@@ -1,0 +1,107 @@
+{
+  "name": "modern-cpp matrix + claude-code",
+
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "args": {
+      "UBUNTU_VERSION": "26.04",
+
+      // Oldest first. Ubuntu 26.04 offers GCC 11..16 and Clang 17..22.
+      // Widen for a fuller fallback matrix, narrow to shrink the image.
+      "GCC_VERSIONS": "12 14 16",
+      "CLANG_VERSIONS": "18 20 22",
+      "GCC_DEFAULT": "16",
+      "CLANG_DEFAULT": "22",
+
+      "LLVM_APT_VERSION": "22",
+      "INSTALL_LLVM_SNAPSHOT": "0",
+
+      "CMAKE_VERSION": "4.3.2",
+      "NINJA_VERSION": "1.13.2"
+    }
+  },
+
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false,
+      "installDockerBuildx": true,
+      "installDockerComposeSwitch": true,
+      "dockerDashComposeVersion": "v2"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+
+  // SYS_PTRACE + unconfined seccomp are required by gdb, valgrind, lldb AND by
+  // the sanitizers' shadow-memory mapping.
+  "runArgs": [
+    "--init",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt",
+    "seccomp=unconfined",
+    "--ulimit",
+    "core=0"
+  ],
+
+  "initializeCommand": [
+    "bash",
+    "-c",
+    "mkdir -p \"$HOME\"/.devcontainer-persist/claude"
+  ],
+
+  "mounts": [
+    "source=${localEnv:HOME}/.devcontainer-persist/claude,target=/home/vscode/.claude,type=bind",
+    "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly"
+  ],
+
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+
+    "CMAKE_GENERATOR": "Ninja",
+    "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+
+    // Sanitizer defaults. Harmless for uninstrumented binaries.
+    // Symbolized traces need llvm-symbolizer on PATH or named explicitly.
+    "ASAN_SYMBOLIZER_PATH": "/usr/local/bin/llvm-symbolizer",
+    "ASAN_OPTIONS": "detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:strict_string_checks=1:symbolize=1",
+    "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1:report_error_type=1",
+    "TSAN_OPTIONS": "second_deadlock_stack=1:halt_on_error=0",
+    "LSAN_OPTIONS": "suppressions=/workspaces/.lsan-suppressions.txt:use_tls=0"
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "ms-vscode.cpptools",
+        "vadimcn.vscode-lldb",
+        "ms-azuretools.vscode-docker",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "C_Cpp.intelliSenseEngine": "disabled",
+        "clangd.path": "/usr/bin/clangd",
+        "clangd.arguments": [
+          "--background-index",
+          "--clang-tidy",
+          "--header-insertion=never",
+          "--compile-commands-dir=${workspaceFolder}/build"
+        ],
+        "cmake.generator": "Ninja",
+        "cmake.useCMakePresets": "always",
+        "cmake.configureOnOpen": false,
+        "files.associations": { "*.ixx": "cpp", "*.cppm": "cpp" }
+      }
+    }
+  }
+}
