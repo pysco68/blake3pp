@@ -26,14 +26,17 @@ namespace blake3pp::core {
 inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
                                          const std::uint8_t* child_cvs,
                                          std::size_t num_children,
+                                         const std::uint32_t key[8],
+                                         std::uint32_t base_flags,
                                          std::uint8_t* out) noexcept {
   const std::size_t num_parents = num_children / 2;
   const std::uint8_t* parent_blocks[kern::max_batch_inputs];
   for (std::size_t i = 0; i < num_parents; ++i) {
     parent_blocks[i] = child_cvs + 2 * i * kern::out_len;
   }
-  k.hash_many(parent_blocks, num_parents, 1, kern::iv, 0,
-              /*increment_counter=*/false, kern::flag_parent, 0, 0, out);
+  k.hash_many(parent_blocks, num_parents, 1, key, 0,
+              /*increment_counter=*/false, kern::flag_parent | base_flags, 0,
+              0, out);
   if (num_children % 2 != 0) {
     std::memcpy(out + num_parents * kern::out_len,
                 child_cvs + (num_children - 1) * kern::out_len, kern::out_len);
@@ -49,26 +52,29 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
                                          const std::uint8_t* input,
                                          std::size_t num_chunks,
                                          std::uint64_t chunk_counter,
+                                         const std::uint32_t key[8],
+                                         std::uint32_t base_flags,
                                          std::uint8_t* out_cvs) noexcept {
   if (num_chunks <= 2 * k.simd_degree) {
     const std::uint8_t* chunks[kern::max_batch_inputs];
     for (std::size_t i = 0; i < num_chunks; ++i) {
       chunks[i] = input + i * kern::chunk_len;
     }
-    k.hash_many(chunks, num_chunks, kern::chunk_len / kern::block_len,
-                kern::iv, chunk_counter, /*increment_counter=*/true, 0,
+    k.hash_many(chunks, num_chunks, kern::chunk_len / kern::block_len, key,
+                chunk_counter, /*increment_counter=*/true, base_flags,
                 kern::flag_chunk_start, kern::flag_chunk_end, out_cvs);
     return num_chunks;
   }
 
   const std::size_t half = num_chunks / 2;
   std::uint8_t child_cvs[2 * kern::max_batch_inputs * kern::out_len];
-  const std::size_t nl =
-      compress_subtree_wide(k, input, half, chunk_counter, child_cvs);
+  const std::size_t nl = compress_subtree_wide(k, input, half, chunk_counter,
+                                               key, base_flags, child_cvs);
   const std::size_t nr = compress_subtree_wide(
-      k, input + half * kern::chunk_len, half, chunk_counter + half,
-      child_cvs + nl * kern::out_len);
-  return compress_parents_wide(k, child_cvs, nl + nr, out_cvs);
+      k, input + half * kern::chunk_len, half, chunk_counter + half, key,
+      base_flags, child_cvs + nl * kern::out_len);
+  return compress_parents_wide(k, child_cvs, nl + nr, key, base_flags,
+                               out_cvs);
 }
 
 // Full reduction of a power-of-2 subtree (>= 2 chunks) to one CV. The final
@@ -78,13 +84,15 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
                                    const std::uint8_t* input,
                                    std::size_t num_chunks,
                                    std::uint64_t chunk_counter,
+                                   const std::uint32_t key[8],
+                                   std::uint32_t base_flags,
                                    std::uint32_t out_cv[8]) noexcept {
   std::uint8_t cvs[kern::max_batch_inputs * kern::out_len];
   std::uint8_t next[kern::max_batch_inputs * kern::out_len];
-  std::size_t n =
-      compress_subtree_wide(k, input, num_chunks, chunk_counter, cvs);
+  std::size_t n = compress_subtree_wide(k, input, num_chunks, chunk_counter,
+                                        key, base_flags, cvs);
   while (n > 1) {
-    n = compress_parents_wide(k, cvs, n, next);
+    n = compress_parents_wide(k, cvs, n, key, base_flags, next);
     std::memcpy(cvs, next, n * kern::out_len);
   }
   for (std::size_t w = 0; w < 8; ++w) {

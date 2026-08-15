@@ -88,6 +88,30 @@ TEST_CASE("parallel_hasher checkpoints and resets like hasher") {
 #endif
 }
 
+TEST_CASE("keyed mode propagates through every parallel quadrant") {
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+  exec::static_thread_pool pool(std::thread::hardware_concurrency());
+  auto sched = pool.get_scheduler();
+  std::array<std::byte, 32> key{};
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<std::byte>(i * 7 + 1);
+  }
+  const std::span<const std::byte, 32> key_span{key};
+  const auto input = make_input(9 * 1024 * 1024 + 137);
+  const auto expected = blake3pp::keyed_hash(key_span, input);
+  CHECK(expected != blake3pp::hash(input));  // the key matters
+
+  // keyed one-shot, multi-core
+  CHECK(blake3pp::keyed_hash(key_span, input, sched) == expected);
+
+  // keyed incremental, multi-core
+  blake3pp::parallel_hasher ph{sched, key_span, {.window_bytes = 512 * 1024}};
+  ph.update(std::span{input}.first(1024 * 1024 + 3));
+  ph.update(std::span{input}.subspan(1024 * 1024 + 3));
+  CHECK(ph.finalize() == expected);
+#endif
+}
+
 TEST_CASE("parallel hash is deterministic across runs") {
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
   exec::static_thread_pool pool(std::thread::hardware_concurrency());

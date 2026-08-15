@@ -105,6 +105,25 @@ TEST_CASE("parallel hash_file matches, across window boundaries") {
 }
 #endif
 
+TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
+  std::array<std::byte, 32> key{};
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<std::byte>(200 - i);
+  }
+  const auto content = make_input(2 * 1024 * 1024 + 999);
+  const temp_file f(content);
+  const auto expected =
+      blake3pp::keyed_hash(std::span<const std::byte, 32>{key}, content);
+
+  CHECK(blake3pp::hash_file(f.path, {.key = key}) == expected);
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+  exec::static_thread_pool pool(4);
+  CHECK(blake3pp::hash_file(f.path, pool.get_scheduler(),
+                            {.window_bytes = 1024 * 1024, .key = key}) ==
+        expected);
+#endif
+}
+
 TEST_CASE("missing file throws system_error") {
   CHECK_THROWS_AS(
       (void)blake3pp::hash_file("/nonexistent/blake3pp/no/such/file"),

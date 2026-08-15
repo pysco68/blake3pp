@@ -48,15 +48,15 @@ using namespace stdexec;
 #endif
 }  // namespace ex
 
-/// Expert: multi-core hash on a caller-supplied kernel table, the same
-/// seam hasher's expert constructor exposes.
-/// @tparam Scheduler  Any std::execution-style scheduler.
-/// @param input  Any length.
-/// @param sched  Where the subtree reductions run.
-/// @param ops    The kernel table; must outlive the call.
+namespace detail {
+
+// The one-shot engine: partitions input into aligned subtrees, fans them
+// out over sched, and finishes inside h, whose key_words()/mode_flags()
+// drive the workers; plain, keyed and derive_key hashers all work.
 template <class Scheduler>
-[[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
-                          const kern::kernel_ops* ops) {
+[[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
+                               Scheduler&& sched,
+                               const kern::kernel_ops* ops) {
   // Only chunks with at least one byte after them may be offloaded: the
   // message's final chunk must stay with the hasher for ROOT finalization.
   const std::size_t safe_chunks =
@@ -89,11 +89,11 @@ template <class Scheduler>
                 ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
                   detail::compress_subtree_cv(
                       ops, base + i * part * chunk_size, part,
-                      static_cast<std::uint64_t>(i) * part, cvs[i].words);
+                      static_cast<std::uint64_t>(i) * part,
+                      h.key_words().data(), h.mode_flags(), cvs[i].words);
                 });
     ex::sync_wait(std::move(work));
 
-    hasher h{ops};
     for (std::size_t i = 0; i < n_parts; ++i) {
       h.push_subtree_cv(cvs[i].words, part);
     }
@@ -101,9 +101,23 @@ template <class Scheduler>
     return h.finalize();
   }
 
-  hasher h{ops};
   h.update(input);
   return h.finalize();
+}
+
+}  // namespace detail
+
+/// Expert: multi-core hash on a caller-supplied kernel table, the same
+/// seam hasher's expert constructor exposes.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param input  Any length.
+/// @param sched  Where the subtree reductions run.
+/// @param ops    The kernel table; must outlive the call.
+template <class Scheduler>
+[[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
+                          const kern::kernel_ops* ops) {
+  hasher h{ops};
+  return detail::hash_into(h, input, std::forward<Scheduler>(sched), ops);
 }
 
 /// Multi-core one-shot hash: the subtree reductions of input run on sched,
@@ -124,6 +138,26 @@ template <class Scheduler>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           arch a = arch::auto_detect) {
   return hash(input, std::forward<Scheduler>(sched), detail::resolve(a));
+}
+
+/// Multi-core keyed one-shot: the MAC/PRF of input under a 32-byte key,
+/// same decomposition as hash().
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param key    Exactly 32 bytes, enforced by the span extent.
+/// @param input  Any length.
+/// @param sched  Where the subtree reductions run.
+/// @param a      The variant to run on.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+                                std::span<const std::byte> input,
+                                Scheduler&& sched,
+                                arch a = arch::auto_detect) {
+  // Reuse the ops overload's partitioning by seeding it with a keyed
+  // hasher: the engine takes key material from the hasher itself.
+  const kern::kernel_ops* const ops = detail::resolve(a);
+  hasher h = hasher::keyed(key, ops);
+  return detail::hash_into(h, input, std::forward<Scheduler>(sched), ops);
 }
 
 namespace detail {
@@ -153,7 +187,9 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
   auto work = ex::schedule(sched) |
               ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
                 compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                                    chunk_counter + i * part, cvs[i].words);
+                                    chunk_counter + i * part,
+                                    h.key_words().data(), h.mode_flags(),
+                                    cvs[i].words);
               });
   ex::sync_wait(std::move(work));
   for (std::size_t i = 0; i < n_parts; ++i) {
@@ -207,6 +243,18 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(ops_),
+        window_(std::bit_floor(
+            std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
+
+  /// Keyed (MAC/PRF) mode.
+  /// @param sched  Where the subtree reductions run.
+  /// @param key    Exactly 32 bytes, enforced by the span extent.
+  /// @param opts   The variant and the window size.
+  parallel_hasher(Scheduler sched, std::span<const std::byte, 32> key,
+                  const parallel_hasher_options& opts = {})
+      : sched_(std::move(sched)),
+        ops_(detail::resolve(opts.a)),
+        h_(hasher::keyed(key, ops_)),
         window_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 

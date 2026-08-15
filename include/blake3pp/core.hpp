@@ -70,7 +70,8 @@ struct digest {
   [[nodiscard]] bool matches(std::string_view hex) const noexcept;
 };
 
-/// The incremental BLAKE3 hasher, with a non-destructive finalize.
+/// The incremental BLAKE3 hasher: plain, keyed (MAC/PRF) or key-derivation
+/// mode, with a non-destructive finalize.
 ///
 /// A fixed-size, trivially relocatable value; never allocates. finalize()
 /// leaves the hasher usable, so a digest can be taken mid-stream and
@@ -100,6 +101,28 @@ class hasher {
   /// @param custom_ops  The kernel table; must outlive the hasher.
   explicit hasher(const kern::kernel_ops* custom_ops) noexcept;
 
+  /// A hasher in keyed mode: BLAKE3's MAC/PRF, its replacement for HMAC.
+  /// @param key  Exactly 32 bytes, enforced by the span extent.
+  /// @param a    The variant to run on.
+  [[nodiscard]] static hasher keyed(std::span<const std::byte, 32> key,
+                                    arch a = arch::auto_detect) noexcept;
+  /// Keyed mode on a caller-supplied kernel table (see the expert
+  /// constructor).
+  /// @param key  Exactly 32 bytes.
+  /// @param ops  The kernel table; must outlive the hasher.
+  [[nodiscard]] static hasher keyed(std::span<const std::byte, 32> key,
+                                    const kern::kernel_ops* ops) noexcept;
+
+  /// A hasher in key-derivation mode: the input is the key material, and
+  /// the output is a subkey bound to context.
+  ///
+  /// The context string should be hardcoded, globally unique and
+  /// application-specific (see the BLAKE3 spec); it is not a secret.
+  /// @param context  The domain-separation string.
+  /// @param a        The variant to run on.
+  [[nodiscard]] static hasher derive_key(std::string_view context,
+                                         arch a = arch::auto_detect) noexcept;
+
   /// Absorbs the next bytes of the message.
   /// @param input  Any length, including zero.
   void update(std::span<const std::byte> input) noexcept;
@@ -122,21 +145,40 @@ class hasher {
   /// subtree covering subtree_chunks complete chunks.
   ///
   /// @pre subtree_chunks is a power of two.
-  /// @pre The hasher sits on a chunk boundary: the bytes absorbed so far
-  ///      are a multiple of chunk_size.
+  /// @pre The hasher sits on a chunk boundary: the bytes absorbed so far are a multiple of
+  ///      chunk_size. A full chunk still open from update() is closed out
+  ///      here, since the subtree proves it is not the last.
   /// @pre The current chunk position is subtree_chunks-aligned.
   /// @pre At least one byte of the message follows the subtree; it must
   ///      not contain the final chunk.
+  /// The subtree must have been hashed under this hasher's key_words() and
+  /// mode_flags() so keyed and derive_key modes propagate.
   /// @param cv              The subtree's root chaining value.
   /// @param subtree_chunks  The number of complete chunks it covers.
   void push_subtree_cv(const std::uint32_t cv[8],
                        std::uint64_t subtree_chunks) noexcept;
 
+  /// Expert observer pairing with push_subtree_cv(): the key schedule
+  /// external subtree computation must hash under.
+  [[nodiscard]] std::span<const std::uint32_t, 8> key_words() const noexcept {
+    return std::span<const std::uint32_t, 8>{key_words_};
+  }
+  /// Expert observer pairing with push_subtree_cv(): the domain flags
+  /// external subtree computation must hash under.
+  [[nodiscard]] std::uint32_t mode_flags() const noexcept {
+    return base_flags_;
+  }
+
  private:
+  hasher(const kern::kernel_ops* ops, const std::uint32_t key[8],
+         std::uint32_t base_flags) noexcept;
+
   void push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
                std::uint64_t subtree_chunks) noexcept;
 
   const kern::kernel_ops* ops_;
+  std::uint32_t key_words_[8];
+  std::uint32_t base_flags_;
   detail::chunk_state chunk_;
   std::uint32_t cv_stack_[54][8];
   std::uint8_t cv_stack_len_;
@@ -149,6 +191,29 @@ class hasher {
 /// @param input  The bytes of the string, not including any terminator.
 [[nodiscard]] digest hash(std::string_view input) noexcept;
 
+/// One-shot keyed hash: the MAC/PRF of input under a 32-byte key.
+/// @param key    Exactly 32 bytes, enforced by the span extent.
+/// @param input  Any length.
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+                                std::span<const std::byte> input) noexcept;
+/// One-shot keyed hash of a string's bytes.
+/// @param key    Exactly 32 bytes.
+/// @param input  The bytes of the string.
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+                                std::string_view input) noexcept;
+
+/// One-shot key derivation: 32 bytes derived from key_material, bound to a
+/// hardcoded, application-unique context (see hasher::derive_key).
+/// @param context       The domain-separation string; not a secret.
+/// @param key_material  The secret to derive from.
+[[nodiscard]] digest derive_key(std::string_view context,
+                                std::span<const std::byte> key_material) noexcept;
+/// One-shot key derivation from a string's bytes.
+/// @param context       The domain-separation string; not a secret.
+/// @param key_material  The secret to derive from.
+[[nodiscard]] digest derive_key(std::string_view context,
+                                std::string_view key_material) noexcept;
+
 namespace detail {
 // Reduces a power-of-2 subtree (>= 2 complete chunks) to its root CV using
 // the given kernel table, key schedule and mode flags (take them from the
@@ -156,6 +221,7 @@ namespace detail {
 // allocation-free; the bridge the parallel engine schedules over.
 void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::size_t num_chunks, std::uint64_t chunk_counter,
+                         const std::uint32_t key[8], std::uint32_t base_flags,
                          std::uint32_t out_cv[8]) noexcept;
 }  // namespace detail
 

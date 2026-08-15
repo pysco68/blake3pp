@@ -9,15 +9,59 @@
 
 namespace blake3pp {
 
+namespace {
+
+// BLAKE3 keys enter as 32 little-endian bytes and live as 8 words.
+void key_bytes_to_words(std::span<const std::byte, 32> key,
+                        std::uint32_t words[8]) noexcept {
+  for (std::size_t w = 0; w < 8; ++w) {
+    const auto b = [&](std::size_t i) {
+      return std::to_integer<std::uint32_t>(key[4 * w + i]);
+    };
+    words[w] = b(0) | (b(1) << 8) | (b(2) << 16) | (b(3) << 24);
+  }
+}
+
+}  // namespace
+
 hasher::hasher(arch a) noexcept : hasher(detail::resolve(a)) {}
 
 hasher::hasher(const kern::kernel_ops* custom_ops) noexcept
-    : ops_(custom_ops), cv_stack_len_(0) {
-  core::chunk_init(chunk_, kern::iv, 0);
+    : hasher(custom_ops, kern::iv, 0) {}
+
+hasher::hasher(const kern::kernel_ops* ops, const std::uint32_t key[8],
+               std::uint32_t base_flags) noexcept
+    : ops_(ops), base_flags_(base_flags), cv_stack_len_(0) {
+  std::memcpy(key_words_, key, sizeof(key_words_));
+  core::chunk_init(chunk_, key_words_, 0);
+}
+
+hasher hasher::keyed(std::span<const std::byte, 32> key, arch a) noexcept {
+  return keyed(key, detail::resolve(a));
+}
+
+hasher hasher::keyed(std::span<const std::byte, 32> key,
+                     const kern::kernel_ops* ops) noexcept {
+  std::uint32_t words[8];
+  key_bytes_to_words(key, words);
+  return hasher(ops, words, kern::flag_keyed_hash);
+}
+
+hasher hasher::derive_key(std::string_view context, arch a) noexcept {
+  const kern::kernel_ops* const ops = detail::resolve(a);
+  // Stage 1: hash the context string in DERIVE_KEY_CONTEXT mode...
+  hasher ctx(ops, kern::iv, kern::flag_derive_key_context);
+  ctx.update(context);
+  const digest context_key = ctx.finalize();
+  // ...stage 2: the returned hasher consumes key material keyed by it.
+  std::uint32_t words[8];
+  key_bytes_to_words(std::span<const std::byte, 32>{context_key.bytes},
+                     words);
+  return hasher(ops, words, kern::flag_derive_key_material);
 }
 
 void hasher::reset() noexcept {
-  core::chunk_init(chunk_, kern::iv, 0);
+  core::chunk_init(chunk_, key_words_, 0);
   cv_stack_len_ = 0;
 }
 
@@ -43,9 +87,10 @@ void hasher::push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
   std::uint64_t chunks = total_chunks / subtree_chunks;
   while ((chunks & 1) == 0) {
     cv_stack_len_--;
-    core::chaining_value(
-        *ops_, core::parent_output(cv_stack_[cv_stack_len_], new_cv, kern::iv),
-        new_cv);
+    core::chaining_value(*ops_,
+                         core::parent_output(cv_stack_[cv_stack_len_], new_cv,
+                                             key_words_, base_flags_),
+                         new_cv);
     chunks >>= 1;
   }
   std::memcpy(cv_stack_[cv_stack_len_], new_cv, sizeof(new_cv));
@@ -61,10 +106,11 @@ void hasher::update(std::span<const std::byte> input) noexcept {
     // chunk of the message must stay open for possible ROOT finalization.
     if (core::chunk_len(chunk_) == kern::chunk_len) {
       std::uint32_t chunk_cv[8];
-      core::chaining_value(*ops_, core::chunk_output(chunk_), chunk_cv);
+      core::chaining_value(*ops_, core::chunk_output(chunk_, base_flags_),
+                           chunk_cv);
       const std::uint64_t total_chunks = chunk_.chunk_counter + 1;
       push_cv(chunk_cv, total_chunks, 1);
-      core::chunk_init(chunk_, kern::iv, total_chunks);
+      core::chunk_init(chunk_, key_words_, total_chunks);
     }
 
     // Subtree fast path: aligned on a chunk boundary with more than one
@@ -84,7 +130,7 @@ void hasher::update(std::span<const std::byte> input) noexcept {
       if (subtree >= 2) {
         std::uint32_t cv[8];
         core::compress_subtree_to_cv(*ops_, p, subtree, chunk_.chunk_counter,
-                                     cv);
+                                     key_words_, base_flags_, cv);
         push_cv(cv, chunk_.chunk_counter + subtree, subtree);
         chunk_.chunk_counter += subtree;
         p += subtree * kern::chunk_len;
@@ -96,7 +142,7 @@ void hasher::update(std::span<const std::byte> input) noexcept {
 
     const std::size_t room = kern::chunk_len - core::chunk_len(chunk_);
     const std::size_t take = len < room ? len : room;
-    core::chunk_update(*ops_, chunk_, p, take);
+    core::chunk_update(*ops_, chunk_, p, take, base_flags_);
     p += take;
     len -= take;
   }
@@ -110,13 +156,14 @@ digest hasher::finalize() const noexcept {
   // Collapse the stack from the top down; the last combination happens with
   // the ROOT flag. No member state is modified; finalize can be called at
   // any point and hashing may continue afterwards.
-  core::output o = core::chunk_output(chunk_);
+  core::output o = core::chunk_output(chunk_, base_flags_);
   std::size_t parents = cv_stack_len_;
   while (parents > 0) {
     parents--;
     std::uint32_t right_cv[8];
     core::chaining_value(*ops_, o, right_cv);
-    o = core::parent_output(cv_stack_[parents], right_cv, kern::iv);
+    o = core::parent_output(cv_stack_[parents], right_cv, key_words_,
+                            base_flags_);
   }
 
   o.flags |= kern::flag_root;
@@ -141,10 +188,12 @@ void hasher::push_subtree_cv(const std::uint32_t cv[8],
 namespace detail {
 void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::size_t num_chunks, std::uint64_t chunk_counter,
+                         const std::uint32_t key[8], std::uint32_t base_flags,
                          std::uint32_t out_cv[8]) noexcept {
   core::compress_subtree_to_cv(*ops,
                                reinterpret_cast<const std::uint8_t*>(data),
-                               num_chunks, chunk_counter, out_cv);
+                               num_chunks, chunk_counter, key, base_flags,
+                               out_cv);
 }
 }  // namespace detail
 
@@ -158,6 +207,31 @@ digest hash(std::string_view input) noexcept {
   hasher h;
   h.update(input);
   return h.finalize();
+}
+
+digest keyed_hash(std::span<const std::byte, 32> key,
+                  std::span<const std::byte> input) noexcept {
+  hasher h = hasher::keyed(key);
+  h.update(input);
+  return h.finalize();
+}
+
+digest keyed_hash(std::span<const std::byte, 32> key,
+                  std::string_view input) noexcept {
+  return keyed_hash(key, std::as_bytes(std::span{input.data(), input.size()}));
+}
+
+digest derive_key(std::string_view context,
+                  std::span<const std::byte> key_material) noexcept {
+  hasher h = hasher::derive_key(context);
+  h.update(key_material);
+  return h.finalize();
+}
+
+digest derive_key(std::string_view context,
+                  std::string_view key_material) noexcept {
+  return derive_key(context, std::as_bytes(std::span{key_material.data(),
+                                                     key_material.size()}));
 }
 
 std::optional<digest> digest::from_hex(std::string_view hex) noexcept {

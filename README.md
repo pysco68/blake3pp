@@ -65,6 +65,45 @@ blake3pp::digest full = h.finalize();       // ...and of the whole stream
 h.reset();                                  // reuse the instance
 ```
 
+### Keyed hashing and key derivation
+
+BLAKE3's keyed mode is its built-in MAC/PRF (the modern replacement for
+HMAC). Keys are exactly 32 bytes; the span extent makes a wrong-sized key
+a compile error:
+
+```cpp
+std::array<std::byte, 32> key = load_secret_key();
+
+blake3pp::digest mac = blake3pp::keyed_hash(key, message);
+
+blake3pp::hasher h = blake3pp::hasher::keyed(key);   // incremental MAC
+h.update(header);
+h.update(body);
+blake3pp::digest tag = h.finalize();
+```
+
+`derive_key` is the domain-separated KDF: derive purpose-bound subkeys
+from one master secret, tied to a hardcoded, application-unique context
+string (the context is not a secret; it is what keeps unrelated uses of
+the same key material cryptographically independent):
+
+```cpp
+auto session_key =
+    blake3pp::derive_key("example.com 2026-08 tls session", master_secret);
+auto storage_key =
+    blake3pp::derive_key("example.com 2026-08 disk encryption", master_secret);
+```
+
+Both modes compose with everything else: `hasher::keyed`/
+`hasher::derive_key` give incremental hashing, `keyed_hash(key, data,
+sched)` and a keyed `parallel_hasher` constructor go multi-core, and
+`hash_file`'s options take a key, for authenticated file manifests at
+full pipeline speed:
+
+```cpp
+auto tag = blake3pp::hash_file(path, pool.get_scheduler(), {.key = key});
+```
+
 ### SIMD variants: introspection and pinning
 
 The binary carries every variant your target platform supports; dispatch
@@ -181,8 +220,8 @@ when blake3pp is the top-level project.
   functions are.
 - Only the I/O layer throws (`std::system_error`, or use the `error_code`
   overloads); compute APIs are `noexcept`.
-- Current API scope: plain 256-bit BLAKE3. Keyed hashing, `derive_key`
-  and extendable output (XOF) are on the roadmap.
+- Current API scope: 256-bit BLAKE3 in all three spec modes (plain, keyed,
+  derive_key). Extendable output (XOF) is on the roadmap.
 
 ## Building
 

@@ -1,5 +1,7 @@
 #include <cstddef>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <blake3pp/blake3pp.hpp>
@@ -25,6 +27,50 @@ TEST_CASE("one-shot hash matches every official vector") {
     CAPTURE(c.input_len);
     const auto input = make_input(c.input_len);
     CHECK(blake3pp::hash(input).to_hex() == std::string(c.hash).substr(0, 64));
+  }
+}
+
+TEST_CASE("keyed hash matches every official vector") {
+  constexpr std::string_view key_str = blake3pp::testvec::key;
+  static_assert(key_str.size() == 32);
+  const auto key =
+      std::as_bytes(std::span<const char, 32>{key_str.data(), 32});
+  for (const auto& c : blake3pp::testvec::cases) {
+    CAPTURE(c.input_len);
+    const auto input = make_input(c.input_len);
+    CHECK(blake3pp::keyed_hash(key, input).to_hex() ==
+          std::string(c.keyed_hash).substr(0, 64));
+  }
+}
+
+TEST_CASE("derive_key matches every official vector") {
+  for (const auto& c : blake3pp::testvec::cases) {
+    CAPTURE(c.input_len);
+    const auto input = make_input(c.input_len);
+    CHECK(blake3pp::derive_key(blake3pp::testvec::context, input).to_hex() ==
+          std::string(c.derive_key).substr(0, 64));
+  }
+}
+
+TEST_CASE("keyed and derive_key match vectors on every available arch") {
+  constexpr std::string_view key_str = blake3pp::testvec::key;
+  const auto key =
+      std::as_bytes(std::span<const char, 32>{key_str.data(), 32});
+  for (const auto a : blake3pp::available_arches()) {
+    CAPTURE(blake3pp::to_string(a));
+    for (const auto& c : blake3pp::testvec::cases) {
+      CAPTURE(c.input_len);
+      const auto input = make_input(c.input_len);
+      blake3pp::hasher kh = blake3pp::hasher::keyed(key, a);
+      kh.update(input);
+      CHECK(kh.finalize().to_hex() ==
+            std::string(c.keyed_hash).substr(0, 64));
+      blake3pp::hasher dk =
+          blake3pp::hasher::derive_key(blake3pp::testvec::context, a);
+      dk.update(input);
+      CHECK(dk.finalize().to_hex() ==
+            std::string(c.derive_key).substr(0, 64));
+    }
   }
 }
 

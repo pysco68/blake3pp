@@ -15,10 +15,12 @@
 /// keep ROOT finalization correct.
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <system_error>
 #include <utility>
@@ -29,8 +31,9 @@
 
 namespace blake3pp {
 
-/// hash_file()'s knobs: the SIMD variant of the hasher it constructs, and
-/// the pipeline's window, queue depth and direct-I/O choice.
+/// hash_file()'s knobs: the SIMD variant and optional key of the hasher it
+/// constructs, and the pipeline's window, queue depth and direct-I/O
+/// choice.
 struct hash_file_options {
   /// The SIMD variant of the hasher.
   arch a = arch::auto_detect;
@@ -41,7 +44,20 @@ struct hash_file_options {
   unsigned queue_depth = 4;
   /// Bypass the page cache where the platform supports it.
   bool direct_io = true;
+  /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
+  std::optional<std::array<std::byte, 32>> key = std::nullopt;
 };
+
+namespace detail {
+inline hasher make_hasher(const hash_file_options& opts,
+                          const kern::kernel_ops* ops) noexcept {
+  if (opts.key.has_value()) {
+    return hasher::keyed(std::span<const std::byte, 32>{opts.key.value()},
+                         ops);
+  }
+  return hasher{ops};
+}
+}  // namespace detail
 
 /// One-shot digest of a file: a hasher shaped by opts (SIMD variant,
 /// optional key), the file streamed through it, finalized.
@@ -83,7 +99,7 @@ template <class Scheduler>
   detail::file_reader reader(
       path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
   const kern::kernel_ops* const ops = detail::resolve(opts.a);
-  hasher h{ops};
+  hasher h = detail::make_hasher(opts, ops);
   while (auto w = reader.next()) {
     if (!w->last) {
       detail::hash_window_parallel(ops, sched, h, w->data,

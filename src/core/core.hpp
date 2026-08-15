@@ -51,15 +51,17 @@ inline std::uint32_t chunk_start_flag(const detail::chunk_state& cs) noexcept {
 }
 
 // Feeds up to (chunk_len - len) bytes; caller ensures the chunk has room.
+// base_flags carries the hashing mode (0, KEYED_HASH, DERIVE_KEY_*).
 inline void chunk_update(const kern::kernel_ops& k, detail::chunk_state& cs,
-                         const std::uint8_t* input, std::size_t len) noexcept {
+                         const std::uint8_t* input, std::size_t len,
+                         std::uint32_t base_flags) noexcept {
   while (len > 0) {
     // A full buffered block is only compressed once more input shows up: if
     // it turned out to be the chunk's last block it needs CHUNK_END later.
     if (cs.block_len == kern::block_len) {
       k.compress_in_place(cs.cv, cs.block,
                           static_cast<std::uint32_t>(kern::block_len),
-                          cs.chunk_counter, chunk_start_flag(cs));
+                          cs.chunk_counter, chunk_start_flag(cs) | base_flags);
       cs.blocks_compressed++;
       cs.block_len = 0;
       std::memset(cs.block, 0, sizeof(cs.block));
@@ -74,13 +76,14 @@ inline void chunk_update(const kern::kernel_ops& k, detail::chunk_state& cs,
   }
 }
 
-inline output chunk_output(const detail::chunk_state& cs) noexcept {
+inline output chunk_output(const detail::chunk_state& cs,
+                           std::uint32_t base_flags) noexcept {
   output o;
   std::memcpy(o.input_cv, cs.cv, sizeof(o.input_cv));
   std::memcpy(o.block, cs.block, sizeof(o.block));
   o.block_len = cs.block_len;
   o.counter = cs.chunk_counter;
-  o.flags = chunk_start_flag(cs) | kern::flag_chunk_end;
+  o.flags = chunk_start_flag(cs) | kern::flag_chunk_end | base_flags;
   return o;
 }
 
@@ -88,7 +91,8 @@ inline output chunk_output(const detail::chunk_state& cs) noexcept {
 // counter 0 (spec section 2.4).
 inline output parent_output(const std::uint32_t left_cv[8],
                             const std::uint32_t right_cv[8],
-                            const std::uint32_t key[8]) noexcept {
+                            const std::uint32_t key[8],
+                            std::uint32_t base_flags) noexcept {
   output o;
   std::memcpy(o.input_cv, key, 8 * sizeof(std::uint32_t));
   for (std::size_t w = 0; w < 8; ++w) {
@@ -101,7 +105,7 @@ inline output parent_output(const std::uint32_t left_cv[8],
   }
   o.block_len = static_cast<std::uint32_t>(kern::block_len);
   o.counter = 0;
-  o.flags = kern::flag_parent;
+  o.flags = kern::flag_parent | base_flags;
   return o;
 }
 
