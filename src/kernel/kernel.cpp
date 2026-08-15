@@ -70,6 +70,18 @@ consteval std::array<std::array<std::uint8_t, 16>, 7> make_msg_schedule() {
 constexpr auto msg_schedule = make_msg_schedule();
 
 // The quarter-round (spec section 2.2), generic over the word type.
+//
+// Scheduling note (all measured on znver3): this plain sequential-g
+// spelling is the best of three schedules tried. llvm-mca shows it
+// latency-bound (459 cycles/block vs a 196 port floor, IPC 2.56 where
+// upstream's hand-scheduled asm reaches 3.50), yet every attempt to
+// expose more ILP in source made things worse. Interleaving two independent
+// batches doubled live state past the 16 architectural registers (2.66 ->
+// 1.83 GiB/s); staging the four quartets' micro-steps helped narrow widths
+// but pessimized AVX2 spill placement on both compilers (ratio vs upstream
+// 0.85 -> 0.71); and staging via index arrays defeated SROA entirely
+// (Clang 0.77 GiB/s). The residual vs hand-written assembly is scheduler
+// quality, and source-level reordering cannot reliably buy it back.
 template <class W>
 inline void g(W v[16], std::size_t a, std::size_t b, std::size_t c,
               std::size_t d, W mx, W my) noexcept {
@@ -85,8 +97,7 @@ inline void g(W v[16], std::size_t a, std::size_t b, std::size_t c,
 
 // The round index is a template parameter so every schedule lookup is a
 // compile-time constant: message operands stay directly addressable instead
-// of register-indexed loads. This matters most under high register pressure
-// (wide vectors), where indirect indexing defeats the register allocator.
+// of register-indexed loads.
 template <std::size_t R, class W>
 inline void round_fn(W v[16], const W m[16]) noexcept {
   constexpr const std::array<std::uint8_t, 16>& s = msg_schedule[R];

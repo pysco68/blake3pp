@@ -29,6 +29,34 @@
 #include <blake3.h>
 #endif
 
+#if defined(BLAKE3PP_BENCH_UPSTREAM) && defined(__x86_64__)
+#include "kernel/kernel.hpp"
+
+// Upstream's hand-scheduled AVX2 assembly, already present in the linked
+// baseline library. Wrapping it as a kernel_ops table plugs it into OUR
+// entire pipeline (subtree batching, CV stack, parallel engine) through
+// the same seam every portable variant uses. Only the flag argument widths
+// differ (upstream narrows them to uint8_t).
+extern "C" void blake3_hash_many_avx2(
+    const std::uint8_t* const* inputs, std::size_t num_inputs,
+    std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
+    bool increment_counter, std::uint8_t flags, std::uint8_t flags_start,
+    std::uint8_t flags_end, std::uint8_t* out);
+
+namespace {
+void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
+                   std::size_t blocks, const std::uint32_t key[8],
+                   std::uint64_t counter, bool increment_counter,
+                   std::uint32_t flags, std::uint32_t flags_start,
+                   std::uint32_t flags_end, std::uint8_t* out) noexcept {
+  blake3_hash_many_avx2(inputs, num_inputs, blocks, key, counter,
+                        increment_counter, static_cast<std::uint8_t>(flags),
+                        static_cast<std::uint8_t>(flags_start),
+                        static_cast<std::uint8_t>(flags_end), out);
+}
+}  // namespace
+#endif
+
 namespace {
 
 constexpr blake3pp::arch all_arches[] = {
@@ -105,6 +133,58 @@ int main(int argc, char** argv) {
     std::printf("%-8s %8.2f GiB/s   (%s...)\n", blake3pp::to_string(a), gib_s,
                 d.to_hex().substr(0, 16).c_str());
   }
+
+#if defined(BLAKE3PP_BENCH_UPSTREAM) && defined(__x86_64__)
+  // Upstream's assembly kernel driven by OUR tree and parallel machinery.
+  if (blake3pp::is_available(blake3pp::arch::avx2)) {
+    blake3pp::kern::kernel_ops asm_ops =
+        *blake3pp::detail::resolve(blake3pp::arch::avx2);
+    asm_ops.name = "asm-avx2";
+    asm_ops.hash_many = &asm_hash_many;  // compress_in_place stays portable
+
+    {
+      blake3pp::digest d{};
+      double best_s = 1e100;
+      for (int r = 0; r < reps + 1; ++r) {
+        blake3pp::hasher h{&asm_ops};
+        const auto t0 = std::chrono::steady_clock::now();
+        h.update(std::span<const std::byte>{input});
+        d = h.finalize();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(t1 - t0).count();
+        if (r > 0 && s < best_s) {
+          best_s = s;
+        }
+      }
+      const double gib_s = static_cast<double>(input.size()) / best_s /
+                           (1024.0 * 1024.0 * 1024.0);
+      std::printf("%-8s %8.2f GiB/s   (%s...)  [upstream asm in our tree]\n",
+                  "asm-avx2", gib_s, d.to_hex().substr(0, 16).c_str());
+    }
+
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+    {
+      exec::static_thread_pool pool(std::thread::hardware_concurrency());
+      auto sched = pool.get_scheduler();
+      blake3pp::digest d{};
+      double best_s = 1e100;
+      for (int r = 0; r < reps + 1; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        d = blake3pp::hash(std::span<const std::byte>{input}, sched, &asm_ops);
+        const auto t1 = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(t1 - t0).count();
+        if (r > 0 && s < best_s) {
+          best_s = s;
+        }
+      }
+      const double gib_s = static_cast<double>(input.size()) / best_s /
+                           (1024.0 * 1024.0 * 1024.0);
+      std::printf("%-8s %8.2f GiB/s   (%s...)  [upstream asm, parallel]\n",
+                  "asm-par", gib_s, d.to_hex().substr(0, 16).c_str());
+    }
+#endif
+  }
+#endif
 
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
   // The sender-based parallel engine over a static thread pool: the number

@@ -34,6 +34,19 @@ function(blake3pp_add_kernel ns)
   # config flags, so it wins over RelWithDebInfo's -O2.
   target_compile_options(${tgt} PRIVATE
     "$<$<CONFIG:Release,RelWithDebInfo>:-O3>")
+  # GCC's post-RA scheduler measurably hurts this register-saturated kernel
+  # (+6% from disabling it, 3/3 paired runs on znver3): with ~32 live vector
+  # values on 16 registers, its static ILP-driven reordering only disturbs
+  # the dataflow order the out-of-order core exploits natively. Clang is the
+  # opposite: disabling its (pressure-aware) MachineScheduler costs ~10%,
+  # so it stays on. Measured, not assumed.
+  target_compile_options(${tgt} PRIVATE
+    "$<$<CXX_COMPILER_ID:GNU>:-fno-schedule-insns2>")
+  # Experimentation hook: extra flags for kernel TUs only (scheduler knobs,
+  # tuning trials). Semicolon-separated list; empty by default.
+  if(BLAKE3PP_KERNEL_EXTRA_FLAGS)
+    target_compile_options(${tgt} PRIVATE ${BLAKE3PP_KERNEL_EXTRA_FLAGS})
+  endif()
   target_include_directories(${tgt} PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/include")

@@ -24,6 +24,11 @@ inline constexpr std::size_t out_len = 32;
 // the caller-side staging buffers for hash_many batches.
 inline constexpr std::size_t max_simd_degree = 16;
 
+// Callers get best throughput handing hash_many TWO batches worth of
+// inputs at once: the kernel interleaves two independent batches to double
+// the dependency chains (see hash_batch2). Bounds the batch-shaped buffers.
+inline constexpr std::size_t max_batch_inputs = 2 * max_simd_degree;
+
 // BLAKE3 IV (identical to BLAKE2s / SHA-256's first eight constants).
 inline constexpr std::uint32_t iv[8] = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,

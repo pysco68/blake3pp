@@ -9,6 +9,9 @@ add_executable(blake3pp_bench throughput.cpp)
 target_link_libraries(blake3pp_bench PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings)
+# For the asm-plug-in rows: the bench builds a kernel_ops table around
+# upstream's assembly, which needs the internal kernel boundary header.
+target_include_directories(blake3pp_bench PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 if(BLAKE3PP_BENCH_UPSTREAM)
   # The upstream library is C plus hand-written assembly; enabling the

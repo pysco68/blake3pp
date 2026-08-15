@@ -28,7 +28,7 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
                                          std::size_t num_children,
                                          std::uint8_t* out) noexcept {
   const std::size_t num_parents = num_children / 2;
-  const std::uint8_t* parent_blocks[kern::max_simd_degree];
+  const std::uint8_t* parent_blocks[kern::max_batch_inputs];
   for (std::size_t i = 0; i < num_parents; ++i) {
     parent_blocks[i] = child_cvs + 2 * i * kern::out_len;
   }
@@ -43,14 +43,15 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
 }
 
 // num_chunks is a power of two; input holds num_chunks complete chunks.
-// Returns min(num_chunks, simd_degree) CVs in out_cvs.
+// Returns min(num_chunks, 2 * simd_degree) CVs in out_cvs. The leaf spans
+// TWO SIMD batches so hash_many can run its dual-batch interleaved path.
 inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
                                          const std::uint8_t* input,
                                          std::size_t num_chunks,
                                          std::uint64_t chunk_counter,
                                          std::uint8_t* out_cvs) noexcept {
-  if (num_chunks <= k.simd_degree) {
-    const std::uint8_t* chunks[kern::max_simd_degree];
+  if (num_chunks <= 2 * k.simd_degree) {
+    const std::uint8_t* chunks[kern::max_batch_inputs];
     for (std::size_t i = 0; i < num_chunks; ++i) {
       chunks[i] = input + i * kern::chunk_len;
     }
@@ -61,7 +62,7 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
   }
 
   const std::size_t half = num_chunks / 2;
-  std::uint8_t child_cvs[2 * kern::max_simd_degree * kern::out_len];
+  std::uint8_t child_cvs[2 * kern::max_batch_inputs * kern::out_len];
   const std::size_t nl =
       compress_subtree_wide(k, input, half, chunk_counter, child_cvs);
   const std::size_t nr = compress_subtree_wide(
@@ -78,8 +79,8 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
                                    std::size_t num_chunks,
                                    std::uint64_t chunk_counter,
                                    std::uint32_t out_cv[8]) noexcept {
-  std::uint8_t cvs[kern::max_simd_degree * kern::out_len];
-  std::uint8_t next[kern::max_simd_degree * kern::out_len];
+  std::uint8_t cvs[kern::max_batch_inputs * kern::out_len];
+  std::uint8_t next[kern::max_batch_inputs * kern::out_len];
   std::size_t n =
       compress_subtree_wide(k, input, num_chunks, chunk_counter, cvs);
   while (n > 1) {

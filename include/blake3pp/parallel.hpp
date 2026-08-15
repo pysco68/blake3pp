@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 
 #include <blake3pp/blake3pp.hpp>
 
@@ -41,12 +42,11 @@ using namespace stdexec;
 #endif
 }  // namespace ex
 
-// Hashes input, scheduling subtree reductions onto sched. Any
-// std::execution-style scheduler works; small inputs (where parallelism
-// cannot pay for itself) fall back to the sequential path.
+// Expert overload: as below, but on a caller-supplied kernel table (the
+// same seam hasher's expert constructor exposes).
 template <class Scheduler>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
-                          arch a = arch::auto_detect) {
+                          const kern::kernel_ops* ops) {
   // Only chunks with at least one byte after them may be offloaded: the
   // message's final chunk must stay with the hasher for ROOT finalization.
   const std::size_t safe_chunks =
@@ -64,7 +64,6 @@ template <class Scheduler>
     // automatically subtree-aligned.
     std::uint32_t cvs[2 * max_parts][8];
     const std::byte* const base = input.data();
-    const kern::kernel_ops* const ops = detail::resolve(a);
 
     auto work = ex::schedule(sched) |
                 ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
@@ -74,7 +73,7 @@ template <class Scheduler>
                 });
     ex::sync_wait(std::move(work));
 
-    hasher h{a};
+    hasher h{ops};
     for (std::size_t i = 0; i < n_parts; ++i) {
       h.push_subtree_cv(cvs[i], part);
     }
@@ -82,9 +81,18 @@ template <class Scheduler>
     return h.finalize();
   }
 
-  hasher h{a};
+  hasher h{ops};
   h.update(input);
   return h.finalize();
+}
+
+// Hashes input, scheduling subtree reductions onto sched. Any
+// std::execution-style scheduler works; small inputs (where parallelism
+// cannot pay for itself) fall back to the sequential path.
+template <class Scheduler>
+[[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
+                          arch a = arch::auto_detect) {
+  return hash(input, std::forward<Scheduler>(sched), detail::resolve(a));
 }
 
 }  // namespace blake3pp

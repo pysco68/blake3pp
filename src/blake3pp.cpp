@@ -9,7 +9,10 @@
 
 namespace blake3pp {
 
-hasher::hasher(arch a) noexcept : ops_(detail::resolve(a)), cv_stack_len_(0) {
+hasher::hasher(arch a) noexcept : hasher(detail::resolve(a)) {}
+
+hasher::hasher(const kern::kernel_ops* custom_ops) noexcept
+    : ops_(custom_ops), cv_stack_len_(0) {
   core::chunk_init(chunk_, kern::iv, 0);
 }
 

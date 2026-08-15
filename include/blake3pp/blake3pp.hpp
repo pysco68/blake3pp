@@ -46,6 +46,11 @@ class hasher {
   hasher() noexcept : hasher(arch::auto_detect) {}
   explicit hasher(arch a) noexcept;
 
+  // Expert: run on a caller-supplied kernel table (must outlive the
+  // hasher). This is how external kernels (e.g. hand-written assembly)
+  // plug into the dispatch seam for comparison; see bench/throughput.cpp.
+  explicit hasher(const kern::kernel_ops* custom_ops) noexcept;
+
   void update(std::span<const std::byte> input) noexcept;
   void update(std::string_view input) noexcept;
 
