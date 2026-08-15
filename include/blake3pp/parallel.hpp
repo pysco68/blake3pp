@@ -60,22 +60,32 @@ template <class Scheduler>
     const std::size_t part = std::bit_floor(std::max(want, min_part_chunks));
     const std::size_t n_parts = safe_chunks / part;  // < 2 * max_parts
 
+    // One result slot per worker, each padded to its own cache line:
+    // adjacent workers complete at unrelated times, and a bare 32-byte CV
+    // array would put two workers' completion writes in the same line:
+    // textbook false sharing on the only memory the workers share.
+    // (std::hardware_destructive_interference_size is the standard name
+    // for this boundary; we pin its value, 64 on every target we build,
+    // because GCC warns on ABI-sensitive uses of the constant in headers.)
+    struct alignas(64) padded_cv {
+      std::uint32_t words[8];
+    };
     // Starting from counter 0 in part-sized steps, every part is
     // automatically subtree-aligned.
-    std::uint32_t cvs[2 * max_parts][8];
+    padded_cv cvs[2 * max_parts];
     const std::byte* const base = input.data();
 
     auto work = ex::schedule(sched) |
                 ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
                   detail::compress_subtree_cv(
                       ops, base + i * part * chunk_size, part,
-                      static_cast<std::uint64_t>(i) * part, cvs[i]);
+                      static_cast<std::uint64_t>(i) * part, cvs[i].words);
                 });
     ex::sync_wait(std::move(work));
 
     hasher h{ops};
     for (std::size_t i = 0; i < n_parts; ++i) {
-      h.push_subtree_cv(cvs[i], part);
+      h.push_subtree_cv(cvs[i].words, part);
     }
     h.update(input.subspan(n_parts * part * chunk_size));
     return h.finalize();
