@@ -30,6 +30,7 @@ add_executable(blake3pp_tests
   official_vectors.cpp
   incremental.cpp
   kernel_ops.cpp
+  parallel.cpp
   "${vectors_hpp}")
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"

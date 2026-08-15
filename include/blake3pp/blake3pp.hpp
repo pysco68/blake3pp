@@ -11,6 +11,10 @@
 
 namespace blake3pp {
 
+// The BLAKE3 chunk granularity; subtree offloading (push_subtree_cv,
+// <blake3pp/parallel.hpp>) is expressed in units of this.
+inline constexpr std::size_t chunk_size = 1024;
+
 namespace detail {
 
 // One chunk (up to 1024 bytes) in flight. The final block of a chunk is kept
@@ -51,6 +55,16 @@ class hasher {
 
   [[nodiscard]] arch selected_arch() const noexcept;
 
+  // Expert seam for external subtree computation (the parallel engine and,
+  // later, the I/O pipeline): absorbs the root CV of a subtree covering
+  // subtree_chunks complete chunks. Preconditions: subtree_chunks is a
+  // power of two; the hasher sits exactly on a chunk boundary (bytes
+  // consumed so far are a multiple of chunk_size); the current chunk
+  // position is subtree_chunks-aligned; and at least one byte of the
+  // message follows the subtree (it must not contain the final chunk).
+  void push_subtree_cv(const std::uint32_t cv[8],
+                       std::uint64_t subtree_chunks) noexcept;
+
  private:
   void push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
                std::uint64_t subtree_chunks) noexcept;
@@ -63,5 +77,14 @@ class hasher {
 
 [[nodiscard]] digest hash(std::span<const std::byte> input) noexcept;
 [[nodiscard]] digest hash(std::string_view input) noexcept;
+
+namespace detail {
+// Reduces a power-of-2 subtree (>= 2 complete chunks) to its root CV using
+// the given kernel table. Thread-safe and allocation-free; the bridge the
+// parallel engine schedules over.
+void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
+                         std::size_t num_chunks, std::uint64_t chunk_counter,
+                         std::uint32_t out_cv[8]) noexcept;
+}  // namespace detail
 
 }  // namespace blake3pp

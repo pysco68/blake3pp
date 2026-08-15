@@ -72,6 +72,27 @@ int main() {
 ]])
 endif()
 
+# Senders polyfill: no shipping standard library has std::execution yet, so
+# NVIDIA's stdexec provides the sender/receiver machinery. Header-only use:
+# SOURCE_SUBDIR points at include/, which has no CMakeLists.txt, so
+# FetchContent populates without configuring stdexec's own build (which
+# would pull rapids-cmake from the network).
+if(NOT BLAKE3PP_HAS_STD_SENDERS)
+  include(FetchContent)
+  FetchContent_Declare(stdexec
+    URL https://github.com/NVIDIA/stdexec/archive/refs/tags/nvhpc-26.05.tar.gz
+    URL_HASH SHA256=9d2396fecd604698c1eae58f0cb6e4517aa727013846240d1a7b2f35e49884dc
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR include)
+  FetchContent_MakeAvailable(stdexec)
+  find_package(Threads REQUIRED)
+  add_library(blake3pp_stdexec INTERFACE)
+  target_include_directories(blake3pp_stdexec SYSTEM INTERFACE
+    "${stdexec_SOURCE_DIR}/include")
+  target_link_libraries(blake3pp_stdexec INTERFACE Threads::Threads)
+  target_link_libraries(blake3pp_features INTERFACE blake3pp_stdexec)
+endif()
+
 # Last resort: xsimd (header-only, imported as SYSTEM so its headers stay
 # outside our warning net).
 if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)

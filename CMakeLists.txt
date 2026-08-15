@@ -14,6 +14,11 @@ if(NOT DEFINED CMAKE_CXX_STANDARD)
   set(CMAKE_CXX_EXTENSIONS OFF)
 endif()
 
+# No C++ modules in this project. Beyond being unnecessary, the scanning
+# support CMake enables for C++20+ targets adds -fmodules-ts to every GCC
+# compile, and GCC 16 trunk's modules machinery ICEs on stdexec's headers.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 option(BLAKE3PP_BUILD_TESTS "Build blake3pp tests" ${PROJECT_IS_TOP_LEVEL})
 option(BLAKE3PP_BUILD_BENCH "Build blake3pp benchmarks" ${PROJECT_IS_TOP_LEVEL})
 
@@ -34,8 +39,11 @@ target_compile_features(blake3pp PUBLIC cxx_std_20)
 target_include_directories(blake3pp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_include_directories(blake3pp PRIVATE src)
+# features is PUBLIC: its defines (BLAKE3PP_HAS_STD_SENDERS etc.) and the
+# stdexec include path must reach consumers of <blake3pp/parallel.hpp>.
 target_link_libraries(blake3pp
-  PRIVATE blake3pp_warnings blake3pp::features)
+  PRIVATE blake3pp_warnings
+  PUBLIC blake3pp::features)
 
 # Architecture kernel variants. Each call compiles src/kernel/kernel.cpp into
 # its own OBJECT library under its own namespace and -m flags; all registered

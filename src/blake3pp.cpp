@@ -129,6 +129,22 @@ digest hasher::finalize() const noexcept {
   return d;
 }
 
+void hasher::push_subtree_cv(const std::uint32_t cv[8],
+                             std::uint64_t subtree_chunks) noexcept {
+  push_cv(cv, chunk_.chunk_counter + subtree_chunks, subtree_chunks);
+  chunk_.chunk_counter += subtree_chunks;
+}
+
+namespace detail {
+void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
+                         std::size_t num_chunks, std::uint64_t chunk_counter,
+                         std::uint32_t out_cv[8]) noexcept {
+  core::compress_subtree_to_cv(*ops,
+                               reinterpret_cast<const std::uint8_t*>(data),
+                               num_chunks, chunk_counter, out_cv);
+}
+}  // namespace detail
+
 digest hash(std::span<const std::byte> input) noexcept {
   hasher h;
   h.update(input);
