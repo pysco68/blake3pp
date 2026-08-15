@@ -104,6 +104,29 @@ full pipeline speed:
 auto tag = blake3pp::hash_file(path, pool.get_scheduler(), {.key = key});
 ```
 
+### Extended output (XOF)
+
+BLAKE3 is natively an extendable-output function: the 32-byte digest is
+just the first 32 bytes of an unbounded stream. Ask for any length, or
+take the seekable reader:
+
+```cpp
+blake3pp::hasher h;
+h.update(seed_material);
+
+std::array<std::byte, 64> wide_key;
+h.finalize(wide_key);                       // any output length
+
+blake3pp::output_reader r = h.finalize_xof();
+r.fill(first_chunk);                        // stream sequentially...
+r.seek(10'000'000'000);                     // ...or jump: O(1) random access
+r.fill(deep_chunk);                         // byte 10 GB costs same as byte 0
+```
+
+Extended output works in all three modes (plain, keyed, derive_key): a
+keyed hasher's `finalize_xof()` streams the MAC'd output, and
+`derive_key` hashers can emit subkeys of any width.
+
 ### SIMD variants: introspection and pinning
 
 The binary carries every variant your target platform supports; dispatch
@@ -220,8 +243,9 @@ when blake3pp is the top-level project.
   functions are.
 - Only the I/O layer throws (`std::system_error`, or use the `error_code`
   overloads); compute APIs are `noexcept`.
-- Current API scope: 256-bit BLAKE3 in all three spec modes (plain, keyed,
-  derive_key). Extendable output (XOF) is on the roadmap.
+- Full BLAKE3 spec surface: plain, keyed and derive_key modes, each with
+  arbitrary-length (XOF) output; every mode is verified against all 131
+  output bytes of the official test vectors.
 
 ## Building
 

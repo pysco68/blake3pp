@@ -1,5 +1,6 @@
 #include <blake3pp/core.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <cstring>
 
@@ -152,10 +153,11 @@ void hasher::update(std::string_view input) noexcept {
   update(std::as_bytes(std::span{input.data(), input.size()}));
 }
 
-digest hasher::finalize() const noexcept {
-  // Collapse the stack from the top down; the last combination happens with
-  // the ROOT flag. No member state is modified; finalize can be called at
-  // any point and hashing may continue afterwards.
+output_reader hasher::finalize_xof() const noexcept {
+  // Collapse the stack from the top down, then capture the ROOT node
+  // instead of compressing it: the reader re-compresses it with varying
+  // output counters. No member state is modified, so finalization can
+  // happen at any point and hashing may continue afterwards.
   core::output o = core::chunk_output(chunk_, base_flags_);
   std::size_t parents = cv_stack_len_;
   while (parents > 0) {
@@ -166,17 +168,45 @@ digest hasher::finalize() const noexcept {
                             base_flags_);
   }
 
-  o.flags |= kern::flag_root;
-  std::uint32_t root_cv[8];
-  core::chaining_value(*ops_, o, root_cv);
+  output_reader r;
+  r.ops_ = ops_;
+  std::memcpy(r.input_cv_, o.input_cv, sizeof(r.input_cv_));
+  std::memcpy(r.block_, o.block, sizeof(r.block_));
+  r.block_len_ = o.block_len;
+  r.flags_ = o.flags | kern::flag_root;
+  return r;
+}
 
+// The 32-byte digest is, by definition, the first 32 bytes of the output
+// stream.
+digest hasher::finalize() const noexcept {
   digest d;
-  for (std::size_t w = 0; w < 8; ++w) {
-    for (std::size_t b = 0; b < 4; ++b) {
-      d.bytes[4 * w + b] = static_cast<std::byte>(root_cv[w] >> (8 * b));
-    }
-  }
+  finalize_xof().fill(std::span<std::byte>{d.bytes});
   return d;
+}
+
+void hasher::finalize(std::span<std::byte> out) const noexcept {
+  finalize_xof().fill(out);
+}
+
+void output_reader::fill(std::span<std::byte> out) noexcept {
+  std::size_t done = 0;
+  while (done < out.size()) {
+    const std::uint64_t block_index = position_ / kern::block_len;
+    const std::size_t in_block =
+        static_cast<std::size_t>(position_ % kern::block_len);
+    if (!cache_valid_ || cached_block_ != block_index) {
+      ops_->compress_xof(input_cv_, block_, block_len_, block_index, flags_,
+                         cache_);
+      cached_block_ = block_index;
+      cache_valid_ = true;
+    }
+    const std::size_t take =
+        std::min(out.size() - done, kern::block_len - in_block);
+    std::memcpy(out.data() + done, cache_ + in_block, take);
+    done += take;
+    position_ += take;
+  }
 }
 
 void hasher::push_subtree_cv(const std::uint32_t cv[8],

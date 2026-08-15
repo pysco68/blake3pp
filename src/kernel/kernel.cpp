@@ -155,6 +155,17 @@ void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
   std::memcpy(cv, out, 8 * sizeof(std::uint32_t));
 }
 
+void compress_xof(const std::uint32_t cv[8],
+                  const std::uint8_t block[block_len], std::uint32_t len,
+                  std::uint64_t counter, std::uint32_t flags,
+                  std::uint8_t out[64]) noexcept {
+  std::uint32_t wide[16];
+  compress(cv, block, len, counter, flags, wide);
+  for (std::size_t i = 0; i < 16; ++i) {
+    store32(out + 4 * i, wide[i]);
+  }
+}
+
 // Hashes exactly u32v::width inputs, one per SIMD lane. State and message
 // live transposed: each of the 16 words is a vector holding that word for
 // every lane. Message transposition goes through a small staging array; the
@@ -266,6 +277,7 @@ const kernel_ops ops = {
     BLAKE3PP_STR(BLAKE3PP_ARCH_NS),
     /*simd_degree=*/u32v::width,
     &compress_in_place,
+    &compress_xof,
     &hash_many,
 };
 

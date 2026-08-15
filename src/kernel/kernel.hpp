@@ -63,6 +63,14 @@ struct kernel_ops {
                             std::uint32_t len, std::uint64_t counter,
                             std::uint32_t flags) noexcept;
 
+  // The full 64-byte compression output as LE bytes, the extended-output
+  // (XOF) primitive: output block t of the stream is this applied to the
+  // ROOT node with counter t.
+  void (*compress_xof)(const std::uint32_t cv[8],
+                       const std::uint8_t block[block_len], std::uint32_t len,
+                       std::uint64_t counter, std::uint32_t flags,
+                       std::uint8_t out[64]) noexcept;
+
   // Hash num_inputs inputs of `blocks` full 64-byte blocks each, writing one
   // 32-byte chaining value per input to out. Each input i starts from key
   // as its CV and uses counter (+ i when increment_counter). flags_start /

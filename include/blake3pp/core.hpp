@@ -70,20 +70,61 @@ struct digest {
   [[nodiscard]] bool matches(std::string_view hex) const noexcept;
 };
 
-/// The incremental BLAKE3 hasher: plain, keyed (MAC/PRF) or key-derivation
-/// mode, with a non-destructive finalize.
+/// Streams BLAKE3's unbounded extended output (XOF).
 ///
-/// A fixed-size, trivially relocatable value; never allocates. finalize()
-/// leaves the hasher usable, so a digest can be taken mid-stream and
-/// feeding can continue. An instance is not thread-safe; distinct
-/// instances are independent. The chaining-value stack is sized for the
-/// spec's maximum input of 2^64 bytes.
+/// Obtained from hasher::finalize_xof(). A small value type capturing the
+/// root node; copyable, and independent of the hasher afterwards. The
+/// stream is seekable in O(1): output block t is one compression with
+/// counter t, so positioning to byte 10 GiB costs the same as byte 0. The
+/// 32-byte digest is exactly the stream's first 32 bytes.
+class output_reader {
+ public:
+  /// Writes the next out.size() bytes of the output stream and advances
+  /// past them.
+  /// @param out  Any length; the stream is unbounded.
+  void fill(std::span<std::byte> out) noexcept;
+
+  /// Positions the stream at an absolute byte offset, in constant time.
+  /// @param byte_offset  The offset of the next byte fill() will produce.
+  void seek(std::uint64_t byte_offset) noexcept {
+    position_ = byte_offset;
+    cache_valid_ = false;
+  }
+
+  /// The byte offset of the next byte fill() will produce.
+  [[nodiscard]] std::uint64_t position() const noexcept { return position_; }
+
+ private:
+  friend class hasher;
+  output_reader() = default;
+
+  const kern::kernel_ops* ops_ = nullptr;
+  std::uint32_t input_cv_[8] = {};
+  std::uint8_t block_[64] = {};
+  std::uint32_t block_len_ = 0;
+  std::uint32_t flags_ = 0;
+  std::uint64_t position_ = 0;
+  std::uint64_t cached_block_ = 0;
+  bool cache_valid_ = false;
+  std::uint8_t cache_[64] = {};
+};
+
+/// The incremental BLAKE3 hasher: plain, keyed (MAC/PRF) or key-derivation
+/// mode, with a non-destructive finalize family.
+///
+/// A fixed-size, trivially relocatable value; never allocates. Every
+/// finalize form leaves the hasher usable, so a digest can be taken
+/// mid-stream and feeding can continue. An instance is not thread-safe;
+/// distinct instances are independent. The chaining-value stack is sized
+/// for the spec's maximum input of 2^64 bytes.
 ///
 /// @code
 /// blake3pp::hasher h;
 /// h.update(header);
 /// h.update(body);                      // std::span<const std::byte> or string_view
 /// blake3pp::digest d = h.finalize();   // non-destructive
+/// std::array<std::byte, 64> wide;
+/// h.finalize(wide);                    // the first 64 bytes of the XOF stream
 /// @endcode
 class hasher {
  public:
@@ -132,6 +173,14 @@ class hasher {
 
   /// The digest of everything absorbed so far; the hasher stays usable.
   [[nodiscard]] digest finalize() const noexcept;
+
+  /// Extended output: fills out with the first out.size() bytes of the
+  /// output stream, of which the digest is the first 32.
+  /// @param out  Any length.
+  void finalize(std::span<std::byte> out) const noexcept;
+  /// Extended output as a seekable stream, independent of the hasher
+  /// afterwards.
+  [[nodiscard]] output_reader finalize_xof() const noexcept;
 
   /// Returns the hasher to its just-constructed state, keeping its mode,
   /// key and variant.

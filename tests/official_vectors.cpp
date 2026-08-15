@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -72,6 +73,83 @@ TEST_CASE("keyed and derive_key match vectors on every available arch") {
             std::string(c.derive_key).substr(0, 64));
     }
   }
+}
+
+// The official vectors carry 131 bytes of extended output per case; with
+// XOF we can verify every byte of every mode, not just the 32-byte prefix.
+TEST_CASE("extended output matches the full 131-byte vectors, all modes") {
+  constexpr std::string_view key_str = blake3pp::testvec::key;
+  const auto key =
+      std::as_bytes(std::span<const char, 32>{key_str.data(), 32});
+
+  const auto to_hex = [](std::span<const std::byte> bytes) {
+    static constexpr char alphabet[] = "0123456789abcdef";
+    std::string s;
+    for (const std::byte b : bytes) {
+      s += alphabet[std::to_integer<unsigned>(b) >> 4];
+      s += alphabet[std::to_integer<unsigned>(b) & 0xF];
+    }
+    return s;
+  };
+
+  for (const auto& c : blake3pp::testvec::cases) {
+    CAPTURE(c.input_len);
+    const auto input = make_input(c.input_len);
+    std::vector<std::byte> out(std::string_view{c.hash}.size() / 2);  // 131
+
+    blake3pp::hasher h;
+    h.update(input);
+    h.finalize(out);
+    CHECK(to_hex(out) == c.hash);
+
+    blake3pp::hasher kh = blake3pp::hasher::keyed(key);
+    kh.update(input);
+    kh.finalize(out);
+    CHECK(to_hex(out) == c.keyed_hash);
+
+    blake3pp::hasher dk =
+        blake3pp::hasher::derive_key(blake3pp::testvec::context);
+    dk.update(input);
+    dk.finalize(out);
+    CHECK(to_hex(out) == c.derive_key);
+  }
+}
+
+TEST_CASE("output_reader streams, seeks, and agrees with the digest") {
+  blake3pp::hasher h;
+  h.update("xof me");
+
+  std::vector<std::byte> big(1000);
+  h.finalize_xof().fill(big);
+
+  // Piecewise fills produce the same stream.
+  {
+    auto r = h.finalize_xof();
+    std::vector<std::byte> pieced(big.size());
+    std::size_t pos = 0;
+    for (const std::size_t piece : {std::size_t{1}, std::size_t{7},
+                                    std::size_t{64}, std::size_t{129}}) {
+      r.fill(std::span{pieced}.subspan(pos, piece));
+      pos += piece;
+    }
+    r.fill(std::span{pieced}.subspan(pos));
+    CHECK(pieced == big);
+  }
+
+  // Seeking is random access into the same stream.
+  {
+    auto r = h.finalize_xof();
+    r.seek(123);
+    CHECK(r.position() == 123);
+    std::vector<std::byte> window(100);
+    r.fill(window);
+    CHECK(r.position() == 223);
+    CHECK(std::equal(window.begin(), window.end(), big.begin() + 123));
+  }
+
+  // The digest is the stream's first 32 bytes.
+  const auto d = h.finalize();
+  CHECK(std::equal(d.bytes.begin(), d.bytes.end(), big.begin()));
 }
 
 TEST_CASE("known answer for the empty input") {
