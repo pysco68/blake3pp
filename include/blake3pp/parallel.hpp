@@ -1,20 +1,21 @@
 #pragma once
 
-// Parallel BLAKE3 over the sender/receiver model.
-//
-// BLAKE3's binary Merkle tree makes the parallel decomposition exact, not
-// heuristic: any power-of-2, position-aligned run of chunks reduces to one
-// chaining value independently of everything else. So the engine partitions
-// the input into equal such subtrees, bulk-schedules the (allocation-free)
-// subtree reductions across the scheduler's execution agents, then absorbs
-// the CVs in order through the hasher's CV-stack discipline and finishes
-// the tail sequentially. The merge work after the parallel phase is
-// O(parts) scalar compressions, which is noise.
-//
-// std::execution where the standard library ships it, NVIDIA stdexec
-// otherwise (same source, same story as the simd providers). No heap
-// allocations in this header: the CV table lives on the caller's stack and
-// sender operation states live inside sync_wait's frame.
+/// @file
+/// Parallel BLAKE3 over the sender/receiver model.
+///
+/// BLAKE3's binary Merkle tree makes the parallel decomposition exact, not
+/// heuristic: any power-of-2, position-aligned run of chunks reduces to one
+/// chaining value independently of everything else. So the engine partitions
+/// the input into equal such subtrees, bulk-schedules the (allocation-free)
+/// subtree reductions across the scheduler's execution agents, then absorbs
+/// the CVs in order through the hasher's CV-stack discipline and finishes
+/// the tail sequentially. The merge work after the parallel phase is
+/// O(parts) scalar compressions, which is noise.
+///
+/// std::execution where the standard library ships it, NVIDIA stdexec
+/// otherwise (same source, same story as the simd providers). No heap
+/// allocations in this header: the CV table lives on the caller's stack and
+/// sender operation states live inside sync_wait's frame.
 
 #include <algorithm>
 #include <bit>
@@ -35,6 +36,9 @@
 
 namespace blake3pp {
 
+/// The sender/receiver vocabulary this build uses (std::execution or
+/// stdexec), so the library and its callers spell schedule, bulk and
+/// sync_wait the same way whichever provider is built.
 namespace ex {
 #if defined(BLAKE3PP_HAS_STD_SENDERS)
 using namespace std::execution;
@@ -44,8 +48,12 @@ using namespace stdexec;
 #endif
 }  // namespace ex
 
-// Expert overload: as below, but on a caller-supplied kernel table (the
-// same seam hasher's expert constructor exposes).
+/// Expert: multi-core hash on a caller-supplied kernel table, the same
+/// seam hasher's expert constructor exposes.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param input  Any length.
+/// @param sched  Where the subtree reductions run.
+/// @param ops    The kernel table; must outlive the call.
 template <class Scheduler>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           const kern::kernel_ops* ops) {
@@ -98,9 +106,20 @@ template <class Scheduler>
   return h.finalize();
 }
 
-// Hashes input, scheduling subtree reductions onto sched. Any
-// std::execution-style scheduler works; small inputs (where parallelism
-// cannot pay for itself) fall back to the sequential path.
+/// Multi-core one-shot hash: the subtree reductions of input run on sched,
+/// and the digest is identical to the sequential hash(input).
+///
+/// Any std::execution-style scheduler works; inputs too small for
+/// parallelism to pay for itself take the sequential path.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param input  Any length.
+/// @param sched  Where the subtree reductions run.
+/// @param a      The variant to run on.
+///
+/// @code
+/// exec::static_thread_pool pool(8);
+/// blake3pp::digest d = blake3pp::hash(big_buffer, pool.get_scheduler());
+/// @endcode
 template <class Scheduler>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           arch a = arch::auto_detect) {
@@ -144,28 +163,45 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
 
 }  // namespace detail
 
+/// parallel_hasher's knobs.
 struct parallel_hasher_options {
+  /// The SIMD variant of the internal hasher.
   arch a = arch::auto_detect;
-  // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB.
-  // Buffered input below one window hashes sequentially at finalize().
+  /// Bytes accumulated before a window is fanned out; rounded down to a
+  /// power-of-2 multiple of chunk_size, minimum 64 KiB. Buffered input
+  /// below one window hashes sequentially at finalize().
   std::size_t window_bytes = 8 * 1024 * 1024;
 };
 
-// The incremental counterpart of the parallel hash(): the same
-// update()/finalize()/reset() interface as hasher, with multi-core
-// subtree hashing happening internally. Input accumulates into an aligned
-// window; a full window is fanned out over the scheduler as soon as one
-// more byte arrives: the "one byte in reserve" that keeps BLAKE3's final
-// chunk with the hasher for ROOT finalization. All alignment and
-// final-chunk discipline lives here, not with the caller.
-//
-// The window buffer is the type's one allocation, made at construction.
-// finalize() is non-destructive, exactly like hasher's. Not thread-safe;
-// the scheduler's workers are used only inside update().
+/// The incremental counterpart of the multi-core hash(): hasher's
+/// update()/finalize()/reset() interface, with the subtree hashing fanned
+/// out over a scheduler internally.
+///
+/// Input accumulates into an aligned window; a full window is fanned out
+/// as soon as one more byte arrives, the "one byte in reserve" that keeps
+/// BLAKE3's final chunk with the hasher for ROOT finalization. All
+/// alignment and final-chunk discipline lives here, not with the caller,
+/// and the digest equals the sequential one. The window buffer is the
+/// type's one allocation, made at construction. finalize() is
+/// non-destructive, like hasher's. Not thread-safe; the scheduler's
+/// workers are used only inside update().
+/// @tparam Scheduler  Any std::execution-style scheduler, held by value.
+///
+/// @code
+/// exec::static_thread_pool pool(8);
+/// blake3pp::parallel_hasher ph{pool.get_scheduler()};
+/// while (auto block = source.next_block()) {
+///   ph.update(*block);
+/// }
+/// blake3pp::digest d = ph.finalize();   // == the sequential digest
+/// @endcode
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 class parallel_hasher {
  public:
+  /// Plain mode.
+  /// @param sched  Where the subtree reductions run.
+  /// @param opts   The variant and the window size.
   explicit parallel_hasher(Scheduler sched,
                            const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
@@ -174,6 +210,9 @@ class parallel_hasher {
         window_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
+  /// Absorbs the next bytes of the message; complete windows are fanned
+  /// out over the scheduler from here.
+  /// @param input  Any length, including zero.
   void update(std::span<const std::byte> input) {
     const std::byte* p = input.data();
     std::size_t len = input.size();
@@ -191,16 +230,21 @@ class parallel_hasher {
     }
   }
 
+  /// Absorbs the next bytes of the message, given as text.
+  /// @param input  The bytes of the string, not including any terminator.
   void update(std::string_view input) {
     update(std::as_bytes(std::span{input.data(), input.size()}));
   }
 
+  /// The digest of everything absorbed so far; the hasher stays usable.
   [[nodiscard]] digest finalize() const {
     hasher h = h_;  // flat value type; copying keeps finalize() const
     h.update(std::span<const std::byte>{window_.data(), filled_});
     return h.finalize();
   }
 
+  /// Returns the hasher to its just-constructed state, keeping its mode,
+  /// key, variant and window.
   void reset() noexcept {
     h_.reset();
     filled_ = 0;

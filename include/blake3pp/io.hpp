@@ -1,17 +1,18 @@
 #pragma once
 
-// File hashing at storage speed: the windowed pipeline that joins the
-// file_reader (io_uring + O_DIRECT where the platform allows) to the
-// compute engine. While window i is being hashed, windows i+1..i+depth-1
-// are already streaming in; the queue-depth buffer ring is the
-// backpressure mechanism, so the pipeline never allocates past setup and
-// never lets the device idle waiting for compute (or vice versa).
-//
-// Every full window is a power-of-2, subtree-aligned run of chunks, so its
-// chaining values drop into the hasher through the same push_subtree_cv
-// seam the in-memory parallel engine uses. The final window (which may be
-// partial and contains the message end) goes through hasher::update to
-// keep ROOT finalization correct.
+/// @file
+/// File hashing at storage speed: the windowed pipeline that joins the
+/// file_reader (io_uring + O_DIRECT where the platform allows) to the
+/// compute engine. While window i is being hashed, windows i+1..i+depth-1
+/// are already streaming in; the queue-depth buffer ring is the
+/// backpressure mechanism, so the pipeline never allocates past setup and
+/// never lets the device idle waiting for compute (or vice versa).
+///
+/// Every full window is a power-of-2, subtree-aligned run of chunks, so its
+/// chaining values drop into the hasher through the same push_subtree_cv
+/// seam the in-memory parallel engine uses. The final window (which may be
+/// partial and contains the message end) goes through hasher::update to
+/// keep ROOT finalization correct.
 
 #include <algorithm>
 #include <bit>
@@ -28,29 +29,52 @@
 
 namespace blake3pp {
 
+/// hash_file()'s knobs: the SIMD variant of the hasher it constructs, and
+/// the pipeline's window, queue depth and direct-I/O choice.
 struct hash_file_options {
+  /// The SIMD variant of the hasher.
   arch a = arch::auto_detect;
+  /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
+  /// minimum 64 KiB.
   std::size_t window_bytes = 8 * 1024 * 1024;
+  /// Windows in flight at once; clamped to [2, 32].
   unsigned queue_depth = 4;
-  bool direct_io = true;  // bypass the page cache where supported
+  /// Bypass the page cache where the platform supports it.
+  bool direct_io = true;
 };
 
-// Sequential compute over the async reader: reads still overlap hashing.
-// std::filesystem::path is the path currency throughout (string literals
-// and std::string convert implicitly). Each entry point follows the
-// standard library's dual-overload idiom: the plain form throws
-// std::system_error on I/O failure, the std::error_code& form reports
-// through ec instead (returning a zero digest on failure).
+/// One-shot digest of a file: a hasher shaped by opts (SIMD variant,
+/// optional key), the file streamed through it, finalized.
+/// @param path  The file to hash.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @throws std::system_error on I/O failure.
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                const hash_file_options& opts = {});
+/// One-shot digest of a file, reporting failure through ec instead of
+/// throwing.
+/// @param path  The file to hash.
+/// @param ec    Cleared on success; the I/O error otherwise.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @return The digest, or an all-zero digest when ec is set.
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept;
 
-// The full pipeline: async reads + parallel subtree hashing per window.
-// Throws std::system_error on I/O failure. (The scheduler concept
-// constraint keeps this template from hijacking the options-only
-// sequential overload above.)
+/// One-shot digest of a file over the full pipeline: a hasher shaped by
+/// opts (SIMD variant, optional key), the file streamed through it
+/// multi-core, finalized.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param path   The file to hash.
+/// @param sched  Where the subtree reductions run.
+/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @throws std::system_error on I/O failure, and whatever the execution
+///         provider raises.
+///
+/// @code
+/// auto d = blake3pp::hash_file(path, pool.get_scheduler(),
+///                              {.window_bytes = 16 * 1024 * 1024,
+///                               .queue_depth = 8});
+/// @endcode
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
@@ -73,7 +97,14 @@ template <class Scheduler>
   return h.finalize();
 }
 
-// error_code form of the parallel pipeline.
+/// One-shot digest of a file over the full pipeline, reporting failure
+/// through ec instead of throwing.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param path   The file to hash.
+/// @param sched  Where the subtree reductions run.
+/// @param ec     Cleared on success; the error otherwise.
+/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @return The digest, or an all-zero digest when ec is set.
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
@@ -105,19 +136,30 @@ concept foreign_path =
 
 }  // namespace detail
 
-// Transparent forwarding for foreign path types (e.g. boost::filesystem).
+/// hash_file() for a foreign path type.
+/// @param path  The file to hash.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
 template <detail::foreign_path P>
 [[nodiscard]] digest hash_file(const P& path,
                                const hash_file_options& opts = {}) {
   return hash_file(std::filesystem::path(path.native()), opts);
 }
 
+/// hash_file() for a foreign path type, reporting through ec.
+/// @param path  The file to hash.
+/// @param ec    Cleared on success; the error otherwise.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @return The digest, or an all-zero digest when ec is set.
 template <detail::foreign_path P>
 [[nodiscard]] digest hash_file(const P& path, std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept {
   return hash_file(std::filesystem::path(path.native()), ec, opts);
 }
 
+/// hash_file() over a scheduler for a foreign path type.
+/// @param path   The file to hash.
+/// @param sched  Where the subtree reductions run.
+/// @param opts   The hasher's variant and key, and the pipeline knobs.
 template <detail::foreign_path P, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const P& path, Scheduler&& sched,
@@ -126,6 +168,13 @@ template <detail::foreign_path P, class Scheduler>
                    std::forward<Scheduler>(sched), opts);
 }
 
+/// hash_file() over a scheduler for a foreign path type, reporting
+/// through ec.
+/// @param path   The file to hash.
+/// @param sched  Where the subtree reductions run.
+/// @param ec     Cleared on success; the error otherwise.
+/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @return The digest, or an all-zero digest when ec is set.
 template <detail::foreign_path P, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const P& path, Scheduler&& sched,
