@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <bit>
-#include <cstring>
 
 #include "core/core.hpp"
 #include "core/subtree.hpp"
@@ -13,14 +12,16 @@ namespace blake3pp {
 namespace {
 
 // BLAKE3 keys enter as 32 little-endian bytes and live as 8 words.
-void key_bytes_to_words(std::span<const std::byte, 32> key,
-                        std::uint32_t words[8]) noexcept {
+std::array<std::uint32_t, 8> key_bytes_to_words(
+    std::span<const std::byte, 32> key) noexcept {
+  std::array<std::uint32_t, 8> words;
   for (std::size_t w = 0; w < 8; ++w) {
     const auto b = [&](std::size_t i) {
       return std::to_integer<std::uint32_t>(key[4 * w + i]);
     };
     words[w] = b(0) | (b(1) << 8) | (b(2) << 16) | (b(3) << 24);
   }
+  return words;
 }
 
 }  // namespace
@@ -30,10 +31,11 @@ hasher::hasher(arch a) noexcept : hasher(detail::resolve(a)) {}
 hasher::hasher(const kern::kernel_ops* custom_ops) noexcept
     : hasher(custom_ops, kern::iv, 0) {}
 
-hasher::hasher(const kern::kernel_ops* ops, const std::uint32_t key[8],
+hasher::hasher(const kern::kernel_ops* ops,
+               std::span<const std::uint32_t, 8> key,
                std::uint32_t base_flags) noexcept
     : ops_(ops), base_flags_(base_flags), cv_stack_len_(0) {
-  std::memcpy(key_words_, key, sizeof(key_words_));
+  std::ranges::copy(key, key_words_.begin());
   core::chunk_init(chunk_, key_words_, 0);
 }
 
@@ -43,9 +45,7 @@ hasher hasher::keyed(std::span<const std::byte, 32> key, arch a) noexcept {
 
 hasher hasher::keyed(std::span<const std::byte, 32> key,
                      const kern::kernel_ops* ops) noexcept {
-  std::uint32_t words[8];
-  key_bytes_to_words(key, words);
-  return hasher(ops, words, kern::flag_keyed_hash);
+  return hasher(ops, key_bytes_to_words(key), kern::flag_keyed_hash);
 }
 
 hasher hasher::derive_key(std::string_view context, arch a) noexcept {
@@ -55,10 +55,8 @@ hasher hasher::derive_key(std::string_view context, arch a) noexcept {
   ctx.update(context);
   const digest context_key = ctx.finalize();
   // ...stage 2: the returned hasher consumes key material keyed by it.
-  std::uint32_t words[8];
-  key_bytes_to_words(std::span<const std::byte, 32>{context_key.bytes},
-                     words);
-  return hasher(ops, words, kern::flag_derive_key_material);
+  return hasher(ops, key_bytes_to_words(context_key.bytes),
+                kern::flag_derive_key_material);
 }
 
 void hasher::reset() noexcept {
@@ -66,25 +64,18 @@ void hasher::reset() noexcept {
   cv_stack_len_ = 0;
 }
 
-arch hasher::selected_arch() const noexcept {
-  // The table's name string doubles as identity; avoids storing the enum.
-  const char* n = ops_->name;
-  if (std::strcmp(n, "sse42") == 0) return arch::sse42;
-  if (std::strcmp(n, "avx2") == 0) return arch::avx2;
-  if (std::strcmp(n, "avx512") == 0) return arch::avx512;
-  if (std::strcmp(n, "neon") == 0) return arch::neon;
-  return arch::scalar;
-}
+arch hasher::selected_arch() const noexcept { return ops_->variant; }
 
 // Merge completed subtrees, then push. The pushed CV may itself be the root
 // of a subtree_chunks-sized (power-of-2, aligned) subtree: counting in
 // subtree units, each trailing zero bit of total_chunks/subtree_chunks is a
 // full sibling subtree waiting on the stack (spec 5.1.2). The invariant
 // afterwards is stack_len == popcount(total_chunks).
-void hasher::push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
+void hasher::push_cv(std::span<const std::uint32_t, 8> cv,
+                     std::uint64_t total_chunks,
                      std::uint64_t subtree_chunks) noexcept {
-  std::uint32_t new_cv[8];
-  std::memcpy(new_cv, cv, sizeof(new_cv));
+  std::array<std::uint32_t, 8> new_cv;
+  std::ranges::copy(cv, new_cv.begin());
   std::uint64_t chunks = total_chunks / subtree_chunks;
   while ((chunks & 1) == 0) {
     cv_stack_len_--;
@@ -94,7 +85,7 @@ void hasher::push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
                          new_cv);
     chunks >>= 1;
   }
-  std::memcpy(cv_stack_[cv_stack_len_], new_cv, sizeof(new_cv));
+  cv_stack_[cv_stack_len_] = new_cv;
   cv_stack_len_++;
 }
 
@@ -106,7 +97,7 @@ void hasher::update(std::span<const std::byte> input) noexcept {
     // A full chunk is only closed out when more input arrives: the final
     // chunk of the message must stay open for possible ROOT finalization.
     if (core::chunk_len(chunk_) == kern::chunk_len) {
-      std::uint32_t chunk_cv[8];
+      std::array<std::uint32_t, 8> chunk_cv;
       core::chaining_value(*ops_, core::chunk_output(chunk_, base_flags_),
                            chunk_cv);
       const std::uint64_t total_chunks = chunk_.chunk_counter + 1;
@@ -129,7 +120,7 @@ void hasher::update(std::span<const std::byte> input) noexcept {
         subtree /= 2;
       }
       if (subtree >= 2) {
-        std::uint32_t cv[8];
+        std::array<std::uint32_t, 8> cv;
         core::compress_subtree_to_cv(*ops_, p, subtree, chunk_.chunk_counter,
                                      key_words_, base_flags_, cv);
         push_cv(cv, chunk_.chunk_counter + subtree, subtree);
@@ -162,7 +153,7 @@ output_reader hasher::finalize_xof() const noexcept {
   std::size_t parents = cv_stack_len_;
   while (parents > 0) {
     parents--;
-    std::uint32_t right_cv[8];
+    std::array<std::uint32_t, 8> right_cv;
     core::chaining_value(*ops_, o, right_cv);
     o = core::parent_output(cv_stack_[parents], right_cv, key_words_,
                             base_flags_);
@@ -170,8 +161,8 @@ output_reader hasher::finalize_xof() const noexcept {
 
   output_reader r;
   r.ops_ = ops_;
-  std::memcpy(r.input_cv_, o.input_cv, sizeof(r.input_cv_));
-  std::memcpy(r.block_, o.block, sizeof(r.block_));
+  r.input_cv_ = o.input_cv;
+  r.block_ = o.block;
   r.block_len_ = o.block_len;
   r.flags_ = o.flags | kern::flag_root;
   return r;
@@ -196,20 +187,22 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
     const std::size_t in_block =
         static_cast<std::size_t>(position_ % kern::block_len);
     if (!cache_valid_ || cached_block_ != block_index) {
-      ops_->compress_xof(input_cv_, block_, block_len_, block_index, flags_,
-                         cache_);
+      // uint8_t view of the byte cache at the flat kernel ABI boundary.
+      ops_->compress_xof(input_cv_.data(), block_.data(), block_len_,
+                         block_index, flags_,
+                         reinterpret_cast<std::uint8_t*>(cache_.data()));
       cached_block_ = block_index;
       cache_valid_ = true;
     }
     const std::size_t take =
         std::min(out.size() - done, kern::block_len - in_block);
-    std::memcpy(out.data() + done, cache_ + in_block, take);
+    std::copy_n(cache_.data() + in_block, take, out.data() + done);
     done += take;
     position_ += take;
   }
 }
 
-void hasher::push_subtree_cv(const std::uint32_t cv[8],
+void hasher::push_subtree_cv(std::span<const std::uint32_t, 8> cv,
                              std::uint64_t subtree_chunks) noexcept {
   push_cv(cv, chunk_.chunk_counter + subtree_chunks, subtree_chunks);
   chunk_.chunk_counter += subtree_chunks;
@@ -218,8 +211,9 @@ void hasher::push_subtree_cv(const std::uint32_t cv[8],
 namespace detail {
 void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::size_t num_chunks, std::uint64_t chunk_counter,
-                         const std::uint32_t key[8], std::uint32_t base_flags,
-                         std::uint32_t out_cv[8]) noexcept {
+                         std::span<const std::uint32_t, 8> key,
+                         std::uint32_t base_flags,
+                         std::span<std::uint32_t, 8> out_cv) noexcept {
   core::compress_subtree_to_cv(*ops,
                                reinterpret_cast<const std::uint8_t*>(data),
                                num_chunks, chunk_counter, key, base_flags,

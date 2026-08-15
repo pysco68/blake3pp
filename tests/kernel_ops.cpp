@@ -38,10 +38,18 @@ TEST_CASE("arch introspection invariants") {
   for (const auto a : compiled) {
     CHECK(blake3pp::detail::resolve(a) != nullptr);
   }
+
+  // Build-configuration introspection reports coherent values.
+  CHECK(!blake3pp::version().empty());
+  const std::string_view simd = blake3pp::simd_provider();
+  CHECK((simd == "std::simd" || simd == "std::experimental::simd" ||
+         simd == "xsimd"));
+  const std::string_view exec = blake3pp::execution_provider();
+  CHECK((exec == "std::execution" || exec == "stdexec"));
 }
 
 TEST_CASE("scalar table is populated") {
-  CHECK(std::string_view{scalar::ops.name} == "scalar");
+  CHECK(scalar::ops.variant == blake3pp::arch::scalar);
   CHECK(scalar::ops.simd_degree == 1u);
   CHECK(scalar::ops.compress_in_place != nullptr);
   CHECK(scalar::ops.compress_xof != nullptr);
@@ -53,11 +61,10 @@ TEST_CASE("compress_xof's first 32 bytes agree with compress_in_place") {
   for (std::size_t i = 0; i < block_len; ++i) {
     block[i] = static_cast<std::uint8_t>(i * 3 + 1);
   }
-  std::uint32_t cv[8];
-  std::memcpy(cv, iv, sizeof(cv));
+  std::array<std::uint32_t, 8> cv = iv;
   std::uint8_t wide[64];
-  scalar::ops.compress_xof(cv, block, block_len, 42, flag_root, wide);
-  scalar::ops.compress_in_place(cv, block, block_len, 42, flag_root);
+  scalar::ops.compress_xof(cv.data(), block, block_len, 42, flag_root, wide);
+  scalar::ops.compress_in_place(cv.data(), block, block_len, 42, flag_root);
   for (std::size_t w = 0; w < 8; ++w) {
     std::uint32_t word = 0;
     std::memcpy(&word, wide + 4 * w, 4);  // LE host assumed in tests
@@ -80,7 +87,7 @@ TEST_CASE("hash_many agrees across all available arches") {
   }
 
   std::vector<std::uint8_t> expected(num_inputs * out_len);
-  scalar::ops.hash_many(inputs, num_inputs, blocks, iv, 100,
+  scalar::ops.hash_many(inputs, num_inputs, blocks, iv.data(), 100,
                         /*increment_counter=*/true, 0, flag_chunk_start,
                         flag_chunk_end, expected.data());
 
@@ -95,7 +102,7 @@ TEST_CASE("hash_many agrees across all available arches") {
     REQUIRE(ops != nullptr);
     CHECK(ops->simd_degree > 1u);
     std::vector<std::uint8_t> out(num_inputs * out_len);
-    ops->hash_many(inputs, num_inputs, blocks, iv, 100,
+    ops->hash_many(inputs, num_inputs, blocks, iv.data(), 100,
                    /*increment_counter=*/true, 0, flag_chunk_start,
                    flag_chunk_end, out.data());
     CHECK(out == expected);
@@ -117,19 +124,18 @@ TEST_CASE("hash_many matches a per-input compress loop") {
 
   constexpr std::uint64_t counter = 17;
   std::uint8_t out[num_inputs * out_len];
-  scalar::ops.hash_many(inputs, num_inputs, blocks, iv, counter,
+  scalar::ops.hash_many(inputs, num_inputs, blocks, iv.data(), counter,
                         /*increment_counter=*/true, 0, flag_chunk_start,
                         flag_chunk_end, out);
 
   for (std::size_t i = 0; i < num_inputs; ++i) {
     CAPTURE(i);
-    std::uint32_t cv[8];
-    std::memcpy(cv, iv, sizeof(cv));
+    std::array<std::uint32_t, 8> cv = iv;
     for (std::size_t b = 0; b < blocks; ++b) {
       std::uint32_t flags = 0;
       if (b == 0) flags |= flag_chunk_start;
       if (b == blocks - 1) flags |= flag_chunk_end;
-      scalar::ops.compress_in_place(cv, inputs[i] + b * block_len,
+      scalar::ops.compress_in_place(cv.data(), inputs[i] + b * block_len,
                                     static_cast<std::uint32_t>(block_len),
                                     counter + i, flags);
     }

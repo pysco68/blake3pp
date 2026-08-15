@@ -16,8 +16,6 @@ target_link_libraries(blake3ppsum PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
   CLI11::CLI11)
-target_compile_definitions(blake3ppsum PRIVATE
-  "BLAKE3PP_VERSION=\"${PROJECT_VERSION}\"")
 
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell): known-answer for the empty input via stdin,

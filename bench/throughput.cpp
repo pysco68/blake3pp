@@ -59,16 +59,9 @@ void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
 
 namespace {
 
-constexpr blake3pp::arch all_arches[] = {
-    blake3pp::arch::scalar, blake3pp::arch::sse42, blake3pp::arch::avx2,
-    blake3pp::arch::avx512, blake3pp::arch::neon,
-};
-
 blake3pp::arch parse_arch(const std::string& name) {
-  for (const auto a : all_arches) {
-    if (name == blake3pp::to_string(a)) {
-      return a;
-    }
+  if (const auto a = blake3pp::arch_from_string(name); a.has_value()) {
+    return a.value();
   }
   std::fprintf(stderr, "unknown arch '%s'\n", name.c_str());
   std::exit(2);
@@ -92,11 +85,10 @@ int main(int argc, char** argv) {
     }
   }
   if (arches.empty()) {
-    for (const auto a : all_arches) {
-      if (blake3pp::is_available(a)) {
-        arches.push_back(a);
-      }
-    }
+    // Available variants, printed worst-to-best so the table reads as an
+    // ascending progression.
+    const auto avail = blake3pp::available_arches();
+    arches.assign(avail.rbegin(), avail.rend());
   }
 
   std::vector<std::byte> input(mib * 1024 * 1024);
@@ -139,7 +131,6 @@ int main(int argc, char** argv) {
   if (blake3pp::is_available(blake3pp::arch::avx2)) {
     blake3pp::kern::kernel_ops asm_ops =
         *blake3pp::detail::resolve(blake3pp::arch::avx2);
-    asm_ops.name = "asm-avx2";
     asm_ops.hash_many = &asm_hash_many;  // compress_in_place stays portable
 
     {

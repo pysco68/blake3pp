@@ -28,9 +28,9 @@ namespace detail {
 // buffered rather than compressed eagerly: its flags (CHUNK_END, possibly
 // ROOT) are only known once we see whether more input arrives.
 struct chunk_state {
-  std::uint32_t cv[8];
+  std::array<std::uint32_t, 8> cv;
   std::uint64_t chunk_counter;
-  std::uint8_t block[64];
+  std::array<std::uint8_t, 64> block;
   std::uint8_t block_len;
   std::uint8_t blocks_compressed;
 };
@@ -99,14 +99,14 @@ class output_reader {
   output_reader() = default;
 
   const kern::kernel_ops* ops_ = nullptr;
-  std::uint32_t input_cv_[8] = {};
-  std::uint8_t block_[64] = {};
+  std::array<std::uint32_t, 8> input_cv_ = {};
+  std::array<std::uint8_t, 64> block_ = {};
   std::uint32_t block_len_ = 0;
   std::uint32_t flags_ = 0;
   std::uint64_t position_ = 0;
   std::uint64_t cached_block_ = 0;
   bool cache_valid_ = false;
-  std::uint8_t cache_[64] = {};
+  std::array<std::byte, 64> cache_ = {};
 };
 
 /// The incremental BLAKE3 hasher: plain, keyed (MAC/PRF) or key-derivation
@@ -204,13 +204,13 @@ class hasher {
   /// mode_flags() so keyed and derive_key modes propagate.
   /// @param cv              The subtree's root chaining value.
   /// @param subtree_chunks  The number of complete chunks it covers.
-  void push_subtree_cv(const std::uint32_t cv[8],
+  void push_subtree_cv(std::span<const std::uint32_t, 8> cv,
                        std::uint64_t subtree_chunks) noexcept;
 
   /// Expert observer pairing with push_subtree_cv(): the key schedule
   /// external subtree computation must hash under.
   [[nodiscard]] std::span<const std::uint32_t, 8> key_words() const noexcept {
-    return std::span<const std::uint32_t, 8>{key_words_};
+    return key_words_;
   }
   /// Expert observer pairing with push_subtree_cv(): the domain flags
   /// external subtree computation must hash under.
@@ -219,17 +219,18 @@ class hasher {
   }
 
  private:
-  hasher(const kern::kernel_ops* ops, const std::uint32_t key[8],
+  hasher(const kern::kernel_ops* ops, std::span<const std::uint32_t, 8> key,
          std::uint32_t base_flags) noexcept;
 
-  void push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
+  void push_cv(std::span<const std::uint32_t, 8> cv,
+               std::uint64_t total_chunks,
                std::uint64_t subtree_chunks) noexcept;
 
   const kern::kernel_ops* ops_;
-  std::uint32_t key_words_[8];
+  std::array<std::uint32_t, 8> key_words_;
   std::uint32_t base_flags_;
   detail::chunk_state chunk_;
-  std::uint32_t cv_stack_[54][8];
+  std::array<std::array<std::uint32_t, 8>, 54> cv_stack_;
   std::uint8_t cv_stack_len_;
 };
 
@@ -270,8 +271,9 @@ namespace detail {
 // allocation-free; the bridge the parallel engine schedules over.
 void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::size_t num_chunks, std::uint64_t chunk_counter,
-                         const std::uint32_t key[8], std::uint32_t base_flags,
-                         std::uint32_t out_cv[8]) noexcept;
+                         std::span<const std::uint32_t, 8> key,
+                         std::uint32_t base_flags,
+                         std::span<std::uint32_t, 8> out_cv) noexcept;
 }  // namespace detail
 
 }  // namespace blake3pp

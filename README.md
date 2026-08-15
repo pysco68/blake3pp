@@ -145,6 +145,16 @@ assert(blake3pp::available_arches().front() == blake3pp::best_available());
 Requesting a variant the CPU can't run silently falls back to the best
 available one; `is_available()` tells you beforehand.
 
+The build configuration is introspectable too, which is handy for
+diagnostics banners and bug reports:
+
+```cpp
+std::cout << std::format("blake3pp {} (simd: {}, execution: {})\n",
+                         blake3pp::version(), blake3pp::simd_provider(),
+                         blake3pp::execution_provider());
+// e.g. "blake3pp 0.1.0 (simd: std::simd, execution: stdexec)"
+```
+
 ### Multi-core hashing (std::execution / stdexec)
 
 One-shot and incremental hashing are each available sequentially or

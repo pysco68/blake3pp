@@ -12,9 +12,11 @@
 // 2^54-chunk maximum-size subtree stays under ~64 KiB of stack. M3's
 // parallel engine reuses these pieces per subtree.
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <span>
 
 #include "kernel/kernel.hpp"
 
@@ -26,7 +28,7 @@ namespace blake3pp::core {
 inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
                                          const std::uint8_t* child_cvs,
                                          std::size_t num_children,
-                                         const std::uint32_t key[8],
+                                         std::span<const std::uint32_t, 8> key,
                                          std::uint32_t base_flags,
                                          std::uint8_t* out) noexcept {
   const std::size_t num_parents = num_children / 2;
@@ -34,12 +36,12 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
   for (std::size_t i = 0; i < num_parents; ++i) {
     parent_blocks[i] = child_cvs + 2 * i * kern::out_len;
   }
-  k.hash_many(parent_blocks, num_parents, 1, key, 0,
+  k.hash_many(parent_blocks, num_parents, 1, key.data(), 0,
               /*increment_counter=*/false, kern::flag_parent | base_flags, 0,
               0, out);
   if (num_children % 2 != 0) {
-    std::memcpy(out + num_parents * kern::out_len,
-                child_cvs + (num_children - 1) * kern::out_len, kern::out_len);
+    std::copy_n(child_cvs + (num_children - 1) * kern::out_len, kern::out_len,
+                out + num_parents * kern::out_len);
     return num_parents + 1;
   }
   return num_parents;
@@ -52,7 +54,7 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
                                          const std::uint8_t* input,
                                          std::size_t num_chunks,
                                          std::uint64_t chunk_counter,
-                                         const std::uint32_t key[8],
+                                         std::span<const std::uint32_t, 8> key,
                                          std::uint32_t base_flags,
                                          std::uint8_t* out_cvs) noexcept {
   if (num_chunks <= 2 * k.simd_degree) {
@@ -60,7 +62,8 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
     for (std::size_t i = 0; i < num_chunks; ++i) {
       chunks[i] = input + i * kern::chunk_len;
     }
-    k.hash_many(chunks, num_chunks, kern::chunk_len / kern::block_len, key,
+    k.hash_many(chunks, num_chunks, kern::chunk_len / kern::block_len,
+                key.data(),
                 chunk_counter, /*increment_counter=*/true, base_flags,
                 kern::flag_chunk_start, kern::flag_chunk_end, out_cvs);
     return num_chunks;
@@ -84,16 +87,16 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
                                    const std::uint8_t* input,
                                    std::size_t num_chunks,
                                    std::uint64_t chunk_counter,
-                                   const std::uint32_t key[8],
+                                   std::span<const std::uint32_t, 8> key,
                                    std::uint32_t base_flags,
-                                   std::uint32_t out_cv[8]) noexcept {
+                                   std::span<std::uint32_t, 8> out_cv) noexcept {
   std::uint8_t cvs[kern::max_batch_inputs * kern::out_len];
   std::uint8_t next[kern::max_batch_inputs * kern::out_len];
   std::size_t n = compress_subtree_wide(k, input, num_chunks, chunk_counter,
                                         key, base_flags, cvs);
   while (n > 1) {
     n = compress_parents_wide(k, cvs, n, key, base_flags, next);
-    std::memcpy(cvs, next, n * kern::out_len);
+    std::copy_n(next, n * kern::out_len, cvs);
   }
   for (std::size_t w = 0; w < 8; ++w) {
     const std::uint8_t* b = cvs + 4 * w;

@@ -19,9 +19,9 @@
 
 #include <algorithm>
 #include <bit>
+#include <array>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <span>
 #include <utility>
 #include <vector>
@@ -78,7 +78,7 @@ template <class Scheduler>
     // for this boundary; we pin its value, 64 on every target we build,
     // because GCC warns on ABI-sensitive uses of the constant in headers.)
     struct alignas(64) padded_cv {
-      std::uint32_t words[8];
+      std::array<std::uint32_t, 8> words;
     };
     // Starting from counter 0 in part-sized steps, every part is
     // automatically subtree-aligned.
@@ -89,8 +89,8 @@ template <class Scheduler>
                 ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
                   detail::compress_subtree_cv(
                       ops, base + i * part * chunk_size, part,
-                      static_cast<std::uint64_t>(i) * part,
-                      h.key_words().data(), h.mode_flags(), cvs[i].words);
+                      static_cast<std::uint64_t>(i) * part, h.key_words(),
+                      h.mode_flags(), cvs[i].words);
                 });
     ex::sync_wait(std::move(work));
 
@@ -180,16 +180,15 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
   const std::size_t n_parts = num_chunks / part;
 
   struct alignas(64) padded_cv {
-    std::uint32_t words[8];
+    std::array<std::uint32_t, 8> words;
   };
   padded_cv cvs[2 * max_parts];
 
   auto work = ex::schedule(sched) |
               ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
                 compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                                    chunk_counter + i * part,
-                                    h.key_words().data(), h.mode_flags(),
-                                    cvs[i].words);
+                                    chunk_counter + i * part, h.key_words(),
+                                    h.mode_flags(), cvs[i].words);
               });
   ex::sync_wait(std::move(work));
   for (std::size_t i = 0; i < n_parts; ++i) {
@@ -271,7 +270,7 @@ class parallel_hasher {
         flush_window();
       }
       const std::size_t take = std::min(window_.size() - filled_, len);
-      std::memcpy(window_.data() + filled_, p, take);
+      std::copy_n(p, take, window_.data() + filled_);
       filled_ += take;
       p += take;
       len -= take;

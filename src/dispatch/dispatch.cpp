@@ -48,9 +48,13 @@ constexpr registry_entry registry[] = {
 
 constexpr std::size_t num_kernels = std::size(registry);
 
-// Best-first dispatch preference; must name every registerable variant.
-constexpr arch preference[] = {arch::avx512, arch::avx2, arch::sse42,
-                               arch::neon, arch::scalar};
+// The one canonical enumerator list: auto_detect first, then best-first.
+// The dispatch preference order is simply its tail. One list, two roles.
+constexpr arch all_enumerators[] = {arch::auto_detect, arch::avx512,
+                                    arch::avx2,        arch::sse42,
+                                    arch::neon,        arch::scalar};
+constexpr std::span<const arch> preference =
+    std::span{all_enumerators}.subspan(1);
 
 // The compiled variants, sorted best-first, computed at compile time.
 constexpr std::array<arch, num_kernels> compiled_sorted = [] {
@@ -131,6 +135,37 @@ arch best_available() noexcept { return available_impl().front(); }
 std::span<const arch> compiled_arches() noexcept { return compiled_sorted; }
 
 std::span<const arch> available_arches() noexcept { return available_impl(); }
+
+std::span<const arch> all_arches() noexcept { return all_enumerators; }
+
+std::string_view version() noexcept { return BLAKE3PP_VERSION; }
+
+std::string_view simd_provider() noexcept {
+#if defined(BLAKE3PP_HAS_STD_SIMD)
+  return "std::simd";
+#elif defined(BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
+  return "std::experimental::simd";
+#else
+  return "xsimd";
+#endif
+}
+
+std::string_view execution_provider() noexcept {
+#if defined(BLAKE3PP_HAS_STD_SENDERS)
+  return "std::execution";
+#else
+  return "stdexec";
+#endif
+}
+
+std::optional<arch> arch_from_string(std::string_view name) noexcept {
+  for (const arch a : all_enumerators) {
+    if (name == to_string(a)) {
+      return a;
+    }
+  }
+  return std::nullopt;
+}
 
 const char* to_string(arch a) noexcept {
   switch (a) {

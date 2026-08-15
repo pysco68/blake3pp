@@ -38,6 +38,8 @@ add_library(blake3pp STATIC
 add_library(blake3pp::blake3pp ALIAS blake3pp)
 
 target_compile_features(blake3pp PUBLIC cxx_std_20)
+target_compile_definitions(blake3pp PRIVATE
+  "BLAKE3PP_VERSION=\"${PROJECT_VERSION}\"")
 target_include_directories(blake3pp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_include_directories(blake3pp PRIVATE src)

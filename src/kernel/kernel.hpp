@@ -11,8 +11,11 @@
 // registers) changes with the -m flags of the defining TU, so passing one
 // across TUs compiled with different flags is undefined behavior in practice.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+
+#include <blake3pp/dispatch.hpp>  // arch: each table names its variant
 
 namespace blake3pp::kern {
 
@@ -24,13 +27,12 @@ inline constexpr std::size_t out_len = 32;
 // the caller-side staging buffers for hash_many batches.
 inline constexpr std::size_t max_simd_degree = 16;
 
-// Callers get best throughput handing hash_many TWO batches worth of
-// inputs at once: the kernel interleaves two independent batches to double
-// the dependency chains (see hash_batch2). Bounds the batch-shaped buffers.
+// Callers hand hash_many up to TWO batches worth of inputs at once (the
+// subtree leaf granularity); bounds the batch-shaped staging buffers.
 inline constexpr std::size_t max_batch_inputs = 2 * max_simd_degree;
 
 // BLAKE3 IV (identical to BLAKE2s / SHA-256's first eight constants).
-inline constexpr std::uint32_t iv[8] = {
+inline constexpr std::array<std::uint32_t, 8> iv = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
     0x510E527Fu, 0x9B05688Cu, 0x1F83D9ABu, 0x5BE0CD19u,
 };
@@ -49,7 +51,9 @@ inline constexpr std::uint32_t flag_derive_key_material = 1u << 6;
 // per >=1 KiB of work; everything behind it inlines under the variant's own
 // flags.
 struct kernel_ops {
-  const char* name;
+  // Which variant this table implements; the identity behind
+  // hasher::selected_arch() and friends.
+  arch variant;
 
   // How many chunks the variant hashes per hash_many step for full
   // utilization (1 for scalar, SIMD width otherwise).
@@ -83,28 +87,13 @@ struct kernel_ops {
                     std::uint32_t flags_end, std::uint8_t* out) noexcept;
 };
 
+// Per-variant tables are declared where they are consumed: dispatch.cpp
+// expands the build-generated blake3pp_kernel_registry.inc into extern
+// declarations for every registered variant, so no hand-maintained list
+// exists here. Only the always-present scalar oracle is declared for
+// direct use (tests pin its semantics as the reference for every variant).
 namespace scalar {
 extern const kernel_ops ops;
 }
-#if defined(BLAKE3PP_HAS_KERNEL_SSE42)
-namespace sse42 {
-extern const kernel_ops ops;
-}
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_AVX2)
-namespace avx2 {
-extern const kernel_ops ops;
-}
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_AVX512)
-namespace avx512 {
-extern const kernel_ops ops;
-}
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_NEON)
-namespace neon {
-extern const kernel_ops ops;
-}
-#endif
 
 }  // namespace blake3pp::kern

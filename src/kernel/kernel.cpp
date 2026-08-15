@@ -6,9 +6,9 @@
 
 #include "kernel/kernel.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
-#include <cstring>
 #include <utility>
 
 #ifndef BLAKE3PP_ARCH_NS
@@ -17,9 +17,6 @@
 
 #include "kernel/simd_facade.hpp"
 #include "kernel/transpose.hpp"
-
-#define BLAKE3PP_STR2(x) #x
-#define BLAKE3PP_STR(x) BLAKE3PP_STR2(x)
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
 namespace {
@@ -123,13 +120,13 @@ inline void all_rounds(W v[16], const W m[16]) noexcept {
 inline void compress(const std::uint32_t cv[8],
                      const std::uint8_t block[block_len], std::uint32_t len,
                      std::uint64_t counter, std::uint32_t flags,
-                     std::uint32_t out[16]) noexcept {
+                     std::array<std::uint32_t, 16>& out) noexcept {
   std::uint32_t m[16];
   for (std::size_t i = 0; i < 16; ++i) {
     m[i] = load32(block + 4 * i);
   }
 
-  std::uint32_t v[16] = {
+  std::array<std::uint32_t, 16> v = {
       cv[0], cv[1], cv[2], cv[3],
       cv[4], cv[5], cv[6], cv[7],
       iv[0], iv[1], iv[2], iv[3],
@@ -138,28 +135,28 @@ inline void compress(const std::uint32_t cv[8],
       len,   flags,
   };
 
-  all_rounds(v, m);
+  all_rounds(v.data(), m);
 
   for (std::size_t i = 0; i < 8; ++i) {
     v[i] ^= v[i + 8];
     v[i + 8] ^= cv[i];
   }
-  std::memcpy(out, v, sizeof(v));
+  out = v;
 }
 
 void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
                        std::uint32_t len, std::uint64_t counter,
                        std::uint32_t flags) noexcept {
-  std::uint32_t out[16];
+  std::array<std::uint32_t, 16> out;
   compress(cv, block, len, counter, flags, out);
-  std::memcpy(cv, out, 8 * sizeof(std::uint32_t));
+  std::copy_n(out.begin(), 8, cv);
 }
 
 void compress_xof(const std::uint32_t cv[8],
                   const std::uint8_t block[block_len], std::uint32_t len,
                   std::uint64_t counter, std::uint32_t flags,
                   std::uint8_t out[64]) noexcept {
-  std::uint32_t wide[16];
+  std::array<std::uint32_t, 16> wide;
   compress(cv, block, len, counter, flags, wide);
   for (std::size_t i = 0; i < 16; ++i) {
     store32(out + 4 * i, wide[i]);
@@ -247,8 +244,8 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
     }
   }
   for (; i < num_inputs; ++i) {
-    std::uint32_t cv[8];
-    std::memcpy(cv, key, sizeof(cv));
+    std::array<std::uint32_t, 8> cv;
+    std::copy_n(key, 8, cv.begin());
     const std::uint64_t ctr = counter + (increment_counter ? i : 0);
     for (std::size_t b = 0; b < blocks; ++b) {
       std::uint32_t f = flags;
@@ -258,7 +255,7 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
       if (b == blocks - 1) {
         f |= flags_end;
       }
-      compress_in_place(cv, inputs[i] + b * block_len,
+      compress_in_place(cv.data(), inputs[i] + b * block_len,
                         static_cast<std::uint32_t>(block_len), ctr, f);
     }
     for (std::size_t w = 0; w < 8; ++w) {
@@ -270,11 +267,13 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
 }  // namespace
 
 // Namespace-scope const defaults to internal linkage; the explicit extern
-// declaration keeps `ops` exported no matter which BLAKE3PP_HAS_KERNEL_*
-// guards were visible in kernel.hpp for this TU.
+// declaration keeps `ops` exported without relying on any header having
+// declared this TU's variant namespace.
 extern const kernel_ops ops;
 const kernel_ops ops = {
-    BLAKE3PP_STR(BLAKE3PP_ARCH_NS),
+    // The namespace token doubles as the enum ID, the same single-source-
+    // of-truth convention the generated registry relies on.
+    arch::BLAKE3PP_ARCH_NS,
     /*simd_degree=*/u32v::width,
     &compress_in_place,
     &compress_xof,

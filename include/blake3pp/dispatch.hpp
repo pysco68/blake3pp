@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <string_view>
 
 namespace blake3pp {
 
@@ -56,6 +58,27 @@ enum class arch : std::uint8_t {
 /// The canonical lowercase name of a variant ("auto", "sse42", "avx2").
 /// @param a  Any variant.
 [[nodiscard]] const char* to_string(arch a) noexcept;
+
+/// The inverse of to_string(): parses a canonical (lowercase) name.
+/// @param name  A variant name, as to_string() spells it.
+/// @return The variant, or std::nullopt for any other string.
+[[nodiscard]] std::optional<arch> arch_from_string(
+    std::string_view name) noexcept;
+
+/// Every enumerator (auto_detect first, then best-first) regardless of
+/// what is compiled or runnable: the list to build CLIs and menus from,
+/// so consumers never hand-enumerate the enum.
+[[nodiscard]] std::span<const arch> all_arches() noexcept;
+
+/// The library version, as the library was built (the git-derived
+/// stamp; see blake3ppsum --version).
+[[nodiscard]] std::string_view version() noexcept;
+/// Which SIMD facade backs this build of the library: "std::simd",
+/// "std::experimental::simd" or "xsimd".
+[[nodiscard]] std::string_view simd_provider() noexcept;
+/// Which sender/receiver implementation backs this build of the library:
+/// "std::execution" or "stdexec".
+[[nodiscard]] std::string_view execution_provider() noexcept;
 
 namespace detail {
 // Maps an arch to its kernel table; unavailable variants fall back to the

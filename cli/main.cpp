@@ -7,27 +7,54 @@
 // internals: --arch pins a SIMD variant, --threads sizes the compute pool
 // (0 = sequential), and --window/--qd/--no-direct tune the I/O pipeline.
 
-#include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
+#include <version>
+
+#if defined(__cpp_lib_print)
+#include <print>
+#endif
 
 #include <CLI/CLI.hpp>
-#include <blake3pp/io.hpp>
+#include <blake3pp/blake3pp.hpp>
 
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
 #include <exec/static_thread_pool.hpp>
 #endif
 
 namespace {
+
+// The project's provider pattern in miniature: std::print where the
+// standard library ships it (C++23), a std::format shim on the C++20
+// toolchains; same source either way.
+#if defined(__cpp_lib_print)
+using std::print;
+using std::println;
+#else
+template <class... Args>
+void print(std::FILE* stream, std::format_string<Args...> fmt,
+           Args&&... args) {
+  std::fputs(std::format(fmt, std::forward<Args>(args)...).c_str(), stream);
+}
+
+template <class... Args>
+void println(std::FILE* stream, std::format_string<Args...> fmt,
+             Args&&... args) {
+  print(stream, fmt, std::forward<Args>(args)...);
+  std::fputc('\n', stream);
+}
+#endif
 
 struct options {
   blake3pp::hash_file_options io;
@@ -37,31 +64,20 @@ struct options {
 };
 
 std::string version_text() {
-  std::string out = "blake3ppsum (blake3pp " BLAKE3PP_VERSION ")\n";
-#if defined(BLAKE3PP_HAS_STD_SIMD)
-  out += "simd provider: std::simd\n";
-#elif defined(BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
-  out += "simd provider: std::experimental::simd\n";
-#else
-  out += "simd provider: xsimd\n";
-#endif
-#if defined(BLAKE3PP_HAS_STD_SENDERS)
-  out += "execution provider: std::execution\n";
-#else
-  out += "execution provider: stdexec\n";
-#endif
-  out += "variants:";
+  std::string variants;
   for (const auto a : blake3pp::compiled_arches()) {
-    out += ' ';
-    out += blake3pp::to_string(a);
-    if (!blake3pp::is_available(a)) {
-      out += "[no cpu support]";
-    }
+    std::format_to(std::back_inserter(variants), " {}{}",
+                   blake3pp::to_string(a),
+                   blake3pp::is_available(a) ? "" : "[no cpu support]");
   }
-  out += " (auto -> ";
-  out += blake3pp::to_string(blake3pp::best_available());
-  out += ')';
-  return out;
+  return std::format(
+      "blake3ppsum (blake3pp {})\n"
+      "simd provider: {}\n"
+      "execution provider: {}\n"
+      "variants:{} (auto -> {})",
+      blake3pp::version(), blake3pp::simd_provider(),
+      blake3pp::execution_provider(), variants,
+      blake3pp::to_string(blake3pp::best_available()));
 }
 
 blake3pp::digest hash_stdin(blake3pp::arch a) {
@@ -69,7 +85,7 @@ blake3pp::digest hash_stdin(blake3pp::arch a) {
   std::vector<std::byte> buf(1024 * 1024);
   std::size_t n = 0;
   while ((n = std::fread(buf.data(), 1, buf.size(), stdin)) > 0) {
-    h.update(std::span<const std::byte>{buf.data(), n});
+    h.update(std::span{buf}.first(n));
   }
   if (std::ferror(stdin) != 0) {
     throw std::system_error(errno, std::generic_category(),
@@ -88,17 +104,17 @@ class engine {
 #endif
   }
 
-  blake3pp::digest hash(const std::string& path) {
+  blake3pp::digest hash(const std::filesystem::path& path) {
     if (path == "-") {
       return hash_stdin(opts_.io.a);
     }
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
-    if (pool_) {
-      return blake3pp::hash_file(std::filesystem::path(path),
-                                 pool_->get_scheduler(), opts_.io);
+    if (pool_.has_value()) {
+      return blake3pp::hash_file(path, pool_.value().get_scheduler(),
+                                 opts_.io);
     }
 #endif
-    return blake3pp::hash_file(std::filesystem::path(path), opts_.io);
+    return blake3pp::hash_file(path, opts_.io);
   }
 
  private:
@@ -109,42 +125,39 @@ class engine {
 };
 
 // Verifies "<64 hex>  <name>" lines (also accepts the '*' binary marker).
-int run_check(engine& eng, std::istream& in, const std::string& list_name) {
+int run_check(engine& eng, std::istream& in, std::string_view list_name) {
   int failures = 0;
-  int line_no = 0;
   std::string line;
-  while (std::getline(in, line)) {
-    ++line_no;
-    if (line.empty() || line[0] == '#') {
+  for (int line_no = 1; std::getline(in, line); ++line_no) {
+    const std::string_view sv{line};
+    if (sv.empty() || sv.starts_with('#')) {
       continue;
     }
-    const auto parsed = line.size() >= 66
-                            ? blake3pp::digest::from_hex(line.substr(0, 64))
-                            : std::nullopt;
-    if (!parsed) {
-      std::fprintf(stderr, "blake3ppsum: %s:%d: malformed line\n",
-                   list_name.c_str(), line_no);
+    const auto expected = sv.size() >= 66
+                              ? blake3pp::digest::from_hex(sv.substr(0, 64))
+                              : std::nullopt;
+    if (!expected.has_value()) {
+      println(stderr, "blake3ppsum: {}:{}: malformed line", list_name,
+              line_no);
       failures++;
       continue;
     }
-    std::size_t pos = 64;
-    while (pos < line.size() && line[pos] == ' ') {
-      ++pos;
+    auto rest = sv.substr(64);
+    rest.remove_prefix(std::min(rest.find_first_not_of(' '), rest.size()));
+    if (rest.starts_with('*')) {
+      rest.remove_prefix(1);
     }
-    if (pos < line.size() && line[pos] == '*') {
-      ++pos;
-    }
-    const std::string name = line.substr(pos);
+    const std::string name{rest};
     try {
-      if (eng.hash(name) == *parsed) {
-        std::printf("%s: OK\n", name.c_str());
+      if (expected == eng.hash(name)) {  // optional's heterogeneous ==
+        println(stdout, "{}: OK", name);
       } else {
-        std::printf("%s: FAILED\n", name.c_str());
+        println(stdout, "{}: FAILED", name);
         failures++;
       }
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "blake3ppsum: %s: %s\n", name.c_str(), e.what());
-      std::printf("%s: FAILED open or read\n", name.c_str());
+      println(stderr, "blake3ppsum: {}: {}", name, e.what());
+      println(stdout, "{}: FAILED open or read", name);
       failures++;
     }
   }
@@ -165,13 +178,12 @@ int main(int argc, char** argv) {
   app.add_flag("-c,--check", o.check,
                "read checksum lines from FILEs and verify them");
 
-  const std::map<std::string, blake3pp::arch> arch_names{
-      {"auto", blake3pp::arch::auto_detect},
-      {"scalar", blake3pp::arch::scalar},
-      {"sse42", blake3pp::arch::sse42},
-      {"avx2", blake3pp::arch::avx2},
-      {"avx512", blake3pp::arch::avx512},
-      {"neon", blake3pp::arch::neon}};
+  // The name<->enum mapping comes from the library's canonical list; the
+  // CLI never re-enumerates the arch enum.
+  std::map<std::string, blake3pp::arch> arch_names;
+  for (const auto a : blake3pp::all_arches()) {
+    arch_names.emplace(blake3pp::to_string(a), a);
+  }
   app.add_option("--arch", o.io.a, "pin a SIMD variant")
       ->transform(CLI::CheckedTransformer(arch_names, CLI::ignore_case))
       ->default_str("auto");
@@ -193,21 +205,21 @@ int main(int argc, char** argv) {
   o.io.window_bytes = window_mib * 1024 * 1024;
   if (o.io.a != blake3pp::arch::auto_detect &&
       !blake3pp::is_available(o.io.a)) {
-    std::fprintf(stderr,
-                 "blake3ppsum: arch '%s' not available on this machine "
-                 "(auto -> %s)\n",
-                 blake3pp::to_string(o.io.a),
-                 blake3pp::to_string(blake3pp::best_available()));
+    println(stderr,
+            "blake3ppsum: arch '{}' not available on this machine "
+            "(auto -> {})",
+            blake3pp::to_string(o.io.a),
+            blake3pp::to_string(blake3pp::best_available()));
     return 2;
   }
 
   engine eng(o);
+  if (o.files.empty()) {
+    o.files.emplace_back("-");
+  }
   int failures = 0;
 
   if (o.check) {
-    if (o.files.empty()) {
-      o.files.emplace_back("-");
-    }
     for (const auto& f : o.files) {
       if (f == "-") {
         failures += run_check(eng, std::cin, "-");
@@ -215,29 +227,25 @@ int main(int argc, char** argv) {
       }
       std::ifstream in(f);
       if (!in) {
-        std::fprintf(stderr, "blake3ppsum: %s: cannot open\n", f.c_str());
+        println(stderr, "blake3ppsum: {}: cannot open", f);
         failures++;
         continue;
       }
       failures += run_check(eng, in, f);
     }
     if (failures > 0) {
-      std::fprintf(stderr,
-                   "blake3ppsum: WARNING: %d computed checksum(s) did NOT "
-                   "match\n",
-                   failures);
+      println(stderr,
+              "blake3ppsum: WARNING: {} computed checksum(s) did NOT match",
+              failures);
     }
     return failures == 0 ? 0 : 1;
   }
 
-  if (o.files.empty()) {
-    o.files.emplace_back("-");
-  }
   for (const auto& f : o.files) {
     try {
-      std::printf("%s  %s\n", eng.hash(f).to_hex().c_str(), f.c_str());
+      println(stdout, "{}  {}", eng.hash(f), f);  // digest is formattable
     } catch (const std::exception& e) {
-      std::fprintf(stderr, "blake3ppsum: %s: %s\n", f.c_str(), e.what());
+      println(stderr, "blake3ppsum: {}: {}", f, e.what());
       failures++;
     }
   }
