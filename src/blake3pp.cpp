@@ -1,8 +1,10 @@
 #include <blake3pp/blake3pp.hpp>
 
+#include <bit>
 #include <cstring>
 
 #include "core/core.hpp"
+#include "core/subtree.hpp"
 #include "kernel/kernel.hpp"
 
 namespace blake3pp {
@@ -26,14 +28,16 @@ arch hasher::selected_arch() const noexcept {
   return arch::scalar;
 }
 
-// Merge completed subtrees, then push: each trailing zero bit of
-// total_chunks is a full binary subtree whose sibling is on the stack
-// (spec 5.1.2).
-void hasher::push_chunk_cv(const std::uint32_t cv[8],
-                           std::uint64_t total_chunks) noexcept {
+// Merge completed subtrees, then push. The pushed CV may itself be the root
+// of a subtree_chunks-sized (power-of-2, aligned) subtree: counting in
+// subtree units, each trailing zero bit of total_chunks/subtree_chunks is a
+// full sibling subtree waiting on the stack (spec 5.1.2). The invariant
+// afterwards is stack_len == popcount(total_chunks).
+void hasher::push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
+                     std::uint64_t subtree_chunks) noexcept {
   std::uint32_t new_cv[8];
   std::memcpy(new_cv, cv, sizeof(new_cv));
-  std::uint64_t chunks = total_chunks;
+  std::uint64_t chunks = total_chunks / subtree_chunks;
   while ((chunks & 1) == 0) {
     cv_stack_len_--;
     core::chaining_value(
@@ -56,42 +60,35 @@ void hasher::update(std::span<const std::byte> input) noexcept {
       std::uint32_t chunk_cv[8];
       core::chaining_value(*ops_, core::chunk_output(chunk_), chunk_cv);
       const std::uint64_t total_chunks = chunk_.chunk_counter + 1;
-      push_chunk_cv(chunk_cv, total_chunks);
+      push_cv(chunk_cv, total_chunks, 1);
       core::chunk_init(chunk_, kern::iv, total_chunks);
     }
 
-    // SIMD fast path: aligned on a chunk boundary with more than one whole
-    // chunk ahead, hand hash_many a batch of chunks. The strict > keeps at
-    // least one byte out of the batch, so no batched chunk can turn out to
-    // be the message's last (which would need CHUNK_END-with-ROOT handling).
+    // Subtree fast path: aligned on a chunk boundary with more than one
+    // whole chunk ahead, reduce the largest power-of-2, position-aligned
+    // subtree in one wide pass (chunks AND parents lanes-parallel). The
+    // strict > keeps at least one byte in reserve, so no offloaded chunk
+    // can turn out to be the message's last (which would need
+    // CHUNK_END-with-ROOT handling).
     if (core::chunk_len(chunk_) == 0 && len > kern::chunk_len) {
       const std::size_t safe_chunks = (len - 1) / kern::chunk_len;
-      const std::size_t n = safe_chunks < ops_->simd_degree
-                                ? safe_chunks
-                                : ops_->simd_degree;
-      const std::uint8_t* ptrs[kern::max_simd_degree];
-      std::uint8_t cvs[kern::max_simd_degree * kern::out_len];
-      for (std::size_t j = 0; j < n; ++j) {
-        ptrs[j] = p + j * kern::chunk_len;
+      std::size_t subtree = std::bit_floor(safe_chunks);
+      // A subtree merged as one CV must sit on a subtree-aligned position
+      // in the overall tree.
+      while (((subtree - 1) & chunk_.chunk_counter) != 0) {
+        subtree /= 2;
       }
-      ops_->hash_many(ptrs, n, kern::chunk_len / kern::block_len, kern::iv,
-                      chunk_.chunk_counter, /*increment_counter=*/true, 0,
-                      kern::flag_chunk_start, kern::flag_chunk_end, cvs);
-      for (std::size_t j = 0; j < n; ++j) {
+      if (subtree >= 2) {
         std::uint32_t cv[8];
-        for (std::size_t w = 0; w < 8; ++w) {
-          const std::uint8_t* b = cvs + j * kern::out_len + 4 * w;
-          cv[w] = static_cast<std::uint32_t>(b[0]) |
-                  (static_cast<std::uint32_t>(b[1]) << 8) |
-                  (static_cast<std::uint32_t>(b[2]) << 16) |
-                  (static_cast<std::uint32_t>(b[3]) << 24);
-        }
-        push_chunk_cv(cv, chunk_.chunk_counter + j + 1);
+        core::compress_subtree_to_cv(*ops_, p, subtree, chunk_.chunk_counter,
+                                     cv);
+        push_cv(cv, chunk_.chunk_counter + subtree, subtree);
+        chunk_.chunk_counter += subtree;
+        p += subtree * kern::chunk_len;
+        len -= subtree * kern::chunk_len;
+        continue;
       }
-      chunk_.chunk_counter += n;
-      p += n * kern::chunk_len;
-      len -= n * kern::chunk_len;
-      continue;
+      // A single (or misaligned) chunk falls through to the buffered path.
     }
 
     const std::size_t room = kern::chunk_len - core::chunk_len(chunk_);

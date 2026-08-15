@@ -52,8 +52,8 @@ class hasher {
   [[nodiscard]] arch selected_arch() const noexcept;
 
  private:
-  void push_chunk_cv(const std::uint32_t cv[8],
-                     std::uint64_t total_chunks) noexcept;
+  void push_cv(const std::uint32_t cv[8], std::uint64_t total_chunks,
+               std::uint64_t subtree_chunks) noexcept;
 
   const kern::kernel_ops* ops_;
   detail::chunk_state chunk_;

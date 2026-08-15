@@ -56,6 +56,23 @@ TEST_CASE("large input splits cross the batch fast path") {
   }
 }
 
+// Deep subtree recursion (8 MiB = 8192 chunks, 13 tree levels) with splits
+// that force subtree offloads at misaligned counters.
+TEST_CASE("multi-megabyte splits cross deep subtrees") {
+  const auto input = make_input(8 * 1024 * 1024 + 5);
+  const auto expected = blake3pp::hash(input);
+
+  for (const std::size_t split :
+       {std::size_t{3 * 1024 + 1}, std::size_t{1024 * 1024},
+        std::size_t{5 * 1024 * 1024 + 333}}) {
+    CAPTURE(split);
+    blake3pp::hasher h;
+    h.update(std::span{input}.first(split));
+    h.update(std::span{input}.subspan(split));
+    CHECK(h.finalize() == expected);
+  }
+}
+
 TEST_CASE("byte at a time") {
   const auto input = make_input(3073);
   const auto expected = blake3pp::hash(input);
