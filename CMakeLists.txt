@@ -73,3 +73,9 @@ endif()
 if(BLAKE3PP_BUILD_BENCH)
   add_subdirectory(bench)
 endif()
+
+option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility"
+  ${PROJECT_IS_TOP_LEVEL})
+if(BLAKE3PP_BUILD_CLI)
+  add_subdirectory(cli)
+endif()

@@ -3,9 +3,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <version>
+
+#if defined(__cpp_lib_format)
+#include <format>
+#endif
 
 #include <blake3pp/dispatch.hpp>
 
@@ -36,6 +42,10 @@ struct digest {
   friend bool operator==(const digest&, const digest&) = default;
 
   [[nodiscard]] std::string to_hex() const;
+
+  // Parses 64 hex characters (either case); nullopt on any malformation.
+  [[nodiscard]] static std::optional<digest> from_hex(
+      std::string_view hex) noexcept;
 };
 
 // Incremental BLAKE3 hasher. Fixed-size, trivially relocatable state; never
@@ -93,3 +103,14 @@ void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
 }  // namespace detail
 
 }  // namespace blake3pp
+
+#if defined(__cpp_lib_format)
+// std::format support: "{}" prints the lowercase hex digest.
+template <>
+struct std::formatter<blake3pp::digest> : std::formatter<std::string_view> {
+  template <class FormatContext>
+  auto format(const blake3pp::digest& d, FormatContext& ctx) const {
+    return std::formatter<std::string_view>::format(d.to_hex(), ctx);
+  }
+};
+#endif

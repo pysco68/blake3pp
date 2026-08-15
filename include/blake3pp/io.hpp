@@ -17,7 +17,9 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <span>
+#include <system_error>
 #include <utility>
 
 #include <blake3pp/blake3pp.hpp>
@@ -34,9 +36,16 @@ struct hash_file_options {
 };
 
 // Sequential compute over the async reader: reads still overlap hashing.
-// Throws std::system_error on I/O failure.
-[[nodiscard]] digest hash_file(const char* path,
+// std::filesystem::path is the path currency throughout (string literals
+// and std::string convert implicitly). Each entry point follows the
+// standard library's dual-overload idiom: the plain form throws
+// std::system_error on I/O failure, the std::error_code& form reports
+// through ec instead (returning a zero digest on failure).
+[[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                const hash_file_options& opts = {});
+[[nodiscard]] digest hash_file(const std::filesystem::path& path,
+                               std::error_code& ec,
+                               const hash_file_options& opts = {}) noexcept;
 
 namespace detail {
 
@@ -81,7 +90,8 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
 // sequential overload above.)
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
-[[nodiscard]] digest hash_file(const char* path, Scheduler&& sched,
+[[nodiscard]] digest hash_file(const std::filesystem::path& path,
+                               Scheduler&& sched,
                                const hash_file_options& opts = {}) {
   detail::file_reader reader(
       path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
@@ -98,6 +108,68 @@ template <class Scheduler>
     reader.release(*w);
   }
   return h.finalize();
+}
+
+// error_code form of the parallel pipeline.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest hash_file(const std::filesystem::path& path,
+                               Scheduler&& sched, std::error_code& ec,
+                               const hash_file_options& opts = {}) noexcept {
+  try {
+    ec.clear();
+    return hash_file(path, std::forward<Scheduler>(sched), opts);
+  } catch (const std::system_error& e) {
+    ec = e.code();
+  } catch (...) {
+    ec = std::make_error_code(std::errc::not_enough_memory);
+  }
+  return digest{};
+}
+
+namespace detail {
+
+// Path types from other filesystem libraries (boost::filesystem::path is
+// the motivating case): anything exposing a native() character sequence
+// that std::filesystem::path accepts as a Source. Bridging through
+// native() preserves the platform encoding exactly (no lossy transcoding,
+// unlike .string() on Windows). Structural, so no third-party dependency
+// or naming enters this library.
+template <class P>
+concept foreign_path =
+    !std::same_as<std::remove_cvref_t<P>, std::filesystem::path> &&
+    requires(const P& p) { std::filesystem::path(p.native()); };
+
+}  // namespace detail
+
+// Transparent forwarding for foreign path types (e.g. boost::filesystem).
+template <detail::foreign_path P>
+[[nodiscard]] digest hash_file(const P& path,
+                               const hash_file_options& opts = {}) {
+  return hash_file(std::filesystem::path(path.native()), opts);
+}
+
+template <detail::foreign_path P>
+[[nodiscard]] digest hash_file(const P& path, std::error_code& ec,
+                               const hash_file_options& opts = {}) noexcept {
+  return hash_file(std::filesystem::path(path.native()), ec, opts);
+}
+
+template <detail::foreign_path P, class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest hash_file(const P& path, Scheduler&& sched,
+                               const hash_file_options& opts = {}) {
+  return hash_file(std::filesystem::path(path.native()),
+                   std::forward<Scheduler>(sched), opts);
+}
+
+template <detail::foreign_path P, class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest hash_file(const P& path, Scheduler&& sched,
+                               std::error_code& ec,
+                               const hash_file_options& opts = {}) noexcept {
+  return hash_file(std::filesystem::path(path.native()),
+                   std::forward<Scheduler>(sched), ec, opts);
 }
 
 }  // namespace blake3pp

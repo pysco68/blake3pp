@@ -329,8 +329,12 @@ struct file_reader::impl {
 #endif
 };
 
-file_reader::file_reader(const char* path, const file_reader_options& opts)
+file_reader::file_reader(const std::filesystem::path& fspath,
+                         const file_reader_options& opts)
     : impl_(new impl) {
+#if defined(BLAKE3PP_IO_POSIX)
+  const char* const path = fspath.c_str();  // native() is char-based here
+#endif
   impl& im = *impl_;
   // Window: power-of-2 multiple of the chunk size so every full window is
   // a subtree-aligned unit; >= 64 KiB keeps O_DIRECT alignment trivial.
@@ -370,7 +374,9 @@ file_reader::file_reader(const char* path, const file_reader_options& opts)
   }
 #endif
 #else
-  im.stream = std::fopen(path, "rb");
+  // Non-POSIX stdio stub; a real Windows backend would use the path's
+  // native wide string with CreateFileW + IOCP.
+  im.stream = std::fopen(fspath.string().c_str(), "rb");
   if (im.stream == nullptr) {
     delete impl_;
     throw_errno("fopen");

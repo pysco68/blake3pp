@@ -61,12 +61,25 @@ TEST_CASE("hash_file matches in-memory hash across size classes") {
     const auto content = make_input(len);
     const temp_file f(content);
     const auto expected = blake3pp::hash(content);
-    CHECK(blake3pp::hash_file(f.path.c_str()) == expected);
-    CHECK(blake3pp::hash_file(f.path.c_str(), small_windows) == expected);
-    CHECK(blake3pp::hash_file(
-              f.path.c_str(),
-              {.direct_io = false}) == expected);
+    CHECK(blake3pp::hash_file(f.path) == expected);  // fs::path overload
+    CHECK(blake3pp::hash_file(f.path, small_windows) == expected);
+    CHECK(blake3pp::hash_file(f.path, {.direct_io = false}) == expected);
   }
+}
+
+TEST_CASE("error_code overload reports instead of throwing") {
+  std::error_code ec;
+  const auto d =
+      blake3pp::hash_file("/nonexistent/blake3pp/no/such/file", ec);
+  CHECK(ec);
+  CHECK(ec == std::errc::no_such_file_or_directory);
+  CHECK(d == blake3pp::digest{});
+
+  const auto content = make_input(4096);
+  const temp_file f(content);
+  const auto ok = blake3pp::hash_file(f.path, ec);
+  CHECK(!ec);
+  CHECK(ok == blake3pp::hash(content));
 }
 
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
@@ -81,10 +94,13 @@ TEST_CASE("parallel hash_file matches, across window boundaries") {
     const auto content = make_input(len);
     const temp_file f(content);
     const auto expected = blake3pp::hash(content);
-    CHECK(blake3pp::hash_file(f.path.c_str(), sched) == expected);
-    CHECK(blake3pp::hash_file(f.path.c_str(), sched,
+    CHECK(blake3pp::hash_file(f.path, sched) == expected);
+    CHECK(blake3pp::hash_file(f.path, sched,
                               {.window_bytes = 1024 * 1024,
                                .queue_depth = 3}) == expected);
+    std::error_code ec;
+    CHECK(blake3pp::hash_file(f.path, sched, ec) == expected);
+    CHECK(!ec);
   }
 }
 #endif
@@ -98,10 +114,52 @@ TEST_CASE("missing file throws system_error") {
 TEST_CASE("reader reports a backend") {
   const auto content = make_input(256 * 1024);
   const temp_file f(content);
-  blake3pp::detail::file_reader r(f.path.c_str(), {});
+  blake3pp::detail::file_reader r(f.path, {});
   CHECK(r.file_size() == content.size());
   MESSAGE("file_reader backend: " << r.backend());
   CHECK(std::string(r.backend()).size() > 0);
+}
+
+// Stand-in for boost::filesystem::path: satisfies the foreign_path concept
+// structurally, which is exactly how a real boost path would enter.
+struct fake_boost_path {
+  std::string s;
+  const std::string& native() const { return s; }
+};
+
+TEST_CASE("foreign path-like types (boost::filesystem shape) forward") {
+  const auto content = make_input(128 * 1024 + 7);
+  const temp_file f(content);
+  const fake_boost_path bp{f.path.string()};
+  const auto expected = blake3pp::hash(content);
+  CHECK(blake3pp::hash_file(bp) == expected);
+  std::error_code ec;
+  CHECK(blake3pp::hash_file(bp, ec) == expected);
+  CHECK(!ec);
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+  exec::static_thread_pool pool(2);
+  CHECK(blake3pp::hash_file(bp, pool.get_scheduler()) == expected);
+#endif
+}
+
+TEST_CASE("digest hex round trip and std::format") {
+  const auto d = blake3pp::hash(std::string_view{"round trip"});
+  const auto parsed = blake3pp::digest::from_hex(d.to_hex());
+  REQUIRE(parsed.has_value());
+  CHECK(*parsed == d);
+
+  std::string upper = d.to_hex();
+  for (char& c : upper) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  CHECK(blake3pp::digest::from_hex(upper) == d);
+
+  CHECK(!blake3pp::digest::from_hex("abc"));
+  CHECK(!blake3pp::digest::from_hex(std::string(64, 'g')));
+
+#if defined(__cpp_lib_format)
+  CHECK(std::format("{}", d) == d.to_hex());
+#endif
 }
 
 }  // TEST_SUITE

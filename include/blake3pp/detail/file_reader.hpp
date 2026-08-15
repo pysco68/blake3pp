@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 
 namespace blake3pp::detail {
@@ -35,7 +36,11 @@ struct file_reader_options {
 class file_reader {
  public:
   // Throws std::system_error if the file cannot be opened or statted.
-  file_reader(const char* path, const file_reader_options& opts);
+  // std::filesystem::path is the canonical currency: it carries the
+  // platform's native encoding, which is what makes the Windows backend
+  // implementable without an API break.
+  file_reader(const std::filesystem::path& path,
+              const file_reader_options& opts);
   ~file_reader();
   file_reader(const file_reader&) = delete;
   file_reader& operator=(const file_reader&) = delete;
