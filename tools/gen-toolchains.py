@@ -41,6 +41,12 @@ CLANG_STDS = {18: [20, 23], 20: [23, 26], 22: [23, 26]}
 # The triple normally lives under /usr/lib/gcc/<triple>/<ver>.
 GCC_TRIPLE = "x86_64-linux-gnu"
 
+# Names are <os>-<compiler><ver>-cxx<std>[-variant]; the OS component is the
+# machine the generator runs on, since the emitted files hard-code host paths
+# (compiler names, GCC install dirs) anyway.
+HOST_OS = {"linux": "linux", "darwin": "macos", "win32": "windows"}.get(
+    "linux" if sys.platform.startswith("linux") else sys.platform, sys.platform)
+
 DEFAULT_GCC = 16
 DEFAULT_CLANG = 22
 
@@ -91,13 +97,16 @@ def base_configs() -> list[tuple[str, str, dict]]:
     for v in GCC_VERSIONS:
         for std in GCC_STDS.get(v, []):
             out.append((
-                f"gcc{v}-c{std}",
+                f"{HOST_OS}-gcc{v}-cxx{std}",
                 f"GCC {v} with libstdc++ {v}, C++{std}",
                 {
                     "C_COMPILER": f"gcc-{v}",
                     "CXX_COMPILER": f"g++-{v}",
                     "CXX_STANDARD": std,
-                    "LINKER": "mold",
+                    # No LINKER: mold 2.40 cannot parse GCC 16 trunk's
+                    # libatomic_asneeded.so INPUT(AS_NEEDED(...)) script, so
+                    # GCC stays on its default (bfd), which also keeps
+                    # GCC-LTO viable.
                     "DEFAULT_BUILD_TYPE": "RelWithDebInfo",
                 },
             ))
@@ -105,7 +114,7 @@ def base_configs() -> list[tuple[str, str, dict]]:
     for v in CLANG_VERSIONS:
         for std in CLANG_STDS.get(v, []):
             out.append((
-                f"clang{v}-c{std}",
+                f"{HOST_OS}-clang{v}-cxx{std}",
                 f"Clang {v} with libc++ {v}, C++{std}",
                 {
                     "C_COMPILER": f"clang-{v}",
@@ -126,7 +135,7 @@ def base_configs() -> list[tuple[str, str, dict]]:
         gcc_pin = max(candidates) if candidates else min(GCC_VERSIONS)
         std = min(CLANG_STDS.get(v, [20]))
         out.append((
-            f"clang{v}-c{std}-libstdcxx",
+            f"{HOST_OS}-clang{v}-cxx{std}-libstdcxx",
             f"Clang {v} against libstdc++ {gcc_pin} (pinned), C++{std}",
             {
                 "C_COMPILER": f"clang-{v}",
@@ -141,7 +150,7 @@ def base_configs() -> list[tuple[str, str, dict]]:
 
     # Post-C++26 experiment: CMake has no cxx_std_29, so pass the flag raw.
     out.append((
-        f"clang{DEFAULT_CLANG}-c2d",
+        f"{HOST_OS}-clang{DEFAULT_CLANG}-cxx2d",
         f"Clang {DEFAULT_CLANG} with libc++, experimental -std=c++2d",
         {
             "C_COMPILER": f"clang-{DEFAULT_CLANG}",
@@ -162,8 +171,8 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
         targets = bases
     else:
         wanted = {
-            f"gcc{DEFAULT_GCC}-c{max(GCC_STDS[DEFAULT_GCC])}",
-            f"clang{DEFAULT_CLANG}-c{max(CLANG_STDS[DEFAULT_CLANG])}",
+            f"{HOST_OS}-gcc{DEFAULT_GCC}-cxx{max(GCC_STDS[DEFAULT_GCC])}",
+            f"{HOST_OS}-clang{DEFAULT_CLANG}-cxx{max(CLANG_STDS[DEFAULT_CLANG])}",
         }
         targets = [b for b in bases if b[0] in wanted]
 

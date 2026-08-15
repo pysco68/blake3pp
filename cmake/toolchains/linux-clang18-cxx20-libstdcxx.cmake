@@ -2,8 +2,8 @@
 #
 # Clang 18 against libstdc++ 14 (pinned), C++20
 #
-#   cmake -S . -B build/clang18-c20-libstdcxx -G Ninja \
-#         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/clang18-c20-libstdcxx.cmake
+#   cmake -S . -B build/linux-clang18-cxx20-libstdcxx -G Ninja \
+#         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-clang18-cxx20-libstdcxx.cmake
 
 
 set(TC_C_COMPILER "clang-18")

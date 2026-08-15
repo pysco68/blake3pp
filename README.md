@@ -1,3 +1,35 @@
+# blake3pp
+
+A C++20-and-later BLAKE3 implementation built as a case study in
+hardware-saturating, portable C++26-forward design: `std::simd` and
+`std::execution` where the standard library provides them, drop-in polyfills
+(xsimd, stdexec) where it doesn't, multi-architecture SIMD kernels compiled
+into a single binary with zero-overhead runtime dispatch, and OS-native
+direct I/O behind a unified interface.
+
+## Building
+
+```bash
+cmake --preset linux-gcc16-cxx26 && cmake --build --preset linux-gcc16-cxx26
+ctest --preset linux-gcc16-cxx26
+```
+
+Any name from `cmake/toolchains/` works as a preset (see
+`CMakePresets-toolchains.json`); test presets exist for `linux-gcc16-cxx26`,
+`linux-clang22-cxx26`, `linux-clang18-cxx20-libstdcxx` (the C++20 polyfill path), and the
+two `-asan` variants. Without a preset, a bare `cmake -S . -B build`
+configures the C++20 baseline with the default compiler.
+
+Layout: public API in `include/blake3pp/`, arch-agnostic tree logic in
+`src/core/`, the per-architecture kernel (one TU, compiled once per variant
+by `cmake/ArchKernels.cmake`) in `src/kernel/`, runtime routing in
+`src/dispatch/`. `cmake/StdFeatures.cmake` probes what the active standard
+library really ships (by compiling usage, not trusting feature-test macros),
+and `tests/` verifies every configuration against the official BLAKE3 test
+vectors.
+
+---
+
 # Modern C++ devcontainer with Claude Code
 
 Ubuntu 26.04 LTS base, GCC 16 and Clang 22 side by side, upstream CMake and
@@ -11,7 +43,7 @@ persisted to the Windows/WSL host.
   devcontainer.json     features, bind mounts, env
   Dockerfile            toolchain
   post-create.sh        ownership fixes, shell setup, version report
-CMakePresets.json       gcc-26 / clang-26 / clang-2d / asan
+CMakePresets.json       test presets; includes generated CMakePresets-toolchains.json
 ```
 
 ## First run
@@ -43,18 +75,18 @@ signed in. Setting `CLAUDE_CONFIG_DIR` to the same path makes Claude Code write
 ## C++26 and C++29: what you actually get
 
 - **C++26**: fully available in both compilers. `CMAKE_CXX_STANDARD 26` on the
-  `gcc-26` and `clang-26` presets.
+  `linux-gcc16-cxx26` and `linux-clang22-cxx26` presets.
 - **C++29**: not a released GCC feature. GCC only gained `-std=c++29` /
   `-std=c++2d` on trunk for the future GCC 17, so GCC 16 will reject it. Clang
-  has a `-std=c++2d` mode; the `clang-2d` preset uses it, and the version report
+  has a `-std=c++2d` mode; the `linux-clang22-cxx2d` preset uses it, and the version report
   from `post-create.sh` tells you whether your installed Clang accepts it. For
   the newest possible Clang, rebuild with `"INSTALL_LLVM_SNAPSHOT": "1"` in
   `devcontainer.json` (that pulls the LLVM 23 snapshot branch alongside 22).
 
 One real trap: Clang parsing libstdc++ headers from a *newer* GCC often breaks,
 because libstdc++ uses GCC built-ins Clang has not implemented yet. With GCC 16
-and Clang 22 installed together, prefer the `clang-26` preset (libc++). The
-`clang-26-libstdcxx` preset exists if you need ABI compatibility with GCC-built
+and Clang 22 installed together, prefer the `linux-clang22-cxx26` preset (libc++). The
+`linux-clang22-cxx23-libstdcxx` preset exists if you need ABI compatibility with GCC-built
 libraries, and is the one to suspect first when Clang chokes inside `<ranges>`.
 
 For `import std;`, CMake still gates it behind `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`,
@@ -110,32 +142,28 @@ inert for uninstrumented binaries.
 
 ## Turning sanitizers on
 
-Presets set one cache variable rather than editing `CMAKE_CXX_FLAGS`, because
-the toolchain presets already own that variable for `-stdlib=`. Wire it up once:
-
-```cmake
-include(cmake/Sanitizers.cmake)
-target_link_libraries(myapp PRIVATE project::sanitizers)
-```
+Instrumentation is baked into the generated toolchain files/presets on the
+newest GCC and Clang (`tools/gen-toolchains.py --all` instruments every
+combination instead):
 
 ```bash
-cmake --preset asan && cmake --build --preset asan   # ASan + UBSan, Clang
-cmake --preset gcc-asan                              # same, GCC + libstdc++
-cmake --preset tsan
-cmake --preset fuzz                                  # libFuzzer + ASan + UBSan
-cmake --preset coverage                              # -fprofile-instr-generate
-ctest --preset valgrind -T memcheck                  # valgrind instead
+cmake --preset linux-clang22-cxx26-asan      # ASan + UBSan, Clang + libc++
+cmake --preset linux-gcc16-cxx26-asan        # same, GCC + libstdc++
+cmake --preset linux-clang22-cxx26-tsan
+cmake --preset linux-clang22-cxx26-fuzzer    # libFuzzer + ASan + UBSan
+cmake --preset linux-clang22-cxx26-coverage  # -fprofile-instr-generate
 ```
 
-`Sanitizers.cmake` rejects the combinations the runtimes genuinely cannot do
-(TSan+ASan, MSan+ASan) rather than letting the linker produce something
-confusing.
+For valgrind, use any uninstrumented build and `ctest -T memcheck` from its
+build directory. `cmake/toolchains/common.cmake` rejects the combinations the
+runtimes genuinely cannot do (TSan+ASan, MSan+ASan) rather than letting the
+linker produce something confusing.
 
 **MSan needs one extra step.** It flags uninitialised reads anywhere in the
 process, including inside an uninstrumented standard library, so it needs a
 libc++ built with `-fsanitize=memory`. Run
-`sudo bash .devcontainer/build-msan-libcxx.sh` once; the `msan` preset already
-points at `/opt/libcxx-msan`. That build lives in the container layer, so a
+`sudo bash .devcontainer/build-msan-libcxx.sh` once; the
+`linux-clang22-cxx26-msan` preset already points at `/opt/libcxx-msan`. That build lives in the container layer, so a
 rebuild discards it; move it into the Dockerfile if you use MSan routinely.
 
 **If ASan aborts on startup** with a shadow-memory mapping error, that is the
@@ -158,15 +186,15 @@ development branch plus the last two releases, which is why anything below
 Clang 21 comes from Ubuntu and 22/23 come from LLVM. Budget roughly 1-1.5 GB
 per extra Clang.
 
-Presets cover the standards axis too: `gcc12-c20`, `gcc14-c23`, `gcc16-c23`,
-`gcc16-c26`, `clang18-c20`, `clang20-c23`, `clang22-c26`, `clang22-c2d`. Note
-`gcc16-c23`: a new compiler pinned to an old standard, which is the case that
+Presets cover the standards axis too: `linux-gcc12-cxx20`, `linux-gcc14-cxx23`, `linux-gcc16-cxx23`,
+`linux-gcc16-cxx26`, `linux-clang18-cxx20`, `linux-clang20-cxx23`, `linux-clang22-cxx26`, `linux-clang22-cxx2d`. Note
+`linux-gcc16-cxx23`: a new compiler pinned to an old standard, which is the case that
 catches fallback code assuming "new compiler implies new library".
 
 Each Clang is paired with its own matching libc++. That is not cosmetic: Clang
 reading libstdc++ headers from a much newer GCC breaks on built-ins it has not
 implemented, and with GCC 16 in the image that is the default outcome. The
-`clang18-c20-libstdcxx` preset shows the fix when you do need libstdc++ ABI
+`linux-clang18-cxx20-libstdcxx` preset shows the fix when you do need libstdc++ ABI
 compatibility: `--gcc-install-dir` pinned to a compatible GCC.
 
 ## Seeing which fallbacks fire
@@ -200,9 +228,9 @@ tree still works, which is exactly the story worth demonstrating.
 passes nothing but the path:
 
 ```bash
-cmake -S . -B build/clang22-c26 -G Ninja \
-      -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/clang22-c26.cmake
-cmake --build build/clang22-c26
+cmake -S . -B build/linux-clang22-cxx26 -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-clang22-cxx26.cmake
+cmake --build build/linux-clang22-cxx26
 ```
 
 That is the whole interface: no companion `-D` flags, no environment. Anything
@@ -272,7 +300,7 @@ Delete and reconfigure.
 
 **`CMAKE_CXX_STANDARD` here is a default, not a mandate.** A project that sets it
 itself, or a dependency calling `target_compile_features(... cxx_std_23)`, still
-wins. That matters most for the `c2d` toolchain: the raw `-std=c++2d` only
+wins. That matters most for the `cxx2d` toolchain: the raw `-std=c++2d` only
 survives while nothing asks CMake for a standard, because CMake appends its own
 `-std=` after `CMAKE_CXX_FLAGS`.
 

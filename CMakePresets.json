@@ -1,0 +1,31 @@
+{
+  "version": 6,
+  "include": ["CMakePresets-toolchains.json"],
+  "testPresets": [
+    {
+      "name": "linux-gcc16-cxx26",
+      "configurePreset": "linux-gcc16-cxx26",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-clang22-cxx26",
+      "configurePreset": "linux-clang22-cxx26",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-clang18-cxx20-libstdcxx",
+      "configurePreset": "linux-clang18-cxx20-libstdcxx",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-gcc16-cxx26-asan",
+      "configurePreset": "linux-gcc16-cxx26-asan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "linux-clang22-cxx26-asan",
+      "configurePreset": "linux-clang22-cxx26-asan",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

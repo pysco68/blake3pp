@@ -1,0 +1,38 @@
+#pragma once
+
+#include <cstdint>
+
+namespace blake3pp {
+
+namespace kern {
+struct kernel_ops;
+}
+
+// Instruction-set variants that may be compiled into this binary. Which ones
+// actually are is a build-time property (see cmake/ArchKernels.cmake); which
+// ones are usable is a runtime property of the CPU. auto_detect resolves to
+// the best usable variant.
+enum class arch : std::uint8_t {
+  auto_detect,
+  scalar,
+  sse42,
+  avx2,
+  avx512,
+  neon,
+};
+
+// True if this variant is compiled in AND supported by the running CPU.
+[[nodiscard]] bool is_available(arch a) noexcept;
+
+// The variant auto_detect resolves to on this machine.
+[[nodiscard]] arch best_available() noexcept;
+
+[[nodiscard]] const char* to_string(arch a) noexcept;
+
+namespace detail {
+// Maps an arch to its kernel table; unavailable variants fall back to the
+// best available one. Never returns null.
+[[nodiscard]] const kern::kernel_ops* resolve(arch a) noexcept;
+}
+
+}  // namespace blake3pp

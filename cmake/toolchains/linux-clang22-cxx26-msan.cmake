@@ -2,8 +2,8 @@
 #
 # Clang 22 with libc++ 22, C++26 + msan
 #
-#   cmake -S . -B build/clang22-c26-msan -G Ninja \
-#         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/clang22-c26-msan.cmake
+#   cmake -S . -B build/linux-clang22-cxx26-msan -G Ninja \
+#         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-clang22-cxx26-msan.cmake
 
 
 set(TC_C_COMPILER "clang-22")

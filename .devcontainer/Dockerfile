@@ -154,9 +154,11 @@ RUN set -eux; \
     useradd --uid ${USER_UID} --gid ${USER_GID} --create-home --shell /bin/bash ${USERNAME}; \
     echo "${USERNAME} ALL=(root) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}; \
     chmod 0440 /etc/sudoers.d/${USERNAME}; \
-    install -d -o ${USERNAME} -g ${USERNAME} \
+    mkdir -p \
       /home/${USERNAME}/.local/bin \
-      /home/${USERNAME}/.claude
+      /home/${USERNAME}/.config \
+      /home/${USERNAME}/.claude; \
+    chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}
 
 # Recorded so tools/feature-matrix.py and the presets can see what this image has.
 ENV DEVCONTAINER_GCC_VERSIONS="${GCC_VERSIONS}" \

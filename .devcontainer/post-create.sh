@@ -21,7 +21,7 @@ if ! grep -q '# >>> devcontainer >>>' "$BASHRC" 2>/dev/null; then
 # >>> devcontainer >>>
 export PATH="$HOME/.local/bin:$PATH"
 
-alias b='cmake --build build/$(basename "$(readlink -f build/.preset 2>/dev/null)" 2>/dev/null || echo gcc-26)'
+alias b='cmake --build build/$(basename "$(readlink -f build/.preset 2>/dev/null)" 2>/dev/null || echo linux-gcc16-cxx26)'
 # <<< devcontainer <<<
 EOF
 fi

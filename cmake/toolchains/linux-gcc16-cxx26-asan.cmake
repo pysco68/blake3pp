@@ -2,14 +2,13 @@
 #
 # GCC 16 with libstdc++ 16, C++26 + asan
 #
-#   cmake -S . -B build/gcc16-c26-asan -G Ninja \
-#         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/gcc16-c26-asan.cmake
+#   cmake -S . -B build/linux-gcc16-cxx26-asan -G Ninja \
+#         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-gcc16-cxx26-asan.cmake
 
 
 set(TC_C_COMPILER "gcc-16")
 set(TC_CXX_COMPILER "g++-16")
 set(TC_CXX_STANDARD "26")
-set(TC_LINKER "mold")
 set(TC_DEFAULT_BUILD_TYPE "Debug")
 set(TC_SANITIZERS address undefined)
 
