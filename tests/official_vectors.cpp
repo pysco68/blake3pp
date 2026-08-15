@@ -33,13 +33,22 @@ TEST_CASE("known answer for the empty input") {
         "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262");
 }
 
-TEST_CASE("explicitly selecting the scalar arch matches") {
-  for (const auto& c : blake3pp::testvec::cases) {
-    CAPTURE(c.input_len);
-    const auto input = make_input(c.input_len);
-    blake3pp::hasher h{blake3pp::arch::scalar};
-    h.update(input);
-    CHECK(h.finalize().to_hex() == std::string(c.hash).substr(0, 64));
+TEST_CASE("every available arch matches the official vectors") {
+  for (const auto a :
+       {blake3pp::arch::scalar, blake3pp::arch::sse42, blake3pp::arch::avx2,
+        blake3pp::arch::avx512, blake3pp::arch::neon}) {
+    if (!blake3pp::is_available(a)) {
+      MESSAGE("skipping unavailable arch: " << blake3pp::to_string(a));
+      continue;
+    }
+    CAPTURE(blake3pp::to_string(a));
+    for (const auto& c : blake3pp::testvec::cases) {
+      CAPTURE(c.input_len);
+      const auto input = make_input(c.input_len);
+      blake3pp::hasher h{a};
+      h.update(input);
+      CHECK(h.finalize().to_hex() == std::string(c.hash).substr(0, 64));
+    }
   }
 }
 

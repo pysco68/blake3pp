@@ -15,14 +15,25 @@
 include_guard(GLOBAL)
 
 function(blake3pp_add_kernel ns)
-  cmake_parse_arguments(PARSE_ARGV 1 AK "" "" "ARCH_FLAGS")
+  cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR" "" "ARCH_FLAGS")
 
   set(tgt "blake3pp_kernel_${ns}")
   add_library(${tgt} OBJECT "${PROJECT_SOURCE_DIR}/src/kernel/kernel.cpp")
   target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_ARCH_NS=${ns}")
+  if(AK_FORCE_SCALAR)
+    # The scalar fallback must be genuinely scalar: without this, the simd
+    # facade would still pick the baseline vector width (SSE2 on x86-64).
+    target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_FORCE_SCALAR=1")
+  endif()
   if(AK_ARCH_FLAGS)
     target_compile_options(${tgt} PRIVATE ${AK_ARCH_FLAGS})
   endif()
+  # The kernels are the hot loop and measurably faster at -O3 (GCC's
+  # std::simd path is ~2x slower at -O2). Applied only to optimized configs
+  # so Debug/sanitizer builds keep their debuggability; appended after the
+  # config flags, so it wins over RelWithDebInfo's -O2.
+  target_compile_options(${tgt} PRIVATE
+    "$<$<CONFIG:Release,RelWithDebInfo>:-O3>")
   target_include_directories(${tgt} PRIVATE
     "${PROJECT_SOURCE_DIR}/src"
     "${PROJECT_SOURCE_DIR}/include")

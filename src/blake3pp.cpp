@@ -26,6 +26,25 @@ arch hasher::selected_arch() const noexcept {
   return arch::scalar;
 }
 
+// Merge completed subtrees, then push: each trailing zero bit of
+// total_chunks is a full binary subtree whose sibling is on the stack
+// (spec 5.1.2).
+void hasher::push_chunk_cv(const std::uint32_t cv[8],
+                           std::uint64_t total_chunks) noexcept {
+  std::uint32_t new_cv[8];
+  std::memcpy(new_cv, cv, sizeof(new_cv));
+  std::uint64_t chunks = total_chunks;
+  while ((chunks & 1) == 0) {
+    cv_stack_len_--;
+    core::chaining_value(
+        *ops_, core::parent_output(cv_stack_[cv_stack_len_], new_cv, kern::iv),
+        new_cv);
+    chunks >>= 1;
+  }
+  std::memcpy(cv_stack_[cv_stack_len_], new_cv, sizeof(new_cv));
+  cv_stack_len_++;
+}
+
 void hasher::update(std::span<const std::byte> input) noexcept {
   const auto* p = reinterpret_cast<const std::uint8_t*>(input.data());
   std::size_t len = input.size();
@@ -37,24 +56,42 @@ void hasher::update(std::span<const std::byte> input) noexcept {
       std::uint32_t chunk_cv[8];
       core::chaining_value(*ops_, core::chunk_output(chunk_), chunk_cv);
       const std::uint64_t total_chunks = chunk_.chunk_counter + 1;
-
-      // Merge completed subtrees: each trailing zero bit of total_chunks is
-      // a full binary subtree whose sibling is on the stack (spec 5.1.2).
-      std::uint64_t chunks = total_chunks;
-      std::uint32_t new_cv[8];
-      std::memcpy(new_cv, chunk_cv, sizeof(new_cv));
-      while ((chunks & 1) == 0) {
-        cv_stack_len_--;
-        core::chaining_value(
-            *ops_,
-            core::parent_output(cv_stack_[cv_stack_len_], new_cv, kern::iv),
-            new_cv);
-        chunks >>= 1;
-      }
-      std::memcpy(cv_stack_[cv_stack_len_], new_cv, sizeof(new_cv));
-      cv_stack_len_++;
-
+      push_chunk_cv(chunk_cv, total_chunks);
       core::chunk_init(chunk_, kern::iv, total_chunks);
+    }
+
+    // SIMD fast path: aligned on a chunk boundary with more than one whole
+    // chunk ahead, hand hash_many a batch of chunks. The strict > keeps at
+    // least one byte out of the batch, so no batched chunk can turn out to
+    // be the message's last (which would need CHUNK_END-with-ROOT handling).
+    if (core::chunk_len(chunk_) == 0 && len > kern::chunk_len) {
+      const std::size_t safe_chunks = (len - 1) / kern::chunk_len;
+      const std::size_t n = safe_chunks < ops_->simd_degree
+                                ? safe_chunks
+                                : ops_->simd_degree;
+      const std::uint8_t* ptrs[kern::max_simd_degree];
+      std::uint8_t cvs[kern::max_simd_degree * kern::out_len];
+      for (std::size_t j = 0; j < n; ++j) {
+        ptrs[j] = p + j * kern::chunk_len;
+      }
+      ops_->hash_many(ptrs, n, kern::chunk_len / kern::block_len, kern::iv,
+                      chunk_.chunk_counter, /*increment_counter=*/true, 0,
+                      kern::flag_chunk_start, kern::flag_chunk_end, cvs);
+      for (std::size_t j = 0; j < n; ++j) {
+        std::uint32_t cv[8];
+        for (std::size_t w = 0; w < 8; ++w) {
+          const std::uint8_t* b = cvs + j * kern::out_len + 4 * w;
+          cv[w] = static_cast<std::uint32_t>(b[0]) |
+                  (static_cast<std::uint32_t>(b[1]) << 8) |
+                  (static_cast<std::uint32_t>(b[2]) << 16) |
+                  (static_cast<std::uint32_t>(b[3]) << 24);
+        }
+        push_chunk_cv(cv, chunk_.chunk_counter + j + 1);
+      }
+      chunk_.chunk_counter += n;
+      p += n * kern::chunk_len;
+      len -= n * kern::chunk_len;
+      continue;
     }
 
     const std::size_t room = kern::chunk_len - core::chunk_len(chunk_);

@@ -37,6 +37,25 @@ TEST_CASE("split at awkward offsets") {
   }
 }
 
+// Large enough that the SIMD batch fast path engages (multiple full
+// hash_many batches on every wide arch), split at offsets that leave the
+// hasher mid-chunk, exactly on chunk boundaries, and mid-batch.
+TEST_CASE("large input splits cross the batch fast path") {
+  const auto input = make_input(300 * 1024 + 7);
+  const auto expected = blake3pp::hash(input);
+
+  for (const std::size_t split :
+       {std::size_t{1}, std::size_t{1024}, std::size_t{1500},
+        std::size_t{16 * 1024}, std::size_t{17 * 1024 + 3},
+        std::size_t{299 * 1024}}) {
+    CAPTURE(split);
+    blake3pp::hasher h;
+    h.update(std::span{input}.first(split));
+    h.update(std::span{input}.subspan(split));
+    CHECK(h.finalize() == expected);
+  }
+}
+
 TEST_CASE("byte at a time") {
   const auto input = make_input(3073);
   const auto expected = blake3pp::hash(input);

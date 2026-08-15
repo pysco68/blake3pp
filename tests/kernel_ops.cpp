@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include <blake3pp/dispatch.hpp>
 #include <doctest/doctest.h>
 
 #include "kernel/kernel.hpp"
@@ -22,6 +23,43 @@ TEST_CASE("scalar table is populated") {
   CHECK(scalar::ops.simd_degree == 1u);
   CHECK(scalar::ops.compress_in_place != nullptr);
   CHECK(scalar::ops.hash_many != nullptr);
+}
+
+// Every variant's hash_many against the scalar oracle, on an input count
+// that exercises both the full-batch path and the serial remainder.
+TEST_CASE("hash_many agrees across all available arches") {
+  constexpr std::size_t num_inputs = 33;  // not a multiple of any lane width
+  constexpr std::size_t blocks = chunk_len / block_len;
+  std::vector<std::uint8_t> data(num_inputs * blocks * block_len);
+  for (std::size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<std::uint8_t>(i % 251);
+  }
+  const std::uint8_t* inputs[num_inputs];
+  for (std::size_t i = 0; i < num_inputs; ++i) {
+    inputs[i] = data.data() + i * blocks * block_len;
+  }
+
+  std::vector<std::uint8_t> expected(num_inputs * out_len);
+  scalar::ops.hash_many(inputs, num_inputs, blocks, iv, 100,
+                        /*increment_counter=*/true, 0, flag_chunk_start,
+                        flag_chunk_end, expected.data());
+
+  for (const auto a :
+       {blake3pp::arch::sse42, blake3pp::arch::avx2, blake3pp::arch::avx512,
+        blake3pp::arch::neon}) {
+    if (!blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(blake3pp::to_string(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    CHECK(ops->simd_degree > 1u);
+    std::vector<std::uint8_t> out(num_inputs * out_len);
+    ops->hash_many(inputs, num_inputs, blocks, iv, 100,
+                   /*increment_counter=*/true, 0, flag_chunk_start,
+                   flag_chunk_end, out.data());
+    CHECK(out == expected);
+  }
 }
 
 TEST_CASE("hash_many matches a per-input compress loop") {

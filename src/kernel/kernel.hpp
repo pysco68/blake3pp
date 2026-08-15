@@ -20,6 +20,10 @@ inline constexpr std::size_t block_len = 64;
 inline constexpr std::size_t chunk_len = 1024;
 inline constexpr std::size_t out_len = 32;
 
+// Upper bound on any variant's simd_degree (AVX-512: 16 u32 lanes); sizes
+// the caller-side staging buffers for hash_many batches.
+inline constexpr std::size_t max_simd_degree = 16;
+
 // BLAKE3 IV (identical to BLAKE2s / SHA-256's first eight constants).
 inline constexpr std::uint32_t iv[8] = {
     0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u, 0xA54FF53Au,
