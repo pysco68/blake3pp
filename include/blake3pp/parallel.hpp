@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-#include <blake3pp/blake3pp.hpp>
+#include <blake3pp/core.hpp>
 
 #if defined(BLAKE3PP_HAS_STD_SENDERS)
 #include <execution>

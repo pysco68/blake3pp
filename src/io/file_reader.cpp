@@ -14,7 +14,7 @@
 #include <system_error>
 #include <vector>
 
-#include <blake3pp/blake3pp.hpp>  // chunk_size
+#include <blake3pp/core.hpp>  // chunk_size
 
 #if defined(__unix__) || defined(__APPLE__)
 #define BLAKE3PP_IO_POSIX 1

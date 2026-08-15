@@ -9,12 +9,15 @@ direct I/O behind a unified interface.
 
 ## Using the library
 
-Everything lives in `namespace blake3pp`. Three headers, by concern:
+Everything lives in `namespace blake3pp`, and
+`#include <blake3pp/blake3pp.hpp>` gets you all of it. Compile-cost-aware
+consumers can pick granular headers instead:
 
-| header                  | provides |
-|-------------------------|----------|
-| `<blake3pp/blake3pp.hpp>` | `digest`, `hasher`, one-shot `hash()`, arch introspection |
-| `<blake3pp/parallel.hpp>` | multi-core `hash()` over a sender/receiver scheduler |
+| header                    | provides |
+|---------------------------|----------|
+| `<blake3pp/blake3pp.hpp>` | umbrella: everything below |
+| `<blake3pp/core.hpp>`     | `digest`, `hasher`, one-shot `hash()`, arch introspection |
+| `<blake3pp/parallel.hpp>` | multi-core `hash()` and `parallel_hasher` |
 | `<blake3pp/io.hpp>`       | `hash_file()`, the async direct-I/O pipeline |
 
 ### One-shot hashing

@@ -22,7 +22,7 @@
 #include <system_error>
 #include <utility>
 
-#include <blake3pp/blake3pp.hpp>
+#include <blake3pp/core.hpp>
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/parallel.hpp>
 

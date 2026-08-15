@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include <blake3pp/blake3pp.hpp>
+#include <blake3pp/core.hpp>
 
 #include "kernel/kernel.hpp"
 
