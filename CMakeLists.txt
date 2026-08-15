@@ -32,7 +32,9 @@ target_compile_options(blake3pp_warnings INTERFACE
 
 add_library(blake3pp STATIC
   src/blake3pp.cpp
-  src/dispatch/dispatch.cpp)
+  src/dispatch/dispatch.cpp
+  src/io/file_reader.cpp
+  src/io_hash.cpp)
 add_library(blake3pp::blake3pp ALIAS blake3pp)
 
 target_compile_features(blake3pp PUBLIC cxx_std_20)

@@ -13,6 +13,11 @@ target_link_libraries(blake3pp_bench PRIVATE
 # upstream's assembly, which needs the internal kernel boundary header.
 target_include_directories(blake3pp_bench PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
+add_executable(blake3pp_bench_file file_throughput.cpp)
+target_link_libraries(blake3pp_bench_file PRIVATE
+  blake3pp::blake3pp
+  blake3pp_warnings)
+
 if(BLAKE3PP_BENCH_UPSTREAM)
   # The upstream library is C plus hand-written assembly; enabling the
   # languages here (rather than letting its nested project() try) keeps
