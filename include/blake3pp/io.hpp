@@ -47,43 +47,6 @@ struct hash_file_options {
                                std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept;
 
-namespace detail {
-
-// Fans one full window (num_chunks: power of two, counter-aligned) out
-// over the scheduler and absorbs the part CVs in file order.
-template <class Scheduler>
-void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
-                          hasher& h, const std::byte* data,
-                          std::size_t num_chunks,
-                          std::uint64_t chunk_counter) {
-  constexpr std::size_t max_parts = 256;
-  const std::size_t part = std::bit_floor(
-      std::max<std::size_t>(num_chunks / max_parts + 1, 16));
-  if (part >= num_chunks) {
-    // Window too small to fan out; hash it inline.
-    h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
-    return;
-  }
-  const std::size_t n_parts = num_chunks / part;
-
-  struct alignas(64) padded_cv {
-    std::uint32_t words[8];
-  };
-  padded_cv cvs[2 * max_parts];
-
-  auto work = ex::schedule(sched) |
-              ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
-                compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                                    chunk_counter + i * part, cvs[i].words);
-              });
-  ex::sync_wait(std::move(work));
-  for (std::size_t i = 0; i < n_parts; ++i) {
-    h.push_subtree_cv(cvs[i].words, part);
-  }
-}
-
-}  // namespace detail
-
 // The full pipeline: async reads + parallel subtree hashing per window.
 // Throws std::system_error on I/O failure. (The scheduler concept
 // constraint keeps this template from hijacking the options-only

@@ -1,21 +1,81 @@
 // Runtime architecture routing. Selection stays a plain pointer to a
 // constexpr-initialized POD table: no heap, no vtable, no ifunc.
 //
-// On x86 the check is __builtin_cpu_supports, which goes through libgcc /
-// compiler-rt's cpu-model probe; that includes the OSXSAVE/XCR0 check, so
-// "avx2" is only reported when the OS actually saves YMM state, not merely
-// when the CPU has the silicon. On AArch64, NEON is architecturally
-// mandatory, so presence of the kernel implies availability.
+// Which variants exist in this binary is not hand-maintained here: the
+// build system generates blake3pp_kernel_registry.inc from the
+// blake3pp_add_kernel() calls, and the X-macro expansions below turn it
+// into the extern declarations and the dispatch/query tables. Register a
+// kernel in CMake and it shows up everywhere; there is no second list to
+// forget to update.
+//
+// On x86 the CPU check is __builtin_cpu_supports, which goes through
+// libgcc / compiler-rt's cpu-model probe; that includes the OSXSAVE/XCR0
+// check, so "avx2" is only reported when the OS actually saves YMM state,
+// not merely when the CPU has the silicon. On AArch64, NEON is
+// architecturally mandatory, so presence of the kernel implies
+// availability.
 
 #include <blake3pp/dispatch.hpp>
 
-#include <initializer_list>
+#include <array>
+#include <cstddef>
 
 #include "kernel/kernel.hpp"
 
 namespace blake3pp {
 
+namespace kern {
+#define BLAKE3PP_KERNEL(ns) \
+  namespace ns {            \
+  extern const kernel_ops ops; \
+  }
+#include "blake3pp_kernel_registry.inc"
+#undef BLAKE3PP_KERNEL
+}  // namespace kern
+
 namespace {
+
+struct registry_entry {
+  arch a;
+  const kern::kernel_ops* ops;
+};
+
+constexpr registry_entry registry[] = {
+#define BLAKE3PP_KERNEL(ns) {arch::ns, &kern::ns::ops},
+#include "blake3pp_kernel_registry.inc"
+#undef BLAKE3PP_KERNEL
+};
+
+constexpr std::size_t num_kernels = std::size(registry);
+
+// Best-first dispatch preference; must name every registerable variant.
+constexpr arch preference[] = {arch::avx512, arch::avx2, arch::sse42,
+                               arch::neon, arch::scalar};
+
+// The compiled variants, sorted best-first, computed at compile time.
+constexpr std::array<arch, num_kernels> compiled_sorted = [] {
+  std::array<arch, num_kernels> out{};
+  std::size_t i = 0;
+  for (const arch p : preference) {
+    for (const registry_entry& e : registry) {
+      if (e.a == p) {
+        out[i++] = p;
+      }
+    }
+  }
+  return out;
+}();
+static_assert(compiled_sorted.back() == arch::scalar,
+              "the scalar fallback must always be registered");
+
+bool compiled_in(arch a) noexcept {
+  for (const registry_entry& e : registry) {
+    if (e.a == a) {
+      return true;
+    }
+  }
+  return false;
+}
 
 bool cpu_supports(arch a) noexcept {
   switch (a) {
@@ -43,30 +103,21 @@ bool cpu_supports(arch a) noexcept {
   }
 }
 
-bool compiled_in(arch a) noexcept {
-  switch (a) {
-    case arch::auto_detect:
-    case arch::scalar:
-      return true;
-#if defined(BLAKE3PP_HAS_KERNEL_SSE42)
-    case arch::sse42:
-      return true;
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_AVX2)
-    case arch::avx2:
-      return true;
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_AVX512)
-    case arch::avx512:
-      return true;
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_NEON)
-    case arch::neon:
-      return true;
-#endif
-    default:
-      return false;
-  }
+// Built once; storage is static, so the returned span never dangles.
+std::span<const arch> available_impl() noexcept {
+  static const auto table = [] {
+    struct {
+      std::array<arch, num_kernels> entries{};
+      std::size_t count = 0;
+    } t;
+    for (const arch a : compiled_sorted) {
+      if (cpu_supports(a)) {
+        t.entries[t.count++] = a;
+      }
+    }
+    return t;
+  }();
+  return {table.entries.data(), table.count};
 }
 
 }  // namespace
@@ -75,14 +126,11 @@ bool is_available(arch a) noexcept {
   return compiled_in(a) && cpu_supports(a);
 }
 
-arch best_available() noexcept {
-  for (const arch a : {arch::avx512, arch::avx2, arch::sse42, arch::neon}) {
-    if (is_available(a)) {
-      return a;
-    }
-  }
-  return arch::scalar;
-}
+arch best_available() noexcept { return available_impl().front(); }
+
+std::span<const arch> compiled_arches() noexcept { return compiled_sorted; }
+
+std::span<const arch> available_arches() noexcept { return available_impl(); }
 
 const char* to_string(arch a) noexcept {
   switch (a) {
@@ -105,29 +153,23 @@ const char* to_string(arch a) noexcept {
 namespace detail {
 
 const kern::kernel_ops* resolve(arch a) noexcept {
-  if (a == arch::auto_detect || !is_available(a)) {
+  if (a == arch::auto_detect || !cpu_supports(a)) {
     a = best_available();
   }
-  switch (a) {
-#if defined(BLAKE3PP_HAS_KERNEL_SSE42)
-    case arch::sse42:
-      return &kern::sse42::ops;
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_AVX2)
-    case arch::avx2:
-      return &kern::avx2::ops;
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_AVX512)
-    case arch::avx512:
-      return &kern::avx512::ops;
-#endif
-#if defined(BLAKE3PP_HAS_KERNEL_NEON)
-    case arch::neon:
-      return &kern::neon::ops;
-#endif
-    default:
-      return &kern::scalar::ops;
+  for (const registry_entry& e : registry) {
+    if (e.a == a) {
+      return e.ops;
+    }
   }
+  // Requested variant not compiled in: fall back to the best one that is.
+  for (const arch b : available_impl()) {
+    for (const registry_entry& e : registry) {
+      if (e.a == b) {
+        return e.ops;
+      }
+    }
+  }
+  return &kern::scalar::ops;  // unreachable: scalar is always registered
 }
 
 }  // namespace detail

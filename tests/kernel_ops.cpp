@@ -2,6 +2,7 @@
 // SIMD variants (M2) implement with lanes-as-inputs, so its scalar semantics
 // are pinned down here as the oracle every variant must match.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string_view>
@@ -17,6 +18,27 @@ namespace {
 using namespace blake3pp::kern;
 
 TEST_SUITE("kernel_ops") {
+
+TEST_CASE("arch introspection invariants") {
+  const auto compiled = blake3pp::compiled_arches();
+  REQUIRE(!compiled.empty());
+  CHECK(compiled.back() == blake3pp::arch::scalar);  // fallback always in
+
+  const auto avail = blake3pp::available_arches();
+  REQUIRE(!avail.empty());
+  CHECK(avail.front() == blake3pp::best_available());
+
+  for (const auto a : avail) {
+    CAPTURE(blake3pp::to_string(a));
+    CHECK(blake3pp::is_available(a));
+    CHECK(std::find(compiled.begin(), compiled.end(), a) != compiled.end());
+  }
+  // Anything compiled but not available must be a CPU limitation, and
+  // resolve() must still hand back a usable table for it.
+  for (const auto a : compiled) {
+    CHECK(blake3pp::detail::resolve(a) != nullptr);
+  }
+}
 
 TEST_CASE("scalar table is populated") {
   CHECK(std::string_view{scalar::ops.name} == "scalar");

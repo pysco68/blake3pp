@@ -44,6 +44,50 @@ TEST_CASE("parallel hash matches sequential at every size class") {
   }
 }
 
+TEST_CASE("parallel_hasher matches sequential across streaming patterns") {
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+  exec::static_thread_pool pool(std::thread::hardware_concurrency());
+  // Small window + odd bite size force many flushes and window straddles.
+  const blake3pp::parallel_hasher_options opts{.window_bytes = 128 * 1024};
+
+  for (const std::size_t len :
+       {std::size_t{0}, std::size_t{100}, std::size_t{128 * 1024},
+        std::size_t{128 * 1024 + 1}, std::size_t{512 * 1024},
+        std::size_t{(3 * 128 + 55) * 1024 + 77}}) {
+    CAPTURE(len);
+    const auto input = make_input(len);
+    blake3pp::parallel_hasher ph{pool.get_scheduler(), opts};
+    std::size_t pos = 0;
+    while (pos < input.size()) {
+      const std::size_t bite = std::min<std::size_t>(77777, len - pos);
+      ph.update(std::span{input}.subspan(pos, bite));
+      pos += bite;
+    }
+    CHECK(ph.finalize() == blake3pp::hash(input));
+  }
+#endif
+}
+
+TEST_CASE("parallel_hasher checkpoints and resets like hasher") {
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+  exec::static_thread_pool pool(4);
+  const auto input = make_input(700 * 1024 + 3);
+
+  blake3pp::parallel_hasher ph{pool.get_scheduler(),
+                               {.window_bytes = 128 * 1024}};
+  ph.update(std::span{input}.first(300 * 1024));
+  // finalize() is non-destructive: a mid-stream checkpoint...
+  CHECK(ph.finalize() == blake3pp::hash(std::span{input}.first(300 * 1024)));
+  // ...and hashing continues correctly afterwards.
+  ph.update(std::span{input}.subspan(300 * 1024));
+  CHECK(ph.finalize() == blake3pp::hash(input));
+
+  ph.reset();
+  ph.update("fresh start");
+  CHECK(ph.finalize() == blake3pp::hash(std::string_view{"fresh start"}));
+#endif
+}
+
 TEST_CASE("parallel hash is deterministic across runs") {
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
   exec::static_thread_pool pool(std::thread::hardware_concurrency());

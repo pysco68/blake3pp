@@ -46,6 +46,13 @@ struct digest {
   // Parses 64 hex characters (either case); nullopt on any malformation.
   [[nodiscard]] static std::optional<digest> from_hex(
       std::string_view hex) noexcept;
+
+  // The verification entry point: true iff hex parses and denotes exactly
+  // this digest. The byte comparison is constant-time (unlike operator==,
+  // which is for ordinary value semantics), so this is the right call when
+  // the expected digest comes from an untrusted or security-relevant
+  // source. Malformed hex is simply no match.
+  [[nodiscard]] bool matches(std::string_view hex) const noexcept;
 };
 
 // Incremental BLAKE3 hasher. Fixed-size, trivially relocatable state; never

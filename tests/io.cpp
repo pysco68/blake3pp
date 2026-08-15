@@ -162,6 +162,26 @@ TEST_CASE("digest hex round trip and std::format") {
 #endif
 }
 
+TEST_CASE("digest::matches verifies hex in one step") {
+  const auto d = blake3pp::hash(std::string_view{"verify me"});
+  CHECK(d.matches(d.to_hex()));
+  std::string upper = d.to_hex();
+  for (char& c : upper) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  CHECK(d.matches(upper));                       // case-insensitive
+  CHECK(!d.matches("abc"));                      // malformed: no match
+  CHECK(!d.matches(std::string(64, 'g')));       // non-hex: no match
+  auto other = d.to_hex();
+  other[0] = other[0] == '0' ? '1' : '0';
+  CHECK(!d.matches(other));                      // wrong digest
+
+  // The optional<digest> == digest spelling needs no library support:
+  // std::optional's heterogeneous comparison handles it (false on nullopt).
+  CHECK(blake3pp::digest::from_hex(d.to_hex()) == d);
+  CHECK(blake3pp::digest::from_hex("nope") != d);
+}
+
 }  // TEST_SUITE
 
 }  // namespace

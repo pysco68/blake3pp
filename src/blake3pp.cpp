@@ -182,6 +182,20 @@ std::optional<digest> digest::from_hex(std::string_view hex) noexcept {
   return d;
 }
 
+bool digest::matches(std::string_view hex) const noexcept {
+  const std::optional<digest> parsed = from_hex(hex);
+  if (!parsed.has_value()) {
+    return false;
+  }
+  // Accumulate the whole difference before deciding: no data-dependent
+  // early exit, so comparison time is independent of where bytes differ.
+  unsigned acc = 0;
+  for (std::size_t i = 0; i < bytes.size(); ++i) {
+    acc |= std::to_integer<unsigned>(bytes[i] ^ parsed->bytes[i]);
+  }
+  return acc == 0;
+}
+
 std::string digest::to_hex() const {
   static constexpr char alphabet[] = "0123456789abcdef";
   std::string s;

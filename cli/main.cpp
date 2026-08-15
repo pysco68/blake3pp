@@ -51,12 +51,11 @@ std::string version_text() {
   out += "execution provider: stdexec\n";
 #endif
   out += "variants:";
-  for (const auto a : {blake3pp::arch::scalar, blake3pp::arch::sse42,
-                       blake3pp::arch::avx2, blake3pp::arch::avx512,
-                       blake3pp::arch::neon}) {
-    if (blake3pp::is_available(a)) {
-      out += ' ';
-      out += blake3pp::to_string(a);
+  for (const auto a : blake3pp::compiled_arches()) {
+    out += ' ';
+    out += blake3pp::to_string(a);
+    if (!blake3pp::is_available(a)) {
+      out += "[no cpu support]";
     }
   }
   out += " (auto -> ";
