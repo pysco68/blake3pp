@@ -25,14 +25,14 @@ static_assert(u32v::width <= max_simd_degree);
 
 // Byte-wise little-endian load/store: endian-independent, and every compiler
 // folds it to a single mov on LE targets.
-inline std::uint32_t load32(const std::uint8_t* p) noexcept {
+BLAKE3PP_FORCE_INLINE std::uint32_t load32(const std::uint8_t* p) noexcept {
   return static_cast<std::uint32_t>(p[0]) |
          (static_cast<std::uint32_t>(p[1]) << 8) |
          (static_cast<std::uint32_t>(p[2]) << 16) |
          (static_cast<std::uint32_t>(p[3]) << 24);
 }
 
-inline void store32(std::uint8_t* p, std::uint32_t v) noexcept {
+BLAKE3PP_FORCE_INLINE void store32(std::uint8_t* p, std::uint32_t v) noexcept {
   p[0] = static_cast<std::uint8_t>(v);
   p[1] = static_cast<std::uint8_t>(v >> 8);
   p[2] = static_cast<std::uint8_t>(v >> 16);
@@ -40,7 +40,7 @@ inline void store32(std::uint8_t* p, std::uint32_t v) noexcept {
 }
 
 template <int N>
-inline std::uint32_t rot(std::uint32_t x) noexcept {
+BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {
   return std::rotr(x, N);
 }
 
@@ -80,7 +80,7 @@ constexpr auto msg_schedule = make_msg_schedule();
 // (Clang 0.77 GiB/s). The residual vs hand-written assembly is scheduler
 // quality, and source-level reordering cannot reliably buy it back.
 template <class W>
-inline void g(W v[16], std::size_t a, std::size_t b, std::size_t c,
+BLAKE3PP_FORCE_INLINE void g(W v[16], std::size_t a, std::size_t b, std::size_t c,
               std::size_t d, W mx, W my) noexcept {
   v[a] = v[a] + v[b] + mx;
   v[d] = rot<16>(v[d] ^ v[a]);
@@ -96,7 +96,7 @@ inline void g(W v[16], std::size_t a, std::size_t b, std::size_t c,
 // compile-time constant: message operands stay directly addressable instead
 // of register-indexed loads.
 template <std::size_t R, class W>
-inline void round_fn(W v[16], const W m[16]) noexcept {
+BLAKE3PP_FORCE_INLINE void round_fn(W v[16], const W m[16]) noexcept {
   constexpr const std::array<std::uint8_t, 16>& s = msg_schedule[R];
   // Columns.
   g(v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
@@ -111,13 +111,14 @@ inline void round_fn(W v[16], const W m[16]) noexcept {
 }
 
 template <class W>
-inline void all_rounds(W v[16], const W m[16]) noexcept {
-  [&]<std::size_t... R>(std::index_sequence<R...>) {
+BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
+  [&]<std::size_t... R>(std::index_sequence<R...>)
+      BLAKE3PP_LAMBDA_FORCE_INLINE {
     (round_fn<R>(v, m), ...);
   }(std::make_index_sequence<7>{});
 }
 
-inline void compress(const std::uint32_t cv[8],
+BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
                      const std::uint8_t block[block_len], std::uint32_t len,
                      std::uint64_t counter, std::uint32_t flags,
                      std::array<std::uint32_t, 16>& out) noexcept {

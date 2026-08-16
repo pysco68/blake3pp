@@ -38,6 +38,12 @@ function(blake3pp_add_kernel ns)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
       target_compile_options(${tgt} PRIVATE
         "$<$<CONFIG:Release,RelWithDebInfo>:/clang:-O3>")
+    else()
+      # cl's default inlining budget (/Ob2) gives up on the facade's
+      # template chains (measured: the sse42 kernel came out as a call
+      # soup with 12 vector adds total). /Ob3 raises the budget.
+      target_compile_options(${tgt} PRIVATE
+        "$<$<CONFIG:Release,RelWithDebInfo>:/Ob3>")
     endif()
   else()
     target_compile_options(${tgt} PRIVATE

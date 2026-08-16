@@ -50,7 +50,7 @@ namespace transpose_detail {
 // raced, not detected. All three paths compile into the W==16 kernel; the
 // relaxed load deciding between them amortizes over a >=16 KiB batch.
 
-inline transpose16_mode t16_mode() noexcept {
+BLAKE3PP_FORCE_INLINE transpose16_mode t16_mode() noexcept {
   return transpose16_active.load(std::memory_order_relaxed);
 }
 
@@ -80,19 +80,19 @@ struct vext<16> {
 };
 
 template <int... I, class V>
-inline V shuf(V a, V b) noexcept {
+BLAKE3PP_FORCE_INLINE V shuf(V a, V b) noexcept {
   return __builtin_shufflevector(a, b, I...);
 }
 
 template <class V>
-inline V load_row(const std::uint8_t* p) noexcept {
+BLAKE3PP_FORCE_INLINE V load_row(const std::uint8_t* p) noexcept {
   V r;
   std::memcpy(&r, p, sizeof(r));
   return r;
 }
 
 // 4x4: two radix-2 stages (32-bit unpacks, then 64-bit unpacks).
-inline void transpose(const vext<4>::type r[4], vext<4>::type out[4]) noexcept {
+BLAKE3PP_FORCE_INLINE void transpose(const vext<4>::type r[4], vext<4>::type out[4]) noexcept {
   using V = vext<4>::type;
   const V a0 = shuf<0, 4, 1, 5>(r[0], r[1]);
   const V a1 = shuf<2, 6, 3, 7>(r[0], r[1]);
@@ -107,7 +107,7 @@ inline void transpose(const vext<4>::type r[4], vext<4>::type out[4]) noexcept {
 // 8x8: three radix-2 stages. The index sets are lane-local on purpose:
 // they are exactly vpunpckl/hdq, vpunpckl/hqdq, and the final cross-lane
 // merge vperm2i128/vinserti128.
-inline void transpose(const vext<8>::type r[8], vext<8>::type out[8]) noexcept {
+BLAKE3PP_FORCE_INLINE void transpose(const vext<8>::type r[8], vext<8>::type out[8]) noexcept {
   using V = vext<8>::type;
   const V a0 = shuf<0, 8, 1, 9, 4, 12, 5, 13>(r[0], r[1]);
   const V a1 = shuf<2, 10, 3, 11, 6, 14, 7, 15>(r[0], r[1]);
@@ -142,7 +142,7 @@ inline void transpose(const vext<8>::type r[8], vext<8>::type out[8]) noexcept {
 // generic lowering lands on vpermt2d (any two-source dword permute, one
 // uop). 64 two-register shuffles replace the 256 scalar load/stores of
 // the staging gather.
-inline void transpose(const vext<16>::type r[16],
+BLAKE3PP_FORCE_INLINE void transpose(const vext<16>::type r[16],
                       vext<16>::type out[16]) noexcept {
   using V = vext<16>::type;
   V a[16];
@@ -187,7 +187,7 @@ inline void transpose(const vext<16>::type r[16],
 // transpose per 128-bit lane finishes the job (same s1/s2 index lists as
 // the full tree; all vpunpck, no cross-lane traffic).
 template <class V>
-inline void inlane_4x4(const V (&r)[4], V (&t)[4]) noexcept {
+BLAKE3PP_FORCE_INLINE void inlane_4x4(const V (&r)[4], V (&t)[4]) noexcept {
   const V a0 = shuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
                     29>(r[0], r[1]);
   const V a1 = shuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15,
@@ -222,7 +222,7 @@ struct bext<8> {
 };
 
 template <int RB, std::size_t W>
-inline typename vext<W>::type rot_bytes(typename vext<W>::type x) noexcept {
+BLAKE3PP_FORCE_INLINE typename vext<W>::type rot_bytes(typename vext<W>::type x) noexcept {
   using B = typename bext<W>::type;
   const B b = std::bit_cast<B>(x);
   const B r = [&]<std::size_t... I>(std::index_sequence<I...>) {
@@ -256,14 +256,14 @@ inline typename vext<W>::type rot_bytes(typename vext<W>::type x) noexcept {
 // still far ahead of the scalar staging gather. This is what makes the
 // xsimd provider self-contained: no compiler-specific machinery required.
 template <std::uint32_t... I, class B>
-inline B xshuf(B a, B b) noexcept {
+BLAKE3PP_FORCE_INLINE B xshuf(B a, B b) noexcept {
   return xsimd::shuffle(
       a, b,
       xsimd::batch_constant<std::uint32_t, typename B::arch_type, I...>{});
 }
 
 template <class B>
-inline void xtranspose(const B (&r)[4], B (&out)[4]) noexcept {
+BLAKE3PP_FORCE_INLINE void xtranspose(const B (&r)[4], B (&out)[4]) noexcept {
   const B a0 = xshuf<0, 4, 1, 5>(r[0], r[1]);
   const B a1 = xshuf<2, 6, 3, 7>(r[0], r[1]);
   const B a2 = xshuf<0, 4, 1, 5>(r[2], r[3]);
@@ -275,7 +275,7 @@ inline void xtranspose(const B (&r)[4], B (&out)[4]) noexcept {
 }
 
 template <class B>
-inline void xtranspose(const B (&r)[8], B (&out)[8]) noexcept {
+BLAKE3PP_FORCE_INLINE void xtranspose(const B (&r)[8], B (&out)[8]) noexcept {
   const B a0 = xshuf<0, 8, 1, 9, 4, 12, 5, 13>(r[0], r[1]);
   const B a1 = xshuf<2, 10, 3, 11, 6, 14, 7, 15>(r[0], r[1]);
   const B a2 = xshuf<0, 8, 1, 9, 4, 12, 5, 13>(r[2], r[3]);
@@ -303,7 +303,7 @@ inline void xtranspose(const B (&r)[8], B (&out)[8]) noexcept {
 }
 
 template <class B>
-inline void xtranspose(const B (&r)[16], B (&out)[16]) noexcept {
+BLAKE3PP_FORCE_INLINE void xtranspose(const B (&r)[16], B (&out)[16]) noexcept {
   B a[16];
   for (std::size_t g = 0; g < 8; ++g) {
     a[2 * g] = xshuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
@@ -341,8 +341,20 @@ inline void xtranspose(const B (&r)[16], B (&out)[16]) noexcept {
   }
 }
 
+// Byte-rotate mask: dest byte i of each 32-bit element takes source byte
+// ((i%4)+RB)%4, a little-endian rotr by 8*RB bits, the same pattern the
+// vext rot_bytes encodes. Lane-local by construction, which is what makes
+// xsimd 14.3's constant u8 swizzle emit a single vpshufb (its
+// is_cross_lane check) instead of a cross-lane fixup.
+template <int RB>
+struct rot_bytes_gen {
+  static constexpr std::uint8_t get(std::size_t i, std::size_t) noexcept {
+    return static_cast<std::uint8_t>((i / 4) * 4 + ((i % 4) + RB) % 4);
+  }
+};
+
 template <class B>
-inline void xinlane_4x4(const B (&r)[4], B (&t)[4]) noexcept {
+BLAKE3PP_FORCE_INLINE void xinlane_4x4(const B (&r)[4], B (&t)[4]) noexcept {
   const B a0 = xshuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
                      29>(r[0], r[1]);
   const B a1 = xshuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15,
@@ -362,7 +374,7 @@ inline void xinlane_4x4(const B (&r)[4], B (&t)[4]) noexcept {
 }
 #endif  // BLAKE3PP_HAS_XSIMD
 
-inline std::uint32_t ld32(const std::uint8_t* p) noexcept {
+BLAKE3PP_FORCE_INLINE std::uint32_t ld32(const std::uint8_t* p) noexcept {
   return static_cast<std::uint32_t>(p[0]) |
          (static_cast<std::uint32_t>(p[1]) << 8) |
          (static_cast<std::uint32_t>(p[2]) << 16) |
@@ -376,7 +388,7 @@ inline std::uint32_t ld32(const std::uint8_t* p) noexcept {
 // shuffle tree where expressible (W of 4, 8 or 16), scalar staging gather
 // everywhere else.
 template <std::size_t W = u32v::width>
-inline void load_transposed(const std::uint8_t* const* inputs,
+BLAKE3PP_FORCE_INLINE void load_transposed(const std::uint8_t* const* inputs,
                             std::size_t offset, u32v m[16]) noexcept {
   namespace td = transpose_detail;
   // Note the preprocessor gates doubling the if-constexpr ones: a discarded
@@ -513,7 +525,7 @@ inline void load_transposed(const std::uint8_t* const* inputs,
 // 64 little-endian bytes at out + l*64, the mirror of load_transposed,
 // using the same radix-2 shuffle trees where expressible.
 template <std::size_t W = u32v::width>
-inline void store_transposed(const u32v (&w)[16], std::uint8_t* out) noexcept {
+BLAKE3PP_FORCE_INLINE void store_transposed(const u32v (&w)[16], std::uint8_t* out) noexcept {
   namespace td = transpose_detail;
 #if defined(BLAKE3PP_HAVE_XSIMD_SHUFFLE)
   if constexpr ((W == 4 || W == 8 || W == 16) &&
@@ -651,7 +663,7 @@ inline void store_transposed(const u32v (&w)[16], std::uint8_t* out) noexcept {
 // load_transposed: non-dependent constructs in a discarded branch are still
 // instantiated (vext<16> exists nowadays, but the discipline stays).
 template <int N, std::size_t W = u32v::width>
-inline u32v rot(u32v a) noexcept {
+BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
 #if defined(BLAKE3PP_HAVE_SHUFFLE_TREE)
   if constexpr ((N == 16 || N == 8) && (W == 4 || W == 8) &&
                 std::endian::native == std::endian::little &&
@@ -660,6 +672,33 @@ inline u32v rot(u32v a) noexcept {
     using V = typename transpose_detail::vext<W>::type;
     return u32v{std::bit_cast<typename u32v::impl>(
         transpose_detail::rot_bytes<N / 8, W>(std::bit_cast<V>(a.v)))};
+  }
+#endif
+#if defined(BLAKE3PP_HAVE_XSIMD_SHUFFLE)
+  // Provider-native byte-rotate for frontends without vector extensions
+  // (pure MSVC): one vpshufb via xsimd's constant u8 swizzle instead of
+  // the three-op shift-or. W==16 stays on shift-or: avx512bw has no
+  // constant u8 swizzle in xsimd 14.3 (and GNU compilers fuse shift-or
+  // into vprold there anyway). CRITICAL gate: the hardware must actually
+  // HAVE a byte shuffle. MSVC has no /arch:SSE4.2, so the "sse42" kernel
+  // is xsimd-sse2 there, and xsimd's sse2 u8 swizzle is a per-byte
+  // scalar loop that measured 4x WORSE than shift-or. x86 needs ssse3+;
+  // NEON and wasm carry native byte shuffles.
+  constexpr bool is_x86 =
+      std::is_base_of_v<xsimd::sse2, typename u32v::impl::arch_type>;
+  constexpr bool has_byte_shuffle =
+      !is_x86 ||
+      std::is_base_of_v<xsimd::ssse3, typename u32v::impl::arch_type>;
+  if constexpr ((N == 16 || N == 8) && (W == 4 || W == 8) &&
+                has_byte_shuffle &&
+                std::endian::native == std::endian::little) {
+    using B = typename u32v::impl;
+    const auto bytes = xsimd::bitwise_cast<std::uint8_t>(a.v);
+    constexpr auto mask = xsimd::make_batch_constant<
+        std::uint8_t, transpose_detail::rot_bytes_gen<N / 8>,
+        typename B::arch_type>();
+    return u32v{
+        xsimd::bitwise_cast<std::uint32_t>(xsimd::swizzle(bytes, mask))};
   }
 #endif
   return rotr(a, N);
