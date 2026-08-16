@@ -22,6 +22,14 @@
 
 #include "kernel/kernel.hpp"
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+// Covers clang-cl too: its __builtin_cpu_supports references compiler-rt's
+// __cpu_model global, which is not part of what lld-link pulls in by
+// default on Windows; the manual probe avoids the linker dependency.
+#define BLAKE3PP_MSVC_CPUID 1
+#include <intrin.h>
+#endif
+
 namespace blake3pp {
 
 namespace kern {
@@ -81,12 +89,52 @@ bool compiled_in(arch a) noexcept {
   return false;
 }
 
+#if defined(BLAKE3PP_MSVC_CPUID)
+// MSVC-frontend toolchains (cl and clang-cl) get the cpu-model probe
+// spelled out: CPUID feature bits AND the OSXSAVE/XCR0 check; the OS
+// must actually save the YMM/ZMM state, silicon alone is not
+// availability.
+bool msvc_cpu_supports(arch a) noexcept {
+  int r[4];
+  __cpuid(r, 1);
+  const unsigned ecx1 = static_cast<unsigned>(r[2]);
+  if (a == arch::sse42) {
+    return (ecx1 >> 20) & 1u;  // SSE4.2; XMM state is baseline on Windows
+  }
+  const bool osxsave = (ecx1 >> 27) & 1u;
+  if (!osxsave) {
+    return false;
+  }
+  const unsigned xcr0 = static_cast<unsigned>(_xgetbv(0));
+  __cpuidex(r, 7, 0);
+  const unsigned ebx7 = static_cast<unsigned>(r[1]);
+  if (a == arch::avx2) {
+    return (xcr0 & 0x6u) == 0x6u &&  // XMM + YMM saved
+           ((ebx7 >> 5) & 1u);
+  }
+  if (a == arch::avx512) {
+    return (xcr0 & 0xE6u) == 0xE6u &&  // + opmask/ZMM state saved
+           ((ebx7 >> 16) & 1u) &&      // F
+           ((ebx7 >> 28) & 1u) &&      // CD
+           ((ebx7 >> 31) & 1u) &&      // VL
+           ((ebx7 >> 30) & 1u) &&      // BW
+           ((ebx7 >> 17) & 1u);        // DQ
+  }
+  return false;
+}
+#endif
+
 bool cpu_supports(arch a) noexcept {
   switch (a) {
     case arch::auto_detect:
     case arch::scalar:
       return true;
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(BLAKE3PP_MSVC_CPUID)
+    case arch::sse42:
+    case arch::avx2:
+    case arch::avx512:
+      return msvc_cpu_supports(a);
+#elif defined(__x86_64__) || defined(__i386__)
     case arch::sse42:
       return __builtin_cpu_supports("sse4.2");
     case arch::avx2:

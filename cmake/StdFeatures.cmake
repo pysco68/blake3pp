@@ -17,6 +17,15 @@ include_guard(GLOBAL)
 add_library(blake3pp_features INTERFACE)
 add_library(blake3pp::features ALIAS blake3pp_features)
 
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  # MSVC reports __cplusplus as 199711L unless told otherwise, which makes
+  # stdexec (and any other honest feature-test consumer) refuse to build;
+  # the conformant preprocessor is likewise table stakes for its macro
+  # machinery. Both are pure conformance switches, safe project-wide.
+  target_compile_options(blake3pp_features INTERFACE
+    /Zc:__cplusplus /Zc:preprocessor)
+endif()
+
 function(_blake3pp_probe var code)
   if(NOT DEFINED CACHE{${var}})
     set(src "${CMAKE_BINARY_DIR}/CMakeFiles/blake3pp_probes/${var}.cpp")

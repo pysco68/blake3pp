@@ -31,9 +31,18 @@ function(blake3pp_add_kernel ns)
   # The kernels are the hot loop and measurably faster at -O3 (GCC's
   # std::simd path is ~2x slower at -O2). Applied only to optimized configs
   # so Debug/sanitizer builds keep their debuggability; appended after the
-  # config flags, so it wins over RelWithDebInfo's -O2.
-  target_compile_options(${tgt} PRIVATE
-    "$<$<CONFIG:Release,RelWithDebInfo>:-O3>")
+  # config flags, so it wins over RelWithDebInfo's -O2. MSVC-frontend
+  # spelling: cl has no /O3 (Release's /O2 is already its ceiling);
+  # clang-cl takes the flag through its /clang: passthrough.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+      target_compile_options(${tgt} PRIVATE
+        "$<$<CONFIG:Release,RelWithDebInfo>:/clang:-O3>")
+    endif()
+  else()
+    target_compile_options(${tgt} PRIVATE
+      "$<$<CONFIG:Release,RelWithDebInfo>:-O3>")
+  endif()
   # GCC's post-RA scheduler measurably hurts this register-saturated kernel
   # (+6% from disabling it, 3/3 paired runs on znver3): with ~32 live vector
   # values on 16 registers, its static ILP-driven reordering only disturbs

@@ -1,7 +1,81 @@
 {
   "version": 6,
   "include": ["CMakePresets-toolchains.json"],
+  "configurePresets": [
+    {
+      "name": "windows-msvc2026-cxx23",
+      "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-msvc2026-cxx23",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "23"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-clangcl-cxx23",
+      "displayName": "Windows clang-cl (VS LLVM toolset), C++23 (vcvars64 shell)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-clangcl-cxx23",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc2026-cxx23",
+      "configurePreset": "windows-msvc2026-cxx23",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-clangcl-cxx23",
+      "configurePreset": "windows-clangcl-cxx23",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    }
+  ],
   "testPresets": [
+    {
+      "name": "windows-msvc2026-cxx23",
+      "configurePreset": "windows-msvc2026-cxx23",
+      "output": { "outputOnFailure": true },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-clangcl-cxx23",
+      "configurePreset": "windows-clangcl-cxx23",
+      "output": { "outputOnFailure": true },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
     {
       "name": "linux-gcc16-cxx26",
       "configurePreset": "linux-gcc16-cxx26",

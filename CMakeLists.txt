@@ -27,8 +27,15 @@ include(StdFeatures)
 include(ArchKernels)
 
 add_library(blake3pp_warnings INTERFACE)
-target_compile_options(blake3pp_warnings INTERFACE
-  -Wall -Wextra -Wconversion -Wshadow)
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
+   AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  # cl.exe: /W4 is the sane maximum (/Wall drowns in STL noise); clang-cl
+  # takes the GNU-style set below.
+  target_compile_options(blake3pp_warnings INTERFACE /W4)
+else()
+  target_compile_options(blake3pp_warnings INTERFACE
+    -Wall -Wextra -Wconversion -Wshadow)
+endif()
 
 add_library(blake3pp STATIC
   src/blake3pp.cpp
@@ -55,12 +62,25 @@ target_link_libraries(blake3pp
 # variants land in the one binary and runtime dispatch picks among them.
 blake3pp_add_kernel(scalar FORCE_SCALAR)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-  blake3pp_add_kernel(sse42 ARCH_FLAGS -msse4.2)
-  blake3pp_add_kernel(avx2 ARCH_FLAGS -mavx2)
-  # The canonical F->CD->DQ->BW progression plus VL: xsimd's arch hierarchy
-  # requires CD once DQ is on, and every physical AVX-512 CPU has all five.
-  blake3pp_add_kernel(avx512
-    ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq)
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
+     AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    # Pure cl.exe: /arch is the only ISA dial. There is no /arch:SSE4.2 on
+    # x64 (SSE2 is the baseline), so the "sse42" variant compiles at
+    # baseline width: same 4-lane facade, slightly humbler codegen. The
+    # dispatch name stays for cross-platform variant parity.
+    blake3pp_add_kernel(sse42)
+    blake3pp_add_kernel(avx2 ARCH_FLAGS /arch:AVX2)
+    blake3pp_add_kernel(avx512 ARCH_FLAGS /arch:AVX512)
+  else()
+    # GNU-style drivers (GCC, Clang, clang-cl passes -m flags through).
+    blake3pp_add_kernel(sse42 ARCH_FLAGS -msse4.2)
+    blake3pp_add_kernel(avx2 ARCH_FLAGS -mavx2)
+    # The canonical F->CD->DQ->BW progression plus VL: xsimd's arch
+    # hierarchy requires CD once DQ is on, and every physical AVX-512 CPU
+    # has all five.
+    blake3pp_add_kernel(avx512
+      ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq)
+  endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
   # NEON is baseline on AArch64; the variant exists so dispatch/reporting can
   # name it, and so the scalar fallback stays honestly scalar.

@@ -20,8 +20,12 @@
 //
 // The shuffled register then enters the provider's vector type via
 // std::bit_cast: all three providers' types are register-sized and
-// trivially copyable, so the cast is free. MSVC (no vector extensions) and
-// exotic widths fall back to the scalar staging gather automatically.
+// trivially copyable, so the cast is free. When the provider is xsimd the
+// same networks are instead expressed through xsimd::shuffle
+// (provider-native, works on MSVC where vector extensions don't exist; on
+// GCC/Clang xsimd lowers it through __builtin_shufflevector, so the
+// codegen is identical, verified by object-histogram diff). Exotic
+// widths fall back to the scalar staging gather automatically.
 
 #include <bit>
 #include <cstddef>
@@ -146,6 +150,65 @@ inline typename vext<W>::type rot_bytes(typename vext<W>::type x) noexcept {
 #pragma GCC diagnostic pop
 #endif
 
+#if defined(BLAKE3PP_HAS_XSIMD) && !defined(BLAKE3PP_FORCE_SCALAR)
+#define BLAKE3PP_HAVE_XSIMD_SHUFFLE 1
+
+// The same radix-2 networks, expressed through xsimd's portable two-input
+// constant shuffle instead of raw vector extensions. On GCC>=13 and Clang
+// (incl. clang-cl) xsimd lowers this through __builtin_shufflevector, so
+// the codegen is instruction-identical to the vext tree (verified: 24
+// shuffles for the AVX2 8x8). On MSVC, which has no such builtin, xsimd
+// decomposes each shuffle into swizzle(x)+swizzle(y)+select (~3 uops),
+// still far ahead of the scalar staging gather. This is what makes the
+// xsimd provider self-contained: no compiler-specific machinery required.
+template <std::uint32_t... I, class B>
+inline B xshuf(B a, B b) noexcept {
+  return xsimd::shuffle(
+      a, b,
+      xsimd::batch_constant<std::uint32_t, typename B::arch_type, I...>{});
+}
+
+template <class B>
+inline void xtranspose(const B (&r)[4], B (&out)[4]) noexcept {
+  const B a0 = xshuf<0, 4, 1, 5>(r[0], r[1]);
+  const B a1 = xshuf<2, 6, 3, 7>(r[0], r[1]);
+  const B a2 = xshuf<0, 4, 1, 5>(r[2], r[3]);
+  const B a3 = xshuf<2, 6, 3, 7>(r[2], r[3]);
+  out[0] = xshuf<0, 1, 4, 5>(a0, a2);
+  out[1] = xshuf<2, 3, 6, 7>(a0, a2);
+  out[2] = xshuf<0, 1, 4, 5>(a1, a3);
+  out[3] = xshuf<2, 3, 6, 7>(a1, a3);
+}
+
+template <class B>
+inline void xtranspose(const B (&r)[8], B (&out)[8]) noexcept {
+  const B a0 = xshuf<0, 8, 1, 9, 4, 12, 5, 13>(r[0], r[1]);
+  const B a1 = xshuf<2, 10, 3, 11, 6, 14, 7, 15>(r[0], r[1]);
+  const B a2 = xshuf<0, 8, 1, 9, 4, 12, 5, 13>(r[2], r[3]);
+  const B a3 = xshuf<2, 10, 3, 11, 6, 14, 7, 15>(r[2], r[3]);
+  const B a4 = xshuf<0, 8, 1, 9, 4, 12, 5, 13>(r[4], r[5]);
+  const B a5 = xshuf<2, 10, 3, 11, 6, 14, 7, 15>(r[4], r[5]);
+  const B a6 = xshuf<0, 8, 1, 9, 4, 12, 5, 13>(r[6], r[7]);
+  const B a7 = xshuf<2, 10, 3, 11, 6, 14, 7, 15>(r[6], r[7]);
+  const B b0 = xshuf<0, 1, 8, 9, 4, 5, 12, 13>(a0, a2);
+  const B b1 = xshuf<2, 3, 10, 11, 6, 7, 14, 15>(a0, a2);
+  const B b2 = xshuf<0, 1, 8, 9, 4, 5, 12, 13>(a1, a3);
+  const B b3 = xshuf<2, 3, 10, 11, 6, 7, 14, 15>(a1, a3);
+  const B b4 = xshuf<0, 1, 8, 9, 4, 5, 12, 13>(a4, a6);
+  const B b5 = xshuf<2, 3, 10, 11, 6, 7, 14, 15>(a4, a6);
+  const B b6 = xshuf<0, 1, 8, 9, 4, 5, 12, 13>(a5, a7);
+  const B b7 = xshuf<2, 3, 10, 11, 6, 7, 14, 15>(a5, a7);
+  out[0] = xshuf<0, 1, 2, 3, 8, 9, 10, 11>(b0, b4);
+  out[1] = xshuf<0, 1, 2, 3, 8, 9, 10, 11>(b1, b5);
+  out[2] = xshuf<0, 1, 2, 3, 8, 9, 10, 11>(b2, b6);
+  out[3] = xshuf<0, 1, 2, 3, 8, 9, 10, 11>(b3, b7);
+  out[4] = xshuf<4, 5, 6, 7, 12, 13, 14, 15>(b0, b4);
+  out[5] = xshuf<4, 5, 6, 7, 12, 13, 14, 15>(b1, b5);
+  out[6] = xshuf<4, 5, 6, 7, 12, 13, 14, 15>(b2, b6);
+  out[7] = xshuf<4, 5, 6, 7, 12, 13, 14, 15>(b3, b7);
+}
+#endif  // BLAKE3PP_HAS_XSIMD
+
 inline std::uint32_t ld32(const std::uint8_t* p) noexcept {
   return static_cast<std::uint32_t>(p[0]) |
          (static_cast<std::uint32_t>(p[1]) << 8) |
@@ -164,9 +227,31 @@ template <std::size_t W = u32v::width>
 inline void load_transposed(const std::uint8_t* const* inputs,
                             std::size_t offset, u32v m[16]) noexcept {
   namespace td = transpose_detail;
-  // Note the preprocessor gate doubling the if-constexpr one: a discarded
+  // Note the preprocessor gates doubling the if-constexpr ones: a discarded
   // constexpr branch still name-looks-up its non-dependent identifiers, so
   // the shuffle machinery must not even be *named* in TUs that lack it.
+#if defined(BLAKE3PP_HAVE_XSIMD_SHUFFLE)
+  // Provider-native path: when u32v wraps an xsimd batch, transpose the
+  // batches directly: self-contained (works on MSVC), and on GCC/Clang
+  // instruction-identical to the vext tree below.
+  if constexpr ((W == 4 || W == 8) &&
+                std::endian::native == std::endian::little) {
+    using B = typename u32v::impl;
+    constexpr std::size_t groups = 16 / W;
+    for (std::size_t g = 0; g < groups; ++g) {
+      B r[W];
+      for (std::size_t lane = 0; lane < W; ++lane) {
+        std::memcpy(&r[lane], inputs[lane] + offset + g * W * 4, sizeof(B));
+      }
+      B t[W];
+      td::xtranspose(r, t);
+      for (std::size_t j = 0; j < W; ++j) {
+        m[g * W + j] = u32v{t[j]};
+      }
+    }
+    return;
+  }
+#endif
 #if defined(BLAKE3PP_HAVE_SHUFFLE_TREE)
   if constexpr ((W == 4 || W == 8) &&
                 std::endian::native == std::endian::little &&
@@ -203,6 +288,25 @@ inline void load_transposed(const std::uint8_t* const* inputs,
 template <std::size_t W = u32v::width>
 inline void store_transposed(const u32v (&w)[16], std::uint8_t* out) noexcept {
   namespace td = transpose_detail;
+#if defined(BLAKE3PP_HAVE_XSIMD_SHUFFLE)
+  if constexpr ((W == 4 || W == 8) &&
+                std::endian::native == std::endian::little) {
+    using B = typename u32v::impl;
+    constexpr std::size_t groups = 16 / W;
+    for (std::size_t g = 0; g < groups; ++g) {
+      B r[W];
+      for (std::size_t j = 0; j < W; ++j) {
+        r[j] = w[g * W + j].v;
+      }
+      B t[W];
+      td::xtranspose(r, t);
+      for (std::size_t lane = 0; lane < W; ++lane) {
+        std::memcpy(out + lane * 64 + g * W * 4, &t[lane], sizeof(B));
+      }
+    }
+    return;
+  }
+#endif
 #if defined(BLAKE3PP_HAVE_SHUFFLE_TREE)
   if constexpr ((W == 4 || W == 8) &&
                 std::endian::native == std::endian::little &&
