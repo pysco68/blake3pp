@@ -6,6 +6,9 @@
 //   Linux:  io_uring + O_DIRECT (async, page-cache-bypassing) with graceful
 //           per-feature fallback (no O_DIRECT -> buffered io_uring;
 //           no io_uring -> synchronous pwrite)
+//   Windows: IOCP + FILE_FLAG_NO_BUFFERING, preallocation via
+//           SetEndOfFile + best-effort SetFileValidData (waives NTFS's
+//           synchronous zero-fill to the valid-data length)
 //   POSIX:  synchronous pwrite
 //   other:  buffered stdio
 //
@@ -36,8 +39,10 @@ struct file_writer_options {
   // Preallocate this many bytes at construction when the total is known.
   // This matters enormously for async direct I/O: writes that EXTEND the
   // file serialize on the inode lock (each waits out journal + allocation),
-  // while writes into preallocated extents overlap freely. finish() trims
-  // the file back to the bytes actually written.
+  // while writes into preallocated extents overlap freely. On Windows the
+  // same role is played by SetEndOfFile plus SetFileValidData (privilege
+  // permitting). finish() trims the file back to the bytes actually
+  // written.
   std::uint64_t preallocate_bytes = 0;
 };
 
@@ -74,7 +79,7 @@ class file_writer {
   [[nodiscard]] std::uint64_t bytes_written() const noexcept;
 
   // Which mechanism was actually engaged, e.g. "io_uring+direct",
-  // "io_uring", "pwrite+direct", "pwrite", "stdio".
+  // "iocp+direct+vdl", "pwrite", "writefile", "stdio".
   [[nodiscard]] const char* backend() const noexcept;
 
  private:

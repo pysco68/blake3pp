@@ -6,10 +6,10 @@
 //   Linux:  io_uring + O_DIRECT (async, page-cache-bypassing) with graceful
 //           per-feature fallback (no O_DIRECT support -> buffered io_uring;
 //           no io_uring -> synchronous pread)
+//   Windows: IOCP + FILE_FLAG_NO_BUFFERING (async, page-cache-bypassing)
+//           with the same per-feature fallback (no port -> sync ReadFile)
 //   POSIX:  synchronous pread
-//   other:  buffered stdio (Windows IOCP backend: designed for, not yet
-//           implemented; the interface below is completion-model-shaped
-//           precisely so it can host one)
+//   other:  buffered stdio
 //
 // The model: the file is a sequence of fixed-size windows. queue_depth
 // buffers are allocated once at construction (the only allocation);
@@ -65,7 +65,7 @@ class file_reader {
   void release(const window& w) noexcept;
 
   // Which mechanism was actually engaged, e.g. "io_uring+direct",
-  // "io_uring", "pread+direct", "pread", "stdio".
+  // "iocp+direct", "pread", "readfile", "stdio".
   [[nodiscard]] const char* backend() const noexcept;
 
  private:

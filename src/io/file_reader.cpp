@@ -16,9 +16,10 @@
 
 #include <blake3pp/core.hpp>  // chunk_size
 
+#include "io/iocp_impl.hpp"
 #include "io/uring_impl.hpp"
 
-#if !defined(BLAKE3PP_IO_POSIX)
+#if !defined(BLAKE3PP_IO_POSIX) && !defined(BLAKE3PP_IO_WIN32)
 #include <cstdio>
 #endif
 
@@ -55,6 +56,14 @@ struct file_reader::impl {
   int fd = -1;        // main data fd (O_DIRECT when engaged)
   int fd_plain = -1;  // always-buffered fd for the unaligned tail window
   bool direct = false;
+#elif defined(BLAKE3PP_IO_WIN32)
+  HANDLE h = INVALID_HANDLE_VALUE;        // main (NO_BUFFERING when direct)
+  HANDLE h_plain = INVALID_HANDLE_VALUE;  // buffered+sync: tail, fallback
+  HANDLE port = nullptr;                  // completion port
+  bool direct = false;
+  bool use_iocp = false;
+  unsigned outstanding = 0;         // async reads in flight
+  std::vector<OVERLAPPED> ovs;      // one per slot; the SQE equivalent
 #else
   std::FILE* stream = nullptr;
 #endif
@@ -93,9 +102,32 @@ struct file_reader::impl {
                      static_cast<unsigned>(st.target), st.win * window, s);
       return;
     }
+#elif defined(BLAKE3PP_IO_WIN32)
+    if (use_iocp && alignable(st.win)) {
+      submit_read(s, 0);
+      return;
+    }
 #endif
     // Synchronous backends read lazily at delivery time.
   }
+
+#if defined(BLAKE3PP_IO_WIN32)
+  // Queues one async read (or a short-read continuation from `from`).
+  void submit_read(unsigned s, std::size_t from) {
+    slot_state& st = slots[s];
+    OVERLAPPED& ov = ovs[s];
+    std::memset(&ov, 0, sizeof(ov));
+    const std::uint64_t off = st.win * window + from;
+    ov.Offset = static_cast<DWORD>(off);
+    ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+    if (::ReadFile(h, buf(s) + from, static_cast<DWORD>(st.target - from),
+                   nullptr, &ov) == 0 &&
+        ::GetLastError() != ERROR_IO_PENDING) {
+      io_impl::throw_winerr("ReadFile(async)");
+    }
+    ++outstanding;
+  }
+#endif
 
   void read_sync(unsigned s) {
     slot_state& st = slots[s];
@@ -119,6 +151,31 @@ struct file_reader::impl {
                                 "unexpected EOF");
       }
       got += static_cast<std::size_t>(n);
+    }
+#elif defined(BLAKE3PP_IO_WIN32)
+    // Positional synchronous read: a non-OVERLAPPED handle plus an
+    // OVERLAPPED offset blocks until complete. The tail (or everything,
+    // in sync mode) goes through the buffered handle: NO_BUFFERING
+    // rejects unaligned lengths, same story as O_DIRECT. In iocp mode
+    // only unalignable windows ever reach this path, so `h` is never an
+    // overlapped handle here.
+    const HANDLE use_h = alignable(st.win) && direct ? h : h_plain;
+    std::size_t got = 0;
+    while (got < st.target) {
+      OVERLAPPED ov{};
+      const std::uint64_t off = st.win * window + got;
+      ov.Offset = static_cast<DWORD>(off);
+      ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+      DWORD n = 0;
+      if (::ReadFile(use_h, buf(s) + got,
+                     static_cast<DWORD>(st.target - got), &n, &ov) == 0) {
+        io_impl::throw_winerr("ReadFile");
+      }
+      if (n == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "unexpected EOF");
+      }
+      got += n;
     }
 #else
     if (std::fseek(stream, static_cast<long>(st.win * window), SEEK_SET) !=
@@ -160,6 +217,43 @@ struct file_reader::impl {
         ring.submit_rw(IORING_OP_READ, fd, buf(s) + st.filled,
                        static_cast<unsigned>(st.target - st.filled),
                        st.win * window + st.filled, s);
+      } else {
+        st.ready = true;
+      }
+    }
+  }
+#elif defined(BLAKE3PP_IO_WIN32)
+  // Reaps completions (issuing continuations for short reads) until the
+  // slot owning `want_win` is fully read. GetQueuedCompletionStatus is
+  // wait_one: the OVERLAPPED pointer identifies the slot.
+  void wait_async(std::uint64_t want_win) {
+    for (;;) {
+      for (const slot_state& st : slots) {
+        if (st.assigned && st.win == want_win && st.ready) {
+          return;
+        }
+      }
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      const BOOL ok =
+          ::GetQueuedCompletionStatus(port, &bytes, &key, &pov, INFINITE);
+      if (pov == nullptr) {
+        io_impl::throw_winerr("GetQueuedCompletionStatus");
+      }
+      --outstanding;
+      const unsigned s = static_cast<unsigned>(pov - ovs.data());
+      slot_state& st = slots[s];
+      if (ok == 0) {
+        io_impl::throw_winerr("iocp read");
+      }
+      if (bytes == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "unexpected EOF (iocp)");
+      }
+      st.filled += bytes;
+      if (st.filled < st.target) {
+        submit_read(s, st.filled);
       } else {
         st.ready = true;
       }
@@ -212,9 +306,67 @@ file_reader::file_reader(const std::filesystem::path& fspath,
     im.backend_name = im.direct ? "io_uring+direct" : "io_uring";
   }
 #endif
+#elif defined(BLAKE3PP_IO_WIN32)
+  // The path's native wide string is the reason fs::path is the API
+  // currency. The buffered synchronous handle always exists (tail
+  // windows, sync fallback); the fast handle layers NO_BUFFERING and/or
+  // OVERLAPPED on top, degrading per-feature like the POSIX ladder.
+  im.h_plain = ::CreateFileW(fspath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                             nullptr, OPEN_EXISTING,
+                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                             nullptr);
+  if (im.h_plain == INVALID_HANDLE_VALUE) {
+    delete impl_;
+    io_impl::throw_winerr("CreateFileW");
+  }
+  LARGE_INTEGER file_sz;
+  if (::GetFileSizeEx(im.h_plain, &file_sz) == 0) {
+    ::CloseHandle(im.h_plain);
+    delete impl_;
+    io_impl::throw_winerr("GetFileSizeEx");
+  }
+  im.size = static_cast<std::uint64_t>(file_sz.QuadPart);
+  im.h = im.h_plain;
+  if (opts.direct_io || opts.async) {
+    DWORD flags = FILE_ATTRIBUTE_NORMAL;
+    if (opts.direct_io) {
+      flags |= FILE_FLAG_NO_BUFFERING;
+    }
+    if (opts.async) {
+      flags |= FILE_FLAG_OVERLAPPED;
+    }
+    const HANDLE fast =
+        ::CreateFileW(fspath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                      OPEN_EXISTING, flags, nullptr);
+    if (fast != INVALID_HANDLE_VALUE) {
+      bool engaged = false;
+      if (opts.async) {
+        im.port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr,
+                                           0, 1);
+        if (im.port != nullptr &&
+            ::CreateIoCompletionPort(fast, im.port, 0, 0) != nullptr) {
+          im.use_iocp = true;
+          engaged = true;
+        } else if (im.port != nullptr) {
+          ::CloseHandle(im.port);
+          im.port = nullptr;
+        }
+      } else {
+        engaged = true;  // sync NO_BUFFERING handle
+      }
+      if (engaged) {
+        im.h = fast;
+        im.direct = opts.direct_io;
+      } else {
+        ::CloseHandle(fast);
+      }
+    }
+  }
+  im.backend_name = im.use_iocp ? (im.direct ? "iocp+direct" : "iocp")
+                    : im.direct ? "readfile+direct"
+                                : "readfile";
+  im.ovs.resize(im.qd);
 #else
-  // Non-POSIX stdio stub; a real Windows backend would use the path's
-  // native wide string with CreateFileW + IOCP.
   im.stream = std::fopen(fspath.string().c_str(), "rb");
   if (im.stream == nullptr) {
     delete impl_;
@@ -251,6 +403,31 @@ file_reader::~file_reader() {
   if (im.fd_plain >= 0) {
     ::close(im.fd_plain);
   }
+#elif defined(BLAKE3PP_IO_WIN32)
+  // In-flight reads reference the buffer pool: cancel and drain before
+  // the pool is freed, or the kernel writes into freed memory.
+  if (im.use_iocp && im.outstanding > 0) {
+    ::CancelIoEx(im.h, nullptr);
+    while (im.outstanding > 0) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      ::GetQueuedCompletionStatus(im.port, &bytes, &key, &pov, 5000);
+      if (pov == nullptr) {
+        break;  // timeout/failure: leak-safe exit beats a hang
+      }
+      --im.outstanding;
+    }
+  }
+  if (im.port != nullptr) {
+    ::CloseHandle(im.port);
+  }
+  if (im.h != im.h_plain && im.h != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(im.h);
+  }
+  if (im.h_plain != INVALID_HANDLE_VALUE) {
+    ::CloseHandle(im.h_plain);
+  }
 #else
   if (im.stream != nullptr) {
     std::fclose(im.stream);
@@ -281,6 +458,12 @@ std::optional<file_reader::window> file_reader::next() {
   if (!st.ready) {
 #if defined(BLAKE3PP_IO_URING)
     if (im.use_uring && im.alignable(want)) {
+      im.wait_async(want);
+    } else {
+      im.read_sync(s);
+    }
+#elif defined(BLAKE3PP_IO_WIN32)
+    if (im.use_iocp && im.alignable(want)) {
       im.wait_async(want);
     } else {
       im.read_sync(s);

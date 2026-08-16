@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
   bool hex = false;
   bool no_direct = false;
   bool no_async = false;
+  bool verbose = false;
   unsigned threads = 1;
 
   CLI::App app{
@@ -107,16 +108,18 @@ int main(int argc, char** argv) {
       app.add_flag("--hex", hex, "emit lowercase hex instead of raw bytes");
   auto* output_opt =
       app.add_option("--output", output,
-                     "write to FILE via direct async I/O (io_uring + "
-                     "O_DIRECT where available) instead of stdout");
+                     "write to FILE via direct async I/O (io_uring or "
+                     "IOCP where available) instead of stdout");
   hex_flag->excludes(output_opt);
   output_opt->excludes(hex_flag);
   app.add_flag("--no-direct", no_direct,
-               "with --output: skip O_DIRECT (write through the page cache)")
+               "with --output: no direct I/O (write through the page cache)")
       ->needs(output_opt);
   app.add_flag("--no-async", no_async,
-               "with --output: skip io_uring (synchronous pwrite)")
+               "with --output: no async queue (synchronous writes)")
       ->needs(output_opt);
+  app.add_flag("-v,--verbose", verbose,
+               "report the engaged write backend on stderr");
   app.add_option("--threads", threads,
                  "generator threads (seekable output is embarrassingly "
                  "parallel)")
@@ -207,6 +210,12 @@ int main(int argc, char** argv) {
       }
 #endif
       blake3pp::detail::file_writer writer(output, wopts);
+      if (verbose) {
+        std::fputs(std::format("blake3ppgen: write backend: {}\n",
+                               writer.backend())
+                       .c_str(),
+                   stderr);
+      }
       while (remaining > 0) {
         auto b = writer.acquire();
         const std::size_t take = static_cast<std::size_t>(

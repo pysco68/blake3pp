@@ -1,6 +1,9 @@
 // End-to-end file hashing throughput: the number the whole project is
-// about. Hashes a real file through the windowed io_uring pipeline,
-// sequential and parallel, and reports the engaged backend.
+// about. First measures the RAW device read speed through the identical
+// windowed pipeline (same backend, window, queue depth; data delivered
+// and discarded, no hashing), then hashes for real, sequential and
+// parallel. The utilization column relates the two: 100%% means the
+// drive, not the hash, is the limit.
 //
 //   blake3pp_bench_file <path> [--reps N] [--window MiB] [--qd N]
 //                       [--no-direct] [--seq-only]
@@ -68,34 +71,56 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  std::uint64_t bytes = 0;
   {
     blake3pp::detail::file_reader probe(
         path.c_str(),
         {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
+    bytes = probe.file_size();
     std::printf("file: %s (%.1f MiB), backend: %s, window %zu MiB, qd %u\n",
-                path.c_str(),
-                static_cast<double>(probe.file_size()) / (1024.0 * 1024.0),
+                path.c_str(), static_cast<double>(bytes) / (1024.0 * 1024.0),
                 probe.backend(), opts.window_bytes >> 20, opts.queue_depth);
   }
 
-  const auto run = [&](const char* label, auto&& fn) {
-    blake3pp::digest d{};
+  const auto time_best = [&](auto&& fn) {
     double best = 1e100;
-    std::uint64_t bytes = 0;
     for (int r = 0; r < reps; ++r) {
       const auto t0 = std::chrono::steady_clock::now();
-      d = fn();
+      fn();
       const auto t1 = std::chrono::steady_clock::now();
       const double s = std::chrono::duration<double>(t1 - t0).count();
       if (s < best) {
         best = s;
       }
     }
-    blake3pp::detail::file_reader sz(path.c_str(), {});
-    bytes = sz.file_size();
-    std::printf("%-10s %8.2f GiB/s   (%s...)\n", label,
-                static_cast<double>(bytes) / best / (1024.0 * 1024.0 * 1024.0),
-                d.to_hex().substr(0, 16).c_str());
+    return best;
+  };
+  const auto gibs = [&](double secs) {
+    return static_cast<double>(bytes) / secs / (1024.0 * 1024.0 * 1024.0);
+  };
+
+  // The control group: the identical pipeline delivering windows that are
+  // simply released unread. This is the device ceiling as seen through
+  // this backend/window/qd; every hash row below is a fraction of it.
+  const double raw_s = time_best([&] {
+    blake3pp::detail::file_reader r(
+        path.c_str(),
+        {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
+    auto w = r.next();
+    while (w.has_value()) {
+      r.release(w.value());
+      w = r.next();
+    }
+  });
+  std::printf("%-10s %8.2f GiB/s   [device ceiling, no hashing]\n", "raw io",
+              gibs(raw_s));
+
+  const auto run = [&](const char* label, auto&& fn) {
+    blake3pp::digest d{};
+    const double best = time_best([&] { d = fn(); });
+    std::printf("%-10s %8.2f GiB/s   (%s...)  [%3.0f%% of raw]\n", label,
+                gibs(best), d.to_hex().substr(0, 16).c_str(),
+                100.0 * raw_s / best);
   };
 
   run("seq", [&] { return blake3pp::hash_file(path.c_str(), opts); });

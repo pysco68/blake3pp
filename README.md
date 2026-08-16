@@ -201,10 +201,11 @@ blake3pp::parallel_hasher tuned{pool.get_scheduler(),
 
 ### Hashing files at storage speed
 
-`hash_file()` streams the file through fixed windows with io_uring +
-`O_DIRECT` on Linux (bypassing the page cache), overlapping reads with
-hashing; it degrades gracefully per feature (no O_DIRECT support ->
-buffered io_uring -> plain `pread` -> stdio). Paths are
+`hash_file()` streams the file through fixed windows using the fastest
+OS-native mechanism (io_uring + `O_DIRECT` on Linux, IOCP +
+`FILE_FLAG_NO_BUFFERING` on Windows), bypassing the page cache and
+overlapping reads with hashing; it degrades gracefully per feature
+(no direct I/O -> buffered async -> plain synchronous reads -> stdio). Paths are
 `std::filesystem::path`; every entry point has a throwing form and a
 `std::error_code` form, mirroring the standard library:
 
@@ -259,9 +260,9 @@ stream, and `--seek` is O(1), so materializing a slice at offset 10 GB
 costs the same as offset 0. Generation runs lanes-parallel in the kernel
 (~3.8 GiB/s per core) and `--threads` fans segments across cores via the
 O(1) seek (13+ GiB/s), so the sink is the bottleneck; `--output`
-removes even that overhead, writing through io_uring + O_DIRECT (where
-available) with the stream generated straight into the write buffers,
-bypassing the page cache entirely:
+removes even that overhead, writing through io_uring + O_DIRECT on
+Linux or IOCP + no-buffering on Windows with the stream generated
+straight into the write buffers, bypassing the page cache entirely:
 
 ```bash
 blake3ppgen --seed run42 --length 1G > testdata.bin
