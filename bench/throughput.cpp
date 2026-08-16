@@ -126,6 +126,39 @@ int main(int argc, char** argv) {
                 d.to_hex().substr(0, 16).c_str());
   }
 
+  // The AVX-512 transpose strategies, raced in-process (the dial is
+  // runtime; no per-strategy binaries needed), plus what the tuner picks.
+  if (blake3pp::is_available(blake3pp::arch::avx512)) {
+    const auto saved = blake3pp::active_transpose16();
+    for (const auto strat :
+         {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
+          blake3pp::transpose16::quartered}) {
+      blake3pp::set_transpose16(strat);
+      blake3pp::digest d{};
+      double best_s = 1e100;
+      for (int r = 0; r < reps + 1; ++r) {
+        blake3pp::hasher h{blake3pp::arch::avx512};
+        const auto t0 = std::chrono::steady_clock::now();
+        h.update(input);
+        d = h.finalize();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double s = std::chrono::duration<double>(t1 - t0).count();
+        if (r > 0 && s < best_s) {
+          best_s = s;
+        }
+      }
+      const double gib_s = static_cast<double>(input.size()) / best_s /
+                           (1024.0 * 1024.0 * 1024.0);
+      std::printf("  t16-%-9s %6.2f GiB/s   (%s...)\n",
+                  std::string(blake3pp::to_string(strat)).c_str(), gib_s,
+                  d.to_hex().substr(0, 16).c_str());
+    }
+    blake3pp::set_transpose16(saved);
+    const auto picked = blake3pp::tune_transpose16();
+    std::printf("  t16 tuner picks: %s\n",
+                std::string(blake3pp::to_string(picked)).c_str());
+  }
+
 #if defined(BLAKE3PP_BENCH_UPSTREAM) && defined(__x86_64__)
   // Upstream's assembly kernel driven by OUR tree and parallel machinery.
   if (blake3pp::is_available(blake3pp::arch::avx2)) {

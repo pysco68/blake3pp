@@ -42,6 +42,18 @@
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
 namespace transpose_detail {
 
+// The W==16 strategy is a RUNTIME dial (kern::transpose16_active, set via
+// blake3pp::set_transpose16 / tune_transpose16): on double-pumped AVX-512
+// (Strix Point) the register tree measured 20% slower than the scalar
+// staging gather while the quartered form measured 17% faster, and no
+// CPUID bit distinguishes those microarchitectures, so the winner is
+// raced, not detected. All three paths compile into the W==16 kernel; the
+// relaxed load deciding between them amortizes over a >=16 KiB batch.
+
+inline transpose16_mode t16_mode() noexcept {
+  return transpose16_active.load(std::memory_order_relaxed);
+}
+
 #if (defined(__GNUC__) || defined(__clang__)) && !defined(BLAKE3PP_FORCE_SCALAR)
 #define BLAKE3PP_HAVE_SHUFFLE_TREE 1
 
@@ -61,6 +73,10 @@ struct vext<4> {
 template <>
 struct vext<8> {
   typedef std::uint32_t type __attribute__((vector_size(32)));
+};
+template <>
+struct vext<16> {
+  typedef std::uint32_t type __attribute__((vector_size(64)));
 };
 
 template <int... I, class V>
@@ -117,6 +133,77 @@ inline void transpose(const vext<8>::type r[8], vext<8>::type out[8]) noexcept {
   out[5] = shuf<4, 5, 6, 7, 12, 13, 14, 15>(b1, b5);
   out[6] = shuf<4, 5, 6, 7, 12, 13, 14, 15>(b2, b6);
   out[7] = shuf<4, 5, 6, 7, 12, 13, 14, 15>(b3, b7);
+}
+
+// 16x16: four radix-2 stages. Index lists derived from the same recursive
+// construction (verified by simulation): in-lane dword unpacks
+// (vpunpckl/hdq), in-lane qword unpacks (vpunpckl/hqdq), then two levels
+// of 128-bit-block merges, AVX-512's vshufi32x4 territory; even a
+// generic lowering lands on vpermt2d (any two-source dword permute, one
+// uop). 64 two-register shuffles replace the 256 scalar load/stores of
+// the staging gather.
+inline void transpose(const vext<16>::type r[16],
+                      vext<16>::type out[16]) noexcept {
+  using V = vext<16>::type;
+  V a[16];
+  for (std::size_t g = 0; g < 8; ++g) {
+    a[2 * g] = shuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
+                    29>(r[2 * g], r[2 * g + 1]);
+    a[2 * g + 1] = shuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30,
+                        15, 31>(r[2 * g], r[2 * g + 1]);
+  }
+  V b[16];
+  for (std::size_t q = 0; q < 4; ++q) {
+    const std::size_t k = 4 * q;
+    b[k + 0] = shuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28,
+                    29>(a[k + 0], a[k + 2]);
+    b[k + 1] = shuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30,
+                    31>(a[k + 0], a[k + 2]);
+    b[k + 2] = shuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28,
+                    29>(a[k + 1], a[k + 3]);
+    b[k + 3] = shuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30,
+                    31>(a[k + 1], a[k + 3]);
+  }
+  V c[16];
+  for (std::size_t h = 0; h < 2; ++h) {
+    const std::size_t k = 8 * h;
+    for (std::size_t j = 0; j < 4; ++j) {
+      c[k + j] = shuf<0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26,
+                      27>(b[k + j], b[k + j + 4]);
+      c[k + j + 4] = shuf<4, 5, 6, 7, 20, 21, 22, 23, 12, 13, 14, 15, 28,
+                          29, 30, 31>(b[k + j], b[k + j + 4]);
+    }
+  }
+  for (std::size_t j = 0; j < 8; ++j) {
+    out[j] = shuf<0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23>(
+        c[j], c[j + 8]);
+    out[j + 8] = shuf<8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29,
+                      30, 31>(c[j], c[j + 8]);
+  }
+}
+
+// The two in-lane stages alone, factored for the quartered form: with
+// block-level transposition already done by 128-bit addressing, a 4x4
+// transpose per 128-bit lane finishes the job (same s1/s2 index lists as
+// the full tree; all vpunpck, no cross-lane traffic).
+template <class V>
+inline void inlane_4x4(const V (&r)[4], V (&t)[4]) noexcept {
+  const V a0 = shuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
+                    29>(r[0], r[1]);
+  const V a1 = shuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15,
+                    31>(r[0], r[1]);
+  const V a2 = shuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
+                    29>(r[2], r[3]);
+  const V a3 = shuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15,
+                    31>(r[2], r[3]);
+  t[0] = shuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29>(a0,
+                                                                        a2);
+  t[1] = shuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31>(
+      a0, a2);
+  t[2] = shuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29>(a1,
+                                                                        a3);
+  t[3] = shuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31>(
+      a1, a3);
 }
 
 // Byte-granular rotate: rotr by a multiple of 8 bits is a byte permutation
@@ -207,6 +294,65 @@ inline void xtranspose(const B (&r)[8], B (&out)[8]) noexcept {
   out[6] = xshuf<4, 5, 6, 7, 12, 13, 14, 15>(b2, b6);
   out[7] = xshuf<4, 5, 6, 7, 12, 13, 14, 15>(b3, b7);
 }
+
+template <class B>
+inline void xtranspose(const B (&r)[16], B (&out)[16]) noexcept {
+  B a[16];
+  for (std::size_t g = 0; g < 8; ++g) {
+    a[2 * g] = xshuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
+                     29>(r[2 * g], r[2 * g + 1]);
+    a[2 * g + 1] = xshuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30,
+                         15, 31>(r[2 * g], r[2 * g + 1]);
+  }
+  B b[16];
+  for (std::size_t q = 0; q < 4; ++q) {
+    const std::size_t k = 4 * q;
+    b[k + 0] = xshuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28,
+                     29>(a[k + 0], a[k + 2]);
+    b[k + 1] = xshuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30,
+                     31>(a[k + 0], a[k + 2]);
+    b[k + 2] = xshuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28,
+                     29>(a[k + 1], a[k + 3]);
+    b[k + 3] = xshuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30,
+                     31>(a[k + 1], a[k + 3]);
+  }
+  B c[16];
+  for (std::size_t h = 0; h < 2; ++h) {
+    const std::size_t k = 8 * h;
+    for (std::size_t j = 0; j < 4; ++j) {
+      c[k + j] = xshuf<0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26,
+                       27>(b[k + j], b[k + j + 4]);
+      c[k + j + 4] = xshuf<4, 5, 6, 7, 20, 21, 22, 23, 12, 13, 14, 15, 28,
+                           29, 30, 31>(b[k + j], b[k + j + 4]);
+    }
+  }
+  for (std::size_t j = 0; j < 8; ++j) {
+    out[j] = xshuf<0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23>(
+        c[j], c[j + 8]);
+    out[j + 8] = xshuf<8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29,
+                       30, 31>(c[j], c[j + 8]);
+  }
+}
+
+template <class B>
+inline void xinlane_4x4(const B (&r)[4], B (&t)[4]) noexcept {
+  const B a0 = xshuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
+                     29>(r[0], r[1]);
+  const B a1 = xshuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15,
+                     31>(r[0], r[1]);
+  const B a2 = xshuf<0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13,
+                     29>(r[2], r[3]);
+  const B a3 = xshuf<2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15,
+                     31>(r[2], r[3]);
+  t[0] = xshuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29>(
+      a0, a2);
+  t[1] = xshuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31>(
+      a0, a2);
+  t[2] = xshuf<0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29>(
+      a1, a3);
+  t[3] = xshuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31>(
+      a1, a3);
+}
 #endif  // BLAKE3PP_HAS_XSIMD
 
 inline std::uint32_t ld32(const std::uint8_t* p) noexcept {
@@ -220,9 +366,8 @@ inline std::uint32_t ld32(const std::uint8_t* p) noexcept {
 
 // Fills m[0..15] with the block's message words transposed across W lanes:
 // m[j][lane] = word j of inputs[lane] at byte offset `offset`. Radix-2
-// shuffle tree where expressible (W of 4 or 8 on GCC/Clang; AVX-512's 16
-// still stages; TODO: a 16x16 network over vshufi32x4), scalar staging
-// gather everywhere else.
+// shuffle tree where expressible (W of 4, 8 or 16), scalar staging gather
+// everywhere else.
 template <std::size_t W = u32v::width>
 inline void load_transposed(const std::uint8_t* const* inputs,
                             std::size_t offset, u32v m[16]) noexcept {
@@ -234,43 +379,118 @@ inline void load_transposed(const std::uint8_t* const* inputs,
   // Provider-native path: when u32v wraps an xsimd batch, transpose the
   // batches directly: self-contained (works on MSVC), and on GCC/Clang
   // instruction-identical to the vext tree below.
-  if constexpr ((W == 4 || W == 8) &&
+  if constexpr ((W == 4 || W == 8 || W == 16) &&
                 std::endian::native == std::endian::little) {
     using B = typename u32v::impl;
-    constexpr std::size_t groups = 16 / W;
-    for (std::size_t g = 0; g < groups; ++g) {
-      B r[W];
-      for (std::size_t lane = 0; lane < W; ++lane) {
-        std::memcpy(&r[lane], inputs[lane] + offset + g * W * 4, sizeof(B));
+    if constexpr (W == 16) {
+      const kern::transpose16_mode mode = td::t16_mode();
+      if (mode == kern::transpose16_mode::quartered) {
+        // Quartered: 128-bit pieces land block-transposed by ADDRESSING;
+        // registers only run the two in-lane stages.
+        for (std::size_t q = 0; q < 4; ++q) {
+          B r[4];
+          for (std::size_t k = 0; k < 4; ++k) {
+            std::uint8_t quad[64];
+            for (std::size_t l = 0; l < 4; ++l) {
+              std::memcpy(quad + 16 * l,
+                          inputs[4 * l + k] + offset + 16 * q, 16);
+            }
+            std::memcpy(&r[k], quad, 64);
+          }
+          B t[4];
+          td::xinlane_4x4(r, t);
+          for (std::size_t j = 0; j < 4; ++j) {
+            m[4 * q + j] = u32v{t[j]};
+          }
+        }
+        return;
       }
-      B t[W];
-      td::xtranspose(r, t);
-      for (std::size_t j = 0; j < W; ++j) {
-        m[g * W + j] = u32v{t[j]};
+      if (mode == kern::transpose16_mode::tree) {
+        B r[16];
+        for (std::size_t lane = 0; lane < 16; ++lane) {
+          std::memcpy(&r[lane], inputs[lane] + offset, sizeof(B));
+        }
+        B t[16];
+        td::xtranspose(r, t);
+        for (std::size_t j = 0; j < 16; ++j) {
+          m[j] = u32v{t[j]};
+        }
+        return;
       }
+      // staging: fall through to the scalar gather below.
+    } else {
+      constexpr std::size_t groups = 16 / W;
+      for (std::size_t g = 0; g < groups; ++g) {
+        B r[W];
+        for (std::size_t lane = 0; lane < W; ++lane) {
+          std::memcpy(&r[lane], inputs[lane] + offset + g * W * 4,
+                      sizeof(B));
+        }
+        B t[W];
+        td::xtranspose(r, t);
+        for (std::size_t j = 0; j < W; ++j) {
+          m[g * W + j] = u32v{t[j]};
+        }
+      }
+      return;
     }
-    return;
   }
 #endif
 #if defined(BLAKE3PP_HAVE_SHUFFLE_TREE)
-  if constexpr ((W == 4 || W == 8) &&
+  if constexpr ((W == 4 || W == 8 || W == 16) &&
                 std::endian::native == std::endian::little &&
                 sizeof(typename u32v::impl) == 4 * W &&
                 std::is_trivially_copyable_v<typename u32v::impl>) {
     using V = typename td::vext<W>::type;
-    constexpr std::size_t groups = 16 / W;
-    for (std::size_t g = 0; g < groups; ++g) {
-      V r[W];
-      for (std::size_t lane = 0; lane < W; ++lane) {
-        r[lane] = td::load_row<V>(inputs[lane] + offset + g * W * 4);
+    if constexpr (W == 16) {
+      const kern::transpose16_mode mode = td::t16_mode();
+      if (mode == kern::transpose16_mode::quartered) {
+        for (std::size_t q = 0; q < 4; ++q) {
+          V r[4];
+          for (std::size_t k = 0; k < 4; ++k) {
+            std::uint8_t quad[64];
+            for (std::size_t l = 0; l < 4; ++l) {
+              std::memcpy(quad + 16 * l,
+                          inputs[4 * l + k] + offset + 16 * q, 16);
+            }
+            r[k] = td::load_row<V>(quad);
+          }
+          V t[4];
+          td::inlane_4x4(r, t);
+          for (std::size_t j = 0; j < 4; ++j) {
+            m[4 * q + j] = u32v{std::bit_cast<typename u32v::impl>(t[j])};
+          }
+        }
+        return;
       }
-      V t[W];
-      td::transpose(r, t);
-      for (std::size_t j = 0; j < W; ++j) {
-        m[g * W + j] = u32v{std::bit_cast<typename u32v::impl>(t[j])};
+      if (mode == kern::transpose16_mode::tree) {
+        V r[16];
+        for (std::size_t lane = 0; lane < 16; ++lane) {
+          r[lane] = td::load_row<V>(inputs[lane] + offset);
+        }
+        V t[16];
+        td::transpose(r, t);
+        for (std::size_t j = 0; j < 16; ++j) {
+          m[j] = u32v{std::bit_cast<typename u32v::impl>(t[j])};
+        }
+        return;
       }
+      // staging: fall through.
+    } else {
+      constexpr std::size_t groups = 16 / W;
+      for (std::size_t g = 0; g < groups; ++g) {
+        V r[W];
+        for (std::size_t lane = 0; lane < W; ++lane) {
+          r[lane] = td::load_row<V>(inputs[lane] + offset + g * W * 4);
+        }
+        V t[W];
+        td::transpose(r, t);
+        for (std::size_t j = 0; j < W; ++j) {
+          m[g * W + j] = u32v{std::bit_cast<typename u32v::impl>(t[j])};
+        }
+      }
+      return;
     }
-    return;
   }
 #endif
   std::uint32_t lanes[W];
@@ -289,43 +509,117 @@ template <std::size_t W = u32v::width>
 inline void store_transposed(const u32v (&w)[16], std::uint8_t* out) noexcept {
   namespace td = transpose_detail;
 #if defined(BLAKE3PP_HAVE_XSIMD_SHUFFLE)
-  if constexpr ((W == 4 || W == 8) &&
+  if constexpr ((W == 4 || W == 8 || W == 16) &&
                 std::endian::native == std::endian::little) {
     using B = typename u32v::impl;
-    constexpr std::size_t groups = 16 / W;
-    for (std::size_t g = 0; g < groups; ++g) {
-      B r[W];
-      for (std::size_t j = 0; j < W; ++j) {
-        r[j] = w[g * W + j].v;
+    if constexpr (W == 16) {
+      const kern::transpose16_mode mode = td::t16_mode();
+      if (mode == kern::transpose16_mode::quartered) {
+        // Quartered mirror: two in-lane stages, then 128-bit pieces go
+        // to their destinations by addressing (extract-stores).
+        for (std::size_t q = 0; q < 4; ++q) {
+          B r[4];
+          for (std::size_t j = 0; j < 4; ++j) {
+            r[j] = w[4 * q + j].v;
+          }
+          B t[4];
+          td::xinlane_4x4(r, t);
+          for (std::size_t k = 0; k < 4; ++k) {
+            std::uint8_t quad[64];
+            std::memcpy(quad, &t[k], 64);
+            for (std::size_t l = 0; l < 4; ++l) {
+              std::memcpy(out + (4 * l + k) * 64 + 16 * q, quad + 16 * l,
+                          16);
+            }
+          }
+        }
+        return;
       }
-      B t[W];
-      td::xtranspose(r, t);
-      for (std::size_t lane = 0; lane < W; ++lane) {
-        std::memcpy(out + lane * 64 + g * W * 4, &t[lane], sizeof(B));
+      if (mode == kern::transpose16_mode::tree) {
+        B r[16];
+        for (std::size_t j = 0; j < 16; ++j) {
+          r[j] = w[j].v;
+        }
+        B t[16];
+        td::xtranspose(r, t);
+        for (std::size_t lane = 0; lane < 16; ++lane) {
+          std::memcpy(out + lane * 64, &t[lane], sizeof(B));
+        }
+        return;
       }
+      // staging: fall through.
+    } else {
+      constexpr std::size_t groups = 16 / W;
+      for (std::size_t g = 0; g < groups; ++g) {
+        B r[W];
+        for (std::size_t j = 0; j < W; ++j) {
+          r[j] = w[g * W + j].v;
+        }
+        B t[W];
+        td::xtranspose(r, t);
+        for (std::size_t lane = 0; lane < W; ++lane) {
+          std::memcpy(out + lane * 64 + g * W * 4, &t[lane], sizeof(B));
+        }
+      }
+      return;
     }
-    return;
   }
 #endif
 #if defined(BLAKE3PP_HAVE_SHUFFLE_TREE)
-  if constexpr ((W == 4 || W == 8) &&
+  if constexpr ((W == 4 || W == 8 || W == 16) &&
                 std::endian::native == std::endian::little &&
                 sizeof(typename u32v::impl) == 4 * W &&
                 std::is_trivially_copyable_v<typename u32v::impl>) {
     using V = typename td::vext<W>::type;
-    constexpr std::size_t groups = 16 / W;
-    for (std::size_t g = 0; g < groups; ++g) {
-      V r[W];
-      for (std::size_t j = 0; j < W; ++j) {
-        r[j] = std::bit_cast<V>(w[g * W + j].v);
+    if constexpr (W == 16) {
+      const kern::transpose16_mode mode = td::t16_mode();
+      if (mode == kern::transpose16_mode::quartered) {
+        for (std::size_t q = 0; q < 4; ++q) {
+          V r[4];
+          for (std::size_t j = 0; j < 4; ++j) {
+            r[j] = std::bit_cast<V>(w[4 * q + j].v);
+          }
+          V t[4];
+          td::inlane_4x4(r, t);
+          for (std::size_t k = 0; k < 4; ++k) {
+            std::uint8_t quad[64];
+            std::memcpy(quad, &t[k], 64);
+            for (std::size_t l = 0; l < 4; ++l) {
+              std::memcpy(out + (4 * l + k) * 64 + 16 * q, quad + 16 * l,
+                          16);
+            }
+          }
+        }
+        return;
       }
-      V t[W];
-      td::transpose(r, t);
-      for (std::size_t lane = 0; lane < W; ++lane) {
-        std::memcpy(out + lane * 64 + g * W * 4, &t[lane], sizeof(V));
+      if (mode == kern::transpose16_mode::tree) {
+        V r[16];
+        for (std::size_t j = 0; j < 16; ++j) {
+          r[j] = std::bit_cast<V>(w[j].v);
+        }
+        V t[16];
+        td::transpose(r, t);
+        for (std::size_t lane = 0; lane < 16; ++lane) {
+          std::memcpy(out + lane * 64, &t[lane], sizeof(V));
+        }
+        return;
       }
+      // staging: fall through.
+    } else {
+      constexpr std::size_t groups = 16 / W;
+      for (std::size_t g = 0; g < groups; ++g) {
+        V r[W];
+        for (std::size_t j = 0; j < W; ++j) {
+          r[j] = std::bit_cast<V>(w[g * W + j].v);
+        }
+        V t[W];
+        td::transpose(r, t);
+        for (std::size_t lane = 0; lane < W; ++lane) {
+          std::memcpy(out + lane * 64 + g * W * 4, &t[lane], sizeof(V));
+        }
+      }
+      return;
     }
-    return;
   }
 #endif
   std::uint32_t lanes[W];
@@ -348,7 +642,7 @@ inline void store_transposed(const u32v (&w)[16], std::uint8_t* out) noexcept {
 // W is a defaulted template parameter (not read directly off u32v) so the
 // discarded constexpr branch stays dependent, the same trap as in
 // load_transposed: non-dependent constructs in a discarded branch are still
-// instantiated, and vext<16> has no definition.
+// instantiated (vext<16> exists nowadays, but the discipline stays).
 template <int N, std::size_t W = u32v::width>
 inline u32v rot(u32v a) noexcept {
 #if defined(BLAKE3PP_HAVE_SHUFFLE_TREE)

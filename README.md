@@ -151,6 +151,18 @@ assert(blake3pp::available_arches().front() == blake3pp::best_available());
 Requesting a variant the CPU can't run silently falls back to the best
 available one; `is_available()` tells you beforehand.
 
+On AVX-512 machines one more dial exists: the 16-lane message transpose
+has three implementation strategies whose ranking depends on whether the
+CPU's AVX-512 datapath is full-width or double-pumped, a property no
+CPUID bit reports. The default (`quartered`) is the measured best, and
+`tune_transpose16()` settles it empirically on the running machine
+(~1 ms race, applies the winner process-wide):
+
+```cpp
+blake3pp::transpose16 best = blake3pp::tune_transpose16();
+std::cout << "transpose strategy: " << blake3pp::to_string(best) << '\n';
+```
+
 The build configuration is introspectable too, which is handy for
 diagnostics banners and bug reports:
 

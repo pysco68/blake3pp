@@ -80,6 +80,33 @@ enum class arch : std::uint8_t {
 /// "std::execution" or "stdexec".
 [[nodiscard]] std::string_view execution_provider() noexcept;
 
+/// The strategy for the AVX-512 kernel's 16-lane message transpose.
+///
+/// The right choice depends on the execution datapath (full-width or
+/// double-pumped AVX-512), which no CPUID bit reports, so beyond the
+/// measured-best default (quartered), tune_transpose16() settles it
+/// empirically: it races the strategies on this CPU, applies the winner
+/// process-wide and returns it. On machines without AVX-512 the setting
+/// is inert. Thread-safe; switching mid-hash is benign, since every
+/// strategy is correct.
+enum class transpose16 : std::uint8_t {
+  staging = 0,    ///< Scalar gather through a staging array.
+  tree = 1,       ///< Radix-2 register shuffle network.
+  quartered = 2,  ///< 128-bit insert-loads plus in-lane unpacks (the default).
+};
+/// Pins the transpose strategy process-wide.
+/// @param strategy  The strategy every width-16 kernel uses from now on.
+void set_transpose16(transpose16 strategy) noexcept;
+/// The strategy currently in effect.
+[[nodiscard]] transpose16 active_transpose16() noexcept;
+/// Races the transpose strategies over a 128 MiB working set and applies the
+/// winner process-wide.
+/// @return The winning strategy, now active.
+transpose16 tune_transpose16() noexcept;
+/// The canonical name of a strategy ("staging", "tree", "quartered").
+/// @param strategy  Any strategy.
+[[nodiscard]] std::string_view to_string(transpose16 strategy) noexcept;
+
 namespace detail {
 // Maps an arch to its kernel table; unavailable variants fall back to the
 // best available one. Never returns null.

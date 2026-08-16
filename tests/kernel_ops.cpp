@@ -190,6 +190,41 @@ TEST_CASE("hash_many matches a per-input compress loop") {
   }
 }
 
+TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
+  const auto saved = blake3pp::active_transpose16();
+  for (const auto strat :
+       {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
+        blake3pp::transpose16::quartered}) {
+    blake3pp::set_transpose16(strat);
+    CHECK(blake3pp::active_transpose16() == strat);
+    if (blake3pp::is_available(blake3pp::arch::avx512)) {
+      // Real coverage only on AVX-512 CPUs (or under Intel SDE): every
+      // strategy must reproduce the official vectors byte-for-byte.
+      std::vector<std::byte> input(31745);  // spec pattern, odd length
+      for (std::size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<std::byte>(i % 251);
+      }
+      blake3pp::hasher h{blake3pp::arch::avx512};
+      h.update(input);
+      blake3pp::hasher ref{blake3pp::arch::scalar};
+      ref.update(input);
+      CHECK(h.finalize() == ref.finalize());
+      // XOF path exercises store_transposed through the same dial.
+      std::vector<std::byte> wide(64 * 64 + 32);
+      std::vector<std::byte> wide_ref(wide.size());
+      h.finalize_xof().fill(wide);
+      ref.finalize_xof().fill(wide_ref);
+      CHECK(wide == wide_ref);
+    }
+  }
+  blake3pp::set_transpose16(saved);
+  // The tuner applies and reports a strategy (a no-op fallback without
+  // AVX-512); either way its result must be the active one afterwards.
+  const auto picked = blake3pp::tune_transpose16();
+  CHECK(blake3pp::active_transpose16() == picked);
+  blake3pp::set_transpose16(saved);
+}
+
 }  // TEST_SUITE
 
 }  // namespace
