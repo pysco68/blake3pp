@@ -1,0 +1,52 @@
+# tools/
+
+Scripts around the build: the toolchain matrix and the binary inspection
+the fat-binary design keeps needing. Everything runs from the repository
+root.
+
+| Script | Purpose |
+| --- | --- |
+| `gen-toolchains.py` | Regenerate the CMake toolchain files under `cmake/toolchains/` for the whole matrix. |
+| `build-msan-libcxx.sh` | Build the MemorySanitizer-instrumented libc++ the msan preset links. |
+| `gen-test-vectors.py` | Turn the official BLAKE3 `test_vectors.json` into the C++ header the tests include. |
+| `objscan.py` | Look inside a built object or binary: instruction classes and code-generation quality. |
+
+## objscan.py
+
+A fat binary raises the same questions on every compiler: did the
+vector kernel vectorize, did the facade inline or leave a call soup,
+does anything outside the kernels use an instruction the dispatch
+verdict does not gate. `objscan.py` answers them from the disassembly.
+
+It reads ELF and PE/COFF (objects and linked binaries) and picks the
+disassembler: GNU objdump when present, llvm-objdump otherwise (the LLVM
+install on the Windows runners; `--objdump` names one explicitly).
+Function names are the disassembler's demangled ones; patterns match on
+`kern::<variant>::` rather than on whole names, since the MSVC demangler
+spells the anonymous namespace its own way.
+
+```sh
+# Did it vectorize? The vector mnemonics in one kernel object.
+tools/objscan.py mnemonics build/linux-gcc16-cxx26/CMakeFiles/blake3pp_kernel_avx2.dir/src/kernel/kernel.cpp.o
+tools/objscan.py mnemonics --per-function BIN -x 'compress_in_place'
+
+# How good is the code? Per hot function: size, vector density, loops
+# (backward branches), calls that survived inlining with their callees,
+# and vector traffic through the stack frame.
+tools/objscan.py quality build/windows-msvc2026-cxx23/CMakeFiles/blake3pp_kernel_sse42.dir/src/kernel/kernel.cpp.obj
+
+# Which functions use an instruction outside the kernel that owns it?
+tools/objscan.py find build/linux-gcc16-cxx26/cli/blake3ppsum '^v[a-z]' -x 'kern::(avx2|avx512)' --fail
+
+# The disassembly of one function.
+tools/objscan.py disasm BIN 'kern::avx2::.*hash_many'
+```
+
+`quality` is the check that catches the two classic failures: a compiler
+that gave up inlining the SIMD facade (calls into `xsimd::` or
+`std::simd` helpers in `hash_many`; MSVC's default inlining budget did
+exactly that on the sse42 kernel until `/Ob3`), and rounds that were not
+unrolled (a rolled kernel has a tenth of the vector instructions and one
+more loop). The stack-vector column counts vector loads and stores
+through the stack pointer; the transposed message blocks legitimately
+live there, so read it as a trend across compilers, not as an assertion.
