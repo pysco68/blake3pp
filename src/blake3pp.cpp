@@ -190,6 +190,18 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
     const std::uint64_t block_index = position_ / kern::block_len;
     const std::size_t in_block =
         static_cast<std::size_t>(position_ % kern::block_len);
+    // Block-aligned bulk of the request goes lanes-wide: output counters
+    // map to SIMD lanes, so long fills run at hash_many-class speed.
+    if (in_block == 0 && out.size() - done >= kern::block_len) {
+      const std::size_t nblocks = (out.size() - done) / kern::block_len;
+      ops_->xof_many(input_cv_.data(), block_.data(), block_len_,
+                     block_index, flags_,
+                     reinterpret_cast<std::uint8_t*>(out.data() + done),
+                     nblocks);
+      done += nblocks * kern::block_len;
+      position_ += nblocks * kern::block_len;
+      continue;
+    }
     if (!cache_valid_ || cached_block_ != block_index) {
       // uint8_t view of the byte cache at the flat kernel ABI boundary.
       ops_->compress_xof(input_cv_.data(), block_.data(), block_len_,

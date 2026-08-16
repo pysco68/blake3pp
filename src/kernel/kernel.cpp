@@ -163,6 +163,66 @@ void compress_xof(const std::uint32_t cv[8],
   }
 }
 
+// Fills u32v::width consecutive XOF output blocks: the root node's cv and
+// message are BROADCAST (identical in every lane); only the counter varies
+// per lane. No input transpose exists at all; the store is the only
+// lane-major step.
+void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
+              std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
+              std::uint8_t* out) noexcept {
+  constexpr std::size_t W = u32v::width;
+
+  u32v m[16];
+  for (std::size_t i = 0; i < 16; ++i) {
+    m[i] = u32v::broadcast(load32(block + 4 * i));
+  }
+
+  std::uint32_t lanes[W];
+  for (std::size_t lane = 0; lane < W; ++lane) {
+    lanes[lane] = static_cast<std::uint32_t>(counter + lane);
+  }
+  const u32v ctr_lo = u32v::load(lanes);
+  for (std::size_t lane = 0; lane < W; ++lane) {
+    lanes[lane] = static_cast<std::uint32_t>((counter + lane) >> 32);
+  }
+  const u32v ctr_hi = u32v::load(lanes);
+
+  u32v v[16];
+  for (std::size_t j = 0; j < 8; ++j) {
+    v[j] = u32v::broadcast(cv[j]);
+  }
+  for (std::size_t j = 0; j < 4; ++j) {
+    v[8 + j] = u32v::broadcast(iv[j]);
+  }
+  v[12] = ctr_lo;
+  v[13] = ctr_hi;
+  v[14] = u32v::broadcast(len);
+  v[15] = u32v::broadcast(flags);
+
+  all_rounds(v, m);
+
+  u32v wide[16];
+  for (std::size_t j = 0; j < 8; ++j) {
+    wide[j] = v[j] ^ v[j + 8];
+    wide[j + 8] = v[j + 8] ^ u32v::broadcast(cv[j]);
+  }
+  store_transposed(wide, out);
+}
+
+void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
+              std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
+              std::uint8_t* out, std::size_t num_blocks) noexcept {
+  std::size_t i = 0;
+  if constexpr (u32v::width > 1) {
+    for (; i + u32v::width <= num_blocks; i += u32v::width) {
+      xof_wide(cv, block, len, counter + i, flags, out + i * 64);
+    }
+  }
+  for (; i < num_blocks; ++i) {
+    compress_xof(cv, block, len, counter + i, flags, out + i * 64);
+  }
+}
+
 // Hashes exactly u32v::width inputs, one per SIMD lane. State and message
 // live transposed: each of the 16 words is a vector holding that word for
 // every lane. Message transposition goes through a small staging array; the
@@ -277,6 +337,7 @@ const kernel_ops ops = {
     /*simd_degree=*/u32v::width,
     &compress_in_place,
     &compress_xof,
+    &xof_many,
     &hash_many,
 };
 

@@ -75,6 +75,15 @@ struct kernel_ops {
                        std::uint64_t counter, std::uint32_t flags,
                        std::uint8_t out[64]) noexcept;
 
+  // Extended-output workhorse: fills num_blocks consecutive 64-byte
+  // output blocks (counters counter .. counter+num_blocks-1) of ONE root
+  // node into out. Lanes map to output counters, the mirror image of
+  // hash_many.
+  void (*xof_many)(const std::uint32_t cv[8],
+                   const std::uint8_t block[block_len], std::uint32_t len,
+                   std::uint64_t counter, std::uint32_t flags,
+                   std::uint8_t* out, std::size_t num_blocks) noexcept;
+
   // Hash num_inputs inputs of `blocks` full 64-byte blocks each, writing one
   // 32-byte chaining value per input to out. Each input i starts from key
   // as its CV and uses counter (+ i when increment_counter). flags_start /

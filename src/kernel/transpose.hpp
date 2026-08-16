@@ -197,6 +197,47 @@ inline void load_transposed(const std::uint8_t* const* inputs,
   }
 }
 
+// Writes 16 wide words lane-major: lane l receives words w[0..15][l] as
+// 64 little-endian bytes at out + l*64, the mirror of load_transposed,
+// using the same radix-2 shuffle trees where expressible.
+template <std::size_t W = u32v::width>
+inline void store_transposed(const u32v (&w)[16], std::uint8_t* out) noexcept {
+  namespace td = transpose_detail;
+#if defined(BLAKE3PP_HAVE_SHUFFLE_TREE)
+  if constexpr ((W == 4 || W == 8) &&
+                std::endian::native == std::endian::little &&
+                sizeof(typename u32v::impl) == 4 * W &&
+                std::is_trivially_copyable_v<typename u32v::impl>) {
+    using V = typename td::vext<W>::type;
+    constexpr std::size_t groups = 16 / W;
+    for (std::size_t g = 0; g < groups; ++g) {
+      V r[W];
+      for (std::size_t j = 0; j < W; ++j) {
+        r[j] = std::bit_cast<V>(w[g * W + j].v);
+      }
+      V t[W];
+      td::transpose(r, t);
+      for (std::size_t lane = 0; lane < W; ++lane) {
+        std::memcpy(out + lane * 64 + g * W * 4, &t[lane], sizeof(V));
+      }
+    }
+    return;
+  }
+#endif
+  std::uint32_t lanes[W];
+  for (std::size_t j = 0; j < 16; ++j) {
+    w[j].store(lanes);
+    for (std::size_t lane = 0; lane < W; ++lane) {
+      const std::uint32_t v = lanes[lane];
+      std::uint8_t* p = out + lane * 64 + 4 * j;
+      p[0] = static_cast<std::uint8_t>(v);
+      p[1] = static_cast<std::uint8_t>(v >> 8);
+      p[2] = static_cast<std::uint8_t>(v >> 16);
+      p[3] = static_cast<std::uint8_t>(v >> 24);
+    }
+  }
+}
+
 // Compile-time-amount rotate for the wide word: byte-shuffle single-uop
 // path for the 16- and 8-bit rotates where expressible, generic shift-or
 // otherwise. The scalar word overload lives in kernel.cpp.

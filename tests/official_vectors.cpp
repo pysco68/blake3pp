@@ -147,6 +147,22 @@ TEST_CASE("output_reader streams, seeks, and agrees with the digest") {
     CHECK(std::equal(window.begin(), window.end(), big.begin() + 123));
   }
 
+  // Long fills take the lanes-wide xof_many path; they must equal the
+  // block-at-a-time stream exactly.
+  {
+    auto bulk = h.finalize_xof();
+    std::vector<std::byte> wide(64 * 1024 + 13);
+    bulk.fill(wide);
+    auto slow = h.finalize_xof();
+    std::vector<std::byte> stepped(wide.size());
+    for (std::size_t pos = 0; pos < stepped.size(); pos += 64) {
+      slow.fill(std::span{stepped}.subspan(pos,
+                                           std::min<std::size_t>(
+                                               64, stepped.size() - pos)));
+    }
+    CHECK(wide == stepped);
+  }
+
   // The digest is the stream's first 32 bytes.
   const auto d = h.finalize();
   CHECK(std::equal(d.bytes.begin(), d.bytes.end(), big.begin()));

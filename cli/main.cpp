@@ -3,10 +3,14 @@
 //   blake3ppsum [OPTIONS] [FILE...]         print "<hex>  <file>" per file
 //   blake3ppsum --check [OPTIONS] [LIST...] verify previously printed lines
 //
-// FILE of "-" (or no files) reads stdin. Options expose the interesting
-// internals: --arch pins a SIMD variant, --threads sizes the compute pool
-// (0 = sequential), and --window/--qd/--no-direct tune the I/O pipeline.
+// FILE of "-" (or no files) reads stdin. All three BLAKE3 modes are
+// available (--keyed, --derive-key), plus extended output (--length), a
+// pinned SIMD variant (--arch), compute threads (--threads) and the I/O
+// pipeline knobs (--window/--qd/--no-direct).
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <format>
@@ -60,6 +64,9 @@ struct options {
   blake3pp::hash_file_options io;
   unsigned threads = std::thread::hardware_concurrency();
   bool check = false;
+  std::size_t out_len = 32;
+  std::string key_file;        // --keyed: path to 32 raw bytes or 64 hex
+  std::string derive_context;  // --derive-key
   std::vector<std::string> files;
 };
 
@@ -80,23 +87,61 @@ std::string version_text() {
       blake3pp::to_string(blake3pp::best_available()));
 }
 
-blake3pp::digest hash_stdin(blake3pp::arch a) {
-  blake3pp::hasher h{a};
-  std::vector<std::byte> buf(1024 * 1024);
-  std::size_t n = 0;
-  while ((n = std::fread(buf.data(), 1, buf.size(), stdin)) > 0) {
-    h.update(std::span{buf}.first(n));
+std::string to_hex(std::span<const std::byte> bytes) {
+  std::string s;
+  for (const std::byte b : bytes) {
+    std::format_to(std::back_inserter(s), "{:02x}",
+                   std::to_integer<unsigned>(b));
   }
-  if (std::ferror(stdin) != 0) {
-    throw std::system_error(errno, std::generic_category(),
-                            "reading standard input");
+  return s;
+}
+
+// Accepts a file holding either exactly 32 raw bytes or 64 hex characters
+// (trailing whitespace tolerated); "-" reads the key from stdin, in which
+// case the data must come from files.
+std::array<std::byte, 32> load_key(const std::string& source) {
+  std::string content;
+  if (source == "-") {
+    std::array<char, 128> buf;
+    const std::size_t n = std::fread(buf.data(), 1, buf.size(), stdin);
+    content.assign(buf.data(), n);
+  } else {
+    std::ifstream in(source, std::ios::binary);
+    if (!in) {
+      throw std::system_error(errno, std::generic_category(), source);
+    }
+    content.assign(std::istreambuf_iterator<char>(in), {});
   }
-  return h.finalize();
+  if (content.size() == 32) {
+    std::array<std::byte, 32> key;
+    for (std::size_t i = 0; i < 32; ++i) {
+      key[i] = static_cast<std::byte>(static_cast<unsigned char>(content[i]));
+    }
+    return key;
+  }
+  while (!content.empty() &&
+         (content.back() == '\n' || content.back() == '\r' ||
+          content.back() == ' ')) {
+    content.pop_back();
+  }
+  if (const auto parsed = blake3pp::digest::from_hex(content)) {
+    return parsed.value().bytes;
+  }
+  throw std::runtime_error(
+      "key must be exactly 32 raw bytes or 64 hex characters");
 }
 
 class engine {
  public:
-  explicit engine(const options& o) : opts_(o) {
+  engine(const options& o) : opts_(o) {
+    if (!o.derive_context.empty()) {
+      proto_ = blake3pp::hasher::derive_key(o.derive_context, o.io.a);
+    } else if (!o.key_file.empty()) {
+      const auto key = load_key(o.key_file);
+      proto_ = blake3pp::hasher::keyed(key, o.io.a);
+    } else {
+      proto_ = blake3pp::hasher{o.io.a};
+    }
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
     if (o.threads > 1) {
       pool_.emplace(o.threads);
@@ -104,27 +149,60 @@ class engine {
 #endif
   }
 
-  blake3pp::digest hash(const std::filesystem::path& path) {
+  // Hashes stdin or a file into a fresh copy of the mode prototype. Every
+  // mode gets async windowed reads, and multi-core when a pool exists.
+  blake3pp::hasher hash_source(const std::string& path) {
+    blake3pp::hasher h = proto_.value();  // hashers are cheap flat copies
     if (path == "-") {
-      return hash_stdin(opts_.io.a);
+      std::vector<std::byte> buf(1024 * 1024);
+      std::size_t n = 0;
+      while ((n = std::fread(buf.data(), 1, buf.size(), stdin)) > 0) {
+        h.update(std::span{buf}.first(n));
+      }
+      if (std::ferror(stdin) != 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "reading standard input");
+      }
+      return h;
     }
+    blake3pp::detail::file_reader reader(
+        std::filesystem::path(path),
+        {opts_.io.window_bytes, opts_.io.queue_depth, opts_.io.direct_io,
+         true});
+    const auto* const ops = blake3pp::detail::resolve(h.selected_arch());
+    while (auto w = reader.next()) {
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
-    if (pool_.has_value()) {
-      return blake3pp::hash_file(path, pool_.value().get_scheduler(),
-                                 opts_.io);
-    }
+      if (pool_.has_value() && !w->last) {
+        auto sched = pool_.value().get_scheduler();
+        blake3pp::detail::hash_window_parallel(
+            ops, sched, h, w->data, w->bytes / blake3pp::chunk_size,
+            w->offset / blake3pp::chunk_size);
+        reader.release(w.value());
+        continue;
+      }
 #endif
-    return blake3pp::hash_file(path, opts_.io);
+      h.update(std::span<const std::byte>{w->data, w->bytes});
+      reader.release(w.value());
+    }
+    return h;
+  }
+
+  std::string hash_hex(const std::string& path, std::size_t out_len) {
+    std::vector<std::byte> out(out_len);
+    hash_source(path).finalize(out);
+    return to_hex(out);
   }
 
  private:
   options opts_;
+  std::optional<blake3pp::hasher> proto_;
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
   std::optional<exec::static_thread_pool> pool_;
 #endif
 };
 
-// Verifies "<64 hex>  <name>" lines (also accepts the '*' binary marker).
+// Verifies "<hex>  <name>" lines of any (even) digest length; also accepts
+// the '*' binary marker.
 int run_check(engine& eng, std::istream& in, std::string_view list_name) {
   int failures = 0;
   std::string line;
@@ -133,23 +211,27 @@ int run_check(engine& eng, std::istream& in, std::string_view list_name) {
     if (sv.empty() || sv.starts_with('#')) {
       continue;
     }
-    const auto expected = sv.size() >= 66
-                              ? blake3pp::digest::from_hex(sv.substr(0, 64))
-                              : std::nullopt;
-    if (!expected.has_value()) {
+    const std::size_t hex_end = sv.find(' ');
+    const std::string_view hex = sv.substr(0, hex_end);
+    if (hex_end == std::string_view::npos || hex.size() < 2 ||
+        hex.size() % 2 != 0) {
       println(stderr, "blake3ppsum: {}:{}: malformed line", list_name,
               line_no);
       failures++;
       continue;
     }
-    auto rest = sv.substr(64);
+    auto rest = sv.substr(hex_end);
     rest.remove_prefix(std::min(rest.find_first_not_of(' '), rest.size()));
     if (rest.starts_with('*')) {
       rest.remove_prefix(1);
     }
     const std::string name{rest};
     try {
-      if (expected == eng.hash(name)) {  // optional's heterogeneous ==
+      std::string expected{hex};
+      for (char& c : expected) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      if (eng.hash_hex(name, hex.size() / 2) == expected) {
         println(stdout, "{}: OK", name);
       } else {
         println(stdout, "{}: FAILED", name);
@@ -171,12 +253,25 @@ int main(int argc, char** argv) {
   std::size_t window_mib = 8;
 
   CLI::App app{
-      "Print or check BLAKE3 (256-bit) checksums.\n"
+      "Print or check BLAKE3 checksums.\n"
       "With no FILE, or FILE of '-', read standard input."};
   app.set_version_flag("--version", version_text);
 
   app.add_flag("-c,--check", o.check,
                "read checksum lines from FILEs and verify them");
+  auto* keyed =
+      app.add_option("--keyed", o.key_file,
+                     "keyed (MAC) mode; FILE holds the 32-byte key as raw "
+                     "bytes or 64 hex chars ('-' reads it from stdin)");
+  auto* derive = app.add_option("--derive-key", o.derive_context,
+                                "key-derivation mode with this context "
+                                "string");
+  keyed->excludes(derive);
+  derive->excludes(keyed);
+  app.add_option("--length", o.out_len,
+                 "output length in bytes (extended output)")
+      ->check(CLI::Range(std::size_t{1}, std::size_t{1} << 20))
+      ->capture_default_str();
 
   // The name<->enum mapping comes from the library's canonical list; the
   // CLI never re-enumerates the arch enum.
@@ -212,42 +307,54 @@ int main(int argc, char** argv) {
             blake3pp::to_string(blake3pp::best_available()));
     return 2;
   }
-
-  engine eng(o);
-  if (o.files.empty()) {
-    o.files.emplace_back("-");
+  if (o.key_file == "-" &&
+      (o.files.empty() ||
+       std::find(o.files.begin(), o.files.end(), "-") != o.files.end())) {
+    println(stderr,
+            "blake3ppsum: with the key on stdin, data must come from files");
+    return 2;
   }
+
   int failures = 0;
+  try {
+    engine eng(o);
+    if (o.files.empty()) {
+      o.files.emplace_back("-");
+    }
 
-  if (o.check) {
+    if (o.check) {
+      for (const auto& f : o.files) {
+        if (f == "-") {
+          failures += run_check(eng, std::cin, "-");
+          continue;
+        }
+        std::ifstream in(f);
+        if (!in) {
+          println(stderr, "blake3ppsum: {}: cannot open", f);
+          failures++;
+          continue;
+        }
+        failures += run_check(eng, in, f);
+      }
+      if (failures > 0) {
+        println(stderr,
+                "blake3ppsum: WARNING: {} computed checksum(s) did NOT match",
+                failures);
+      }
+      return failures == 0 ? 0 : 1;
+    }
+
     for (const auto& f : o.files) {
-      if (f == "-") {
-        failures += run_check(eng, std::cin, "-");
-        continue;
-      }
-      std::ifstream in(f);
-      if (!in) {
-        println(stderr, "blake3ppsum: {}: cannot open", f);
+      try {
+        println(stdout, "{}  {}", eng.hash_hex(f, o.out_len), f);
+      } catch (const std::exception& e) {
+        println(stderr, "blake3ppsum: {}: {}", f, e.what());
         failures++;
-        continue;
       }
-      failures += run_check(eng, in, f);
     }
-    if (failures > 0) {
-      println(stderr,
-              "blake3ppsum: WARNING: {} computed checksum(s) did NOT match",
-              failures);
-    }
-    return failures == 0 ? 0 : 1;
-  }
-
-  for (const auto& f : o.files) {
-    try {
-      println(stdout, "{}  {}", eng.hash(f), f);  // digest is formattable
-    } catch (const std::exception& e) {
-      println(stderr, "blake3ppsum: {}: {}", f, e.what());
-      failures++;
-    }
+  } catch (const std::exception& e) {
+    println(stderr, "blake3ppsum: {}", e.what());
+    return 2;
   }
   return failures == 0 ? 0 : 1;
 }

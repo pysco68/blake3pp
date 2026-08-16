@@ -1,0 +1,179 @@
+// blake3ppgen: a deterministic, SEEKABLE stream generator built on
+// BLAKE3's extended output.
+//
+//   blake3ppgen --seed hello --length 1G > testdata.bin
+//   blake3ppgen --seed hello --seek 10G --length 1M > slice.bin
+//
+// The same seed always produces the same infinite stream, and --seek is
+// O(1): materializing a slice at offset 10 GB costs the same as offset 0.
+// That makes it a reproducible test-data source at hashing speed (dd for
+// deterministic bytes). --derive-key domain-separates streams sharing seed
+// material; --hex prints hex instead of raw bytes.
+
+#include <cstdio>
+#include <format>
+#include <fstream>
+#include <span>
+#include <string>
+#include <vector>
+
+#include <CLI/CLI.hpp>
+#include <blake3pp/parallel.hpp>
+
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+#include <exec/static_thread_pool.hpp>
+#include <thread>
+#endif
+
+namespace {
+
+// Parses "123", "16K", "8M", "2G", "1T" (binary units) or "inf".
+std::uint64_t parse_size(const std::string& text) {
+  if (text == "inf") {
+    return std::uint64_t(-1);
+  }
+  std::size_t consumed = 0;
+  const std::uint64_t base = std::stoull(text, &consumed);
+  std::uint64_t multiplier = 1;
+  if (consumed + 1 == text.size()) {
+    switch (text[consumed]) {
+      case 'K': multiplier = std::uint64_t{1} << 10; break;
+      case 'M': multiplier = std::uint64_t{1} << 20; break;
+      case 'G': multiplier = std::uint64_t{1} << 30; break;
+      case 'T': multiplier = std::uint64_t{1} << 40; break;
+      default: throw CLI::ValidationError("size", "unknown unit suffix");
+    }
+  } else if (consumed != text.size()) {
+    throw CLI::ValidationError("size", "malformed size");
+  }
+  return base * multiplier;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::string seed;
+  std::string seed_file;
+  std::string context;
+  std::string length_text = "inf";
+  std::string seek_text = "0";
+  bool hex = false;
+  unsigned threads = 1;
+
+  CLI::App app{
+      "Deterministic seekable byte stream from BLAKE3 extended output.\n"
+      "The same seed always yields the same stream; --seek is O(1)."};
+  auto* seed_opt = app.add_option("--seed", seed, "seed string");
+  auto* seed_file_opt =
+      app.add_option("--seed-file", seed_file, "read seed bytes from FILE");
+  seed_opt->excludes(seed_file_opt);
+  seed_file_opt->excludes(seed_opt);
+  app.add_option("--derive-key", context,
+                 "domain-separate the stream with this context string");
+  app.add_option("--length", length_text,
+                 "bytes to emit: N, NK/NM/NG/NT, or 'inf'")
+      ->capture_default_str();
+  app.add_option("--seek", seek_text, "starting offset in the stream")
+      ->capture_default_str();
+  app.add_flag("--hex", hex, "emit lowercase hex instead of raw bytes");
+  app.add_option("--threads", threads,
+                 "generator threads (seekable output is embarrassingly "
+                 "parallel)")
+      ->capture_default_str();
+  CLI11_PARSE(app, argc, argv);
+
+  std::uint64_t remaining = 0;
+  std::uint64_t seek = 0;
+  try {
+    remaining = parse_size(length_text);
+    seek = parse_size(seek_text);
+  } catch (const std::exception& e) {
+    std::fputs(std::format("blake3ppgen: {}\n", e.what()).c_str(), stderr);
+    return 2;
+  }
+
+  blake3pp::hasher h = context.empty()
+                           ? blake3pp::hasher{}
+                           : blake3pp::hasher::derive_key(context);
+  if (!seed_file.empty()) {
+    std::ifstream in(seed_file, std::ios::binary);
+    if (!in) {
+      std::fputs(
+          std::format("blake3ppgen: cannot open {}\n", seed_file).c_str(),
+          stderr);
+      return 2;
+    }
+    const std::string content(std::istreambuf_iterator<char>(in), {});
+    h.update(content);
+  } else {
+    h.update(seed);
+  }
+
+  blake3pp::output_reader stream = h.finalize_xof();
+  stream.seek(seek);
+
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+  std::optional<exec::static_thread_pool> pool;
+  if (threads == 0) {
+    threads = std::thread::hardware_concurrency();
+  }
+  if (threads > 1) {
+    pool.emplace(threads);
+  }
+  constexpr std::size_t segment = 4 * 1024 * 1024;
+#endif
+
+  std::vector<std::byte> buf(
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+      threads > 1 ? threads * segment :
+#endif
+                  1024 * 1024);
+  while (remaining > 0) {
+    const std::size_t take = static_cast<std::size_t>(
+        std::min<std::uint64_t>(remaining, buf.size()));
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+    if (pool.has_value()) {
+      // Each task copies the reader, seeks its own segment, fills it:
+      // O(1) seek makes the stream embarrassingly parallel.
+      namespace ex = blake3pp::ex;
+      const std::uint64_t base = stream.position();
+      const std::size_t n_segs = (take + segment - 1) / segment;
+      auto work =
+          ex::schedule(pool.value().get_scheduler()) |
+          ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
+            blake3pp::output_reader r = stream;
+            r.seek(base + i * segment);
+            const std::size_t off = i * segment;
+            r.fill(std::span{buf}.first(take).subspan(
+                off, std::min(segment, take - off)));
+          });
+      ex::sync_wait(std::move(work));
+      stream.seek(base + take);
+    } else {
+      stream.fill(std::span{buf}.first(take));
+    }
+#else
+    stream.fill(std::span{buf}.first(take));
+#endif
+    if (hex) {
+      std::string line;
+      line.reserve(2 * take);
+      for (std::size_t i = 0; i < take; ++i) {
+        std::format_to(std::back_inserter(line), "{:02x}",
+                       std::to_integer<unsigned>(buf[i]));
+      }
+      if (std::fwrite(line.data(), 1, line.size(), stdout) != line.size()) {
+        break;  // downstream closed (e.g. head); not an error
+      }
+    } else if (std::fwrite(buf.data(), 1, take, stdout) != take) {
+      break;
+    }
+    if (remaining != std::uint64_t(-1)) {
+      remaining -= take;
+    }
+  }
+  if (hex) {
+    std::fputc('\n', stdout);
+  }
+  return 0;
+}

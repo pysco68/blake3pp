@@ -17,13 +17,21 @@ target_link_libraries(blake3ppsum PRIVATE
   blake3pp_warnings
   CLI11::CLI11)
 
+add_executable(blake3ppgen gen.cpp)
+target_link_libraries(blake3ppgen PRIVATE
+  blake3pp::blake3pp
+  blake3pp_warnings
+  CLI11::CLI11)
+
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell): known-answer for the empty input via stdin,
 # and the --check round trip including corruption detection.
-foreach(case version empty_stdin check_roundtrip)
+foreach(case version empty_stdin check_roundtrip length_prefix
+    keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads)
   add_test(NAME cli_${case}
     COMMAND ${CMAKE_COMMAND}
       "-DSUM=$<TARGET_FILE:blake3ppsum>"
+      "-DGEN=$<TARGET_FILE:blake3ppgen>"
       "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/smoke-${case}"
       "-DCASE=${case}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")

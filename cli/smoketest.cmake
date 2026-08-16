@@ -69,6 +69,82 @@ elseif(CASE STREQUAL "check_roundtrip")
     message(FATAL_ERROR "--check accepted a corrupted checksum")
   endif()
 
+elseif(CASE STREQUAL "length_prefix")
+  # Extended output: the 32-byte digest is the prefix of any longer output.
+  file(WRITE "${WORK}/f" "extended output prefix property")
+  run_sum(short res ARGS --length 32 f)
+  run_sum(long res2 ARGS --length 64 f)
+  string(SUBSTRING "${short}" 0 64 short_hex)
+  string(SUBSTRING "${long}" 0 64 long_prefix)
+  if(NOT res EQUAL 0 OR NOT res2 EQUAL 0 OR NOT short_hex STREQUAL long_prefix)
+    message(FATAL_ERROR "--length 64 does not extend --length 32")
+  endif()
+
+elseif(CASE STREQUAL "keyed_roundtrip")
+  # Key as 64 hex chars; keyed sums verify only with the same key.
+  file(WRITE "${WORK}/key"
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+  file(WRITE "${WORK}/f" "authenticated payload")
+  run_sum(sums res ARGS --keyed key f)
+  file(WRITE "${WORK}/sums" "${sums}")
+  run_sum(out res2 ARGS --keyed key --check sums)
+  if(NOT res EQUAL 0 OR NOT res2 EQUAL 0)
+    message(FATAL_ERROR "keyed round trip failed: ${out}")
+  endif()
+  run_sum(out res3 ARGS --check sums)  # without the key: must FAIL
+  if(res3 EQUAL 0)
+    message(FATAL_ERROR "unkeyed --check accepted a keyed sum")
+  endif()
+
+elseif(CASE STREQUAL "derive_key")
+  # Different contexts must derive different digests from the same data.
+  file(WRITE "${WORK}/f" "master key material")
+  run_sum(a res ARGS --derive-key "ctx one" f)
+  run_sum(b res2 ARGS --derive-key "ctx two" f)
+  if(NOT res EQUAL 0 OR NOT res2 EQUAL 0 OR a STREQUAL b)
+    message(FATAL_ERROR "derive-key contexts not domain-separated")
+  endif()
+
+elseif(CASE STREQUAL "gen_deterministic")
+  execute_process(COMMAND "${GEN}" --seed smoke --length 64 --hex
+    OUTPUT_VARIABLE a RESULT_VARIABLE r1)
+  execute_process(COMMAND "${GEN}" --seed smoke --length 64 --hex
+    OUTPUT_VARIABLE b RESULT_VARIABLE r2)
+  if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT a STREQUAL b)
+    message(FATAL_ERROR "gen is not deterministic")
+  endif()
+  # Cross-check the tools: gen of the empty seed at length 32 IS the
+  # blake3 digest of empty input.
+  execute_process(COMMAND "${GEN}" --length 32 --hex
+    OUTPUT_VARIABLE g RESULT_VARIABLE r3)
+  if(NOT r3 EQUAL 0 OR NOT g MATCHES
+     "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+    message(FATAL_ERROR "gen of empty seed != blake3 of empty input: ${g}")
+  endif()
+
+elseif(CASE STREQUAL "gen_seek")
+  # O(1) seek: a slice at an offset equals that region of the full stream.
+  execute_process(COMMAND "${GEN}" --seed smoke --length 148 --hex
+    OUTPUT_VARIABLE full RESULT_VARIABLE r1)
+  execute_process(COMMAND "${GEN}" --seed smoke --seek 100 --length 48 --hex
+    OUTPUT_VARIABLE slice RESULT_VARIABLE r2)
+  string(SUBSTRING "${full}" 200 96 expected)  # bytes 100..148 as hex
+  string(SUBSTRING "${slice}" 0 96 got)
+  if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT expected STREQUAL got)
+    message(FATAL_ERROR "seeked slice diverges from the stream")
+  endif()
+
+elseif(CASE STREQUAL "gen_threads")
+  execute_process(COMMAND "${GEN}" --seed t --length 20000000 --threads 1
+    OUTPUT_FILE "${WORK}/one" RESULT_VARIABLE r1)
+  execute_process(COMMAND "${GEN}" --seed t --length 20000000 --threads 4
+    OUTPUT_FILE "${WORK}/four" RESULT_VARIABLE r2)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
+    "${WORK}/one" "${WORK}/four" RESULT_VARIABLE same)
+  if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT same EQUAL 0)
+    message(FATAL_ERROR "threaded generation diverges from sequential")
+  endif()
+
 else()
   message(FATAL_ERROR "unknown CASE '${CASE}'")
 endif()

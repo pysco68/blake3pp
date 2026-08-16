@@ -92,6 +92,27 @@ TEST_CASE("compress_xof's first 32 bytes agree with compress_in_place") {
   }
 }
 
+TEST_CASE("xof_many matches repeated compress_xof on every arch") {
+  std::uint8_t block[block_len];
+  for (std::size_t i = 0; i < block_len; ++i) {
+    block[i] = static_cast<std::uint8_t>(i * 5 + 2);
+  }
+  constexpr std::size_t nblocks = 19;  // wide batches + serial remainder
+  std::vector<std::uint8_t> expected(nblocks * 64);
+  for (std::size_t t = 0; t < nblocks; ++t) {
+    scalar::ops.compress_xof(iv.data(), block, block_len, 7 + t, flag_root,
+                             expected.data() + t * 64);
+  }
+  for (const auto a : blake3pp::available_arches()) {
+    CAPTURE(blake3pp::to_string(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    std::vector<std::uint8_t> out(nblocks * 64);
+    ops->xof_many(iv.data(), block, block_len, 7, flag_root, out.data(),
+                  nblocks);
+    CHECK(out == expected);
+  }
+}
+
 // Every variant's hash_many against the scalar oracle, on an input count
 // that exercises both the full-batch path and the serial remainder.
 TEST_CASE("hash_many agrees across all available arches") {
