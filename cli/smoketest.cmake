@@ -145,6 +145,25 @@ elseif(CASE STREQUAL "gen_threads")
     message(FATAL_ERROR "threaded generation diverges from sequential")
   endif()
 
+elseif(CASE STREQUAL "gen_output")
+  # --output (direct async I/O when available) must be byte-identical to
+  # the stdout stream. Odd length: exercises the unaligned-tail path and
+  # the preallocate-then-trim size logic.
+  execute_process(COMMAND "${GEN}" --seed o --length 20000003
+    OUTPUT_FILE "${WORK}/stdout_stream" RESULT_VARIABLE r1)
+  execute_process(COMMAND "${GEN}" --seed o --length 20000003
+    --output "${WORK}/direct" RESULT_VARIABLE r2)
+  execute_process(COMMAND "${GEN}" --seed o --length 20000003
+    --output "${WORK}/threaded" --threads 4 RESULT_VARIABLE r3)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
+    "${WORK}/stdout_stream" "${WORK}/direct" RESULT_VARIABLE same1)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
+    "${WORK}/stdout_stream" "${WORK}/threaded" RESULT_VARIABLE same2)
+  if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT r3 EQUAL 0
+     OR NOT same1 EQUAL 0 OR NOT same2 EQUAL 0)
+    message(FATAL_ERROR "--output file diverges from the stdout stream")
+  endif()
+
 else()
   message(FATAL_ERROR "unknown CASE '${CASE}'")
 endif()

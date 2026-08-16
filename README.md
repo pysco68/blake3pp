@@ -258,12 +258,16 @@ built on extended output: the same seed always yields the same infinite
 stream, and `--seek` is O(1), so materializing a slice at offset 10 GB
 costs the same as offset 0. Generation runs lanes-parallel in the kernel
 (~3.8 GiB/s per core) and `--threads` fans segments across cores via the
-O(1) seek (13+ GiB/s); whatever consumes the stream is the bottleneck:
+O(1) seek (13+ GiB/s), so the sink is the bottleneck; `--output`
+removes even that overhead, writing through io_uring + O_DIRECT (where
+available) with the stream generated straight into the write buffers,
+bypassing the page cache entirely:
 
 ```bash
 blake3ppgen --seed run42 --length 1G > testdata.bin
-blake3ppgen --seed run42 --seek 10G --length 1M > slice.bin    # instant
-blake3ppgen --seed run42 --threads 0 --length 100G > /dev/nvme # I/O-bound
+blake3ppgen --seed run42 --seek 10G --length 1M > slice.bin   # instant
+blake3ppgen --seed run42 --length 100G --threads 0 \
+            --output fixture.bin                              # device-bound
 ```
 
 ### Consuming via CMake

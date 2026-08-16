@@ -8,7 +8,10 @@
 // O(1): materializing a slice at offset 10 GB costs the same as offset 0.
 // That makes it a reproducible test-data source at hashing speed (dd for
 // deterministic bytes). --derive-key domain-separates streams sharing seed
-// material; --hex prints hex instead of raw bytes.
+// material; --hex prints hex instead of raw bytes. --output FILE writes
+// through io_uring + O_DIRECT where available: the generator fills the
+// writer's aligned buffers in place, so bytes go from the XOF kernel to
+// the device with no page cache and no intermediate copy.
 
 #include <cstdio>
 #include <format>
@@ -18,6 +21,7 @@
 #include <vector>
 
 #include <CLI/CLI.hpp>
+#include <blake3pp/detail/file_writer.hpp>
 #include <blake3pp/parallel.hpp>
 
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
@@ -57,7 +61,10 @@ int main(int argc, char** argv) {
   std::string context;
   std::string length_text = "inf";
   std::string seek_text = "0";
+  std::string output = "-";
   bool hex = false;
+  bool no_direct = false;
+  bool no_async = false;
   unsigned threads = 1;
 
   CLI::App app{
@@ -75,7 +82,20 @@ int main(int argc, char** argv) {
       ->capture_default_str();
   app.add_option("--seek", seek_text, "starting offset in the stream")
       ->capture_default_str();
-  app.add_flag("--hex", hex, "emit lowercase hex instead of raw bytes");
+  auto* hex_flag =
+      app.add_flag("--hex", hex, "emit lowercase hex instead of raw bytes");
+  auto* output_opt =
+      app.add_option("--output", output,
+                     "write to FILE via direct async I/O (io_uring + "
+                     "O_DIRECT where available) instead of stdout");
+  hex_flag->excludes(output_opt);
+  output_opt->excludes(hex_flag);
+  app.add_flag("--no-direct", no_direct,
+               "with --output: skip O_DIRECT (write through the page cache)")
+      ->needs(output_opt);
+  app.add_flag("--no-async", no_async,
+               "with --output: skip io_uring (synchronous pwrite)")
+      ->needs(output_opt);
   app.add_option("--threads", threads,
                  "generator threads (seekable output is embarrassingly "
                  "parallel)")
@@ -123,6 +143,67 @@ int main(int argc, char** argv) {
   constexpr std::size_t segment = 4 * 1024 * 1024;
 #endif
 
+  // Fills `out` from the stream's current position and advances it,
+  // fanning out over the pool when one is running: each task copies the
+  // reader, seeks its own segment, and fills it. O(1) seek makes the
+  // stream embarrassingly parallel.
+  const auto fill = [&](std::span<std::byte> out) {
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+    if (pool.has_value() && out.size() > segment) {
+      namespace ex = blake3pp::ex;
+      const std::uint64_t base = stream.position();
+      const std::size_t n_segs = (out.size() + segment - 1) / segment;
+      auto work =
+          ex::schedule(pool.value().get_scheduler()) |
+          ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
+            blake3pp::output_reader r = stream;
+            r.seek(base + i * segment);
+            const std::size_t off = i * segment;
+            r.fill(out.subspan(off, std::min(segment, out.size() - off)));
+          });
+      ex::sync_wait(std::move(work));
+      stream.seek(base + out.size());
+      return;
+    }
+#endif
+    stream.fill(out);
+  };
+
+  if (output != "-") {
+    // File sink: generate straight into the writer's O_DIRECT-aligned
+    // buffers; submit() returns immediately, so the next buffer fills
+    // while the device drains this one.
+    try {
+      blake3pp::detail::file_writer_options wopts;
+      wopts.direct_io = !no_direct;
+      wopts.async = !no_async;
+      if (remaining != std::uint64_t(-1)) {
+        wopts.preallocate_bytes = remaining;
+      }
+#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+      if (threads > 1) {
+        wopts.buffer_bytes = threads * segment;
+      }
+#endif
+      blake3pp::detail::file_writer writer(output, wopts);
+      while (remaining > 0) {
+        auto b = writer.acquire();
+        const std::size_t take = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, b.capacity));
+        fill(std::span{b.data, take});
+        writer.submit(b, take);
+        if (remaining != std::uint64_t(-1)) {
+          remaining -= take;
+        }
+      }
+      writer.finish();
+    } catch (const std::exception& e) {
+      std::fputs(std::format("blake3ppgen: {}\n", e.what()).c_str(), stderr);
+      return 1;
+    }
+    return 0;
+  }
+
   std::vector<std::byte> buf(
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
       threads > 1 ? threads * segment :
@@ -131,30 +212,7 @@ int main(int argc, char** argv) {
   while (remaining > 0) {
     const std::size_t take = static_cast<std::size_t>(
         std::min<std::uint64_t>(remaining, buf.size()));
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-    if (pool.has_value()) {
-      // Each task copies the reader, seeks its own segment, fills it:
-      // O(1) seek makes the stream embarrassingly parallel.
-      namespace ex = blake3pp::ex;
-      const std::uint64_t base = stream.position();
-      const std::size_t n_segs = (take + segment - 1) / segment;
-      auto work =
-          ex::schedule(pool.value().get_scheduler()) |
-          ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
-            blake3pp::output_reader r = stream;
-            r.seek(base + i * segment);
-            const std::size_t off = i * segment;
-            r.fill(std::span{buf}.first(take).subspan(
-                off, std::min(segment, take - off)));
-          });
-      ex::sync_wait(std::move(work));
-      stream.seek(base + take);
-    } else {
-      stream.fill(std::span{buf}.first(take));
-    }
-#else
-    stream.fill(std::span{buf}.first(take));
-#endif
+    fill(std::span{buf}.first(take));
     if (hex) {
       std::string line;
       line.reserve(2 * take);

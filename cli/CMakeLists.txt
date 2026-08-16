@@ -11,7 +11,7 @@ set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CLI11_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(cli11)
 
-add_executable(blake3ppsum main.cpp)
+add_executable(blake3ppsum sum.cpp)
 target_link_libraries(blake3ppsum PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
@@ -27,7 +27,8 @@ target_link_libraries(blake3ppgen PRIVATE
 # every platform (no shell): known-answer for the empty input via stdin,
 # and the --check round trip including corruption detection.
 foreach(case version empty_stdin check_roundtrip length_prefix
-    keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads)
+    keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
+    gen_output)
   add_test(NAME cli_${case}
     COMMAND ${CMAKE_COMMAND}
       "-DSUM=$<TARGET_FILE:blake3ppsum>"

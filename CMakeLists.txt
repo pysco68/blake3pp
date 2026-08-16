@@ -34,6 +34,7 @@ add_library(blake3pp STATIC
   src/blake3pp.cpp
   src/dispatch/dispatch.cpp
   src/io/file_reader.cpp
+  src/io/file_writer.cpp
   src/io_hash.cpp)
 add_library(blake3pp::blake3pp ALIAS blake3pp)
 
