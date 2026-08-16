@@ -217,6 +217,14 @@ TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
       CHECK(wide == wide_ref);
     }
   }
+  // String round-trip: the persistence contract for tune-once-ever.
+  for (const auto strat :
+       {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
+        blake3pp::transpose16::quartered}) {
+    CHECK(blake3pp::transpose16_from_string(blake3pp::to_string(strat)) ==
+          strat);
+  }
+  CHECK(blake3pp::transpose16_from_string("bogus") == std::nullopt);
   blake3pp::set_transpose16(saved);
   // The tuner applies and reports a strategy (a no-op fallback without
   // AVX-512); either way its result must be the active one afterwards.

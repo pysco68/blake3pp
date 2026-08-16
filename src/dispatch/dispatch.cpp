@@ -8,12 +8,14 @@
 // kernel in CMake and it shows up everywhere; there is no second list to
 // forget to update.
 //
-// On x86 the CPU check is __builtin_cpu_supports, which goes through
-// libgcc / compiler-rt's cpu-model probe; that includes the OSXSAVE/XCR0
-// check, so "avx2" is only reported when the OS actually saves YMM state,
-// not merely when the CPU has the silicon. On AArch64, NEON is
-// architecturally mandatory, so presence of the kernel implies
-// availability.
+// On x86 the CPU check is a self-contained cpuid + xgetbv probe with the
+// OSXSAVE/XCR0 check: "avx2" is only reported when the OS actually saves
+// YMM state, not merely when the CPU has the silicon. (The
+// __builtin_cpu_supports shortcut was retired: it drags libgcc/
+// compiler-rt's __cpu_model machinery into the link, which is absent
+// under lld-link on Windows AND under zig/musl static linking.) On
+// AArch64, NEON is architecturally mandatory, so presence of the kernel
+// implies availability.
 
 #include <blake3pp/dispatch.hpp>
 
@@ -23,12 +25,20 @@
 
 #include "kernel/kernel.hpp"
 
-#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-// Covers clang-cl too: its __builtin_cpu_supports references compiler-rt's
-// __cpu_model global, which is not part of what lld-link pulls in by
-// default on Windows; the manual probe avoids the linker dependency.
-#define BLAKE3PP_MSVC_CPUID 1
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || \
+    defined(_M_IX86)
+// One manual cpuid/xgetbv probe for ALL x86 toolchains. The tempting
+// alternative, __builtin_cpu_supports, references compiler-rt/libgcc's
+// __cpu_model support machinery, a link-time dependency that failed us
+// twice (clang-cl with lld-link on Windows; zig/musl static linking):
+// the builtin is only as portable as the runtime library du jour. The
+// manual probe is self-contained and does the same OSXSAVE/XCR0 dance.
+#define BLAKE3PP_X86_CPUID 1
+#if defined(_MSC_VER)
 #include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 #endif
 
 namespace blake3pp {
@@ -91,25 +101,48 @@ bool compiled_in(arch a) noexcept {
   return false;
 }
 
-#if defined(BLAKE3PP_MSVC_CPUID)
-// MSVC-frontend toolchains (cl and clang-cl) get the cpu-model probe
-// spelled out: CPUID feature bits AND the OSXSAVE/XCR0 check; the OS
-// must actually save the YMM/ZMM state, silicon alone is not
-// availability.
-bool msvc_cpu_supports(arch a) noexcept {
+#if defined(BLAKE3PP_X86_CPUID)
+// The probe: CPUID feature bits AND the OSXSAVE/XCR0 check; the OS must
+// actually save the YMM/ZMM state; silicon alone is not availability.
+void x86_cpuid(unsigned leaf, unsigned subleaf, unsigned out[4]) noexcept {
+#if defined(_MSC_VER)
   int r[4];
-  __cpuid(r, 1);
-  const unsigned ecx1 = static_cast<unsigned>(r[2]);
+  __cpuidex(r, static_cast<int>(leaf), static_cast<int>(subleaf));
+  for (int i = 0; i < 4; ++i) {
+    out[i] = static_cast<unsigned>(r[i]);
+  }
+#else
+  __get_cpuid_count(leaf, subleaf, &out[0], &out[1], &out[2], &out[3]);
+#endif
+}
+
+unsigned x86_xgetbv0() noexcept {
+#if defined(_MSC_VER)
+  return static_cast<unsigned>(_xgetbv(0));
+#else
+  // The intrinsic needs -mxsave on GNU compilers (unavailable in this
+  // flag-neutral TU); the two-byte encoding is the portable spelling.
+  unsigned eax = 0;
+  unsigned edx = 0;
+  asm volatile(".byte 0x0f, 0x01, 0xd0" : "=a"(eax), "=d"(edx) : "c"(0u));
+  return eax;
+#endif
+}
+
+bool x86_cpu_supports(arch a) noexcept {
+  unsigned r[4];
+  x86_cpuid(1, 0, r);
+  const unsigned ecx1 = r[2];
   if (a == arch::sse42) {
-    return (ecx1 >> 20) & 1u;  // SSE4.2; XMM state is baseline on Windows
+    return (ecx1 >> 20) & 1u;  // SSE4.2; XMM state is OS baseline
   }
   const bool osxsave = (ecx1 >> 27) & 1u;
   if (!osxsave) {
     return false;
   }
-  const unsigned xcr0 = static_cast<unsigned>(_xgetbv(0));
-  __cpuidex(r, 7, 0);
-  const unsigned ebx7 = static_cast<unsigned>(r[1]);
+  const unsigned xcr0 = x86_xgetbv0();
+  x86_cpuid(7, 0, r);
+  const unsigned ebx7 = r[1];
   if (a == arch::avx2) {
     return (xcr0 & 0x6u) == 0x6u &&  // XMM + YMM saved
            ((ebx7 >> 5) & 1u);
@@ -131,22 +164,11 @@ bool cpu_supports(arch a) noexcept {
     case arch::auto_detect:
     case arch::scalar:
       return true;
-#if defined(BLAKE3PP_MSVC_CPUID)
+#if defined(BLAKE3PP_X86_CPUID)
     case arch::sse42:
     case arch::avx2:
     case arch::avx512:
-      return msvc_cpu_supports(a);
-#elif defined(__x86_64__) || defined(__i386__)
-    case arch::sse42:
-      return __builtin_cpu_supports("sse4.2");
-    case arch::avx2:
-      return __builtin_cpu_supports("avx2");
-    case arch::avx512:
-      return __builtin_cpu_supports("avx512f") &&
-             __builtin_cpu_supports("avx512cd") &&
-             __builtin_cpu_supports("avx512vl") &&
-             __builtin_cpu_supports("avx512bw") &&
-             __builtin_cpu_supports("avx512dq");
+      return x86_cpu_supports(a);
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     // GCC/Clang spell it __aarch64__, MSVC _M_ARM64; NEON is
@@ -266,6 +288,17 @@ transpose16 active_transpose16() noexcept {
       kern::transpose16_active.load(std::memory_order_relaxed));
 }
 
+std::optional<transpose16> transpose16_from_string(
+    std::string_view name) noexcept {
+  for (const transpose16 t : {transpose16::staging, transpose16::tree,
+                              transpose16::quartered}) {
+    if (name == to_string(t)) {
+      return t;
+    }
+  }
+  return std::nullopt;
+}
+
 std::string_view to_string(transpose16 strategy) noexcept {
   switch (strategy) {
     case transpose16::staging:   return "staging";
@@ -304,15 +337,21 @@ transpose16 tune_transpose16() noexcept {
     ops->hash_many(inputs, lanes, chunk / 64, key, 0, true, 0,
                    kern::flag_chunk_start, kern::flag_chunk_end, out.data());
   };
+  // Race at STEADY-STATE scale. A ~300us in-cache micro-race mispicked on
+  // real full-width AVX-512 hardware (Skylake-SP: chose tree while the
+  // 512 MiB benchmark showed quartered ahead by 13%). Wide-vector
+  // frequency licensing and cache-hot staging distort short samples. 256
+  // batches x 16 KiB per rep (~4 MiB) with a longer warm-up tracks the
+  // macro benchmark's verdict; whole tune stays in the tens of ms.
   const auto race = [&](transpose16 mode) {
     set_transpose16(mode);
-    for (int i = 0; i < 16; ++i) {  // warm-up: wide-vector frequency ramp
+    for (int i = 0; i < 64; ++i) {  // warm-up: frequency ramp + caches
       run_batch();
     }
     auto best = std::chrono::steady_clock::duration::max();
-    for (int rep = 0; rep < 5; ++rep) {
+    for (int rep = 0; rep < 3; ++rep) {
       const auto t0 = std::chrono::steady_clock::now();
-      for (int i = 0; i < 48; ++i) {
+      for (int i = 0; i < 256; ++i) {
         run_batch();
       }
       const auto dt = std::chrono::steady_clock::now() - t0;

@@ -25,6 +25,26 @@
       }
     },
     {
+      "name": "linux-arm64-zigmusl-cxx23-static",
+      "displayName": "Static musl release (aarch64, zig + mimalloc)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-arm64-zigmusl-cxx23-static",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-zigmusl-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "linux-zigmusl-cxx23-static",
+      "displayName": "Static musl release (x86_64, zig + mimalloc)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-zigmusl-cxx23-static",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-zigmusl-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
       "generator": "Ninja",
@@ -105,6 +125,14 @@
       "configurePreset": "wasm32-emcc-cxx23"
     },
     {
+      "name": "linux-arm64-zigmusl-cxx23-static",
+      "configurePreset": "linux-arm64-zigmusl-cxx23-static"
+    },
+    {
+      "name": "linux-zigmusl-cxx23-static",
+      "configurePreset": "linux-zigmusl-cxx23-static"
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "configurePreset": "windows-msvc2026-cxx23",
       "condition": {
@@ -152,6 +180,20 @@
     {
       "name": "wasm32-emcc-cxx23",
       "configurePreset": "wasm32-emcc-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-arm64-zigmusl-cxx23-static",
+      "configurePreset": "linux-arm64-zigmusl-cxx23-static",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-zigmusl-cxx23-static",
+      "configurePreset": "linux-zigmusl-cxx23-static",
       "output": {
         "outputOnFailure": true
       }

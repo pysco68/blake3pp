@@ -9,6 +9,31 @@ direct I/O behind a unified interface.
 
 ## Using the library
 
+blake3pp is consumed **from source**: vendor it with FetchContent (or a
+submodule + `add_subdirectory`) and link the target; tests, benchmarks
+and tools stay out of your build automatically:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(blake3pp
+  GIT_REPOSITORY https://github.com/pysco68/blake3pp.git
+  GIT_TAG v0.1.0)
+FetchContent_MakeAvailable(blake3pp)
+target_link_libraries(your_app PRIVATE blake3pp::blake3pp)
+```
+
+The polyfill dependencies (xsimd, stdexec) are fetched and version-pinned
+by blake3pp's own build where the toolchain lacks the C++26 facilities;
+nothing to install. There is deliberately no binary library or
+`find_package` distribution at 0.x: the feature probes must run against
+*your* toolchain and standard-library combination.
+
+For the **tools** (blake3ppsum, blake3ppgen, benchmarks), binary
+releases are fully static Linux executables (x86_64 + aarch64, musl +
+mimalloc, built via `tools/make-release.sh` with the zig toolchain
+presets): no glibc version coupling, no dynamic loader, runtime SIMD
+dispatch intact, one file that runs on any distro.
+
 Everything lives in `namespace blake3pp`, and
 `#include <blake3pp/blake3pp.hpp>` gets you all of it. Compile-cost-aware
 consumers can pick granular headers instead:

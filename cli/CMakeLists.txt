@@ -12,12 +12,14 @@ set(CLI11_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(cli11)
 
 add_executable(blake3ppsum sum.cpp)
+blake3pp_tool_allocator(blake3ppsum)
 target_link_libraries(blake3ppsum PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
   CLI11::CLI11)
 
 add_executable(blake3ppgen gen.cpp)
+blake3pp_tool_allocator(blake3ppgen)
 target_link_libraries(blake3ppgen PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings

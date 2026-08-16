@@ -112,6 +112,11 @@ transpose16 tune_transpose16() noexcept;
 /// The canonical name of a strategy ("staging", "tree", "quartered").
 /// @param strategy  Any strategy.
 [[nodiscard]] std::string_view to_string(transpose16 strategy) noexcept;
+/// The inverse of to_string(): parses a strategy name.
+/// @param name  A name as to_string() spells it.
+/// @return The strategy, or std::nullopt for any other string.
+[[nodiscard]] std::optional<transpose16> transpose16_from_string(
+    std::string_view name) noexcept;
 
 namespace detail {
 // Maps an arch to its kernel table; unavailable variants fall back to the
