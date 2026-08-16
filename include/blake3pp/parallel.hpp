@@ -298,6 +298,11 @@ class parallel_hasher {
     chunk_counter_ = 0;
   }
 
+  /// Total bytes absorbed since construction or reset.
+  [[nodiscard]] std::uint64_t count() const noexcept {
+    return h_.count() + filled_;
+  }
+
  private:
   void flush_window() {
     const std::size_t chunks = window_.size() / chunk_size;

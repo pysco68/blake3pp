@@ -50,10 +50,14 @@ struct digest {
   /// Constant-time equality (matching the Rust reference): the safe
   /// default for a value that is compared in security-sensitive contexts,
   /// at a cost that is irrelevant.
-  friend bool operator==(const digest&, const digest&) = default;
+  friend bool operator==(const digest& lhs, const digest& rhs) noexcept;
 
   /// Returns the digest as 64 lowercase hex characters.
   [[nodiscard]] std::string to_hex() const;
+
+  /// Returns the digest as 64 lowercase hex characters plus a terminating
+  /// NUL, without allocating.
+  [[nodiscard]] std::array<char, 65> to_hex_chars() const noexcept;
 
   /// Parses a digest from 64 hex characters of either case.
   /// @param hex  Exactly 64 hex characters.
@@ -186,6 +190,10 @@ class hasher {
   /// key and variant.
   void reset() noexcept;
 
+  /// Total bytes absorbed since construction or reset, subtrees pushed
+  /// through push_subtree_cv() included.
+  [[nodiscard]] std::uint64_t count() const noexcept;
+
   /// The variant this hasher actually runs on (auto_detect resolved).
   [[nodiscard]] arch selected_arch() const noexcept;
 
@@ -194,7 +202,7 @@ class hasher {
   /// subtree covering subtree_chunks complete chunks.
   ///
   /// @pre subtree_chunks is a power of two.
-  /// @pre The hasher sits on a chunk boundary: the bytes absorbed so far are a multiple of
+  /// @pre The hasher sits on a chunk boundary: count() is a multiple of
   ///      chunk_size. A full chunk still open from update() is closed out
   ///      here, since the subtree proves it is not the last.
   /// @pre The current chunk position is subtree_chunks-aligned.

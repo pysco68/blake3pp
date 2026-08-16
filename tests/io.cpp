@@ -163,6 +163,9 @@ TEST_CASE("foreign path-like types (boost::filesystem shape) forward") {
 
 TEST_CASE("digest hex round trip and std::format") {
   const auto d = blake3pp::hash(std::string_view{"round trip"});
+  const auto chars = d.to_hex_chars();  // allocation-free variant
+  CHECK(std::string_view{chars.data()} == d.to_hex());
+  CHECK(chars[64] == '\0');
   const auto parsed = blake3pp::digest::from_hex(d.to_hex());
   REQUIRE(parsed.has_value());
   CHECK(*parsed == d);

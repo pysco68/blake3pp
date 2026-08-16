@@ -98,6 +98,20 @@ TEST_CASE("finalize is non-destructive") {
   CHECK(h.finalize() == blake3pp::hash(input));
 }
 
+TEST_CASE("count reports bytes absorbed across every ingestion path") {
+  const auto input = make_input(300 * 1024 + 7);
+  blake3pp::hasher h;
+  CHECK(h.count() == 0);
+  h.update(std::span{input}.first(100));           // buffered path
+  CHECK(h.count() == 100);
+  h.update(std::span{input}.subspan(100, 200 * 1024));  // subtree fast path
+  CHECK(h.count() == 100 + 200 * 1024);
+  h.update(std::span{input}.subspan(100 + 200 * 1024));
+  CHECK(h.count() == input.size());
+  h.reset();
+  CHECK(h.count() == 0);
+}
+
 TEST_CASE("reset reuses the instance") {
   blake3pp::hasher h;
   h.update("some earlier message");

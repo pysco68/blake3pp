@@ -32,6 +32,10 @@ blake3pp::digest d2 = blake3pp::hash(payload);        // anything span-like
 
 std::cout << d.to_hex() << '\n';                      // lowercase hex
 std::cout << std::format("digest: {}\n", d);          // std::format-able
+
+// Allocation-free hex for hot paths and C interop: 64 chars, NUL-terminated.
+std::array<char, 65> hex = d.to_hex_chars();
+std::printf("%s\n", hex.data());
 ```
 
 `digest` is a regular value type: compare with `==`, round-trip through
@@ -43,9 +47,11 @@ hex, use it as a map key after hashing its bytes.
 if (blake3pp::hash(payload).matches(user_input)) { /* verified */ }
 
 // Parsing explicitly? std::optional's heterogeneous == compares the
-// contained value (and is false for nullopt); no dereference needed:
+// contained value (and is false for nullopt); no dereference needed.
+// digest's operator== is itself constant-time (the safe default for a
+// crypto value type, matching the Rust reference):
 if (blake3pp::digest::from_hex(user_input) == blake3pp::hash(payload)) {
-  /* verified (ordinary, non-constant-time comparison) */
+  /* verified */
 }
 ```
 

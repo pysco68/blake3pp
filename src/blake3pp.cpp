@@ -66,6 +66,10 @@ void hasher::reset() noexcept {
 
 arch hasher::selected_arch() const noexcept { return ops_->variant; }
 
+std::uint64_t hasher::count() const noexcept {
+  return chunk_.chunk_counter * kern::chunk_len + core::chunk_len(chunk_);
+}
+
 // Merge completed subtrees, then push. The pushed CV may itself be the root
 // of a subtree_chunks-sized (power-of-2, aligned) subtree: counting in
 // subtree units, each trailing zero bit of total_chunks/subtree_chunks is a
@@ -281,29 +285,34 @@ std::optional<digest> digest::from_hex(std::string_view hex) noexcept {
 }
 
 bool digest::matches(std::string_view hex) const noexcept {
-  const std::optional<digest> parsed = from_hex(hex);
-  if (!parsed.has_value()) {
-    return false;
-  }
-  // Accumulate the whole difference before deciding: no data-dependent
-  // early exit, so comparison time is independent of where bytes differ.
-  unsigned acc = 0;
+  return from_hex(hex) == *this;  // optional's heterogeneous, CT inner ==
+}
+
+std::array<char, 65> digest::to_hex_chars() const noexcept {
+  static constexpr char alphabet[] = "0123456789abcdef";
+  std::array<char, 65> out;
   for (std::size_t i = 0; i < bytes.size(); ++i) {
-    acc |= std::to_integer<unsigned>(bytes[i] ^ parsed->bytes[i]);
+    const auto v = std::to_integer<unsigned>(bytes[i]);
+    out[2 * i] = alphabet[v >> 4];
+    out[2 * i + 1] = alphabet[v & 0xF];
   }
-  return acc == 0;
+  out[64] = '\0';
+  return out;
 }
 
 std::string digest::to_hex() const {
-  static constexpr char alphabet[] = "0123456789abcdef";
-  std::string s;
-  s.resize(bytes.size() * 2);
-  for (std::size_t i = 0; i < bytes.size(); ++i) {
-    const auto v = static_cast<std::uint8_t>(bytes[i]);
-    s[2 * i] = alphabet[v >> 4];
-    s[2 * i + 1] = alphabet[v & 0xF];
+  const auto chars = to_hex_chars();
+  return std::string{chars.data(), 64};
+}
+
+bool operator==(const digest& lhs, const digest& rhs) noexcept {
+  // Accumulate the whole difference before deciding: no data-dependent
+  // early exit, so comparison time is independent of where bytes differ.
+  unsigned acc = 0;
+  for (std::size_t i = 0; i < lhs.bytes.size(); ++i) {
+    acc |= std::to_integer<unsigned>(lhs.bytes[i] ^ rhs.bytes[i]);
   }
-  return s;
+  return acc == 0;
 }
 
 }  // namespace blake3pp

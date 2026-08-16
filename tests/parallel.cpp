@@ -80,6 +80,7 @@ TEST_CASE("parallel_hasher checkpoints and resets like hasher") {
   CHECK(ph.finalize() == blake3pp::hash(std::span{input}.first(300 * 1024)));
   // ...and hashing continues correctly afterwards.
   ph.update(std::span{input}.subspan(300 * 1024));
+  CHECK(ph.count() == input.size());
   CHECK(ph.finalize() == blake3pp::hash(input));
 
   ph.reset();
