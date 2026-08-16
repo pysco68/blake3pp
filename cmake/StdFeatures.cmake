@@ -107,8 +107,8 @@ endif()
 if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
   include(FetchContent)
   FetchContent_Declare(xsimd
-    URL https://github.com/xtensor-stack/xsimd/archive/refs/tags/13.2.0.tar.gz
-    URL_HASH SHA256=edd8cd3d548c185adc70321c53c36df41abe64c1fe2c67bc6d93c3ecda82447a
+    URL https://github.com/xtensor-stack/xsimd/archive/refs/tags/14.3.0.tar.gz
+    URL_HASH SHA256=b3d50e7a73fbf4642ceef30131c93414901d69eee41c2a5302db650b03e2c792
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     SYSTEM)
   FetchContent_MakeAvailable(xsimd)

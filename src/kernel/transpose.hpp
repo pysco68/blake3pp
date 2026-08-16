@@ -237,7 +237,14 @@ inline typename vext<W>::type rot_bytes(typename vext<W>::type x) noexcept {
 #pragma GCC diagnostic pop
 #endif
 
-#if defined(BLAKE3PP_HAS_XSIMD) && !defined(BLAKE3PP_FORCE_SCALAR)
+#if defined(BLAKE3PP_HAS_XSIMD) && !defined(BLAKE3PP_FORCE_SCALAR) && \
+    !(defined(_M_ARM64) && !defined(__clang__))
+// The pure-MSVC-arm64 exclusion: xsimd 14.3's neon64 swizzle (which the
+// shuffle decomposition instantiates on non-builtin frontends) returns
+// through a vreinterpretq_* chain that MSVC's arm64_neon.h defines as
+// no-ops over one shared __n128 type, so a batch<uint8_t> lands in a
+// batch<uint32_t> return seat and C2440 follows. Until that is fixed
+// upstream, cl-on-arm64 keeps NEON rounds but stages its transposes.
 #define BLAKE3PP_HAVE_XSIMD_SHUFFLE 1
 
 // The same radix-2 networks, expressed through xsimd's portable two-input
