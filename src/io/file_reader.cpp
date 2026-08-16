@@ -30,6 +30,20 @@
 #include <sys/syscall.h>
 
 #include <atomic>
+
+// MemorySanitizer cannot see io_uring completions: the kernel fills the
+// buffer without any libc call MSan intercepts, so the bytes stay
+// "uninitialized" in its shadow. Each completion therefore unpoisons the
+// range it filled, stating a fact MSan has no other way to learn.
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#define BLAKE3PP_MSAN_UNPOISON(ptr, len) __msan_unpoison(ptr, len)
+#endif
+#endif
+#endif
+#if !defined(BLAKE3PP_MSAN_UNPOISON)
+#define BLAKE3PP_MSAN_UNPOISON(ptr, len) ((void)0)
 #endif
 
 #if !defined(BLAKE3PP_IO_POSIX)
@@ -316,6 +330,7 @@ struct file_reader::impl {
         throw std::system_error(EIO, std::generic_category(),
                                 "unexpected EOF (io_uring)");
       }
+      BLAKE3PP_MSAN_UNPOISON(buf(s) + st.filled, static_cast<std::size_t>(res));
       st.filled += static_cast<std::size_t>(res);
       if (st.filled < st.target) {
         ring.submit_read(fd, buf(s) + st.filled,

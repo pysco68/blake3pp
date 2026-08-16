@@ -1,0 +1,5 @@
+# Keep docker build contexts lean: none of the Dockerfiles COPY project
+# sources except tools/, and the build trees are gigabytes.
+build/
+.git/
+.cache/
