@@ -139,6 +139,29 @@ TEST_CASE("reader reports a backend") {
   CHECK(std::string(r.backend()).size() > 0);
 }
 
+// The degradation ladder below io_uring: synchronous backends must produce
+// identical windows. These run rarely in the wild (no-io_uring kernels,
+// seccomp sandboxes), so exercise them deliberately.
+TEST_CASE("reader fallback backends deliver identical data") {
+  const auto content = make_input(300 * 1024 + 77);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+
+  for (const bool direct : {true, false}) {
+    CAPTURE(direct);
+    blake3pp::detail::file_reader r(
+        f.path, {.window_bytes = 64 * 1024, .queue_depth = 2,
+                 .direct_io = direct, .async = false});
+    MESSAGE("sync backend: " << r.backend());
+    blake3pp::hasher h;
+    while (auto w = r.next()) {
+      h.update(std::span<const std::byte>{w->data, w->bytes});
+      r.release(*w);
+    }
+    CHECK(h.finalize() == expected);
+  }
+}
+
 // Stand-in for boost::filesystem::path: satisfies the foreign_path concept
 // structurally, which is exactly how a real boost path would enter.
 struct fake_boost_path {
@@ -158,6 +181,9 @@ TEST_CASE("foreign path-like types (boost::filesystem shape) forward") {
 #if !defined(BLAKE3PP_HAS_STD_SENDERS)
   exec::static_thread_pool pool(2);
   CHECK(blake3pp::hash_file(bp, pool.get_scheduler()) == expected);
+  std::error_code fec;
+  CHECK(blake3pp::hash_file(bp, pool.get_scheduler(), fec) == expected);
+  CHECK(!fec);
 #endif
 }
 

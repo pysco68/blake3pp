@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-#include <blake3pp/dispatch.hpp>
+#include <blake3pp/core.hpp>
 #include <doctest/doctest.h>
 
 #include "kernel/kernel.hpp"
@@ -38,6 +38,26 @@ TEST_CASE("arch introspection invariants") {
   for (const auto a : compiled) {
     CHECK(blake3pp::detail::resolve(a) != nullptr);
   }
+
+  // Requesting a variant that is not compiled in (or not runnable) must
+  // fall back to a usable table, never fail: on x86 that is neon, on ARM
+  // the avx tiers.
+  for (const auto a : blake3pp::all_arches()) {
+    CAPTURE(blake3pp::to_string(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    blake3pp::hasher h{a};
+    h.update("fallback check");
+    CHECK(h.finalize() ==
+          blake3pp::hash(std::string_view{"fallback check"}));
+  }
+
+  // Name round trips, and unknown names are rejected.
+  for (const auto a : blake3pp::all_arches()) {
+    CHECK(blake3pp::arch_from_string(blake3pp::to_string(a)) == a);
+  }
+  CHECK(!blake3pp::arch_from_string("bogus").has_value());
+  CHECK(!blake3pp::arch_from_string("").has_value());
 
   // Build-configuration introspection reports coherent values.
   CHECK(!blake3pp::version().empty());
