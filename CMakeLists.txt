@@ -82,9 +82,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
       ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq)
   endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-  # NEON is baseline on AArch64; the variant exists so dispatch/reporting can
-  # name it, and so the scalar fallback stays honestly scalar.
-  blake3pp_add_kernel(neon)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    # Pure cl.exe on arm64: xsimd 13.2 gates NEON64 on __aarch64__, which
+    # MSVC does not define (and its NEON backend is GNU-intrinsics-shaped),
+    # so no SIMD provider exists and the scalar fallback carries the build.
+    # clang-cl defines __aarch64__ and takes the full NEON path below.
+  else()
+    # NEON is baseline on AArch64; the variant exists so dispatch/reporting
+    # can name it, and so the scalar fallback stays honestly scalar.
+    blake3pp_add_kernel(neon)
+  endif()
+elseif(EMSCRIPTEN)
+  # WASM SIMD128 is a module-level feature (engines reject SIMD-bearing
+  # modules wholesale if unsupported), so this is a compile-time choice;
+  # the scalar variant still ships for the honest-fallback story.
+  blake3pp_add_kernel(simd128 ARCH_FLAGS -msimd128)
 endif()
 blake3pp_target_link_kernels(blake3pp)
 

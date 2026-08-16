@@ -35,5 +35,8 @@ foreach(case version empty_stdin check_roundtrip length_prefix
       "-DGEN=$<TARGET_FILE:blake3ppgen>"
       "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/smoke-${case}"
       "-DCASE=${case}"
+      # ctest only wraps add_test(target) commands in the emulator; a
+      # script-mode driver must carry it explicitly for cross builds.
+      "-DEMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()

@@ -11,6 +11,8 @@ endif()
 file(REMOVE_RECURSE "${WORK}")
 file(MAKE_DIRECTORY "${WORK}")
 
+# EMULATOR (optional, e.g. "qemu-aarch64;-L;/usr/aarch64-linux-gnu")
+# prefixes every tool invocation on cross builds; empty on native ones.
 function(run_sum out_var result_var)
   cmake_parse_arguments(RS "" "STDIN" "ARGS" ${ARGN})
   set(input_args "")
@@ -18,7 +20,7 @@ function(run_sum out_var result_var)
     set(input_args INPUT_FILE "${RS_STDIN}")
   endif()
   execute_process(
-    COMMAND "${SUM}" ${RS_ARGS}
+    COMMAND ${EMULATOR} "${SUM}" ${RS_ARGS}
     WORKING_DIRECTORY "${WORK}"
     ${input_args}
     OUTPUT_VARIABLE out
@@ -106,16 +108,16 @@ elseif(CASE STREQUAL "derive_key")
   endif()
 
 elseif(CASE STREQUAL "gen_deterministic")
-  execute_process(COMMAND "${GEN}" --seed smoke --length 64 --hex
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 64 --hex
     OUTPUT_VARIABLE a RESULT_VARIABLE r1)
-  execute_process(COMMAND "${GEN}" --seed smoke --length 64 --hex
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 64 --hex
     OUTPUT_VARIABLE b RESULT_VARIABLE r2)
   if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT a STREQUAL b)
     message(FATAL_ERROR "gen is not deterministic")
   endif()
   # Cross-check the tools: gen of the empty seed at length 32 IS the
   # blake3 digest of empty input.
-  execute_process(COMMAND "${GEN}" --length 32 --hex
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --length 32 --hex
     OUTPUT_VARIABLE g RESULT_VARIABLE r3)
   if(NOT r3 EQUAL 0 OR NOT g MATCHES
      "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
@@ -124,9 +126,9 @@ elseif(CASE STREQUAL "gen_deterministic")
 
 elseif(CASE STREQUAL "gen_seek")
   # O(1) seek: a slice at an offset equals that region of the full stream.
-  execute_process(COMMAND "${GEN}" --seed smoke --length 148 --hex
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 148 --hex
     OUTPUT_VARIABLE full RESULT_VARIABLE r1)
-  execute_process(COMMAND "${GEN}" --seed smoke --seek 100 --length 48 --hex
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --seek 100 --length 48 --hex
     OUTPUT_VARIABLE slice RESULT_VARIABLE r2)
   string(SUBSTRING "${full}" 200 96 expected)  # bytes 100..148 as hex
   string(SUBSTRING "${slice}" 0 96 got)
@@ -135,9 +137,9 @@ elseif(CASE STREQUAL "gen_seek")
   endif()
 
 elseif(CASE STREQUAL "gen_threads")
-  execute_process(COMMAND "${GEN}" --seed t --length 20000000 --threads 1
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed t --length 20000000 --threads 1
     OUTPUT_FILE "${WORK}/one" RESULT_VARIABLE r1)
-  execute_process(COMMAND "${GEN}" --seed t --length 20000000 --threads 4
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed t --length 20000000 --threads 4
     OUTPUT_FILE "${WORK}/four" RESULT_VARIABLE r2)
   execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
     "${WORK}/one" "${WORK}/four" RESULT_VARIABLE same)
@@ -149,11 +151,11 @@ elseif(CASE STREQUAL "gen_output")
   # --output (direct async I/O when available) must be byte-identical to
   # the stdout stream. Odd length: exercises the unaligned-tail path and
   # the preallocate-then-trim size logic.
-  execute_process(COMMAND "${GEN}" --seed o --length 20000003
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
     OUTPUT_FILE "${WORK}/stdout_stream" RESULT_VARIABLE r1)
-  execute_process(COMMAND "${GEN}" --seed o --length 20000003
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
     --output "${WORK}/direct" RESULT_VARIABLE r2)
-  execute_process(COMMAND "${GEN}" --seed o --length 20000003
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
     --output "${WORK}/threaded" --threads 4 RESULT_VARIABLE r3)
   execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
     "${WORK}/stdout_stream" "${WORK}/direct" RESULT_VARIABLE same1)

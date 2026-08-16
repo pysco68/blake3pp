@@ -34,6 +34,12 @@ enum class arch : std::uint8_t {
   /// AArch64 NEON, 128-bit lanes. Architecturally mandatory on AArch64:
   /// presence of the kernel implies availability.
   neon,
+  /// WebAssembly SIMD128. A module-level feature: an engine that lacks it
+  /// rejects the whole module at load, so if this code is running at all,
+  /// the variant is available.
+  simd128,
+            // lacks it rejects the whole module at load, so if this code
+            // is running at all, the variant is available.
 };
 
 /// True if the variant is compiled into this binary and the running CPU

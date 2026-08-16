@@ -43,4 +43,17 @@ target_link_libraries(blake3pp_tests PRIVATE
 
 list(APPEND CMAKE_MODULE_PATH "${doctest_SOURCE_DIR}/scripts/cmake")
 include(doctest)
-doctest_discover_tests(blake3pp_tests)
+if(EMSCRIPTEN)
+  # Per-case discovery parses --list-test-cases output; under node,
+  # emscripten's isatty says "terminal" and the ANSI-colored listing
+  # defeats the parser. One aggregate entry (emulator-wrapped by ctest)
+  # keeps the whole suite running instead.
+  add_test(NAME blake3pp_tests COMMAND blake3pp_tests --no-colors)
+elseif(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+  # Discovery must RUN the binary, which a cross build without an
+  # emulator cannot (e.g. arm64-windows built on x64). Register the
+  # aggregate; it becomes runnable on real hardware.
+  add_test(NAME blake3pp_tests COMMAND blake3pp_tests --no-colors)
+else()
+  doctest_discover_tests(blake3pp_tests)
+endif()

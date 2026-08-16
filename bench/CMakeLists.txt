@@ -18,6 +18,11 @@ target_link_libraries(blake3pp_bench_file PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings)
 
+if(EMSCRIPTEN)
+  # Upstream's build hard-codes x86/ARM SIMD kernels with -m flags the
+  # wasm target rejects; the comparison rows are host-hardware-only.
+  set(BLAKE3PP_BENCH_UPSTREAM OFF)
+endif()
 if(BLAKE3PP_BENCH_UPSTREAM)
   # The upstream library is C plus hand-written assembly; enabling the
   # languages here (rather than letting its nested project() try) keeps

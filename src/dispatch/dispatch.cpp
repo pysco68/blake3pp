@@ -61,7 +61,8 @@ constexpr std::size_t num_kernels = std::size(registry);
 // The dispatch preference order is simply its tail. One list, two roles.
 constexpr arch all_enumerators[] = {arch::auto_detect, arch::avx512,
                                     arch::avx2,        arch::sse42,
-                                    arch::neon,        arch::scalar};
+                                    arch::neon,        arch::simd128,
+                                    arch::scalar};
 constexpr std::span<const arch> preference =
     std::span{all_enumerators}.subspan(1);
 
@@ -147,8 +148,16 @@ bool cpu_supports(arch a) noexcept {
              __builtin_cpu_supports("avx512bw") &&
              __builtin_cpu_supports("avx512dq");
 #endif
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(_M_ARM64)
+    // GCC/Clang spell it __aarch64__, MSVC _M_ARM64; NEON is
+    // architecturally mandatory on AArch64 either way.
     case arch::neon:
+      return true;
+#endif
+#if defined(__wasm__)
+    case arch::simd128:
+      // Module-level feature: SIMD opcodes in a module make load-time
+      // validation the availability check; running code proves support.
       return true;
 #endif
     default:
@@ -230,6 +239,8 @@ const char* to_string(arch a) noexcept {
       return "avx512";
     case arch::neon:
       return "neon";
+    case arch::simd128:
+      return "simd128";
   }
   return "unknown";
 }

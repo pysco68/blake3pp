@@ -1,7 +1,29 @@
 {
   "version": 6,
-  "include": ["CMakePresets-toolchains.json"],
+  "include": [
+    "CMakePresets-toolchains.json"
+  ],
   "configurePresets": [
+    {
+      "name": "linux-arm64-gcc15-cxx23",
+      "displayName": "aarch64 Linux cross (GCC 15, C++23, runs via qemu-user)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-arm64-gcc15-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-gcc15-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "wasm32-emcc-cxx23",
+      "displayName": "WebAssembly (Emscripten, SIMD128 + threads, runs via node)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/wasm32-emcc-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/wasm32-emcc-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
     {
       "name": "windows-msvc2026-cxx23",
       "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
@@ -33,9 +55,55 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "windows-arm64-msvc2026-cxx23",
+      "displayName": "Windows arm64 cross (MSVC, scalar-only: xsimd lacks MSVC-arm64), vcvarsamd64_arm64 shell",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-arm64-msvc2026-cxx23",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_SYSTEM_PROCESSOR": "ARM64"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-arm64-clangcl-cxx23",
+      "displayName": "Windows arm64 cross (clang-cl, full NEON), vcvarsamd64_arm64 shell",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-arm64-clangcl-cxx23",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "23",
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_SYSTEM_PROCESSOR": "ARM64",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_C_COMPILER_TARGET": "arm64-pc-windows-msvc",
+        "CMAKE_CXX_COMPILER_TARGET": "arm64-pc-windows-msvc"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
+    {
+      "name": "linux-arm64-gcc15-cxx23",
+      "configurePreset": "linux-arm64-gcc15-cxx23"
+    },
+    {
+      "name": "wasm32-emcc-cxx23",
+      "configurePreset": "wasm32-emcc-cxx23"
+    },
     {
       "name": "windows-msvc2026-cxx23",
       "configurePreset": "windows-msvc2026-cxx23",
@@ -48,6 +116,24 @@
     {
       "name": "windows-clangcl-cxx23",
       "configurePreset": "windows-clangcl-cxx23",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-arm64-msvc2026-cxx23",
+      "configurePreset": "windows-arm64-msvc2026-cxx23",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-arm64-clangcl-cxx23",
+      "configurePreset": "windows-arm64-clangcl-cxx23",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -57,9 +143,25 @@
   ],
   "testPresets": [
     {
+      "name": "linux-arm64-gcc15-cxx23",
+      "configurePreset": "linux-arm64-gcc15-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "wasm32-emcc-cxx23",
+      "configurePreset": "wasm32-emcc-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "configurePreset": "windows-msvc2026-cxx23",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -69,7 +171,9 @@
     {
       "name": "windows-clangcl-cxx23",
       "configurePreset": "windows-clangcl-cxx23",
-      "output": { "outputOnFailure": true },
+      "output": {
+        "outputOnFailure": true
+      },
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",
@@ -79,27 +183,37 @@
     {
       "name": "linux-gcc16-cxx26",
       "configurePreset": "linux-gcc16-cxx26",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "linux-clang22-cxx26",
       "configurePreset": "linux-clang22-cxx26",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "linux-clang18-cxx20-libstdcxx",
       "configurePreset": "linux-clang18-cxx20-libstdcxx",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "linux-gcc16-cxx26-asan",
       "configurePreset": "linux-gcc16-cxx26-asan",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     },
     {
       "name": "linux-clang22-cxx26-asan",
       "configurePreset": "linux-clang22-cxx26-asan",
-      "output": { "outputOnFailure": true }
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }
