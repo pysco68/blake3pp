@@ -6,7 +6,7 @@
 // drive, not the hash, is the limit.
 //
 //   blake3pp_bench_file <path> [--reps N] [--window MiB] [--qd N]
-//                       [--no-direct] [--seq-only]
+//                       [--no-direct] [--seq-only] [--cooldown s]
 //   blake3pp_bench_file --make <MiB>   # create a test file and use it
 //
 // Note: with direct I/O the page cache is bypassed, so repetitions measure
@@ -23,13 +23,12 @@
 
 #include <blake3pp/io.hpp>
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-#include <exec/static_thread_pool.hpp>
-#endif
+
 
 int main(int argc, char** argv) {
   std::string path;
   int reps = 3;
+  double cooldown_s = 5.0;
   blake3pp::hash_file_options opts;
   bool seq_only = false;
 
@@ -37,6 +36,8 @@ int main(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "--reps" && i + 1 < argc) {
       reps = std::atoi(argv[++i]);
+    } else if (arg == "--cooldown" && i + 1 < argc) {
+      cooldown_s = std::strtod(argv[++i], nullptr);
     } else if (arg == "--window" && i + 1 < argc) {
       opts.window_bytes =
           static_cast<std::size_t>(std::atoi(argv[++i])) * 1024 * 1024;
@@ -116,6 +117,12 @@ int main(int argc, char** argv) {
               gibs(raw_s));
 
   const auto run = [&](const char* label, auto&& fn) {
+    // Laptops throttle: don't let this measurement inherit the previous
+    // one's heat (the raw-io pass above ran unconditionally already).
+    if (cooldown_s > 0) {
+      std::fflush(stdout);
+      std::this_thread::sleep_for(std::chrono::duration<double>(cooldown_s));
+    }
     blake3pp::digest d{};
     const double best = time_best([&] { d = fn(); });
     std::printf("%-10s %8.2f GiB/s   (%s...)  [%3.0f%% of raw]\n", label,
@@ -125,13 +132,10 @@ int main(int argc, char** argv) {
 
   run("seq", [&] { return blake3pp::hash_file(path.c_str(), opts); });
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
   if (!seq_only) {
-    exec::static_thread_pool pool(std::thread::hardware_concurrency());
-    auto sched = pool.get_scheduler();
+    auto sched = blake3pp::get_parallel_scheduler();
     run("parallel",
         [&] { return blake3pp::hash_file(path.c_str(), sched, opts); });
   }
-#endif
   return 0;
 }

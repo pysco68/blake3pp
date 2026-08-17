@@ -231,8 +231,10 @@ std::string_view simd_provider() noexcept {
 }
 
 std::string_view execution_provider() noexcept {
-#if defined(BLAKE3PP_HAS_STD_SENDERS)
+#if defined(BLAKE3PP_EXECUTION_STD)
   return "std::execution";
+#elif defined(BLAKE3PP_EXECUTION_BEMAN)
+  return "beman.execution";
 #else
   return "stdexec";
 #endif

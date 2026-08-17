@@ -65,7 +65,8 @@ TEST_CASE("arch introspection invariants") {
   CHECK((simd == "std::simd" || simd == "std::experimental::simd" ||
          simd == "xsimd"));
   const std::string_view exec = blake3pp::execution_provider();
-  CHECK((exec == "std::execution" || exec == "stdexec"));
+  CHECK((exec == "std::execution" || exec == "beman.execution" ||
+         exec == "stdexec"));
 }
 
 TEST_CASE("scalar table is populated") {

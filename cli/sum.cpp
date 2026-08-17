@@ -33,7 +33,7 @@
 #include <CLI/CLI.hpp>
 #include <blake3pp/blake3pp.hpp>
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
 #include <exec/static_thread_pool.hpp>
 #endif
 
@@ -142,7 +142,7 @@ class engine {
     } else {
       proto_ = blake3pp::hasher{o.io.a};
     }
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
     if (o.threads > 1) {
       pool_.emplace(o.threads);
     }
@@ -171,16 +171,23 @@ class engine {
          true});
     const auto* const ops = blake3pp::detail::resolve(h.selected_arch());
     while (auto w = reader.next()) {
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+      // stdexec honors --threads exactly (a pool of that size); the other
+      // providers use the process-wide parallel scheduler, where any
+      // --threads > 1 means "parallel" and the exact count is the
+      // provider's business.
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
       if (pool_.has_value() && !w->last) {
         auto sched = pool_.value().get_scheduler();
+#else
+      if (opts_.threads > 1 && !w->last) {
+        auto sched = blake3pp::get_parallel_scheduler();
+#endif
         blake3pp::detail::hash_window_parallel(
             ops, sched, h, w->data, w->bytes / blake3pp::chunk_size,
             w->offset / blake3pp::chunk_size);
         reader.release(w.value());
         continue;
       }
-#endif
       h.update(std::span<const std::byte>{w->data, w->bytes});
       reader.release(w.value());
     }
@@ -196,7 +203,7 @@ class engine {
  private:
   options opts_;
   std::optional<blake3pp::hasher> proto_;
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
   std::optional<exec::static_thread_pool> pool_;
 #endif
 };

@@ -10,10 +10,6 @@
 #include <blake3pp/io.hpp>
 #include <doctest/doctest.h>
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-#include <exec/static_thread_pool.hpp>
-#endif
-
 namespace {
 
 namespace fs = std::filesystem;
@@ -82,10 +78,8 @@ TEST_CASE("error_code overload reports instead of throwing") {
   CHECK(ok == blake3pp::hash(content));
 }
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
 TEST_CASE("parallel hash_file matches, across window boundaries") {
-  exec::static_thread_pool pool(std::thread::hardware_concurrency());
-  auto sched = pool.get_scheduler();
+  auto sched = blake3pp::get_parallel_scheduler();
 
   for (const std::size_t len :
        {std::size_t{1024 * 1024}, std::size_t{4 * 1024 * 1024},
@@ -103,7 +97,6 @@ TEST_CASE("parallel hash_file matches, across window boundaries") {
     CHECK(!ec);
   }
 }
-#endif
 
 TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
   std::array<std::byte, 32> key{};
@@ -116,12 +109,9 @@ TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
       blake3pp::keyed_hash(std::span<const std::byte, 32>{key}, content);
 
   CHECK(blake3pp::hash_file(f.path, {.key = key}) == expected);
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-  exec::static_thread_pool pool(4);
-  CHECK(blake3pp::hash_file(f.path, pool.get_scheduler(),
+  CHECK(blake3pp::hash_file(f.path, blake3pp::get_parallel_scheduler(),
                             {.window_bytes = 1024 * 1024, .key = key}) ==
         expected);
-#endif
 }
 
 TEST_CASE("missing file throws system_error") {
@@ -178,13 +168,12 @@ TEST_CASE("foreign path-like types (boost::filesystem shape) forward") {
   std::error_code ec;
   CHECK(blake3pp::hash_file(bp, ec) == expected);
   CHECK(!ec);
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-  exec::static_thread_pool pool(2);
-  CHECK(blake3pp::hash_file(bp, pool.get_scheduler()) == expected);
+  CHECK(blake3pp::hash_file(bp, blake3pp::get_parallel_scheduler()) ==
+        expected);
   std::error_code fec;
-  CHECK(blake3pp::hash_file(bp, pool.get_scheduler(), fec) == expected);
+  CHECK(blake3pp::hash_file(bp, blake3pp::get_parallel_scheduler(), fec) ==
+        expected);
   CHECK(!fec);
-#endif
 }
 
 TEST_CASE("digest hex round trip and std::format") {

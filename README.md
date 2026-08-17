@@ -214,29 +214,42 @@ multi-core; the concepts are orthogonal:
 
 For large in-memory buffers, hand `hash()` any sender/receiver scheduler.
 BLAKE3's tree makes the decomposition exact, so the digest is identical to
-the sequential one:
+the sequential one. The easiest scheduler is the process-wide one, in
+P2079's shape, the same call C++26 application code makes:
 
 ```cpp
 #include <blake3pp/parallel.hpp>
-#include <exec/static_thread_pool.hpp>   // until std::execution ships one
 
-exec::static_thread_pool pool(std::thread::hardware_concurrency());
-blake3pp::digest d = blake3pp::hash(big_buffer, pool.get_scheduler());
+auto sched = blake3pp::get_parallel_scheduler();
+blake3pp::digest d = blake3pp::hash(big_buffer, sched);
 ```
+
+Anyone who needs a sized or bounded pool constructs their provider's pool
+directly and passes its scheduler instead (e.g. stdexec's
+`exec::static_thread_pool pool(8); ... hash(big_buffer, pool.get_scheduler())`).
+
+The sender/receiver provider itself is a build-time choice
+(`-DBLAKE3PP_EXECUTION_PROVIDER=auto|std|beman|stdexec`): `std::execution`
+where the standard library ships it, [beman.execution]
+(conformance-first, C++23+) or NVIDIA stdexec (the default polyfill,
+C++20+) otherwise. `blake3pp::execution_provider()` reports which one a
+binary carries.
+
+[beman.execution]: https://github.com/bemanproject/execution
 
 When the data arrives in pieces, `parallel_hasher` has the exact
 interface of `hasher`, with the multi-core fan-out (and all of BLAKE3's
 subtree-alignment and final-chunk discipline) handled internally:
 
 ```cpp
-blake3pp::parallel_hasher ph{pool.get_scheduler()};
+blake3pp::parallel_hasher ph{blake3pp::get_parallel_scheduler()};
 while (auto block = source.next_block()) {
   ph.update(*block);
 }
 blake3pp::digest streamed = ph.finalize();   // == the sequential digest
 
 // Tunable, and checkpointable mid-stream just like hasher:
-blake3pp::parallel_hasher tuned{pool.get_scheduler(),
+blake3pp::parallel_hasher tuned{blake3pp::get_parallel_scheduler(),
                                 {.window_bytes = 16 * 1024 * 1024}};
 ```
 

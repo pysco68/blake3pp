@@ -41,3 +41,10 @@ if(BLAKE3PP_BENCH_UPSTREAM)
   target_link_libraries(blake3pp_bench PRIVATE BLAKE3::blake3)
   target_compile_definitions(blake3pp_bench PRIVATE BLAKE3PP_BENCH_UPSTREAM=1)
 endif()
+
+# Under the beman provider the executables carry the program-level
+# parallel_scheduler backend (see src/execution/beman_backend.cpp).
+if(TARGET blake3pp_beman_backend)
+  target_link_libraries(blake3pp_bench PRIVATE blake3pp::beman_backend)
+  target_link_libraries(blake3pp_bench_file PRIVATE blake3pp::beman_backend)
+endif()

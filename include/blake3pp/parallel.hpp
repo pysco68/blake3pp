@@ -12,8 +12,10 @@
 /// the tail sequentially. The merge work after the parallel phase is
 /// O(parts) scalar compressions, which is noise.
 ///
-/// std::execution where the standard library ships it, NVIDIA stdexec
-/// otherwise (same source, same story as the simd providers). No heap
+/// The provider is a build-time choice (BLAKE3PP_EXECUTION_PROVIDER):
+/// std::execution where the standard library ships it, beman.execution as
+/// the conformance-first polyfill, NVIDIA stdexec as the performance
+/// workhorse (same source, same story as the simd providers). No heap
 /// allocations in this header: the CV table lives on the caller's stack and
 /// sender operation states live inside sync_wait's frame.
 
@@ -23,14 +25,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <blake3pp/core.hpp>
 
-#if defined(BLAKE3PP_HAS_STD_SENDERS)
+#if defined(BLAKE3PP_EXECUTION_STD)
 #include <execution>
-#else
+#elif defined(BLAKE3PP_EXECUTION_BEMAN)
+#include <beman/execution/execution.hpp>
+#else  // BLAKE3PP_EXECUTION_STDEXEC
+#include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
 #endif
 
@@ -40,13 +46,83 @@ namespace blake3pp {
 /// stdexec), so the library and its callers spell schedule, bulk and
 /// sync_wait the same way whichever provider is built.
 namespace ex {
-#if defined(BLAKE3PP_HAS_STD_SENDERS)
+#if defined(BLAKE3PP_EXECUTION_STD)
 using namespace std::execution;
 using std::this_thread::sync_wait;
+#elif defined(BLAKE3PP_EXECUTION_BEMAN)
+using namespace beman::execution;
 #else
 using namespace stdexec;
 #endif
 }  // namespace ex
+
+// The process-wide parallel scheduler, in P2079's shape: the same call
+// C++26 application code makes. Calling it is the explicit opt-in that may
+// create the process pool (provider-dependent). The scheduler-taking hash
+// overloads below stay the primary, caller-controlled API, and anyone who
+// needs a sized or bounded pool constructs their provider's pool directly.
+//
+// parallel_scheduler_t is a per-build concrete type, not type-erased: the
+// provider is fixed at configure time, so dispatch stays fully inlinable.
+#if defined(BLAKE3PP_EXECUTION_STD)
+
+/// The type of the process-wide scheduler: a per-build concrete type, not
+/// type-erased, so dispatch stays fully inlinable.
+using parallel_scheduler_t = decltype(std::execution::get_parallel_scheduler());
+/// The process-wide parallel scheduler, in P2079's shape.
+///
+/// The same call C++26 application code makes. Calling it is the explicit
+/// opt-in that may create the process pool. The scheduler-taking overloads
+/// stay the primary, caller-controlled API; a sized or bounded pool is the
+/// provider's own, passed in directly.
+[[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
+  return std::execution::get_parallel_scheduler();
+}
+
+#elif defined(BLAKE3PP_EXECUTION_BEMAN)
+
+/// The type of the process-wide scheduler: a per-build concrete type, not
+/// type-erased, so dispatch stays fully inlinable.
+using parallel_scheduler_t = beman::execution::parallel_scheduler;
+/// The process-wide parallel scheduler, in P2079's shape.
+///
+/// Requires a parallel_scheduler backend definition in the program: the
+/// executables in this repository link blake3pp::beman_backend (stdexec's
+/// pool as the engine room until beman ships its default backend);
+/// downstream users may provide their own
+/// query_parallel_scheduler_backend() instead.
+[[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
+  return beman::execution::get_parallel_scheduler();
+}
+
+#else  // BLAKE3PP_EXECUTION_STDEXEC
+
+namespace detail {
+// Function-local static: constructed on first use, threads joined during
+// static destruction; the same lifetime the standard's parallel scheduler
+// has.
+inline exec::static_thread_pool& process_pool() {
+  static exec::static_thread_pool pool{std::thread::hardware_concurrency()};
+  return pool;
+}
+}  // namespace detail
+
+/// The type of the process-wide scheduler: a per-build concrete type, not
+/// type-erased, so dispatch stays fully inlinable.
+using parallel_scheduler_t =
+    decltype(detail::process_pool().get_scheduler());
+/// The process-wide parallel scheduler, in P2079's shape.
+///
+/// The same call C++26 application code makes. The first call creates the
+/// process pool (one thread per hardware thread), joined during static
+/// destruction. The scheduler-taking overloads stay the primary,
+/// caller-controlled API; a sized or bounded pool is the provider's own
+/// (exec::static_thread_pool pool(8); pool.get_scheduler()).
+[[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
+  return detail::process_pool().get_scheduler();
+}
+
+#endif
 
 namespace detail {
 

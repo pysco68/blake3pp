@@ -24,9 +24,10 @@
 #include <blake3pp/detail/file_writer.hpp>
 #include <blake3pp/parallel.hpp>
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-#include <exec/static_thread_pool.hpp>
 #include <thread>
+
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#include <exec/static_thread_pool.hpp>
 #endif
 
 namespace {
@@ -156,15 +157,18 @@ int main(int argc, char** argv) {
   blake3pp::output_reader stream = h.finalize_xof();
   stream.seek(seek);
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-  std::optional<exec::static_thread_pool> pool;
   if (threads == 0) {
     threads = std::thread::hardware_concurrency();
   }
+  constexpr std::size_t segment = 4 * 1024 * 1024;
+  // stdexec honors --threads exactly (a pool of that size); the other
+  // providers use the process-wide parallel scheduler, where --threads > 1
+  // means "parallel" and the exact count is the provider's business.
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+  std::optional<exec::static_thread_pool> pool;
   if (threads > 1) {
     pool.emplace(threads);
   }
-  constexpr std::size_t segment = 4 * 1024 * 1024;
 #endif
 
   // Fills `out` from the stream's current position and advances it,
@@ -172,13 +176,17 @@ int main(int argc, char** argv) {
   // reader, seeks its own segment, and fills it. O(1) seek makes the
   // stream embarrassingly parallel.
   const auto fill = [&](std::span<std::byte> out) {
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-    if (pool.has_value() && out.size() > segment) {
+    if (threads > 1 && out.size() > segment) {
       namespace ex = blake3pp::ex;
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+      auto sched = pool.value().get_scheduler();
+#else
+      auto sched = blake3pp::get_parallel_scheduler();
+#endif
       const std::uint64_t base = stream.position();
       const std::size_t n_segs = (out.size() + segment - 1) / segment;
       auto work =
-          ex::schedule(pool.value().get_scheduler()) |
+          ex::schedule(sched) |
           ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
             blake3pp::output_reader r = stream;
             r.seek(base + i * segment);
@@ -189,7 +197,6 @@ int main(int argc, char** argv) {
       stream.seek(base + out.size());
       return;
     }
-#endif
     stream.fill(out);
   };
 
@@ -204,11 +211,9 @@ int main(int argc, char** argv) {
       if (remaining != std::uint64_t(-1)) {
         wopts.preallocate_bytes = remaining;
       }
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
       if (threads > 1) {
         wopts.buffer_bytes = threads * segment;
       }
-#endif
       blake3pp::detail::file_writer writer(output, wopts);
       if (verbose) {
         std::fputs(std::format("blake3ppgen: write backend: {}\n",
@@ -235,10 +240,7 @@ int main(int argc, char** argv) {
   }
 
   std::vector<std::byte> buf(
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-      threads > 1 ? threads * segment :
-#endif
-                  1024 * 1024);
+      threads > 1 ? threads * segment : 1024 * 1024);
   while (remaining > 0) {
     const std::size_t take = static_cast<std::size_t>(
         std::min<std::uint64_t>(remaining, buf.size()));

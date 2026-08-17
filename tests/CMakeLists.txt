@@ -57,3 +57,9 @@ elseif(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
 else()
   doctest_discover_tests(blake3pp_tests)
 endif()
+
+# Under the beman provider the executables carry the program-level
+# parallel_scheduler backend (see src/execution/beman_backend.cpp).
+if(TARGET blake3pp_beman_backend)
+  target_link_libraries(blake3pp_tests PRIVATE blake3pp::beman_backend)
+endif()

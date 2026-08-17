@@ -54,3 +54,10 @@ foreach(case version empty_stdin check_roundtrip length_prefix
       "-DEMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()
+
+# Under the beman provider the executables carry the program-level
+# parallel_scheduler backend (see src/execution/beman_backend.cpp).
+if(TARGET blake3pp_beman_backend)
+  target_link_libraries(blake3ppsum PRIVATE blake3pp::beman_backend)
+  target_link_libraries(blake3ppgen PRIVATE blake3pp::beman_backend)
+endif()

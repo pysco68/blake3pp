@@ -1,6 +1,6 @@
 // Single-thread hashing throughput per architecture variant.
 //
-//   blake3pp_bench [--size <MiB>] [--reps <N>] [arch ...]
+//   blake3pp_bench [--size <MiB>] [--reps <N>] [--cooldown <s>] [arch ...]
 //
 // With no arch arguments, measures every variant available on this machine.
 // Reports the best of N repetitions, the interesting number for a
@@ -14,16 +14,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <blake3pp/blake3pp.hpp>
 #include <blake3pp/parallel.hpp>
 
-#include <thread>
-
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-#include <exec/static_thread_pool.hpp>
-#endif
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
 #include <blake3.h>
@@ -72,6 +68,7 @@ blake3pp::arch parse_arch(const std::string& name) {
 int main(int argc, char** argv) {
   std::size_t mib = 512;
   int reps = 5;
+  double cooldown_s = 5.0;
   std::vector<blake3pp::arch> arches;
 
   for (int i = 1; i < argc; ++i) {
@@ -80,6 +77,8 @@ int main(int argc, char** argv) {
       mib = static_cast<std::size_t>(std::strtoull(argv[++i], nullptr, 10));
     } else if (arg == "--reps" && i + 1 < argc) {
       reps = std::atoi(argv[++i]);
+    } else if (arg == "--cooldown" && i + 1 < argc) {
+      cooldown_s = std::strtod(argv[++i], nullptr);
     } else {
       arches.push_back(parse_arch(arg));
     }
@@ -96,10 +95,28 @@ int main(int argc, char** argv) {
     input[i] = static_cast<std::byte>(i % 251);
   }
 
-  std::printf("blake3pp single-thread throughput, %zu MiB, best of %d\n",
-              mib, reps);
+  std::printf(
+      "blake3pp single-thread throughput, %zu MiB, best of %d, "
+      "%.0fs cooldown\n",
+      mib, reps, cooldown_s);
   std::printf("auto resolves to: %s\n\n",
               blake3pp::to_string(blake3pp::best_available()));
+
+  // Laptops throttle: run variants back to back and each one measures the
+  // previous one's heat (observed: ~20% swing on identical code). Idle
+  // between measurements; the first one starts immediately, --cooldown 0
+  // disables.
+  bool first_measurement = true;
+  const auto cooldown = [&] {
+    if (first_measurement) {
+      first_measurement = false;
+      return;
+    }
+    if (cooldown_s > 0) {
+      std::fflush(stdout);
+      std::this_thread::sleep_for(std::chrono::duration<double>(cooldown_s));
+    }
+  };
 
   for (const auto a : arches) {
     if (!blake3pp::is_available(a)) {
@@ -107,6 +124,7 @@ int main(int argc, char** argv) {
                   blake3pp::to_string(a));
       continue;
     }
+    cooldown();
     blake3pp::digest d{};
     double best_s = 1e100;
     for (int r = 0; r < reps + 1; ++r) {  // rep 0 is warmup
@@ -134,6 +152,7 @@ int main(int argc, char** argv) {
          {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
           blake3pp::transpose16::quartered}) {
       blake3pp::set_transpose16(strat);
+      cooldown();
       blake3pp::digest d{};
       double best_s = 1e100;
       for (int r = 0; r < reps + 1; ++r) {
@@ -154,6 +173,7 @@ int main(int argc, char** argv) {
                   d.to_hex().substr(0, 16).c_str());
     }
     blake3pp::set_transpose16(saved);
+    cooldown();
     const auto picked = blake3pp::tune_transpose16();
     std::printf("  t16 tuner picks: %s\n",
                 std::string(blake3pp::to_string(picked)).c_str());
@@ -167,6 +187,7 @@ int main(int argc, char** argv) {
     asm_ops.hash_many = &asm_hash_many;  // compress_in_place stays portable
 
     {
+      cooldown();
       blake3pp::digest d{};
       double best_s = 1e100;
       for (int r = 0; r < reps + 1; ++r) {
@@ -186,10 +207,9 @@ int main(int argc, char** argv) {
                   "asm-avx2", gib_s, d.to_hex().substr(0, 16).c_str());
     }
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
     {
-      exec::static_thread_pool pool(std::thread::hardware_concurrency());
-      auto sched = pool.get_scheduler();
+      cooldown();
+      auto sched = blake3pp::get_parallel_scheduler();
       blake3pp::digest d{};
       double best_s = 1e100;
       for (int r = 0; r < reps + 1; ++r) {
@@ -206,17 +226,15 @@ int main(int argc, char** argv) {
       std::printf("%-8s %8.2f GiB/s   (%s...)  [upstream asm, parallel]\n",
                   "asm-par", gib_s, d.to_hex().substr(0, 16).c_str());
     }
-#endif
   }
 #endif
 
-#if !defined(BLAKE3PP_HAS_STD_SENDERS)
-  // The sender-based parallel engine over a static thread pool: the number
-  // that matters for feeding modern storage.
+  // The sender-based parallel engine over the process-wide parallel
+  // scheduler: the number that matters for feeding modern storage.
   {
+    cooldown();
     const unsigned nthreads = std::thread::hardware_concurrency();
-    exec::static_thread_pool pool(nthreads);
-    auto sched = pool.get_scheduler();
+    auto sched = blake3pp::get_parallel_scheduler();
     blake3pp::digest d{};
     double best_s = 1e100;
     for (int r = 0; r < reps + 1; ++r) {
@@ -230,15 +248,16 @@ int main(int argc, char** argv) {
     }
     const double gib_s =
         static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("%-8s %8.2f GiB/s   (%s...)  [stdexec pool, %u threads]\n",
-                "parallel", gib_s, d.to_hex().substr(0, 16).c_str(), nthreads);
+    std::printf("%-8s %8.2f GiB/s   (%s...)  [%s, %u threads]\n", "parallel",
+                gib_s, d.to_hex().substr(0, 16).c_str(),
+                blake3pp::execution_provider().data(), nthreads);
   }
-#endif
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
   // Baseline: the official C library with its hand-written assembly kernels,
   // own runtime dispatch, same input. The digest must match ours.
   {
+    cooldown();
     std::uint8_t out[BLAKE3_OUT_LEN];
     double best_s = 1e100;
     for (int r = 0; r < reps + 1; ++r) {
