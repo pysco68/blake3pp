@@ -34,6 +34,13 @@ endif()
 option(BLAKE3PP_TOOL_MIMALLOC
   "Use mimalloc as the allocator for CLI tools and benchmarks"
   ${_blake3pp_tool_mimalloc_default})
+if(BLAKE3PP_TOOL_MIMALLOC AND CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+  # Sanitizers interpose the allocator themselves; a second interposer
+  # (mimalloc) fights their interceptors and breaks the runtime. The
+  # sanitizer owns the heap in those builds.
+  message(STATUS "blake3pp: sanitizer build - tool mimalloc disabled")
+  set(BLAKE3PP_TOOL_MIMALLOC OFF)
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(StdFeatures)

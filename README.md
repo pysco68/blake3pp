@@ -28,9 +28,13 @@ nothing to install. There is deliberately no binary library or
 `find_package` distribution at 0.x: the feature probes must run against
 *your* toolchain and standard-library combination.
 
-For the **tools** (blake3ppsum, blake3ppgen, benchmarks), binary
-releases are fully static Linux executables (x86_64 + aarch64, musl +
-mimalloc, built via `tools/make-release.sh` with the zig toolchain
+For the **tools** (blake3ppsum, blake3ppgen, benchmarks), mimalloc is
+the default allocator on every supported target (`BLAKE3PP_TOOL_MIMALLOC`,
+off only for wasm): full malloc override on POSIX, global operator
+new/delete override on Windows (the reliable static route there), keeping
+single-file executables. The library itself stays allocator-neutral.
+Binary releases are fully static Linux executables (x86_64 + aarch64,
+musl + mimalloc, built via `tools/make-release.sh` with the zig toolchain
 presets): no glibc version coupling, no dynamic loader, runtime SIMD
 dispatch intact, one file that runs on any distro.
 

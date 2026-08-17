@@ -1,3 +1,15 @@
+# The CLI tools use std::format/std::print-style output, a C++20 library
+# feature that trails the language: libstdc++ ships <format> from GCC 13.
+# On older standard libraries the tools are skipped with a notice; the
+# LIBRARY keeps its C++20 floor; only the tools carry this extra floor.
+include(CheckIncludeFileCXX)
+check_include_file_cxx("format" BLAKE3PP_CLI_HAS_FORMAT)
+if(NOT BLAKE3PP_CLI_HAS_FORMAT)
+  message(STATUS
+    "blake3pp: <format> unavailable on this stdlib - CLI tools skipped")
+  return()
+endif()
+
 # CLI11 for argument parsing: robust, pinned.
 include(FetchContent)
 FetchContent_Declare(cli11

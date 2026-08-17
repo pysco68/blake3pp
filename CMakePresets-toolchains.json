@@ -62,28 +62,8 @@
       }
     },
     {
-      "name": "linux-clang18-cxx20",
-      "displayName": "Clang 18 with libc++ 18, C++20",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/linux-clang18-cxx20",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang18-cxx20.cmake",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-      }
-    },
-    {
-      "name": "linux-clang18-cxx23",
-      "displayName": "Clang 18 with libc++ 18, C++23",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/linux-clang18-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang18-cxx23.cmake",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-      }
-    },
-    {
       "name": "linux-clang20-cxx23",
-      "displayName": "Clang 20 with libc++ 20, C++23",
+      "displayName": "Clang 20 with libc++ (system), C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang20-cxx23",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx23.cmake",
@@ -93,7 +73,7 @@
     },
     {
       "name": "linux-clang20-cxx26",
-      "displayName": "Clang 20 with libc++ 20, C++26",
+      "displayName": "Clang 20 with libc++ (system), C++26",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang20-cxx26",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx26.cmake",
@@ -103,7 +83,7 @@
     },
     {
       "name": "linux-clang22-cxx23",
-      "displayName": "Clang 22 with libc++ 22, C++23",
+      "displayName": "Clang 22 with libc++ (system), C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx23",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx23.cmake",
@@ -113,7 +93,7 @@
     },
     {
       "name": "linux-clang22-cxx26",
-      "displayName": "Clang 22 with libc++ 22, C++26",
+      "displayName": "Clang 22 with libc++ (system), C++26",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26.cmake",
@@ -152,11 +132,11 @@
       }
     },
     {
-      "name": "linux-clang22-cxx2d",
-      "displayName": "Clang 22 with libc++, experimental -std=c++2d",
+      "name": "linux-clang22-cxx2c",
+      "displayName": "Clang 22 with libc++, experimental -std=c++2c (post-C++26 working draft)",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/linux-clang22-cxx2d",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx2d.cmake",
+      "binaryDir": "${sourceDir}/build/linux-clang22-cxx2c",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx2c.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -193,7 +173,7 @@
     },
     {
       "name": "linux-clang22-cxx26-asan",
-      "displayName": "Clang 22 with libc++ 22, C++26 + asan",
+      "displayName": "Clang 22 with libc++ (system), C++26 + asan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-asan",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-asan.cmake",
@@ -203,7 +183,7 @@
     },
     {
       "name": "linux-clang22-cxx26-tsan",
-      "displayName": "Clang 22 with libc++ 22, C++26 + tsan",
+      "displayName": "Clang 22 with libc++ (system), C++26 + tsan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-tsan",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-tsan.cmake",
@@ -213,7 +193,7 @@
     },
     {
       "name": "linux-clang22-cxx26-msan",
-      "displayName": "Clang 22 with libc++ 22, C++26 + msan",
+      "displayName": "Clang 22 with libc++ (system), C++26 + msan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-msan",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-msan.cmake",
@@ -223,7 +203,7 @@
     },
     {
       "name": "linux-clang22-cxx26-fuzzer",
-      "displayName": "Clang 22 with libc++ 22, C++26 + fuzzer",
+      "displayName": "Clang 22 with libc++ (system), C++26 + fuzzer",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-fuzzer",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-fuzzer.cmake",
@@ -233,7 +213,7 @@
     },
     {
       "name": "linux-clang22-cxx26-coverage",
-      "displayName": "Clang 22 with libc++ 22, C++26 + coverage",
+      "displayName": "Clang 22 with libc++ (system), C++26 + coverage",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-coverage",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-coverage.cmake",
@@ -268,14 +248,6 @@
       "configurePreset": "linux-gcc16-cxx26"
     },
     {
-      "name": "linux-clang18-cxx20",
-      "configurePreset": "linux-clang18-cxx20"
-    },
-    {
-      "name": "linux-clang18-cxx23",
-      "configurePreset": "linux-clang18-cxx23"
-    },
-    {
       "name": "linux-clang20-cxx23",
       "configurePreset": "linux-clang20-cxx23"
     },
@@ -304,8 +276,8 @@
       "configurePreset": "linux-clang22-cxx23-libstdcxx"
     },
     {
-      "name": "linux-clang22-cxx2d",
-      "configurePreset": "linux-clang22-cxx2d"
+      "name": "linux-clang22-cxx2c",
+      "configurePreset": "linux-clang22-cxx2c"
     },
     {
       "name": "linux-gcc16-cxx26-asan",

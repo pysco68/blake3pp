@@ -111,11 +111,20 @@ def base_configs() -> list[tuple[str, str, dict]]:
                 },
             ))
 
+    # The libc++ flavor rides the SYSTEM libc++, and Ubuntu's libc++-X-dev
+    # packages conflict across versions (one unversioned /usr/include/c++/v1
+    # per container), so every clang here parses the NEWEST clang's libc++
+    # headers. That works within a small version skew (clang 20 vs libc++ 22
+    # is fine) but clang 18 cannot parse libc++-22's headers; older clangs
+    # get their coverage from the pinned-libstdcxx variant below instead.
+    LIBCXX_MIN_CLANG = 20
     for v in CLANG_VERSIONS:
+        if v < LIBCXX_MIN_CLANG:
+            continue
         for std in CLANG_STDS.get(v, []):
             out.append((
                 f"{HOST_OS}-clang{v}-cxx{std}",
-                f"Clang {v} with libc++ {v}, C++{std}",
+                f"Clang {v} with libc++ (system), C++{std}",
                 {
                     "C_COMPILER": f"clang-{v}",
                     "CXX_COMPILER": f"clang++-{v}",
@@ -150,13 +159,14 @@ def base_configs() -> list[tuple[str, str, dict]]:
 
     # Post-C++26 experiment: CMake has no cxx_std_29, so pass the flag raw.
     out.append((
-        f"{HOST_OS}-clang{DEFAULT_CLANG}-cxx2d",
-        f"Clang {DEFAULT_CLANG} with libc++, experimental -std=c++2d",
+        f"{HOST_OS}-clang{DEFAULT_CLANG}-cxx2c",
+        f"Clang {DEFAULT_CLANG} with libc++, experimental -std=c++2c "
+        "(post-C++26 working draft)",
         {
             "C_COMPILER": f"clang-{DEFAULT_CLANG}",
             "CXX_COMPILER": f"clang++-{DEFAULT_CLANG}",
             "STDLIB": "libc++",
-            "CXX_STANDARD_RAW": "c++2d",
+            "CXX_STANDARD_RAW": "c++2c",
             "LINKER": f"lld-{DEFAULT_CLANG}",
             "DEFAULT_BUILD_TYPE": "RelWithDebInfo",
         },
