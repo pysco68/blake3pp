@@ -19,6 +19,8 @@
 
 #include <blake3pp/dispatch.hpp>
 
+#include "blake3pp_version_stamp.hpp"
+
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -218,7 +220,7 @@ std::span<const arch> available_arches() noexcept { return available_impl(); }
 
 std::span<const arch> all_arches() noexcept { return all_enumerators; }
 
-std::string_view version() noexcept { return BLAKE3PP_VERSION; }
+std::string_view version() noexcept { return BLAKE3PP_STAMPED_VERSION; }
 
 std::string_view simd_provider() noexcept {
 #if defined(BLAKE3PP_HAS_STD_SIMD)

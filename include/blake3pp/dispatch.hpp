@@ -83,7 +83,7 @@ enum class arch : std::uint8_t {
 /// "std::experimental::simd" or "xsimd".
 [[nodiscard]] std::string_view simd_provider() noexcept;
 /// Which sender/receiver implementation backs this build of the library:
-/// "std::execution" or "stdexec".
+/// "std::execution", "beman.execution" or "stdexec".
 [[nodiscard]] std::string_view execution_provider() noexcept;
 
 /// The strategy for the AVX-512 kernel's 16-lane message transpose.

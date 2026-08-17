@@ -66,11 +66,24 @@ add_library(blake3pp STATIC
 add_library(blake3pp::blake3pp ALIAS blake3pp)
 
 target_compile_features(blake3pp PUBLIC cxx_std_20)
-target_compile_definitions(blake3pp PRIVATE
-  "BLAKE3PP_VERSION=\"${PROJECT_VERSION}\"")
 target_include_directories(blake3pp PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_include_directories(blake3pp PRIVATE src)
+target_include_directories(blake3pp PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
+
+# Version stamp, taken from git at BUILD time (a commit between configures
+# still lands in the next build). The custom target reruns every build
+# (one ~10 ms git call), but the header moves only when the version string
+# changes, so only dispatch.cpp ever recompiles for it.
+set(_blake3pp_version_stamp "${CMAKE_CURRENT_BINARY_DIR}/blake3pp_version_stamp.hpp")
+add_custom_target(blake3pp_version_stamp
+  COMMAND "${CMAKE_COMMAND}"
+    -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+    -DOUTPUT_FILE=${_blake3pp_version_stamp}
+    -DFALLBACK_VERSION=${PROJECT_VERSION}
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/GitVersionStamp.cmake"
+  BYPRODUCTS "${_blake3pp_version_stamp}"
+  COMMENT "Stamping blake3pp version from git")
+add_dependencies(blake3pp blake3pp_version_stamp)
 # features is PUBLIC: its defines (BLAKE3PP_HAS_STD_SENDERS etc.) and the
 # stdexec include path must reach consumers of <blake3pp/parallel.hpp>.
 target_link_libraries(blake3pp

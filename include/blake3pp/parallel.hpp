@@ -42,9 +42,9 @@
 
 namespace blake3pp {
 
-/// The sender/receiver vocabulary this build uses (std::execution or
-/// stdexec), so the library and its callers spell schedule, bulk and
-/// sync_wait the same way whichever provider is built.
+/// The sender/receiver vocabulary this build uses (std::execution,
+/// beman::execution or stdexec), so the library and its callers spell
+/// schedule, bulk and sync_wait the same way whichever provider is built.
 namespace ex {
 #if defined(BLAKE3PP_EXECUTION_STD)
 using namespace std::execution;
@@ -207,8 +207,8 @@ template <class Scheduler>
 /// @param a      The variant to run on.
 ///
 /// @code
-/// exec::static_thread_pool pool(8);
-/// blake3pp::digest d = blake3pp::hash(big_buffer, pool.get_scheduler());
+/// auto sched = blake3pp::get_parallel_scheduler();
+/// blake3pp::digest d = blake3pp::hash(big_buffer, sched);
 /// @endcode
 template <class Scheduler>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
@@ -299,8 +299,7 @@ struct parallel_hasher_options {
 /// @tparam Scheduler  Any std::execution-style scheduler, held by value.
 ///
 /// @code
-/// exec::static_thread_pool pool(8);
-/// blake3pp::parallel_hasher ph{pool.get_scheduler()};
+/// blake3pp::parallel_hasher ph{blake3pp::get_parallel_scheduler()};
 /// while (auto block = source.next_block()) {
 ///   ph.update(*block);
 /// }
