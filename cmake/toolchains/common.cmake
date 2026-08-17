@@ -111,7 +111,14 @@ if(DEFINED TC_SANITIZERS AND NOT TC_SANITIZERS STREQUAL "")
     message(FATAL_ERROR "toolchain: libFuzzer requires Clang")
   endif()
 
-  string(REPLACE ";" "," _san_csv "${TC_SANITIZERS}")
+  # libFuzzer's runtime is whole-archive-linked and carries its own main(),
+  # so a global -fsanitize=fuzzer breaks every ordinary executable (starting
+  # with CMake's own compiler check). Instrument globally with
+  # fuzzer-no-link; dedicated fuzz-harness targets add -fsanitize=fuzzer on
+  # their own link line.
+  set(_san_for_flags "${TC_SANITIZERS}")
+  list(TRANSFORM _san_for_flags REPLACE "^fuzzer$" "fuzzer-no-link")
+  string(REPLACE ";" "," _san_csv "${_san_for_flags}")
   list(APPEND _cxx_flags
     "-fsanitize=${_san_csv}"
     "-fno-omit-frame-pointer"
@@ -133,7 +140,9 @@ if(DEFINED TC_SANITIZERS AND NOT TC_SANITIZERS STREQUAL "")
     if(NOT IS_DIRECTORY "${TC_MSAN_LIBCXX_PREFIX}/include/c++/v1")
       message(WARNING
         "toolchain: MSan build but no instrumented libc++ at ${TC_MSAN_LIBCXX_PREFIX}. "
-        "Expect false positives. Run .devcontainer/build-msan-libcxx.sh first.")
+        "Expect false positives. Run this preset via tools/tc (the clang22 "
+        "toolchain image bakes /opt/libcxx-msan in), or run "
+        "tools/build-msan-libcxx.sh locally.")
     endif()
     list(APPEND _cxx_flags
       "-fsanitize-memory-track-origins=2"

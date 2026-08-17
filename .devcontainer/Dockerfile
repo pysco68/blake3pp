@@ -4,9 +4,11 @@
 #   GCC   11..16  from the default repos
 #   Clang 17..22  from the default repos; 22 and the 23 snapshot via apt.llvm.org
 #
-# SIZE WARNING: every extra Clang is roughly 1-1.5 GB installed. The default
-# selection below lands somewhere around 9-11 GB. Trim CLANG_VERSIONS if that
-# hurts more than the matrix helps.
+# Slim by design: this image carries only the default gcc/clang pair plus
+# editor tooling. The full compiler matrix lives in the per-compiler
+# toolchain images (docker/, driven by tools/tc). Every extra Clang here is
+# roughly 1-1.5 GB installed; widen the version lists only if you really
+# want compilers back in the devcontainer itself.
 #
 ARG UBUNTU_VERSION=26.04
 FROM ubuntu:${UBUNTU_VERSION}
@@ -14,8 +16,8 @@ FROM ubuntu:${UBUNTU_VERSION}
 # --- compiler matrix ---------------------------------------------------------
 # Space-separated, oldest first. Must exist in the repos; the build fails loudly
 # with the available list if one does not.
-ARG GCC_VERSIONS="12 14 16"
-ARG CLANG_VERSIONS="18 20 22"
+ARG GCC_VERSIONS="16"
+ARG CLANG_VERSIONS="22"
 ARG GCC_DEFAULT=16
 ARG CLANG_DEFAULT=22
 # apt.llvm.org only carries the dev branch + last two releases, so it is the

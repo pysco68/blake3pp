@@ -26,12 +26,16 @@ for preset in linux-zigmusl-cxx23-static linux-arm64-zigmusl-cxx23-static; do
              bench/blake3pp_bench_file; do
     cp "build/$preset/$bin" "$stage/"
   done
-  # llvm-strip handles both architectures; fall back per-arch otherwise.
+  # llvm-strip handles both architectures; fall back per-arch otherwise
+  # (the zig toolchain image carries binutils + binutils-aarch64-linux-gnu,
+  # not LLVM).
   STRIP=$(command -v llvm-strip || ls /usr/bin/llvm-strip-* 2>/dev/null | sort -V | tail -1 || true)
   if [ -n "$STRIP" ]; then
     "$STRIP" "$stage"/*
   elif [ "$arch" = x86_64 ]; then
     strip "$stage"/*
+  elif command -v aarch64-linux-gnu-strip >/dev/null; then
+    aarch64-linux-gnu-strip "$stage"/*
   fi
   cp README.md "$stage/"
   tar -C "$OUT" -czf "$OUT/$pkg.tar.gz" "$pkg"

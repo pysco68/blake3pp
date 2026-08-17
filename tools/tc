@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# tc: run a CMake preset inside its per-compiler toolchain image.
+#
+#   tools/tc <preset>               configure + build + ctest in the image
+#   tools/tc <preset> -- <cmd...>   run an arbitrary command in the image
+#   tools/tc --shell <preset>       interactive shell in the preset's image
+#   tools/tc --pull                 pull/refresh all toolchain images
+#   tools/tc --list                 show the preset -> image mapping
+#
+# The devcontainer talks to the HOST docker daemon (docker-outside-of-docker),
+# so every -v below must be a HOST path. devcontainer.json passes it in as
+# LOCAL_WORKSPACE_FOLDER; outside a container we fall back
+# to the current checkout. The workspace mounts at /workspaces/blake3pp in
+# every image (the same path as in the devcontainer), so build/<preset>
+# trees, compile_commands.json and coverage paths are valid in both worlds.
+set -euo pipefail
+
+REGISTRY="${BLAKE3PP_TC_REGISTRY:-ghcr.io/pysco68/blake3pp}"
+TAG="${BLAKE3PP_TC_TAG:-latest}"
+WORKDIR=/workspaces/blake3pp
+
+ALL_IMAGES=(gcc12 gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 zig emscripten)
+
+die() { echo "tc: $*" >&2; exit 1; }
+
+usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# The linux-<compiler><N>-... naming convention enforced by
+# tools/gen-toolchains.py is the contract here.
+image_for() {
+  case "$1" in
+    linux-gcc12-*)        echo gcc12 ;;
+    linux-gcc14-*)        echo gcc14 ;;
+    linux-gcc16-*)        echo gcc16 ;;
+    linux-clang18-*)      echo clang18 ;;
+    linux-clang20-*)      echo clang20 ;;
+    linux-clang22-*)      echo clang22 ;;
+    linux-arm64-gcc15-*)  echo arm64-gcc15 ;;
+    *zigmusl*)            echo zig ;;
+    wasm32-*)             echo emscripten ;;
+    windows-*)            die "windows presets are not containerized (build them natively or in CI)" ;;
+    *)                    die "unknown preset '$1' (see tools/tc --list)" ;;
+  esac
+}
+
+host_workspace() {
+  if [ -n "${LOCAL_WORKSPACE_FOLDER:-}" ]; then
+    echo "$LOCAL_WORKSPACE_FOLDER"
+  elif [ ! -f /.dockerenv ]; then
+    git -C "$(dirname "$0")/.." rev-parse --show-toplevel
+  else
+    die "LOCAL_WORKSPACE_FOLDER is not set; rebuild the devcontainer so \
+devcontainer.json can pass the host workspace path through (required for \
+docker-outside-of-docker mounts)"
+  fi
+}
+
+run_in_image() {
+  local image="$1"; shift
+  local -a tty_args=()
+  if [ -t 0 ] && [ -t 1 ]; then tty_args=(-it); fi
+  docker run --rm "${tty_args[@]}" --init \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit core=0 \
+    -u 1000:1000 \
+    -v "$(host_workspace):${WORKDIR}" \
+    -w "${WORKDIR}" \
+    -e CMAKE_GENERATOR=Ninja \
+    -e CMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -e ASAN_SYMBOLIZER_PATH=/usr/local/bin/llvm-symbolizer \
+    -e ASAN_OPTIONS=detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:strict_string_checks=1:symbolize=1 \
+    -e UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1:report_error_type=1 \
+    -e TSAN_OPTIONS=second_deadlock_stack=1:halt_on_error=0 \
+    -e LSAN_OPTIONS=use_tls=0 \
+    "${REGISTRY}/toolchain-${image}:${TAG}" \
+    "$@" \
+  || { rc=$?; \
+       echo "tc: if the image failed to pull, log the HOST daemon in to GHCR:" >&2; \
+       echo "tc:   gh auth token | docker login ghcr.io -u pysco68 --password-stdin" >&2; \
+       exit "$rc"; }
+}
+
+[ $# -ge 1 ] || { usage; exit 1; }
+
+case "$1" in
+  -h|--help)
+    usage; exit 0 ;;
+  --list)
+    printf '%-38s %s\n' "PRESET PATTERN" "IMAGE"
+    printf '%-38s %s\n' \
+      'linux-gcc12-*'       "${REGISTRY}/toolchain-gcc12:${TAG}" \
+      'linux-gcc14-*'       "${REGISTRY}/toolchain-gcc14:${TAG}" \
+      'linux-gcc16-*'       "${REGISTRY}/toolchain-gcc16:${TAG}" \
+      'linux-clang18-*'     "${REGISTRY}/toolchain-clang18:${TAG}" \
+      'linux-clang20-*'     "${REGISTRY}/toolchain-clang20:${TAG}" \
+      'linux-clang22-*'     "${REGISTRY}/toolchain-clang22:${TAG}" \
+      'linux-arm64-gcc15-*' "${REGISTRY}/toolchain-arm64-gcc15:${TAG}" \
+      '*zigmusl*'           "${REGISTRY}/toolchain-zig:${TAG}" \
+      'wasm32-*'            "${REGISTRY}/toolchain-emscripten:${TAG}"
+    exit 0 ;;
+  --pull)
+    for img in "${ALL_IMAGES[@]}"; do
+      docker pull "${REGISTRY}/toolchain-${img}:${TAG}"
+    done
+    exit 0 ;;
+  --shell)
+    [ $# -ge 2 ] || die "--shell needs a preset name"
+    run_in_image "$(image_for "$2")" bash
+    exit 0 ;;
+  --*)
+    die "unknown option '$1'" ;;
+esac
+
+preset="$1"; shift
+image="$(image_for "$preset")"
+
+if [ $# -gt 0 ]; then
+  [ "$1" = "--" ] || die "expected '--' before the command"
+  shift
+  [ $# -gt 0 ] || die "empty command after '--'"
+  run_in_image "$image" "$@"
+else
+  # ctest --test-dir rather than --preset: most generated presets have no
+  # testPreset entry.
+  run_in_image "$image" bash -c "
+    set -euo pipefail
+    cmake --preset '${preset}'
+    cmake --build --preset '${preset}'
+    ctest --test-dir 'build/${preset}' --output-on-failure
+  "
+fi

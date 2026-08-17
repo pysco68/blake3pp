@@ -352,6 +352,10 @@ Any name from `cmake/toolchains/` works as a preset (see
 two `-asan` variants. Without a preset, a bare `cmake -S . -B build`
 configures the C++20 baseline with the default compiler.
 
+The devcontainer carries only the default gcc/clang pair; every other preset
+runs inside its per-compiler toolchain image via `tools/tc <preset>`;
+see `docker/README.md` for the image matrix and its glibc-floor design.
+
 Layout: public API in `include/blake3pp/`, arch-agnostic tree logic in
 `src/core/`, the per-architecture kernel (one TU, compiled once per variant
 by `cmake/ArchKernels.cmake`) in `src/kernel/`, runtime routing in

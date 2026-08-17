@@ -37,6 +37,9 @@ command -v claude >/dev/null && echo "claude $(claude --version 2>/dev/null || e
 command -v docker >/dev/null && (docker version --format '{{.Server.Version}}' >/dev/null 2>&1 \
   && echo "docker: host daemon reachable" \
   || echo "docker: CLI present but daemon NOT reachable; check Docker Desktop WSL integration")
+echo "-- toolchain images (full matrix runs via tools/tc <preset>;"
+echo "   if pulls fail: gh auth token | docker login ghcr.io -u pysco68 --password-stdin)"
+tools/tc --list 2>/dev/null || true
 echo "-- C++ standards this g++ accepts:"
 g++ -v --help 2>/dev/null | grep -Eo '\-std=c\+\+[0-9a-z]+' | sort -u | tr '\n' ' '; echo
 echo "-- C++ standards this clang++ accepts:"

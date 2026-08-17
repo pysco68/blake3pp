@@ -7,10 +7,12 @@
     "args": {
       "UBUNTU_VERSION": "26.04",
 
-      // Oldest first. Ubuntu 26.04 offers GCC 11..16 and Clang 17..22.
-      // Widen for a fuller fallback matrix, narrow to shrink the image.
-      "GCC_VERSIONS": "12 14 16",
-      "CLANG_VERSIONS": "18 20 22",
+      // Slim by design: only the default pair lives here. Every other
+      // preset runs in its per-compiler toolchain image via tools/tc
+      // (see docker/README.md). Widen only if you really want compilers
+      // back in the devcontainer itself.
+      "GCC_VERSIONS": "16",
+      "CLANG_VERSIONS": "22",
       "GCC_DEFAULT": "16",
       "CLANG_DEFAULT": "22",
 
@@ -61,6 +63,11 @@
 
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+
+    // Host path for tools/tc: docker-outside-of-docker means any -v mount
+    // must name paths as the HOST daemon sees them, not as this container
+    // does.
+    "LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}",
 
     "CMAKE_GENERATOR": "Ninja",
     "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",

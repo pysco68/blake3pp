@@ -1,0 +1,81 @@
+# Build & push the per-compiler toolchain images to GHCR.
+#
+# Two stages: the three per-release base instantiations first, then a 9-way
+# fan-out with one runner per toolchain image, each building FROM the exact base
+# digest pushed in this run (the --set contexts.base override below), so all
+# images of a distro cohort share identical base layers even across runners.
+# Layer cache lives registry-side (GHA's 10 GB cache is too small for this
+# set). First clang22 build is the long pole: the MSan libc++ stage compiles
+# LLVM runtimes from source (~60-90 min on 2 cores), cached afterwards.
+#
+# REGISTRY and EXTRA_TAG are picked up by docker-bake.hcl as bake variables.
+name: toolchain-images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - "tools/build-msan-libcxx.sh"
+      - ".github/workflows/toolchains.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/${{ github.repository }}
+  CACHE: ghcr.io/${{ github.repository }}/toolchain-cache
+
+jobs:
+  bases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push base images
+        run: |
+          EXTRA_TAG="sha-${GITHUB_SHA::12}" \
+          docker buildx bake -f docker/docker-bake.hcl base --push \
+            --set "base-*.cache-from=type=registry,ref=${CACHE}:base" \
+            --set "base-*.cache-to=type=registry,ref=${CACHE}:base,mode=max"
+
+  images:
+    needs: bases
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Mirrors the {target, rel} table in docker/docker-bake.hcl; a
+          # mismatch fails the build loudly.
+          - { target: gcc12,       rel: "2204" }
+          - { target: gcc14,       rel: "2404" }
+          - { target: gcc16,       rel: "2604" }
+          - { target: clang18,     rel: "2404" }
+          - { target: clang20,     rel: "2404" }
+          - { target: clang22,     rel: "2604" }
+          - { target: arm64-gcc15, rel: "2604" }
+          - { target: zig,         rel: "2604" }
+          - { target: emscripten,  rel: "2604" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push ${{ matrix.target }}
+        run: |
+          EXTRA_TAG="sha-${GITHUB_SHA::12}" \
+          docker buildx bake -f docker/docker-bake.hcl "${{ matrix.target }}" --push \
+            --set "*.contexts.base=docker-image://${REGISTRY}/toolchain-base-${{ matrix.rel }}:sha-${GITHUB_SHA::12}" \
+            --set "*.cache-from=type=registry,ref=${CACHE}:${{ matrix.target }}" \
+            --set "*.cache-to=type=registry,ref=${CACHE}:${{ matrix.target }},mode=max"
