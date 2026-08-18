@@ -55,6 +55,36 @@
       }
     },
     {
+      "name": "macos-appleclang-cxx23",
+      "displayName": "macOS Apple Clang, C++23 (GCD + F_NOCACHE I/O)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-appleclang-cxx23",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "23"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-clang22-cxx26",
+      "displayName": "macOS Homebrew LLVM 22, C++26 (bundled libc++, GCD + F_NOCACHE I/O)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-clang22-cxx26",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/macos-clang22-cxx26.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
       "generator": "Ninja",
@@ -147,6 +177,24 @@
       "configurePreset": "linux-zigmusl-cxx23-static"
     },
     {
+      "name": "macos-appleclang-cxx23",
+      "configurePreset": "macos-appleclang-cxx23",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-clang22-cxx26",
+      "configurePreset": "macos-clang22-cxx26",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "configurePreset": "windows-msvc2026-cxx23",
       "condition": {
@@ -217,6 +265,30 @@
       "configurePreset": "linux-zigmusl-cxx23-static",
       "output": {
         "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos-appleclang-cxx23",
+      "configurePreset": "macos-appleclang-cxx23",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-clang22-cxx26",
+      "configurePreset": "macos-clang22-cxx26",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
       }
     },
     {

@@ -5,8 +5,8 @@
 // slot whose write is still in flight is the entire backpressure story.
 // Degradation ladder as on the read side: O_DIRECT refused -> buffered
 // io_uring; io_uring refused -> synchronous pwrite. Windows mirrors it
-// with IOCP + FILE_FLAG_NO_BUFFERING through iocp_impl.hpp; anything
-// else falls to stdio.
+// with IOCP + FILE_FLAG_NO_BUFFERING through iocp_impl.hpp, macOS with
+// GCD + F_NOCACHE through darwin_impl.hpp; anything else falls to stdio.
 
 #include <blake3pp/detail/file_writer.hpp>
 
@@ -16,6 +16,7 @@
 #include <system_error>
 #include <vector>
 
+#include "io/darwin_impl.hpp"
 #include "io/iocp_impl.hpp"
 #include "io/uring_impl.hpp"
 
@@ -48,6 +49,9 @@ struct file_writer::impl {
     std::size_t len = 0;    // bytes to write
     std::size_t done = 0;   // bytes completed so far (async)
     bool busy = false;      // write in flight
+#if defined(BLAKE3PP_IO_GCD)
+    int error = 0;  // errno captured by the GCD worker; thrown at acquire
+#endif
   };
   std::vector<slot_state> slots;
 
@@ -69,6 +73,15 @@ struct file_writer::impl {
 #if defined(BLAKE3PP_IO_URING)
   uring ring;
   bool use_uring = false;
+#endif
+#if defined(BLAKE3PP_IO_GCD)
+  struct gcd_task {
+    impl* self;
+    unsigned slot;
+  };
+  std::vector<gcd_task> tasks;  // one per slot, fixed at construction
+  io_impl::gcd_pump pump;
+  bool use_gcd = false;
 #endif
 
   std::byte* buf(unsigned slot) const noexcept {
@@ -151,6 +164,52 @@ struct file_writer::impl {
   }
 #endif
 
+#if defined(BLAKE3PP_IO_GCD)
+  // Runs on a GCD worker: drains the slot's buffer with one positional
+  // write loop, then publishes completion under the pump lock. noexcept:
+  // errors travel through slot_state::error to the acquiring thread.
+  static void run_write(void* ctx) noexcept {
+    const gcd_task t = *static_cast<gcd_task*>(ctx);
+    impl& im = *t.self;
+    slot_state& st = im.slots[t.slot];
+    int err = 0;
+    std::size_t put = 0;
+    while (put < st.len) {
+      const ssize_t n = ::pwrite(im.fd, im.buf(t.slot) + put, st.len - put,
+                                 static_cast<off_t>(st.off + put));
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        err = errno;
+        break;
+      }
+      put += static_cast<std::size_t>(n);
+    }
+    {
+      const std::lock_guard<std::mutex> lk(im.pump.m);
+      st.done = put;
+      st.error = err;
+      st.busy = false;
+    }
+    im.pump.cv.notify_all();
+  }
+
+  // Blocks until slot s is idle; surfaces its deferred write error once
+  // (cleared after the throw so the slot stays reusable, matching the
+  // reap_one contract).
+  void wait_slot(unsigned s) {
+    slot_state& st = slots[s];
+    std::unique_lock<std::mutex> lk(pump.m);
+    pump.cv.wait(lk, [&] { return !st.busy; });
+    if (st.error != 0) {
+      const int e = st.error;
+      st.error = 0;
+      throw std::system_error(e, std::generic_category(), "gcd pwrite");
+    }
+  }
+#endif
+
 #if defined(BLAKE3PP_IO_URING)
   // Reaps one completion, issuing a continuation on a short write. The
   // device may complete slots in any order; each carries its slot index.
@@ -202,6 +261,12 @@ file_writer::file_writer(const std::filesystem::path& fspath,
                   static_cast<off_t>(opts.preallocate_bytes)) == 0) {
     im.prealloc = opts.preallocate_bytes;
   }
+#elif defined(BLAKE3PP_IO_GCD)
+  // Same story via Darwin's spelling: F_PREALLOCATE + ftruncate.
+  if (opts.preallocate_bytes > 0 &&
+      io_impl::preallocate(im.fd_plain, opts.preallocate_bytes)) {
+    im.prealloc = opts.preallocate_bytes;
+  }
 #endif
 #if defined(O_DIRECT)
   if (opts.direct_io) {
@@ -212,8 +277,26 @@ file_writer::file_writer(const std::filesystem::path& fspath,
       im.direct = true;
     }
   }
+#elif defined(BLAKE3PP_IO_GCD)
+  // Per-fd cache bypass, no alignment contract: one fd serves aligned
+  // submits and the unaligned tail alike.
+  if (opts.direct_io && io_impl::set_nocache(im.fd_plain)) {
+    im.direct = true;
+  }
 #endif
+#if defined(BLAKE3PP_IO_GCD)
+  im.backend_name = im.direct ? "pwrite+nocache" : "pwrite";
+  if (opts.async && im.pump.init()) {
+    im.use_gcd = true;
+    im.tasks.resize(im.qd);
+    for (unsigned s = 0; s < im.qd; ++s) {
+      im.tasks[s] = {&im, s};
+    }
+    im.backend_name = im.direct ? "gcd+nocache" : "gcd";
+  }
+#else
   im.backend_name = im.direct ? "pwrite+direct" : "pwrite";
+#endif
 #if defined(BLAKE3PP_IO_URING)
   if (opts.async && im.ring.init(2 * im.qd)) {
     im.use_uring = true;
@@ -306,13 +389,19 @@ file_writer::file_writer(const std::filesystem::path& fspath,
 }
 
 file_writer::~file_writer() {
-#if defined(BLAKE3PP_IO_URING) || defined(BLAKE3PP_IO_WIN32)
+#if defined(BLAKE3PP_IO_URING) || defined(BLAKE3PP_IO_WIN32) || \
+    defined(BLAKE3PP_IO_GCD)
   // Best-effort drain: buffers must outlive in-flight writes. Errors here
   // are unreportable; that is why finish() exists.
   try {
     finish();
   } catch (...) {
   }
+#endif
+#if defined(BLAKE3PP_IO_GCD)
+  // If finish() threw, workers may still be writing from the pool: wait
+  // them all out before it is freed.
+  impl_->pump.destroy();
 #endif
 #if defined(BLAKE3PP_IO_URING)
   impl_->ring.destroy();
@@ -338,7 +427,9 @@ file_writer::~file_writer() {
     ::operator delete(im.pool, std::align_val_t{direct_align});
   }
 #if defined(BLAKE3PP_IO_POSIX)
-  if (im.direct && im.fd >= 0) {
+  // fd is a second, separately-opened fd only when the O_DIRECT reopen
+  // engaged; on Darwin (F_NOCACHE on the one fd) they are the same.
+  if (im.fd != im.fd_plain && im.fd >= 0) {
     ::close(im.fd);
   }
   if (im.fd_plain >= 0) {
@@ -373,7 +464,11 @@ const char* file_writer::backend() const noexcept {
 file_writer::buffer file_writer::acquire() {
   impl& im = *impl_;
   const unsigned s = im.next_slot;
-#if defined(BLAKE3PP_IO_URING) || defined(BLAKE3PP_IO_WIN32)
+#if defined(BLAKE3PP_IO_GCD)
+  if (im.use_gcd) {
+    im.wait_slot(s);
+  }
+#elif defined(BLAKE3PP_IO_URING) || defined(BLAKE3PP_IO_WIN32)
   while (im.slots[s].busy) {
     im.reap_one();
   }
@@ -394,7 +489,20 @@ void file_writer::submit(const buffer& b, std::size_t bytes) {
   if (!aligned) {
     im.tail_submitted = true;
   }
-#if defined(BLAKE3PP_IO_URING)
+#if defined(BLAKE3PP_IO_GCD)
+  if (im.use_gcd && aligned) {
+    impl::slot_state& st = im.slots[b.slot];
+    st.off = im.offset;
+    st.len = bytes;
+    st.done = 0;
+    st.busy = true;
+    im.pump.submit(&impl::run_write, &im.tasks[b.slot]);
+    im.offset += bytes;
+    im.written += bytes;
+    im.next_slot = (b.slot + 1) % im.qd;
+    return;
+  }
+#elif defined(BLAKE3PP_IO_URING)
   if (im.use_uring && aligned) {
     impl::slot_state& st = im.slots[b.slot];
     st.off = im.offset;
@@ -445,7 +553,13 @@ void file_writer::submit(const buffer& b, std::size_t bytes) {
 
 void file_writer::finish() {
   impl& im = *impl_;
-#if defined(BLAKE3PP_IO_URING) || defined(BLAKE3PP_IO_WIN32)
+#if defined(BLAKE3PP_IO_GCD)
+  if (im.use_gcd) {
+    for (unsigned s = 0; s < im.qd; ++s) {
+      im.wait_slot(s);
+    }
+  }
+#elif defined(BLAKE3PP_IO_URING) || defined(BLAKE3PP_IO_WIN32)
   for (impl::slot_state& st : im.slots) {
     while (st.busy) {
       im.reap_one();

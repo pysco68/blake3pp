@@ -1,9 +1,10 @@
 // file_reader implementation. On Linux this drives io_uring through raw
 // syscalls (three of them: setup, enter, and mmap for the rings), with no
-// liburing dependency, and every moving part visible. Everything degrades
-// per-feature at runtime: O_DIRECT refused by the filesystem -> buffered
-// reads; io_uring refused (seccomp, old kernel) -> synchronous pread;
-// non-POSIX -> stdio.
+// liburing dependency, and every moving part visible. On macOS the async
+// engine is GCD (positional preads on the global pool, F_NOCACHE for the
+// cache bypass; see darwin_impl.hpp). Everything degrades per-feature at
+// runtime: O_DIRECT refused by the filesystem -> buffered reads; io_uring
+// refused (seccomp, old kernel) -> synchronous pread; non-POSIX -> stdio.
 
 #include <blake3pp/detail/file_reader.hpp>
 
@@ -16,6 +17,7 @@
 
 #include <blake3pp/core.hpp>  // chunk_size
 
+#include "io/darwin_impl.hpp"
 #include "io/iocp_impl.hpp"
 #include "io/uring_impl.hpp"
 
@@ -49,6 +51,9 @@ struct file_reader::impl {
     bool assigned = false;
     bool ready = false;  // data complete, awaiting delivery
     bool held = false;   // delivered, not yet released
+#if defined(BLAKE3PP_IO_GCD)
+    int error = 0;  // errno captured by the GCD worker; thrown at delivery
+#endif
   };
   std::vector<slot_state> slots;
 
@@ -70,6 +75,15 @@ struct file_reader::impl {
 #if defined(BLAKE3PP_IO_URING)
   uring ring;
   bool use_uring = false;
+#endif
+#if defined(BLAKE3PP_IO_GCD)
+  struct gcd_task {
+    impl* self;
+    unsigned slot;
+  };
+  std::vector<gcd_task> tasks;  // one per slot, fixed at construction
+  io_impl::gcd_pump pump;
+  bool use_gcd = false;
 #endif
 
   std::size_t window_len(std::uint64_t w) const noexcept {
@@ -96,7 +110,16 @@ struct file_reader::impl {
     st.assigned = true;
     st.ready = false;
     st.held = false;
-#if defined(BLAKE3PP_IO_URING)
+#if defined(BLAKE3PP_IO_GCD)
+    st.error = 0;
+    if (use_gcd) {
+      // Every window, the unaligned tail included, takes the async
+      // path: F_NOCACHE has no alignment contract, the kernel just serves
+      // unaligned edges through the cache.
+      pump.submit(&impl::run_read, &tasks[s]);
+      return;
+    }
+#elif defined(BLAKE3PP_IO_URING)
     if (use_uring && alignable(st.win)) {
       ring.submit_rw(IORING_OP_READ, fd, buf(s),
                      static_cast<unsigned>(st.target), st.win * window, s);
@@ -189,6 +212,56 @@ struct file_reader::impl {
     st.filled = st.target;
     st.ready = true;
   }
+
+#if defined(BLAKE3PP_IO_GCD)
+  // Runs on a GCD worker: fills the slot's buffer with one positional
+  // read loop, then publishes completion under the pump lock. noexcept:
+  // errors travel through slot_state::error to the delivering thread.
+  static void run_read(void* ctx) noexcept {
+    const gcd_task t = *static_cast<gcd_task*>(ctx);
+    impl& im = *t.self;
+    slot_state& st = im.slots[t.slot];
+    int err = 0;
+    std::size_t got = 0;
+    while (got < st.target) {
+      const ssize_t n =
+          ::pread(im.fd, im.buf(t.slot) + got, st.target - got,
+                  static_cast<off_t>(st.win * im.window + got));
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        err = errno;
+        break;
+      }
+      if (n == 0) {
+        err = EIO;  // unexpected EOF
+        break;
+      }
+      got += static_cast<std::size_t>(n);
+    }
+    {
+      const std::lock_guard<std::mutex> lk(im.pump.m);
+      st.filled = got;
+      st.error = err;
+      st.ready = true;
+    }
+    im.pump.cv.notify_all();
+  }
+
+  // Blocks until slot s completes; throws the worker's deferred errno.
+  // ready/error are written under the pump lock, so the whole check lives
+  // here rather than in next()'s unlocked fast path.
+  void wait_async(unsigned s) {
+    slot_state& st = slots[s];
+    std::unique_lock<std::mutex> lk(pump.m);
+    pump.cv.wait(lk, [&] { return st.ready; });
+    if (st.error != 0) {
+      throw std::system_error(st.error, std::generic_category(),
+                              "gcd pread");
+    }
+  }
+#endif
 
 #if defined(BLAKE3PP_IO_URING)
   // Reaps completions (issuing continuations for short reads) until the
@@ -298,8 +371,26 @@ file_reader::file_reader(const std::filesystem::path& fspath,
       im.direct = true;
     }
   }
+#elif defined(BLAKE3PP_IO_GCD)
+  // Darwin's cache bypass is per-fd, not per-open, and tolerates any
+  // alignment, so one fd serves every window, tail included.
+  if (opts.direct_io && io_impl::set_nocache(im.fd_plain)) {
+    im.direct = true;
+  }
 #endif
+#if defined(BLAKE3PP_IO_GCD)
+  im.backend_name = im.direct ? "pread+nocache" : "pread";
+  if (opts.async && im.pump.init()) {
+    im.use_gcd = true;
+    im.tasks.resize(im.qd);
+    for (unsigned s = 0; s < im.qd; ++s) {
+      im.tasks[s] = {&im, s};
+    }
+    im.backend_name = im.direct ? "gcd+nocache" : "gcd";
+  }
+#else
   im.backend_name = im.direct ? "pread+direct" : "pread";
+#endif
 #if defined(BLAKE3PP_IO_URING)
   if (opts.async && im.ring.init(2 * im.qd)) {
     im.use_uring = true;
@@ -390,6 +481,11 @@ file_reader::file_reader(const std::filesystem::path& fspath,
 
 file_reader::~file_reader() {
   impl& im = *impl_;
+#if defined(BLAKE3PP_IO_GCD)
+  // In-flight workers write into the buffer pool: wait them out before
+  // the pool is freed; the GCD flavor of the IOCP cancel-and-drain rule.
+  im.pump.destroy();
+#endif
 #if defined(BLAKE3PP_IO_URING)
   im.ring.destroy();
 #endif
@@ -397,7 +493,9 @@ file_reader::~file_reader() {
     ::operator delete(im.pool, std::align_val_t{direct_align});
   }
 #if defined(BLAKE3PP_IO_POSIX)
-  if (im.direct && im.fd >= 0) {
+  // fd is a second, separately-opened fd only when the O_DIRECT reopen
+  // engaged; on Darwin (F_NOCACHE on the one fd) they are the same.
+  if (im.fd != im.fd_plain && im.fd >= 0) {
     ::close(im.fd);
   }
   if (im.fd_plain >= 0) {
@@ -455,6 +553,16 @@ std::optional<file_reader::window> file_reader::next() {
     }
   }
   impl::slot_state& st = im.slots[s];
+#if defined(BLAKE3PP_IO_GCD)
+  // GCD workers publish ready under the pump lock, so even the "is it
+  // done already" check belongs inside wait_async: an unlocked peek at
+  // st.ready here would be a data race.
+  if (im.use_gcd) {
+    im.wait_async(s);
+  } else if (!st.ready) {
+    im.read_sync(s);
+  }
+#else
   if (!st.ready) {
 #if defined(BLAKE3PP_IO_URING)
     if (im.use_uring && im.alignable(want)) {
@@ -472,6 +580,7 @@ std::optional<file_reader::window> file_reader::next() {
     im.read_sync(s);
 #endif
   }
+#endif
   st.held = true;
   im.next_deliver++;
   return window{im.buf(s), st.target, want * im.window,

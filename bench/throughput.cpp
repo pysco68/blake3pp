@@ -20,6 +20,9 @@
 #include <blake3pp/blake3pp.hpp>
 #include <blake3pp/parallel.hpp>
 
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
+#include <exec/libdispatch_queue.hpp>
+#endif
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
 #include <blake3.h>
@@ -252,6 +255,34 @@ int main(int argc, char** argv) {
                 gib_s, d.to_hex().substr(0, 16).c_str(),
                 blake3pp::execution_provider().data(), nthreads);
   }
+
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
+  // The identical sender pipeline on Apple's platform runtime: stdexec's
+  // libdispatch scheduler submits the bulk work to GCD's global pool
+  // (QoS-placed across P/E cores by the OS) instead of a process-owned
+  // thread pool. Same engine, different scheduler argument; compare with
+  // the parallel row above.
+  {
+    cooldown();
+    exec::libdispatch_queue queue;
+    auto sched = queue.get_scheduler();
+    blake3pp::digest d{};
+    double best_s = 1e100;
+    for (int r = 0; r < reps + 1; ++r) {
+      const auto t0 = std::chrono::steady_clock::now();
+      d = blake3pp::hash(std::span<const std::byte>{input}, sched);
+      const auto t1 = std::chrono::steady_clock::now();
+      const double s = std::chrono::duration<double>(t1 - t0).count();
+      if (r > 0 && s < best_s) {
+        best_s = s;
+      }
+    }
+    const double gib_s =
+        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
+    std::printf("%-8s %8.2f GiB/s   (%s...)  [stdexec on GCD]\n", "gcd-par",
+                gib_s, d.to_hex().substr(0, 16).c_str());
+  }
+#endif
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
   // Baseline: the official C library with its hand-written assembly kernels,

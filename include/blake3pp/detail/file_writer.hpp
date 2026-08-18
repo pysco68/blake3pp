@@ -9,6 +9,8 @@
 //   Windows: IOCP + FILE_FLAG_NO_BUFFERING, preallocation via
 //           SetEndOfFile + best-effort SetFileValidData (waives NTFS's
 //           synchronous zero-fill to the valid-data length)
+//   macOS:  GCD (libdispatch pool) + F_NOCACHE, preallocation via
+//           F_PREALLOCATE + ftruncate
 //   POSIX:  synchronous pwrite
 //   other:  buffered stdio
 //
@@ -79,7 +81,7 @@ class file_writer {
   [[nodiscard]] std::uint64_t bytes_written() const noexcept;
 
   // Which mechanism was actually engaged, e.g. "io_uring+direct",
-  // "iocp+direct+vdl", "pwrite", "writefile", "stdio".
+  // "iocp+direct+vdl", "gcd+nocache", "pwrite", "writefile", "stdio".
   [[nodiscard]] const char* backend() const noexcept;
 
  private:

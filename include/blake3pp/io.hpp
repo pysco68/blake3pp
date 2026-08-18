@@ -2,11 +2,12 @@
 
 /// @file
 /// File hashing at storage speed: the windowed pipeline that joins the
-/// file_reader (io_uring + O_DIRECT where the platform allows) to the
-/// compute engine. While window i is being hashed, windows i+1..i+depth-1
-/// are already streaming in; the queue-depth buffer ring is the
-/// backpressure mechanism, so the pipeline never allocates past setup and
-/// never lets the device idle waiting for compute (or vice versa).
+/// file_reader (io_uring + O_DIRECT, IOCP + NO_BUFFERING, or GCD +
+/// F_NOCACHE, whatever the platform allows) to the compute engine. While
+/// window i is being hashed, windows i+1..i+depth-1 are already streaming
+/// in; the queue-depth buffer ring is the backpressure mechanism, so the
+/// pipeline never allocates past setup and never lets the device idle
+/// waiting for compute (or vice versa).
 ///
 /// Every full window is a power-of-2, subtree-aligned run of chunks, so its
 /// chaining values drop into the hasher through the same push_subtree_cv

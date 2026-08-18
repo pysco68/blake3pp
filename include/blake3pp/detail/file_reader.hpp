@@ -8,6 +8,9 @@
 //           no io_uring -> synchronous pread)
 //   Windows: IOCP + FILE_FLAG_NO_BUFFERING (async, page-cache-bypassing)
 //           with the same per-feature fallback (no port -> sync ReadFile)
+//   macOS:  GCD (libdispatch pool) + F_NOCACHE (async, page-cache-
+//           bypassing for uncached data; already-cached pages still come
+//           from RAM) with the same fallback (no async -> sync pread)
 //   POSIX:  synchronous pread
 //   other:  buffered stdio
 //
@@ -65,7 +68,7 @@ class file_reader {
   void release(const window& w) noexcept;
 
   // Which mechanism was actually engaged, e.g. "io_uring+direct",
-  // "iocp+direct", "pread", "readfile", "stdio".
+  // "iocp+direct", "gcd+nocache", "pread", "readfile", "stdio".
   [[nodiscard]] const char* backend() const noexcept;
 
  private:

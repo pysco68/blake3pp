@@ -179,11 +179,15 @@ if(BLAKE3PP_TOOL_MIMALLOC)
   # arm64 unless MI_NO_OPT_ARCH is set (priority over MI_OPT_ARCH).
   # @ONLY substitutes the @...@ slot here; the ${...} survive verbatim and
   # expand in the proxy toolchain, not at this configure.
+  # MI_INSTALL_TOPLEVEL: install to <prefix>/lib and <prefix>/include
+  # instead of versioned subdirs, so the mimalloc.o path below does not
+  # encode the mimalloc version.
   string(CONFIGURE [=[
     set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
     set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
+    set(MI_INSTALL_TOPLEVEL ON CACHE BOOL "" FORCE)
     @_mi_date_time_flag@
   ]=] _mi_toolchain_extension @ONLY)
   FetchContent_Declare(mimalloc
@@ -191,8 +195,23 @@ if(BLAKE3PP_TOOL_MIMALLOC)
     GIT_TAG acf2fdd329f9dc2a7ffe3f12a133fe7175e39378) # v3.4.5
   FetchContent_MakeHermetic(mimalloc
     HERMETIC_BUILD_SYSTEM cmake
-    HERMETIC_TOOLCHAIN_EXTENSION "${_mi_toolchain_extension}")
+    HERMETIC_TOOLCHAIN_EXTENSION "${_mi_toolchain_extension}"
+    # mimalloc names its install(EXPORT) set plain "mimalloc", so the
+    # generated export file is mimalloc.cmake, invisible to hfc's
+    # default ([Tt]argets|[Ee]xport(s))\.cmake discovery, which is what
+    # used to force the add_subdirectory fallback. With the pattern,
+    # mimalloc-static imports hermetically like every other dependency.
+    # (Deliberately NOT matching the per-config mimalloc-*.cmake files:
+    # the base export file includes them itself.)
+    HERMETIC_DISCOVER_TARGETS_FILE_PATTERN [[/mimalloc\.cmake$]])
   HermeticFetchContent_MakeAvailableAtBuildTime(mimalloc)
+  # Tripwire: the hermetic import creates only the IMPORTED
+  # mimalloc-static. A real mimalloc-obj target can only mean discovery
+  # failed and hfc fell back to add_subdirectory into THIS project,
+  # which builds mimalloc's shared lib and tests with root flags and
+  # (through hfc's extension-drop bug on that path) without the MI_*
+  # settings above. Fail loudly instead of shipping that silently.
+
   if(WIN32)
     # Full malloc override on Windows needs the mimalloc-redirect DLL
     # pair next to every exe (their docs: static malloc override is not
@@ -208,11 +227,27 @@ if(BLAKE3PP_TOOL_MIMALLOC)
       target_link_libraries(${target} PRIVATE mimalloc-static)
     endfunction()
   else()
-    # POSIX: the object-library form statically overrides malloc/free and
-    # new/delete wholesale; its definitions enter the link before libc's.
+    # POSIX: the single combined object file statically overrides
+    # malloc/free and new/delete wholesale; its definitions enter the
+    # link before libc's (macOS strictly needs the .o: the interpose/zone
+    # override objects are referenced by nothing, so an archive would
+    # never pull them in). The mimalloc-obj OBJECT library itself cannot
+    # cross the hermetic boundary (hfc target caches cannot represent
+    # OBJECT libraries; mimalloc's own install(TARGETS mimalloc-obj
+    # EXPORT) is commented out upstream for similar reasons), but
+    # mimalloc installs the combined mimalloc.o as a plain file precisely
+    # for this use case, so we link that.
+    #
+    # The .o goes in via target_link_options, NOT target_link_libraries:
+    # link options are not dependency-tracked, so ninja does not demand a
+    # producing rule for a file only the hermetic install step creates.
+    # Ordering and relinking ride on mimalloc-static, whose imported
+    # location IS a registered byproduct of that same install step.
+    set(_mi_objfile
+      "${HERMETIC_FETCHCONTENT_INSTALL_DIR}/mimalloc-install/lib/mimalloc.o")
     function(blake3pp_tool_allocator target)
-      target_sources(${target} PRIVATE $<TARGET_OBJECTS:mimalloc-obj>)
-      target_link_libraries(${target} PRIVATE mimalloc-obj)
+      target_link_options(${target} PRIVATE "${_mi_objfile}")
+      target_link_libraries(${target} PRIVATE mimalloc-static)
     endfunction()
   endif()
 else()

@@ -4,6 +4,10 @@
 #include <blake3pp/parallel.hpp>
 #include <doctest/doctest.h>
 
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
+#include <exec/libdispatch_queue.hpp>
+#endif
+
 namespace {
 
 std::vector<std::byte> make_input(std::size_t len) {
@@ -102,6 +106,29 @@ TEST_CASE("parallel hash is deterministic across runs") {
     CHECK(blake3pp::hash(input, sched) == first);
   }
 }
+
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
+// The scheduler-parameterized design meeting the platform's native
+// runtime: stdexec's libdispatch scheduler submits the same bulk work to
+// GCD's global pool instead of a thread pool the process owns. Nothing in
+// the engine knows the difference, which is the point.
+TEST_CASE("GCD (libdispatch) scheduler drives the engine unchanged") {
+  exec::libdispatch_queue queue;
+  auto sched = queue.get_scheduler();
+
+  for (const std::size_t len :
+       {std::size_t{1024 * 1024}, std::size_t{8 * 1024 * 1024 + 7}}) {
+    CAPTURE(len);
+    const auto input = make_input(len);
+    CHECK(blake3pp::hash(input, sched) == blake3pp::hash(input));
+  }
+
+  blake3pp::parallel_hasher ph{sched, {.window_bytes = 512 * 1024}};
+  const auto input = make_input(3 * 1024 * 1024 + 41);
+  ph.update(input);
+  CHECK(ph.finalize() == blake3pp::hash(input));
+}
+#endif
 
 }  // TEST_SUITE
 

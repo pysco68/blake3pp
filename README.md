@@ -257,8 +257,9 @@ blake3pp::parallel_hasher tuned{blake3pp::get_parallel_scheduler(),
 
 `hash_file()` streams the file through fixed windows using the fastest
 OS-native mechanism (io_uring + `O_DIRECT` on Linux, IOCP +
-`FILE_FLAG_NO_BUFFERING` on Windows), bypassing the page cache and
-overlapping reads with hashing; it degrades gracefully per feature
+`FILE_FLAG_NO_BUFFERING` on Windows, GCD/libdispatch + `F_NOCACHE` on
+macOS), bypassing the page cache and overlapping reads with hashing; it
+degrades gracefully per feature
 (no direct I/O -> buffered async -> plain synchronous reads -> stdio). Paths are
 `std::filesystem::path`; every entry point has a throwing form and a
 `std::error_code` form, mirroring the standard library:
@@ -315,8 +316,9 @@ costs the same as offset 0. Generation runs lanes-parallel in the kernel
 (~3.8 GiB/s per core) and `--threads` fans segments across cores via the
 O(1) seek (13+ GiB/s), so the sink is the bottleneck; `--output`
 removes even that overhead, writing through io_uring + O_DIRECT on
-Linux or IOCP + no-buffering on Windows with the stream generated
-straight into the write buffers, bypassing the page cache entirely:
+Linux, IOCP + no-buffering on Windows or GCD + F_NOCACHE on macOS with
+the stream generated straight into the write buffers, bypassing the page
+cache entirely:
 
 ```bash
 blake3ppgen --seed run42 --length 1G > testdata.bin
@@ -362,8 +364,11 @@ ctest --preset linux-gcc16-cxx26
 Any name from `cmake/toolchains/` works as a preset (see
 `CMakePresets-toolchains.json`); test presets exist for `linux-gcc16-cxx26`,
 `linux-clang22-cxx26`, `linux-clang18-cxx20-libstdcxx` (the C++20 polyfill path), and the
-two `-asan` variants. Without a preset, a bare `cmake -S . -B build`
-configures the C++20 baseline with the default compiler.
+two `-asan` variants. On a Mac, `macos-appleclang-cxx23` is the native
+preset (Apple clang, GCD + F_NOCACHE I/O) and `macos-clang22-cxx26`
+builds with Homebrew LLVM 22 against its bundled libc++ (`brew install
+llvm`). Without a preset, a bare `cmake -S . -B build` configures the
+C++20 baseline with the default compiler.
 
 The devcontainer carries only the default gcc/clang pair; every other preset
 runs inside its per-compiler toolchain image via `tools/tc <preset>`;
