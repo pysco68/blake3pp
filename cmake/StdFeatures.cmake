@@ -115,19 +115,23 @@ message(STATUS "blake3pp: execution provider = ${_blake3pp_execution_provider} "
 
 # stdexec is needed by the stdexec provider AND by the beman bridge backend
 # (which drives beman's parallel_scheduler with stdexec's pool until beman
-# ships a default backend). Header-only use: SOURCE_SUBDIR points at
-# include/, which has no CMakeLists.txt, so FetchContent populates without
-# configuring stdexec's own build (which would pull rapids-cmake from the
-# network).
+# ships a default backend).
+#
+# It is also the one INTERLOCKED (populate-only) hfc content, by policy: its
+# upstream CMake pulls rapids-cmake from the network at configure time, so
+# it must never be configured. SOURCE_SUBDIR points at include/, which has
+# no CMakeLists, so hfc populates the shared source cache (cross-process
+# locked via goldilock) and stops; the INTERFACE target below is the sole
+# consumer surface. Every other dependency is a classic hermetic content.
 macro(_blake3pp_fetch_stdexec)
   if(NOT TARGET blake3pp_stdexec)
     include(FetchContent)
     FetchContent_Declare(stdexec
-      URL https://github.com/NVIDIA/stdexec/archive/refs/tags/nvhpc-26.05.tar.gz
-      URL_HASH SHA256=9d2396fecd604698c1eae58f0cb6e4517aa727013846240d1a7b2f35e49884dc
-      DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-      SOURCE_SUBDIR include)
-    FetchContent_MakeAvailable(stdexec)
+      GIT_REPOSITORY https://github.com/NVIDIA/stdexec.git
+      GIT_TAG 6d7ad689f4d4831c5136e4abe1c601f9a3b64e43 # nvhpc-26.05
+      SOURCE_SUBDIR include
+      BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/stdexec-build")
+    hfc_FetchContent_MakeAvailable_interlocked(stdexec)
     find_package(Threads REQUIRED)
     add_library(blake3pp_stdexec INTERFACE)
     target_include_directories(blake3pp_stdexec SYSTEM INTERFACE
@@ -146,40 +150,37 @@ if(_blake3pp_execution_provider STREQUAL "std")
     BLAKE3PP_EXECUTION_STD=1)
 
 elseif(_blake3pp_execution_provider STREQUAL "beman")
-  # Pinned commit: beman has no tagged releases yet. Includes P2079R10
-  # parallel_scheduler (merged 2026-07-12). Header-only via the same
-  # SOURCE_SUBDIR trick as stdexec.
-  include(FetchContent)
-  FetchContent_Declare(beman_execution
-    URL https://github.com/bemanproject/execution/archive/cc721c44496bc4b5ae63ad4ea47fe965818e52ae.tar.gz
-    URL_HASH SHA256=52fdd1bda869add63fb29e71c70976c1484aca41ccbf247d5f52d2758965e9bd
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SOURCE_SUBDIR include)
-  FetchContent_MakeAvailable(beman_execution)
-  if(NOT DEFINED CACHE{BLAKE3PP_BEMAN_USABLE})
-    set(_bp_src "${CMAKE_BINARY_DIR}/CMakeFiles/blake3pp_probes/BLAKE3PP_BEMAN_USABLE.cpp")
-    file(WRITE "${_bp_src}" [[
-#include <beman/execution/execution.hpp>
-int main() {
-  auto s = beman::execution::just(42);
-  (void)s;
-}
-]])
-    try_compile(BLAKE3PP_BEMAN_USABLE SOURCES "${_bp_src}"
-      CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${beman_execution_SOURCE_DIR}/include")
-  endif()
-  if(NOT BLAKE3PP_BEMAN_USABLE)
+  if(DEFINED CMAKE_CXX_STANDARD AND CMAKE_CXX_STANDARD LESS 23)
     message(FATAL_ERROR "blake3pp: BLAKE3PP_EXECUTION_PROVIDER=beman, but "
-      "beman.execution does not compile under this toolchain/standard "
-      "(it requires C++23 or newer; this project's cxx20 presets cannot "
-      "use it)")
+      "beman.execution requires C++23 or newer; this project's cxx20 "
+      "presets cannot use it")
   endif()
-  find_package(Threads REQUIRED)
-  add_library(blake3pp_beman INTERFACE)
-  target_include_directories(blake3pp_beman SYSTEM INTERFACE
-    "${beman_execution_SOURCE_DIR}/include")
-  target_link_libraries(blake3pp_beman INTERFACE Threads::Threads)
-  target_link_libraries(blake3pp_features INTERFACE blake3pp_beman)
+  # Pinned commit: beman has no tagged releases yet. Includes P2079R10
+  # parallel_scheduler (merged 2026-07-12). Classic hermetic content:
+  # header-only, so the "build" is just the header/config install.
+  FetchContent_Declare(beman_execution
+    GIT_REPOSITORY https://github.com/bemanproject/execution.git
+    GIT_TAG cc721c44496bc4b5ae63ad4ea47fe965818e52ae)
+  FetchContent_MakeHermetic(beman_execution
+    HERMETIC_BUILD_SYSTEM cmake
+    HERMETIC_TOOLCHAIN_EXTENSION [=[
+      set(BEMAN_USE_MODULES OFF CACHE BOOL "" FORCE)
+      # beman gates its (large, occasionally non-compiling) test suite on
+      # its own option, not BUILD_TESTING; hermetic makes it top-level,
+      # which would default the tests on.
+      set(BEMAN_EXECUTION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+      set(BEMAN_EXECUTION_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+      set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    ]=])
+  HermeticFetchContent_MakeAvailableAtBuildTime(beman_execution)
+  target_link_libraries(blake3pp_features INTERFACE beman::execution)
+  # TODO(upstream hfc): beman's install export carries its include dirs only
+  # via HEADERS file sets on CMake >= 3.23 (INTERFACE_HEADER_SETS /
+  # BASE_DIRS), which hfc's target discovery doesn't fold into
+  # INTERFACE_INCLUDE_DIRECTORIES yet, so the reconstructed beman::execution
+  # arrives include-less. Bridge it explicitly until hfc learns file sets.
+  target_include_directories(blake3pp_features SYSTEM INTERFACE
+    "${HERMETIC_FETCHCONTENT_INSTALL_DIR}/beman_execution-install/include")
   target_compile_definitions(blake3pp_features INTERFACE
     BLAKE3PP_EXECUTION_BEMAN=1)
   _blake3pp_fetch_stdexec()  # engine room for blake3pp::beman_backend
@@ -194,13 +195,11 @@ endif()
 # Last resort: xsimd (header-only, imported as SYSTEM so its headers stay
 # outside our warning net).
 if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
-  include(FetchContent)
   FetchContent_Declare(xsimd
-    URL https://github.com/xtensor-stack/xsimd/archive/refs/tags/14.3.0.tar.gz
-    URL_HASH SHA256=b3d50e7a73fbf4642ceef30131c93414901d69eee41c2a5302db650b03e2c792
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SYSTEM)
-  FetchContent_MakeAvailable(xsimd)
+    GIT_REPOSITORY https://github.com/xtensor-stack/xsimd.git
+    GIT_TAG e88a72831858123924f7118f345dfe5d70d95991) # 14.3.0
+  FetchContent_MakeHermetic(xsimd HERMETIC_BUILD_SYSTEM cmake)
+  HermeticFetchContent_MakeAvailableAtBuildTime(xsimd)
   target_link_libraries(blake3pp_features INTERFACE xsimd)
   target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XSIMD=1)
 endif()

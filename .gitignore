@@ -3,3 +3,4 @@ build/
 compile_commands.json
 blake3pp-bin.zip
 release/
+/thirdparty/

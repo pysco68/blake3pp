@@ -11,17 +11,19 @@ if(NOT BLAKE3PP_CLI_HAS_FORMAT)
 endif()
 
 # CLI11 for argument parsing: robust, pinned.
-include(FetchContent)
 FetchContent_Declare(cli11
-  URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.7.2.tar.gz
-  URL_HASH SHA256=46eef3101da70852ec7af026e09d485ccee81813331c8c6052d39344443b83da
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-  SYSTEM)
-set(CLI11_PRECOMPILED ON CACHE BOOL "" FORCE) # Oo measured 2.4x faster recompiles of main.cpp (32.7s -> 13.4s).
-set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(CLI11_INSTALL OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(cli11)
+  GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+  GIT_TAG cbd58a3696887b34c70949aef21a71735a0c2ad5) # v2.7.2
+FetchContent_MakeHermetic(cli11
+  HERMETIC_BUILD_SYSTEM cmake
+  HERMETIC_TOOLCHAIN_EXTENSION [=[
+    # PRECOMPILED: measured 2.4x faster recompiles of main.cpp (32.7s -> 13.4s).
+    set(CLI11_PRECOMPILED ON CACHE BOOL "" FORCE)
+    set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(CLI11_INSTALL ON CACHE BOOL "" FORCE)
+  ]=])
+HermeticFetchContent_MakeAvailableAtBuildTime(cli11)
 
 add_executable(blake3ppsum sum.cpp)
 blake3pp_tool_allocator(blake3ppsum)

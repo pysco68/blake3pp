@@ -30,14 +30,12 @@ if(BLAKE3PP_BENCH_UPSTREAM)
   # languages here (rather than letting its nested project() try) keeps
   # compiler-feature detection in a scope CMake handles reliably.
   enable_language(C ASM)
-  include(FetchContent)
   FetchContent_Declare(blake3_upstream
-    URL https://github.com/BLAKE3-team/BLAKE3/archive/refs/tags/1.8.6.tar.gz
-    URL_HASH SHA256=da7b5b0b6cf7106fe54b7d718d1ea371cce434cd15ebe5e56ca011b645cbef0e
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SOURCE_SUBDIR c
-    SYSTEM)
-  FetchContent_MakeAvailable(blake3_upstream)
+    GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
+    GIT_TAG 77b257eee7da5cd608eaf6be8343d3a4c9776af2 # 1.8.6
+    SOURCE_SUBDIR c)
+  FetchContent_MakeHermetic(blake3_upstream HERMETIC_BUILD_SYSTEM cmake)
+  HermeticFetchContent_MakeAvailableAtBuildTime(blake3_upstream)
   target_link_libraries(blake3pp_bench PRIVATE BLAKE3::blake3)
   target_compile_definitions(blake3pp_bench PRIVATE BLAKE3PP_BENCH_UPSTREAM=1)
 endif()

@@ -1,15 +1,17 @@
 # doctest: a single-header framework with no dependency tree. Still built
 # from source with the project's own toolchain flags rather than a system
-# package: the matrix includes libc++ builds.
-include(FetchContent)
+# package: the matrix includes libc++ builds. AtConfigureTime because the
+# doctest_discover_tests() cmake module (installed into the config dir) is
+# include()d below, at configure.
 FetchContent_Declare(doctest
-  URL https://github.com/doctest/doctest/archive/refs/tags/v2.4.12.tar.gz
-  URL_HASH SHA256=73381c7aa4dee704bd935609668cf41880ea7f19fa0504a200e13b74999c2d70
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-  SYSTEM)
-set(DOCTEST_NO_INSTALL ON CACHE BOOL "" FORCE)
-set(DOCTEST_WITH_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(doctest)
+  GIT_REPOSITORY https://github.com/doctest/doctest.git
+  GIT_TAG 1da23a3e8119ec5cce4f9388e91b065e20bf06f5) # v2.4.12
+FetchContent_MakeHermetic(doctest
+  HERMETIC_BUILD_SYSTEM cmake
+  HERMETIC_TOOLCHAIN_EXTENSION [=[
+    set(DOCTEST_WITH_TESTS OFF CACHE BOOL "" FORCE)
+  ]=])
+HermeticFetchContent_MakeAvailableAtConfigureTime(doctest)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -41,7 +43,9 @@ target_link_libraries(blake3pp_tests PRIVATE
   blake3pp_warnings
   doctest::doctest)
 
-list(APPEND CMAKE_MODULE_PATH "${doctest_SOURCE_DIR}/scripts/cmake")
+list(APPEND CMAKE_MODULE_PATH
+  "${HERMETIC_FETCHCONTENT_INSTALL_DIR}/doctest-install/lib/cmake/doctest"
+  "${HERMETIC_FETCHCONTENT_INSTALL_DIR}/doctest-install/lib64/cmake/doctest")
 include(doctest)
 if(EMSCRIPTEN)
   # Per-case discovery parses --list-test-cases output; under node,

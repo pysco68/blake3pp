@@ -43,6 +43,29 @@ if(BLAKE3PP_TOOL_MIMALLOC AND CMAKE_CXX_FLAGS MATCHES "-fsanitize")
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
+# --- Hermetic FetchContent (tipi-build/hfc) ----------------------------------
+# Shared, content-hash-keyed source cache + isolated per-dependency builds.
+# Everything under thirdparty/ is disposable cache (gitignored): one
+# population serves every preset build dir and toolchain container, and CI
+# caches the whole directory. Pinned by commit, per hfc's own advice.
+include(FetchContent)
+FetchContent_Populate(hfc
+  GIT_REPOSITORY https://github.com/tipi-build/hfc.git
+  # Carries the SOURCE_SUBDIR precedence fix for
+  # hfc_FetchContent_MakeAvailable_interlocked (PR pending upstream; the
+  # commit is reachable on the main repo). Re-pin to a mainline commit once
+  # the PR merges.
+  GIT_TAG c7a35602231b516b64c4dc2118ae7bf54eb532e3
+  SOURCE_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/src"
+  SUBBUILD_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/subbuild"
+  BINARY_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/bin"
+)
+FetchContent_GetProperties(hfc)
+list(APPEND CMAKE_MODULE_PATH "${hfc_SOURCE_DIR}/cmake")
+set(HFC_ENABLE_CMAKE_SBOM OFF CACHE BOOL "no SBOM generation for now")
+include(HermeticFetchContent)
+
 include(StdFeatures)
 include(ArchKernels)
 
@@ -53,8 +76,7 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
   # takes the GNU-style set below.
   target_compile_options(blake3pp_warnings INTERFACE /W4)
 else()
-  target_compile_options(blake3pp_warnings INTERFACE
-    -Wall -Wextra -Wconversion -Wshadow)
+  target_compile_options(blake3pp_warnings INTERFACE -Wall -Wextra -Wconversion -Wshadow)
 endif()
 
 add_library(blake3pp STATIC
@@ -141,31 +163,36 @@ if(_blake3pp_execution_provider STREQUAL "beman")
 endif()
 
 if(BLAKE3PP_TOOL_MIMALLOC)
-  include(FetchContent)
-  set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-  set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-  set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
-  # mimalloc's arch tuning passes -march spellings zig's clang rejects at
-  # build time (armv8.1 on aarch64), and it force-enables itself on arm64
-  # unless MI_NO_OPT_ARCH is set (which has priority over MI_OPT_ARCH).
-  set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
-  FetchContent_Declare(mimalloc
-    URL https://github.com/microsoft/mimalloc/archive/refs/tags/v3.4.5.tar.gz
-    URL_HASH SHA256=19a43af0645c57d348e729d5b31e23e912582911bb1047f795790834d3416221
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    SYSTEM)
-  FetchContent_MakeAvailable(mimalloc)
   # zig cc enforces reproducible builds (-Werror,-Wdate-time); mimalloc
   # stamps __DATE__ into its version banner. GNU-style flag: pure cl
-  # rejects the spelling (and has no such warning to silence).
-  if(NOT (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
-          AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"))
-    foreach(mi_target mimalloc-static mimalloc-obj)
-      if(TARGET ${mi_target})
-        target_compile_options(${mi_target} PRIVATE -Wno-date-time)
-      endif()
-    endforeach()
+  # rejects the spelling (and has no such warning to silence). Decided
+  # HERE, where the compiler is known.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
+     AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set(_mi_date_time_flag "")
+  else()
+    set(_mi_date_time_flag
+      [=[set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -Wno-date-time")]=])
   endif()
+  # MI_NO_OPT_ARCH: mimalloc's arch tuning passes -march spellings zig's
+  # clang rejects (armv8.1 on aarch64), and it force-enables itself on
+  # arm64 unless MI_NO_OPT_ARCH is set (priority over MI_OPT_ARCH).
+  # @ONLY substitutes the @...@ slot here; the ${...} survive verbatim and
+  # expand in the proxy toolchain, not at this configure.
+  string(CONFIGURE [=[
+    set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
+    set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
+    @_mi_date_time_flag@
+  ]=] _mi_toolchain_extension @ONLY)
+  FetchContent_Declare(mimalloc
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG acf2fdd329f9dc2a7ffe3f12a133fe7175e39378) # v3.4.5
+  FetchContent_MakeHermetic(mimalloc
+    HERMETIC_BUILD_SYSTEM cmake
+    HERMETIC_TOOLCHAIN_EXTENSION "${_mi_toolchain_extension}")
+  HermeticFetchContent_MakeAvailableAtBuildTime(mimalloc)
   if(WIN32)
     # Full malloc override on Windows needs the mimalloc-redirect DLL
     # pair next to every exe (their docs: static malloc override is not
@@ -179,8 +206,6 @@ if(BLAKE3PP_TOOL_MIMALLOC)
       target_sources(${target} PRIVATE
         "${CMAKE_BINARY_DIR}/blake3pp_generated/mimalloc_newdelete.cpp")
       target_link_libraries(${target} PRIVATE mimalloc-static)
-      target_include_directories(${target} PRIVATE
-        "${mimalloc_SOURCE_DIR}/include")
     endfunction()
   else()
     # POSIX: the object-library form statically overrides malloc/free and
