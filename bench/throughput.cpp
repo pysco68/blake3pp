@@ -39,11 +39,14 @@
 // The reference implementation's kernels, already present in the linked
 // baseline library, wrapped as kernel_ops tables: that plugs them into the
 // blake3pp pipeline (subtree batching, CV stack, parallel engine) through
-// the same seam every portable variant uses. Only the flag argument widths
-// differ (the reference narrows them to uint8_t). Two comparison rows come
-// from this: the portable C kernel (the scalar row's direct counterpart)
-// and the hand-tuned wide kernel: hand-scheduled AVX2 assembly on x86-64,
-// NEON intrinsics on aarch64 (the reference ships no ARM assembly).
+// the same seam every portable variant uses, so each reference row differs
+// from its same-ISA blake3pp twin ONLY in the hash_many kernel. Only the
+// flag argument widths differ (the reference narrows them to uint8_t). The
+// comparison rows come from this: the portable C kernel (the scalar row's
+// direct counterpart) and every hand-tuned wide kernel: hand-scheduled
+// AVX2 and AVX-512 assembly on x86-64 (GAS-built under gcc/clang/clang-cl,
+// MASM under MSVC), NEON intrinsics on aarch64 (the reference ships no ARM
+// assembly).
 extern "C" void blake3_hash_many_portable(
     const std::uint8_t* const* inputs, std::size_t num_inputs,
     std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
@@ -65,9 +68,14 @@ void portable_hash_many(const std::uint8_t* const* inputs,
 }
 }  // namespace
 
-#if defined(__x86_64__) || defined(__aarch64__)
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(_M_X64)
 extern "C" void blake3_hash_many_avx2(
+    const std::uint8_t* const* inputs, std::size_t num_inputs,
+    std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
+    bool increment_counter, std::uint8_t flags, std::uint8_t flags_start,
+    std::uint8_t flags_end, std::uint8_t* out);
+extern "C" void blake3_hash_many_avx512(
     const std::uint8_t* const* inputs, std::size_t num_inputs,
     std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
     bool increment_counter, std::uint8_t flags, std::uint8_t flags_start,
@@ -81,30 +89,45 @@ extern "C" void blake3_hash_many_neon(
 #endif
 
 namespace {
-// Everything that varies by host architecture, decided once: which kernel
-// exists, which of our variants it pairs with, and how the row reads.
-#if defined(__x86_64__)
-constexpr auto upstream_hash_many = &blake3_hash_many_avx2;
-constexpr auto asm_arch = blake3pp::arch::avx2;
-constexpr const char* asm_row = "avx2";
-constexpr const char* asm_note = "hand-written asm";
-#else
-constexpr auto upstream_hash_many = &blake3_hash_many_neon;
-constexpr auto asm_arch = blake3pp::arch::neon;
-constexpr const char* asm_row = "neon";
-constexpr const char* asm_note = "hand-tuned intrinsics";
-#endif
-
+// One forwarding wrapper per reference kernel; the only work is widening
+// the flag arguments back to the blake3pp signature.
+template <auto ReferenceFn>
 void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
                    std::size_t blocks, const std::uint32_t key[8],
                    std::uint64_t counter, bool increment_counter,
                    std::uint32_t flags, std::uint32_t flags_start,
                    std::uint32_t flags_end, std::uint8_t* out) noexcept {
-  upstream_hash_many(inputs, num_inputs, blocks, key, counter,
-                     increment_counter, static_cast<std::uint8_t>(flags),
-                     static_cast<std::uint8_t>(flags_start),
-                     static_cast<std::uint8_t>(flags_end), out);
+  ReferenceFn(inputs, num_inputs, blocks, key, counter, increment_counter,
+              static_cast<std::uint8_t>(flags),
+              static_cast<std::uint8_t>(flags_start),
+              static_cast<std::uint8_t>(flags_end), out);
 }
+
+// Everything that varies by host architecture, decided once: which wide
+// kernels exist, which of our variants each pairs with, and how the rows
+// read. Narrowest first, so the widest AVAILABLE entry (the ISA the
+// reference's own dispatcher would pick) is the last match, and the one
+// the parallel row below reuses.
+struct asm_kernel {
+  blake3pp::arch variant;
+  const char* row;
+  const char* note;
+  decltype(blake3pp::kern::kernel_ops::hash_many) hash_many;
+};
+
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr asm_kernel asm_kernels[] = {
+    {blake3pp::arch::avx2, "avx2", "hand-written asm",
+     &asm_hash_many<&blake3_hash_many_avx2>},
+    {blake3pp::arch::avx512, "avx512", "hand-written asm",
+     &asm_hash_many<&blake3_hash_many_avx512>},
+};
+#else
+constexpr asm_kernel asm_kernels[] = {
+    {blake3pp::arch::neon, "neon", "hand-tuned intrinsics",
+     &asm_hash_many<&blake3_hash_many_neon>},
+};
+#endif
 }  // namespace
 #endif
 #endif
@@ -218,9 +241,12 @@ int main(int argc, char** argv) {
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
   // The reference kernels behind the blake3pp kernel_ops seam: identical
-  // pipeline, only hash_many swapped, so any difference to the section above
-  // is pure kernel codegen. Row labels match the blake3pp rows they pair
-  // with (portable <-> scalar, neon <-> neon, avx2 <-> avx2).
+  // pipeline, only hash_many swapped, so any difference to the section
+  // above is pure kernel codegen. Row labels match the blake3pp rows they
+  // pair with (portable <-> scalar, neon <-> neon, avx2 <-> avx2, avx512
+  // <-> avx512); always compare a reference row against its same-ISA twin,
+  // never against the end-to-end `reference` row, which picks its own
+  // best ISA.
   println(stdout,
           "\nreference impl. kernels in the blake3pp pipeline "
           "(single thread, BLAKE3 {})",
@@ -232,13 +258,21 @@ int main(int argc, char** argv) {
     row("portable", "", [&] { return hash_with(&port_ops); });
   }
 
-#if defined(__x86_64__) || defined(__aarch64__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
+  // One row per wide reference kernel this machine can run. The widest one
+  // is kept for the parallel row further down, the same ISA the reference
+  // dispatcher would have chosen for itself.
   blake3pp::kern::kernel_ops asm_ops{};
-  const bool have_asm = blake3pp::is_available(asm_arch);
-  if (have_asm) {
-    asm_ops = *blake3pp::detail::resolve(asm_arch);
-    asm_ops.hash_many = &asm_hash_many;  // compress_in_place stays portable
-    row(asm_row, asm_note, [&] { return hash_with(&asm_ops); });
+  const char* asm_row = nullptr;
+  for (const auto& k : asm_kernels) {
+    if (!blake3pp::is_available(k.variant)) {
+      continue;
+    }
+    blake3pp::kern::kernel_ops ops = *blake3pp::detail::resolve(k.variant);
+    ops.hash_many = k.hash_many;  // compress_in_place stays portable
+    row(k.row, k.note, [&] { return hash_with(&ops); });
+    asm_ops = ops;
+    asm_row = k.row;
   }
 #endif
 
@@ -284,10 +318,10 @@ int main(int argc, char** argv) {
 #endif
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM) && \
-    (defined(__x86_64__) || defined(__aarch64__))
-  // The reference wide kernel on the same parallel engine: separates kernel
-  // from scheduler in the rows above.
-  if (have_asm) {
+    (defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__))
+  // The widest reference kernel on the same parallel engine: separates
+  // kernel from scheduler in the rows above.
+  if (asm_row != nullptr) {
     auto sched = blake3pp::get_parallel_scheduler();
     row("reference/pool",
         std::format("{} kernel, {} pool", asm_row,
