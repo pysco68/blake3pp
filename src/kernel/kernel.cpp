@@ -413,8 +413,13 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
       if (b == blocks - 1) {
         f |= flags_end;
       }
-      compress_in_place(cv.data(), inputs[i] + b * block_len,
-                        static_cast<std::uint32_t>(block_len), ctr, f);
+      // The inlined compress (not the exported compress_in_place): keeps
+      // the chaining value in registers across the block loop instead of a
+      // call plus CV store/reload round-trip per 64-byte block.
+      std::array<std::uint32_t, 16> wide;
+      compress(cv.data(), inputs[i] + b * block_len,
+               static_cast<std::uint32_t>(block_len), ctr, f, wide);
+      std::copy_n(wide.begin(), 8, cv.begin());
     }
     for (std::size_t w = 0; w < 8; ++w) {
       store32(out + i * out_len + 4 * w, cv[w]);
