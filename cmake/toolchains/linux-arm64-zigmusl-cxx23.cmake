@@ -25,3 +25,11 @@ set(CMAKE_CROSSCOMPILING_EMULATOR "qemu-aarch64")
 # zig 0.16 segfaults on lld's --dependency-file flag, which CMake >= 3.27
 # passes for link-dependency tracking; disable that feature here.
 set(CMAKE_LINK_DEPENDS_USE_LINKER OFF)
+
+# zig identifies as Clang but ships no clang-scan-deps, so CMake's C++20
+# module scanning (on by default for C++20+ with Ninja) dies with a bare
+# exit 127 at the first .ddi rule. The root CMakeLists' OFF only covers
+# the main project; hermetic dependency builds run in their own processes
+# and inherit ONLY this toolchain (via hfc's proxy toolchain), so the
+# switch must live here too.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)

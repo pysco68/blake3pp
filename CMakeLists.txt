@@ -51,12 +51,11 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 # caches the whole directory. Pinned by commit, per hfc's own advice.
 include(FetchContent)
 FetchContent_Populate(hfc
-  GIT_REPOSITORY https://github.com/tipi-build/hfc.git
-  # Carries the SOURCE_SUBDIR precedence fix for
-  # hfc_FetchContent_MakeAvailable_interlocked (PR pending upstream; the
-  # commit is reachable on the main repo). Re-pin to a mainline commit once
-  # the PR merges.
-  GIT_TAG c7a35602231b516b64c4dc2118ae7bf54eb532e3
+  GIT_REPOSITORY https://github.com/pysco68/hfc.git
+  # windows-support branch tip (2026-08-20), rebased to include the
+  # SOURCE_SUBDIR precedence fix the interlocked stdexec population relies
+  # on. Re-pin to a tipi-build/hfc mainline commit once merged upstream.
+  GIT_TAG ce030d44df549cb6d0c8169fd5918c486a3af077
   SOURCE_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/src"
   SUBBUILD_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/subbuild"
   BINARY_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/bin"
