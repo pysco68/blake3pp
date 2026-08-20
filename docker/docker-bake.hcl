@@ -25,7 +25,6 @@ function "tc_tags" {
 # Digest-pinned glibc anchors. Bump deliberately, here only.
 variable "UBUNTU" {
   default = {
-    "2204" = "ubuntu:22.04@sha256:3b06811b2afd352be909dd088a004166d665dc76d38b13eada33522a9d915c6f"
     "2404" = "ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea"
     "2604" = "ubuntu:26.04@sha256:678c6550cc43645e08669028bc177f50be4e7c5b8cca677067b1914d4afc7a03"
   }
@@ -43,7 +42,7 @@ group "default" {
 # can pin the exact digest their cohort was built from.
 target "base" {
   name       = "base-${item.rel}"
-  matrix     = { item = [{ rel = "2204" }, { rel = "2404" }, { rel = "2604" }] }
+  matrix     = { item = [{ rel = "2404" }, { rel = "2604" }] }
   context    = "."
   dockerfile = "docker/base.Dockerfile"
   args = {
@@ -57,7 +56,6 @@ target "base" {
 target "gcc" {
   name = "gcc${item.v}"
   matrix = { item = [
-    { v = "12", rel = "2204" },
     { v = "14", rel = "2404" },
     { v = "16", rel = "2604" },
   ]}

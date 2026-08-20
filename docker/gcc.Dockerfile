@@ -2,7 +2,7 @@
 #
 # GCC toolchain image, parameterized by GCC_VERSION. The "base" build context
 # is wired up by docker-bake.hcl to the per-release base instantiation
-# (gcc12 -> 22.04, gcc14 -> 24.04, gcc16 -> 26.04).
+# (gcc14 -> 24.04, gcc16 -> 26.04).
 #
 # libgcc-N-dev Depends on libasan / libubsan / libtsan / liblsan, so the image
 # gets its matching sanitizer runtimes even with --no-install-recommends.

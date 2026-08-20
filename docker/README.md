@@ -16,7 +16,6 @@ unsupported and unneeded.
 
 | Image | Base | glibc floor | Serves presets | Extras |
 |---|---|---|---|---|
-| `toolchain-gcc12` | 22.04 | 2.35 | `linux-gcc12-*` | |
 | `toolchain-gcc14` | 24.04 | 2.39 | `linux-gcc14-*` | |
 | `toolchain-gcc16` | 26.04 | ~2.42 | `linux-gcc16-*` (incl. asan/tsan/coverage) | gdb, valgrind, lcov/gcovr, Intel SDE |
 | `toolchain-clang18` | 24.04 | 2.39 | `linux-clang18-*` | g++-14 tree for the libstdcxx pin |
@@ -35,7 +34,7 @@ immutable `sha-<short>`. Built and pushed by
 From the (slim) devcontainer, via docker-outside-of-docker:
 
 ```sh
-tools/tc linux-gcc12-cxx20                 # configure + build + ctest
+tools/tc linux-gcc14-cxx23                 # configure + build + ctest
 tools/tc linux-clang22-cxx26-msan          # msan against the baked libc++
 tools/tc linux-zigmusl-cxx23-static -- sh tools/make-release.sh
 tools/tc --shell wasm32-emcc-cxx23
@@ -74,7 +73,7 @@ Version pins (Ubuntu digests, CMake, Ninja, zig, SDE) live at the top of
   into gcc16/clang22. Its license does not clearly permit redistribution,
   which is fine while the GHCR packages stay private; make them public and
   SDE must move to an on-demand download instead.
-- **apt archive lifetimes**: jammy (gcc12) leaves standard support 2027-04;
-  the apt.llvm.org noble-20 pocket can be dropped when LLVM ages it out. If a
+- **apt archive lifetimes**: the apt.llvm.org noble-20 pocket can be dropped
+  when LLVM ages it out. If a
   pocket disappears, move that one image up a distro cohort in
   `docker-bake.hcl` (one line); the glibc floor rises accordingly.

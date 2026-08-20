@@ -19,7 +19,7 @@ REGISTRY="${BLAKE3PP_TC_REGISTRY:-ghcr.io/pysco68/blake3pp}"
 TAG="${BLAKE3PP_TC_TAG:-latest}"
 WORKDIR=/workspaces/blake3pp
 
-ALL_IMAGES=(gcc12 gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 zig emscripten)
+ALL_IMAGES=(gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 zig emscripten)
 
 die() { echo "tc: $*" >&2; exit 1; }
 
@@ -29,7 +29,6 @@ usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
 # tools/gen-toolchains.py is the contract here.
 image_for() {
   case "$1" in
-    linux-gcc12-*)        echo gcc12 ;;
     linux-gcc14-*)        echo gcc14 ;;
     linux-gcc16-*)        echo gcc16 ;;
     linux-clang18-*)      echo clang18 ;;
@@ -87,7 +86,6 @@ case "$1" in
   --list)
     printf '%-38s %s\n' "PRESET PATTERN" "IMAGE"
     printf '%-38s %s\n' \
-      'linux-gcc12-*'       "${REGISTRY}/toolchain-gcc12:${TAG}" \
       'linux-gcc14-*'       "${REGISTRY}/toolchain-gcc14:${TAG}" \
       'linux-gcc16-*'       "${REGISTRY}/toolchain-gcc16:${TAG}" \
       'linux-clang18-*'     "${REGISTRY}/toolchain-clang18:${TAG}" \

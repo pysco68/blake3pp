@@ -1,6 +1,6 @@
 # Build & push the per-compiler toolchain images to GHCR.
 #
-# Two stages: the three per-release base instantiations first, then a 9-way
+# Two stages: the two per-release base instantiations first, then an 8-way
 # fan-out with one runner per toolchain image, each building FROM the exact base
 # digest pushed in this run (the --set contexts.base override below), so all
 # images of a distro cohort share identical base layers even across runners.
@@ -55,7 +55,6 @@ jobs:
         include:
           # Mirrors the {target, rel} table in docker/docker-bake.hcl; a
           # mismatch fails the build loudly.
-          - { target: gcc12,       rel: "2204" }
           - { target: gcc14,       rel: "2404" }
           - { target: gcc16,       rel: "2604" }
           - { target: clang18,     rel: "2404" }

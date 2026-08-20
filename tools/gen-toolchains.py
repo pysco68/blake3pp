@@ -29,23 +29,26 @@ REPO = os.path.dirname(HERE)
 OUTDIR_DEFAULT = os.path.join(REPO, "cmake", "toolchains")
 
 # --- edit these to match your image ----------------------------------------
-GCC_VERSIONS = [12, 14, 16]
+GCC_VERSIONS = [14, 16]
 CLANG_VERSIONS = [18, 20, 22]
 
 # Which standards make sense per compiler. GCC gained -std=c++26 in GCC 14;
 # Clang has spelled it c++2c since 17 (CMake picks the right spelling for you
 # when you use CMAKE_CXX_STANDARD, which is what these files do).
-GCC_STDS = {12: [20, 23], 14: [23, 26], 16: [23, 26]}
+GCC_STDS = {14: [23, 26], 16: [23, 26]}
 CLANG_STDS = {18: [20, 23], 20: [23, 26], 22: [23, 26]}
 
 # The triple normally lives under /usr/lib/gcc/<triple>/<ver>.
 GCC_TRIPLE = "x86_64-linux-gnu"
 
-# Names are <os>-<compiler><ver>-cxx<std>[-variant]; the OS component is the
-# machine the generator runs on, since the emitted files hard-code host paths
-# (compiler names, GCC install dirs) anyway.
-HOST_OS = {"linux": "linux", "darwin": "macos", "win32": "windows"}.get(
-    "linux" if sys.platform.startswith("linux") else sys.platform, sys.platform)
+# Names are <os>-<compiler><ver>-cxx<std>[-variant]. This generator emits the
+# LINUX native-compiler matrix only; the macOS and Windows toolchains are
+# hand-written (Homebrew keg-only libc++ plumbing, vcvars) and say so at the
+# top of each file. So the OS component is a fixed default, NOT the host:
+# sniffing sys.platform meant a run from a Mac silently emitted a macos-*
+# matrix and overwrote those hand-written files. Override with --os only if
+# you are deliberately generating another OS's matrix.
+HOST_OS = "linux"
 
 DEFAULT_GCC = 16
 DEFAULT_CLANG = 22
@@ -207,15 +210,21 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
 
 
 def main() -> int:
+    global HOST_OS
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=OUTDIR_DEFAULT)
+    ap.add_argument("--os", default=HOST_OS,
+                    help="OS component of the generated names "
+                         "(default: %(default)s; the macOS and Windows "
+                         "toolchains are hand-written, not generated)")
     ap.add_argument("--all", action="store_true",
                     help="instrument every compiler/standard combo, not just the newest")
     ap.add_argument("--list", action="store_true", help="print names and exit")
     ap.add_argument("--presets", action="store_true",
                     help="also write CMakePresets-toolchains.json alongside")
     args = ap.parse_args()
+    HOST_OS = args.os
 
     bases = base_configs()
     configs = bases + instrumented(bases, args.all)

@@ -2,26 +2,6 @@
   "version": 6,
   "configurePresets": [
     {
-      "name": "linux-gcc12-cxx20",
-      "displayName": "GCC 12 with libstdc++ 12, C++20",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/linux-gcc12-cxx20",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc12-cxx20.cmake",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-      }
-    },
-    {
-      "name": "linux-gcc12-cxx23",
-      "displayName": "GCC 12 with libstdc++ 12, C++23",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/linux-gcc12-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc12-cxx23.cmake",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-      }
-    },
-    {
       "name": "linux-gcc14-cxx23",
       "displayName": "GCC 14 with libstdc++ 14, C++23",
       "generator": "Ninja",
@@ -223,14 +203,6 @@
     }
   ],
   "buildPresets": [
-    {
-      "name": "linux-gcc12-cxx20",
-      "configurePreset": "linux-gcc12-cxx20"
-    },
-    {
-      "name": "linux-gcc12-cxx23",
-      "configurePreset": "linux-gcc12-cxx23"
-    },
     {
       "name": "linux-gcc14-cxx23",
       "configurePreset": "linux-gcc14-cxx23"
