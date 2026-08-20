@@ -1,43 +1,20 @@
-# The CLI tools use std::format/std::print-style output, a C++20 library
-# feature that trails the language: libstdc++ ships <format> from GCC 13.
-# On older standard libraries the tools are skipped with a notice; the
-# LIBRARY keeps its C++20 floor; only the tools carry this extra floor.
-include(CheckIncludeFileCXX)
-check_include_file_cxx("format" BLAKE3PP_CLI_HAS_FORMAT)
-if(NOT BLAKE3PP_CLI_HAS_FORMAT)
-  message(STATUS
-    "blake3pp: <format> unavailable on this stdlib - CLI tools skipped")
-  return()
-endif()
-
-# CLI11 for argument parsing: robust, pinned.
-FetchContent_Declare(cli11
-  GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
-  GIT_TAG cbd58a3696887b34c70949aef21a71735a0c2ad5) # v2.7.2
-FetchContent_MakeHermetic(cli11
-  HERMETIC_BUILD_SYSTEM cmake
-  HERMETIC_TOOLCHAIN_EXTENSION [=[
-    # PRECOMPILED: measured 2.4x faster recompiles of main.cpp (32.7s -> 13.4s).
-    set(CLI11_PRECOMPILED ON CACHE BOOL "" FORCE)
-    set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(CLI11_INSTALL ON CACHE BOOL "" FORCE)
-  ]=])
-HermeticFetchContent_MakeAvailableAtBuildTime(cli11)
+# The two checksum/generator tools. Everything they share with the
+# benchmarks (CLI11, tooling/tool_common.hpp, the <format> floor) comes
+# from blake3pp::tooling, set up in the top-level CMakeLists.
 
 add_executable(blake3ppsum sum.cpp)
 blake3pp_tool_allocator(blake3ppsum)
 target_link_libraries(blake3ppsum PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
-  CLI11::CLI11)
+  blake3pp::tooling)
 
 add_executable(blake3ppgen gen.cpp)
 blake3pp_tool_allocator(blake3ppgen)
 target_link_libraries(blake3ppgen PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
-  CLI11::CLI11)
+  blake3pp::tooling)
 
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell): known-answer for the empty input via stdin,

@@ -9,7 +9,8 @@ add_executable(blake3pp_bench throughput.cpp)
 blake3pp_tool_allocator(blake3pp_bench)
 target_link_libraries(blake3pp_bench PRIVATE
   blake3pp::blake3pp
-  blake3pp_warnings)
+  blake3pp_warnings
+  blake3pp::tooling)
 # For the asm-plug-in rows: the bench builds a kernel_ops table around
 # upstream's assembly, which needs the internal kernel boundary header.
 target_include_directories(blake3pp_bench PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -18,7 +19,8 @@ add_executable(blake3pp_bench_file file_throughput.cpp)
 blake3pp_tool_allocator(blake3pp_bench_file)
 target_link_libraries(blake3pp_bench_file PRIVATE
   blake3pp::blake3pp
-  blake3pp_warnings)
+  blake3pp_warnings
+  blake3pp::tooling)
 
 if(EMSCRIPTEN)
   # Upstream's build hard-codes x86/ARM SIMD kernels with -m flags the

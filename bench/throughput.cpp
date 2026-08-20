@@ -3,25 +3,29 @@
 // pipeline, the reference implementation end-to-end, and the parallel
 // engine under different schedulers/kernels.
 //
-//   blake3pp_bench [--size <MiB>] [--reps <N>] [--cooldown <s>] [arch ...]
+//   blake3pp_bench [--size MiB] [--reps N] [--cooldown S] [ARCH...]
 //
-// With no arch arguments, measures every variant available on this machine.
+// With no ARCH arguments, measures every variant available on this machine.
 // Reports the best of N repetitions, the interesting number for a
 // throughput ceiling; interference only ever slows a run down. Deliberately
 // framework-free: pair it with hyperfine when process-level statistics are
 // wanted.
 
-#include <chrono>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <map>
+#include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
+#include <CLI/CLI.hpp>
 #include <blake3pp/blake3pp.hpp>
 #include <blake3pp/parallel.hpp>
+
+#include "tool_common.hpp"
 
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
 #include <exec/libdispatch_queue.hpp>
@@ -29,9 +33,7 @@
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
 #include <blake3.h>
-#endif
 
-#if defined(BLAKE3PP_BENCH_UPSTREAM)
 #include "kernel/kernel.hpp"
 
 // The reference implementation's kernels, already present in the linked
@@ -79,10 +81,18 @@ extern "C" void blake3_hash_many_neon(
 #endif
 
 namespace {
+// Everything that varies by host architecture, decided once: which kernel
+// exists, which of our variants it pairs with, and how the row reads.
 #if defined(__x86_64__)
 constexpr auto upstream_hash_many = &blake3_hash_many_avx2;
+constexpr auto asm_arch = blake3pp::arch::avx2;
+constexpr const char* asm_row = "avx2";
+constexpr const char* asm_note = "hand-written asm";
 #else
 constexpr auto upstream_hash_many = &blake3_hash_many_neon;
+constexpr auto asm_arch = blake3pp::arch::neon;
+constexpr const char* asm_row = "neon";
+constexpr const char* asm_note = "hand-tuned intrinsics";
 #endif
 
 void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
@@ -100,15 +110,7 @@ void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
 #endif
 
 namespace {
-
-blake3pp::arch parse_arch(const std::string& name) {
-  if (const auto a = blake3pp::arch_from_string(name); a.has_value()) {
-    return a.value();
-  }
-  std::fprintf(stderr, "unknown arch '%s'\n", name.c_str());
-  std::exit(2);
-}
-
+using b3tool::println;
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -117,18 +119,29 @@ int main(int argc, char** argv) {
   double cooldown_s = 5.0;
   std::vector<blake3pp::arch> arches;
 
-  for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "--size" && i + 1 < argc) {
-      mib = static_cast<std::size_t>(std::strtoull(argv[++i], nullptr, 10));
-    } else if (arg == "--reps" && i + 1 < argc) {
-      reps = std::atoi(argv[++i]);
-    } else if (arg == "--cooldown" && i + 1 < argc) {
-      cooldown_s = std::strtod(argv[++i], nullptr);
-    } else {
-      arches.push_back(parse_arch(arg));
-    }
+  CLI::App app{
+      "Single-thread and parallel BLAKE3 hashing throughput.\n"
+      "With no ARCH, measures every variant available on this machine."};
+  app.add_option("--size", mib, "input size in MiB")
+      ->check(CLI::PositiveNumber)
+      ->capture_default_str();
+  app.add_option("--reps", reps, "timed repetitions (best wins)")
+      ->check(CLI::PositiveNumber)
+      ->capture_default_str();
+  app.add_option("--cooldown", cooldown_s,
+                 "idle seconds between measurements (0 disables)")
+      ->capture_default_str();
+
+  // The name<->enum mapping comes from the library's canonical list; the
+  // bench never re-enumerates the arch enum.
+  std::map<std::string, blake3pp::arch> arch_names;
+  for (const auto a : blake3pp::all_arches()) {
+    arch_names.emplace(blake3pp::to_string(a), a);
   }
+  app.add_option("arch", arches, "SIMD variants to measure")
+      ->transform(CLI::CheckedTransformer(arch_names, CLI::ignore_case));
+  CLI11_PARSE(app, argc, argv);
+
   if (arches.empty()) {
     // Available variants, printed worst-to-best so the table reads as an
     // ascending progression.
@@ -141,52 +154,47 @@ int main(int argc, char** argv) {
     input[i] = static_cast<std::byte>(i % 251);
   }
 
-  std::printf("blake3pp throughput, %zu MiB, best of %d, %.0fs cooldown\n",
-              mib, reps, cooldown_s);
-  std::printf("auto resolves to: %s\n\n",
-              blake3pp::to_string(blake3pp::best_available()));
+  println(stdout, "blake3pp throughput, {} MiB, best of {}, {:.0f}s cooldown",
+          mib, reps, cooldown_s);
+  println(stdout, "auto resolves to: {}\n",
+          blake3pp::to_string(blake3pp::best_available()));
 
-  // Laptops throttle: run variants back to back and each one measures the
-  // previous one's heat (observed: ~20% swing on identical code). Idle
-  // between measurements; the first one starts immediately, --cooldown 0
-  // disables.
-  bool first_measurement = true;
-  const auto cooldown = [&] {
-    if (first_measurement) {
-      first_measurement = false;
-      return;
-    }
-    if (cooldown_s > 0) {
-      std::fflush(stdout);
-      std::this_thread::sleep_for(std::chrono::duration<double>(cooldown_s));
+  b3tool::cooldown cooldown(cooldown_s);
+
+  // One measured table row: cool down, time the best of `reps` (plus an
+  // uncounted warmup), print. Every row in every section goes through here.
+  const auto row = [&](std::string_view label, std::string_view note,
+                       auto&& fn, int width = 10) {
+    cooldown();
+    blake3pp::digest d{};
+    const double best =
+        b3tool::best_seconds(reps, /*warmup=*/true, [&] { d = fn(); });
+    const double gib = b3tool::gib_per_s(input.size(), best);
+    if (note.empty()) {
+      println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)", label, width, gib,
+              d.to_hex().substr(0, 16));
+    } else {
+      println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)  [{}]", label, width,
+              gib, d.to_hex().substr(0, 16), note);
     }
   };
 
-  std::printf("blake3pp kernels (single thread)\n");
+  // Hashes the whole input with one kernel table, sequentially.
+  const auto hash_with = [&](const blake3pp::kern::kernel_ops* ops) {
+    blake3pp::hasher h{ops};
+    h.update(std::span<const std::byte>{input});
+    return h.finalize();
+  };
+
+  println(stdout, "blake3pp kernels (single thread)");
   for (const auto a : arches) {
     if (!blake3pp::is_available(a)) {
-      std::printf("  %-10s unavailable on this machine\n",
-                  blake3pp::to_string(a));
+      println(stdout, "  {:<10} unavailable on this machine",
+              blake3pp::to_string(a));
       continue;
     }
-    cooldown();
-    blake3pp::digest d{};
-    double best_s = 1e100;
-    for (int r = 0; r < reps + 1; ++r) {  // rep 0 is warmup
-      blake3pp::hasher h{a};
-      const auto t0 = std::chrono::steady_clock::now();
-      h.update(input);
-      d = h.finalize();
-      const auto t1 = std::chrono::steady_clock::now();
-      const double s = std::chrono::duration<double>(t1 - t0).count();
-      if (r > 0 && s < best_s) {
-        best_s = s;
-      }
-    }
-    const double gib_s =
-        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("  %-10s %8.2f GiB/s   (%s...)\n", blake3pp::to_string(a),
-                gib_s, d.to_hex().substr(0, 16).c_str());
+    row(blake3pp::to_string(a), "",
+        [&] { return hash_with(blake3pp::detail::resolve(a)); });
   }
 
   // The AVX-512 transpose strategies, raced in-process (the dial is
@@ -197,153 +205,67 @@ int main(int argc, char** argv) {
          {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
           blake3pp::transpose16::quartered}) {
       blake3pp::set_transpose16(strat);
-      cooldown();
-      blake3pp::digest d{};
-      double best_s = 1e100;
-      for (int r = 0; r < reps + 1; ++r) {
-        blake3pp::hasher h{blake3pp::arch::avx512};
-        const auto t0 = std::chrono::steady_clock::now();
-        h.update(input);
-        d = h.finalize();
-        const auto t1 = std::chrono::steady_clock::now();
-        const double s = std::chrono::duration<double>(t1 - t0).count();
-        if (r > 0 && s < best_s) {
-          best_s = s;
-        }
-      }
-      const double gib_s = static_cast<double>(input.size()) / best_s /
-                           (1024.0 * 1024.0 * 1024.0);
-      std::printf("    t16-%-9s %6.2f GiB/s   (%s...)\n",
-                  std::string(blake3pp::to_string(strat)).c_str(), gib_s,
-                  d.to_hex().substr(0, 16).c_str());
+      row(std::format("  t16-{}", blake3pp::to_string(strat)), "",
+          [&] { return hash_with(
+                    blake3pp::detail::resolve(blake3pp::arch::avx512)); },
+          14);
     }
     blake3pp::set_transpose16(saved);
     cooldown();
-    const auto picked = blake3pp::tune_transpose16();
-    std::printf("    t16 tuner picks: %s\n",
-                std::string(blake3pp::to_string(picked)).c_str());
+    println(stdout, "    t16 tuner picks: {}",
+            blake3pp::to_string(blake3pp::tune_transpose16()));
   }
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
-#if defined(__x86_64__)
-  constexpr auto asm_arch = blake3pp::arch::avx2;
-  constexpr const char* asm_row = "avx2";
-  constexpr const char* asm_note = "hand-written asm";
-#elif defined(__aarch64__)
-  constexpr auto asm_arch = blake3pp::arch::neon;
-  constexpr const char* asm_row = "neon";
-  constexpr const char* asm_note = "hand-tuned intrinsics";
-#endif
-
   // The reference kernels behind the blake3pp kernel_ops seam: identical
   // pipeline, only hash_many swapped, so any difference to the section above
   // is pure kernel codegen. Row labels match the blake3pp rows they pair
   // with (portable <-> scalar, neon <-> neon, avx2 <-> avx2).
-  std::printf(
-      "\nreference impl. kernels in the blake3pp pipeline "
-      "(single thread, BLAKE3 %s)\n",
-      BLAKE3_VERSION_STRING);
+  println(stdout,
+          "\nreference impl. kernels in the blake3pp pipeline "
+          "(single thread, BLAKE3 {})",
+          BLAKE3_VERSION_STRING);
   {
     blake3pp::kern::kernel_ops port_ops =
         *blake3pp::detail::resolve(blake3pp::arch::scalar);
     port_ops.hash_many = &portable_hash_many;
-    cooldown();
-    blake3pp::digest d{};
-    double best_s = 1e100;
-    for (int r = 0; r < reps + 1; ++r) {
-      blake3pp::hasher h{&port_ops};
-      const auto t0 = std::chrono::steady_clock::now();
-      h.update(std::span<const std::byte>{input});
-      d = h.finalize();
-      const auto t1 = std::chrono::steady_clock::now();
-      const double s = std::chrono::duration<double>(t1 - t0).count();
-      if (r > 0 && s < best_s) {
-        best_s = s;
-      }
-    }
-    const double gib_s =
-        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("  %-10s %8.2f GiB/s   (%s...)\n", "portable", gib_s,
-                d.to_hex().substr(0, 16).c_str());
+    row("portable", "", [&] { return hash_with(&port_ops); });
   }
 
 #if defined(__x86_64__) || defined(__aarch64__)
-  if (blake3pp::is_available(asm_arch)) {
-    blake3pp::kern::kernel_ops asm_ops = *blake3pp::detail::resolve(asm_arch);
+  blake3pp::kern::kernel_ops asm_ops{};
+  const bool have_asm = blake3pp::is_available(asm_arch);
+  if (have_asm) {
+    asm_ops = *blake3pp::detail::resolve(asm_arch);
     asm_ops.hash_many = &asm_hash_many;  // compress_in_place stays portable
-    cooldown();
-    blake3pp::digest d{};
-    double best_s = 1e100;
-    for (int r = 0; r < reps + 1; ++r) {
-      blake3pp::hasher h{&asm_ops};
-      const auto t0 = std::chrono::steady_clock::now();
-      h.update(std::span<const std::byte>{input});
-      d = h.finalize();
-      const auto t1 = std::chrono::steady_clock::now();
-      const double s = std::chrono::duration<double>(t1 - t0).count();
-      if (r > 0 && s < best_s) {
-        best_s = s;
-      }
-    }
-    const double gib_s =
-        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("  %-10s %8.2f GiB/s   (%s...)  [%s]\n", asm_row, gib_s,
-                d.to_hex().substr(0, 16).c_str(), asm_note);
+    row(asm_row, asm_note, [&] { return hash_with(&asm_ops); });
   }
 #endif
 
   // The reference implementation as shipped: its own runtime dispatch, same
   // input. The digest must match every row above.
-  std::printf("\nreference impl. end-to-end (single thread, own dispatch)\n");
-  {
-    cooldown();
-    std::uint8_t out[BLAKE3_OUT_LEN];
-    double best_s = 1e100;
-    for (int r = 0; r < reps + 1; ++r) {
-      blake3_hasher h;
-      blake3_hasher_init(&h);
-      const auto t0 = std::chrono::steady_clock::now();
-      blake3_hasher_update(&h, input.data(), input.size());
-      blake3_hasher_finalize(&h, out, BLAKE3_OUT_LEN);
-      const auto t1 = std::chrono::steady_clock::now();
-      const double s = std::chrono::duration<double>(t1 - t0).count();
-      if (r > 0 && s < best_s) {
-        best_s = s;
-      }
-    }
-    const double gib_s =
-        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("  %-10s %8.2f GiB/s   (", "reference", gib_s);
-    for (int i = 0; i < 8; ++i) {
-      std::printf("%02x", out[i]);
-    }
-    std::printf("...)\n");
-  }
+  println(stdout, "\nreference impl. end-to-end (single thread, own dispatch)");
+  row("reference", "", [&] {
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, input.data(), input.size());
+    blake3pp::digest d{};
+    blake3_hasher_finalize(&h, reinterpret_cast<std::uint8_t*>(d.bytes.data()),
+                           BLAKE3_OUT_LEN);
+    return d;
+  });
 #endif
 
   // The sender-based parallel engine over the whole tree: the numbers that
   // matter for feeding modern storage. Rows are kernel/scheduler pairings.
   const unsigned nthreads = std::thread::hardware_concurrency();
-  std::printf("\nparallel engine (%u threads)\n", nthreads);
+  println(stdout, "\nparallel engine ({} threads)", nthreads);
   {
-    cooldown();
     auto sched = blake3pp::get_parallel_scheduler();
-    blake3pp::digest d{};
-    double best_s = 1e100;
-    for (int r = 0; r < reps + 1; ++r) {
-      const auto t0 = std::chrono::steady_clock::now();
-      d = blake3pp::hash(std::span<const std::byte>{input}, sched);
-      const auto t1 = std::chrono::steady_clock::now();
-      const double s = std::chrono::duration<double>(t1 - t0).count();
-      if (r > 0 && s < best_s) {
-        best_s = s;
-      }
-    }
-    const double gib_s =
-        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("  %-15s %8.2f GiB/s   (%s...)  [%s pool]\n", "blake3pp/pool",
-                gib_s, d.to_hex().substr(0, 16).c_str(),
-                blake3pp::execution_provider().data());
+    row("blake3pp/pool",
+        std::format("{} pool", blake3pp::execution_provider()),
+        [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); },
+        15);
   }
 
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
@@ -353,24 +275,11 @@ int main(int argc, char** argv) {
   // thread pool. Same engine, different scheduler argument; compare with
   // the blake3pp/pool row.
   {
-    cooldown();
     exec::libdispatch_queue queue;
     auto sched = queue.get_scheduler();
-    blake3pp::digest d{};
-    double best_s = 1e100;
-    for (int r = 0; r < reps + 1; ++r) {
-      const auto t0 = std::chrono::steady_clock::now();
-      d = blake3pp::hash(std::span<const std::byte>{input}, sched);
-      const auto t1 = std::chrono::steady_clock::now();
-      const double s = std::chrono::duration<double>(t1 - t0).count();
-      if (r > 0 && s < best_s) {
-        best_s = s;
-      }
-    }
-    const double gib_s =
-        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("  %-15s %8.2f GiB/s   (%s...)  [stdexec on GCD]\n",
-                "blake3pp/gcd", gib_s, d.to_hex().substr(0, 16).c_str());
+    row("blake3pp/gcd", "stdexec on GCD",
+        [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); },
+        15);
   }
 #endif
 
@@ -378,27 +287,16 @@ int main(int argc, char** argv) {
     (defined(__x86_64__) || defined(__aarch64__))
   // The reference wide kernel on the same parallel engine: separates kernel
   // from scheduler in the rows above.
-  if (blake3pp::is_available(asm_arch)) {
-    blake3pp::kern::kernel_ops asm_ops = *blake3pp::detail::resolve(asm_arch);
-    asm_ops.hash_many = &asm_hash_many;
-    cooldown();
+  if (have_asm) {
     auto sched = blake3pp::get_parallel_scheduler();
-    blake3pp::digest d{};
-    double best_s = 1e100;
-    for (int r = 0; r < reps + 1; ++r) {
-      const auto t0 = std::chrono::steady_clock::now();
-      d = blake3pp::hash(std::span<const std::byte>{input}, sched, &asm_ops);
-      const auto t1 = std::chrono::steady_clock::now();
-      const double s = std::chrono::duration<double>(t1 - t0).count();
-      if (r > 0 && s < best_s) {
-        best_s = s;
-      }
-    }
-    const double gib_s =
-        static_cast<double>(input.size()) / best_s / (1024.0 * 1024.0 * 1024.0);
-    std::printf("  %-15s %8.2f GiB/s   (%s...)  [%s kernel, %s pool]\n",
-                "reference/pool", gib_s, d.to_hex().substr(0, 16).c_str(),
-                asm_row, blake3pp::execution_provider().data());
+    row("reference/pool",
+        std::format("{} kernel, {} pool", asm_row,
+                    blake3pp::execution_provider()),
+        [&] {
+          return blake3pp::hash(std::span<const std::byte>{input}, sched,
+                                &asm_ops);
+        },
+        15);
   }
 #endif
   return 0;

@@ -254,17 +254,55 @@ else()
   endfunction()
 endif()
 
+# --- Command-line tooling (CLI tools + benchmarks) ---------------------------
+# Everything the executables share, so the two CLI tools and the two
+# benchmarks are one kind of program: CLI11 for argument parsing and
+# tooling/tool_common.hpp for output and --threads handling.
+#
+# They also share one extra floor. std::format is a C++20 LIBRARY feature
+# that trails the language (libstdc++ ships <format> from GCC 13), and the
+# shared header's print shim needs it. Where it is missing, the executables
+# are skipped with a notice; the LIBRARY itself keeps its C++20 floor.
+include(CheckIncludeFileCXX)
+check_include_file_cxx("format" BLAKE3PP_HAS_FORMAT)
+if(BLAKE3PP_HAS_FORMAT)
+  # CLI11 for argument parsing: robust, pinned.
+  FetchContent_Declare(cli11
+    GIT_REPOSITORY https://github.com/CLIUtils/CLI11.git
+    GIT_TAG cbd58a3696887b34c70949aef21a71735a0c2ad5) # v2.7.2
+  FetchContent_MakeHermetic(cli11
+    HERMETIC_BUILD_SYSTEM cmake
+    HERMETIC_TOOLCHAIN_EXTENSION [=[
+      # PRECOMPILED: measured 2.4x faster recompiles of main.cpp (32.7s -> 13.4s).
+      set(CLI11_PRECOMPILED ON CACHE BOOL "" FORCE)
+      set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+      set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+      set(CLI11_INSTALL ON CACHE BOOL "" FORCE)
+    ]=])
+  HermeticFetchContent_MakeAvailableAtBuildTime(cli11)
+
+  add_library(blake3pp_tooling INTERFACE)
+  add_library(blake3pp::tooling ALIAS blake3pp_tooling)
+  target_include_directories(blake3pp_tooling
+    INTERFACE "${PROJECT_SOURCE_DIR}/tooling")
+  target_link_libraries(blake3pp_tooling INTERFACE CLI11::CLI11)
+else()
+  message(STATUS
+    "blake3pp: <format> unavailable on this stdlib - CLI tools and "
+    "benchmarks skipped")
+endif()
+
 if(BLAKE3PP_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
 
-if(BLAKE3PP_BUILD_BENCH)
+if(BLAKE3PP_BUILD_BENCH AND BLAKE3PP_HAS_FORMAT)
   add_subdirectory(bench)
 endif()
 
 option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility"
   ${PROJECT_IS_TOP_LEVEL})
-if(BLAKE3PP_BUILD_CLI)
+if(BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT)
   add_subdirectory(cli)
 endif()
