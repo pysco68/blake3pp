@@ -45,6 +45,16 @@ BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {
   return std::rotr(x, N);
 }
 
+// The spec's 64-bit block counter enters the state as two u32 words
+// (v[12]/v[13], t0/t1): this pair is the one place the kernel deliberately
+// truncates.
+BLAKE3PP_FORCE_INLINE std::uint32_t counter_lo(std::uint64_t c) noexcept {
+  return static_cast<std::uint32_t>(c);
+}
+BLAKE3PP_FORCE_INLINE std::uint32_t counter_hi(std::uint64_t c) noexcept {
+  return static_cast<std::uint32_t>(c >> 32);
+}
+
 // Instead of physically permuting the 16 message words between rounds, index
 // them through the accumulated permutation: msg_schedule[r][i] is the
 // original word that round r reads at position i. With vectors this saves 16
@@ -228,8 +238,7 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
       cv[0], cv[1], cv[2], cv[3],
       cv[4], cv[5], cv[6], cv[7],
       iv[0], iv[1], iv[2], iv[3],
-      static_cast<std::uint32_t>(counter),
-      static_cast<std::uint32_t>(counter >> 32),
+      counter_lo(counter), counter_hi(counter),
       len,   flags,
   };
 
@@ -261,6 +270,20 @@ void compress_xof(const std::uint32_t cv[8],
   }
 }
 
+// Every lane's 64-bit counter, split lane-wise into the two u32 state
+// words.
+BLAKE3PP_FORCE_INLINE std::pair<u32v, u32v> counter_lanes(
+    std::uint64_t counter, bool increment_counter) noexcept {
+  std::uint32_t lo[u32v::width];
+  std::uint32_t hi[u32v::width];
+  for (std::size_t lane = 0; lane < u32v::width; ++lane) {
+    const std::uint64_t c = counter + (increment_counter ? lane : 0);
+    lo[lane] = counter_lo(c);
+    hi[lane] = counter_hi(c);
+  }
+  return {u32v::load(lo), u32v::load(hi)};
+}
+
 // Fills u32v::width consecutive XOF output blocks: the root node's cv and
 // message are BROADCAST (identical in every lane); only the counter varies
 // per lane. No input transpose exists at all; the store is the only
@@ -275,15 +298,7 @@ void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
     m[i] = u32v::broadcast(load32(block + 4 * i));
   }
 
-  std::uint32_t lanes[W];
-  for (std::size_t lane = 0; lane < W; ++lane) {
-    lanes[lane] = static_cast<std::uint32_t>(counter + lane);
-  }
-  const u32v ctr_lo = u32v::load(lanes);
-  for (std::size_t lane = 0; lane < W; ++lane) {
-    lanes[lane] = static_cast<std::uint32_t>((counter + lane) >> 32);
-  }
-  const u32v ctr_hi = u32v::load(lanes);
+  const auto [ctr_lo, ctr_hi] = counter_lanes(counter, true);
 
   u32v v[16];
   for (std::size_t j = 0; j < 8; ++j) {
@@ -337,17 +352,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     cv[j] = u32v::broadcast(key[j]);
   }
 
-  std::uint32_t lanes[W];
-  for (std::size_t lane = 0; lane < W; ++lane) {
-    const std::uint64_t c = counter + (increment_counter ? lane : 0);
-    lanes[lane] = static_cast<std::uint32_t>(c);
-  }
-  const u32v ctr_lo = u32v::load(lanes);
-  for (std::size_t lane = 0; lane < W; ++lane) {
-    const std::uint64_t c = counter + (increment_counter ? lane : 0);
-    lanes[lane] = static_cast<std::uint32_t>(c >> 32);
-  }
-  const u32v ctr_hi = u32v::load(lanes);
+  const auto [ctr_lo, ctr_hi] = counter_lanes(counter, increment_counter);
 
   for (std::size_t b = 0; b < blocks; ++b) {
     std::uint32_t block_flags = flags;
@@ -370,7 +375,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     }
     v[12] = ctr_lo;
     v[13] = ctr_hi;
-    v[14] = u32v::broadcast(static_cast<std::uint32_t>(block_len));
+    v[14] = u32v::broadcast(block_len);
     v[15] = u32v::broadcast(block_flags);
 
     all_rounds(v, m);
@@ -380,6 +385,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     }
   }
 
+  std::uint32_t lanes[W];
   for (std::size_t j = 0; j < 8; ++j) {
     cv[j].store(lanes);
     for (std::size_t lane = 0; lane < W; ++lane) {
@@ -417,8 +423,8 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
       // the chaining value in registers across the block loop instead of a
       // call plus CV store/reload round-trip per 64-byte block.
       std::array<std::uint32_t, 16> wide;
-      compress(cv.data(), inputs[i] + b * block_len,
-               static_cast<std::uint32_t>(block_len), ctr, f, wide);
+      compress(cv.data(), inputs[i] + b * block_len, block_len, ctr, f,
+               wide);
       std::copy_n(wide.begin(), 8, cv.begin());
     }
     for (std::size_t w = 0; w < 8; ++w) {

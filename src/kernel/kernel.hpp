@@ -35,7 +35,7 @@ enum class transpose16_mode : std::uint8_t {
 extern std::atomic<transpose16_mode> transpose16_active;  // dispatch.cpp
 
 
-inline constexpr std::size_t block_len = 64;
+inline constexpr std::uint32_t block_len = 64;
 inline constexpr std::size_t chunk_len = 1024;
 inline constexpr std::size_t out_len = 32;
 

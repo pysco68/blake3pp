@@ -63,8 +63,7 @@ inline void chunk_update(const kern::kernel_ops& k, detail::chunk_state& cs,
     // A full buffered block is only compressed once more input shows up: if
     // it turned out to be the chunk's last block it needs CHUNK_END later.
     if (cs.block_len == kern::block_len) {
-      k.compress_in_place(cs.cv.data(), cs.block.data(),
-                          static_cast<std::uint32_t>(kern::block_len),
+      k.compress_in_place(cs.cv.data(), cs.block.data(), kern::block_len,
                           cs.chunk_counter, chunk_start_flag(cs) | base_flags);
       cs.blocks_compressed++;
       cs.block_len = 0;
@@ -107,7 +106,7 @@ inline output parent_output(std::span<const std::uint32_t, 8> left_cv,
           static_cast<std::uint8_t>(right_cv[w] >> (8 * byte));
     }
   }
-  o.block_len = static_cast<std::uint32_t>(kern::block_len);
+  o.block_len = kern::block_len;
   o.counter = 0;
   o.flags = kern::flag_parent | base_flags;
   return o;
