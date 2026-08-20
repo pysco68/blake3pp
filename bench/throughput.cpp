@@ -28,30 +28,46 @@
 #include <blake3.h>
 #endif
 
-#if defined(BLAKE3PP_BENCH_UPSTREAM) && defined(__x86_64__)
+#if defined(BLAKE3PP_BENCH_UPSTREAM) && \
+    (defined(__x86_64__) || defined(__aarch64__))
 #include "kernel/kernel.hpp"
 
-// Upstream's hand-scheduled AVX2 assembly, already present in the linked
-// baseline library. Wrapping it as a kernel_ops table plugs it into OUR
-// entire pipeline (subtree batching, CV stack, parallel engine) through
-// the same seam every portable variant uses. Only the flag argument widths
-// differ (upstream narrows them to uint8_t).
+// Upstream's hand-tuned wide kernel, already present in the linked baseline
+// library: hand-scheduled AVX2 assembly on x86-64, NEON intrinsics on
+// aarch64 (upstream ships no ARM assembly). Wrapping it as a kernel_ops
+// table plugs it into OUR entire pipeline (subtree batching, CV stack,
+// parallel engine) through the same seam every portable variant uses. Only
+// the flag argument widths differ (upstream narrows them to uint8_t).
+#if defined(__x86_64__)
 extern "C" void blake3_hash_many_avx2(
     const std::uint8_t* const* inputs, std::size_t num_inputs,
     std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
     bool increment_counter, std::uint8_t flags, std::uint8_t flags_start,
     std::uint8_t flags_end, std::uint8_t* out);
+#else
+extern "C" void blake3_hash_many_neon(
+    const std::uint8_t* const* inputs, std::size_t num_inputs,
+    std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
+    bool increment_counter, std::uint8_t flags, std::uint8_t flags_start,
+    std::uint8_t flags_end, std::uint8_t* out);
+#endif
 
 namespace {
+#if defined(__x86_64__)
+constexpr auto upstream_hash_many = &blake3_hash_many_avx2;
+#else
+constexpr auto upstream_hash_many = &blake3_hash_many_neon;
+#endif
+
 void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
                    std::size_t blocks, const std::uint32_t key[8],
                    std::uint64_t counter, bool increment_counter,
                    std::uint32_t flags, std::uint32_t flags_start,
                    std::uint32_t flags_end, std::uint8_t* out) noexcept {
-  blake3_hash_many_avx2(inputs, num_inputs, blocks, key, counter,
-                        increment_counter, static_cast<std::uint8_t>(flags),
-                        static_cast<std::uint8_t>(flags_start),
-                        static_cast<std::uint8_t>(flags_end), out);
+  upstream_hash_many(inputs, num_inputs, blocks, key, counter,
+                     increment_counter, static_cast<std::uint8_t>(flags),
+                     static_cast<std::uint8_t>(flags_start),
+                     static_cast<std::uint8_t>(flags_end), out);
 }
 }  // namespace
 #endif
@@ -182,11 +198,20 @@ int main(int argc, char** argv) {
                 std::string(blake3pp::to_string(picked)).c_str());
   }
 
-#if defined(BLAKE3PP_BENCH_UPSTREAM) && defined(__x86_64__)
-  // Upstream's assembly kernel driven by OUR tree and parallel machinery.
-  if (blake3pp::is_available(blake3pp::arch::avx2)) {
-    blake3pp::kern::kernel_ops asm_ops =
-        *blake3pp::detail::resolve(blake3pp::arch::avx2);
+#if defined(BLAKE3PP_BENCH_UPSTREAM) && \
+    (defined(__x86_64__) || defined(__aarch64__))
+  // Upstream's wide kernel driven by OUR tree and parallel machinery.
+#if defined(__x86_64__)
+  constexpr auto asm_arch = blake3pp::arch::avx2;
+  constexpr const char* asm_row = "asm-avx2";
+  constexpr const char* asm_what = "upstream asm";
+#else
+  constexpr auto asm_arch = blake3pp::arch::neon;
+  constexpr const char* asm_row = "asm-neon";
+  constexpr const char* asm_what = "upstream neon";
+#endif
+  if (blake3pp::is_available(asm_arch)) {
+    blake3pp::kern::kernel_ops asm_ops = *blake3pp::detail::resolve(asm_arch);
     asm_ops.hash_many = &asm_hash_many;  // compress_in_place stays portable
 
     {
@@ -206,8 +231,8 @@ int main(int argc, char** argv) {
       }
       const double gib_s = static_cast<double>(input.size()) / best_s /
                            (1024.0 * 1024.0 * 1024.0);
-      std::printf("%-8s %8.2f GiB/s   (%s...)  [upstream asm in our tree]\n",
-                  "asm-avx2", gib_s, d.to_hex().substr(0, 16).c_str());
+      std::printf("%-8s %8.2f GiB/s   (%s...)  [%s in our tree]\n", asm_row,
+                  gib_s, d.to_hex().substr(0, 16).c_str(), asm_what);
     }
 
     {
@@ -226,8 +251,8 @@ int main(int argc, char** argv) {
       }
       const double gib_s = static_cast<double>(input.size()) / best_s /
                            (1024.0 * 1024.0 * 1024.0);
-      std::printf("%-8s %8.2f GiB/s   (%s...)  [upstream asm, parallel]\n",
-                  "asm-par", gib_s, d.to_hex().substr(0, 16).c_str());
+      std::printf("%-8s %8.2f GiB/s   (%s...)  [%s, parallel]\n", "asm-par",
+                  gib_s, d.to_hex().substr(0, 16).c_str(), asm_what);
     }
   }
 #endif

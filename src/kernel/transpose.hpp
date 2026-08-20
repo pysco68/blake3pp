@@ -33,6 +33,10 @@
 #include <cstring>
 #include <type_traits>
 
+#if defined(__aarch64__) && !defined(BLAKE3PP_FORCE_SCALAR)
+#include <arm_neon.h>
+#endif
+
 #include "kernel/simd_facade.hpp"
 
 #ifndef BLAKE3PP_ARCH_NS
@@ -699,6 +703,22 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
         typename B::arch_type>();
     return u32v{
         xsimd::bitwise_cast<std::uint32_t>(xsimd::swizzle(bytes, mask))};
+  }
+#endif
+#if defined(__aarch64__) && !defined(BLAKE3PP_FORCE_SCALAR)
+  // The rotate amounts with no byte-granular shuffle (12 and 7): shl+sri
+  // instead of the shl+usra clang selects for the generic shift-or. SRI and
+  // USRA cost the same two instructions, but SRI is a cycle faster on Apple
+  // cores, and these rotates sit on g's serial critical path. This was the
+  // entire residual against upstream's blake3_neon.c, whose explicit
+  // intrinsics reach sri directly (their PR #319 measured the same):
+  // 1.61 -> 1.71 GiB/s on Apple M2 / clang 22, exactly upstream's number;
+  // the two hash loops are otherwise instruction-for-instruction identical.
+  if constexpr (W == 4 && sizeof(typename u32v::impl) == 16 &&
+                std::is_trivially_copyable_v<typename u32v::impl>) {
+    const uint32x4_t x = std::bit_cast<uint32x4_t>(a.v);
+    return u32v{std::bit_cast<typename u32v::impl>(
+        vsriq_n_u32(vshlq_n_u32(x, 32 - N), x, N))};
   }
 #endif
   return rotr(a, N);

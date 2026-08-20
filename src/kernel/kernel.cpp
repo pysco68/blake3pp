@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <type_traits>
 #include <utility>
 
 #ifndef BLAKE3PP_ARCH_NS
@@ -110,11 +111,107 @@ BLAKE3PP_FORCE_INLINE void round_fn(W v[16], const W m[16]) noexcept {
   g(v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
 }
 
+// The same round, quartet-staged: the four g's identical micro-steps run
+// batched (all four first-adds, then all four rot16s, and so on) instead of
+// each g to completion; this is upstream blake3_neon.c's ordering. Every
+// step is four independent dependency chains where sequential g serializes
+// one. The cost is live state: all 16 state words plus message operands in
+// flight at once. On x86's 16 architectural registers that loses (measured;
+// see the scheduling note on g); aarch64's 32 vector registers hold the
+// whole working set, and the spelling measured a small consistent win there
+// (Apple M2, clang 22: 1.61 vs 1.59 GiB/s sequential). The difference only
+// exists at all because the round core is register-resident (see the
+// always_inline note in simd_facade.hpp); when it was outlined-to-memory,
+// both spellings compiled identically.
+template <std::size_t R, class W>
+BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
+  constexpr const std::array<std::uint8_t, 16>& s = msg_schedule[R];
+  // Columns.
+  v[0] = v[0] + v[4] + m[s[0]];
+  v[1] = v[1] + v[5] + m[s[2]];
+  v[2] = v[2] + v[6] + m[s[4]];
+  v[3] = v[3] + v[7] + m[s[6]];
+  v[12] = rot<16>(v[12] ^ v[0]);
+  v[13] = rot<16>(v[13] ^ v[1]);
+  v[14] = rot<16>(v[14] ^ v[2]);
+  v[15] = rot<16>(v[15] ^ v[3]);
+  v[8] = v[8] + v[12];
+  v[9] = v[9] + v[13];
+  v[10] = v[10] + v[14];
+  v[11] = v[11] + v[15];
+  v[4] = rot<12>(v[4] ^ v[8]);
+  v[5] = rot<12>(v[5] ^ v[9]);
+  v[6] = rot<12>(v[6] ^ v[10]);
+  v[7] = rot<12>(v[7] ^ v[11]);
+  v[0] = v[0] + v[4] + m[s[1]];
+  v[1] = v[1] + v[5] + m[s[3]];
+  v[2] = v[2] + v[6] + m[s[5]];
+  v[3] = v[3] + v[7] + m[s[7]];
+  v[12] = rot<8>(v[12] ^ v[0]);
+  v[13] = rot<8>(v[13] ^ v[1]);
+  v[14] = rot<8>(v[14] ^ v[2]);
+  v[15] = rot<8>(v[15] ^ v[3]);
+  v[8] = v[8] + v[12];
+  v[9] = v[9] + v[13];
+  v[10] = v[10] + v[14];
+  v[11] = v[11] + v[15];
+  v[4] = rot<7>(v[4] ^ v[8]);
+  v[5] = rot<7>(v[5] ^ v[9]);
+  v[6] = rot<7>(v[6] ^ v[10]);
+  v[7] = rot<7>(v[7] ^ v[11]);
+  // Diagonals: quartet i is (i, {5,6,7,4}[i], {10,11,8,9}[i],
+  // {15,12,13,14}[i]).
+  v[0] = v[0] + v[5] + m[s[8]];
+  v[1] = v[1] + v[6] + m[s[10]];
+  v[2] = v[2] + v[7] + m[s[12]];
+  v[3] = v[3] + v[4] + m[s[14]];
+  v[15] = rot<16>(v[15] ^ v[0]);
+  v[12] = rot<16>(v[12] ^ v[1]);
+  v[13] = rot<16>(v[13] ^ v[2]);
+  v[14] = rot<16>(v[14] ^ v[3]);
+  v[10] = v[10] + v[15];
+  v[11] = v[11] + v[12];
+  v[8] = v[8] + v[13];
+  v[9] = v[9] + v[14];
+  v[5] = rot<12>(v[5] ^ v[10]);
+  v[6] = rot<12>(v[6] ^ v[11]);
+  v[7] = rot<12>(v[7] ^ v[8]);
+  v[4] = rot<12>(v[4] ^ v[9]);
+  v[0] = v[0] + v[5] + m[s[9]];
+  v[1] = v[1] + v[6] + m[s[11]];
+  v[2] = v[2] + v[7] + m[s[13]];
+  v[3] = v[3] + v[4] + m[s[15]];
+  v[15] = rot<8>(v[15] ^ v[0]);
+  v[12] = rot<8>(v[12] ^ v[1]);
+  v[13] = rot<8>(v[13] ^ v[2]);
+  v[14] = rot<8>(v[14] ^ v[3]);
+  v[10] = v[10] + v[15];
+  v[11] = v[11] + v[12];
+  v[8] = v[8] + v[13];
+  v[9] = v[9] + v[14];
+  v[5] = rot<7>(v[5] ^ v[10]);
+  v[6] = rot<7>(v[6] ^ v[11]);
+  v[7] = rot<7>(v[7] ^ v[8]);
+  v[4] = rot<7>(v[4] ^ v[9]);
+}
+
+#if defined(__aarch64__)
+constexpr bool staged_rounds = (u32v::width == 4);
+#else
+constexpr bool staged_rounds = false;
+#endif
+
 template <class W>
 BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   [&]<std::size_t... R>(std::index_sequence<R...>)
       BLAKE3PP_LAMBDA_FORCE_INLINE {
-    (round_fn<R>(v, m), ...);
+    // The gate is wide-word-only: the scalar compress in this same TU keeps
+    // the sequential spelling.
+    if constexpr (staged_rounds && std::is_same_v<W, u32v>) {
+      (round_fn_staged<R>(v, m), ...);
+    } else {
+      (round_fn<R>(v, m), ...);
+    }
   }(std::make_index_sequence<7>{});
 }
 
