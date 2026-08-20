@@ -13,17 +13,20 @@ root.
 
 ## objscan.py
 
-A fat binary raises the same questions on every compiler: did the
-vector kernel vectorize, did the facade inline or leave a call soup,
-does anything outside the kernels use an instruction the dispatch
-verdict does not gate. `objscan.py` answers them from the disassembly.
+A fat binary raises the same questions on every compiler and
+architecture: did the vector kernel vectorize, did the facade inline or
+leave a call soup, does anything outside the kernels use an instruction
+the dispatch verdict does not gate. `objscan.py` answers them from the
+disassembly.
 
-It reads ELF and PE/COFF (objects and linked binaries) and picks the
-disassembler: GNU objdump when present, llvm-objdump otherwise (the LLVM
-install on the Windows runners; `--objdump` names one explicitly).
-Function names are the disassembler's demangled ones; patterns match on
-`kern::<variant>::` rather than on whole names, since the MSVC demangler
-spells the anonymous namespace its own way.
+It reads ELF, Mach-O and PE/COFF (objects and linked binaries) and picks
+the disassembler for the target: the prefixed GNU binutils in the cross
+images, llvm-objdump elsewhere (Xcode's `objdump`, the LLVM install on
+the Windows runners; `--objdump` names one explicitly). Function names
+are the disassembler's demangled ones; patterns match on
+`kern::<variant>::` rather than on whole names, since Mach-O keeps a
+leading underscore and the MSVC demangler spells the anonymous namespace
+its own way.
 
 ```sh
 # Did it vectorize? The vector mnemonics in one kernel object.

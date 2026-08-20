@@ -24,12 +24,15 @@ functions use an instruction the dispatch verdict does not gate.
         their callees; anything outside --allow is an inlining failure)
         and vector traffic through the stack frame (spills).
 
-Runs on Linux and Windows: ELF and PE/COFF are recognised from their
-headers. The disassembler is GNU objdump when present, llvm-objdump
-otherwise (the LLVM install on the Windows runners), dumpbin as a last
-resort, or --objdump to name one. Function names come demangled from
-the disassembler; the MSVC demangler spells the anonymous namespace its
-own way, so patterns match on `kern::<ns>::` rather than on whole names.
+Runs on Linux, macOS and Windows: ELF, Mach-O and PE/COFF are recognised
+from their headers. The disassembler is the target-prefixed GNU binutils
+when present (aarch64-linux-gnu-objdump and friends, for the cross
+lanes), llvm-objdump otherwise (Xcode's objdump, the LLVM install on the
+Windows runners), dumpbin or otool as last resorts, or --objdump to name
+one. Function names come demangled from the disassembler; Mach-O keeps
+its leading underscore and the MSVC demangler spells the anonymous
+namespace its own way, so patterns match on `kern::<ns>::` rather than
+on whole names.
 """
 import argparse
 import collections
@@ -43,13 +46,14 @@ import sys
 
 # ---------------------------------------------------------------- formats
 
-ELF_MACHINES = {62: "x86_64"}
-PE_MACHINES = {0x8664: "x86_64"}
-BINUTILS_PREFIX = {}
+ELF_MACHINES = {62: "x86_64", 183: "aarch64"}
+PE_MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64"}
+MACHO_CPUTYPES = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
+BINUTILS_PREFIX = {"aarch64": "aarch64-linux-gnu-"}
 
 
 def identify(path):
-    """(arch, format) from the file header; format is elf or pe."""
+    """(arch, format) from the file header; format is elf, pe or macho."""
     with open(path, "rb") as fh:
         head = fh.read(64)
     if head[:4] == b"\x7fELF":
@@ -70,7 +74,10 @@ def identify(path):
     if len(head) >= 20 and struct.unpack("<H", head[:2])[0] in PE_MACHINES:
         # a COFF object has no MZ stub: the machine word comes first
         return PE_MACHINES[struct.unpack("<H", head[:2])[0]], "pe"
-    sys.exit(f"objscan: {path} is neither ELF nor PE (a wasm module has no objdump)")
+    if head[:4] in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):
+        (cputype,) = struct.unpack("<I", head[4:8])
+        return MACHO_CPUTYPES.get(cputype, f"macho-{cputype:#x}"), "macho"
+    sys.exit(f"objscan: {path} is neither ELF, PE nor Mach-O (a wasm module has no objdump)")
 
 
 # llvm-objdump decodes only its default CPU's instructions on these targets.
@@ -88,6 +95,8 @@ def tool(arch, fmt, name, override=None):
     candidates += ["llvm-" + name, name]
     if fmt == "pe" and name == "objdump":
         candidates.append("dumpbin")
+    if fmt == "macho" and name == "objdump":
+        candidates.append("otool")
     for candidate in candidates:
         if shutil.which(candidate):
             return candidate
@@ -99,6 +108,7 @@ def tool(arch, fmt, name, override=None):
 # GNU and llvm objdump:  "0000000000401000 <sym>:"  then  "  401000:\tmnemonic ops"
 #                        relocations (-r) on their own line: "  401001: R_X86_64_PLT32 memcpy-0x4"
 # dumpbin /DISASM:       "sym:"  then  "  0000000140001000: 48 83 EC 28  sub  rsp,28h"
+# otool -tV:             "_sym:"  then  "0000000100003f5c\tsub\tsp, sp, #0x30"
 FUNC = re.compile(r"^(?:[0-9a-fA-F]+ <(?P<gnu>.+)>|(?P<bare>[^\s<>][^\t]*)):$")
 INSN = re.compile(r"^\s*([0-9a-fA-F]+):?\s+((?:[0-9A-F]{2} )*)\s*([a-z][\w.]*)\s*(.*)$")
 RELOC = re.compile(r"^\s*[0-9a-fA-F]+:\s+(?:R_\w+|IMAGE_REL_\w+|\w+_RELOC_\w+)\s+(.+?)(?:[+-]0x[0-9a-fA-F]+)?\s*$")
@@ -120,6 +130,8 @@ def disassemble(path, objdump, arch):
     base = os.path.basename(objdump).lower()
     if base.startswith("dumpbin"):
         cmd = [objdump, "/DISASM", "/NOLOGO", path]
+    elif base.startswith("otool"):
+        cmd = [objdump, "-tV", path]
     else:
         cmd = [objdump, "-d", "-r", "--no-show-raw-insn", "-C", path]
         if base.startswith("llvm-objdump"):
@@ -201,17 +213,21 @@ def branch_target(insn):
 # counts: x86 and arm64 name their vector registers.
 VECTOR = {
     "x86_64": (r"^v[a-z]", r"\b[xyz]mm\d+\b"),
+    "aarch64": (None, r"\b[vzq]\d+\b|\bp\d+/[mz]"),
 }
 # Control flow inside a function (loops) and out of it (calls).
 BRANCH = {
     "x86_64": r"^j",
+    "aarch64": r"^(b(\.\w+)?|cbn?z|tbn?z)$",
 }
 CALL = {
     "x86_64": r"^call",
+    "aarch64": r"^blr?$",
 }
 # A memory operand through the stack pointer (or the frame pointer).
 STACK = {
     "x86_64": r"\(%r[sb]p\)|\[r[sb]p\b",
+    "aarch64": r"\[(sp|x29)\b",
 }
 
 
