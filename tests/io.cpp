@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -9,6 +10,16 @@
 
 #include <blake3pp/io.hpp>
 #include <doctest/doctest.h>
+
+// The portable engines and the backends the platform selector never
+// picks here: instantiating reader_engine/writer_engine with them below
+// keeps the off-platform code compiled AND executed on every platform
+// (on Linux the selector only ever compiles the io_uring backend).
+#include "io/engine.hpp"
+#include "io/stdio_backend.hpp"
+#if defined(__unix__) || defined(__APPLE__)
+#include "io/pread_backend.hpp"
+#endif
 
 namespace {
 
@@ -150,6 +161,58 @@ TEST_CASE("reader fallback backends deliver identical data") {
     }
     CHECK(h.finalize() == expected);
   }
+}
+
+// Writes `content` through writer_engine<W>, reads it back through
+// reader_engine<R>, and checks byte identity. Small buffers and low queue
+// depth force slot recycling; the odd length forces an unaligned tail
+// through the sync path.
+template <class R, class W>
+void roundtrip_engines(const char* tag) {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const auto content = make_input(300 * 1024 + 77);
+  const temp_file f({});  // placeholder path; the writer recreates it
+
+  {
+    io_impl::writer_engine<W> w(
+        f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2,
+                 .preallocate_bytes = content.size()});
+    MESSAGE(tag << " writer backend: " << w.backend_name());
+    std::size_t pos = 0;
+    while (pos < content.size()) {
+      const auto b = w.acquire();
+      const std::size_t n = std::min(b.capacity, content.size() - pos);
+      std::memcpy(b.data, content.data() + pos, n);
+      w.submit(b, n);
+      pos += n;
+    }
+    w.finish();
+    CHECK(w.bytes_written() == content.size());
+  }
+
+  io_impl::reader_engine<R> r(f.path,
+                              {.window_bytes = 64 * 1024, .queue_depth = 2});
+  MESSAGE(tag << " reader backend: " << r.backend_name());
+  CHECK(r.file_size() == content.size());
+  std::vector<std::byte> out;
+  while (auto win = r.next()) {
+    out.insert(out.end(), win->data, win->data + win->bytes);
+    r.release(*win);
+  }
+  CHECK(out == content);
+}
+
+// The engines are templates over the backend concepts, so the backends
+// the selector ignores on this platform still get concept-checked (the
+// definition-site static_asserts in their headers fire on #include) and
+// driven through the full engine machinery: compiled AND executed
+// everywhere, not just where the selector picks them.
+TEST_CASE("engine templates drive the off-platform backends") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  roundtrip_engines<io_impl::stdio_reader, io_impl::stdio_writer>("stdio");
+#if defined(__unix__) || defined(__APPLE__)
+  roundtrip_engines<io_impl::pread_reader, io_impl::pread_writer>("pread");
+#endif
 }
 
 // Stand-in for boost::filesystem::path: satisfies the foreign_path concept
