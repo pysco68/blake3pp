@@ -473,6 +473,31 @@ The devcontainer carries only the default gcc/clang pair; every other preset
 runs inside its per-compiler toolchain image via `tools/tc <preset>`;
 see `docker/README.md` for the image matrix and its glibc-floor design.
 
+### Kernel tuning switches
+
+Three cache variables turn measured kernel optimizations on or off. Each
+is `auto|on|off` and defaults to `auto`, which is the fastest setting on
+every machine it has been measured on. **These are not performance
+options to tune, they are measurement controls**, and turning one off
+makes the library slower. They exist so a result can be re-checked on
+hardware its original measurement did not cover; the resolved value is
+reported at configure time when it is not the default.
+
+| variable | default | off means |
+|----------|---------|-----------|
+| `BLAKE3PP_KERNEL_INLINE_ENFORCEMENT` | on, all targets | Drop `always_inline`/`__forceinline` from the round core. Every compiler measured then outlines it (clang the whole `all_rounds`, GCC the `index_sequence` lambda), costing 6-40% depending on compiler and variant. |
+| `BLAKE3PP_KERNEL_SRI_ROTATE` | on, aarch64 | Spell rot12/rot7 as the generic shift-or, which selects `shl`+`usra` instead of `shl`+`sri`. Worth ~6% on Apple M2 / clang 22; unverified on Neoverse. |
+| `BLAKE3PP_KERNEL_STAGED_ROUNDS` | on, aarch64 | Run each round as sequential `g` calls instead of quartet-staged. A small win on Apple M2 / clang 22, and provably inert on GCC 15 (same schedule, different register names). Loses on x86, where it is off regardless. |
+
+```bash
+# Re-run the inlining A/B on a machine this project has never measured:
+cmake --preset macos-clang22-cxx26 -DBLAKE3PP_KERNEL_INLINE_ENFORCEMENT=off
+```
+
+`BLAKE3PP_KERNEL_EXTRA_FLAGS` (a semicolon-separated list) appends raw
+compiler flags to the kernel TUs only, for one-off flag trials that have
+not earned a switch.
+
 Layout: public API in `include/blake3pp/`, arch-agnostic tree logic in
 `src/core/`, the per-architecture kernel (one TU, compiled once per variant
 by `cmake/ArchKernels.cmake`) in `src/kernel/`, runtime routing in

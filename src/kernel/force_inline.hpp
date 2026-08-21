@@ -25,10 +25,16 @@
 // here was observed outlining exactly the round-fold lambda while inlining
 // its enclosing function.
 
-#if defined(BLAKE3PP_NO_FORCE_INLINE)
-// A/B hook for re-running that comparison: restores the pre-enforcement
-// spelling so one tree builds both ways. Opt-in, and slow by construction;
-// inject via -DBLAKE3PP_KERNEL_EXTRA_FLAGS=-DBLAKE3PP_NO_FORCE_INLINE.
+// Set by cmake/ArchKernels.cmake from -DBLAKE3PP_KERNEL_INLINE_ENFORCEMENT=
+// auto|on|off; the fallback below repeats that default for tooling and for
+// consumers building these sources outside our CMake. Turning it off
+// restores the pre-enforcement spelling so one tree can be built both ways
+// and the numbers above re-measured on other hardware.
+#ifndef BLAKE3PP_KERNEL_INLINE_ENFORCEMENT
+#define BLAKE3PP_KERNEL_INLINE_ENFORCEMENT 1
+#endif
+
+#if !BLAKE3PP_KERNEL_INLINE_ENFORCEMENT
 #define BLAKE3PP_FORCE_INLINE inline
 #define BLAKE3PP_LAMBDA_FORCE_INLINE
 #elif defined(_MSC_VER) && !defined(__clang__)

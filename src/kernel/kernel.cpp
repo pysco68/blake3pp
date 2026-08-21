@@ -205,7 +205,19 @@ BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
   v[4] = rot<7>(v[4] ^ v[9]);
 }
 
-#if defined(__aarch64__)
+// Measured on clang/Apple M2 only. GCC 15 on aarch64 compiles both spellings
+// to the SAME schedule (the objects differ in register naming alone, and
+// llvm-mca gives identical cycle counts on apple-m2, neoverse-n1 and
+// neoverse-v2), so this gate is live but inert there.
+//
+// Set by cmake/ArchKernels.cmake from -DBLAKE3PP_KERNEL_STAGED_ROUNDS=
+// auto|on|off; the fallback repeats that default. Off restores the
+// sequential round for re-measurement on a core with a clock.
+#ifndef BLAKE3PP_KERNEL_STAGED_ROUNDS
+#define BLAKE3PP_KERNEL_STAGED_ROUNDS 1
+#endif
+
+#if defined(__aarch64__) && BLAKE3PP_KERNEL_STAGED_ROUNDS
 constexpr bool staged_rounds = (u32v::width == 4);
 #else
 constexpr bool staged_rounds = false;

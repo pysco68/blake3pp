@@ -281,7 +281,17 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
     return shuffle_backend::rot_bytes<N / 8, W>(a);
   }
 #endif
-#if defined(__aarch64__) && !defined(BLAKE3PP_FORCE_SCALAR)
+// Set by cmake/ArchKernels.cmake from -DBLAKE3PP_KERNEL_SRI_ROTATE=
+// auto|on|off; the fallback repeats that default. Off restores the generic
+// shift-or, which is how this escape gets re-measured on a core it has not
+// been measured on. GCC 15 selects usra without it exactly as clang does,
+// and whether sri wins outside Apple cores is still unverified.
+#ifndef BLAKE3PP_KERNEL_SRI_ROTATE
+#define BLAKE3PP_KERNEL_SRI_ROTATE 1
+#endif
+
+#if defined(__aarch64__) && !defined(BLAKE3PP_FORCE_SCALAR) && \
+    BLAKE3PP_KERNEL_SRI_ROTATE
   // The rotate amounts with no byte-granular shuffle (12 and 7): shl+sri
   // instead of the shl+usra clang selects for the generic shift-or. SRI and
   // USRA cost the same two instructions, but SRI is a cycle faster on Apple

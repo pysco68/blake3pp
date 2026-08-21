@@ -14,12 +14,79 @@
 
 include_guard(GLOBAL)
 
+# --- Kernel tuning switches -------------------------------------------------
+#
+# Each switch below turns a MEASURED optimization on or off in the kernel
+# TUs. They exist so a result can be re-measured on hardware the original
+# measurement did not cover: every one of them defends a number, and the
+# number came from a machine somebody had. They are NOT performance options:
+# `auto` is the fastest setting everywhere it has been measured, and turning
+# one off makes the library slower (in one case by 40%).
+#
+# Spelling is deliberate. Each is a tri-state auto/on/off, matching
+# BLAKE3PP_EXECUTION_PROVIDER, so that (a) the default is a value this file
+# states out loud rather than the absence of a #define, (b) a switch can be
+# forced ON as well as off (a negative-only opt-out cannot test a target
+# where the default is off), and (c) the resolved value is passed explicitly
+# to every kernel TU and printed at configure time, so what got built is in
+# the build log instead of inferred from a header's #if.
+#
+# Adding one: call blake3pp_kernel_switch(), then read the macro in the
+# kernel sources as `#if BLAKE3PP_KERNEL_<NAME>`, with an #ifndef fallback
+# carrying the same default (the headers are also parsed by tooling that
+# does not pass our flags).
+function(blake3pp_kernel_switch name default doc)
+  set(var "BLAKE3PP_KERNEL_${name}")
+  set(${var} "auto" CACHE STRING "${doc} [auto|on|off]")
+  set_property(CACHE ${var} PROPERTY STRINGS auto on off)
+  if(${var} STREQUAL "auto")
+    set(resolved "${default}")
+  elseif(${var} STREQUAL "on")
+    set(resolved 1)
+  elseif(${var} STREQUAL "off")
+    set(resolved 0)
+  else()
+    message(FATAL_ERROR "blake3pp: ${var} must be auto, on or off "
+      "(got '${${var}}')")
+  endif()
+  set_property(GLOBAL APPEND PROPERTY BLAKE3PP_KERNEL_SWITCHES
+    "${var}=${resolved}")
+  if(NOT ${var} STREQUAL "auto")
+    message(STATUS "blake3pp: ${var}=${${var}} (kernel default is "
+      "${default}); non-default kernel tuning")
+  endif()
+endfunction()
+
+# Inlining enforcement for the kernel's call chains. Off costs 6-40%
+# depending on compiler and variant: every compiler measured outlines the
+# round core or its index_sequence lambda without it. See
+# src/kernel/force_inline.hpp.
+blake3pp_kernel_switch(INLINE_ENFORCEMENT 1
+  "Force-inline the kernel's round core (measured 6-40% faster)")
+
+# aarch64: combine rot12/rot7 with shl+sri rather than the shl+usra the
+# generic shift-or selects. Measured +6% on Apple M2 / clang 22; GCC 15
+# performs the same selection swap. See src/kernel/transpose.hpp.
+blake3pp_kernel_switch(SRI_ROTATE 1
+  "aarch64: use shl+sri for rot12/rot7 instead of the generic shift-or")
+
+# aarch64: run each round quartet-staged instead of one g at a time. A small
+# measured win on Apple M2 / clang 22; provably inert on GCC 15 (same
+# schedule, different register names). Loses on x86, which is why the gate
+# is architectural. See src/kernel/kernel.cpp.
+blake3pp_kernel_switch(STAGED_ROUNDS 1
+  "aarch64: quartet-staged round ordering instead of sequential g")
+
 function(blake3pp_add_kernel ns)
   cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR" "" "ARCH_FLAGS")
 
   set(tgt "blake3pp_kernel_${ns}")
   add_library(${tgt} OBJECT "${PROJECT_SOURCE_DIR}/src/kernel/kernel.cpp")
   target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_ARCH_NS=${ns}")
+  # The resolved tuning switches, passed explicitly rather than left to the
+  # headers' fallback defaults.
+  get_property(_ak_switches GLOBAL PROPERTY BLAKE3PP_KERNEL_SWITCHES)
+  target_compile_definitions(${tgt} PRIVATE ${_ak_switches})
   if(AK_FORCE_SCALAR)
     # The scalar fallback must be genuinely scalar: without this, the simd
     # facade would still pick the baseline vector width (SSE2 on x86-64).
