@@ -170,8 +170,22 @@ blake3pp_add_kernel(scalar FORCE_SCALAR)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
   if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    # Pure cl.exe: /arch is the only ISA dial. There is no /arch:SSE4.2 on x64 (SSE2 is the baseline)
-    blake3pp_add_kernel(sse42)
+    # Pure cl.exe: /arch is the only ISA dial. /arch:SSE4.2 DOES exist
+    # (VS 17.10+), but on its own it changes nothing here: it defines no
+    # feature macro, and xsimd detects capability ONLY from the GNU
+    # spellings (#ifdef __SSSE3__ ...). Without the -D's below xsimd
+    # resolves best_arch = sse2, shuffle_backend::has_byte_shuffle is
+    # false, and this "sse42" kernel is a mislabelled SSE2 one with the
+    # byte-rotate gate shut -- measured: 0 pshufb, every rotate spelled
+    # psrld+pslld+orps. With them the kernel gains the same byte-rotate
+    # path every other target has (571 pshufb, shift-or triples halved to
+    # just rot12/rot7, 23407 -> 21493 instructions). Safe by
+    # construction: dispatch only selects this variant when CPUID reports
+    # SSE4.2. xsimd back-fills SSE4_2 -> SSE4_1 -> SSSE3 -> SSE3, so
+    # __SSE4_2__ alone would do; all three are spelled out so this does
+    # not depend on xsimd keeping that cascade.
+    blake3pp_add_kernel(sse42 ARCH_FLAGS /arch:SSE4.2
+      -D__SSSE3__ -D__SSE4_1__ -D__SSE4_2__)
     blake3pp_add_kernel(avx2 ARCH_FLAGS /arch:AVX2)
     blake3pp_add_kernel(avx512 ARCH_FLAGS /arch:AVX512)
   else()
