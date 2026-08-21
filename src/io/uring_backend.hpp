@@ -97,6 +97,7 @@ struct uring {
     sq_ring = ::mmap(nullptr, sq_ring_sz, PROT_READ | PROT_WRITE,
                      MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
     if (sq_ring == MAP_FAILED) {
+      sq_ring = nullptr;  // destroy() tests for null, and MAP_FAILED is -1
       return fail();
     }
     cq_ring = (p.features & IORING_FEAT_SINGLE_MMAP)
@@ -104,6 +105,7 @@ struct uring {
                   : ::mmap(nullptr, cq_ring_sz, PROT_READ | PROT_WRITE,
                            MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
     if (cq_ring == MAP_FAILED) {
+      cq_ring = nullptr;
       return fail();
     }
     sqes_sz = p.sq_entries * sizeof(io_uring_sqe);
