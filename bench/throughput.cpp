@@ -11,9 +11,11 @@
 // framework-free: pair it with hyperfine when process-level statistics are
 // wanted.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <map>
 #include <span>
 #include <string>
@@ -134,12 +136,87 @@ constexpr asm_kernel asm_kernels[] = {
 
 namespace {
 using b3tool::println;
+
+// Why the t16 tuner can disagree with the table above, settled by
+// measurement rather than argument. tune_transpose16() races the three
+// strategies over a 16 KiB working set reused hundreds of times (L1
+// resident throughout), while the benchmark rows stream 512 MiB out of
+// DRAM. If the strategies rank differently in those two regimes, the tuner
+// is calibrated for the wrong one.
+//
+// This sweeps the SAME comparison across working-set sizes, and runs each
+// size in both strategy orders: a ranking that flips with size is a regime
+// mismatch, a ranking that flips with ORDER is thermal/frequency drift
+// contaminating the measurement instead.
+void t16_sweep(int reps, double cooldown_s) {
+  if (!blake3pp::is_available(blake3pp::arch::avx512)) {
+    println(stdout, "t16 sweep needs an AVX-512 kernel; none available here");
+    return;
+  }
+  constexpr std::size_t work = 128u << 20;  // hashed bytes per timed rep
+  const std::size_t sizes[] = {16u << 10,  128u << 10, 1u << 20,
+                               8u << 20,   64u << 20,  512u << 20};
+  const blake3pp::transpose16 order[] = {blake3pp::transpose16::staging,
+                                         blake3pp::transpose16::tree,
+                                         blake3pp::transpose16::quartered};
+
+  std::vector<std::byte> buf(sizes[std::size(sizes) - 1]);
+  for (std::size_t i = 0; i < buf.size(); ++i) {
+    buf[i] = static_cast<std::byte>(i % 251);
+  }
+  const auto saved = blake3pp::active_transpose16();
+  b3tool::cooldown cooldown(cooldown_s);
+
+  println(stdout,
+          "t16 strategy vs working-set size (avx512, {} MiB hashed per rep,\n"
+          "best of {}; 'rev' repeats the size with the strategy order "
+          "reversed)\n",
+          work >> 20, reps);
+  println(stdout, "  {:>10}  {:>10} {:>10} {:>10}   winner", "working set",
+          "staging", "tree", "quartered");
+
+  for (const std::size_t size : sizes) {
+    for (const bool reverse : {false, true}) {
+      const std::size_t iters = std::max<std::size_t>(1, work / size);
+      double best[3] = {0, 0, 0};
+      for (int k = 0; k < 3; ++k) {
+        const int idx = reverse ? 2 - k : k;
+        cooldown();
+        blake3pp::set_transpose16(order[idx]);
+        const double s = b3tool::best_seconds(reps, /*warmup=*/true, [&] {
+          for (std::size_t it = 0; it < iters; ++it) {
+            blake3pp::hasher h{blake3pp::arch::avx512};
+            h.update(std::span<const std::byte>{buf.data(), size});
+            (void)h.finalize();
+          }
+        });
+        best[idx] = b3tool::gib_per_s(size * iters, s);
+      }
+      const int win = static_cast<int>(
+          std::max_element(best, best + 3) - best);
+      const std::string label =
+          size >= (1u << 20)
+              ? std::format("{} MiB", size >> 20)
+              : std::format("{} KiB", size >> 10);
+      println(stdout, "  {:>10}  {:10.2f} {:10.2f} {:10.2f}   {}{}", label,
+              best[0], best[1], best[2],
+              blake3pp::to_string(order[win]), reverse ? "  (rev)" : "");
+    }
+  }
+  blake3pp::set_transpose16(saved);
+  cooldown();
+  println(stdout, "\n  tune_transpose16() picks: {}   (its own race uses a "
+                  "16 KiB working set)",
+          blake3pp::to_string(blake3pp::tune_transpose16()));
+  blake3pp::set_transpose16(saved);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
   std::size_t mib = 512;
   int reps = 5;
   double cooldown_s = 5.0;
+  bool sweep_t16 = false;
   std::vector<blake3pp::arch> arches;
 
   CLI::App app{
@@ -154,6 +231,9 @@ int main(int argc, char** argv) {
   app.add_option("--cooldown", cooldown_s,
                  "idle seconds between measurements (0 disables)")
       ->capture_default_str();
+  app.add_flag("--t16-sweep", sweep_t16,
+               "diagnose the AVX-512 transpose tuner: rank the three "
+               "strategies across working-set sizes and strategy orders");
 
   // The name<->enum mapping comes from the library's canonical list; the
   // bench never re-enumerates the arch enum.
@@ -164,6 +244,11 @@ int main(int argc, char** argv) {
   app.add_option("arch", arches, "SIMD variants to measure")
       ->transform(CLI::CheckedTransformer(arch_names, CLI::ignore_case));
   CLI11_PARSE(app, argc, argv);
+
+  if (sweep_t16) {
+    t16_sweep(reps, cooldown_s);
+    return 0;
+  }
 
   if (arches.empty()) {
     // Available variants, printed worst-to-best so the table reads as an
@@ -235,8 +320,15 @@ int main(int argc, char** argv) {
     }
     blake3pp::set_transpose16(saved);
     cooldown();
-    println(stdout, "    t16 tuner picks: {}",
-            blake3pp::to_string(blake3pp::tune_transpose16()));
+    // Tuned for THIS run's input size, so the verdict is comparable to the
+    // three rows above it. The winner depends on the size (cache-resident
+    // inputs rank the strategies differently from streaming ones), so a
+    // tuner asked about a different size than the table measures has every
+    // right to disagree with it.
+    println(stdout, "    t16 tuner picks: {} (tuned for {} MiB)",
+            blake3pp::to_string(blake3pp::tune_transpose16(input.size())),
+            mib);
+    blake3pp::set_transpose16(saved);
   }
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)

@@ -24,6 +24,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 
 #include "kernel/kernel.hpp"
 
@@ -315,21 +316,49 @@ std::string_view to_string(transpose16 strategy) noexcept {
 // Races the three strategies on this CPU and applies the winner. No CPUID
 // bit distinguishes a double-pumped from a full-width AVX-512 datapath
 // (Strix Point and Granite Ridge report identical feature flags), so the
-// only honest detector is a stopwatch. ~1 ms, once, opt-in.
-transpose16 tune_transpose16() noexcept {
+// only honest detector is a stopwatch.
+//
+// The race walks a buffer sized like the caller's inputs, ONE pass per
+// timed repetition, because the winner depends on where the data lives as
+// much as on the CPU. Measured on a Ryzen AI Max 395: quartered wins by
+// 18% over staging when the input fits in last-level cache (8 MiB) and
+// LOSES to it by 8% when the input streams from DRAM (512 MiB), both
+// reproducible. An earlier version of this race hashed the same 16 KiB
+// ~800 times (L1-resident throughout) and duly picked the cache-resident
+// winner for every caller, including ones hashing gigabyte files, where it
+// selected the slowest of the three.
+//
+// This is a heuristic, not an oracle: it samples one size on one machine
+// while it is not doing the caller's real work. Callers who need the last
+// few percent should measure with blake3pp_bench and pin the result with
+// set_transpose16().
+transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
   if (!is_available(arch::avx512)) {
     return active_transpose16();  // dial is inert without a W=16 kernel
   }
   const kern::kernel_ops* ops = detail::resolve(arch::avx512);
-  static constexpr std::size_t chunk = 1024;
-  static constexpr std::size_t lanes = 16;
-  std::array<std::uint8_t, lanes * chunk> data;
-  for (std::size_t i = 0; i < data.size(); ++i) {
-    data[i] = static_cast<std::uint8_t>(i % 251);
+  static constexpr std::size_t chunk = 1024;  // BLAKE3 chunk
+  static constexpr std::size_t lanes = 16;    // the W=16 kernel's batch
+  static constexpr std::size_t batch = lanes * chunk;   // 16 KiB per step
+  static constexpr std::size_t cap = 256u << 20;
+
+  // Whole batches, at least one, and never more than the cap: a caller
+  // hashing 40 GiB files does not get a 40 GiB race.
+  std::size_t bytes = typical_input_bytes > cap ? cap : typical_input_bytes;
+  bytes = (bytes / batch) * batch;
+  if (bytes == 0) {
+    bytes = batch;
   }
-  const std::uint8_t* inputs[lanes];
-  for (std::size_t i = 0; i < lanes; ++i) {
-    inputs[i] = data.data() + i * chunk;
+
+  // Heap, not stack: the point is a working set that does not fit in
+  // cache. Tuning must not fail the program, so an allocation failure
+  // simply leaves the current setting alone.
+  auto* data = static_cast<std::uint8_t*>(std::malloc(bytes));
+  if (data == nullptr) {
+    return active_transpose16();
+  }
+  for (std::size_t i = 0; i < bytes; ++i) {
+    data[i] = static_cast<std::uint8_t>(i % 251);
   }
   constexpr std::uint32_t key[8] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u,
                                     0xA54FF53Au, 0x510E527Fu, 0x9B05688Cu,
@@ -337,27 +366,25 @@ transpose16 tune_transpose16() noexcept {
   std::array<std::uint8_t, lanes * 32> out;
 
   const transpose16 saved = active_transpose16();
-  const auto run_batch = [&] {
-    ops->hash_many(inputs, lanes, chunk / 64, key, 0, true, 0,
-                   kern::flag_chunk_start, kern::flag_chunk_end, out.data());
+  const std::size_t batches = bytes / batch;
+  const auto one_pass = [&] {
+    for (std::size_t b = 0; b < batches; ++b) {
+      const std::uint8_t* inputs[lanes];
+      for (std::size_t i = 0; i < lanes; ++i) {
+        inputs[i] = data + b * batch + i * chunk;
+      }
+      ops->hash_many(inputs, lanes, chunk / 64, key, 0, true, 0,
+                     kern::flag_chunk_start, kern::flag_chunk_end,
+                     out.data());
+    }
   };
-  // Race at STEADY-STATE scale. A ~300us in-cache micro-race mispicked on
-  // real full-width AVX-512 hardware (Skylake-SP: chose tree while the
-  // 512 MiB benchmark showed quartered ahead by 13%). Wide-vector
-  // frequency licensing and cache-hot staging distort short samples. 256
-  // batches x 16 KiB per rep (~4 MiB) with a longer warm-up tracks the
-  // macro benchmark's verdict; whole tune stays in the tens of ms.
   const auto race = [&](transpose16 mode) {
     set_transpose16(mode);
-    for (int i = 0; i < 64; ++i) {  // warm-up: frequency ramp + caches
-      run_batch();
-    }
+    one_pass();  // warm-up: frequency ramp, page faults, TLB
     auto best = std::chrono::steady_clock::duration::max();
     for (int rep = 0; rep < 3; ++rep) {
       const auto t0 = std::chrono::steady_clock::now();
-      for (int i = 0; i < 256; ++i) {
-        run_batch();
-      }
+      one_pass();
       const auto dt = std::chrono::steady_clock::now() - t0;
       if (dt < best) {
         best = dt;
@@ -376,8 +403,13 @@ transpose16 tune_transpose16() noexcept {
       winner = mode;
     }
   }
+  std::free(data);
   set_transpose16(winner);
   return winner;
+}
+
+transpose16 tune_transpose16() noexcept {
+  return tune_transpose16(default_tune_bytes);
 }
 
 namespace detail {

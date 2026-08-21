@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -86,15 +87,34 @@ enum class arch : std::uint8_t {
 /// "std::execution", "beman.execution" or "stdexec".
 [[nodiscard]] std::string_view execution_provider() noexcept;
 
-/// The strategy for the AVX-512 kernel's 16-lane message transpose.
+/// The strategy for the 16-lane message transpose used by every width-16
+/// kernel (avx512).
 ///
 /// The right choice depends on the execution datapath (full-width or
-/// double-pumped AVX-512), which no CPUID bit reports, so beyond the
-/// measured-best default (quartered), tune_transpose16() settles it
-/// empirically: it races the strategies on this CPU, applies the winner
-/// process-wide and returns it. On machines without AVX-512 the setting
-/// is inert. Thread-safe; switching mid-hash is benign, since every
-/// strategy is correct.
+/// double-pumped), which no CPUID bit reports, and on where the input
+/// lives; it moves about 10% and is not predictable from the CPU alone.
+/// Two AMD parts with identical feature flags rank the strategies in
+/// opposite order at the same input size (Strix Point: quartered 17% over
+/// staging; Strix Halo: staging 8% over quartered), and on one machine
+/// the winner changes with the input (Strix Halo: quartered for an 8 MiB
+/// input that fits in cache, staging for a 512 MiB one streaming from
+/// DRAM). All numbers are AVX-512 measurements, the only width-16
+/// hardware measured so far.
+///
+/// The three cost policies, none of them implicit:
+///   - Do nothing: quartered, the default, measured best on most parts
+///     tested and never worse than about 10% off.
+///   - Tune per start: tune_transpose16(bytes) races the strategies on
+///     this CPU over a working set the size of the typical input,
+///     applies the winner process-wide and returns it.
+///   - Tune once ever: persist to_string(tune_transpose16(bytes)) and on
+///     later starts restore with
+///     set_transpose16(transpose16_from_string(saved).value_or(
+///         transpose16::quartered)).
+/// Workloads at the edge measure themselves with blake3pp_bench (the
+/// t16-* rows and --t16-sweep) and pin the winner with set_transpose16().
+/// On machines without a width-16 kernel the setting is inert. Thread-safe;
+/// switching mid-hash is benign, since every strategy is correct.
 enum class transpose16 : std::uint8_t {
   staging = 0,    ///< Scalar gather through a staging array.
   tree = 1,       ///< Radix-2 register shuffle network.
@@ -105,6 +125,23 @@ enum class transpose16 : std::uint8_t {
 void set_transpose16(transpose16 strategy) noexcept;
 /// The strategy currently in effect.
 [[nodiscard]] transpose16 active_transpose16() noexcept;
+
+/// The working set tune_transpose16() races over when given no size:
+/// large enough to stream past the last-level cache of current parts,
+/// the regime of this library's headline workload (hashing files).
+/// Callers who hash something smaller should say so.
+inline constexpr std::size_t default_tune_bytes = 128u << 20;
+/// Races the transpose strategies on this CPU and applies the winner
+/// process-wide.
+///
+/// Never called implicitly. Costs one streaming pass per strategy (tens of
+/// milliseconds for small inputs, a few hundred at the 256 MiB cap) and
+/// allocates a buffer of that size. A no-op returning the active strategy
+/// where no width-16 kernel is available.
+/// @param typical_input_bytes  The size the application actually hashes;
+///                             the answer depends on it.
+/// @return The winning strategy, now active.
+transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept;
 /// Races the transpose strategies over default_tune_bytes and applies the
 /// winner process-wide.
 /// @return The winning strategy, now active.

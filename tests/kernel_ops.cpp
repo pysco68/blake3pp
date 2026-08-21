@@ -239,7 +239,10 @@ TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
   blake3pp::set_transpose16(saved);
   // The tuner applies and reports a strategy (a no-op fallback without
   // AVX-512); either way its result must be the active one afterwards.
-  const auto picked = blake3pp::tune_transpose16();
+  // Tuned for a deliberately tiny input: the postcondition is what is
+  // under test, and the no-argument overload would race a 128 MiB working
+  // set on every AVX-512 machine in the matrix to prove the same thing.
+  const auto picked = blake3pp::tune_transpose16(64u << 10);
   CHECK(blake3pp::active_transpose16() == picked);
   blake3pp::set_transpose16(saved);
 }

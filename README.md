@@ -195,16 +195,41 @@ Requesting a variant the CPU can't run silently falls back to the best
 available one; `is_available()` tells you beforehand.
 
 On AVX-512 machines one more dial exists: the 16-lane message transpose
-has three implementation strategies whose ranking depends on whether the
-CPU's AVX-512 datapath is full-width or double-pumped, a property no
-CPUID bit reports. The default (`quartered`) is the measured best, and
-`tune_transpose16()` settles it empirically on the running machine
-(~1 ms race, applies the winner process-wide):
+has three implementation strategies, and which is fastest is not
+predictable from the CPU. It depends on whether the AVX-512 datapath is
+full-width or double-pumped (no CPUID bit reports that) and, on the
+same machine, on whether the input fits in cache. Measured:
+
+| machine | input | fastest | margin |
+|---------|-------|---------|--------|
+| Skylake-SP, Strix Point | streaming | `quartered` | 13-17% |
+| Ryzen AI Max 395 | 8 MiB (in cache) | `quartered` | 18% over `staging` |
+| Ryzen AI Max 395 | 512 MiB (streaming) | `staging` | 8% over `quartered` |
+
+Two AMD parts with identical feature flags, opposite rankings. The whole
+spread is about 10%, so the default is never a disaster, but there is no
+setting that is right everywhere. Pick your cost:
 
 ```cpp
-blake3pp::transpose16 best = blake3pp::tune_transpose16();
-std::cout << "transpose strategy: " << blake3pp::to_string(best) << '\n';
+// 1. Do nothing. The default (quartered) won on most parts measured.
+
+// 2. Tune at startup for the size you actually hash; the answer depends
+//    on it. One streaming pass per strategy; allocates that buffer.
+blake3pp::transpose16 best = blake3pp::tune_transpose16(512u << 20);
+
+// 3. Tune once ever: persist the name, restore it on later starts.
+save(std::string{blake3pp::to_string(best)});
+blake3pp::set_transpose16(
+    blake3pp::transpose16_from_string(load()).value_or(
+        blake3pp::transpose16::quartered));
 ```
+
+If you need to live at the edge, don't trust any of that: **measure your
+own workload and set what works best for you**. `blake3pp_bench` times all
+three (`t16-*` rows), and `blake3pp_bench --t16-sweep` ranks them across
+input sizes so you can see where your workload sits; then pin the winner
+with `set_transpose16()`. The tuner samples one size on an otherwise idle
+machine, which is not the same thing as your program under load.
 
 The build configuration is introspectable too, which is handy for
 diagnostics banners and bug reports:
