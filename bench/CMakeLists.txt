@@ -22,21 +22,34 @@ target_link_libraries(blake3pp_bench_file PRIVATE
   blake3pp::tooling
   blake3pp::tool_allocator)
 
-if(EMSCRIPTEN)
-  # Upstream's build hard-codes x86/ARM SIMD kernels with -m flags the
-  # wasm target rejects; the comparison rows are host-hardware-only.
-  set(BLAKE3PP_BENCH_UPSTREAM OFF)
-endif()
 if(BLAKE3PP_BENCH_UPSTREAM)
   # The upstream library is C plus hand-written assembly; enabling the
   # languages here (rather than letting its nested project() try) keeps
-  # compiler-feature detection in a scope CMake handles reliably.
-  enable_language(C ASM)
+  # compiler-feature detection in a scope CMake handles reliably. There is
+  # no assembly to assemble on wasm.
+  enable_language(C)
+  if(NOT EMSCRIPTEN)
+    enable_language(ASM)
+  endif()
   FetchContent_Declare(blake3_upstream
     GIT_REPOSITORY https://github.com/BLAKE3-team/BLAKE3.git
     GIT_TAG 77b257eee7da5cd608eaf6be8343d3a4c9776af2 # 1.8.6
     SOURCE_SUBDIR c)
-  FetchContent_MakeHermetic(blake3_upstream HERMETIC_BUILD_SYSTEM cmake)
+  if(EMSCRIPTEN)
+    # Upstream selects its kernels from CMAKE_SYSTEM_PROCESSOR, which
+    # Emscripten reports as "x86", so it picks the x86 intrinsics kernels
+    # and then fails on -msse2, which the wasm target rejects. Its own
+    # BLAKE3_SIMD_TYPE=none arm builds the portable C alone, which compiles
+    # to wasm perfectly well. That keeps the `portable` and `reference`
+    # rows on this target: without them a wasm bench run has no
+    # same-pipeline control to measure against, only its own noise.
+    FetchContent_MakeHermetic(blake3_upstream HERMETIC_BUILD_SYSTEM cmake
+      HERMETIC_TOOLCHAIN_EXTENSION [=[
+        set(BLAKE3_SIMD_TYPE "none" CACHE STRING "" FORCE)
+      ]=])
+  else()
+    FetchContent_MakeHermetic(blake3_upstream HERMETIC_BUILD_SYSTEM cmake)
+  endif()
   HermeticFetchContent_MakeAvailableAtBuildTime(blake3_upstream)
   target_link_libraries(blake3pp_bench PRIVATE BLAKE3::blake3)
   target_compile_definitions(blake3pp_bench PRIVATE BLAKE3PP_BENCH_UPSTREAM=1)
