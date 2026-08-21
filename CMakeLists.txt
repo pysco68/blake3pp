@@ -269,21 +269,10 @@ if(BLAKE3PP_TOOL_MIMALLOC)
     # is the fix.
     #
     # mimalloc also ships MI_BUILD_OBJECT, a combined mimalloc.o meant for
-    # exactly this, and linking that object works equally well. Force-loading 
-    # is preferred because it needs no second artifact
-    if(APPLE)
-      set(_mi_force_load "-Wl,-force_load,$<TARGET_FILE:mimalloc-static>")
-    else()
-      # GNU ld and lld; the archive is named between the framing flags, so
-      # this does not depend on where the option lands on the link line.
-      set(_mi_force_load "LINKER:--whole-archive,$<TARGET_FILE:mimalloc-static>,--no-whole-archive")
-    endif()
-    # Both: the archive carries the include dirs, the system link libraries
-    # and (since its imported location is a registered byproduct of the
-    # hermetic install) the build ordering. The option only forces its
-    # members in.
-    target_link_libraries(blake3pp_tool_allocator INTERFACE mimalloc-static)
-    target_link_options(blake3pp_tool_allocator INTERFACE "${_mi_force_load}")
+    # exactly this, and linking that object works equally well. Force-loading
+    # is preferred because it needs no second artifact.
+    target_link_libraries(blake3pp_tool_allocator INTERFACE
+      "$<LINK_LIBRARY:WHOLE_ARCHIVE,mimalloc-static>")
   endif()
 endif()
 
