@@ -43,6 +43,7 @@ if(BLAKE3PP_TOOL_MIMALLOC AND CMAKE_CXX_FLAGS MATCHES "-fsanitize")
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(GNUInstallDirs)
 
 # --- Hermetic FetchContent (tipi-build/hfc) ----------------------------------
 # Shared, content-hash-keyed source cache + isolated per-dependency builds.
@@ -106,9 +107,25 @@ add_dependencies(blake3pp blake3pp_version_stamp)
 
 # features is PUBLIC: its defines (BLAKE3PP_HAS_STD_SENDERS etc.) and the
 # stdexec include path must reach consumers of <blake3pp/parallel.hpp>.
+# blake3pp::features carries this build's simd/execution wiring, including
+# include paths that point into the hermetic dependency trees. Those are
+# meaningful here and meaningless to someone consuming an INSTALLED blake3pp,
+# so it is scoped to the build tree. What an installed consumer needs from it
+# is one thing only: the BLAKE3PP_EXECUTION_* macro, so <blake3pp/parallel.hpp>
+# selects the same provider branch the library was compiled against. That is
+# re-stated on the install interface below.
+# Both are wrapped: a STATIC library propagates even PRIVATE dependencies
+# into its link interface as $<LINK_ONLY:...>, so an unwrapped warnings
+# target would have to join the export set despite carrying nothing but
+# compile options for our own sources.
 target_link_libraries(blake3pp
-  PRIVATE blake3pp_warnings
-  PUBLIC blake3pp::features)
+  PRIVATE $<BUILD_INTERFACE:blake3pp_warnings>
+  PUBLIC $<BUILD_INTERFACE:blake3pp::features>)
+string(TOUPPER "${_blake3pp_execution_provider}" _blake3pp_provider_uc)
+target_compile_definitions(blake3pp INTERFACE
+  $<INSTALL_INTERFACE:BLAKE3PP_EXECUTION_${_blake3pp_provider_uc}=1>)
+target_include_directories(blake3pp PUBLIC
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
 # Architecture kernel variants. Each call compiles src/kernel/kernel.cpp into
 # its own OBJECT library under its own namespace and -m flags; all registered
@@ -283,4 +300,41 @@ endif()
 option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility" ${PROJECT_IS_TOP_LEVEL})
 if(BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT)
   add_subdirectory(cli)
+endif()
+
+# --- Install / export --------------------------------------------------------
+# Only the library and its public headers ship. The kernels are OBJECT
+# libraries already folded into the archive ($<TARGET_OBJECTS:>), the tools
+# are development artifacts, and blake3pp::features/warnings describe THIS
+# build rather than the installed one.
+option(BLAKE3PP_INSTALL "Generate blake3pp install and export rules" ${PROJECT_IS_TOP_LEVEL})
+if(BLAKE3PP_INSTALL)
+  include(CMakePackageConfigHelpers)
+
+  install(TARGETS blake3pp
+    EXPORT blake3ppTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+  install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/blake3pp"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+
+  set(_blake3pp_cmakedir "${CMAKE_INSTALL_LIBDIR}/cmake/blake3pp")
+  install(EXPORT blake3ppTargets
+    FILE blake3ppTargets.cmake
+    NAMESPACE blake3pp::
+    DESTINATION "${_blake3pp_cmakedir}")
+
+  configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/blake3ppConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/blake3ppConfig.cmake"
+    INSTALL_DESTINATION "${_blake3pp_cmakedir}")
+  # The ABI is settled by the compiler and standard library, not by our
+  # version, so SameMajorVersion is the honest compatibility claim.
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/blake3ppConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion)
+  install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/blake3ppConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/blake3ppConfigVersion.cmake"
+    DESTINATION "${_blake3pp_cmakedir}")
 endif()

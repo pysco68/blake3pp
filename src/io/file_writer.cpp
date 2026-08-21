@@ -20,7 +20,7 @@ struct file_writer::impl : io_impl::writer_engine<io_impl::native_writer> {
 
 file_writer::file_writer(const std::filesystem::path& path,
                          const file_writer_options& opts)
-    : impl_(new impl(path, opts)) {}
+    : impl_(std::make_unique<impl>(path, opts)) {}
 
 file_writer::~file_writer() {
   // Best-effort drain: buffers must outlive in-flight writes. Errors here
@@ -30,7 +30,6 @@ file_writer::~file_writer() {
     finish();
   } catch (...) {
   }
-  delete impl_;
 }
 
 std::uint64_t file_writer::bytes_written() const noexcept {

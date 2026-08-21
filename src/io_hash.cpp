@@ -1,3 +1,4 @@
+#include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/io.hpp>
 
 #include <span>

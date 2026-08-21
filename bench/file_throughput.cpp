@@ -20,6 +20,7 @@
 
 #include <CLI/CLI.hpp>
 #include <blake3pp/io.hpp>
+#include <blake3pp/parallel_io.hpp>
 
 #include "tool_common.hpp"
 

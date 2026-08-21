@@ -18,3 +18,4 @@
 #include <blake3pp/dispatch.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
+#include <blake3pp/parallel_io.hpp>

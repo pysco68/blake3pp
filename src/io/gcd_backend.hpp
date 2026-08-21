@@ -73,6 +73,16 @@ struct gcd_pump {
     return group != nullptr;
   }
 
+  // Owning the group means owning its release. The backends below also
+  // call destroy() explicitly (it is idempotent), but they can only do so
+  // once their constructor has COMPLETED: both allocate slot vectors after
+  // init() succeeds, and a throw there destroys members without ever
+  // running the backend destructor. This is the net under that window.
+  ~gcd_pump() { destroy(); }
+  gcd_pump() = default;
+  gcd_pump(const gcd_pump&) = delete;
+  gcd_pump& operator=(const gcd_pump&) = delete;
+
   void destroy() noexcept {
     if (group != nullptr) {
       dispatch_group_wait(group, DISPATCH_TIME_FOREVER);

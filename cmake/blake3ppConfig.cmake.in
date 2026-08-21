@@ -1,0 +1,24 @@
+@PACKAGE_INIT@
+
+# blake3pp package configuration.
+#
+# The installed archive is self-contained: the per-architecture kernels are
+# compiled into it, and it carries no link dependency on any third-party
+# library. So there is deliberately no find_dependency() here.
+#
+# The one thing a consumer may still need is an execution provider, and only
+# for <blake3pp/parallel.hpp>, the header that offers the scheduler-taking
+# overloads. core.hpp, dispatch.hpp and io.hpp compile against the standard
+# library alone. blake3pp was built against the provider named below and the
+# imported target defines the matching BLAKE3PP_EXECUTION_* macro, so
+# parallel.hpp selects the same branch it was built with. Putting that
+# provider's headers on the include path is the consumer's job:
+#
+#   stdexec  -> https://github.com/NVIDIA/stdexec  (headers only)
+#   beman    -> beman.execution                    (headers only)
+#   std      -> <execution> from the standard library, nothing to add
+set(blake3pp_EXECUTION_PROVIDER "@_blake3pp_execution_provider@")
+
+include("${CMAKE_CURRENT_LIST_DIR}/blake3ppTargets.cmake")
+
+check_required_components(blake3pp)

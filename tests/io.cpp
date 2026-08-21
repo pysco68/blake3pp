@@ -11,6 +11,8 @@
 #include <vector>
 
 #include <blake3pp/io.hpp>
+#include <blake3pp/parallel.hpp>
+#include <blake3pp/parallel_io.hpp>
 #include <doctest/doctest.h>
 
 // The portable engines and the backends the platform selector never

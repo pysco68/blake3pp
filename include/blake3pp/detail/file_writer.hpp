@@ -30,6 +30,7 @@
 #include <string_view>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 
 namespace blake3pp::detail {
 
@@ -87,7 +88,11 @@ class file_writer {
 
  private:
   struct impl;
-  impl* impl_;
+  // unique_ptr over an incomplete type: legal because the destructor is
+  // only DECLARED here and defined in the TU where impl is complete. That
+  // also keeps this class non-movable by default, which is deliberate:
+  // outstanding windows/buffers hold the slot indices this object owns.
+  std::unique_ptr<impl> impl_;
 };
 
 }  // namespace blake3pp::detail

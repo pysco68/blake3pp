@@ -23,9 +23,9 @@ struct file_reader::impl : io_impl::reader_engine<io_impl::native_reader> {
 
 file_reader::file_reader(const std::filesystem::path& path,
                          const file_reader_options& opts)
-    : impl_(new impl(path, opts)) {}
+    : impl_(std::make_unique<impl>(path, opts)) {}
 
-file_reader::~file_reader() { delete impl_; }
+file_reader::~file_reader() = default;
 
 std::uint64_t file_reader::file_size() const noexcept {
   return impl_->file_size();

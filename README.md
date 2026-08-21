@@ -9,8 +9,8 @@ direct I/O behind a unified interface.
 
 ## Using the library
 
-blake3pp is consumed **from source**: vendor it with FetchContent (or a
-submodule + `add_subdirectory`) and link the target; tests, benchmarks
+blake3pp is normally consumed **from source**: vendor it with FetchContent
+(or a submodule + `add_subdirectory`) and link the target; tests, benchmarks
 and tools stay out of your build automatically:
 
 ```cmake
@@ -24,9 +24,11 @@ target_link_libraries(your_app PRIVATE blake3pp::blake3pp)
 
 The polyfill dependencies (xsimd, stdexec) are fetched and version-pinned
 by blake3pp's own build where the toolchain lacks the C++26 facilities;
-nothing to install. There is deliberately no binary library or
-`find_package` distribution at 0.x: the feature probes must run against
-*your* toolchain and standard-library combination.
+nothing to install. Building from source is recommended at 0.x because the
+feature probes run against *your* toolchain and standard-library
+combination; an installed package freezes the choices made on the machine
+that built it. Installing is supported too, see
+[Installing and find_package](#installing-and-find_package).
 
 For the **tools** (blake3ppsum, blake3ppgen, benchmarks), mimalloc is
 the default allocator on every supported target (`BLAKE3PP_TOOL_MIMALLOC`,
@@ -42,12 +44,19 @@ Everything lives in `namespace blake3pp`, and
 `#include <blake3pp/blake3pp.hpp>` gets you all of it. Compile-cost-aware
 consumers can pick granular headers instead:
 
-| header                    | provides |
-|---------------------------|----------|
-| `<blake3pp/blake3pp.hpp>` | umbrella: everything below |
-| `<blake3pp/core.hpp>`     | `digest`, `hasher`, one-shot `hash()`, arch introspection |
-| `<blake3pp/parallel.hpp>` | multi-core `hash()` and `parallel_hasher` |
-| `<blake3pp/io.hpp>`       | `hash_file()`, the async direct-I/O pipeline |
+| header                       | provides | needs an execution provider |
+|------------------------------|----------|:---:|
+| `<blake3pp/blake3pp.hpp>`    | umbrella: everything below | yes |
+| `<blake3pp/dispatch.hpp>`    | `arch` introspection, SIMD variant selection | no |
+| `<blake3pp/core.hpp>`        | `digest`, `hasher`, one-shot `hash()` | no |
+| `<blake3pp/io.hpp>`          | `hash_file()`, the async direct-I/O pipeline | no |
+| `<blake3pp/parallel.hpp>`    | multi-core `hash()` and `parallel_hasher` | yes |
+| `<blake3pp/parallel_io.hpp>` | `hash_file()` over a scheduler (the two combined) | yes |
+
+The last column is the one that matters when you install blake3pp rather
+than build it: only the scheduler-taking headers include an execution
+library (stdexec, beman.execution, or `<execution>`). Hashing buffers and
+hashing files sequentially compile against the standard library alone.
 
 ### One-shot hashing
 
@@ -265,13 +274,20 @@ degrades gracefully per feature
 `std::error_code` form, mirroring the standard library:
 
 ```cpp
-#include <blake3pp/io.hpp>
+#include <blake3pp/io.hpp>   // sequential; standard library only
 
 auto d = blake3pp::hash_file("dataset.parquet");        // throws system_error
 
 std::error_code ec;
 auto d2 = blake3pp::hash_file(config.input_path, ec);   // reports via ec
 if (ec) { log_error(ec.message()); }
+```
+
+Adding cores means adding a scheduler, and that is the one thing that
+pulls in an execution provider, so it lives in its own header:
+
+```cpp
+#include <blake3pp/parallel_io.hpp>   // io.hpp + parallel.hpp
 
 // Full pipeline: async reads + multi-core hashing, tuned:
 auto d3 = blake3pp::hash_file(path, pool.get_scheduler(),
@@ -329,6 +345,8 @@ blake3ppgen --seed run42 --length 100G --threads 0 \
 
 ### Consuming via CMake
 
+Vendoring is the normal path, and the one that probes *your* toolchain:
+
 ```cmake
 include(FetchContent)
 FetchContent_Declare(blake3pp GIT_REPOSITORY <this-repo> GIT_TAG main)
@@ -339,7 +357,54 @@ target_link_libraries(app PRIVATE blake3pp::blake3pp)
 The library is C++20; with a C++26 toolchain it uses native `std::simd`,
 otherwise `std::experimental::simd` or xsimd: the same source, probed at
 configure time. Tests, benchmarks and the `blake3ppsum` CLI only build
-when blake3pp is the top-level project.
+when blake3pp is the top-level project, so vendoring costs you nothing
+beyond the library itself.
+
+### Installing and find_package
+
+```bash
+cmake --preset linux-gcc16-cxx26
+cmake --build --preset linux-gcc16-cxx26
+cmake --install build/linux-gcc16-cxx26 --prefix /opt/blake3pp
+```
+
+```cmake
+find_package(blake3pp REQUIRED)          # CMAKE_PREFIX_PATH=/opt/blake3pp
+target_link_libraries(app PRIVATE blake3pp::blake3pp)
+```
+
+What gets installed is the static library, the public headers, and the
+package config, nothing else. The archive is **self-contained**: the
+per-architecture SIMD kernels are compiled into it, and it carries no link
+dependency on any third-party library, so there is no `find_dependency()`
+in the config and nothing to install alongside it. `BLAKE3PP_INSTALL`
+(default: on for top-level builds) turns the rules off for consumers who
+vendor.
+
+One thing does not travel, and it is the reason for the last column of the
+header table above. The execution provider is header-only and belongs to
+whoever builds the final program, so blake3pp does not install it. Code
+that includes `<blake3pp/parallel.hpp>` or `<blake3pp/parallel_io.hpp>`
+(including anything that pulls the umbrella header) must put that
+provider's headers on its own include path:
+
+```cmake
+find_package(blake3pp REQUIRED)
+message(STATUS "built against: ${blake3pp_EXECUTION_PROVIDER}")   # e.g. stdexec
+target_include_directories(app SYSTEM PRIVATE ${STDEXEC_INCLUDE_DIR})
+```
+
+The imported target defines the matching `BLAKE3PP_EXECUTION_*` macro, so
+those headers select the same provider branch the library was compiled
+against, and `blake3pp_EXECUTION_PROVIDER` tells you which one that was.
+Consumers that stay on `core.hpp` / `dispatch.hpp` / `io.hpp` need none of
+this: link the target and go.
+
+Because the choices are frozen at install time, an installed package is
+only valid for toolchains ABI-compatible with the one that built it; the
+package version file declares `SameMajorVersion` compatibility, which
+covers blake3pp's own API but says nothing about your compiler. If in
+doubt, vendor.
 
 ### Guarantees and caveats
 
