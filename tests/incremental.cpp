@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <span>
+#include <ostream>
 #include <string_view>
 #include <vector>
 

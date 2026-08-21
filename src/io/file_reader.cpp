@@ -31,7 +31,7 @@ std::uint64_t file_reader::file_size() const noexcept {
   return impl_->file_size();
 }
 
-const char* file_reader::backend() const noexcept {
+std::string_view file_reader::backend() const noexcept {
   return impl_->backend_name();
 }
 

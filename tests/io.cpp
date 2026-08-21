@@ -5,6 +5,8 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <ostream>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -137,7 +139,7 @@ TEST_CASE("reader reports a backend") {
   blake3pp::detail::file_reader r(f.path, {});
   CHECK(r.file_size() == content.size());
   MESSAGE("file_reader backend: " << r.backend());
-  CHECK(std::string(r.backend()).size() > 0);
+  CHECK(!r.backend().empty());
 }
 
 // The degradation ladder below io_uring: synchronous backends must produce
@@ -168,7 +170,7 @@ TEST_CASE("reader fallback backends deliver identical data") {
 // depth force slot recycling; the odd length forces an unaligned tail
 // through the sync path.
 template <class R, class W>
-void roundtrip_engines(const char* tag) {
+void roundtrip_engines(std::string_view tag) {
   namespace io_impl = blake3pp::detail::io_impl;
   const auto content = make_input(300 * 1024 + 77);
   const temp_file f({});  // placeholder path; the writer recreates it

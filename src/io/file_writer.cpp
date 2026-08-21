@@ -37,7 +37,7 @@ std::uint64_t file_writer::bytes_written() const noexcept {
   return impl_->bytes_written();
 }
 
-const char* file_writer::backend() const noexcept {
+std::string_view file_writer::backend() const noexcept {
   return impl_->backend_name();
 }
 

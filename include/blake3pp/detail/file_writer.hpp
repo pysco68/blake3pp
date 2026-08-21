@@ -27,6 +27,7 @@
 // many).
 
 #include <cstddef>
+#include <string_view>
 #include <cstdint>
 #include <filesystem>
 
@@ -82,7 +83,7 @@ class file_writer {
 
   // Which mechanism was actually engaged, e.g. "io_uring+direct",
   // "iocp+direct+vdl", "gcd+nocache", "pwrite", "writefile", "stdio".
-  [[nodiscard]] const char* backend() const noexcept;
+  [[nodiscard]] std::string_view backend() const noexcept;
 
  private:
   struct impl;

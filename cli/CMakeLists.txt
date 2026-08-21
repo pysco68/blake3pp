@@ -3,18 +3,18 @@
 # from blake3pp::tooling, set up in the top-level CMakeLists.
 
 add_executable(blake3ppsum sum.cpp)
-blake3pp_tool_allocator(blake3ppsum)
 target_link_libraries(blake3ppsum PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
-  blake3pp::tooling)
+  blake3pp::tooling
+  blake3pp::tool_allocator)
 
 add_executable(blake3ppgen gen.cpp)
-blake3pp_tool_allocator(blake3ppgen)
 target_link_libraries(blake3ppgen PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
-  blake3pp::tooling)
+  blake3pp::tooling
+  blake3pp::tool_allocator)
 
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell): known-answer for the empty input via stdin,

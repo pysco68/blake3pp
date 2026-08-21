@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <span>
 #include <string>
+#include <ostream>
 #include <string_view>
 #include <vector>
 
@@ -11,6 +12,15 @@
 #include "test_vectors.hpp"
 
 namespace {
+
+// doctest stringifies a `const char*` as its ADDRESS, not its text, so
+// arch names must reach CAPTURE/MESSAGE as a string_view to be readable.
+// blake3pp::to_string(arch) deliberately returns const char*: generic code
+// (CLI11's default-value printer, found by ADL) needs implicit conversion
+// to std::string, which std::string_view does not provide.
+[[nodiscard]] std::string_view arch_name(blake3pp::arch a) noexcept {
+  return blake3pp::to_string(a);
+}
 
 // The spec's test input: input_len bytes of the repeating pattern 0..250.
 std::vector<std::byte> make_input(std::size_t len) {
@@ -58,7 +68,7 @@ TEST_CASE("keyed and derive_key match vectors on every available arch") {
   const auto key =
       std::as_bytes(std::span<const char, 32>{key_str.data(), 32});
   for (const auto a : blake3pp::available_arches()) {
-    CAPTURE(blake3pp::to_string(a));
+    CAPTURE(arch_name(a));
     for (const auto& c : blake3pp::testvec::cases) {
       CAPTURE(c.input_len);
       const auto input = make_input(c.input_len);
@@ -178,10 +188,10 @@ TEST_CASE("every available arch matches the official vectors") {
        {blake3pp::arch::scalar, blake3pp::arch::sse42, blake3pp::arch::avx2,
         blake3pp::arch::avx512, blake3pp::arch::neon}) {
     if (!blake3pp::is_available(a)) {
-      MESSAGE("skipping unavailable arch: " << blake3pp::to_string(a));
+      MESSAGE("skipping unavailable arch: " << arch_name(a));
       continue;
     }
-    CAPTURE(blake3pp::to_string(a));
+    CAPTURE(arch_name(a));
     for (const auto& c : blake3pp::testvec::cases) {
       CAPTURE(c.input_len);
       const auto input = make_input(c.input_len);

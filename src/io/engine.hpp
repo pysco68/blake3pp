@@ -12,11 +12,13 @@
 // never installed.
 
 #include <algorithm>
+#include <string_view>
 #include <bit>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <span>
 #include <system_error>
@@ -60,11 +62,22 @@ class reader_engine {
   [[nodiscard]] std::uint64_t file_size() const noexcept {
     return backend_.size();
   }
-  [[nodiscard]] const char* backend_name() const noexcept {
+  [[nodiscard]] std::string_view backend_name() const noexcept {
     return backend_.name();
   }
 
   std::optional<window> next() {
+    // A submission that fails inside release() cannot be reported there:
+    // release() is noexcept because callers pair it with next() in a tight
+    // loop, and letting it throw would call std::terminate, including
+    // from hash_file(path, ec, opts), whose whole contract is to turn I/O
+    // failures into an error_code. So the failure is latched here instead,
+    // in the function already documented as throwing. The latch is
+    // permanent: the slot whose submission failed holds a window that can
+    // never be delivered, so there is no way to continue reading.
+    if (submit_failed_) {
+      std::rethrow_exception(submit_failed_);
+    }
     if (next_deliver_ >= num_windows_) {
       return std::nullopt;
     }
@@ -92,8 +105,14 @@ class reader_engine {
     slot_state& st = slots_[w.slot];
     st.assigned = false;
     st.held = false;
-    if (next_submit_ < num_windows_) {
-      assign(w.slot);
+    if (next_submit_ < num_windows_ && !submit_failed_) {
+      // assign() submits real I/O (io_uring_enter / ReadFile), which can
+      // fail. Latch it for next() to rethrow; see the note there.
+      try {
+        assign(w.slot);
+      } catch (...) {
+        submit_failed_ = std::current_exception();
+      }
     }
   }
 
@@ -134,6 +153,7 @@ class reader_engine {
   std::uint64_t num_windows_ = 0;
   std::uint64_t next_submit_ = 0;   // next window index to assign to a slot
   std::uint64_t next_deliver_ = 0;  // next window index to hand out
+  std::exception_ptr submit_failed_;  // latched by release(), thrown by next()
   std::vector<slot_state> slots_;
 
   // Declaration order is the teardown contract: the backend destructs
@@ -165,7 +185,7 @@ class writer_engine {
   [[nodiscard]] std::uint64_t bytes_written() const noexcept {
     return written_;
   }
-  [[nodiscard]] const char* backend_name() const noexcept {
+  [[nodiscard]] std::string_view backend_name() const noexcept {
     return backend_.name();
   }
 

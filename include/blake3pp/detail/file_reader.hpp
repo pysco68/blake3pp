@@ -22,6 +22,7 @@
 // Not thread-safe; drive it from one pipeline thread.
 
 #include <cstddef>
+#include <string_view>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -69,7 +70,7 @@ class file_reader {
 
   // Which mechanism was actually engaged, e.g. "io_uring+direct",
   // "iocp+direct", "gcd+nocache", "pread", "readfile", "stdio".
-  [[nodiscard]] const char* backend() const noexcept;
+  [[nodiscard]] std::string_view backend() const noexcept;
 
  private:
   struct impl;

@@ -15,6 +15,7 @@
 #if defined(__APPLE__)
 
 #include <dispatch/dispatch.h>
+#include <string_view>
 #include <fcntl.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -119,7 +120,7 @@ class gcd_reader {
   gcd_reader& operator=(const gcd_reader&) = delete;
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] const char* name() const noexcept { return name_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   // Every window, the unaligned tail included, takes the async path:
   // F_NOCACHE has no alignment contract, the kernel just serves unaligned
@@ -210,7 +211,7 @@ class gcd_reader {
   std::vector<task> tasks_;
   std::uint64_t size_ = 0;
   bool use_gcd_ = false;
-  const char* name_ = "pread";
+  std::string_view name_ = "pread";
 };
 
 class gcd_writer {
@@ -245,7 +246,7 @@ class gcd_writer {
   gcd_writer(const gcd_writer&) = delete;
   gcd_writer& operator=(const gcd_writer&) = delete;
 
-  [[nodiscard]] const char* name() const noexcept { return name_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
     return use_gcd_ && len % direct_align == 0;
@@ -346,7 +347,7 @@ class gcd_writer {
   std::vector<task> tasks_;
   std::uint64_t prealloc_ = 0;
   bool use_gcd_ = false;
-  const char* name_ = "pwrite";
+  std::string_view name_ = "pwrite";
 };
 
 // Definition-site conformance check (see uring_backend.hpp).

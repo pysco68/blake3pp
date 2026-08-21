@@ -10,6 +10,7 @@
 #if defined(__linux__)
 
 #include <linux/io_uring.h>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
@@ -209,7 +210,7 @@ class uring_reader {
   }
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] const char* name() const noexcept { return name_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   // Only fully-aligned windows may ride the io_uring path (O_DIRECT
   // rejects unaligned lengths); the tail goes through read_sync.
@@ -270,7 +271,7 @@ class uring_reader {
   std::vector<slot> slots_;
   std::uint64_t size_ = 0;
   bool use_uring_ = false;
-  const char* name_ = "pread";
+  std::string_view name_ = "pread";
 };
 
 class uring_writer {
@@ -299,7 +300,7 @@ class uring_writer {
                        : (f_.direct ? "pwrite+direct" : "pwrite");
   }
 
-  [[nodiscard]] const char* name() const noexcept { return name_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
     return use_uring_ && len % direct_align == 0;
@@ -367,7 +368,7 @@ class uring_writer {
   std::vector<slot> slots_;
   std::uint64_t prealloc_ = 0;
   bool use_uring_ = false;
-  const char* name_ = "pwrite";
+  std::string_view name_ = "pwrite";
 };
 
 // Definition-site conformance check. Concepts only verify use-sites, so

@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <string_view>
 
 #include <cerrno>
 #include <cstddef>
@@ -140,22 +141,34 @@ class iocp_reader {
                            : "readfile";
   }
 
-  ~iocp_reader() {
-    // In-flight reads target the engine's buffer pool (declared before
-    // this backend, so freed after us): cancel and drain first, or the
-    // kernel writes into freed memory.
-    if (fast_.use_iocp && outstanding_ > 0) {
-      ::CancelIoEx(fast_.h, nullptr);
-      while (outstanding_ > 0) {
-        DWORD bytes = 0;
-        ULONG_PTR key = 0;
-        OVERLAPPED* pov = nullptr;
-        ::GetQueuedCompletionStatus(fast_.port, &bytes, &key, &pov, 5000);
-        if (pov == nullptr) {
-          break;  // timeout/failure: leak-safe exit beats a hang
-        }
-        --outstanding_;
+
+  // Cancels every in-flight request and waits for ALL of them to report.
+  // The wait is INFINITE on purpose. These requests target the engine's
+  // buffer pool, which is declared before this backend and therefore freed
+  // AFTER it, so returning while one is still pending hands the kernel a
+  // window to write into freed memory. CancelIoEx makes that wait bounded
+  // in practice: once it returns, every outstanding request is guaranteed
+  // to complete, successfully or with ERROR_OPERATION_ABORTED. A null
+  // OVERLAPPED here therefore means the port itself has failed, not that a
+  // request is merely slow: no completion can ever arrive, so breaking is
+  // the only option left.
+  void drain_cancelled() noexcept {
+    ::CancelIoEx(fast_.h, nullptr);
+    while (outstanding_ > 0) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      ::GetQueuedCompletionStatus(fast_.port, &bytes, &key, &pov, INFINITE);
+      if (pov == nullptr) {
+        break;  // port unusable: no completion will ever arrive
       }
+      --outstanding_;
+    }
+  }
+
+  ~iocp_reader() {
+    if (fast_.use_iocp && outstanding_ > 0) {
+      drain_cancelled();
     }
     if (fast_.port != nullptr) {
       ::CloseHandle(fast_.port);
@@ -171,7 +184,7 @@ class iocp_reader {
   iocp_reader& operator=(const iocp_reader&) = delete;
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] const char* name() const noexcept { return name_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   // Only fully-aligned windows may ride the IOCP path (NO_BUFFERING
   // rejects unaligned lengths); the tail goes through read_sync.
@@ -276,7 +289,7 @@ class iocp_reader {
   std::vector<OVERLAPPED> ovs_;  // one per slot; the SQE equivalent
   std::uint64_t size_ = 0;
   unsigned outstanding_ = 0;  // async reads in flight
-  const char* name_ = "readfile";
+  std::string_view name_ = "readfile";
 };
 
 class iocp_writer {
@@ -317,21 +330,35 @@ class iocp_writer {
                     : "writefile";
   }
 
-  ~iocp_writer() {
-    // If finish() threw (or was skipped), writes may still be in flight
-    // against the engine's pool: cancel and drain before it is freed.
-    if (outstanding_ > 0) {
-      ::CancelIoEx(fast_.h, nullptr);
-      while (outstanding_ > 0) {
-        DWORD bytes = 0;
-        ULONG_PTR key = 0;
-        OVERLAPPED* pov = nullptr;
-        ::GetQueuedCompletionStatus(fast_.port, &bytes, &key, &pov, 5000);
-        if (pov == nullptr) {
-          break;
-        }
-        --outstanding_;
+
+  // Cancels every in-flight request and waits for ALL of them to report.
+  // The wait is INFINITE on purpose. These requests target the engine's
+  // buffer pool, which is declared before this backend and therefore freed
+  // AFTER it, so returning while one is still pending hands the kernel a
+  // window to write into freed memory. CancelIoEx makes that wait bounded
+  // in practice: once it returns, every outstanding request is guaranteed
+  // to complete, successfully or with ERROR_OPERATION_ABORTED. A null
+  // OVERLAPPED here therefore means the port itself has failed, not that a
+  // request is merely slow: no completion can ever arrive, so breaking is
+  // the only option left.
+  void drain_cancelled() noexcept {
+    ::CancelIoEx(fast_.h, nullptr);
+    while (outstanding_ > 0) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      ::GetQueuedCompletionStatus(fast_.port, &bytes, &key, &pov, INFINITE);
+      if (pov == nullptr) {
+        break;  // port unusable: no completion will ever arrive
       }
+      --outstanding_;
+    }
+  }
+
+  ~iocp_writer() {
+    // finish() may have thrown or been skipped, leaving writes in flight.
+    if (fast_.use_iocp && outstanding_ > 0) {
+      drain_cancelled();
     }
     if (fast_.port != nullptr) {
       ::CloseHandle(fast_.port);
@@ -346,7 +373,7 @@ class iocp_writer {
   iocp_writer(const iocp_writer&) = delete;
   iocp_writer& operator=(const iocp_writer&) = delete;
 
-  [[nodiscard]] const char* name() const noexcept { return name_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
     return fast_.use_iocp && len % direct_align == 0;
@@ -456,7 +483,7 @@ class iocp_writer {
   std::vector<OVERLAPPED> ovs_;  // one per slot
   std::uint64_t prealloc_ = 0;
   unsigned outstanding_ = 0;
-  const char* name_ = "writefile";
+  std::string_view name_ = "writefile";
 };
 
 // Definition-site conformance check (see uring_backend.hpp): fails here,

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <ostream>
 #include <string_view>
 #include <vector>
 
@@ -14,6 +15,15 @@
 #include "kernel/kernel.hpp"
 
 namespace {
+
+// doctest stringifies a `const char*` as its ADDRESS, not its text, so
+// arch names must reach CAPTURE/MESSAGE as a string_view to be readable.
+// blake3pp::to_string(arch) deliberately returns const char*: generic code
+// (CLI11's default-value printer, found by ADL) needs implicit conversion
+// to std::string, which std::string_view does not provide.
+[[nodiscard]] std::string_view arch_name(blake3pp::arch a) noexcept {
+  return blake3pp::to_string(a);
+}
 
 using namespace blake3pp::kern;
 
@@ -29,7 +39,7 @@ TEST_CASE("arch introspection invariants") {
   CHECK(avail.front() == blake3pp::best_available());
 
   for (const auto a : avail) {
-    CAPTURE(blake3pp::to_string(a));
+    CAPTURE(arch_name(a));
     CHECK(blake3pp::is_available(a));
     CHECK(std::find(compiled.begin(), compiled.end(), a) != compiled.end());
   }
@@ -43,7 +53,7 @@ TEST_CASE("arch introspection invariants") {
   // fall back to a usable table, never fail: on x86 that is neon, on ARM
   // the avx tiers.
   for (const auto a : blake3pp::all_arches()) {
-    CAPTURE(blake3pp::to_string(a));
+    CAPTURE(arch_name(a));
     const auto* ops = blake3pp::detail::resolve(a);
     REQUIRE(ops != nullptr);
     blake3pp::hasher h{a};
@@ -54,7 +64,7 @@ TEST_CASE("arch introspection invariants") {
 
   // Name round trips, and unknown names are rejected.
   for (const auto a : blake3pp::all_arches()) {
-    CHECK(blake3pp::arch_from_string(blake3pp::to_string(a)) == a);
+    CHECK(blake3pp::arch_from_string(arch_name(a)) == a);
   }
   CHECK(!blake3pp::arch_from_string("bogus").has_value());
   CHECK(!blake3pp::arch_from_string("").has_value());
@@ -105,7 +115,7 @@ TEST_CASE("xof_many matches repeated compress_xof on every arch") {
                              expected.data() + t * 64);
   }
   for (const auto a : blake3pp::available_arches()) {
-    CAPTURE(blake3pp::to_string(a));
+    CAPTURE(arch_name(a));
     const auto* ops = blake3pp::detail::resolve(a);
     std::vector<std::uint8_t> out(nblocks * 64);
     ops->xof_many(iv.data(), block, block_len, 7, flag_root, out.data(),
@@ -139,7 +149,7 @@ TEST_CASE("hash_many agrees across all available arches") {
     if (!blake3pp::is_available(a)) {
       continue;
     }
-    CAPTURE(blake3pp::to_string(a));
+    CAPTURE(arch_name(a));
     const auto* ops = blake3pp::detail::resolve(a);
     REQUIRE(ops != nullptr);
     CHECK(ops->simd_degree > 1u);

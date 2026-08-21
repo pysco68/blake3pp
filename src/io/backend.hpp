@@ -15,6 +15,7 @@
 // Internal to src/io/, never installed.
 
 #include <cerrno>
+#include <string_view>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -59,7 +60,7 @@ concept reader_backend =
     requires(B b, const B cb, unsigned slot, std::uint64_t off,
              std::span<std::byte> buf) {
       { cb.size() } noexcept -> std::same_as<std::uint64_t>;
-      { cb.name() } noexcept -> std::convertible_to<const char*>;
+      { cb.name() } noexcept -> std::convertible_to<std::string_view>;
       // The whole runtime-degradation ladder folded into one question the
       // engine asks per window: "may THIS (offset, length) ride your
       // async path?" uring/IOCP answer engaged && length aligned
@@ -95,7 +96,7 @@ concept writer_backend =
                             const file_writer_options&, unsigned> &&
     requires(B b, const B cb, unsigned slot, std::uint64_t off,
              std::span<const std::byte> buf, std::uint64_t written) {
-      { cb.name() } noexcept -> std::convertible_to<const char*>;
+      { cb.name() } noexcept -> std::convertible_to<std::string_view>;
       // The reader's degradation question, minus the offset: the engine
       // writes strictly sequentially and only the final submit may be
       // unaligned, so the length alone decides. False routes the buffer

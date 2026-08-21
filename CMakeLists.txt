@@ -31,9 +31,9 @@ if(EMSCRIPTEN)
 else()
   set(_blake3pp_tool_mimalloc_default ON)
 endif()
-option(BLAKE3PP_TOOL_MIMALLOC
-  "Use mimalloc as the allocator for CLI tools and benchmarks"
-  ${_blake3pp_tool_mimalloc_default})
+
+option(BLAKE3PP_TOOL_MIMALLOC "Use mimalloc as the allocator for CLI tools and benchmarks" ${_blake3pp_tool_mimalloc_default})
+
 if(BLAKE3PP_TOOL_MIMALLOC AND CMAKE_CXX_FLAGS MATCHES "-fsanitize")
   # Sanitizers interpose the allocator themselves; a second interposer
   # (mimalloc) fights their interceptors and breaks the runtime. The
@@ -69,8 +69,7 @@ include(StdFeatures)
 include(ArchKernels)
 
 add_library(blake3pp_warnings INTERFACE)
-if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
-   AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   # cl.exe: /W4 is the sane maximum (/Wall drowns in STL noise); clang-cl
   # takes the GNU-style set below.
   target_compile_options(blake3pp_warnings INTERFACE /W4)
@@ -87,8 +86,7 @@ add_library(blake3pp STATIC
 add_library(blake3pp::blake3pp ALIAS blake3pp)
 
 target_compile_features(blake3pp PUBLIC cxx_std_20)
-target_include_directories(blake3pp PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_include_directories(blake3pp PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_include_directories(blake3pp PRIVATE src "${CMAKE_CURRENT_BINARY_DIR}")
 
 # Version stamp, taken from git at BUILD time (a commit between configures
@@ -105,6 +103,7 @@ add_custom_target(blake3pp_version_stamp
   BYPRODUCTS "${_blake3pp_version_stamp}"
   COMMENT "Stamping blake3pp version from git")
 add_dependencies(blake3pp blake3pp_version_stamp)
+
 # features is PUBLIC: its defines (BLAKE3PP_HAS_STD_SENDERS etc.) and the
 # stdexec include path must reach consumers of <blake3pp/parallel.hpp>.
 target_link_libraries(blake3pp
@@ -115,38 +114,30 @@ target_link_libraries(blake3pp
 # its own OBJECT library under its own namespace and -m flags; all registered
 # variants land in the one binary and runtime dispatch picks among them.
 blake3pp_add_kernel(scalar FORCE_SCALAR)
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
-     AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    # Pure cl.exe: /arch is the only ISA dial. There is no /arch:SSE4.2 on
-    # x64 (SSE2 is the baseline), so the "sse42" variant compiles at
-    # baseline width: same 4-lane facade, slightly humbler codegen. The
-    # dispatch name stays for cross-platform variant parity.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    # Pure cl.exe: /arch is the only ISA dial. There is no /arch:SSE4.2 on x64 (SSE2 is the baseline)
     blake3pp_add_kernel(sse42)
     blake3pp_add_kernel(avx2 ARCH_FLAGS /arch:AVX2)
     blake3pp_add_kernel(avx512 ARCH_FLAGS /arch:AVX512)
   else()
-    # GNU-style drivers (GCC, Clang, clang-cl passes -m flags through).
     blake3pp_add_kernel(sse42 ARCH_FLAGS -msse4.2)
     blake3pp_add_kernel(avx2 ARCH_FLAGS -mavx2)
     # The canonical F->CD->DQ->BW progression plus VL: xsimd's arch
     # hierarchy requires CD once DQ is on, and every physical AVX-512 CPU
     # has all five.
-    blake3pp_add_kernel(avx512
-      ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq)
+    blake3pp_add_kernel(avx512 ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq)
   endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-  # NEON is baseline on AArch64; the variant exists so dispatch/reporting
-  # can name it, and so the scalar fallback stays honestly scalar.
-  # (MSVC-arm64 needs xsimd >= 14.3: upstream revived _M_ARM64 support
-  # in 2026; with the 13.2 pin this variant was scalar-only under cl.)
+  # NEON is baseline on AArch64
   blake3pp_add_kernel(neon)
 elseif(EMSCRIPTEN)
   # WASM SIMD128 is a module-level feature (engines reject SIMD-bearing
-  # modules wholesale if unsupported), so this is a compile-time choice;
-  # the scalar variant still ships for the honest-fallback story.
+  # modules wholesale if unsupported), so this really is a compile-time choice
   blake3pp_add_kernel(simd128 ARCH_FLAGS -msimd128)
 endif()
+
 blake3pp_target_link_kernels(blake3pp)
 
 # The beman provider needs a program-level parallel_scheduler backend
@@ -161,55 +152,46 @@ if(_blake3pp_execution_provider STREQUAL "beman")
     PRIVATE blake3pp_stdexec blake3pp_warnings)
 endif()
 
+# What an executable needs in order to use mimalloc as its allocator,
+# expressed as a target rather than a function: the platform answers differ
+# only in which properties they set, and when BLAKE3PP_TOOL_MIMALLOC is off
+# this simply stays empty and linking it is a no-op. INTERFACE sources are
+# what make the Windows case work: they compile once per CONSUMER, which is
+# exactly the one-definition-per-program rule new/delete overrides live under.
+add_library(blake3pp_tool_allocator INTERFACE)
+add_library(blake3pp::tool_allocator ALIAS blake3pp_tool_allocator)
+
 if(BLAKE3PP_TOOL_MIMALLOC)
-  # zig cc enforces reproducible builds (-Werror,-Wdate-time); mimalloc
-  # stamps __DATE__ into its version banner. GNU-style flag: pure cl
-  # rejects the spelling (and has no such warning to silence). Decided
-  # HERE, where the compiler is known.
-  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
-     AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    set(_mi_date_time_flag "")
-  else()
-    set(_mi_date_time_flag
-      [=[set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -Wno-date-time")]=])
-  endif()
+  # The hermetic mimalloc build's settings.
+  #
   # MI_NO_OPT_ARCH: mimalloc's arch tuning passes -march spellings zig's
   # clang rejects (armv8.1 on aarch64), and it force-enables itself on
   # arm64 unless MI_NO_OPT_ARCH is set (priority over MI_OPT_ARCH).
-  # @ONLY substitutes the @...@ slot here; the ${...} survive verbatim and
-  # expand in the proxy toolchain, not at this configure.
   # MI_INSTALL_TOPLEVEL: install to <prefix>/lib and <prefix>/include
-  # instead of versioned subdirs, so the mimalloc.o path below does not
-  # encode the mimalloc version.
-  string(CONFIGURE [=[
+  # instead of versioned subdirs, keeping the installed layout stable for
+  # hfc's export discovery.
+  set(_mi_toolchain_extension [=[
     set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
     set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
     set(MI_INSTALL_TOPLEVEL ON CACHE BOOL "" FORCE)
-    @_mi_date_time_flag@
-  ]=] _mi_toolchain_extension @ONLY)
+  ]=])
+  # zig cc enforces reproducible builds (-Werror,-Wdate-time) and mimalloc
+  # stamps __DATE__ into its version banner. Pure cl rejects the GNU flag
+  # spelling and has no such warning to silence, so it is skipped there.
+  if(NOT (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"))
+    string(APPEND _mi_toolchain_extension "    set(CMAKE_C_FLAGS_INIT \"\${CMAKE_C_FLAGS_INIT} -Wno-date-time\")\n")
+  endif()
+
   FetchContent_Declare(mimalloc
     GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
     GIT_TAG acf2fdd329f9dc2a7ffe3f12a133fe7175e39378) # v3.4.5
   FetchContent_MakeHermetic(mimalloc
     HERMETIC_BUILD_SYSTEM cmake
     HERMETIC_TOOLCHAIN_EXTENSION "${_mi_toolchain_extension}"
-    # mimalloc names its install(EXPORT) set plain "mimalloc", so the
-    # generated export file is mimalloc.cmake, invisible to hfc's
-    # default ([Tt]argets|[Ee]xport(s))\.cmake discovery, which is what
-    # used to force the add_subdirectory fallback. With the pattern,
-    # mimalloc-static imports hermetically like every other dependency.
-    # (Deliberately NOT matching the per-config mimalloc-*.cmake files:
-    # the base export file includes them itself.)
+    # mimalloc names its install(EXPORT) set plain "mimalloc", so the generated export file is mimalloc.cmake
     HERMETIC_DISCOVER_TARGETS_FILE_PATTERN [[/mimalloc\.cmake$]])
   HermeticFetchContent_MakeAvailableAtBuildTime(mimalloc)
-  # Tripwire: the hermetic import creates only the IMPORTED
-  # mimalloc-static. A real mimalloc-obj target can only mean discovery
-  # failed and hfc fell back to add_subdirectory into THIS project,
-  # which builds mimalloc's shared lib and tests with root flags and
-  # (through hfc's extension-drop bug on that path) without the MI_*
-  # settings above. Fail loudly instead of shipping that silently.
 
   if(WIN32)
     # Full malloc override on Windows needs the mimalloc-redirect DLL
@@ -217,41 +199,39 @@ if(BLAKE3PP_TOOL_MIMALLOC)
     # reliable there). The reliable static route for C++ programs is the
     # global operator new/delete override, which covers effectively all
     # of the tools' allocation traffic while keeping single-file exes.
-    file(CONFIGURE
-      OUTPUT "${CMAKE_BINARY_DIR}/blake3pp_generated/mimalloc_newdelete.cpp"
-      CONTENT "#include <mimalloc-new-delete.h>\n" @ONLY)
-    function(blake3pp_tool_allocator target)
-      target_sources(${target} PRIVATE
-        "${CMAKE_BINARY_DIR}/blake3pp_generated/mimalloc_newdelete.cpp")
-      target_link_libraries(${target} PRIVATE mimalloc-static)
-    endfunction()
+    # The overriding TU is a tracked source, not a generated one: the
+    # operators it defines end up in every shipped executable, and that is
+    # worth being greppable, reviewable and visible in a backtrace. It is
+    # added per-executable because these are one-per-program definitions.
+    target_sources(blake3pp_tool_allocator INTERFACE "${PROJECT_SOURCE_DIR}/tooling/mimalloc_newdelete.cpp")
+    target_link_libraries(blake3pp_tool_allocator INTERFACE mimalloc-static)
   else()
-    # POSIX: the single combined object file statically overrides
-    # malloc/free and new/delete wholesale; its definitions enter the
-    # link before libc's (macOS strictly needs the .o: the interpose/zone
-    # override objects are referenced by nothing, so an archive would
-    # never pull them in). The mimalloc-obj OBJECT library itself cannot
-    # cross the hermetic boundary (hfc target caches cannot represent
-    # OBJECT libraries; mimalloc's own install(TARGETS mimalloc-obj
-    # EXPORT) is commented out upstream for similar reasons), but
-    # mimalloc installs the combined mimalloc.o as a plain file precisely
-    # for this use case, so we link that.
+    # POSIX: mimalloc's override machinery (the operator new/delete
+    # replacements, and on macOS the malloc-zone interposition) lives in
+    # archive members that nothing in the program references. A plain
+    # archive link therefore never extracts them (a linker only pulls a
+    # member that resolves an undefined symbol) and the override silently
+    # does not happen: the binary still initializes mimalloc and looks
+    # fine, it just is not the allocator. Force-loading the whole archive
+    # is the fix.
     #
-    # The .o goes in via target_link_options, NOT target_link_libraries:
-    # link options are not dependency-tracked, so ninja does not demand a
-    # producing rule for a file only the hermetic install step creates.
-    # Ordering and relinking ride on mimalloc-static, whose imported
-    # location IS a registered byproduct of that same install step.
-    set(_mi_objfile
-      "${HERMETIC_FETCHCONTENT_INSTALL_DIR}/mimalloc-install/lib/mimalloc.o")
-    function(blake3pp_tool_allocator target)
-      target_link_options(${target} PRIVATE "${_mi_objfile}")
-      target_link_libraries(${target} PRIVATE mimalloc-static)
-    endfunction()
+    # mimalloc also ships MI_BUILD_OBJECT, a combined mimalloc.o meant for
+    # exactly this, and linking that object works equally well. Force-loading 
+    # is preferred because it needs no second artifact
+    if(APPLE)
+      set(_mi_force_load "-Wl,-force_load,$<TARGET_FILE:mimalloc-static>")
+    else()
+      # GNU ld and lld; the archive is named between the framing flags, so
+      # this does not depend on where the option lands on the link line.
+      set(_mi_force_load "LINKER:--whole-archive,$<TARGET_FILE:mimalloc-static>,--no-whole-archive")
+    endif()
+    # Both: the archive carries the include dirs, the system link libraries
+    # and (since its imported location is a registered byproduct of the
+    # hermetic install) the build ordering. The option only forces its
+    # members in.
+    target_link_libraries(blake3pp_tool_allocator INTERFACE mimalloc-static)
+    target_link_options(blake3pp_tool_allocator INTERFACE "${_mi_force_load}")
   endif()
-else()
-  function(blake3pp_tool_allocator target)
-  endfunction()
 endif()
 
 # --- Command-line tooling (CLI tools + benchmarks) ---------------------------
@@ -283,8 +263,7 @@ if(BLAKE3PP_HAS_FORMAT)
 
   add_library(blake3pp_tooling INTERFACE)
   add_library(blake3pp::tooling ALIAS blake3pp_tooling)
-  target_include_directories(blake3pp_tooling
-    INTERFACE "${PROJECT_SOURCE_DIR}/tooling")
+  target_include_directories(blake3pp_tooling INTERFACE "${PROJECT_SOURCE_DIR}/tooling")
   target_link_libraries(blake3pp_tooling INTERFACE CLI11::CLI11)
 else()
   message(STATUS
@@ -301,8 +280,7 @@ if(BLAKE3PP_BUILD_BENCH AND BLAKE3PP_HAS_FORMAT)
   add_subdirectory(bench)
 endif()
 
-option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility"
-  ${PROJECT_IS_TOP_LEVEL})
+option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility" ${PROJECT_IS_TOP_LEVEL})
 if(BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT)
   add_subdirectory(cli)
 endif()

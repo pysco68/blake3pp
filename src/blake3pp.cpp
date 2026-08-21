@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cassert>
 
 #include "core/core.hpp"
 #include "core/subtree.hpp"
@@ -78,10 +79,19 @@ std::uint64_t hasher::count() const noexcept {
 void hasher::push_cv(std::span<const std::uint32_t, 8> cv,
                      std::uint64_t total_chunks,
                      std::uint64_t subtree_chunks) noexcept {
+  // push_subtree_cv is an expert entry point whose preconditions are
+  // documented but unenforceable at run time without cost. Violating them
+  // is not a graceful failure: subtree_chunks == 0 divides by zero here,
+  // and a misaligned or non-power-of-two size produces more trailing zero
+  // bits than there are stacked siblings, wrapping the uint8_t length to
+  // 255 and indexing a 54-entry array out of bounds. Debug builds say so.
+  assert(subtree_chunks > 0 && std::has_single_bit(subtree_chunks));
+  assert(total_chunks % subtree_chunks == 0);
   std::array<std::uint32_t, 8> new_cv;
   std::ranges::copy(cv, new_cv.begin());
   std::uint64_t chunks = total_chunks / subtree_chunks;
   while ((chunks & 1) == 0) {
+    assert(cv_stack_len_ > 0);  // a sibling must be waiting for each merge
     cv_stack_len_--;
     core::chaining_value(*ops_,
                          core::parent_output(cv_stack_[cv_stack_len_], new_cv,
@@ -89,6 +99,7 @@ void hasher::push_cv(std::span<const std::uint32_t, 8> cv,
                          new_cv);
     chunks >>= 1;
   }
+  assert(cv_stack_len_ < cv_stack_.size());
   cv_stack_[cv_stack_len_] = new_cv;
   cv_stack_len_++;
 }

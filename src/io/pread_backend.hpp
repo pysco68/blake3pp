@@ -9,6 +9,7 @@
 #if defined(__unix__) || defined(__APPLE__)
 
 #include <cassert>
+#include <string_view>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -30,7 +31,7 @@ class pread_reader {
   }
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] const char* name() const noexcept {
+  [[nodiscard]] std::string_view name() const noexcept {
     return f_.direct ? "pread+direct" : "pread";
   }
   [[nodiscard]] bool wants_async(std::uint64_t, std::size_t) const noexcept {
@@ -65,7 +66,7 @@ class pread_writer {
     }
   }
 
-  [[nodiscard]] const char* name() const noexcept {
+  [[nodiscard]] std::string_view name() const noexcept {
     return f_.direct ? "pwrite+direct" : "pwrite";
   }
   [[nodiscard]] bool wants_async(std::size_t) const noexcept { return false; }
