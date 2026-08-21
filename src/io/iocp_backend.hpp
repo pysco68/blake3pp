@@ -24,6 +24,7 @@
 #include <cstring>
 #include <span>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "io/backend.hpp"
@@ -64,18 +65,87 @@ inline bool try_set_valid_data(HANDLE file, std::int64_t size) noexcept {
   return ::SetFileValidData(file, n.QuadPart) != 0;
 }
 
-// Opens the fast handle next to the plain one: NO_BUFFERING and/or
-// OVERLAPPED layered per-feature, an IOCP attached when async engaged.
+// Owns one Win32 HANDLE and closes it exactly once. Win32 spells "no
+// handle" two ways (CreateFileW yields INVALID_HANDLE_VALUE, the IOCP
+// calls yield nullptr), so both count as empty here and neither is ever
+// handed to CloseHandle. Move-only, so a handle can never be owned twice.
+class unique_handle {
+ public:
+  unique_handle() = default;
+  explicit unique_handle(HANDLE h) noexcept : h_(h) {}
+  unique_handle(const unique_handle&) = delete;
+  unique_handle& operator=(const unique_handle&) = delete;
+  unique_handle(unique_handle&& other) noexcept
+      : h_(std::exchange(other.h_, INVALID_HANDLE_VALUE)) {}
+  unique_handle& operator=(unique_handle&& other) noexcept {
+    if (this != &other) {
+      reset(std::exchange(other.h_, INVALID_HANDLE_VALUE));
+    }
+    return *this;
+  }
+  ~unique_handle() { reset(); }
+
+  [[nodiscard]] HANDLE get() const noexcept { return h_; }
+  explicit operator bool() const noexcept {
+    return h_ != nullptr && h_ != INVALID_HANDLE_VALUE;
+  }
+  void reset(HANDLE h = INVALID_HANDLE_VALUE) noexcept {
+    if (*this) {
+      ::CloseHandle(h_);
+    }
+    h_ = h;
+  }
+
+ private:
+  HANDLE h_ = INVALID_HANDLE_VALUE;
+};
+
+// Shared Windows file plumbing, the twin of posix_file: the buffered
+// handle that always exists, the optional NO_BUFFERING/OVERLAPPED reopen
+// next to it (both are per-open flags, hence a second handle), and the
+// completion port when async engages. Every handle lives in a
+// unique_handle, which makes the type non-copyable by construction and
+// unwinds the whole set when a constructor throws part-way through.
+//
+// `fast` is held ONLY when the reopen genuinely engaged, so it never
+// aliases `plain` and no destructor has to test for that.
 // Shared verbatim between reader and writer; only access/creation differ.
-struct win_fast_open {
-  HANDLE h = INVALID_HANDLE_VALUE;  // the winning handle (may == plain)
-  HANDLE port = nullptr;
+struct win_file {
+  unique_handle plain;  // always-buffered+sync: unaligned tails, fallback
+  unique_handle fast;   // the reopened handle, when one engaged
+  unique_handle port;   // IOCP, when async engaged
   bool direct = false;
   bool use_iocp = false;
 
-  void engage(const wchar_t* path, HANDLE plain, DWORD access, DWORD share,
+  // The handle the fast path should use: the reopened one when it
+  // engaged, else the plain one. Borrowed: the caller never closes it.
+  [[nodiscard]] HANDLE h() const noexcept {
+    return fast ? fast.get() : plain.get();
+  }
+
+  void open(const wchar_t* path, DWORD access, DWORD share, DWORD creation,
+            DWORD flags) {
+    plain.reset(::CreateFileW(path, access, share, nullptr, creation, flags,
+                              nullptr));
+    if (!plain) {
+      throw_winerr("CreateFileW");
+    }
+  }
+
+  [[nodiscard]] std::uint64_t stat_size() const {
+    LARGE_INTEGER sz;
+    if (::GetFileSizeEx(plain.get(), &sz) == 0) {
+      throw_winerr("GetFileSizeEx");
+    }
+    return static_cast<std::uint64_t>(sz.QuadPart);
+  }
+
+  // NO_BUFFERING and OVERLAPPED are per-open flags: engage by reopening,
+  // keeping the plain handle for unaligned lengths. Best-effort: a
+  // refused reopen, or a port that will not attach, simply leaves the
+  // plain handle in charge with direct/use_iocp still false.
+  void engage(const wchar_t* path, DWORD access, DWORD share,
               bool want_direct, bool want_async) noexcept {
-    h = plain;
     if (!want_direct && !want_async) {
       return;
     }
@@ -86,31 +156,26 @@ struct win_fast_open {
     if (want_async) {
       flags |= FILE_FLAG_OVERLAPPED;
     }
-    const HANDLE fast = ::CreateFileW(path, access, share, nullptr,
-                                      OPEN_EXISTING, flags, nullptr);
-    if (fast == INVALID_HANDLE_VALUE) {
+    unique_handle cand(::CreateFileW(path, access, share, nullptr,
+                                     OPEN_EXISTING, flags, nullptr));
+    if (!cand) {
       return;
     }
-    bool engaged = false;
     if (want_async) {
-      port = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
-      if (port != nullptr &&
-          ::CreateIoCompletionPort(fast, port, 0, 0) != nullptr) {
-        use_iocp = true;
-        engaged = true;
-      } else if (port != nullptr) {
-        ::CloseHandle(port);
-        port = nullptr;
+      unique_handle p(
+          ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1));
+      // An unattachable port takes the fast handle down with it: a
+      // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path.
+      // Both candidates close on the way out of this branch.
+      if (!p ||
+          ::CreateIoCompletionPort(cand.get(), p.get(), 0, 0) == nullptr) {
+        return;
       }
-    } else {
-      engaged = true;  // sync NO_BUFFERING handle
+      port = std::move(p);
+      use_iocp = true;
     }
-    if (engaged) {
-      h = fast;
-      direct = want_direct;
-    } else {
-      ::CloseHandle(fast);
-    }
+    fast = std::move(cand);
+    direct = want_direct;
   }
 };
 
@@ -119,25 +184,13 @@ class iocp_reader {
   iocp_reader(const std::filesystem::path& path,
               const file_reader_options& opts, unsigned nslots)
       : slots_(nslots), ovs_(nslots) {
-    h_plain_ = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                             nullptr, OPEN_EXISTING,
-                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-                             nullptr);
-    if (h_plain_ == INVALID_HANDLE_VALUE) {
-      throw_winerr("CreateFileW");
-    }
-    LARGE_INTEGER file_sz;
-    if (::GetFileSizeEx(h_plain_, &file_sz) == 0) {
-      const DWORD e = ::GetLastError();  // before CloseHandle can clobber it
-      ::CloseHandle(h_plain_);
-      throw std::system_error(static_cast<int>(e), std::system_category(),
-                              "GetFileSizeEx");
-    }
-    size_ = static_cast<std::uint64_t>(file_sz.QuadPart);
-    fast_.engage(path.c_str(), h_plain_, GENERIC_READ, FILE_SHARE_READ,
-                 opts.direct_io, opts.async);
-    name_ = fast_.use_iocp ? (fast_.direct ? "iocp+direct" : "iocp")
-            : fast_.direct ? "readfile+direct"
+    file_.open(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
+    size_ = file_.stat_size();
+    file_.engage(path.c_str(), GENERIC_READ, FILE_SHARE_READ, opts.direct_io,
+                 opts.async);
+    name_ = file_.use_iocp ? (file_.direct ? "iocp+direct" : "iocp")
+            : file_.direct ? "readfile+direct"
                            : "readfile";
   }
 
@@ -153,12 +206,13 @@ class iocp_reader {
   // request is merely slow: no completion can ever arrive, so breaking is
   // the only option left.
   void drain_cancelled() noexcept {
-    ::CancelIoEx(fast_.h, nullptr);
+    ::CancelIoEx(file_.h(), nullptr);
     while (outstanding_ > 0) {
       DWORD bytes = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
-      ::GetQueuedCompletionStatus(fast_.port, &bytes, &key, &pov, INFINITE);
+      ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key, &pov,
+                                  INFINITE);
       if (pov == nullptr) {
         break;  // port unusable: no completion will ever arrive
       }
@@ -166,18 +220,12 @@ class iocp_reader {
     }
   }
 
+  // Only the drain is hand-written now: every handle belongs to file_,
+  // whose destructor runs after this body, that is, after the last
+  // request has reported, which is the ordering the drain exists for.
   ~iocp_reader() {
-    if (fast_.use_iocp && outstanding_ > 0) {
+    if (file_.use_iocp && outstanding_ > 0) {
       drain_cancelled();
-    }
-    if (fast_.port != nullptr) {
-      ::CloseHandle(fast_.port);
-    }
-    if (fast_.h != h_plain_ && fast_.h != INVALID_HANDLE_VALUE) {
-      ::CloseHandle(fast_.h);
-    }
-    if (h_plain_ != INVALID_HANDLE_VALUE) {
-      ::CloseHandle(h_plain_);
     }
   }
   iocp_reader(const iocp_reader&) = delete;
@@ -190,7 +238,7 @@ class iocp_reader {
   // rejects unaligned lengths); the tail goes through read_sync.
   [[nodiscard]] bool wants_async(std::uint64_t, std::size_t len) const
       noexcept {
-    return fast_.use_iocp && len % direct_align == 0;
+    return file_.use_iocp && len % direct_align == 0;
   }
 
   void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
@@ -206,8 +254,8 @@ class iocp_reader {
       DWORD bytes = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
-      const BOOL ok = ::GetQueuedCompletionStatus(fast_.port, &bytes, &key,
-                                                  &pov, INFINITE);
+      const BOOL ok = ::GetQueuedCompletionStatus(file_.port.get(), &bytes,
+                                                  &key, &pov, INFINITE);
       if (pov == nullptr) {
         throw_winerr("GetQueuedCompletionStatus");
       }
@@ -235,10 +283,10 @@ class iocp_reader {
   // tails reach this path; the !use_iocp guard makes it structural that
   // the overlapped handle is never used synchronously.
   void read_sync(std::uint64_t off, std::span<std::byte> buf) {
-    const HANDLE use_h = fast_.direct && !fast_.use_iocp &&
+    const HANDLE use_h = file_.direct && !file_.use_iocp &&
                                  buf.size() % direct_align == 0
-                             ? fast_.h
-                             : h_plain_;
+                             ? file_.h()
+                             : file_.plain.get();
     std::size_t got = 0;
     while (got < buf.size()) {
       OVERLAPPED ov{};
@@ -275,7 +323,7 @@ class iocp_reader {
     const std::uint64_t off = st.off + from;
     ov.Offset = static_cast<DWORD>(off);
     ov.OffsetHigh = static_cast<DWORD>(off >> 32);
-    if (::ReadFile(fast_.h, st.dst + from,
+    if (::ReadFile(file_.h(), st.dst + from,
                    static_cast<DWORD>(st.len - from), nullptr, &ov) == 0 &&
         ::GetLastError() != ERROR_IO_PENDING) {
       throw_winerr("ReadFile(async)");
@@ -283,13 +331,17 @@ class iocp_reader {
     ++outstanding_;
   }
 
-  HANDLE h_plain_ = INVALID_HANDLE_VALUE;  // buffered+sync: tail, fallback
-  win_fast_open fast_;
   std::vector<slot> slots_;
   std::vector<OVERLAPPED> ovs_;  // one per slot; the SQE equivalent
   std::uint64_t size_ = 0;
   unsigned outstanding_ = 0;  // async reads in flight
   std::string_view name_ = "readfile";
+  // Declared LAST so it is destroyed FIRST: the handles must close before
+  // ovs_ goes away. drain_cancelled() normally guarantees nothing is in
+  // flight by then, but it gives up early if the port itself has failed,
+  // and closing the handles is what cancels any request still holding an
+  // OVERLAPPED in that path.
+  win_file file_;  // plain (tail, fallback) + fast reopen + IOCP port
 };
 
 class iocp_writer {
@@ -299,11 +351,8 @@ class iocp_writer {
       : slots_(nslots), ovs_(nslots) {
     // Two opens of one file need explicit sharing on Windows.
     constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
-    h_plain_ = ::CreateFileW(path.c_str(), GENERIC_WRITE, share, nullptr,
-                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h_plain_ == INVALID_HANDLE_VALUE) {
-      throw_winerr("CreateFileW");
-    }
+    file_.open(path.c_str(), GENERIC_WRITE, share, CREATE_ALWAYS,
+               FILE_ATTRIBUTE_NORMAL);
     bool vdl = false;
     if (opts.preallocate_bytes > 0) {
       // SetEndOfFile is the fallocate twin: writes become overwrites of an
@@ -312,20 +361,21 @@ class iocp_writer {
       // synchronously. SetFileValidData waives that, privilege permitting.
       LARGE_INTEGER target;
       target.QuadPart = static_cast<std::int64_t>(opts.preallocate_bytes);
-      if (::SetFilePointerEx(h_plain_, target, nullptr, FILE_BEGIN) != 0 &&
-          ::SetEndOfFile(h_plain_) != 0) {
+      if (::SetFilePointerEx(file_.plain.get(), target, nullptr,
+                             FILE_BEGIN) != 0 &&
+          ::SetEndOfFile(file_.plain.get()) != 0) {
         prealloc_ = opts.preallocate_bytes;
-        vdl = try_set_valid_data(h_plain_, target.QuadPart);
+        vdl = try_set_valid_data(file_.plain.get(), target.QuadPart);
       }
       LARGE_INTEGER zero{};
-      ::SetFilePointerEx(h_plain_, zero, nullptr, FILE_BEGIN);
+      ::SetFilePointerEx(file_.plain.get(), zero, nullptr, FILE_BEGIN);
     }
-    fast_.engage(path.c_str(), h_plain_, GENERIC_WRITE, share,
-                 opts.direct_io, opts.async);
-    name_ = fast_.use_iocp
-                ? (fast_.direct ? (vdl ? "iocp+direct+vdl" : "iocp+direct")
+    file_.engage(path.c_str(), GENERIC_WRITE, share, opts.direct_io,
+                 opts.async);
+    name_ = file_.use_iocp
+                ? (file_.direct ? (vdl ? "iocp+direct+vdl" : "iocp+direct")
                                 : "iocp")
-                : fast_.direct
+                : file_.direct
                     ? (vdl ? "writefile+direct+vdl" : "writefile+direct")
                     : "writefile";
   }
@@ -342,12 +392,13 @@ class iocp_writer {
   // request is merely slow: no completion can ever arrive, so breaking is
   // the only option left.
   void drain_cancelled() noexcept {
-    ::CancelIoEx(fast_.h, nullptr);
+    ::CancelIoEx(file_.h(), nullptr);
     while (outstanding_ > 0) {
       DWORD bytes = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
-      ::GetQueuedCompletionStatus(fast_.port, &bytes, &key, &pov, INFINITE);
+      ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key, &pov,
+                                  INFINITE);
       if (pov == nullptr) {
         break;  // port unusable: no completion will ever arrive
       }
@@ -355,19 +406,13 @@ class iocp_writer {
     }
   }
 
+  // Only the drain is hand-written now: every handle belongs to file_,
+  // whose destructor runs after this body, that is, after the last
+  // request has reported, which is the ordering the drain exists for.
   ~iocp_writer() {
     // finish() may have thrown or been skipped, leaving writes in flight.
-    if (fast_.use_iocp && outstanding_ > 0) {
+    if (file_.use_iocp && outstanding_ > 0) {
       drain_cancelled();
-    }
-    if (fast_.port != nullptr) {
-      ::CloseHandle(fast_.port);
-    }
-    if (fast_.h != h_plain_ && fast_.h != INVALID_HANDLE_VALUE) {
-      ::CloseHandle(fast_.h);
-    }
-    if (h_plain_ != INVALID_HANDLE_VALUE) {
-      ::CloseHandle(h_plain_);
     }
   }
   iocp_writer(const iocp_writer&) = delete;
@@ -376,7 +421,7 @@ class iocp_writer {
   [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
-    return fast_.use_iocp && len % direct_align == 0;
+    return file_.use_iocp && len % direct_align == 0;
   }
 
   void start_write(unsigned s, std::uint64_t off,
@@ -395,10 +440,10 @@ class iocp_writer {
   // unaligned tail always takes the buffered handle (NO_BUFFERING rejects
   // unaligned lengths, same story as O_DIRECT).
   void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
-    const HANDLE use_h = fast_.direct && !fast_.use_iocp &&
+    const HANDLE use_h = file_.direct && !file_.use_iocp &&
                                  buf.size() % direct_align == 0
-                             ? fast_.h
-                             : h_plain_;
+                             ? file_.h()
+                             : file_.plain.get();
     std::size_t put = 0;
     while (put < buf.size()) {
       OVERLAPPED ov{};
@@ -422,8 +467,8 @@ class iocp_writer {
     if (prealloc_ > written) {
       LARGE_INTEGER n;
       n.QuadPart = static_cast<std::int64_t>(written);
-      if (::SetFilePointerEx(h_plain_, n, nullptr, FILE_BEGIN) == 0 ||
-          ::SetEndOfFile(h_plain_) == 0) {
+      if (::SetFilePointerEx(file_.plain.get(), n, nullptr, FILE_BEGIN) == 0 ||
+          ::SetEndOfFile(file_.plain.get()) == 0) {
         throw_winerr("SetEndOfFile(trim)");
       }
     }
@@ -446,7 +491,7 @@ class iocp_writer {
     const std::uint64_t o = st.off + from;
     ov.Offset = static_cast<DWORD>(o);
     ov.OffsetHigh = static_cast<DWORD>(o >> 32);
-    if (::WriteFile(fast_.h, st.src + from,
+    if (::WriteFile(file_.h(), st.src + from,
                     static_cast<DWORD>(st.len - from), nullptr, &ov) == 0 &&
         ::GetLastError() != ERROR_IO_PENDING) {
       throw_winerr("WriteFile(async)");
@@ -458,7 +503,7 @@ class iocp_writer {
     DWORD bytes = 0;
     ULONG_PTR key = 0;
     OVERLAPPED* pov = nullptr;
-    const BOOL ok = ::GetQueuedCompletionStatus(fast_.port, &bytes, &key,
+    const BOOL ok = ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key,
                                                 &pov, INFINITE);
     if (pov == nullptr) {
       throw_winerr("GetQueuedCompletionStatus");
@@ -477,13 +522,17 @@ class iocp_writer {
     }
   }
 
-  HANDLE h_plain_ = INVALID_HANDLE_VALUE;  // buffered+sync: tail, trim
-  win_fast_open fast_;
   std::vector<slot> slots_;
   std::vector<OVERLAPPED> ovs_;  // one per slot
   std::uint64_t prealloc_ = 0;
   unsigned outstanding_ = 0;
   std::string_view name_ = "writefile";
+  // Declared LAST so it is destroyed FIRST: the handles must close before
+  // ovs_ goes away. drain_cancelled() normally guarantees nothing is in
+  // flight by then, but it gives up early if the port itself has failed,
+  // and closing the handles is what cancels any request still holding an
+  // OVERLAPPED in that path.
+  win_file file_;  // plain (tail, trim) + fast reopen + IOCP port
 };
 
 // Definition-site conformance check (see uring_backend.hpp): fails here,
