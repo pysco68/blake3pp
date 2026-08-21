@@ -56,9 +56,13 @@ struct file_io_options {
   bool direct_io = true;
 };
 
-/// hash_file()'s knobs: the SIMD variant and optional key of the hasher it
-/// constructs, and the pipeline's window, queue depth and direct-I/O
-/// choice.
+/// hash_file()'s knobs: the pipeline's, plus what shapes the hasher it
+/// constructs internally.
+///
+/// Both structs spell the shared fields the same way so designated
+/// initializers read alike, and this one converts to file_io_options so a
+/// single options object can drive both entry points (a tool's
+/// --window/--qd/--no-direct flags land in one place).
 struct hash_file_options {
   /// The SIMD variant of the hasher.
   arch a = arch::auto_detect;

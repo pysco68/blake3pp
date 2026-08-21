@@ -105,7 +105,7 @@ enum class transpose16 : std::uint8_t {
 void set_transpose16(transpose16 strategy) noexcept;
 /// The strategy currently in effect.
 [[nodiscard]] transpose16 active_transpose16() noexcept;
-/// Races the transpose strategies over a 128 MiB working set and applies the
+/// Races the transpose strategies over default_tune_bytes and applies the
 /// winner process-wide.
 /// @return The winning strategy, now active.
 transpose16 tune_transpose16() noexcept;

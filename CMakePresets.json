@@ -89,9 +89,9 @@
       "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-msvc2026-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-msvc2026-cxx23.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_STANDARD": "23"
+        "CMAKE_BUILD_TYPE": "Release"
       },
       "condition": {
         "type": "equals",
@@ -104,11 +104,9 @@
       "displayName": "Windows clang-cl (VS LLVM toolset), C++23 (vcvars64 shell)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-clangcl-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-clangcl-cxx23.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_STANDARD": "23",
-        "CMAKE_C_COMPILER": "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl"
+        "CMAKE_BUILD_TYPE": "Release"
       },
       "condition": {
         "type": "equals",
@@ -121,11 +119,9 @@
       "displayName": "Windows arm64 cross (MSVC, scalar-only: xsimd lacks MSVC-arm64), vcvarsamd64_arm64 shell",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-arm64-msvc2026-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-msvc2026-cxx23.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_STANDARD": "23",
-        "CMAKE_SYSTEM_NAME": "Windows",
-        "CMAKE_SYSTEM_PROCESSOR": "ARM64"
+        "CMAKE_BUILD_TYPE": "Release"
       },
       "condition": {
         "type": "equals",
@@ -138,15 +134,9 @@
       "displayName": "Windows arm64 cross (clang-cl, full NEON), vcvarsamd64_arm64 shell",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-arm64-clangcl-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-clangcl-cxx23.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_STANDARD": "23",
-        "CMAKE_SYSTEM_NAME": "Windows",
-        "CMAKE_SYSTEM_PROCESSOR": "ARM64",
-        "CMAKE_C_COMPILER": "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl",
-        "CMAKE_C_COMPILER_TARGET": "arm64-pc-windows-msvc",
-        "CMAKE_CXX_COMPILER_TARGET": "arm64-pc-windows-msvc"
+        "CMAKE_BUILD_TYPE": "Release"
       },
       "condition": {
         "type": "equals",

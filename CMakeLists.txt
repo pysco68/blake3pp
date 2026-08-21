@@ -64,16 +64,52 @@ FetchContent_Populate(hfc
 FetchContent_GetProperties(hfc)
 list(APPEND CMAKE_MODULE_PATH "${hfc_SOURCE_DIR}/cmake")
 set(HFC_ENABLE_CMAKE_SBOM OFF CACHE BOOL "no SBOM generation for now")
+
+# hfc drives each dependency as an isolated sub-build whose proxy toolchain
+# include()s our CMAKE_TOOLCHAIN_FILE but forwards no other cache variables
+# unless they are named here. Without this list a compiler or standard chosen
+# outside a toolchain file reaches the blake3pp targets and nothing else, and
+# mimalloc/xsimd/doctest/CLI11/blake3_upstream quietly configure with CMake's
+# defaults instead -- on Windows that meant clang-cl on top of cl.exe-built
+# dependencies.
+set(HERMETIC_FETCHCONTENT_FORWARDED_CMAKE_VARIABLES
+  "CMAKE_PREFIX_PATH"
+  "CMAKE_BUILD_TYPE"
+  "CMAKE_DEBUG_POSTFIX"
+  "CMAKE_EXE_LINKER_FLAGS"
+  "CMAKE_C_COMPILER"
+  "CMAKE_C_FLAGS"
+  "CMAKE_C_COMPILE_FEATURES"
+  "CMAKE_C_EXTENSIONS"
+  "CMAKE_C_STANDARD"
+  "CMAKE_C_STANDARD_REQUIRED"
+  "CMAKE_CXX_COMPILER"
+  "CMAKE_CXX_FLAGS"
+  "CMAKE_CXX_COMPILE_FEATURES"
+  "CMAKE_CXX_COMPILER_IMPORT_STD"
+  "CMAKE_CXX_EXTENSIONS"
+  "CMAKE_CXX_SCAN_FOR_MODULES"
+  "CMAKE_CXX_STANDARD"
+  "CMAKE_CXX_STANDARD_REQUIRED"
+  "BUILD_SHARED_LIBS")
+
 include(HermeticFetchContent)
 
 include(StdFeatures)
 include(ArchKernels)
 
 add_library(blake3pp_warnings INTERFACE)
-if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-  # cl.exe: /W4 is the sane maximum (/Wall drowns in STL noise); clang-cl
-  # takes the GNU-style set below.
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  # MSVC-style drivers. /W4 is the sane maximum (/Wall drowns in STL noise),
+  # and clang-cl needs it for the same reason cl.exe does: its driver aliases
+  # the GNU spelling -Wall to /Wall, i.e. -Weverything, which buries the build
+  # in -Wc++98-compat noise about the C++23 the library is written in. /W4
+  # maps to -Wall -Wextra under clang-cl, so the two extra GNU-spelled flags
+  # below still add up to the set the GNU branch asks for.
   target_compile_options(blake3pp_warnings INTERFACE /W4)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_options(blake3pp_warnings INTERFACE -Wconversion -Wshadow)
+  endif()
 else()
   target_compile_options(blake3pp_warnings INTERFACE -Wall -Wextra -Wconversion -Wshadow)
 endif()
