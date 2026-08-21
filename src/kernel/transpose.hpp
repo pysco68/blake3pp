@@ -229,17 +229,55 @@ BLAKE3PP_FORCE_INLINE void store_transposed(const u32v (&w)[16],
   }
 }
 
+// Which SOURCE spelling reaches the one-instruction rotate is a property of
+// the compiler, not of the hardware. Measured for rot(d ^ a, N), the shape
+// g actually uses, at both 128- and 256-bit width:
+//
+//                       clang 22        GCC 14/16
+//   generic shift-or    1x pshufb       pslld+psrld+por
+//   byte shuffle        N=16: pshuflw+pshufhw    1x pshufb
+//                       N=8:  1x pshufb          1x pshufb
+//
+// Mirror images: LLVM canonicalizes the shift-or rotate idiom straight to
+// pshufb, but lowers OUR byte-shuffle to the 16-bit-lane pair for N==16
+// (both are legal; its cost model dislikes materializing the mask, even
+// though upstream's asm hoists exactly that mask out of the loop). GCC
+// never forms a shuffle from shift-or and needs the byte spelling. Neither
+// form is portable-optimal, so the choice is made here per compiler.
+// Forcing it with _mm256_shuffle_epi8 does NOT work: InstCombine folds a
+// constant-mask pshufb intrinsic back into a generic shuffle and lowers it
+// the same way. The split is stable across the clang range this project
+// builds with (18.1, 20.1 and 22 all lower both spellings identically),
+// so the predicate is a compiler-family choice, not a version workaround.
+//
+// Worth +4.0% avx2 and +4.2% sse42 on clang 22 / Zen 3+ (256 MiB, best of
+// 3, interleaved; the reference-kernel rows moved 0.8% over the same runs).
+// Not because it shrinks the loop; it does not: 1489 -> 1486 instructions,
+// because the freed pshuflw/pshufhw pair comes back as spills once the mask
+// occupies a register all loop long. What shortens is g's SERIAL chain, two
+// dependent shuffles down to one. Same lesson as the aarch64 sri escape:
+// on this kernel the metric is critical-path length, not instruction count.
+template <int N>
+constexpr bool prefer_byte_rot() noexcept {
+#if defined(__clang__) && \
+    (defined(__x86_64__) || defined(__i386__) || defined(_M_X64))
+  return N == 8;  // N == 16 is one instruction cheaper as generic shift-or
+#else
+  return N == 16 || N == 8;
+#endif
+}
+
 // Compile-time-amount rotate for the wide word: a single byte shuffle for
-// the 16- and 8-bit amounts where expressible, then the aarch64 shl+sri
-// pair, then the generic shift-or. The scalar word overload lives in
-// kernel.cpp.
+// the 16- and 8-bit amounts where that is the better spelling (above), then
+// the aarch64 shl+sri pair, then the generic shift-or. The scalar word
+// overload lives in kernel.cpp.
 // W is a defaulted template parameter (not read directly off u32v) so the
 // discarded constexpr branches stay dependent; non-dependent constructs in
 // a discarded branch are still instantiated.
 template <int N, std::size_t W = u32v::width>
 BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
-  if constexpr ((N == 16 || N == 8) && shuffle_backend::supports_byte_rot<W>) {
+  if constexpr (prefer_byte_rot<N>() && shuffle_backend::supports_byte_rot<W>) {
     return shuffle_backend::rot_bytes<N / 8, W>(a);
   }
 #endif
