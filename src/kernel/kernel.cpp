@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstring>
 #include <type_traits>
 #include <utility>
 
@@ -24,20 +25,27 @@ namespace {
 
 static_assert(u32v::width <= max_simd_degree);
 
-// Byte-wise little-endian load/store: endian-independent, and every compiler
-// folds it to a single mov on LE targets.
+// Little-endian load/store, spelled memcpy + byteswap rather than the
+// byte-wise shift-or idiom: GCC and Clang fold both spellings to a single
+// mov on LE targets, but MSVC 19.51 does not recognize the shift-or idiom
+// at all: it emitted the four movzx/shl/or per word verbatim, 10
+// instructions per message word in the scalar kernel's block loop. The
+// memcpy folds to one mov on every compiler; the byteswap arm keeps the
+// endian independence the old spelling had.
 BLAKE3PP_FORCE_INLINE std::uint32_t load32(const std::uint8_t* p) noexcept {
-  return static_cast<std::uint32_t>(p[0]) |
-         (static_cast<std::uint32_t>(p[1]) << 8) |
-         (static_cast<std::uint32_t>(p[2]) << 16) |
-         (static_cast<std::uint32_t>(p[3]) << 24);
+  std::uint32_t v;
+  std::memcpy(&v, p, sizeof v);
+  if constexpr (std::endian::native == std::endian::big) {
+    v = std::byteswap(v);
+  }
+  return v;
 }
 
 BLAKE3PP_FORCE_INLINE void store32(std::uint8_t* p, std::uint32_t v) noexcept {
-  p[0] = static_cast<std::uint8_t>(v);
-  p[1] = static_cast<std::uint8_t>(v >> 8);
-  p[2] = static_cast<std::uint8_t>(v >> 16);
-  p[3] = static_cast<std::uint8_t>(v >> 24);
+  if constexpr (std::endian::native == std::endian::big) {
+    v = std::byteswap(v);
+  }
+  std::memcpy(p, &v, sizeof v);
 }
 
 template <int N>
