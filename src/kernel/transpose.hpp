@@ -62,11 +62,11 @@ BLAKE3PP_FORCE_INLINE std::uint32_t ld32(const std::uint8_t* p) noexcept {
 // whole point is to use the scalar gather instead.
 template <class B, std::size_t W>
 BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
-                                        std::size_t offset,
-                                        u32v m[16]) noexcept {
+                                        std::size_t offset, u32v m[16],
+                                        [[maybe_unused]]
+                                        transpose16_mode mode) noexcept {
   using V = typename B::template reg<W>;
   if constexpr (W == 16) {
-    const transpose16_mode mode = t16_mode();
     if (mode == transpose16_mode::quartered) {
       // Quartered: 128-bit pieces land block-transposed by ADDRESSING;
       // registers only run the two in-lane stages.
@@ -121,10 +121,11 @@ BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
 // The mirror image: 16 wide words out to W lane-major 64-byte blocks.
 template <class B, std::size_t W>
 BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
-                                         std::uint8_t* out) noexcept {
+                                         std::uint8_t* out,
+                                         [[maybe_unused]]
+                                         transpose16_mode mode) noexcept {
   using V = typename B::template reg<W>;
   if constexpr (W == 16) {
-    const transpose16_mode mode = t16_mode();
     if (mode == transpose16_mode::quartered) {
       // Quartered mirror: two in-lane stages, then 128-bit pieces go to
       // their destinations by addressing (extract-stores).
@@ -183,12 +184,13 @@ BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
 // m[j][lane] = word j of inputs[lane] at byte offset `offset`.
 template <std::size_t W = u32v::width>
 BLAKE3PP_FORCE_INLINE void load_transposed(const std::uint8_t* const* inputs,
-                                           std::size_t offset,
-                                           u32v m[16]) noexcept {
+                                           std::size_t offset, u32v m[16],
+                                           [[maybe_unused]]
+                                           transpose16_mode mode) noexcept {
   namespace td = transpose_detail;
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
   if constexpr (shuffle_backend::supports<W>) {
-    if (td::shuffle_load<shuffle_backend, W>(inputs, offset, m)) {
+    if (td::shuffle_load<shuffle_backend, W>(inputs, offset, m, mode)) {
       return;
     }
   }
@@ -206,11 +208,13 @@ BLAKE3PP_FORCE_INLINE void load_transposed(const std::uint8_t* const* inputs,
 // 64 little-endian bytes at out + l*64, the mirror of load_transposed.
 template <std::size_t W = u32v::width>
 BLAKE3PP_FORCE_INLINE void store_transposed(const u32v (&w)[16],
-                                            std::uint8_t* out) noexcept {
+                                            std::uint8_t* out,
+                                            [[maybe_unused]]
+                                            transpose16_mode mode) noexcept {
   namespace td = transpose_detail;
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
   if constexpr (shuffle_backend::supports<W>) {
-    if (td::shuffle_store<shuffle_backend, W>(w, out)) {
+    if (td::shuffle_store<shuffle_backend, W>(w, out, mode)) {
       return;
     }
   }

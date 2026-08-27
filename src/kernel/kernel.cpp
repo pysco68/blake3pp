@@ -331,7 +331,7 @@ void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
     wide[j] = v[j] ^ v[j + 8];
     wide[j + 8] = v[j + 8] ^ u32v::broadcast(cv[j]);
   }
-  store_transposed(wide, out);
+  store_transposed(wide, out, transpose_detail::t16_mode());
 }
 
 void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
@@ -366,6 +366,12 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
 
   const auto [ctr_lo, ctr_hi] = counter_lanes(counter, increment_counter);
 
+  // Read the W==16 transpose dial ONCE per batch, not once per block. MSVC
+  // emits std::atomic<transpose16_mode>::load out of line, and a call in
+  // the block loop is an optimisation barrier that spills the whole wide
+  // state every iteration, measured as the entire AVX-512 width advantage.
+  const transpose16_mode t16 = transpose_detail::t16_mode();
+
   for (std::size_t b = 0; b < blocks; ++b) {
     std::uint32_t block_flags = flags;
     if (b == 0) {
@@ -376,7 +382,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     }
 
     u32v m[16];
-    load_transposed(inputs, b * block_len, m);
+    load_transposed(inputs, b * block_len, m, t16);
 
     u32v v[16];
     for (std::size_t j = 0; j < 8; ++j) {
