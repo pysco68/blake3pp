@@ -268,7 +268,13 @@ void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
                        std::uint32_t flags) noexcept {
   std::array<std::uint32_t, 16> out;
   compress(cv, block, len, counter, flags, out);
-  std::copy_n(out.begin(), 8, cv);
+  // A counted loop, not std::copy_n: MSVC lowers copy_n of 8 uint32_t to an
+  // out-of-line std::_Copy_memmove_n call rather than 32 bytes of inline
+  // moves, and in hash_many's block loop below that call lands in the
+  // innermost loop. clang-cl inlines it. Both inline the explicit loop.
+  for (std::size_t i = 0; i < 8; ++i) {
+    cv[i] = out[i];
+  }
 }
 
 void compress_xof(const std::uint32_t cv[8],
@@ -427,7 +433,9 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
   }
   for (; i < num_inputs; ++i) {
     std::array<std::uint32_t, 8> cv;
-    std::copy_n(key, 8, cv.begin());
+    for (std::size_t j = 0; j < 8; ++j) {
+      cv[j] = key[j];
+    }
     const std::uint64_t ctr = counter + (increment_counter ? i : 0);
     for (std::size_t b = 0; b < blocks; ++b) {
       std::uint32_t f = flags;
@@ -443,7 +451,9 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
       std::array<std::uint32_t, 16> wide;
       compress(cv.data(), inputs[i] + b * block_len, block_len, ctr, f,
                wide);
-      std::copy_n(wide.begin(), 8, cv.begin());
+      for (std::size_t j = 0; j < 8; ++j) {
+        cv[j] = wide[j];
+      }
     }
     for (std::size_t w = 0; w < 8; ++w) {
       store32(out + i * out_len + 4 * w, cv[w]);

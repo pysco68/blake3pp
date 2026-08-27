@@ -88,7 +88,11 @@ void hasher::push_cv(std::span<const std::uint32_t, 8> cv,
   assert(subtree_chunks > 0 && std::has_single_bit(subtree_chunks));
   assert(total_chunks % subtree_chunks == 0);
   std::array<std::uint32_t, 8> new_cv;
-  std::ranges::copy(cv, new_cv.begin());
+  // Counted loop rather than ranges::copy: the extent is 8 and MSVC still
+  // lowers the algorithm to an out-of-line memmove call here.
+  for (std::size_t i = 0; i < 8; ++i) {
+    new_cv[i] = cv[i];
+  }
   std::uint64_t chunks = total_chunks / subtree_chunks;
   while ((chunks & 1) == 0) {
     assert(cv_stack_len_ > 0);  // a sibling must be waiting for each merge

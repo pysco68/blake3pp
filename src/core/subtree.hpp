@@ -40,8 +40,13 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
               /*increment_counter=*/false, kern::flag_parent | base_flags, 0,
               0, out);
   if (num_children % 2 != 0) {
-    std::copy_n(child_cvs + (num_children - 1) * kern::out_len, kern::out_len,
-                out + num_parents * kern::out_len);
+    // kern::out_len is a compile-time constant; a counted loop keeps this
+    // inline on MSVC, which turns the algorithm call into memcpy.
+    const std::uint8_t* odd = child_cvs + (num_children - 1) * kern::out_len;
+    std::uint8_t* dst = out + num_parents * kern::out_len;
+    for (std::size_t i = 0; i < kern::out_len; ++i) {
+      dst[i] = odd[i];
+    }
     return num_parents + 1;
   }
   return num_parents;
