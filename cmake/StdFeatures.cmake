@@ -40,13 +40,43 @@ function(_blake3pp_probe var code)
   endif()
 endfunction()
 
-_blake3pp_probe(BLAKE3PP_HAS_STD_SIMD [[
+# The simd provider is an explicit choice with an auto default, mirroring
+# BLAKE3PP_EXECUTION_PROVIDER below:
+#   auto             - std::simd if the standard library ships one, else
+#                      std::experimental::simd, else xsimd
+#   std              - require C++26 <simd>
+#   std-experimental - require the Parallelism TS v2 <experimental/simd>
+#   xsimd            - skip the std probes entirely. The riscv64 toolchain
+#                      sets this: libstdc++ has no RVV ABI, so its
+#                      experimental::simd would pass the probe yet never
+#                      vectorize there.
+# Note the per-kernel FORCE_XSIMD pin (cmake/ArchKernels.cmake) is a
+# separate, narrower mechanism: it overrides the provider for single
+# kernel TUs (the SVE/RVV variants) regardless of this choice.
+set(BLAKE3PP_SIMD_PROVIDER "auto" CACHE STRING
+  "simd provider: auto, std, std-experimental, xsimd")
+set_property(CACHE BLAKE3PP_SIMD_PROVIDER
+  PROPERTY STRINGS auto std std-experimental xsimd)
+if(NOT BLAKE3PP_SIMD_PROVIDER MATCHES "^(auto|std|std-experimental|xsimd)$")
+  message(FATAL_ERROR "blake3pp: BLAKE3PP_SIMD_PROVIDER must be one of "
+    "auto, std, std-experimental, xsimd (got '${BLAKE3PP_SIMD_PROVIDER}')")
+endif()
+message(STATUS
+  "blake3pp: simd provider choice = ${BLAKE3PP_SIMD_PROVIDER}")
+
+if(BLAKE3PP_SIMD_PROVIDER MATCHES "^(auto|std)$")
+  _blake3pp_probe(BLAKE3PP_HAS_STD_SIMD [[
 #include <simd>
 int main() {
   std::simd::vec<unsigned, 8> v{};
   return static_cast<int>(v.size()) - 8;
 }
 ]])
+endif()
+if(BLAKE3PP_SIMD_PROVIDER STREQUAL "std" AND NOT BLAKE3PP_HAS_STD_SIMD)
+  message(FATAL_ERROR "blake3pp: BLAKE3PP_SIMD_PROVIDER=std, but this "
+    "standard library has no usable <simd> (see the probe above)")
+endif()
 
 _blake3pp_probe(BLAKE3PP_HAS_STD_SENDERS [[
 #include <execution>
@@ -61,7 +91,8 @@ int main() {
 # libstdc++) is complete enough for our facade at C++17 and up. libc++'s is
 # not: it hides behind -fexperimental-library and lacks the shift operators,
 # so this probe rightly fails there and xsimd takes over.
-if(NOT BLAKE3PP_HAS_STD_SIMD)
+if((BLAKE3PP_SIMD_PROVIDER STREQUAL "auto" AND NOT BLAKE3PP_HAS_STD_SIMD)
+   OR BLAKE3PP_SIMD_PROVIDER STREQUAL "std-experimental")
   _blake3pp_probe(BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD [[
 #include <experimental/simd>
 #include <cstdint>
@@ -79,6 +110,12 @@ int main() {
   return static_cast<int>(a[0]) - 56;
 }
 ]])
+endif()
+if(BLAKE3PP_SIMD_PROVIDER STREQUAL "std-experimental"
+   AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
+  message(FATAL_ERROR "blake3pp: BLAKE3PP_SIMD_PROVIDER=std-experimental, "
+    "but this standard library has no usable <experimental/simd> (see the "
+    "probe above)")
 endif()
 
 # ------------------------------------------------------ sender/receiver

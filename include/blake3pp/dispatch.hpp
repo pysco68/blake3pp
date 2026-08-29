@@ -52,6 +52,12 @@ enum class arch : std::uint8_t {
   sve2_256,
   /// AArch64 SVE2 at exactly 512 bits (opt-in build).
   sve2_512,
+  /// RISC-V RVV 1.0 at a vector length of exactly 128 bits.
+  rvv128,
+  /// RISC-V RVV 1.0 at exactly 256 bits.
+  rvv256,
+  /// RISC-V RVV 1.0 at exactly 512 bits.
+  rvv512,
 };
 
 /// True if the variant is compiled into this binary and the running CPU
@@ -99,7 +105,7 @@ enum class arch : std::uint8_t {
 [[nodiscard]] std::string_view execution_provider() noexcept;
 
 /// The strategy for the 16-lane message transpose used by every width-16
-/// kernel (avx512, sve512/sve2_512).
+/// kernel (avx512, sve512/sve2_512, rvv512).
 ///
 /// The right choice depends on the execution datapath (full-width or
 /// double-pumped), which no CPUID bit reports, and on where the input

@@ -282,6 +282,46 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
       endif()
     endif()
   endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64)$")
+  # Fixed-VLEN RVV 1.0 variants: -mrvv-vector-bits=zvl pins vscale (min
+  # AND max) to the -march zvl bound, so, exactly like SVE, each VLEN is
+  # its own kernel and dispatch exact-matches the runtime vlenb. The base
+  # build stays rv64gc (no global -march); only these TUs speak vector.
+  # FORCE_XSIMD because no std simd provider has an RVV ABI at all.
+  include(CheckCXXSourceCompiles)
+  # The constructs the kernel relies on: a fixed-vlen RVV type, bit_cast
+  # to/from a same-size GNU vector (the shuffle backend's currency), and
+  # a basic intrinsic round-trip.
+  set(_blake3pp_rvv_smoke [=[
+    #include <riscv_vector.h>
+    #include <bit>
+    #ifndef __riscv_v_fixed_vlen
+    #error "-mrvv-vector-bits=zvl did not fix the vlen"
+    #endif
+    typedef vuint32m1_t fixed_u32
+        __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen)));
+    typedef unsigned gnu_vec
+        __attribute__((vector_size(__riscv_v_fixed_vlen / 8)));
+    int main() {
+      fixed_u32 z = __riscv_vmv_v_x_u32m1(1u, __riscv_v_fixed_vlen / 32);
+      gnu_vec g = std::bit_cast<gnu_vec>(z);
+      fixed_u32 back = std::bit_cast<fixed_u32>(g);
+      return __riscv_vmv_x_s_u32m1_u32(back) == 1u ? 0 : 1;
+    }
+  ]=])
+  set(CMAKE_REQUIRED_FLAGS "-march=rv64gcv_zvl256b -mrvv-vector-bits=zvl")
+  check_cxx_source_compiles("${_blake3pp_rvv_smoke}"
+    BLAKE3PP_COMPILER_RVV_FIXED_VLEN)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(BLAKE3PP_COMPILER_RVV_FIXED_VLEN)
+    _blake3pp_fetch_xsimd()
+    blake3pp_add_kernel(rvv128 FORCE_XSIMD
+      ARCH_FLAGS -march=rv64gcv_zvl128b -mrvv-vector-bits=zvl)
+    blake3pp_add_kernel(rvv256 FORCE_XSIMD
+      ARCH_FLAGS -march=rv64gcv_zvl256b -mrvv-vector-bits=zvl)
+    blake3pp_add_kernel(rvv512 FORCE_XSIMD
+      ARCH_FLAGS -march=rv64gcv_zvl512b -mrvv-vector-bits=zvl)
+  endif()
 elseif(EMSCRIPTEN)
   # WASM SIMD128 is a module-level feature (engines reject SIMD-bearing
   # modules wholesale if unsupported), so this really is a compile-time choice

@@ -67,6 +67,17 @@
 #endif
 #endif
 
+#if defined(__riscv) && __riscv_xlen == 64 && defined(__linux__)
+// RVV probing: the auxv HWCAP bit for the single-letter 'V' extension
+// (bits 0-25 map A-Z), then the vlenb CSR for the vector length in bytes.
+// Reading a vector CSR needs V enabled at the ASSEMBLER level; the
+// .option push/arch/pop dance scopes that to one instruction so this
+// flag-neutral TU still builds as plain rv64gc, and the read only ever
+// EXECUTES behind the hwcap check, so a V-less CPU never sees it.
+#define BLAKE3PP_RISCV64_LINUX_RVV 1
+#include <sys/auxv.h>
+#endif
+
 namespace blake3pp {
 
 namespace kern {
@@ -106,8 +117,8 @@ constexpr std::size_t num_kernels = std::size(registry);
 constexpr arch all_enumerators[] = {
     arch::auto_detect, arch::avx512, arch::avx2,     arch::sse42,
     arch::sve2_512,    arch::sve512, arch::sve2_256, arch::sve256,
-    arch::sve2_128,    arch::neon,   arch::sve128,   arch::simd128,
-    arch::scalar};
+    arch::sve2_128,    arch::neon,   arch::sve128,   arch::rvv512,
+    arch::rvv256,      arch::rvv128, arch::simd128,  arch::scalar};
 constexpr std::span<const arch> preference =
     std::span{all_enumerators}.subspan(1);
 
@@ -242,6 +253,48 @@ bool sve_cpu_supports(arch a) noexcept {
 }
 #endif
 
+#if defined(BLAKE3PP_RISCV64_LINUX_RVV)
+struct rvv_state {
+  bool v = false;
+  unsigned long vlenb = 0;
+};
+
+const rvv_state& rvv_probe() noexcept {
+  static const rvv_state s = [] {
+    rvv_state st{};
+    // Single-letter ISA extensions occupy HWCAP bits 0-25 (A-Z).
+    if ((getauxval(AT_HWCAP) & (1UL << ('V' - 'A'))) != 0) {
+      unsigned long vlenb = 0;
+      asm(".option push\n\t"
+          ".option arch, +v\n\t"
+          "csrr %0, vlenb\n\t"
+          ".option pop"
+          : "=r"(vlenb));
+      st.v = vlenb != 0;
+      st.vlenb = vlenb;
+    }
+    return st;
+  }();
+  return s;
+}
+
+// Exact-match on the runtime vlenb, same reasoning as SVE: fixed-vlen
+// code pins vscale min AND max, and its whole-register moves are only
+// correct at exactly the compiled VLEN.
+bool rvv_cpu_supports(arch a) noexcept {
+  const rvv_state& s = rvv_probe();
+  if (!s.v) {
+    return false;
+  }
+  switch (a) {
+    case arch::rvv128: return s.vlenb == 16;
+    case arch::rvv256: return s.vlenb == 32;
+    case arch::rvv512: return s.vlenb == 64;
+    default:           return false;
+  }
+}
+#endif
+
 bool cpu_supports(arch a) noexcept {
   switch (a) {
     case arch::auto_detect:
@@ -267,6 +320,12 @@ bool cpu_supports(arch a) noexcept {
     case arch::sve2_512:
       return sve_cpu_supports(a);
 #endif
+#endif
+#if defined(BLAKE3PP_RISCV64_LINUX_RVV)
+    case arch::rvv128:
+    case arch::rvv256:
+    case arch::rvv512:
+      return rvv_cpu_supports(a);
 #endif
 #if defined(__wasm__)
     case arch::simd128:
@@ -369,6 +428,12 @@ const char* to_string(arch a) noexcept {
       return "sve2_256";
     case arch::sve2_512:
       return "sve2_512";
+    case arch::rvv128:
+      return "rvv128";
+    case arch::rvv256:
+      return "rvv256";
+    case arch::rvv512:
+      return "rvv512";
   }
   return "unknown";
 }

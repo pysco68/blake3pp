@@ -25,6 +25,16 @@
       }
     },
     {
+      "name": "linux-riscv64-gcc15-cxx23",
+      "displayName": "riscv64 Linux cross (GCC 15, C++23, runs via qemu-user)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-riscv64-gcc15-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-gcc15-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
       "name": "wasm32-emcc-cxx23",
       "displayName": "WebAssembly (Emscripten, SIMD128 + threads, runs via node)",
       "generator": "Ninja",
@@ -155,6 +165,10 @@
       "configurePreset": "linux-arm64-gcc15-cxx23"
     },
     {
+      "name": "linux-riscv64-gcc15-cxx23",
+      "configurePreset": "linux-riscv64-gcc15-cxx23"
+    },
+    {
       "name": "wasm32-emcc-cxx23",
       "configurePreset": "wasm32-emcc-cxx23"
     },
@@ -232,6 +246,13 @@
     {
       "name": "linux-arm64-gcc15-cxx23",
       "configurePreset": "linux-arm64-gcc15-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-riscv64-gcc15-cxx23",
+      "configurePreset": "linux-riscv64-gcc15-cxx23",
       "output": {
         "outputOnFailure": true
       }
