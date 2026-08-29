@@ -19,8 +19,8 @@ Everything runs from the repository root.
 A fat binary raises the same questions on every compiler and
 architecture: did the vector kernel vectorize, did the facade inline or
 leave a call soup, does anything outside the kernels use an instruction
-the dispatch verdict does not gate. `objscan.py` answers them from the
-disassembly.
+the dispatch verdict does not gate, whose address is that in the
+emulator's trace. `objscan.py` answers them from the disassembly.
 
 It reads ELF, Mach-O and PE/COFF (objects and linked binaries) and picks
 the disassembler for the target: the prefixed GNU binutils in the cross
@@ -46,6 +46,9 @@ tools/objscan.py find build/linux-gcc16-cxx26/cli/blake3ppsum '^v[a-z]' -x 'kern
 
 # The disassembly of one function.
 tools/objscan.py disasm BIN 'kern::sve256::.*hash_batch'
+
+# Whose address is that? (qemu -d in_asm prints load-biased addresses.)
+tools/objscan.py resolve build/linux-riscv64-gcc15-cxx23/cli/blake3ppsum 0x5555556a0b2c --bias 0x555555554000
 ```
 
 `quality` is the check that catches the two classic failures: a compiler
@@ -66,7 +69,7 @@ tools/objscan.py audit build/<preset> [--binary build/<preset>/cli/blake3ppsum]
 `kernel-audit.json` states, per architecture and kernel variant, the
 instruction class the variant must contain, the classes it must not
 (the dispatch verdict does not gate them: no AVX-512 in the avx2 kernel,
-no SVE in the neon kernel), the quality thresholds for
+no SVE in the neon kernel, no Zvbb in the plain rvv kernels), the quality thresholds for
 the hot functions (no call outside the allow-list, a loop budget, a
 minimum vector count in the widest function), and the classes that must
 not appear in the linked binary outside the kernels that own them. A
@@ -74,7 +77,7 @@ rule matches an instruction by mnemonic or by operand text; `all: true`
 asks for both.
 
 Adding a kernel variant: add a `variants` entry under its architecture,
-with a `match` regex against the variant name (`sve\d+`, `sve2_\d+`),
+with a `match` regex against the variant name (`sve\d+`, `rvv\d+_zvbb`),
 and extend the neighbouring variants' `forbid` lists if the new
 instruction class must stay out of them. The audit reports a variant
 without a rule and does not fail on it.

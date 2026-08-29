@@ -4,7 +4,8 @@
 The questions a fat binary keeps raising, answered from the disassembly
 rather than from the compiler's flags: did the vector kernel actually
 vectorize, did the facade inline or leave a call soup behind, which
-functions use an instruction the dispatch verdict does not gate.
+functions use an instruction the dispatch verdict does not gate, whose
+address is that in the emulator's trace.
 
     tools/objscan.py mnemonics BIN [--all] [--per-function] [-x RE]
         Histogram of the vector mnemonics in BIN (--all: every mnemonic),
@@ -23,6 +24,10 @@ functions use an instruction the dispatch verdict does not gate.
         block loop and little else), calls that survived inlining (with
         their callees; anything outside --allow is an inlining failure)
         and vector traffic through the stack frame (spills).
+    tools/objscan.py resolve BIN ADDR [--bias HEX]
+        The symbol and source line at ADDR; --bias subtracts the load
+        address of a position-independent executable, as reported by a
+        qemu trace or a core.
     tools/objscan.py audit BUILD_DIR [--binary BIN] [--rules FILE]
         The CI assertion, driven by tools/kernel-audit.json: every kernel
         object under BUILD_DIR contains the instruction class its variant
@@ -53,10 +58,10 @@ import sys
 
 # ---------------------------------------------------------------- formats
 
-ELF_MACHINES = {62: "x86_64", 183: "aarch64"}
+ELF_MACHINES = {62: "x86_64", 183: "aarch64", 243: "riscv64"}
 PE_MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64"}
 MACHO_CPUTYPES = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
-BINUTILS_PREFIX = {"aarch64": "aarch64-linux-gnu-"}
+BINUTILS_PREFIX = {"aarch64": "aarch64-linux-gnu-", "riscv64": "riscv64-linux-gnu-"}
 
 
 def identify(path):
@@ -89,6 +94,7 @@ def identify(path):
 
 # llvm-objdump decodes only its default CPU's instructions on these targets.
 LLVM_FLAGS = {
+    "riscv64": ["--mattr=+v,+zvbb"],
 }
 
 
@@ -154,18 +160,28 @@ def disassemble(path, objdump, arch):
             continue
         m = FUNC.match(line)
         if m:
-            current = m.group("gnu") or m.group("bare")
-            functions.setdefault(current, [])
+            name = m.group("gnu") or m.group("bare")
+            # Local labels (RISC-V keeps .L* for relaxation, llvm's Mach-O
+            # writer emits ltmp*) are not function boundaries.
+            if current is None or not re.match(r"\.L|ltmp\d+$|\$[xd]$", name):
+                current = name
+                functions.setdefault(current, [])
             last = None
             continue
         m = RELOC.match(line)
-        if m and last is not None:
+        if m and last is not None and not m.group(1).startswith("*"):  # *ABS* is R_RISCV_RELAX's
             last.callee = m.group(1)
     names = demangle({i.callee for fns in functions.values() for i in fns if i.callee})
     for fns in functions.values():
+        prev = None
         for insn in fns:
             if insn.callee in names:
                 insn.callee = names[insn.callee]
+            # RISC-V's call is an auipc/jalr pair whose relocation sits on
+            # the auipc; the jalr takes it over.
+            if insn.callee is None and prev is not None and prev.mnemonic == "auipc" and prev.callee:
+                insn.callee = prev.callee
+            prev = insn
     return functions
 
 
@@ -217,24 +233,29 @@ def branch_target(insn):
 # ---------------------------------------------------------- architectures
 
 # Vector classification: (mnemonic regex, operand regex); either match
-# counts: x86 and arm64 name their vector registers.
+# counts. x86 and arm64 name their vector registers, the others prefix
+# the mnemonic.
 VECTOR = {
     "x86_64": (r"^v[a-z]", r"\b[xyz]mm\d+\b"),
     "aarch64": (None, r"\b[vzq]\d+\b|\bp\d+/[mz]"),
+    "riscv64": (r"^(th\.)?v[a-z]", None),
 }
 # Control flow inside a function (loops) and out of it (calls).
 BRANCH = {
     "x86_64": r"^j",
     "aarch64": r"^(b(\.\w+)?|cbn?z|tbn?z)$",
+    "riscv64": r"^(c\.)?(b[a-z]*|j)$",
 }
 CALL = {
     "x86_64": r"^call",
     "aarch64": r"^blr?$",
+    "riscv64": r"^(jalr?|call)$",
 }
 # A memory operand through the stack pointer (or the frame pointer).
 STACK = {
     "x86_64": r"\(%r[sb]p\)|\[r[sb]p\b",
     "aarch64": r"\[(sp|x29)\b",
+    "riscv64": r"\((sp|s0)\)",
 }
 
 
@@ -383,6 +404,29 @@ def cmd_quality(args):
             print(f"{'':20}   unexpected call: {c} x{n}")
 
 
+def cmd_resolve(args):
+    arch, fmt = identify(args.binary)
+    addr = int(args.address, 16) - (int(args.bias, 16) if args.bias else 0)
+    nm = subprocess.run([tool(arch, fmt, "nm", None), "-C", "-n", "--defined-only", args.binary],
+                        capture_output=True, text=True, check=True).stdout
+    best = None
+    for line in nm.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) < 3 or parts[1].lower() not in "tw":
+            continue
+        start = int(parts[0], 16)
+        if start <= addr:
+            best = (start, parts[2])
+    if best:
+        print(f"{addr:#x} = {best[1]} + {addr - best[0]:#x}")
+    else:
+        print(f"{addr:#x}: no text symbol at or before this address")
+    a2l = subprocess.run([tool(arch, fmt, "addr2line", None), "-f", "-C", "-i", "-e", args.binary, f"{addr:#x}"],
+                         capture_output=True, text=True).stdout.strip()
+    if a2l and not a2l.startswith("??"):
+        print(a2l)
+
+
 # ------------------------------------------------------------------ audit
 
 def rule_hits(insns, rule):
@@ -507,6 +551,9 @@ def main():
     p.add_argument("--hot", metavar="RE", default=HOT, help="functions to measure")
     p.add_argument("--allow", metavar="RE", default=ALLOW, help="callees that are not inlining failures")
     p.set_defaults(fn=cmd_quality)
+    p = sub.add_parser("resolve"); p.add_argument("binary"); p.add_argument("address")
+    p.add_argument("--bias", help="load address to subtract (PIE)")
+    p.set_defaults(fn=cmd_resolve)
     p = sub.add_parser("audit"); p.add_argument("build_dir")
     p.add_argument("--binary", help="a linked binary for the outside-the-kernels checks")
     p.add_argument("--rules", help="rules file (default: tools/kernel-audit.json)")

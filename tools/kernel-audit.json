@@ -53,5 +53,26 @@
     "binary": [
       { "name": "SVE", "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]", "outside": "kern::sve" }
     ]
+  },
+  "riscv64": {
+    "variants": [
+      { "match": "scalar",
+        "forbid": [ { "name": "vector", "mnemonic": "^(th\\.)?v[a-z]" } ] },
+      { "match": "rvv\\d+",
+        "require": { "name": "RVV", "mnemonic": "^v[a-z]" },
+        "forbid": [ { "name": "Zvbb", "mnemonic": "^v(ror|rol|andn|brev8?|rev8|clz|ctz|cpop|wsll)\\." },
+                    { "name": "XTheadVector", "mnemonic": "^th\\." } ] },
+      { "match": "rvv\\d+_zvbb",
+        "require": { "name": "Zvbb rotates", "mnemonic": "^vro[rl]\\.", "min": 50 },
+        "forbid": [ { "name": "XTheadVector", "mnemonic": "^th\\." } ] },
+      { "match": "xthead",
+        "require": { "name": "XTheadVector", "mnemonic": "^th\\.v" },
+        "quality": { "min_vector": 400 },
+        "forbid": [ { "name": "RVV 1.0", "mnemonic": "^v(setvli|setivli|le\\d+|se\\d+|ror|rol|mv)\\." } ] }
+    ],
+    "binary": [
+      { "name": "vector", "mnemonic": "^(th\\.)?v[a-z]",
+        "outside": "kern::(rvv|xthead)|cpu_detect|vsetvli|detail::(riscv|test)" }
+    ]
   }
 }
