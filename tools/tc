@@ -19,7 +19,8 @@ REGISTRY="${BLAKE3PP_TC_REGISTRY:-ghcr.io/pysco68/blake3pp}"
 TAG="${BLAKE3PP_TC_TAG:-latest}"
 WORKDIR=/workspaces/blake3pp
 
-ALL_IMAGES=(gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 zig emscripten)
+ALL_IMAGES=(gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 riscv64-gcc15
+            zig emscripten)
 
 die() { echo "tc: $*" >&2; exit 1; }
 
@@ -35,6 +36,7 @@ image_for() {
     linux-clang20-*)      echo clang20 ;;
     linux-clang22-*)      echo clang22 ;;
     linux-arm64-gcc15-*)  echo arm64-gcc15 ;;
+    linux-riscv64-gcc15-*) echo riscv64-gcc15 ;;
     *zigmusl*)            echo zig ;;
     wasm32-*)             echo emscripten ;;
     windows-*)            die "windows presets are not containerized (build them natively or in CI)" ;;

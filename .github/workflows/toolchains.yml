@@ -61,6 +61,7 @@ jobs:
           - { target: clang20,     rel: "2404" }
           - { target: clang22,     rel: "2604" }
           - { target: arm64-gcc15, rel: "2604" }
+          - { target: riscv64-gcc15, rel: "2604" }
           - { target: zig,         rel: "2604" }
           - { target: emscripten,  rel: "2604" }
     steps:

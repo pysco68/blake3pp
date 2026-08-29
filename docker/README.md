@@ -22,6 +22,7 @@ unsupported and unneeded.
 | `toolchain-clang20` | 24.04 | 2.39 | `linux-clang20-*` | g++-14 tree; clang from apt.llvm.org noble-20 |
 | `toolchain-clang22` | 26.04 | ~2.42 | `linux-clang22-*` (incl. asan/tsan/msan/fuzzer/coverage/cxx2c) | g++-16 tree, libfuzzer/libomp, gdb, valgrind, Intel SDE, **/opt/libcxx-msan** |
 | `toolchain-arm64-gcc15` | 26.04 | (aarch64 sysroot) | `linux-arm64-gcc15-*` | qemu-aarch64 |
+| `toolchain-riscv64-gcc15` | 26.04 | (riscv64 sysroot) | `linux-riscv64-gcc15-*` | qemu-riscv64 (RVV 1.0, `QEMU_CPU=max,vlen=<bits>`) |
 | `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*`, `tools/make-release.sh` | qemu-aarch64, aarch64 strip, prewarmed zig cache |
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
 

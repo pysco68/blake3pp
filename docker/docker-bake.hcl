@@ -35,7 +35,8 @@ variable "NINJA_VERSION" { default = "1.13.2" }
 variable "ZIG_VERSION"   { default = "0.16.0" }
 
 group "default" {
-  targets = ["base", "gcc", "clang", "arm64-gcc15", "zig", "emscripten"]
+  targets = ["base", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "zig",
+             "emscripten"]
 }
 
 # One recipe instantiated per release. Pushed too (cheap) so CI matrix jobs
@@ -97,6 +98,13 @@ target "arm64-gcc15" {
   dockerfile = "docker/arm64-gcc15.Dockerfile"
   contexts   = { base = "target:base-2604" }
   tags       = tc_tags("arm64-gcc15")
+}
+
+target "riscv64-gcc15" {
+  context    = "."
+  dockerfile = "docker/riscv64-gcc15.Dockerfile"
+  contexts   = { base = "target:base-2604" }
+  tags       = tc_tags("riscv64-gcc15")
 }
 
 target "zig" {

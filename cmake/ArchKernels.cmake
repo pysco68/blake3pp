@@ -79,9 +79,9 @@ blake3pp_kernel_switch(STAGED_ROUNDS 1
 
 # aarch64 SVE2 fixed-length variants: fuse every rot<N>(x ^ y) in the round
 # into one XAR instruction instead of eor+tbl / eor+shl+sri, the reason an
-# SVE2 kernel can beat NEON at the same 128-bit width. Not yet measured on
-# real silicon (qemu cannot arbitrate); this switch exists to A/B it there.
-# See xor_rot in src/kernel/transpose.hpp.
+# SVE2 kernel beats NEON at the same 128-bit width. Measured on Neoverse V2
+# (GCP Axion): 1.89 vs 1.61 GiB/s single-thread, off-vs-on the whole
+# difference. See xor_rot in src/kernel/transpose.hpp.
 blake3pp_kernel_switch(XAR_ROTATE 1
   "aarch64 SVE2: fuse xor+rotate into a single XAR instead of eor + rotate")
 

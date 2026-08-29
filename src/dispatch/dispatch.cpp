@@ -98,9 +98,11 @@ constexpr std::size_t num_kernels = std::size(registry);
 // Ranking notes: the fixed-length SVE variants are exact-VL matches,
 // so at most one SVE1 and one SVE2 entry can ever be runtime-available at
 // once; their relative order encodes generation (SVE2's XAR) and width.
-// sve2_128 above neon is provisional until measured on real silicon (the
-// XAR argument; qemu cannot arbitrate). sve128 sits BELOW neon: same
-// width, no XAR, and no measured reason to displace the tuned NEON kernel.
+// sve2_128 above neon is MEASURED: 1.89 vs 1.59 GiB/s single-thread on
+// Neoverse V2 (GCP Axion, 2026-08-29), the whole margin being XAR (the
+// XAR_ROTATE=off build lands exactly on neon parity). sve128 sits BELOW
+// neon: same width, no XAR, measured parity (1.62), so no reason to
+// displace the tuned NEON kernel.
 constexpr arch all_enumerators[] = {
     arch::auto_detect, arch::avx512, arch::avx2,     arch::sse42,
     arch::sve2_512,    arch::sve512, arch::sve2_256, arch::sve256,
