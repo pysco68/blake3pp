@@ -1,15 +1,18 @@
 # tools/
 
-Scripts around the build: the toolchain matrix and the binary inspection
-the fat-binary design keeps needing. Everything runs from the repository
-root.
+Scripts around the build: the toolchain matrix, the release packaging,
+and the binary inspection the fat-binary design keeps needing.
+Everything runs from the repository root.
 
 | Script | Purpose |
 | --- | --- |
+| `tc` | Run a CMake preset inside its per-compiler toolchain image (`tools/tc <preset>`, `tools/tc --shell <preset>`, `tools/tc --list`). |
 | `gen-toolchains.py` | Regenerate the CMake toolchain files under `cmake/toolchains/` for the whole matrix. |
+| `make-release.sh` | Assemble the static Linux release archives. |
 | `build-msan-libcxx.sh` | Build the MemorySanitizer-instrumented libc++ the msan preset links. |
 | `gen-test-vectors.py` | Turn the official BLAKE3 `test_vectors.json` into the C++ header the tests include. |
-| `objscan.py` | Look inside a built object or binary: instruction classes and code-generation quality. |
+| `objscan.py` | Look inside a built object or binary: instruction classes, code-generation quality, and the kernel audit. |
+| `kernel-audit.json` | The rules `objscan.py audit` enforces. |
 
 ## objscan.py
 
@@ -42,7 +45,7 @@ tools/objscan.py quality build/windows-msvc2026-cxx23/CMakeFiles/blake3pp_kernel
 tools/objscan.py find build/linux-gcc16-cxx26/cli/blake3ppsum '^v[a-z]' -x 'kern::(avx2|avx512)' --fail
 
 # The disassembly of one function.
-tools/objscan.py disasm BIN 'kern::avx2::.*hash_many'
+tools/objscan.py disasm BIN 'kern::sve256::.*hash_batch'
 ```
 
 `quality` is the check that catches the two classic failures: a compiler
@@ -53,3 +56,25 @@ unrolled (a rolled kernel has a tenth of the vector instructions and one
 more loop). The stack-vector column counts vector loads and stores
 through the stack pointer; the transposed message blocks legitimately
 live there, so read it as a trend across compilers, not as an assertion.
+
+### The audit
+
+```sh
+tools/objscan.py audit build/<preset> [--binary build/<preset>/cli/blake3ppsum]
+```
+
+`kernel-audit.json` states, per architecture and kernel variant, the
+instruction class the variant must contain, the classes it must not
+(the dispatch verdict does not gate them: no AVX-512 in the avx2 kernel,
+no SVE in the neon kernel), the quality thresholds for
+the hot functions (no call outside the allow-list, a loop budget, a
+minimum vector count in the widest function), and the classes that must
+not appear in the linked binary outside the kernels that own them. A
+rule matches an instruction by mnemonic or by operand text; `all: true`
+asks for both.
+
+Adding a kernel variant: add a `variants` entry under its architecture,
+with a `match` regex against the variant name (`sve\d+`, `sve2_\d+`),
+and extend the neighbouring variants' `forbid` lists if the new
+instruction class must stay out of them. The audit reports a variant
+without a rule and does not fail on it.

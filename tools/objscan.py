@@ -23,6 +23,12 @@ functions use an instruction the dispatch verdict does not gate.
         block loop and little else), calls that survived inlining (with
         their callees; anything outside --allow is an inlining failure)
         and vector traffic through the stack frame (spills).
+    tools/objscan.py audit BUILD_DIR [--binary BIN] [--rules FILE]
+        The CI assertion, driven by tools/kernel-audit.json: every kernel
+        object under BUILD_DIR contains the instruction class its variant
+        promises and nothing above it, its hot functions pass the quality
+        thresholds, and (with --binary) the linked binary carries nothing
+        above the baseline outside the kernels. Exit 1 on any failure.
 
 Runs on Linux, macOS and Windows: ELF, Mach-O and PE/COFF are recognised
 from their headers. The disassembler is the target-prefixed GNU binutils
@@ -37,6 +43,7 @@ on whole names.
 import argparse
 import collections
 import glob
+import json
 import os
 import re
 import shutil
@@ -376,8 +383,112 @@ def cmd_quality(args):
             print(f"{'':20}   unexpected call: {c} x{n}")
 
 
+# ------------------------------------------------------------------ audit
+
+def rule_hits(insns, rule):
+    """Instructions matching a rule: {"mnemonic": RE} and/or {"operand": RE},
+    either sufficing unless "all" asks for both."""
+    mn = re.compile(rule["mnemonic"]) if "mnemonic" in rule else None
+    op = re.compile(rule["operand"]) if "operand" in rule else None
+    both = rule.get("all", False)
+    n = 0
+    for insn in insns:
+        a = mn is not None and mn.search(insn.mnemonic) is not None
+        b = op is not None and op.search(insn.operands) is not None
+        if (a and b) if both else (a or b):
+            n += 1
+    return n
+
+
+def kernel_objects(build_dir):
     """(variant, object) for every kernel object under a build tree
     (multi-config generators add a configuration directory)."""
+    found = []
+    for obj in glob.glob(os.path.join(build_dir, "CMakeFiles", "blake3pp_kernel_*.dir", "**", "*kernel.cpp.o*"),
+                         recursive=True):
+        found.append((re.search(r"blake3pp_kernel_([^/\\]+)\.dir", obj).group(1), obj))
+    return sorted(found)
+
+
+def verdict(ok):
+    return "OK  " if ok else "FAIL"
+
+
+def cmd_audit(args):
+    rules_path = args.rules or os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel-audit.json")
+    with open(rules_path) as fh:
+        rules = json.load(fh)
+    objects = kernel_objects(args.build_dir)
+    if not objects:
+        sys.exit(f"objscan: no kernel objects under {args.build_dir}")
+    quality = rules.get("quality", {})
+    hot, allow = quality.get("hot", HOT), quality.get("allow_calls", ALLOW)
+    failures = 0
+    arch = None
+    for variant, obj in objects:
+        arch, functions = load(obj, args.objdump)
+        insns = [i for fn in functions.values() for i in fn]
+        per_arch = rules.get(arch, {})
+        spec = next((s for s in per_arch.get("variants", []) if re.fullmatch(s["match"], variant)), None)
+        if spec is None:
+            print(f"  {variant:<12} {len(insns):6d} insns  (no rule for {variant} on {arch})")
+            continue
+        ok, notes = True, []
+        req = spec.get("require")
+        if req:
+            n = rule_hits(insns, req)
+            need = req.get("min", rules.get("min_vector_instructions", 500))
+            good = n >= need
+            ok &= good
+            notes.append(f"{req['name']}: {n} ({'>=' if good else '<'} {need})")
+        for forbid in spec.get("forbid", []):
+            n = rule_hits(insns, forbid)
+            ok &= n == 0
+            notes.append(f"no {forbid['name']}: {n}")
+        print(f"  {variant:<12} {len(insns):6d} insns  {verdict(ok)}  {'; '.join(notes)}")
+        failures += not ok
+        limits = {**quality, **spec.get("quality", {})}
+        rows = list(quality_rows(arch, functions, hot, allow))
+        # A sanitizer or coverage runtime in the callees means instrumented
+        # code: its check blocks branch back into the fast path by the
+        # hundred, so the loop budget does not apply.
+        instrumented = any(re.match(r"_?__(asan|hwasan|ubsan|tsan|msan|sanitizer|gcov|llvm)_", c)
+                           for _, q in rows for c in q["calls"])
+        for fn, q in rows:
+            good = not q["unexpected"] and (instrumented or q["loops"] <= limits.get("max_loops", 24))
+            print(f"    {verdict(good)} {format_row(short(fn).split('::')[-1], q)}")
+            for c, n in q["unexpected"].most_common():
+                print(f"{'':11}unexpected call: {c} x{n}")
+            for site in q["indirect"]:
+                print(f"{'':11}indirect call site: {site}")
+            failures += not good
+        if instrumented:
+            print(f"    {'':4} instrumented (sanitizer or coverage runtime called): loop budget not applied")
+        if req and rows:
+            # The unrolled core: the hot function carrying the most vector
+            # instructions (the others may be drivers around it).
+            widest = max(q["vector"] for _, q in rows)
+            need = limits.get("min_vector", 500)
+            print(f"    {verdict(widest >= need)} widest hot function: {widest} vector instructions ({'>=' if widest >= need else '<'} {need})")
+            failures += widest < need
+    if args.binary:
+        arch, functions = load(args.binary, args.objdump)
+        for check in rules.get(arch, {}).get("binary", []):
+            outside = re.compile(check["outside"])
+            hits = collections.Counter()
+            for fn, insns in functions.items():
+                if not outside.search(fn):
+                    n = rule_hits(insns, check)
+                    if n:
+                        hits[fn] += n
+            failures += bool(hits)
+            print(f"  {os.path.basename(args.binary):<12} {verdict(not hits)}  no {check['name']} outside /{check['outside']}/"
+                  + ("" if not hits else ": " + ", ".join(f"{short(fn)} x{n}" for fn, n in hits.most_common(5))))
+    print(f"kernel audit: {args.build_dir} ({arch}): {'FAILED, ' + str(failures) + ' finding(s)' if failures else 'OK'}")
+    if failures:
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--objdump", help="disassembler to use instead of the one chosen from the file header")
@@ -396,6 +507,10 @@ def main():
     p.add_argument("--hot", metavar="RE", default=HOT, help="functions to measure")
     p.add_argument("--allow", metavar="RE", default=ALLOW, help="callees that are not inlining failures")
     p.set_defaults(fn=cmd_quality)
+    p = sub.add_parser("audit"); p.add_argument("build_dir")
+    p.add_argument("--binary", help="a linked binary for the outside-the-kernels checks")
+    p.add_argument("--rules", help="rules file (default: tools/kernel-audit.json)")
+    p.set_defaults(fn=cmd_audit)
     args = ap.parse_args()
     args.fn(args)
 

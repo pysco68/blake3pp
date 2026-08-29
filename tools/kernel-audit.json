@@ -1,0 +1,57 @@
+{
+  "_comment": [
+    "Rules for `tools/objscan.py audit`. Per architecture: one entry per",
+    "kernel variant (match: a regex against the variant name), each with a",
+    "required instruction class (min defaults to min_vector_instructions)",
+    "and classes that must not appear, since the dispatch verdict does not",
+    "gate them; and checks on the linked binary, where the class must not",
+    "appear outside the functions matching `outside`. A rule matches an",
+    "instruction by mnemonic or by operand text (either suffices; all: true",
+    "asks for both). The quality thresholds apply to the hot kernel",
+    "functions: no call outside allow_calls (an inlining failure), at most",
+    "max_loops backward branches, and in the wide entry points at least",
+    "min_vector vector instructions (a rolled round loop has a tenth)."
+  ],
+  "min_vector_instructions": 500,
+  "quality": {
+    "hot": "::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof)\\(",
+    "allow_calls": "^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck|__asan_\\w+|__hwasan_\\w+|__ubsan_\\w+|__tsan_\\w+|__msan_\\w+|__sanitizer_\\w+|__gcov\\w*|__llvm_\\w+)$|kern::\\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\\(",
+    "max_loops": 24,
+    "min_vector": 500
+  },
+  "x86_64": {
+    "variants": [
+      { "match": "scalar",
+        "forbid": [ { "name": "VEX or AVX-512", "mnemonic": "^v[a-z]", "operand": "\\b[yz]mm\\d|%?k[0-7]\\b" } ] },
+      { "match": "sse42",
+        "require": { "name": "xmm", "operand": "\\bxmm\\d+" },
+        "forbid": [ { "name": "VEX or AVX-512", "mnemonic": "^v[a-z]", "operand": "\\b[yz]mm\\d|%?k[0-7]\\b" } ] },
+      { "match": "avx2",
+        "require": { "name": "ymm", "operand": "\\bymm\\d+" },
+        "forbid": [ { "name": "AVX-512", "operand": "\\bzmm\\d|%?k[0-7]\\b" } ] },
+      { "match": "avx512",
+        "require": { "name": "zmm", "operand": "\\bzmm\\d+" } }
+    ],
+    "binary": [
+      { "name": "VEX or AVX-512", "mnemonic": "^v[a-z]", "operand": "\\b[yz]mm\\d",
+        "outside": "kern::(avx2|avx512)::|_avx|_evex" }
+    ]
+  },
+  "aarch64": {
+    "variants": [
+      { "match": "scalar",
+        "forbid": [ { "name": "SVE", "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]" } ] },
+      { "match": "neon",
+        "require": { "name": "NEON", "operand": "\\bv\\d+\\b" },
+        "forbid": [ { "name": "SVE", "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]" } ] },
+      { "match": "sve\\d+",
+        "require": { "name": "SVE", "operand": "\\bz\\d+\\b" },
+        "forbid": [ { "name": "SVE2", "mnemonic": "^(xar|eor3|bcax)$", "operand": "\\bz\\d+\\b", "all": true } ] },
+      { "match": "sve2_\\d+",
+        "require": { "name": "SVE2 (xar, eor3)", "mnemonic": "^(xar|eor3|bcax)$", "operand": "\\bz\\d+\\b", "all": true, "min": 50 } }
+    ],
+    "binary": [
+      { "name": "SVE", "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]", "outside": "kern::sve" }
+    ]
+  }
+}
