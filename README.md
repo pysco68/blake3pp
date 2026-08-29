@@ -194,11 +194,12 @@ assert(blake3pp::available_arches().front() == blake3pp::best_available());
 Requesting a variant the CPU can't run silently falls back to the best
 available one; `is_available()` tells you beforehand.
 
-On AVX-512 machines one more dial exists: the 16-lane message transpose
-has three implementation strategies, and which is fastest is not
-predictable from the CPU. It depends on whether the AVX-512 datapath is
-full-width or double-pumped (no CPUID bit reports that) and, on the
-same machine, on whether the input fits in cache. Measured:
+On machines with a width-16 kernel (AVX-512; SVE-512 on ARM) one more
+dial exists: the 16-lane message transpose has three implementation
+strategies, and which is fastest is not predictable from the CPU. It
+depends on whether the vector datapath is full-width or double-pumped
+(no CPUID bit reports that) and, on the same machine, on whether the
+input fits in cache. Measured (all AVX-512 parts so far):
 
 | machine | input | fastest | margin |
 |---------|-------|---------|--------|

@@ -44,6 +44,29 @@
 #endif
 #endif
 
+#if defined(__aarch64__) && defined(__linux__)
+// SVE probing: auxv HWCAP bits for presence, prctl for the runtime vector
+// length. Both are plain syscall surfaces, usable from this flag-neutral
+// TU (no SVE codegen needed, unlike an rdvl/svcntb read) and emulated
+// faithfully by qemu-user. Constants carry #ifndef fallbacks because musl
+// and older glibc auxv/prctl headers do not spell them all.
+#define BLAKE3PP_AARCH64_LINUX_SVE 1
+#include <sys/auxv.h>
+#include <sys/prctl.h>
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1UL << 22)
+#endif
+#ifndef HWCAP2_SVE2
+#define HWCAP2_SVE2 (1UL << 1)
+#endif
+#ifndef PR_SVE_GET_VL
+#define PR_SVE_GET_VL 51
+#endif
+#ifndef PR_SVE_VL_LEN_MASK
+#define PR_SVE_VL_LEN_MASK 0xffff
+#endif
+#endif
+
 namespace blake3pp {
 
 namespace kern {
@@ -72,10 +95,17 @@ constexpr std::size_t num_kernels = std::size(registry);
 
 // The one canonical enumerator list: auto_detect first, then best-first.
 // The dispatch preference order is simply its tail. One list, two roles.
-constexpr arch all_enumerators[] = {arch::auto_detect, arch::avx512,
-                                    arch::avx2,        arch::sse42,
-                                    arch::neon,        arch::simd128,
-                                    arch::scalar};
+// Ranking notes: the fixed-length SVE variants are exact-VL matches,
+// so at most one SVE1 and one SVE2 entry can ever be runtime-available at
+// once; their relative order encodes generation (SVE2's XAR) and width.
+// sve2_128 above neon is provisional until measured on real silicon (the
+// XAR argument; qemu cannot arbitrate). sve128 sits BELOW neon: same
+// width, no XAR, and no measured reason to displace the tuned NEON kernel.
+constexpr arch all_enumerators[] = {
+    arch::auto_detect, arch::avx512, arch::avx2,     arch::sse42,
+    arch::sve2_512,    arch::sve512, arch::sve2_256, arch::sve256,
+    arch::sve2_128,    arch::neon,   arch::sve128,   arch::simd128,
+    arch::scalar};
 constexpr std::span<const arch> preference =
     std::span{all_enumerators}.subspan(1);
 
@@ -162,6 +192,54 @@ bool x86_cpu_supports(arch a) noexcept {
 }
 #endif
 
+#if defined(BLAKE3PP_AARCH64_LINUX_SVE)
+struct sve_state {
+  bool sve = false;
+  bool sve2 = false;
+  unsigned long vl_bytes = 0;
+};
+
+const sve_state& sve_probe() noexcept {
+  static const sve_state s = [] {
+    sve_state st{};
+    if ((getauxval(AT_HWCAP) & HWCAP_SVE) != 0) {
+      // The auxv bit says CPU and kernel both speak SVE; the prctl reports
+      // the vector length this thread actually runs at (process-wide
+      // unless somebody lowers it). A negative return means a kernel
+      // without SVE state handling after all; treat as absent.
+      const int vl = prctl(PR_SVE_GET_VL);
+      if (vl >= 0) {
+        st.sve = true;
+        st.vl_bytes = static_cast<unsigned long>(vl) & PR_SVE_VL_LEN_MASK;
+        st.sve2 = (getauxval(AT_HWCAP2) & HWCAP2_SVE2) != 0;
+      }
+    }
+    return st;
+  }();
+  return s;
+}
+
+// Exact-match on the runtime VL: vector-length-specific code is only
+// guaranteed on hardware whose VL equals the compiled -msve-vector-bits
+// (GCC and Arm both document exact-match only), so a 256-bit kernel on a
+// 512-bit machine is not a degraded option: it is not an option at all.
+bool sve_cpu_supports(arch a) noexcept {
+  const sve_state& s = sve_probe();
+  if (!s.sve) {
+    return false;
+  }
+  switch (a) {
+    case arch::sve128:   return s.vl_bytes == 16;
+    case arch::sve256:   return s.vl_bytes == 32;
+    case arch::sve512:   return s.vl_bytes == 64;
+    case arch::sve2_128: return s.sve2 && s.vl_bytes == 16;
+    case arch::sve2_256: return s.sve2 && s.vl_bytes == 32;
+    case arch::sve2_512: return s.sve2 && s.vl_bytes == 64;
+    default:             return false;
+  }
+}
+#endif
+
 bool cpu_supports(arch a) noexcept {
   switch (a) {
     case arch::auto_detect:
@@ -178,6 +256,15 @@ bool cpu_supports(arch a) noexcept {
     // architecturally mandatory on AArch64 either way.
     case arch::neon:
       return true;
+#if defined(BLAKE3PP_AARCH64_LINUX_SVE)
+    case arch::sve128:
+    case arch::sve256:
+    case arch::sve512:
+    case arch::sve2_128:
+    case arch::sve2_256:
+    case arch::sve2_512:
+      return sve_cpu_supports(a);
+#endif
 #endif
 #if defined(__wasm__)
     case arch::simd128:
@@ -268,6 +355,18 @@ const char* to_string(arch a) noexcept {
       return "neon";
     case arch::simd128:
       return "simd128";
+    case arch::sve128:
+      return "sve128";
+    case arch::sve256:
+      return "sve256";
+    case arch::sve512:
+      return "sve512";
+    case arch::sve2_128:
+      return "sve2_128";
+    case arch::sve2_256:
+      return "sve2_256";
+    case arch::sve2_512:
+      return "sve2_512";
   }
   return "unknown";
 }
@@ -333,10 +432,20 @@ std::string_view to_string(transpose16 strategy) noexcept {
 // few percent should measure with blake3pp_bench and pin the result with
 // set_transpose16().
 transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
-  if (!is_available(arch::avx512)) {
+  // Race whichever width-16 kernel this machine would actually dispatch to
+  // (avx512, sve512/sve2_512): available_arches() is best-first, so the
+  // first width-16 entry is the one auto_detect would pick.
+  const kern::kernel_ops* ops = nullptr;
+  for (const arch a : available_arches()) {
+    const kern::kernel_ops* k = detail::resolve(a);
+    if (k->simd_degree == 16) {
+      ops = k;
+      break;
+    }
+  }
+  if (ops == nullptr) {
     return active_transpose16();  // dial is inert without a W=16 kernel
   }
-  const kern::kernel_ops* ops = detail::resolve(arch::avx512);
   static constexpr std::size_t chunk = 1024;  // BLAKE3 chunk
   static constexpr std::size_t lanes = 16;    // the W=16 kernel's batch
   static constexpr std::size_t batch = lanes * chunk;   // 16 KiB per step

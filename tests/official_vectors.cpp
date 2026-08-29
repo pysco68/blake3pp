@@ -184,9 +184,12 @@ TEST_CASE("known answer for the empty input") {
 }
 
 TEST_CASE("every available arch matches the official vectors") {
-  for (const auto a :
-       {blake3pp::arch::scalar, blake3pp::arch::sse42, blake3pp::arch::avx2,
-        blake3pp::arch::avx512, blake3pp::arch::neon}) {
+  // Every enumerator, not a hand-kept list: a newly added variant is
+  // vector-checked here (when runnable) with no test edit.
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect) {
+      continue;
+    }
     if (!blake3pp::is_available(a)) {
       MESSAGE("skipping unavailable arch: " << arch_name(a));
       continue;

@@ -77,8 +77,17 @@ blake3pp_kernel_switch(SRI_ROTATE 1
 blake3pp_kernel_switch(STAGED_ROUNDS 1
   "aarch64: quartet-staged round ordering instead of sequential g")
 
+# aarch64 SVE2 fixed-length variants: fuse every rot<N>(x ^ y) in the round
+# into one XAR instruction instead of eor+tbl / eor+shl+sri, the reason an
+# SVE2 kernel can beat NEON at the same 128-bit width. Not yet measured on
+# real silicon (qemu cannot arbitrate); this switch exists to A/B it there.
+# See xor_rot in src/kernel/transpose.hpp.
+blake3pp_kernel_switch(XAR_ROTATE 1
+  "aarch64 SVE2: fuse xor+rotate into a single XAR instead of eor + rotate")
+
 function(blake3pp_add_kernel ns)
-  cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR" "" "ARCH_FLAGS")
+  cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD" ""
+    "ARCH_FLAGS")
 
   set(tgt "blake3pp_kernel_${ns}")
   add_library(${tgt} OBJECT "${PROJECT_SOURCE_DIR}/src/kernel/kernel.cpp")
@@ -91,6 +100,15 @@ function(blake3pp_add_kernel ns)
     # The scalar fallback must be genuinely scalar: without this, the simd
     # facade would still pick the baseline vector width (SSE2 on x86-64).
     target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_FORCE_SCALAR=1")
+  endif()
+  if(AK_FORCE_XSIMD)
+    # Pin this TU to the xsimd provider regardless of the project-wide
+    # selection (see BLAKE3PP_FORCE_XSIMD in src/kernel/simd_facade.hpp;
+    # the SVE variants need it to stay free of load-time SVE code). The
+    # caller must have made the xsimd target available first
+    # (_blake3pp_fetch_xsimd in cmake/StdFeatures.cmake).
+    target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_FORCE_XSIMD=1")
+    target_link_libraries(${tgt} PRIVATE xsimd)
   endif()
   if(AK_ARCH_FLAGS)
     target_compile_options(${tgt} PRIVATE ${AK_ARCH_FLAGS})

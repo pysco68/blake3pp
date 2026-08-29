@@ -26,6 +26,13 @@
 #include <arm_neon.h>
 #endif
 
+// SVE2 fixed-length TUs get the fused xor+rotate (XAR); see xor_rot below.
+#if defined(__aarch64__) && !defined(BLAKE3PP_FORCE_SCALAR) && \
+    defined(__ARM_FEATURE_SVE2) && defined(__ARM_FEATURE_SVE_BITS)
+#include <arm_sve.h>
+#define BLAKE3PP_HAVE_SVE2_XAR 1
+#endif
+
 #include "kernel/force_inline.hpp"
 #include "kernel/shuffle.hpp"
 #include "kernel/simd_facade.hpp"
@@ -306,12 +313,57 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
   // the two hash loops are otherwise instruction-for-instruction identical.
   if constexpr (W == 4 && sizeof(typename u32v::impl) == 16 &&
                 std::is_trivially_copyable_v<typename u32v::impl>) {
-    const uint32x4_t x = std::bit_cast<uint32x4_t>(a.v);
-    return u32v{std::bit_cast<typename u32v::impl>(
-        vsriq_n_u32(vshlq_n_u32(x, 32 - N), x, N))};
+    // Immediately-invoked generic lambda: `if constexpr` only shields
+    // DEPENDENT constructs from the discarded branch, and everything here
+    // is concrete: a wider-than-NEON aarch64 TU (fixed-length SVE) would
+    // hard-error on the 16-byte bit_cast at template definition time even
+    // though the branch is never taken. Routing a.v through a deduced
+    // parameter restores the dependency. (At SVE VL=128 the branch IS
+    // taken, and validly: Z0-Z31 alias V0-V31, so the NEON sri applies.)
+    return [](auto impl) BLAKE3PP_LAMBDA_FORCE_INLINE {
+      const uint32x4_t x = std::bit_cast<uint32x4_t>(impl);
+      return u32v{std::bit_cast<decltype(impl)>(
+          vsriq_n_u32(vshlq_n_u32(x, 32 - N), x, N))};
+    }(a.v);
   }
 #endif
   return rotr(a, N);
+}
+
+// Set by cmake/ArchKernels.cmake from -DBLAKE3PP_KERNEL_XAR_ROTATE=
+// auto|on|off; the fallback repeats that default. Off restores the
+// two-op eor + rot spelling for re-measurement.
+#ifndef BLAKE3PP_KERNEL_XAR_ROTATE
+#define BLAKE3PP_KERNEL_XAR_ROTATE 1
+#endif
+
+#if defined(BLAKE3PP_HAVE_SVE2_XAR)
+typedef svuint32_t sve_fixed_u32
+    __attribute__((arm_sve_vector_bits(__ARM_FEATURE_SVE_BITS)));
+#endif
+
+// The fused xor-then-rotate the kernel's g function is made of:
+// every rotate in BLAKE3 has the shape rot<N>(x ^ y). SVE2's XAR does the
+// pair in ONE instruction (rotate right of the exclusive-or), replacing
+// either eor+tbl (N=16/8, byte-granular) or eor+shl+sri (N=12/7). It is
+// the whole reason an SVE2 variant can beat the NEON kernel at the same
+// 128-bit width. Everywhere else this is exactly rot<N>(x ^ y).
+template <int N>
+BLAKE3PP_FORCE_INLINE u32v xor_rot(u32v x, u32v y) noexcept {
+#if defined(BLAKE3PP_HAVE_SVE2_XAR) && BLAKE3PP_KERNEL_XAR_ROTATE
+  if constexpr (sizeof(typename u32v::impl) * 8 == __ARM_FEATURE_SVE_BITS &&
+                std::is_trivially_copyable_v<typename u32v::impl>) {
+    // Same dependent-lambda shield as rot's sri escape above: keeps the
+    // bit_casts out of TUs whose impl is not the fixed-length SVE size.
+    return [](auto ix, auto iy) BLAKE3PP_LAMBDA_FORCE_INLINE {
+      const sve_fixed_u32 r = svxar_n_u32(std::bit_cast<sve_fixed_u32>(ix),
+                                          std::bit_cast<sve_fixed_u32>(iy),
+                                          N);
+      return u32v{std::bit_cast<decltype(ix)>(r)};
+    }(x.v, y.v);
+  }
+#endif
+  return rot<N>(x ^ y);
 }
 
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS

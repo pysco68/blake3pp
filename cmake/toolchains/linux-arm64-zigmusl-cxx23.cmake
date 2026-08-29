@@ -33,3 +33,15 @@ set(CMAKE_LINK_DEPENDS_USE_LINKER OFF)
 # and inherit ONLY this toolchain (via hfc's proxy toolchain), so the
 # switch must live here too.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
+# zig's linker driver implements only a subset of GNU ld's options, and
+# --push-state/--pop-state are not in it. CMake probes for them by running
+# the linker and looking for an error message that NAMES those flags; zig
+# does not answer that way, so the probe concludes "supported" and
+# $<LINK_LIBRARY:WHOLE_ARCHIVE,...> (how the tools force-load mimalloc's
+# override members) emits a push-state pair that zig then rejects with
+# "unsupported linker arg: --push-state". Stating the answer here pre-empts
+# the probe (CMake only probes when the variable is undefined) and selects
+# the --whole-archive/--no-whole-archive spelling, which zig does accept.
+set(CMAKE_C_LINKER_PUSHPOP_STATE_SUPPORTED FALSE)
+set(CMAKE_CXX_LINKER_PUSHPOP_STATE_SUPPORTED FALSE)

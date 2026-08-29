@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <ostream>
 #include <string_view>
 #include <vector>
@@ -143,10 +144,11 @@ TEST_CASE("hash_many agrees across all available arches") {
                         /*increment_counter=*/true, 0, flag_chunk_start,
                         flag_chunk_end, expected.data());
 
-  for (const auto a :
-       {blake3pp::arch::sse42, blake3pp::arch::avx2, blake3pp::arch::avx512,
-        blake3pp::arch::neon}) {
-    if (!blake3pp::is_available(a)) {
+  // Every enumerator, not a hand-kept list: a variant added to the enum
+  // (and compiled in) is oracle-checked here with no test edit.
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || a == blake3pp::arch::scalar ||
+        !blake3pp::is_available(a)) {
       continue;
     }
     CAPTURE(arch_name(a));
@@ -208,14 +210,22 @@ TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
         blake3pp::transpose16::quartered}) {
     blake3pp::set_transpose16(strat);
     CHECK(blake3pp::active_transpose16() == strat);
-    if (blake3pp::is_available(blake3pp::arch::avx512)) {
-      // Real coverage only on AVX-512 CPUs (or under Intel SDE): every
-      // strategy must reproduce the official vectors byte-for-byte.
+    // Real coverage only where a width-16 kernel runs (AVX-512 CPUs or
+    // Intel SDE on x86; SVE-512 under qemu): every strategy must
+    // reproduce the scalar reference byte-for-byte.
+    std::optional<blake3pp::arch> w16;
+    for (const auto a : blake3pp::available_arches()) {
+      if (blake3pp::detail::resolve(a)->simd_degree == 16) {
+        w16 = a;
+        break;
+      }
+    }
+    if (w16.has_value()) {
       std::vector<std::byte> input(31745);  // spec pattern, odd length
       for (std::size_t i = 0; i < input.size(); ++i) {
         input[i] = static_cast<std::byte>(i % 251);
       }
-      blake3pp::hasher h{blake3pp::arch::avx512};
+      blake3pp::hasher h{*w16};
       h.update(input);
       blake3pp::hasher ref{blake3pp::arch::scalar};
       ref.update(input);
@@ -237,8 +247,8 @@ TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
   }
   CHECK(blake3pp::transpose16_from_string("bogus") == std::nullopt);
   blake3pp::set_transpose16(saved);
-  // The tuner applies and reports a strategy (a no-op fallback without
-  // AVX-512); either way its result must be the active one afterwards.
+  // The tuner applies and reports a strategy (a no-op fallback without a
+  // width-16 kernel); either way its result must be the active one after.
   // Tuned for a deliberately tiny input: the postcondition is what is
   // under test, and the no-argument overload would race a 128 MiB working
   // set on every AVX-512 machine in the matrix to prove the same thing.

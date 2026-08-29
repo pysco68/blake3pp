@@ -192,14 +192,23 @@ else()  # stdexec
     BLAKE3PP_EXECUTION_STDEXEC=1)
 endif()
 
-# Last resort: xsimd (header-only, imported as SYSTEM so its headers stay
-# outside our warning net).
+# xsimd (header-only, imported as SYSTEM so its headers stay outside our
+# warning net). Fetched on demand: as the project-wide provider of last
+# resort below, and by kernels that pin themselves to xsimd via
+# blake3pp_add_kernel(... FORCE_XSIMD) even when a std provider exists.
+macro(_blake3pp_fetch_xsimd)
+  if(NOT TARGET xsimd)
+    FetchContent_Declare(xsimd
+      GIT_REPOSITORY https://github.com/xtensor-stack/xsimd.git
+      GIT_TAG e88a72831858123924f7118f345dfe5d70d95991) # 14.3.0
+    FetchContent_MakeHermetic(xsimd HERMETIC_BUILD_SYSTEM cmake)
+    HermeticFetchContent_MakeAvailableAtBuildTime(xsimd)
+  endif()
+endmacro()
+
+# Last resort: the project-wide simd provider falls back to xsimd.
 if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
-  FetchContent_Declare(xsimd
-    GIT_REPOSITORY https://github.com/xtensor-stack/xsimd.git
-    GIT_TAG e88a72831858123924f7118f345dfe5d70d95991) # 14.3.0
-  FetchContent_MakeHermetic(xsimd HERMETIC_BUILD_SYSTEM cmake)
-  HermeticFetchContent_MakeAvailableAtBuildTime(xsimd)
+  _blake3pp_fetch_xsimd()
   target_link_libraries(blake3pp_features INTERFACE xsimd)
   target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XSIMD=1)
 endif()

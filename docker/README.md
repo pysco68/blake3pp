@@ -45,6 +45,24 @@ tools/tc --pull                            # refresh after a CI image push
 path), so build trees and
 `compile_commands.json` are valid on both sides.
 
+### SVE testing: one binary, every vector length
+
+The aarch64 presets compile fixed-length SVE kernels (sve256/sve512 +
+sve2_128 by default; `-DBLAKE3PP_SVE_ALL_VARIANTS=ON` adds sve128,
+sve2_256, sve2_512) next to NEON, and runtime dispatch exact-matches the
+CPU's vector length. qemu-user's `QEMU_CPU` env selects the emulated VL, so
+the whole dispatch matrix runs from one build, with no per-VL presets:
+
+```sh
+tools/tc linux-arm64-gcc15-cxx23                    # -cpu max: VL=512 -> sve512
+tools/tc linux-arm64-gcc15-cxx23 -- bash -c \
+  'QEMU_CPU=max,sve-default-vector-length=32 ctest --test-dir build/linux-arm64-gcc15-cxx23'   # VL=256 -> sve256
+# sve-default-vector-length is in BYTES: 16 -> sve2_128, 32 -> sve256,
+# 64 -> sve512. QEMU_CPU=max,sve=off is the NEON-only regression; it is
+# also the config that catches load-time SVE leaks: experimental::simd
+# emits SVE static initializers that SIGILL on non-SVE CPUs.
+```
+
 ## Building locally
 
 ```sh

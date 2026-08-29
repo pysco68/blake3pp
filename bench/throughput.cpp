@@ -17,6 +17,7 @@
 #include <cstring>
 #include <format>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -148,9 +149,22 @@ using b3tool::println;
 // size in both strategy orders: a ranking that flips with size is a regime
 // mismatch, a ranking that flips with ORDER is thermal/frequency drift
 // contaminating the measurement instead.
+// The width-16 kernel this machine would dispatch to (avx512 on x86,
+// sve512/sve2_512 elsewhere), if any: the t16 dial rows and the sweep race
+// whichever it is.
+std::optional<blake3pp::arch> first_w16_arch() {
+  for (const auto a : blake3pp::available_arches()) {
+    if (blake3pp::detail::resolve(a)->simd_degree == 16) {
+      return a;
+    }
+  }
+  return std::nullopt;
+}
+
 void t16_sweep(int reps, double cooldown_s) {
-  if (!blake3pp::is_available(blake3pp::arch::avx512)) {
-    println(stdout, "t16 sweep needs an AVX-512 kernel; none available here");
+  const auto w16 = first_w16_arch();
+  if (!w16.has_value()) {
+    println(stdout, "t16 sweep needs a width-16 kernel; none available here");
     return;
   }
   constexpr std::size_t work = 128u << 20;  // hashed bytes per timed rep
@@ -168,10 +182,10 @@ void t16_sweep(int reps, double cooldown_s) {
   b3tool::cooldown cooldown(cooldown_s);
 
   println(stdout,
-          "t16 strategy vs working-set size (avx512, {} MiB hashed per rep,\n"
+          "t16 strategy vs working-set size ({}, {} MiB hashed per rep,\n"
           "best of {}; 'rev' repeats the size with the strategy order "
           "reversed)\n",
-          work >> 20, reps);
+          blake3pp::to_string(*w16), work >> 20, reps);
   println(stdout, "  {:>10}  {:>10} {:>10} {:>10}   winner", "working set",
           "staging", "tree", "quartered");
 
@@ -185,7 +199,7 @@ void t16_sweep(int reps, double cooldown_s) {
         blake3pp::set_transpose16(order[idx]);
         const double s = b3tool::best_seconds(reps, /*warmup=*/true, [&] {
           for (std::size_t it = 0; it < iters; ++it) {
-            blake3pp::hasher h{blake3pp::arch::avx512};
+            blake3pp::hasher h{*w16};
             h.update(std::span<const std::byte>{buf.data(), size});
             (void)h.finalize();
           }
@@ -305,17 +319,16 @@ int main(int argc, char** argv) {
         [&] { return hash_with(blake3pp::detail::resolve(a)); });
   }
 
-  // The AVX-512 transpose strategies, raced in-process (the dial is
+  // The width-16 transpose strategies, raced in-process (the dial is
   // runtime; no per-strategy binaries needed), plus what the tuner picks.
-  if (blake3pp::is_available(blake3pp::arch::avx512)) {
+  if (const auto w16 = first_w16_arch(); w16.has_value()) {
     const auto saved = blake3pp::active_transpose16();
     for (const auto strat :
          {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
           blake3pp::transpose16::quartered}) {
       blake3pp::set_transpose16(strat);
       row(std::format("  t16-{}", blake3pp::to_string(strat)), "",
-          [&] { return hash_with(
-                    blake3pp::detail::resolve(blake3pp::arch::avx512)); },
+          [&] { return hash_with(blake3pp::detail::resolve(*w16)); },
           14);
     }
     blake3pp::set_transpose16(saved);

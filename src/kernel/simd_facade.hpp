@@ -5,6 +5,15 @@
 //
 //   BLAKE3PP_FORCE_SCALAR   width-1 plain uint32_t (the scalar kernel, and
 //                           the correctness oracle for everything else)
+//   BLAKE3PP_FORCE_XSIMD    per-TU override to xsimd even when a std
+//                           provider exists. The SVE kernels need it:
+//                           libstdc++'s experimental::simd SVE backend
+//                           keeps guarded inline-variable index tables
+//                           whose dynamic initializers are SVE code that
+//                           runs at LOAD TIME: an instant SIGILL on any
+//                           non-SVE machine, which defeats the whole
+//                           fat-binary premise. xsimd's SVE backend is
+//                           initializer-free.
 //   BLAKE3PP_HAS_STD_SIMD   native C++26 std::simd (GCC 16's <simd>)
 //   BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD
 //                           Parallelism TS v2 <experimental/simd>
@@ -29,6 +38,8 @@
 
 #if defined(BLAKE3PP_FORCE_SCALAR)
 #include "kernel/simd/scalar.hpp"
+#elif defined(BLAKE3PP_FORCE_XSIMD)
+#include "kernel/simd/xsimd.hpp"
 #elif defined(BLAKE3PP_HAS_STD_SIMD)
 #include "kernel/simd/std_simd.hpp"
 #elif defined(BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)

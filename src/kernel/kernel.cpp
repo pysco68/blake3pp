@@ -53,6 +53,15 @@ BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {
   return std::rotr(x, N);
 }
 
+// Scalar twin of the wide xor_rot in transpose.hpp: the rounds are written
+// against the fused form so SVE2's XAR can claim it; everywhere else the
+// compilers fold this back to exactly the old eor + ror pair.
+template <int N>
+BLAKE3PP_FORCE_INLINE std::uint32_t xor_rot(std::uint32_t x,
+                                            std::uint32_t y) noexcept {
+  return std::rotr(x ^ y, N);
+}
+
 // The spec's 64-bit block counter enters the state as two u32 words
 // (v[12]/v[13], t0/t1): this pair is the one place the kernel deliberately
 // truncates.
@@ -102,13 +111,13 @@ template <class W>
 BLAKE3PP_FORCE_INLINE void g(W v[16], std::size_t a, std::size_t b, std::size_t c,
               std::size_t d, W mx, W my) noexcept {
   v[a] = v[a] + v[b] + mx;
-  v[d] = rot<16>(v[d] ^ v[a]);
+  v[d] = xor_rot<16>(v[d], v[a]);
   v[c] = v[c] + v[d];
-  v[b] = rot<12>(v[b] ^ v[c]);
+  v[b] = xor_rot<12>(v[b], v[c]);
   v[a] = v[a] + v[b] + my;
-  v[d] = rot<8>(v[d] ^ v[a]);
+  v[d] = xor_rot<8>(v[d], v[a]);
   v[c] = v[c] + v[d];
-  v[b] = rot<7>(v[b] ^ v[c]);
+  v[b] = xor_rot<7>(v[b], v[c]);
 }
 
 // The round index is a template parameter so every schedule lookup is a
@@ -149,68 +158,68 @@ BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
   v[1] = v[1] + v[5] + m[s[2]];
   v[2] = v[2] + v[6] + m[s[4]];
   v[3] = v[3] + v[7] + m[s[6]];
-  v[12] = rot<16>(v[12] ^ v[0]);
-  v[13] = rot<16>(v[13] ^ v[1]);
-  v[14] = rot<16>(v[14] ^ v[2]);
-  v[15] = rot<16>(v[15] ^ v[3]);
+  v[12] = xor_rot<16>(v[12], v[0]);
+  v[13] = xor_rot<16>(v[13], v[1]);
+  v[14] = xor_rot<16>(v[14], v[2]);
+  v[15] = xor_rot<16>(v[15], v[3]);
   v[8] = v[8] + v[12];
   v[9] = v[9] + v[13];
   v[10] = v[10] + v[14];
   v[11] = v[11] + v[15];
-  v[4] = rot<12>(v[4] ^ v[8]);
-  v[5] = rot<12>(v[5] ^ v[9]);
-  v[6] = rot<12>(v[6] ^ v[10]);
-  v[7] = rot<12>(v[7] ^ v[11]);
+  v[4] = xor_rot<12>(v[4], v[8]);
+  v[5] = xor_rot<12>(v[5], v[9]);
+  v[6] = xor_rot<12>(v[6], v[10]);
+  v[7] = xor_rot<12>(v[7], v[11]);
   v[0] = v[0] + v[4] + m[s[1]];
   v[1] = v[1] + v[5] + m[s[3]];
   v[2] = v[2] + v[6] + m[s[5]];
   v[3] = v[3] + v[7] + m[s[7]];
-  v[12] = rot<8>(v[12] ^ v[0]);
-  v[13] = rot<8>(v[13] ^ v[1]);
-  v[14] = rot<8>(v[14] ^ v[2]);
-  v[15] = rot<8>(v[15] ^ v[3]);
+  v[12] = xor_rot<8>(v[12], v[0]);
+  v[13] = xor_rot<8>(v[13], v[1]);
+  v[14] = xor_rot<8>(v[14], v[2]);
+  v[15] = xor_rot<8>(v[15], v[3]);
   v[8] = v[8] + v[12];
   v[9] = v[9] + v[13];
   v[10] = v[10] + v[14];
   v[11] = v[11] + v[15];
-  v[4] = rot<7>(v[4] ^ v[8]);
-  v[5] = rot<7>(v[5] ^ v[9]);
-  v[6] = rot<7>(v[6] ^ v[10]);
-  v[7] = rot<7>(v[7] ^ v[11]);
+  v[4] = xor_rot<7>(v[4], v[8]);
+  v[5] = xor_rot<7>(v[5], v[9]);
+  v[6] = xor_rot<7>(v[6], v[10]);
+  v[7] = xor_rot<7>(v[7], v[11]);
   // Diagonals: quartet i is (i, {5,6,7,4}[i], {10,11,8,9}[i],
   // {15,12,13,14}[i]).
   v[0] = v[0] + v[5] + m[s[8]];
   v[1] = v[1] + v[6] + m[s[10]];
   v[2] = v[2] + v[7] + m[s[12]];
   v[3] = v[3] + v[4] + m[s[14]];
-  v[15] = rot<16>(v[15] ^ v[0]);
-  v[12] = rot<16>(v[12] ^ v[1]);
-  v[13] = rot<16>(v[13] ^ v[2]);
-  v[14] = rot<16>(v[14] ^ v[3]);
+  v[15] = xor_rot<16>(v[15], v[0]);
+  v[12] = xor_rot<16>(v[12], v[1]);
+  v[13] = xor_rot<16>(v[13], v[2]);
+  v[14] = xor_rot<16>(v[14], v[3]);
   v[10] = v[10] + v[15];
   v[11] = v[11] + v[12];
   v[8] = v[8] + v[13];
   v[9] = v[9] + v[14];
-  v[5] = rot<12>(v[5] ^ v[10]);
-  v[6] = rot<12>(v[6] ^ v[11]);
-  v[7] = rot<12>(v[7] ^ v[8]);
-  v[4] = rot<12>(v[4] ^ v[9]);
+  v[5] = xor_rot<12>(v[5], v[10]);
+  v[6] = xor_rot<12>(v[6], v[11]);
+  v[7] = xor_rot<12>(v[7], v[8]);
+  v[4] = xor_rot<12>(v[4], v[9]);
   v[0] = v[0] + v[5] + m[s[9]];
   v[1] = v[1] + v[6] + m[s[11]];
   v[2] = v[2] + v[7] + m[s[13]];
   v[3] = v[3] + v[4] + m[s[15]];
-  v[15] = rot<8>(v[15] ^ v[0]);
-  v[12] = rot<8>(v[12] ^ v[1]);
-  v[13] = rot<8>(v[13] ^ v[2]);
-  v[14] = rot<8>(v[14] ^ v[3]);
+  v[15] = xor_rot<8>(v[15], v[0]);
+  v[12] = xor_rot<8>(v[12], v[1]);
+  v[13] = xor_rot<8>(v[13], v[2]);
+  v[14] = xor_rot<8>(v[14], v[3]);
   v[10] = v[10] + v[15];
   v[11] = v[11] + v[12];
   v[8] = v[8] + v[13];
   v[9] = v[9] + v[14];
-  v[5] = rot<7>(v[5] ^ v[10]);
-  v[6] = rot<7>(v[6] ^ v[11]);
-  v[7] = rot<7>(v[7] ^ v[8]);
-  v[4] = rot<7>(v[4] ^ v[9]);
+  v[5] = xor_rot<7>(v[5], v[10]);
+  v[6] = xor_rot<7>(v[6], v[11]);
+  v[7] = xor_rot<7>(v[7], v[8]);
+  v[4] = xor_rot<7>(v[4], v[9]);
 }
 
 // Measured on clang/Apple M2 only. GCC 15 on aarch64 compiles both spellings

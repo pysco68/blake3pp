@@ -199,6 +199,89 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
   # NEON is baseline on AArch64
   blake3pp_add_kernel(neon)
+  # Fixed-length SVE variants: one kernel per vector length, because VLS
+  # code is only valid when the runtime VL EQUALS the compiled one (GCC
+  # and Arm document exact-match only), and dispatch checks precisely that.
+  # sve256/sve512 are SVE1 so Graviton3/Neoverse-V1-class parts qualify;
+  # sve2_128 is the Grace/Graviton4-class variant and carries the XAR
+  # fused rotate. GNU-frontend compilers only (MSVC has no
+  # -msve-vector-bits); the probe keeps unusual cross setups honest: no
+  # probe pass, no kernel registered.
+  option(BLAKE3PP_SVE_ALL_VARIANTS
+    "Also compile the SVE variants matching no shipping silicon (sve128, sve2_256, sve2_512), for emulator targets"
+    OFF)
+  if(NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    include(CheckCXXSourceCompiles)
+    # The exact constructs the kernel relies on: a fixed-length SVE type,
+    # bit_cast to/from a GNU vector of the same size (the shuffle backend's
+    # currency), and (under SVE2) the XAR intrinsic.
+    set(_blake3pp_sve_smoke [=[
+      #include <arm_sve.h>
+      #include <bit>
+      typedef svuint32_t fixed_u32
+          __attribute__((arm_sve_vector_bits(__ARM_FEATURE_SVE_BITS)));
+      typedef unsigned gnu_vec
+          __attribute__((vector_size(sizeof(fixed_u32))));
+      int main() {
+        fixed_u32 z = svdup_u32(1u);
+      #if defined(__ARM_FEATURE_SVE2)
+        z = svxar_n_u32(z, z, 7);
+      #endif
+        gnu_vec g = std::bit_cast<gnu_vec>(z);
+        fixed_u32 back = std::bit_cast<fixed_u32>(g);
+        return svaddv_u32(svptrue_b32(), back) != 0u ? 0 : 1;
+      }
+    ]=])
+    # Two candidate spellings per generation: GCC/Clang take the -march
+    # form; zig cc rejects aarch64 -march outright (its flag model wants
+    # -mcpu=<cpu>+<features>), and both clang and zig accept the -mcpu
+    # form. First candidate that passes the smoke test wins.
+    function(_blake3pp_probe_sve_flags out_var probe_name)
+      set(result "")
+      foreach(cand IN LISTS ARGN)
+        string(MAKE_C_IDENTIFIER "${probe_name}_${cand}" var)
+        set(CMAKE_REQUIRED_FLAGS "${cand} -msve-vector-bits=256")
+        check_cxx_source_compiles("${_blake3pp_sve_smoke}" ${var})
+        if(${var})
+          set(result "${cand}")
+          break()
+        endif()
+      endforeach()
+      set(${out_var} "${result}" PARENT_SCOPE)
+    endfunction()
+    _blake3pp_probe_sve_flags(_blake3pp_sve1_flag BLAKE3PP_COMPILER_SVE_VLS
+      "-march=armv8.2-a+sve" "-mcpu=generic+sve")
+    _blake3pp_probe_sve_flags(_blake3pp_sve2_flag BLAKE3PP_COMPILER_SVE2_VLS
+      "-march=armv8.5-a+sve2" "-mcpu=generic+sve2")
+    if(_blake3pp_sve1_flag OR _blake3pp_sve2_flag)
+      # The SVE kernels pin themselves to xsimd (FORCE_XSIMD) even when the
+      # project provider is a std one: libstdc++'s experimental::simd SVE
+      # backend emits guarded dynamic initializers containing SVE
+      # instructions, which run at LOAD TIME in every including TU: an
+      # instant SIGILL on non-SVE hardware, defeating the fat binary.
+      _blake3pp_fetch_xsimd()
+    endif()
+    if(_blake3pp_sve1_flag)
+      blake3pp_add_kernel(sve256 FORCE_XSIMD
+        ARCH_FLAGS ${_blake3pp_sve1_flag} -msve-vector-bits=256)
+      blake3pp_add_kernel(sve512 FORCE_XSIMD
+        ARCH_FLAGS ${_blake3pp_sve1_flag} -msve-vector-bits=512)
+      if(BLAKE3PP_SVE_ALL_VARIANTS)
+        blake3pp_add_kernel(sve128 FORCE_XSIMD
+          ARCH_FLAGS ${_blake3pp_sve1_flag} -msve-vector-bits=128)
+      endif()
+    endif()
+    if(_blake3pp_sve2_flag)
+      blake3pp_add_kernel(sve2_128 FORCE_XSIMD
+        ARCH_FLAGS ${_blake3pp_sve2_flag} -msve-vector-bits=128)
+      if(BLAKE3PP_SVE_ALL_VARIANTS)
+        blake3pp_add_kernel(sve2_256 FORCE_XSIMD
+          ARCH_FLAGS ${_blake3pp_sve2_flag} -msve-vector-bits=256)
+        blake3pp_add_kernel(sve2_512 FORCE_XSIMD
+          ARCH_FLAGS ${_blake3pp_sve2_flag} -msve-vector-bits=512)
+      endif()
+    endif()
+  endif()
 elseif(EMSCRIPTEN)
   # WASM SIMD128 is a module-level feature (engines reject SIMD-bearing
   # modules wholesale if unsupported), so this really is a compile-time choice
