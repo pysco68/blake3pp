@@ -322,6 +322,51 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64)$")
     blake3pp_add_kernel(rvv512 FORCE_XSIMD
       ARCH_FLAGS -march=rv64gcv_zvl512b -mrvv-vector-bits=zvl)
   endif()
+  # T-Head XTheadVector (draft RVV 0.7.1): a hand-written standalone TU
+  # (see src/kernel/xthead_kernel.cpp for why the facade cannot express
+  # it). Opt-in: real 0.7.1 silicon exists (D1, SG2042, TH1520) but
+  # mainline qemu cannot execute the th. encodings, so the default build
+  # carries only what its test matrix can run.
+  option(BLAKE3PP_XTHEAD_KERNEL
+    "Compile the hand-written T-Head XTheadVector (RVV 0.7.1) kernel" OFF)
+  if(BLAKE3PP_XTHEAD_KERNEL)
+    set(CMAKE_REQUIRED_FLAGS "-march=rv64gc_xtheadvector")
+    # Compile-only probe: linking a full exe would trip binutils'
+    # xtheadvector-vs-v attribute-merge refusal against the distro crt
+    # objects, the very thing STRIP_RISCV_ATTRIBUTE exists to solve for
+    # the real kernel object.
+    set(_blake3pp_saved_tct "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    check_cxx_source_compiles([=[
+      #include <riscv_th_vector.h>
+      int main() {
+        unsigned buf[4] = {1, 2, 3, 4};
+        vuint32m1_t a = __riscv_th_vlwu_v_u32m1(buf, 4);
+        a = __riscv_vadd_vv_u32m1(a, a, 4);
+        __riscv_th_vsw_v_u32m1(buf, a, 4);
+        return static_cast<int>(buf[0]) - 2;
+      }
+    ]=] BLAKE3PP_COMPILER_XTHEADVECTOR)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_blake3pp_saved_tct}")
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(BLAKE3PP_COMPILER_XTHEADVECTOR)
+      # The attribute suppression pair: binutils' ld refuses to merge the
+      # xtheadvector ELF arch attribute with the v/zve32x one the distro
+      # crt objects carry (the encodings overlap by design, so the
+      # attribute machinery models them as mutually exclusive), even
+      # though this mix is exactly what a runtime-dispatched fat binary
+      # wants. -mno-riscv-attribute silences GCC's directive and
+      # -Wa,-mno-arch-attr the assembler's own; the attribute is advisory
+      # metadata, and execution gating is runtime dispatch's job.
+      blake3pp_add_kernel(xthead SOURCE src/kernel/xthead_kernel.cpp
+        ARCH_FLAGS -march=rv64gc_xtheadvector
+                   -mno-riscv-attribute -Wa,-mno-arch-attr)
+    else()
+      message(WARNING "blake3pp: BLAKE3PP_XTHEAD_KERNEL=ON but the "
+        "compiler cannot build XTheadVector (needs GCC 14+ with "
+        "riscv_th_vector.h); kernel skipped")
+    endif()
+  endif()
 elseif(EMSCRIPTEN)
   # WASM SIMD128 is a module-level feature (engines reject SIMD-bearing
   # modules wholesale if unsupported), so this really is a compile-time choice

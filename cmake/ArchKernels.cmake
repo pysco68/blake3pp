@@ -86,11 +86,20 @@ blake3pp_kernel_switch(XAR_ROTATE 1
   "aarch64 SVE2: fuse xor+rotate into a single XAR instead of eor + rotate")
 
 function(blake3pp_add_kernel ns)
-  cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD" ""
+  cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD" "SOURCE"
     "ARCH_FLAGS")
 
+  # Almost every variant is an instantiation of the one kernel TU; SOURCE
+  # substitutes a standalone hand-written TU for the ISAs the facade
+  # cannot express (xthead: sizeless 0.7.1 vector types cannot back u32v).
+  # The substitute must export the same kern::<ns>::ops table.
+  set(_ak_src "${PROJECT_SOURCE_DIR}/src/kernel/kernel.cpp")
+  if(AK_SOURCE)
+    set(_ak_src "${PROJECT_SOURCE_DIR}/${AK_SOURCE}")
+  endif()
+
   set(tgt "blake3pp_kernel_${ns}")
-  add_library(${tgt} OBJECT "${PROJECT_SOURCE_DIR}/src/kernel/kernel.cpp")
+  add_library(${tgt} OBJECT "${_ak_src}")
   target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_ARCH_NS=${ns}")
   # The resolved tuning switches, passed explicitly rather than left to the
   # headers' fallback defaults.

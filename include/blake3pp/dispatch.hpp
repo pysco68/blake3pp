@@ -58,6 +58,11 @@ enum class arch : std::uint8_t {
   rvv256,
   /// RISC-V RVV 1.0 at exactly 512 bits.
   rvv512,
+  /// T-Head XTheadVector, the draft-RVV-0.7.1 encoding of C906/C910
+  /// silicon (Allwinner D1, SG2042, TH1520). Hand-written kernel, opt-in
+  /// build (BLAKE3PP_XTHEAD_KERNEL=ON); detected through the hwprobe
+  /// vendor-extension key (Linux 6.13+).
+  xthead,
 };
 
 /// True if the variant is compiled into this binary and the running CPU

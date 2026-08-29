@@ -76,6 +76,8 @@
 // EXECUTES behind the hwcap check, so a V-less CPU never sees it.
 #define BLAKE3PP_RISCV64_LINUX_RVV 1
 #include <sys/auxv.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace blake3pp {
@@ -118,7 +120,8 @@ constexpr arch all_enumerators[] = {
     arch::auto_detect, arch::avx512, arch::avx2,     arch::sse42,
     arch::sve2_512,    arch::sve512, arch::sve2_256, arch::sve256,
     arch::sve2_128,    arch::neon,   arch::sve128,   arch::rvv512,
-    arch::rvv256,      arch::rvv128, arch::simd128,  arch::scalar};
+    arch::rvv256,      arch::rvv128, arch::xthead,   arch::simd128,
+    arch::scalar};
 constexpr std::span<const arch> preference =
     std::span{all_enumerators}.subspan(1);
 
@@ -278,6 +281,44 @@ const rvv_state& rvv_probe() noexcept {
   return s;
 }
 
+// XTheadVector (draft RVV 0.7.1, T-Head encoding): Linux 6.13+ reports it
+// through the hwprobe vendor-extension key. Raw syscall: glibc grew a
+// wrapper only recently and musl has none; ENOSYS (pre-6.4 kernels) and
+// missing-key (pre-6.13) both degrade to "absent". Never parse
+// /proc/cpuinfo: old vendor kernels print a bare "v" for 0.7.1. The
+// BLAKE3PP_ASSUME_XTHEADVECTOR=1 env hook exists for emulator testing
+// (T-Head's qemu fork predates the hwprobe key) and is honored for this
+// one arch only.
+#ifndef BLAKE3PP_NR_riscv_hwprobe
+#define BLAKE3PP_NR_riscv_hwprobe 258
+#endif
+#ifndef RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0
+#define RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0 11
+#endif
+#ifndef RISCV_HWPROBE_VENDOR_EXT_XTHEADVECTOR
+#define RISCV_HWPROBE_VENDOR_EXT_XTHEADVECTOR (1 << 0)
+#endif
+
+bool xthead_cpu_supports() noexcept {
+  static const bool s = [] {
+    const char* assume = std::getenv("BLAKE3PP_ASSUME_XTHEADVECTOR");
+    if (assume != nullptr && assume[0] == '1') {
+      return true;
+    }
+    struct {
+      std::int64_t key;
+      std::uint64_t value;
+    } pair = {RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0, 0};
+    const long rc = syscall(BLAKE3PP_NR_riscv_hwprobe, &pair, 1UL, 0UL,
+                            nullptr, 0U);
+    // An unknown key comes back as key=-1 with value=0, an old kernel as
+    // ENOSYS; both mean "not detectable" and therefore "absent".
+    return rc == 0 && pair.key == RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0 &&
+           (pair.value & RISCV_HWPROBE_VENDOR_EXT_XTHEADVECTOR) != 0;
+  }();
+  return s;
+}
+
 // Exact-match on the runtime vlenb, same reasoning as SVE: fixed-vlen
 // code pins vscale min AND max, and its whole-register moves are only
 // correct at exactly the compiled VLEN.
@@ -326,6 +367,8 @@ bool cpu_supports(arch a) noexcept {
     case arch::rvv256:
     case arch::rvv512:
       return rvv_cpu_supports(a);
+    case arch::xthead:
+      return xthead_cpu_supports();
 #endif
 #if defined(__wasm__)
     case arch::simd128:
@@ -434,6 +477,8 @@ const char* to_string(arch a) noexcept {
       return "rvv256";
     case arch::rvv512:
       return "rvv512";
+    case arch::xthead:
+      return "xthead";
   }
   return "unknown";
 }
