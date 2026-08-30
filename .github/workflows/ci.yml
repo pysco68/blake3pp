@@ -408,11 +408,13 @@ jobs:
   # (actions/runner-images Windows11-Arm64 image): runs the CROSS-BUILT
   # binaries (the Neoverse pattern) so the arm64 archives the release
   # ships are exactly the bytes tested here. OPT-IN via repository
-  # variable WIN_ARM64_NATIVE=1: the free windows-11-arm label serves
-  # PUBLIC repositories only, and this repo is private; un-gated, the
-  # job would wait for a runner that never comes and stall the run (and
-  # the release trigger behind it). Flip the var on after making the
-  # repo public or wiring a paid larger arm64 runner to this label.
+  # variable WIN_ARM64_NATIVE=1: the label DOES serve this private repo
+  # (observed 2026-08-30: a run completed on Cobalt 100 silicon), but
+  # private-repo hosted minutes are BILLED, Windows ones at a premium,
+  # so hardware lanes stay a deliberate opt-in rather than a default
+  # spend. Bench note from that first run: on Windows this Neoverse N2
+  # runs the NEON kernel: the clang-cl build registers no SVE variants
+  # by construction, and Windows on Arm exposes no user-mode SVE anyway.
   windows-arm64-native:
     name: windows-arm64 native test (${{ matrix.preset }})
     needs: windows
@@ -520,10 +522,10 @@ jobs:
   # numbers are NOT measurements (thermal/noisy-neighbor caveats apply),
   # but a sve2_128-vs-neon ratio collapsing to 1.0 would still be a
   # regression signal.
-  # OPT-IN via repository variable LINUX_ARM64_NATIVE=1: like
-  # windows-11-arm above, the free ubuntu-24.04-arm label serves PUBLIC
-  # repositories only; on this private repo an un-gated job would hang
-  # waiting for a runner and stall the run.
+  # OPT-IN via repository variable LINUX_ARM64_NATIVE=1: the arm64
+  # labels serve this private repo (the windows-11-arm twin proved it on
+  # real Cobalt silicon), but private-repo hosted minutes are billed;
+  # hardware lanes are a deliberate opt-in spend, not a default.
   neoverse-test-bench:
     name: neoverse-n2 test+bench (real SVE2 silicon)
     needs: build-arm64-static
