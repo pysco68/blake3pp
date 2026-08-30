@@ -18,6 +18,19 @@ build_dir="build/${preset}"
 cmake --preset "${preset}"
 cmake --build "${build_dir}" -j"$(nproc)"
 
+# The kernel audit (tools/objscan.py, rules in tools/kernel-audit.json):
+# every variant's object carries its instruction class and nothing above
+# it, the hot functions are inlined and unrolled, and the linked tool
+# carries nothing above the baseline outside the kernels. A wasm module
+# has no objdump.
+audit_kernels() {  # <build-dir>
+  case "${preset}" in
+    wasm32-*) ;;
+    *) python3 tools/objscan.py audit "$1" --binary "$1/cli/blake3ppsum" ;;
+  esac
+}
+audit_kernels "${build_dir}"
+
 run_ctest() {  # <label> [QEMU_CPU value]
   local label=$1 cpu=${2-}
   echo "::group::ctest ${preset} [${label}]"
@@ -58,6 +71,7 @@ case "${preset}" in
       xthead_dir="build/${preset}-xthead"
       cmake --preset "${preset}" -B "${xthead_dir}" -DBLAKE3PP_XTHEAD_KERNEL=ON
       cmake --build "${xthead_dir}" -j"$(nproc)"
+      audit_kernels "${xthead_dir}"
       echo "::group::ctest ${preset} [xthead-compiled-in]"
       ctest --test-dir "${xthead_dir}" --output-on-failure
       echo "::endgroup::"

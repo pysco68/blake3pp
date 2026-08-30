@@ -1,13 +1,14 @@
 # tools/
 
-Scripts around the build: the toolchain matrix, the release packaging,
-and the binary inspection the fat-binary design keeps needing.
-Everything runs from the repository root.
+Scripts around the build: the toolchain matrix, the CI entry point, the
+release packaging, and the binary inspection the fat-binary design keeps
+needing. Everything runs from the repository root.
 
 | Script | Purpose |
 | --- | --- |
 | `tc` | Run a CMake preset inside its per-compiler toolchain image (`tools/tc <preset>`, `tools/tc --shell <preset>`, `tools/tc --list`). |
 | `gen-toolchains.py` | Regenerate the CMake toolchain files under `cmake/toolchains/` for the whole matrix. |
+| `ci-test.sh` | The CI entry point: configure, build, audit and run the preset's full test matrix (every emulator configuration its architecture supports). |
 | `make-release.sh` | Assemble the static Linux release archives. |
 | `build-msan-libcxx.sh` | Build the MemorySanitizer-instrumented libc++ the msan preset links. |
 | `gen-test-vectors.py` | Turn the official BLAKE3 `test_vectors.json` into the C++ header the tests include. |
@@ -75,6 +76,11 @@ minimum vector count in the widest function), and the classes that must
 not appear in the linked binary outside the kernels that own them. A
 rule matches an instruction by mnemonic or by operand text; `all: true`
 asks for both.
+
+`ci-test.sh` runs the audit on every Linux preset after the build (the
+wasm presets excepted: a wasm module has no objdump), the Windows and
+macOS jobs run it on theirs. Windows executables carry no symbol table,
+so the binary-level check runs on the object files only there.
 
 Adding a kernel variant: add a `variants` entry under its architecture,
 with a `match` regex against the variant name (`sve\d+`, `rvv\d+_zvbb`),
