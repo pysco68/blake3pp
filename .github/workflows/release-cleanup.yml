@@ -1,0 +1,41 @@
+# Sweeps the automated dev-* prereleases (created by release.yml) that
+# are older than 90 days, deleting both the release and its anchor tag.
+# Scope is deliberately narrow: only releases that are (a) marked
+# prerelease AND (b) tagged dev-* are candidates; hand-tagged releases
+# (v*), including hand-tagged prereleases, are never touched.
+name: release-cleanup
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"  # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KEEP_DAYS: 90
+    steps:
+      - name: Delete stale dev prereleases
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d "${KEEP_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "deleting dev-* prereleases created before ${cutoff}"
+          gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '.[] | select(.prerelease == true)
+                       | select(.tag_name | startswith("dev-"))
+                       | [.tag_name, .created_at] | @tsv' |
+          while IFS=$'\t' read -r tag created; do
+            if [[ "${created}" < "${cutoff}" ]]; then
+              echo "deleting ${tag} (created ${created})"
+              gh release delete "${tag}" \
+                --repo "${GITHUB_REPOSITORY}" --cleanup-tag --yes
+            else
+              echo "keeping  ${tag} (created ${created})"
+            fi
+          done

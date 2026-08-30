@@ -1,0 +1,80 @@
+# Automatic prerelease publishing: after every GREEN ci run on main, build
+# the static release archives (tools/make-release.sh: musl + mimalloc
+# tools for x86_64 and aarch64, test-passed under qemu) and attach them to
+# a prerelease keyed by the commit: tag dev-<sha12>, created at exactly
+# that commit. Triggering on ci's completion rather than on push does two
+# things at once: nothing is ever published from a red commit, and the
+# zig image pulled here is the one ci just refreshed if docker/** changed.
+#
+# These dev-* prereleases are disposable by design; release-cleanup.yml
+# deletes them (and their anchor tags) after 90 days. Real releases are
+# hand-tagged v* and never touched by any of this.
+name: release
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  prerelease:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-zig:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CMAKE_GENERATOR: Ninja
+      # The commit being released: the ci run's head on workflow_run, the
+      # current ref on manual dispatch.
+      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v4
+        with:
+          path: thirdparty/cache
+          key: hfc-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-
+
+      - name: Build, test and package the static archives
+        run: sh tools/make-release.sh
+
+      - name: Compute release identity
+        id: ident
+        run: |
+          echo "tag=dev-${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "short=${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ident.outputs.tag }}
+          target_commitish: ${{ env.RELEASE_SHA }}
+          name: dev build ${{ steps.ident.outputs.short }}
+          prerelease: true
+          files: release/*.tar.gz
+          body: |
+            Automated prerelease of commit ${{ env.RELEASE_SHA }} (ci green).
+            Fully static musl+mimalloc tool builds (`blake3ppsum`,
+            `blake3ppgen`, benchmarks) for x86_64 and aarch64: the aarch64
+            archives carry the full NEON+SVE kernel chain with runtime
+            vector-length dispatch, the x86_64 ones SSE4.2 through AVX-512.
+            Disposable: swept by release-cleanup after 90 days.
