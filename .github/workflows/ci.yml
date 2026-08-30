@@ -6,9 +6,8 @@
 # x86. Windows runs on the hosted windows-latest runners (x64 presets
 # built AND tested; arm64 presets cross-built via vcvarsall x64_arm64,
 # since x64 Windows cannot emulate arm64 and native arm64 testing is a gated
-# extra job for the windows-11-arm runners). macOS runs both its presets
-# natively on the Apple-silicon macos-15 runners (Homebrew LLVM ships
-# preinstalled on those images).
+# extra job for the windows-11-arm runners). macOS runs the appleclang
+# preset natively on the Apple-silicon macos-15 runners.
 #
 # Every platform that runs natively also runs the FULL bench, one rep
 # (--reps 1 --cooldown 0), and uploads a bench-report-* artifact
@@ -337,12 +336,15 @@ jobs:
             build/${{ matrix.preset }}/bench/blake3pp_bench_file.exe
             build/${{ matrix.preset }}/tests/blake3pp_tests.exe
 
-  # macOS on the Apple-silicon macos-15 runners, both presets natively:
-  # Apple clang exercises the GCD + F_NOCACHE I/O backend in CI for the
-  # first time; the Homebrew-LLVM preset rides the LLVM the runner image
-  # preinstalls (the toolchain file resolves /opt/homebrew/opt/llvm
-  # version-agnostically; the report's --version line records what it
-  # actually was).
+  # macOS on the Apple-silicon macos-15 runners: Apple clang exercises
+  # the GCD + F_NOCACHE I/O backend in CI and ships the macos release
+  # artifact. The macos-clang22-cxx26 preset is deliberately NOT a lane:
+  # the runner image preinstalls only Homebrew llvm@18, LLVM 22 would
+  # cost a multi-minute bottle pour on the scarcest runner pool, and its
+  # incremental coverage is thin: linux-clang22-cxx26 already tests the
+  # same clang major/libc++/providers, and appleclang covers Darwin. The
+  # preset stays for local use on a brewed Mac (brew install llvm@22);
+  # re-adding the lane is one matrix line + an install step.
   macos:
     name: ${{ matrix.preset }}
     runs-on: macos-15
@@ -350,7 +352,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [macos-appleclang-cxx23, macos-clang22-cxx26]
+        preset: [macos-appleclang-cxx23]
     env:
       CMAKE_GENERATOR: Ninja
     steps:

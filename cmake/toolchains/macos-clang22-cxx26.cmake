@@ -17,12 +17,33 @@
 # _LIBCPP_DISABLE_AVAILABILITY so availability markup keyed to macOS system
 # libc++ versions does not hide features libc++ 22 actually ships.
 
-set(_brew_llvm "/opt/homebrew/opt/llvm")
-if(NOT IS_DIRECTORY "${_brew_llvm}")
-  set(_brew_llvm "/usr/local/opt/llvm")  # Intel-Mac Homebrew prefix
-endif()
-if(NOT IS_DIRECTORY "${_brew_llvm}")
-  message(FATAL_ERROR "toolchain: no Homebrew LLVM found (brew install llvm)")
+# The preset is pinned to clang 22 (its identity is being the Darwin twin
+# of linux-clang22-cxx26), so accept the versioned keg or an unversioned
+# `llvm` that still resolves to a 22.x Cellar, never a different major
+# silently wearing the preset's name. The GitHub macos runner images
+# preinstall only a versioned OLDER keg (llvm@18 on macos-15) and
+# Homebrew's unversioned formula has moved past 22, which is why this
+# preset is a local-Mac preset, not a CI lane (see the macos job comment
+# in ci.yml): brew install llvm@22 first.
+set(_brew_llvm "")
+foreach(_prefix "/opt/homebrew/opt" "/usr/local/opt")  # arm64 / Intel-Mac
+  foreach(_keg "llvm@22" "llvm")
+    if(IS_DIRECTORY "${_prefix}/${_keg}")
+      # opt/<keg> links to Cellar/<formula>/<version>; check the major.
+      get_filename_component(_brew_llvm_real "${_prefix}/${_keg}" REALPATH)
+      get_filename_component(_brew_llvm_ver "${_brew_llvm_real}" NAME)
+      if(_brew_llvm_ver MATCHES "^22(\\.|$)")
+        set(_brew_llvm "${_prefix}/${_keg}")
+        break()
+      endif()
+    endif()
+  endforeach()
+  if(_brew_llvm)
+    break()
+  endif()
+endforeach()
+if(NOT _brew_llvm)
+  message(FATAL_ERROR "toolchain: no Homebrew LLVM 22 found (brew install llvm@22)")
 endif()
 
 set(TC_C_COMPILER "${_brew_llvm}/bin/clang")
