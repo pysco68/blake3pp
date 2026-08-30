@@ -408,15 +408,16 @@ jobs:
   # Native arm64 Windows testing on GitHub's windows-11-arm runners
   # (actions/runner-images Windows11-Arm64 image): runs the CROSS-BUILT
   # binaries (the Neoverse pattern) so the arm64 archives the release
-  # ships are exactly the bytes tested here. On by default: an
-  # unavailable HOSTED label fails fast rather than queueing, so if this
-  # plan turns out not to carry the image, the failure is one visible
-  # job, and setting the repository variable WIN_ARM64_NATIVE=0 switches
-  # the lane off.
+  # ships are exactly the bytes tested here. OPT-IN via repository
+  # variable WIN_ARM64_NATIVE=1: the free windows-11-arm label serves
+  # PUBLIC repositories only, and this repo is private; un-gated, the
+  # job would wait for a runner that never comes and stall the run (and
+  # the release trigger behind it). Flip the var on after making the
+  # repo public or wiring a paid larger arm64 runner to this label.
   windows-arm64-native:
     name: windows-arm64 native test (${{ matrix.preset }})
     needs: windows
-    if: vars.WIN_ARM64_NATIVE != '0'
+    if: vars.WIN_ARM64_NATIVE == '1'
     runs-on: windows-11-arm
     timeout-minutes: 30
     strategy:
@@ -517,9 +518,14 @@ jobs:
   # numbers are NOT measurements (thermal/noisy-neighbor caveats apply),
   # but a sve2_128-vs-neon ratio collapsing to 1.0 would still be a
   # regression signal.
+  # OPT-IN via repository variable LINUX_ARM64_NATIVE=1: like
+  # windows-11-arm above, the free ubuntu-24.04-arm label serves PUBLIC
+  # repositories only; on this private repo an un-gated job would hang
+  # waiting for a runner and stall the run.
   neoverse-test-bench:
     name: neoverse-n2 test+bench (real SVE2 silicon)
     needs: build-arm64-static
+    if: vars.LINUX_ARM64_NATIVE == '1'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
