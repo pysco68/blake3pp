@@ -22,53 +22,9 @@ struct kernel_ops;
 /// detail/arch.def, which documents each entry; its line order is the
 /// ABI order and append-only.
 enum class arch : std::uint8_t {
-  /// Resolves to the best usable variant at runtime.
-  auto_detect,
-  /// Portable C++ without SIMD; always compiled, the final fallback.
-  scalar,
-  /// x86-64 SSE4.2, 128-bit lanes.
-  sse42,
-  /// x86-64 AVX2, 256-bit lanes.
-  avx2,
-  /// x86-64 AVX-512 (F, CD, VL, BW, DQ), 512-bit lanes.
-  avx512,
-  /// AArch64 NEON, 128-bit lanes. Architecturally mandatory on AArch64:
-  /// presence of the kernel implies availability.
-  neon,
-  /// WebAssembly SIMD128. A module-level feature: an engine that lacks it
-  /// rejects the whole module at load, so if this code is running at all,
-  /// the variant is available.
-  simd128,
-  /// AArch64 SVE at a vector length of exactly 128 bits (opt-in build).
-  sve128,
-  /// AArch64 SVE at exactly 256 bits (Neoverse V1 / Graviton3 class).
-  sve256,
-  /// AArch64 SVE at exactly 512 bits (Fujitsu A64FX class).
-  sve512,
-  /// AArch64 SVE2 at exactly 128 bits, with the XAR fused xor-rotate
-  /// (Neoverse N2/V2, Grace, Graviton4).
-  sve2_128,
-  /// AArch64 SVE2 at exactly 256 bits (opt-in build).
-  sve2_256,
-  /// AArch64 SVE2 at exactly 512 bits (opt-in build).
-  sve2_512,
-  /// RISC-V RVV 1.0 at a vector length of exactly 128 bits.
-  rvv128,
-  /// RISC-V RVV 1.0 at exactly 256 bits.
-  rvv256,
-  /// RISC-V RVV 1.0 at exactly 512 bits.
-  rvv512,
-  /// T-Head XTheadVector, the draft-RVV-0.7.1 encoding of C906/C910
-  /// silicon (Allwinner D1, SG2042, TH1520). Hand-written kernel, opt-in
-  /// build (BLAKE3PP_XTHEAD_KERNEL=ON); detected through the hwprobe
-  /// vendor-extension key (Linux 6.13+).
-  xthead,
-  /// RISC-V RVV 1.0 plus Zvbb (vector rotate) at exactly 128 bits.
-  rvv128_zvbb,
-  /// RISC-V RVV 1.0 plus Zvbb at exactly 256 bits.
-  rvv256_zvbb,
-  /// RISC-V RVV 1.0 plus Zvbb at exactly 512 bits.
-  rvv512_zvbb,
+#define BLAKE3PP_ARCH(enumerator, name, rank) enumerator,
+#include <blake3pp/detail/arch.def>
+#undef BLAKE3PP_ARCH
 };
 
 /// True if the variant is compiled into this binary and the running CPU

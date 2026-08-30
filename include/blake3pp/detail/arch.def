@@ -1,0 +1,84 @@
+/// @file
+/// The one canonical list of instruction-set variants: the single source
+/// the enum, the name strings, and the dispatch preference order are all
+/// generated from (same include-me-under-a-macro pattern as the build-time
+/// kernel registry). Consumers define BLAKE3PP_ARCH(enumerator, "name",
+/// rank) and include this file; no include guard on purpose.
+///
+/// Two orders live here, deliberately separated:
+///   * LINE ORDER is ABI order. The enum's underlying values follow it, so
+///     entries are APPEND-ONLY: never reorder, never insert, never remove.
+///   * RANK is the dispatch preference, lower wins, unique (asserted).
+///     auto_detect must hold the lowest rank; scalar the highest. Ranks are
+///     spaced by 10 so a measured reordering is a one-number edit with no
+///     ABI consequence.
+///
+/// The enumerator doubles as the kernel namespace token and the CMake
+/// registration name (see cmake/ArchKernels.cmake); they must all agree.
+/// The display name is separate only where convention demands it ("auto").
+
+/// Resolves to the best usable variant at runtime.
+BLAKE3PP_ARCH(auto_detect, "auto", 0)
+/// Portable C++ without SIMD; always compiled, the final fallback.
+BLAKE3PP_ARCH(scalar, "scalar", 190)
+/// x86-64 SSE4.2, 128-bit lanes.
+BLAKE3PP_ARCH(sse42, "sse42", 30)
+/// x86-64 AVX2, 256-bit lanes.
+BLAKE3PP_ARCH(avx2, "avx2", 20)
+/// x86-64 AVX-512 (F, CD, VL, BW, DQ), 512-bit lanes.
+BLAKE3PP_ARCH(avx512, "avx512", 10)
+/// AArch64 NEON, 128-bit lanes. Architecturally mandatory on AArch64:
+/// presence of the kernel implies availability.
+BLAKE3PP_ARCH(neon, "neon", 90)
+/// WebAssembly SIMD128. A module-level feature: an engine that lacks it
+/// rejects the whole module at load, so if this code is running at all,
+/// the variant is available.
+BLAKE3PP_ARCH(simd128, "simd128", 180)
+// Fixed-length SVE variants. Vector-length-specific code is only valid
+// when the runtime vector length EQUALS the compiled one (GCC/Arm
+// document exact-match only), so each VL is its own variant and at most
+// one of each SVE generation is ever available on a given machine. The
+// sve2_* variants additionally use SVE2's XAR fused xor-rotate: a
+// measured +19% over neon on Neoverse V2, entirely from XAR, which is
+// why sve2_128 outranks neon while sve128 (same width, no XAR,
+// measured parity) sits below it. sve128 / sve2_256 /
+// sve2_512 match no shipping silicon and are compiled only when
+// BLAKE3PP_SVE_ALL_VARIANTS=ON (emulators make them runnable anyway).
+/// AArch64 SVE at a vector length of exactly 128 bits (opt-in build).
+BLAKE3PP_ARCH(sve128, "sve128", 100)
+/// AArch64 SVE at exactly 256 bits (Neoverse V1 / Graviton3 class).
+BLAKE3PP_ARCH(sve256, "sve256", 70)
+/// AArch64 SVE at exactly 512 bits (Fujitsu A64FX class).
+BLAKE3PP_ARCH(sve512, "sve512", 50)
+/// AArch64 SVE2 at exactly 128 bits, with the XAR fused xor-rotate
+/// (Neoverse N2/V2, Grace, Graviton4).
+BLAKE3PP_ARCH(sve2_128, "sve2_128", 80)
+/// AArch64 SVE2 at exactly 256 bits (opt-in build).
+BLAKE3PP_ARCH(sve2_256, "sve2_256", 60)
+/// AArch64 SVE2 at exactly 512 bits (opt-in build).
+BLAKE3PP_ARCH(sve2_512, "sve2_512", 40)
+// Fixed-VLEN RVV 1.0 variants: the same exact-match rule as SVE
+// (-mrvv-vector-bits=zvl pins vscale, min AND max, and whole-register
+// moves assume it), keyed on the runtime vlenb. VLEN>512 hardware falls
+// back to scalar (documented gap; a scalable kernel would be new work).
+/// RISC-V RVV 1.0 at a vector length of exactly 128 bits.
+BLAKE3PP_ARCH(rvv128, "rvv128", 160)
+/// RISC-V RVV 1.0 at exactly 256 bits.
+BLAKE3PP_ARCH(rvv256, "rvv256", 140)
+/// RISC-V RVV 1.0 at exactly 512 bits.
+BLAKE3PP_ARCH(rvv512, "rvv512", 120)
+/// T-Head XTheadVector, the draft-RVV-0.7.1 encoding of C906/C910
+/// silicon (Allwinner D1, SG2042, TH1520). Hand-written kernel, opt-in
+/// build (BLAKE3PP_XTHEAD_KERNEL=ON); detected through the hwprobe
+/// vendor-extension key (Linux 6.13+).
+BLAKE3PP_ARCH(xthead, "xthead", 170)
+// RVV 1.0 + Zvbb: the same fixed-VLEN kernels with the 3-op shift-or
+// rotate replaced by Zvbb's single vror (base RVV has no rotate); the
+// RVV analog of SVE2's XAR. Zvbb is detected via hwprobe (it has no
+// HWCAP letter), VLEN exact-match as ever.
+/// RISC-V RVV 1.0 plus Zvbb (vector rotate) at exactly 128 bits.
+BLAKE3PP_ARCH(rvv128_zvbb, "rvv128_zvbb", 150)
+/// RISC-V RVV 1.0 plus Zvbb at exactly 256 bits.
+BLAKE3PP_ARCH(rvv256_zvbb, "rvv256_zvbb", 130)
+/// RISC-V RVV 1.0 plus Zvbb at exactly 512 bits.
+BLAKE3PP_ARCH(rvv512_zvbb, "rvv512_zvbb", 110)

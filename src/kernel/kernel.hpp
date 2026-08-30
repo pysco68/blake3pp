@@ -32,7 +32,7 @@ enum class transpose16_mode : std::uint8_t {
   tree = 1,       // 4-stage radix-2 register shuffle network
   quartered = 2,  // 128-bit insert-loads + in-lane unpacks (default)
 };
-extern std::atomic<transpose16_mode> transpose16_active;  // dispatch.cpp
+extern std::atomic<transpose16_mode> transpose16_active;  // transpose16.cpp
 
 
 inline constexpr std::uint32_t block_len = 64;
