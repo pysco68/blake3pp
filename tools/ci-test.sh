@@ -61,6 +61,22 @@ case "${preset}" in
       echo "::group::ctest ${preset} [xthead-compiled-in]"
       ctest --test-dir "${xthead_dir}" --output-on-failure
       echo "::endgroup::"
+      # Freestanding xthead verifier (tests/xthead_verify.cpp): no libc,
+      # raw syscalls, runs on ANY riscv64 Linux. Built here so the
+      # Cloud-V Pioneer job can exercise the 0.7.1 kernel on real
+      # silicon without any toolchain on the board.
+      vd="build/xthead-verify"
+      vf="-std=c++23 -O2 -fno-exceptions -fno-rtti -fno-stack-protector -Isrc -Iinclude"
+      mkdir -p "${vd}"
+      riscv64-linux-gnu-g++ ${vf} -march=rv64gc -DBLAKE3PP_ARCH_NS=scalar \
+        -DBLAKE3PP_FORCE_SCALAR=1 -c src/kernel/kernel.cpp -o "${vd}/scalar.o"
+      riscv64-linux-gnu-g++ ${vf} -march=rv64gc_xtheadvector \
+        -mno-riscv-attribute -Wa,-mno-arch-attr -DBLAKE3PP_ARCH_NS=xthead \
+        -c src/kernel/xthead_kernel.cpp -o "${vd}/xthead.o"
+      riscv64-linux-gnu-g++ ${vf} -march=rv64gc \
+        -c tests/xthead_verify.cpp -o "${vd}/main.o"
+      riscv64-linux-gnu-g++ -nostdlib -static -o "${vd}/xthead_verify" \
+        "${vd}/main.o" "${vd}/scalar.o" "${vd}/xthead.o"
     fi
     ;;
   wasm32-*)
