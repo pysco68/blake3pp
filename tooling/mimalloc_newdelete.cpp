@@ -7,12 +7,16 @@
 // to each executable individually; two copies in one link is a duplicate
 // symbol error, and that is the intended failure mode.
 //
-// WINDOWS ONLY. On POSIX, mimalloc's combined object already defines these
-// operators (along with the wholesale malloc/free override), so compiling
-// this into a POSIX link would collide with it. The choice lives in the
-// top-level CMakeLists next to the reasoning for both platforms; this file
-// is deliberately not self-guarding, so a mistake there fails loudly at
-// link time instead of silently doing nothing.
+// WINDOWS AND MACOS ONLY. On ELF POSIX, mimalloc's force-loaded archive
+// already provides the wholesale malloc/free override (which operator
+// new/delete reach through malloc), so compiling this into such a link
+// would collide with its own new/delete replacements. On Windows and
+// macOS the static archive is built WITHOUT the override machinery
+// (unreliable there: redirect DLL resp. malloc-zone crash; see the
+// top-level CMakeLists), and this TU is the allocator hookup. The choice
+// lives in the top-level CMakeLists next to the reasoning for all three
+// platforms; this file is deliberately not self-guarding, so a mistake
+// there fails loudly at link time instead of silently doing nothing.
 //
 // <mimalloc-new-delete.h> is reached through mimalloc-static's
 // INTERFACE_INCLUDE_DIRECTORIES.

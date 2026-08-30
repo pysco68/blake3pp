@@ -219,6 +219,16 @@ if(BLAKE3PP_TOOL_MIMALLOC)
   if(NOT (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"))
     string(APPEND _mi_toolchain_extension "    set(CMAKE_C_FLAGS_INIT \"\${CMAKE_C_FLAGS_INIT} -Wno-date-time\")\n")
   endif()
+  # macOS cannot do wholesale malloc override from a static link: dyld
+  # honors __interpose sections only in dylibs, so the active mechanism
+  # would be mimalloc's default-malloc-zone swap, and that crashed every
+  # tool at load on the macos-15 arm64 runners (mimalloc v3 zone override
+  # vs current libmalloc). Build without MI_OVERRIDE there so the zone/
+  # interpose machinery does not even exist in the archive; allocation
+  # still reaches mimalloc via the operator new/delete route below.
+  if(APPLE)
+    string(APPEND _mi_toolchain_extension "    set(MI_OVERRIDE OFF CACHE BOOL \"\" FORCE)\n")
+  endif()
 
   FetchContent_Declare(mimalloc
     GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
@@ -230,12 +240,15 @@ if(BLAKE3PP_TOOL_MIMALLOC)
     HERMETIC_DISCOVER_TARGETS_FILE_PATTERN [[/mimalloc\.cmake$]])
   HermeticFetchContent_MakeAvailableAtBuildTime(mimalloc)
 
-  if(WIN32)
-    # Full malloc override on Windows needs the mimalloc-redirect DLL
-    # pair next to every exe (their docs: static malloc override is not
-    # reliable there). The reliable static route for C++ programs is the
-    # global operator new/delete override, which covers effectively all
-    # of the tools' allocation traffic while keeping single-file exes.
+  if(WIN32 OR APPLE)
+    # Windows: full malloc override needs the mimalloc-redirect DLL pair
+    # next to every exe (their docs: static malloc override is not
+    # reliable there). macOS: static override is equally off the table,
+    # since dyld ignores __interpose outside dylibs and the malloc-zone
+    # swap crashed at load (see the MI_OVERRIDE note above). The reliable
+    # static route for C++ programs on both is the global operator
+    # new/delete override, which covers effectively all of the tools'
+    # allocation traffic while keeping single-file exes.
     # The overriding TU is a tracked source, not a generated one: the
     # operators it defines end up in every shipped executable, and that is
     # worth being greppable, reviewable and visible in a backtrace. It is
@@ -243,14 +256,14 @@ if(BLAKE3PP_TOOL_MIMALLOC)
     target_sources(blake3pp_tool_allocator INTERFACE "${PROJECT_SOURCE_DIR}/tooling/mimalloc_newdelete.cpp")
     target_link_libraries(blake3pp_tool_allocator INTERFACE mimalloc-static)
   else()
-    # POSIX: mimalloc's override machinery (the operator new/delete
-    # replacements, and on macOS the malloc-zone interposition) lives in
-    # archive members that nothing in the program references. A plain
-    # archive link therefore never extracts them (a linker only pulls a
-    # member that resolves an undefined symbol) and the override silently
-    # does not happen: the binary still initializes mimalloc and looks
-    # fine, it just is not the allocator. Force-loading the whole archive
-    # is the fix.
+    # ELF POSIX: mimalloc's override machinery (the strong malloc/free
+    # symbols and operator new/delete replacements) lives in archive
+    # members that nothing in the program references. A plain archive
+    # link therefore never extracts them (a linker only pulls a member
+    # that resolves an undefined symbol) and the override silently does
+    # not happen: the binary still initializes mimalloc and looks fine,
+    # it just is not the allocator. Force-loading the whole archive is
+    # the fix.
     #
     # mimalloc also ships MI_BUILD_OBJECT, a combined mimalloc.o meant for
     # exactly this, and linking that object works equally well. Force-loading
