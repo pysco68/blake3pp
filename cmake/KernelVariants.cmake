@@ -48,31 +48,22 @@ function(_blake3pp_register_x86_kernels)
 endfunction()
 
 function(_blake3pp_register_aarch64_kernels)
-  # NEON is baseline on AArch64, with one diagnosed exception. Under
-  # pure cl.exe the kernel MEASURED <0.005 GiB/s on Cobalt 100 (~100x
-  # below scalar in the same binary) while validating byte-identical.
-  # Root cause, proven by disassembling the CI artifact and reproducing
-  # the compile with /w14883: warning C4883 "function size suppresses
-  # optimizations". MSVC's optimizer has an internal size budget, the
-  # flattened all_rounds/hash_batch/xof_wide blow it, and cl SILENTLY
-  # emits /Od-class code inside the /O2 build (2.24M instructions,
-  # 550k stack round-trips, 14.8MB object). The documented-by-Chromium
-  # /d2OptimizeHugeFunctions raises the budget: same TU drops to 29.4k
-  # instructions / 603 stack ops / 194KB, real NEON code. cl gets the
-  # kernel only with that flag, probed because /d2 options are
-  # version-fragile; /we4883 makes any FUTURE silent bailout a build
-  # error instead of a 250x mystery. Silicon verdict on the optimized
-  # kernel comes from the windows-11-arm lane; the arm64-msvc zip ships
-  # in the release, so that lane doubles as its pre-ship gate whenever
-  # it is enabled.
-  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
-    set(CMAKE_REQUIRED_FLAGS "/d2OptimizeHugeFunctions /WX")
-    check_cxx_source_compiles("int main() { return 0; }" BLAKE3PP_MSVC_HUGE_FUNC_OPT)
-    set(CMAKE_REQUIRED_FLAGS "")
-    if(BLAKE3PP_MSVC_HUGE_FUNC_OPT)
-      blake3pp_add_kernel(neon ARCH_FLAGS /d2OptimizeHugeFunctions /we4883)
-    endif()
-  else()
+  # NEON is baseline on AArch64, except under pure cl.exe, which is
+  # scalar-only BY VERDICT, not by inability. The full story: xsimd 14.3
+  # compiles on
+  # MSVC-arm64 and validates byte-identical, but cl's optimizer
+  # size-budget bailout (C4883, silent, off by default) emitted
+  # /Od-class code: <0.005 GiB/s on Cobalt 100, ~100x BELOW scalar,
+  # with auto-dispatch preferring it. The fix exists and was verified
+  # (/d2OptimizeHugeFunctions: 2.24M -> 29.4k instructions, 14.8MB ->
+  # 194KB object), but the economics killed it: 15-20 MINUTES of
+  # compile for this one TU (OOM-ing 16GB runners at the default /Ob3,
+  # C1002) versus clang-cl producing a faster kernel (1.29 GiB/s) in
+  # seconds. Anyone wanting fast hashing on arm64 Windows should use
+  # the clang-cl build; the cl build ships correct scalar (0.52).
+  # If cl's optimizer economics improve, the recipe that worked is:
+  # ARCH_FLAGS /d2OptimizeHugeFunctions /we4883 /Ob2.
+  if(NOT (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"))
     blake3pp_add_kernel(neon)
   endif()
   # Fixed-length SVE variants: one kernel per vector length, because VLS

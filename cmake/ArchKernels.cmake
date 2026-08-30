@@ -127,9 +127,6 @@ function(blake3pp_add_kernel ns)
     target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_FORCE_XSIMD=1")
     target_link_libraries(${tgt} PRIVATE xsimd)
   endif()
-  if(AK_ARCH_FLAGS)
-    target_compile_options(${tgt} PRIVATE ${AK_ARCH_FLAGS})
-  endif()
   # The kernels are the hot loop and measurably faster at -O3 (GCC's
   # std::simd path is ~2x slower at -O2). Applied only to optimized configs
   # so Debug/sanitizer builds keep their debuggability; appended after the
@@ -159,6 +156,13 @@ function(blake3pp_add_kernel ns)
   # so it stays on. Measured, not assumed.
   target_compile_options(${tgt} PRIVATE
     "$<$<CXX_COMPILER_ID:GNU>:-fno-schedule-insns2>")
+  # Per-kernel ARCH_FLAGS come AFTER the shared optimization flags so a
+  # kernel can override them; last flag wins on every driver here, which
+  # makes ARCH_FLAGS a true escape hatch (e.g. a per-kernel /Ob2 beating
+  # the /Ob3 above).
+  if(AK_ARCH_FLAGS)
+    target_compile_options(${tgt} PRIVATE ${AK_ARCH_FLAGS})
+  endif()
   # Experimentation hook: extra flags for kernel TUs only (scheduler knobs,
   # tuning trials). Semicolon-separated list; empty by default.
   if(BLAKE3PP_KERNEL_EXTRA_FLAGS)

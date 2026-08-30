@@ -136,7 +136,7 @@
     },
     {
       "name": "windows-arm64-msvc2026-cxx23",
-      "displayName": "Windows arm64 cross (MSVC; neon needs /d2OptimizeHugeFunctions vs C4883 bailout), vcvarsamd64_arm64 shell",
+      "displayName": "Windows arm64 cross (MSVC, scalar-only by verdict; see KernelVariants.cmake), vcvarsamd64_arm64 shell",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-arm64-msvc2026-cxx23",
       "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-msvc2026-cxx23.cmake",
