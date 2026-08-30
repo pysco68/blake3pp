@@ -45,6 +45,27 @@ if(NOT DEFINED TC_CXX_COMPILER)
   message(FATAL_ERROR "toolchain: TC_CXX_COMPILER must be set before including windows-common.cmake")
 endif()
 
+# clang-cl by BARE NAME resolves through PATH, and the hosted runner
+# images ship a standalone LLVM in C:\Program Files\LLVM that shadows
+# the VS-bundled toolset (`where clang-cl` listed it first). That makes
+# the compiler whatever the runner image last dropped there: an image
+# update moved the standalone copy and source-identical windows-arm64
+# binaries started crashing at startup (2026-08-30). "The VS LLVM
+# toolset" is what these toolchains MEAN, so resolve it explicitly from
+# the developer-shell environment; bare-name PATH resolution is only
+# the fallback, and it warns.
+if(TC_CXX_COMPILER STREQUAL "clang-cl" AND DEFINED ENV{VCINSTALLDIR})
+  cmake_path(CONVERT "$ENV{VCINSTALLDIR}Tools/Llvm/x64/bin/clang-cl.exe"
+             TO_CMAKE_PATH_LIST _tc_vs_clangcl)
+  if(EXISTS "${_tc_vs_clangcl}")
+    set(TC_C_COMPILER "${_tc_vs_clangcl}")
+    set(TC_CXX_COMPILER "${_tc_vs_clangcl}")
+    message(STATUS "toolchain: clang-cl pinned to the VS LLVM toolset: ${_tc_vs_clangcl}")
+  else()
+    message(WARNING "toolchain: developer shell present but no VS LLVM toolset at ${_tc_vs_clangcl}; falling back to clang-cl from PATH; which compiler that is depends on the machine")
+  endif()
+endif()
+
 set(CMAKE_C_COMPILER   "${TC_C_COMPILER}")
 set(CMAKE_CXX_COMPILER "${TC_CXX_COMPILER}")
 

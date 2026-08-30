@@ -548,12 +548,32 @@ jobs:
       - name: CPU identity
         shell: pwsh
         run: (Get-CimInstance Win32_Processor).Name
-      - name: Startup smoke (blake3ppsum --version)
+      # Triage smoke: probe EVERY binary, not just the first (which
+      # binaries crash discriminates hypotheses: the tests binary is the
+      # only one not linking the tool allocator), then pull the Windows
+      # Error Reporting events for any crash: faulting module + offset,
+      # mappable to an instruction in a dumpbin disassembly.
+      - name: Startup smoke (all binaries, crash triage)
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          & "cli\blake3ppsum.exe" --version 2>&1
+          $failed = @()
+          foreach ($probe in @(
+              @{exe = 'cli\blake3ppsum.exe';       args = @('--version')},
+              @{exe = 'cli\blake3ppgen.exe';       args = @('--help')},
+              @{exe = 'bench\blake3pp_bench.exe';  args = @('--help')},
+              @{exe = 'tests\blake3pp_tests.exe';  args = @('--version')})) {
+            & $probe.exe @($probe.args) 2>&1 | ForEach-Object { "  $_" }
+            $code = $LASTEXITCODE
+            "{0} -> exit 0x{1:X8} ({1})" -f $probe.exe, $code
+            if ($code -ne 0) { $failed += $probe.exe }
+          }
+          if ($failed) {
+            Start-Sleep -Seconds 5  # let WER finish writing the event
+            "== WER crash events =="
+            Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000} -MaxEvents 5 -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.TimeCreated; $_.Message; '---' }
+            throw "startup crash in: $failed"
+          }
       - name: Test the cross-built binaries on real arm64 Windows
         shell: pwsh
         run: |
