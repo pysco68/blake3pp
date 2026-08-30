@@ -117,11 +117,13 @@ constexpr std::size_t num_kernels = std::size(registry);
 // neon: same width, no XAR, measured parity (1.62), so no reason to
 // displace the tuned NEON kernel.
 constexpr arch all_enumerators[] = {
-    arch::auto_detect, arch::avx512, arch::avx2,     arch::sse42,
-    arch::sve2_512,    arch::sve512, arch::sve2_256, arch::sve256,
-    arch::sve2_128,    arch::neon,   arch::sve128,   arch::rvv512,
-    arch::rvv256,      arch::rvv128, arch::xthead,   arch::simd128,
-    arch::scalar};
+    arch::auto_detect,  arch::avx512,      arch::avx2,
+    arch::sse42,        arch::sve2_512,    arch::sve512,
+    arch::sve2_256,     arch::sve256,      arch::sve2_128,
+    arch::neon,         arch::sve128,      arch::rvv512_zvbb,
+    arch::rvv512,       arch::rvv256_zvbb, arch::rvv256,
+    arch::rvv128_zvbb,  arch::rvv128,      arch::xthead,
+    arch::simd128,      arch::scalar};
 constexpr std::span<const arch> preference =
     std::span{all_enumerators}.subspan(1);
 
@@ -257,8 +259,21 @@ bool sve_cpu_supports(arch a) noexcept {
 #endif
 
 #if defined(BLAKE3PP_RISCV64_LINUX_RVV)
+// Zvbb has no single-letter HWCAP bit; the hwprobe IMA_EXT_0 key carries
+// it. Raw syscall (see the xthead note below); ENOSYS degrades to absent.
+#ifndef BLAKE3PP_NR_riscv_hwprobe
+#define BLAKE3PP_NR_riscv_hwprobe 258
+#endif
+#ifndef RISCV_HWPROBE_KEY_IMA_EXT_0
+#define RISCV_HWPROBE_KEY_IMA_EXT_0 4
+#endif
+#ifndef RISCV_HWPROBE_EXT_ZVBB
+#define RISCV_HWPROBE_EXT_ZVBB (1ULL << 17)
+#endif
+
 struct rvv_state {
   bool v = false;
+  bool zvbb = false;
   unsigned long vlenb = 0;
 };
 
@@ -275,6 +290,16 @@ const rvv_state& rvv_probe() noexcept {
           : "=r"(vlenb));
       st.v = vlenb != 0;
       st.vlenb = vlenb;
+      if (st.v) {
+        struct {
+          std::int64_t key;
+          std::uint64_t value;
+        } pair = {RISCV_HWPROBE_KEY_IMA_EXT_0, 0};
+        const long rc = syscall(BLAKE3PP_NR_riscv_hwprobe, &pair, 1UL, 0UL,
+                                nullptr, 0U);
+        st.zvbb = rc == 0 && pair.key == RISCV_HWPROBE_KEY_IMA_EXT_0 &&
+                  (pair.value & RISCV_HWPROBE_EXT_ZVBB) != 0;
+      }
     }
     return st;
   }();
@@ -289,9 +314,6 @@ const rvv_state& rvv_probe() noexcept {
 // BLAKE3PP_ASSUME_XTHEADVECTOR=1 env hook exists for emulator testing
 // (T-Head's qemu fork predates the hwprobe key) and is honored for this
 // one arch only.
-#ifndef BLAKE3PP_NR_riscv_hwprobe
-#define BLAKE3PP_NR_riscv_hwprobe 258
-#endif
 #ifndef RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0
 #define RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0 11
 #endif
@@ -328,10 +350,13 @@ bool rvv_cpu_supports(arch a) noexcept {
     return false;
   }
   switch (a) {
-    case arch::rvv128: return s.vlenb == 16;
-    case arch::rvv256: return s.vlenb == 32;
-    case arch::rvv512: return s.vlenb == 64;
-    default:           return false;
+    case arch::rvv128:      return s.vlenb == 16;
+    case arch::rvv256:      return s.vlenb == 32;
+    case arch::rvv512:      return s.vlenb == 64;
+    case arch::rvv128_zvbb: return s.zvbb && s.vlenb == 16;
+    case arch::rvv256_zvbb: return s.zvbb && s.vlenb == 32;
+    case arch::rvv512_zvbb: return s.zvbb && s.vlenb == 64;
+    default:                return false;
   }
 }
 #endif
@@ -366,6 +391,9 @@ bool cpu_supports(arch a) noexcept {
     case arch::rvv128:
     case arch::rvv256:
     case arch::rvv512:
+    case arch::rvv128_zvbb:
+    case arch::rvv256_zvbb:
+    case arch::rvv512_zvbb:
       return rvv_cpu_supports(a);
     case arch::xthead:
       return xthead_cpu_supports();
@@ -479,6 +507,12 @@ const char* to_string(arch a) noexcept {
       return "rvv512";
     case arch::xthead:
       return "xthead";
+    case arch::rvv128_zvbb:
+      return "rvv128_zvbb";
+    case arch::rvv256_zvbb:
+      return "rvv256_zvbb";
+    case arch::rvv512_zvbb:
+      return "rvv512_zvbb";
   }
   return "unknown";
 }

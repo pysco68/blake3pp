@@ -63,6 +63,12 @@ enum class arch : std::uint8_t {
   /// build (BLAKE3PP_XTHEAD_KERNEL=ON); detected through the hwprobe
   /// vendor-extension key (Linux 6.13+).
   xthead,
+  /// RISC-V RVV 1.0 plus Zvbb (vector rotate) at exactly 128 bits.
+  rvv128_zvbb,
+  /// RISC-V RVV 1.0 plus Zvbb at exactly 256 bits.
+  rvv256_zvbb,
+  /// RISC-V RVV 1.0 plus Zvbb at exactly 512 bits.
+  rvv512_zvbb,
 };
 
 /// True if the variant is compiled into this binary and the running CPU

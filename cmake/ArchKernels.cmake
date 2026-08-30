@@ -85,6 +85,14 @@ blake3pp_kernel_switch(STAGED_ROUNDS 1
 blake3pp_kernel_switch(XAR_ROTATE 1
   "aarch64 SVE2: fuse xor+rotate into a single XAR instead of eor + rotate")
 
+# riscv Zvbb variants: single-instruction vror instead of the 3-op
+# shift-or (base RVV 1.0 has no vector rotate; GCC 15 does not fuse the
+# pattern on its own: measured, 0 vror emitted). The XAR playbook one ISA
+# over; unmeasured on real Zvbb silicon so far, which is what this switch
+# is for. See xor_rot in src/kernel/transpose.hpp.
+blake3pp_kernel_switch(VROR_ROTATE 1
+  "riscv Zvbb: single-instruction vror rotate instead of the 3-op shift-or")
+
 function(blake3pp_add_kernel ns)
   cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD" "SOURCE"
     "ARCH_FLAGS")

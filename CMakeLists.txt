@@ -321,6 +321,31 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64)$")
       ARCH_FLAGS -march=rv64gcv_zvl256b -mrvv-vector-bits=zvl)
     blake3pp_add_kernel(rvv512 FORCE_XSIMD
       ARCH_FLAGS -march=rv64gcv_zvl512b -mrvv-vector-bits=zvl)
+    # The Zvbb twins: same kernels, single-instruction vror rotates via
+    # xor_rot's Zvbb branch (GCC does not fuse the generic pattern on its
+    # own). Zvbb-less V hardware exists, hence separate variants.
+    set(CMAKE_REQUIRED_FLAGS
+      "-march=rv64gcv_zvbb_zvl256b -mrvv-vector-bits=zvl")
+    check_cxx_source_compiles([=[
+      #include <riscv_vector.h>
+      typedef vuint32m1_t fixed_u32
+          __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen)));
+      int main() {
+        fixed_u32 z =
+            __riscv_vmv_v_x_u32m1(0x80000001u, __riscv_v_fixed_vlen / 32);
+        fixed_u32 r = __riscv_vror_vx_u32m1(z, 7, __riscv_v_fixed_vlen / 32);
+        return __riscv_vmv_x_s_u32m1_u32(r) != 0u ? 0 : 1;
+      }
+    ]=] BLAKE3PP_COMPILER_RVV_ZVBB)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(BLAKE3PP_COMPILER_RVV_ZVBB)
+      blake3pp_add_kernel(rvv128_zvbb FORCE_XSIMD
+        ARCH_FLAGS -march=rv64gcv_zvbb_zvl128b -mrvv-vector-bits=zvl)
+      blake3pp_add_kernel(rvv256_zvbb FORCE_XSIMD
+        ARCH_FLAGS -march=rv64gcv_zvbb_zvl256b -mrvv-vector-bits=zvl)
+      blake3pp_add_kernel(rvv512_zvbb FORCE_XSIMD
+        ARCH_FLAGS -march=rv64gcv_zvbb_zvl512b -mrvv-vector-bits=zvl)
+    endif()
   endif()
   # T-Head XTheadVector (draft RVV 0.7.1): a hand-written standalone TU
   # (see src/kernel/xthead_kernel.cpp for why the facade cannot express

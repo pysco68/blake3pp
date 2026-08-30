@@ -33,6 +33,13 @@
 #define BLAKE3PP_HAVE_SVE2_XAR 1
 #endif
 
+// RVV+Zvbb fixed-vlen TUs get the single-instruction rotate; see xor_rot.
+#if defined(__riscv) && !defined(BLAKE3PP_FORCE_SCALAR) && \
+    defined(__riscv_zvbb) && defined(__riscv_v_fixed_vlen)
+#include <riscv_vector.h>
+#define BLAKE3PP_HAVE_ZVBB_VROR 1
+#endif
+
 #include "kernel/force_inline.hpp"
 #include "kernel/shuffle.hpp"
 #include "kernel/simd_facade.hpp"
@@ -337,9 +344,19 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
 #define BLAKE3PP_KERNEL_XAR_ROTATE 1
 #endif
 
+// Likewise for -DBLAKE3PP_KERNEL_VROR_ROTATE (riscv Zvbb).
+#ifndef BLAKE3PP_KERNEL_VROR_ROTATE
+#define BLAKE3PP_KERNEL_VROR_ROTATE 1
+#endif
+
 #if defined(BLAKE3PP_HAVE_SVE2_XAR)
 typedef svuint32_t sve_fixed_u32
     __attribute__((arm_sve_vector_bits(__ARM_FEATURE_SVE_BITS)));
+#endif
+
+#if defined(BLAKE3PP_HAVE_ZVBB_VROR)
+typedef vuint32m1_t rvv_fixed_u32
+    __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen)));
 #endif
 
 // The fused xor-then-rotate the kernel's g function is made of:
@@ -361,6 +378,21 @@ BLAKE3PP_FORCE_INLINE u32v xor_rot(u32v x, u32v y) noexcept {
                                           N);
       return u32v{std::bit_cast<decltype(ix)>(r)};
     }(x.v, y.v);
+  }
+#endif
+#if defined(BLAKE3PP_HAVE_ZVBB_VROR) && BLAKE3PP_KERNEL_VROR_ROTATE
+  if constexpr (sizeof(typename u32v::impl) * 8 == __riscv_v_fixed_vlen &&
+                std::is_trivially_copyable_v<typename u32v::impl>) {
+    // Zvbb's vror is XAR minus the folded eor: base RVV has no rotate at
+    // all, so the generic fallback is FOUR ops (vxor+vsll+vsrl+vor); this
+    // is vxor+vror. Same dependent-lambda shield as the branches above.
+    const u32v e = x ^ y;
+    return [](auto impl) BLAKE3PP_LAMBDA_FORCE_INLINE {
+      const rvv_fixed_u32 v = std::bit_cast<rvv_fixed_u32>(impl);
+      const rvv_fixed_u32 r =
+          __riscv_vror_vx_u32m1(v, N, __riscv_v_fixed_vlen / 32);
+      return u32v{std::bit_cast<decltype(impl)>(r)};
+    }(e.v);
   }
 #endif
   return rot<N>(x ^ y);

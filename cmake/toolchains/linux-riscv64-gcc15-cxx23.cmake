@@ -14,6 +14,16 @@ set(CMAKE_SYSTEM_PROCESSOR riscv64)
 set(CMAKE_C_COMPILER riscv64-linux-gnu-gcc)
 set(CMAKE_CXX_COMPILER riscv64-linux-gnu-g++)
 
+# Ubuntu resolute's riscv64 gcc defaults to the RVA23 profile baseline:
+# V, Zvbb and friends emitted unconditionally. Left alone, that plants
+# ungated vector code in every non-kernel TU (GCC autovectorizes
+# mimalloc's random-init into Zvbb vwsll, which SIGILLs before main on
+# anything below RVA23). Pin the BASE build to plain rv64gc; kernel
+# TUs opt into their extensions per-TU via ARCH_FLAGS, which append
+# after these and win.
+set(CMAKE_C_FLAGS_INIT "-march=rv64gc")
+set(CMAKE_CXX_FLAGS_INIT "-march=rv64gc")
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
