@@ -1,9 +1,12 @@
-# The test matrix: every containerizable preset, each job running INSIDE
-# its per-compiler toolchain image (the same images tools/tc uses locally,
-# built and pushed by toolchains.yml). One entry point, tools/ci-test.sh,
-# holds the per-architecture emulator matrices: qemu vector lengths and
-# feature-off fallbacks for the cross presets, Intel SDE for AVX-512 on
-# x86. Windows runs on the hosted windows-latest runners (x64 presets
+# Every containerizable preset runs INSIDE its per-compiler toolchain
+# image (the same images tools/tc uses locally, built and pushed by
+# toolchains.yml), split into two matrices: `test` (pure validation:
+# compiler cohort, sanitizers, wasm, arm64 emulation) and `binaries`
+# (the legs whose outputs ship or meet hardware), so the hardware lanes
+# wait only on the bytes they run, never on a sanitizer suite. One
+# entry point, tools/ci-test.sh, holds the per-architecture emulator
+# matrices: qemu vector lengths and feature-off fallbacks for the cross
+# presets, Intel SDE for AVX-512 on x86. Windows runs on the hosted windows-latest runners (x64 presets
 # built AND tested; arm64 presets cross-built via vcvarsall x64_arm64,
 # since x64 Windows cannot emulate arm64 and native arm64 testing is a gated
 # extra job for the windows-11-arm runners). macOS runs the appleclang
@@ -124,6 +127,13 @@ jobs:
             docker buildx imagetools create -t "${ref%:*}:latest" "${ref}"
           done
 
+  # Pure validation: the native compiler cohort, the sanitizers, wasm,
+  # and the arm64 emulator matrix. Produces NOTHING downstream: no
+  # artifacts, no hardware lane waits on it. It still gates the release
+  # with everything else (release.yml fires only on a fully green run);
+  # splitting it out just means the riscv boards do not idle behind an
+  # msan suite (needs: can only reference whole jobs, never single
+  # matrix legs, so unblocking the boards required two jobs).
   test:
     name: ${{ matrix.preset }}
     needs: [changes, images]
@@ -149,15 +159,10 @@ jobs:
           - { preset: linux-clang22-cxx26-asan, image: clang22 }
           - { preset: linux-clang22-cxx26-msan, image: clang22 }
           - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
-          # Cross architectures, emulator-in-the-loop (vector-length and
-          # feature-off matrices live in tools/ci-test.sh).
+          # arm64 cross, emulator-in-the-loop (the SVE vector-length and
+          # feature-off matrices live in tools/ci-test.sh; the aarch64
+          # STATIC build is build-arm64-static below, feeding Neoverse).
           - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
-          - { preset: linux-riscv64-gcc15-cxx23, image: riscv64-gcc15 }
-          # Static musl + mimalloc release chain, x86_64 and riscv64.
-          # (The aarch64 twin builds in its own job below so the Neoverse
-          # runner can pick up its binaries.)
-          - { preset: linux-zigmusl-cxx23-static, image: zig }
-          - { preset: linux-riscv64-zigmusl-cxx23-static, image: zig }
           # WebAssembly (runs in node).
           - { preset: wasm32-emcc-cxx23, image: emscripten }
     container:
@@ -206,6 +211,52 @@ jobs:
           # cross-restore freely; only Windows ones are fenced by
           # enableCrossOsArchive). Generation src2: pre-fix entries can
           # never be restored.
+          path: |
+            thirdparty/cache/*-src
+            thirdparty/cache/sources/*-src
+          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src2-linux-
+
+      - name: Configure, build, test (full emulator matrix)
+        run: bash tools/ci-test.sh ${{ matrix.preset }}
+
+  # The legs whose OUTPUTS ship or meet hardware: the static musl release
+  # chains (x86_64 + riscv64; the aarch64 twin is build-arm64-static
+  # below) and the riscv64 gcc cross job, which runs the full RVV qemu
+  # matrix and builds the freestanding xthead verifier the Pioneer
+  # executes. This job, not the validation matrix above, is what the
+  # Cloud-V boards wait on: scarce serialized board time starts as soon
+  # as the bytes it will run are built and emulator-proven, without
+  # idling behind sanitizer suites.
+  binaries:
+    name: ${{ matrix.preset }}
+    needs: [changes, images]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.images.result == 'success' || needs.images.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { preset: linux-riscv64-gcc15-cxx23, image: riscv64-gcc15 }
+          - { preset: linux-zigmusl-cxx23-static, image: zig }
+          - { preset: linux-riscv64-zigmusl-cxx23-static, image: zig }
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v7
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v6
+        with:
+          # Same positive-glob scheme as the test job above; the full
+          # reasoning lives there.
           path: |
             thirdparty/cache/*-src
             thirdparty/cache/sources/*-src
@@ -567,18 +618,19 @@ jobs:
   # ci-built static musl binaries (which run on any riscv64 Linux,
   # regardless of libc) plus, on the Pioneer, the freestanding
   # xthead_verify (no libc at all), so the hand-written 0.7.1 kernel is
-  # exercised on the silicon it was written for. needs: test is the
-  # point Yannic raised: scarce, serialized board time only ever runs
-  # against commits the cheap legs already proved, on the exact bytes
-  # they proved. (The musl bench carries no xthead variant because clang
-  # cannot build it, so Pioneer bench rows are scalar + the 64-core
-  # parallel engine; xthead BENCH numbers would need a native gcc build,
-  # deliberately out of scope here.)
+  # exercised on the silicon it was written for. needs: binaries rather
+  # than the wider validation matrix, so scarce, serialized board time
+  # starts the moment its own bytes are built and emulator-proven,
+  # without idling behind the sanitizer suites; those still gate the
+  # RELEASE, just not the boards. (The musl bench carries no xthead
+  # variant because clang cannot build it, so Pioneer bench rows are
+  # scalar + the 64-core parallel engine; xthead BENCH numbers would
+  # need a native gcc build, deliberately out of scope here.)
   # Gated on CLOUDV_RISCV64=1 (self-hosted labels queue forever when
   # unregistered, unlike hosted ones).
   riscv-boards:
     name: riscv64 ${{ matrix.board }} (Cloud-V)
-    needs: test
+    needs: binaries
     if: vars.CLOUDV_RISCV64 == '1'
     runs-on: [self-hosted, "${{ matrix.board }}"]
     timeout-minutes: 60
