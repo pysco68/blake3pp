@@ -1,7 +1,7 @@
 # Build & push the per-compiler toolchain images to GHCR.
 #
-# Two stages: the two per-release base instantiations first, then an 8-way
-# fan-out with one runner per toolchain image, each building FROM the exact base
+# Two stages: the two per-release base instantiations first, then a
+# per-image fan-out with one runner per toolchain image, each building FROM the exact base
 # digest pushed in this run (the --set contexts.base override below), so all
 # images of a distro cohort share identical base layers even across runners.
 # Layer cache lives registry-side (GHA's 10 GB cache is too small for this

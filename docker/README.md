@@ -1,7 +1,7 @@
 # Toolchain images
 
 One Docker image per compiler, so CI jobs and local matrix runs pull a small
-prebuilt image instead of the old 8.6 GB kitchen-sink devcontainer. All 26
+prebuilt image instead of the old 8.6 GB kitchen-sink devcontainer. The
 `cmake/toolchains/*.cmake` files are unchanged: they name compilers by bare
 PATH name, which resolves inside the right image.
 

@@ -4,8 +4,11 @@ A C++20-and-later BLAKE3 implementation built as a case study in
 hardware-saturating, portable C++26-forward design: `std::simd` and
 `std::execution` where the standard library provides them, drop-in polyfills
 (xsimd, stdexec) where it doesn't, multi-architecture SIMD kernels compiled
-into a single binary with zero-overhead runtime dispatch, and OS-native
-direct I/O behind a unified interface.
+into a single binary with zero-overhead runtime dispatch, covering SSE4.2
+through AVX-512 on x86, NEON plus fixed-length SVE/SVE2 on ARM, RVV 1.0
+with its Zvbb rotate (and, opt-in, T-Head's draft-0.7.1 XTheadVector) on
+RISC-V, and SIMD128 on wasm; plus OS-native direct I/O behind a unified
+interface.
 
 ## Using the library
 
@@ -194,7 +197,8 @@ assert(blake3pp::available_arches().front() == blake3pp::best_available());
 Requesting a variant the CPU can't run silently falls back to the best
 available one; `is_available()` tells you beforehand.
 
-On machines with a width-16 kernel (AVX-512; SVE-512 on ARM) one more
+On machines with a width-16 kernel (AVX-512; SVE-512 on ARM; RVV at
+VLEN=512) one more
 dial exists: the 16-lane message transpose has three implementation
 strategies, and which is fastest is not predictable from the CPU. It
 depends on whether the vector datapath is full-width or double-pumped
@@ -498,10 +502,18 @@ C++20 baseline with the default compiler.
 The devcontainer carries only the default gcc/clang pair; every other preset
 runs inside its per-compiler toolchain image via `tools/tc <preset>`;
 see `docker/README.md` for the image matrix and its glibc-floor design.
+The cross presets (`linux-arm64-gcc15-cxx23`, `linux-riscv64-gcc15-cxx23`)
+run their whole test suites under qemu-user with a selectable vector
+length, so one build exercises every SVE VL or RVV VLEN; the emulator
+recipes are in `docker/README.md` too. Two kernel sets are opt-in:
+`-DBLAKE3PP_SVE_ALL_VARIANTS=ON` adds the SVE variants matching no
+shipping silicon (emulator targets), and `-DBLAKE3PP_XTHEAD_KERNEL=ON`
+compiles the hand-written T-Head XTheadVector (draft RVV 0.7.1) kernel,
+which only T-Head's qemu fork can execute.
 
 ### Kernel tuning switches
 
-Three cache variables turn measured kernel optimizations on or off. Each
+Five cache variables turn measured kernel optimizations on or off. Each
 is `auto|on|off` and defaults to `auto`, which is the fastest setting on
 every machine it has been measured on. **These are not performance
 options to tune, they are measurement controls**, and turning one off
@@ -514,6 +526,8 @@ reported at configure time when it is not the default.
 | `BLAKE3PP_KERNEL_INLINE_ENFORCEMENT` | on, all targets | Drop `always_inline`/`__forceinline` from the round core. Every compiler measured then outlines it (clang the whole `all_rounds`, GCC the `index_sequence` lambda), costing 6-40% depending on compiler and variant. |
 | `BLAKE3PP_KERNEL_SRI_ROTATE` | on, aarch64 | Spell rot12/rot7 as the generic shift-or, which selects `shl`+`usra` instead of `shl`+`sri`. Worth ~6% on Apple M2 / clang 22; unverified on Neoverse. |
 | `BLAKE3PP_KERNEL_STAGED_ROUNDS` | on, aarch64 | Run each round as sequential `g` calls instead of quartet-staged. A small win on Apple M2 / clang 22, and provably inert on GCC 15 (same schedule, different register names). Loses on x86, where it is off regardless. |
+| `BLAKE3PP_KERNEL_XAR_ROTATE` | on, SVE2 variants | Spell `rot(x ^ y)` as `eor` + rotate instead of one fused `XAR`. Off costs the SVE2 kernels their entire margin over NEON: measured 1.89 vs 1.61 GiB/s on Neoverse V2 (GCP Axion). |
+| `BLAKE3PP_KERNEL_VROR_ROTATE` | on, RVV Zvbb variants | Spell the rotate as the 4-op shift-or (base RVV has no rotate) instead of `vxor`+`vror`. The XAR playbook on RISC-V; unmeasured on real Zvbb silicon so far (this switch is how it will be). |
 
 ```bash
 # Re-run the inlining A/B on a machine this project has never measured:
@@ -526,11 +540,14 @@ not earned a switch.
 
 Layout: public API in `include/blake3pp/`, arch-agnostic tree logic in
 `src/core/`, the per-architecture kernel (one TU, compiled once per variant
-by `cmake/ArchKernels.cmake`) in `src/kernel/`, runtime routing in
-`src/dispatch/`. `cmake/StdFeatures.cmake` probes what the active standard
-library really ships (by compiling usage, not trusting feature-test macros),
-and `tests/` verifies every configuration against the official BLAKE3 test
-vectors.
+by `cmake/ArchKernels.cmake`; variants registered per ISA family in
+`cmake/KernelVariants.cmake`) in `src/kernel/`, runtime routing in
+`src/dispatch/` (per-platform CPU probes in `cpu_detect_*.cpp`; the
+canonical variant list (enum, names, preference ranking) is generated
+from `include/blake3pp/detail/arch.def`). `cmake/StdFeatures.cmake` probes
+what the active standard library really ships (by compiling usage, not
+trusting feature-test macros), and `tests/` verifies every configuration
+against the official BLAKE3 test vectors.
 
 ## License
 
