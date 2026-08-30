@@ -52,13 +52,16 @@ case "${preset}" in
     # fat binary; execution needs the Xuantie qemu fork (not in the CI
     # image; see docker/riscv64-gcc15.Dockerfile), so under mainline
     # qemu the variant reports unavailable and the suite proves exactly
-    # that.
-    xthead_dir="build/${preset}-xthead"
-    cmake --preset "${preset}" -B "${xthead_dir}" -DBLAKE3PP_XTHEAD_KERNEL=ON
-    cmake --build "${xthead_dir}" -j"$(nproc)"
-    echo "::group::ctest ${preset} [xthead-compiled-in]"
-    ctest --test-dir "${xthead_dir}" --output-on-failure
-    echo "::endgroup::"
+    # that. GCC presets only: riscv_th_vector.h is a GCC 14+ header, the
+    # zig/clang chain has nothing to compile it with.
+    if [[ "${preset}" == *gcc* ]]; then
+      xthead_dir="build/${preset}-xthead"
+      cmake --preset "${preset}" -B "${xthead_dir}" -DBLAKE3PP_XTHEAD_KERNEL=ON
+      cmake --build "${xthead_dir}" -j"$(nproc)"
+      echo "::group::ctest ${preset} [xthead-compiled-in]"
+      ctest --test-dir "${xthead_dir}" --output-on-failure
+      echo "::endgroup::"
+    fi
     ;;
   wasm32-*)
     run_ctest default

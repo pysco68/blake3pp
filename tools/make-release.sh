@@ -10,10 +10,12 @@ VERSION=$(sed -n 's/^  VERSION \([0-9.]*\)$/\1/p' CMakeLists.txt)
 OUT=release
 rm -rf "$OUT" && mkdir -p "$OUT"
 
-for preset in linux-zigmusl-cxx23-static linux-arm64-zigmusl-cxx23-static; do
+for preset in linux-zigmusl-cxx23-static linux-arm64-zigmusl-cxx23-static \
+              linux-riscv64-zigmusl-cxx23-static; do
   case $preset in
-    *arm64*) arch=aarch64 ;;
-    *)       arch=x86_64 ;;
+    *arm64*)   arch=aarch64 ;;
+    *riscv64*) arch=riscv64 ;;
+    *)         arch=x86_64 ;;
   esac
   cmake --preset "$preset"
   cmake --build --preset "$preset"
@@ -34,8 +36,10 @@ for preset in linux-zigmusl-cxx23-static linux-arm64-zigmusl-cxx23-static; do
     "$STRIP" "$stage"/*
   elif [ "$arch" = x86_64 ]; then
     strip "$stage"/*
-  elif command -v aarch64-linux-gnu-strip >/dev/null; then
-    aarch64-linux-gnu-strip "$stage"/*
+  elif command -v "$arch-linux-gnu-strip" >/dev/null; then
+    "$arch-linux-gnu-strip" "$stage"/*
+  else
+    echo "make-release: no strip for $arch; archiving unstripped" >&2
   fi
   cp README.md "$stage/"
   tar -C "$OUT" -czf "$OUT/$pkg.tar.gz" "$pkg"

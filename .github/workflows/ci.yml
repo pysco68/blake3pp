@@ -145,10 +145,11 @@ jobs:
           # feature-off matrices live in tools/ci-test.sh).
           - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
           - { preset: linux-riscv64-gcc15-cxx23, image: riscv64-gcc15 }
-          # Static musl + mimalloc release chain, x86_64. (The aarch64
-          # twin builds in its own job below so the Neoverse runner can
-          # pick up its binaries.)
+          # Static musl + mimalloc release chain, x86_64 and riscv64.
+          # (The aarch64 twin builds in its own job below so the Neoverse
+          # runner can pick up its binaries.)
           - { preset: linux-zigmusl-cxx23-static, image: zig }
+          - { preset: linux-riscv64-zigmusl-cxx23-static, image: zig }
           # WebAssembly (runs in node).
           - { preset: wasm32-emcc-cxx23, image: emscripten }
     container:
@@ -189,6 +190,24 @@ jobs:
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
+
+      # The container shares the runner's CPU, so the x86_64 static build
+      # can bench right here, one of the hardware reports release.yml
+      # appends to the prerelease notes.
+      - name: Bench report (runner x86_64 silicon)
+        if: matrix.preset == 'linux-zigmusl-cxx23-static'
+        run: |
+          { echo "== x86_64, GitHub ubuntu-latest runner, static musl build =="
+            grep -m1 "model name" /proc/cpuinfo || true
+            build/${{ matrix.preset }}/cli/blake3ppsum --version < /dev/null
+            build/${{ matrix.preset }}/bench/blake3pp_bench --size 256 --reps 3 --cooldown 0
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v4
+        if: matrix.preset == 'linux-zigmusl-cxx23-static'
+        with:
+          name: bench-report-x86_64
+          path: bench-report.txt
+          retention-days: 7
 
   # The aarch64 static musl chain, built cross in the zig image (with its
   # qemu VL matrix), binaries handed to the Neoverse job below.
@@ -251,20 +270,31 @@ jobs:
           cli/blake3ppsum --version
       - name: Test on real silicon
         run: tests/blake3pp_tests
-      - name: Indicative bench (shared runner; ratios, not numbers)
-        run: bench/blake3pp_bench --size 256 --reps 3 --cooldown 0
+      - name: Bench report (real SVE2 silicon)
+        run: |
+          { echo "== aarch64, GitHub ubuntu-24.04-arm (Azure Cobalt 100 / Neoverse N2), static musl build =="
+            lscpu | grep -iE "model name|flags" | cut -c1-200 || true
+            cli/blake3ppsum --version < /dev/null
+            bench/blake3pp_bench --size 256 --reps 3 --cooldown 0
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-neoverse-n2
+          path: bench-report.txt
+          retention-days: 7
 
-  # Native RISC-V validation on Cloud-V runners (https://cloud-v.co).
-  # PREPARED but inert until runners are registered: create the
-  # self-hosted runner with a `riscv64` label, then set the repository
-  # variable CLOUDV_RISCV64=1 to arm this job. It builds bare with the
-  # host toolchain (kernel probes degrade gracefully on older GCC: no
-  # fixed-vlen support simply registers fewer variants), prints what the
-  # silicon actually supports, tests, and runs a short indicative bench.
-  # Cross-built binaries are deliberately NOT reused here: ours carry
-  # Ubuntu resolute's glibc floor, which real riscv distros are unlikely
-  # to meet yet. The runner environment must provide cmake >= 3.28, ninja,
-  # a C++20 compiler and network access (hermetic dependency fetch).
+  # Native RISC-V validation on the project's Cloud-V runners
+  # (https://cloud-v.co), gated on the repository variable
+  # CLOUDV_RISCV64=1 (set it after registering runners; adjust the
+  # runs-on labels to whatever the runner registered with). Builds bare
+  # with the host toolchain (kernel probes degrade gracefully on older
+  # GCC: no fixed-vlen support simply registers fewer variants), then
+  # tests and writes the hardware bench report. Cross-built glibc
+  # binaries are deliberately NOT reused here (resolute glibc floor); the
+  # static musl riscv64 archives would run anywhere, but a native build
+  # additionally validates the toolchain path on real silicon. The runner
+  # must provide cmake >= 3.28, ninja, a C++20 compiler and network
+  # access (hermetic dependency fetch).
   riscv-native:
     name: riscv64 native (Cloud-V)
     if: vars.CLOUDV_RISCV64 == '1'
@@ -283,5 +313,15 @@ jobs:
           build/riscv-native/cli/blake3ppsum --version
       - name: Test on real silicon
         run: ctest --test-dir build/riscv-native --output-on-failure
-      - name: Indicative bench
-        run: build/riscv-native/bench/blake3pp_bench --size 128 --reps 3 --cooldown 0
+      - name: Bench report (real RISC-V silicon)
+        run: |
+          { echo "== riscv64, Cloud-V self-hosted runner, native build =="
+            { lscpu | head -20; } 2>/dev/null || sort -u /proc/cpuinfo | head -20
+            build/riscv-native/cli/blake3ppsum --version < /dev/null
+            build/riscv-native/bench/blake3pp_bench --size 128 --reps 3 --cooldown 0
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-riscv64-cloudv
+          path: bench-report.txt
+          retention-days: 7

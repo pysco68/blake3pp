@@ -2,8 +2,8 @@
 #
 # zig cc/c++ musl toolchain image for the linux-{,arm64-}zigmusl-cxx23-static
 # presets and tools/make-release.sh. zig lands on PATH (the monolith had it
-# only at /opt/zig, reachable via $ZIG alone); qemu-aarch64 runs the aarch64
-# test pass; binutils-aarch64-linux-gnu provides aarch64-linux-gnu-strip for
+# only at /opt/zig, reachable via $ZIG alone); qemu-user runs the aarch64 and
+# riscv64 test passes; the cross binutils provide per-arch strip for
 # the release packaging.
 FROM base
 
@@ -18,7 +18,7 @@ RUN set -eux; \
     zig version
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        qemu-user binutils-aarch64-linux-gnu \
+        qemu-user binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
 # Prewarm zig's global cache for both musl targets. REQUIRED, not an

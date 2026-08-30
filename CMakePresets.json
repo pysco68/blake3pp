@@ -55,6 +55,16 @@
       }
     },
     {
+      "name": "linux-riscv64-zigmusl-cxx23-static",
+      "displayName": "Static musl release (riscv64, zig + mimalloc)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-riscv64-zigmusl-cxx23-static",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-zigmusl-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "linux-zigmusl-cxx23-static",
       "displayName": "Static musl release (x86_64, zig + mimalloc)",
       "generator": "Ninja",
@@ -177,6 +187,10 @@
       "configurePreset": "linux-arm64-zigmusl-cxx23-static"
     },
     {
+      "name": "linux-riscv64-zigmusl-cxx23-static",
+      "configurePreset": "linux-riscv64-zigmusl-cxx23-static"
+    },
+    {
       "name": "linux-zigmusl-cxx23-static",
       "configurePreset": "linux-zigmusl-cxx23-static"
     },
@@ -267,6 +281,13 @@
     {
       "name": "linux-arm64-zigmusl-cxx23-static",
       "configurePreset": "linux-arm64-zigmusl-cxx23-static",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-riscv64-zigmusl-cxx23-static",
+      "configurePreset": "linux-riscv64-zigmusl-cxx23-static",
       "output": {
         "outputOnFailure": true
       }

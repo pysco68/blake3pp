@@ -20,6 +20,7 @@ on:
 permissions:
   contents: write
   packages: read
+  actions: read  # download the triggering ci run's bench-report artifacts
 
 jobs:
   # The zig image is pulled by CONTENT tag (same scheme as ci.yml) so the
@@ -78,6 +79,42 @@ jobs:
           echo "tag=dev-${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
           echo "short=${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
 
+      # The hardware test+bench reports the ci run produced: x86_64 (the
+      # runner itself), aarch64 (Neoverse N2), riscv64 (Cloud-V). Whatever
+      # subset exists gets appended to the release notes.
+      - name: Collect hardware bench reports
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-report-*
+          path: bench-reports
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compose release notes
+        run: |
+          {
+            echo "Automated prerelease of commit ${RELEASE_SHA} (ci green)."
+            echo "Fully static musl+mimalloc tool builds (\`blake3ppsum\`,"
+            echo "\`blake3ppgen\`, benchmarks) for x86_64, aarch64 and riscv64:"
+            echo "the aarch64 archives carry the full NEON+SVE kernel chain,"
+            echo "the riscv64 ones the RVV/Zvbb chain (both with runtime"
+            echo "vector-length dispatch), and the x86_64 ones SSE4.2 through"
+            echo "AVX-512. Disposable: swept by release-cleanup after 90 days."
+            if ls bench-reports/*/bench-report.txt > /dev/null 2>&1; then
+              echo
+              echo "## Hardware test & bench reports (from the triggering ci run)"
+              echo "_Shared-runner numbers are indicative ratios, not measurements._"
+              for f in bench-reports/*/bench-report.txt; do
+                echo
+                echo '```'
+                cat "$f"
+                echo '```'
+              done
+            fi
+          } > release-notes.md
+
       - name: Publish prerelease
         uses: softprops/action-gh-release@v2
         with:
@@ -86,10 +123,4 @@ jobs:
           name: dev build ${{ steps.ident.outputs.short }}
           prerelease: true
           files: release/*.tar.gz
-          body: |
-            Automated prerelease of commit ${{ env.RELEASE_SHA }} (ci green).
-            Fully static musl+mimalloc tool builds (`blake3ppsum`,
-            `blake3ppgen`, benchmarks) for x86_64 and aarch64: the aarch64
-            archives carry the full NEON+SVE kernel chain with runtime
-            vector-length dispatch, the x86_64 ones SSE4.2 through AVX-512.
-            Disposable: swept by release-cleanup after 90 days.
+          body_path: release-notes.md

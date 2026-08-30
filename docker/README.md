@@ -23,7 +23,7 @@ unsupported and unneeded.
 | `toolchain-clang22` | 26.04 | ~2.42 | `linux-clang22-*` (incl. asan/tsan/msan/fuzzer/coverage/cxx2c) | g++-16 tree, libfuzzer/libomp, gdb, valgrind, Intel SDE, **/opt/libcxx-msan** |
 | `toolchain-arm64-gcc15` | 26.04 | (aarch64 sysroot) | `linux-arm64-gcc15-*` | qemu-aarch64 |
 | `toolchain-riscv64-gcc15` | 26.04 | (riscv64 sysroot) | `linux-riscv64-gcc15-*` | qemu-riscv64 (RVV 1.0, `QEMU_CPU=max,vlen=<bits>`); opt-in Xuantie-qemu stage for XTheadVector (`--set riscv64-gcc15.args.WITH_XUANTIE_QEMU=1`, builds T-Head's fork in a pinned 22.04 stage; verify the 0.7.1 kernel with the freestanding `tests/xthead_verify.cpp` harness under `qemu-riscv64-xuantie -cpu c906fdv`; glibc binaries cannot run on the th CPU models, see the harness header) |
-| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*`, `tools/make-release.sh` | qemu-aarch64, aarch64 strip, prewarmed zig cache |
+| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, prewarmed zig cache |
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
 
 Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`. The canonical tag

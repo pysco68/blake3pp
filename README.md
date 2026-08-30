@@ -502,7 +502,8 @@ C++20 baseline with the default compiler.
 The devcontainer carries only the default gcc/clang pair; every other preset
 runs inside its per-compiler toolchain image via `tools/tc <preset>`;
 see `docker/README.md` for the image matrix and its glibc-floor design.
-The cross presets (`linux-arm64-gcc15-cxx23`, `linux-riscv64-gcc15-cxx23`)
+The cross presets (`linux-arm64-gcc15-cxx23`, `linux-riscv64-gcc15-cxx23`,
+and the static musl trio `linux-{,arm64-,riscv64-}zigmusl-cxx23-static`)
 run their whole test suites under qemu-user with a selectable vector
 length, so one build exercises every SVE VL or RVV VLEN; the emulator
 recipes are in `docker/README.md` too. Two kernel sets are opt-in:

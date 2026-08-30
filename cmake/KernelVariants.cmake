@@ -160,42 +160,65 @@ function(_blake3pp_register_riscv64_kernels)
       return __riscv_vmv_x_s_u32m1_u32(back) == 1u ? 0 : 1;
     }
   ]=])
-  set(CMAKE_REQUIRED_FLAGS "-march=rv64gcv_zvl256b -mrvv-vector-bits=zvl")
-  check_cxx_source_compiles("${_blake3pp_rvv_smoke}"
-    BLAKE3PP_COMPILER_RVV_FIXED_VLEN)
-  unset(CMAKE_REQUIRED_FLAGS)
-  if(BLAKE3PP_COMPILER_RVV_FIXED_VLEN)
+  set(_blake3pp_rvv_zvbb_smoke [=[
+    #include <riscv_vector.h>
+    typedef vuint32m1_t fixed_u32
+        __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen)));
+    int main() {
+      fixed_u32 z =
+          __riscv_vmv_v_x_u32m1(0x80000001u, __riscv_v_fixed_vlen / 32);
+      fixed_u32 r = __riscv_vror_vx_u32m1(z, 7, __riscv_v_fixed_vlen / 32);
+      return __riscv_vmv_x_s_u32m1_u32(r) != 0u ? 0 : 1;
+    }
+  ]=])
+  # Two candidate flag PATTERNS per extension set, @VLEN@ expanded per
+  # variant: GCC and native clang take -march with the zvl-derived fixed
+  # vlen; zig cc rejects riscv -march outright (the same objection as its
+  # aarch64 one: its flag model wants -mcpu=<cpu>+<features>) and its
+  # clang wants the numeric -mrvv-vector-bits. The zig base cpu must be
+  # baseline_rv64 (IMAFDC), NOT generic_rv64: -mcpu REPLACES the feature
+  # set wholesale, and generic_rv64 is bare RV64I, so musl's atomics fail
+  # to assemble the moment anything links. First pattern whose 256-bit
+  # expansion passes the smoke test wins.
+  function(_blake3pp_probe_rvv_flags out_var probe_name smoke)
+    set(result "")
+    foreach(cand IN LISTS ARGN)
+      string(REPLACE "@VLEN@" "256" trial "${cand}")
+      string(MAKE_C_IDENTIFIER "${probe_name}_${cand}" var)
+      set(CMAKE_REQUIRED_FLAGS "${trial}")
+      check_cxx_source_compiles("${smoke}" ${var})
+      if(${var})
+        set(result "${cand}")
+        break()
+      endif()
+    endforeach()
+    set(${out_var} "${result}" PARENT_SCOPE)
+  endfunction()
+  _blake3pp_probe_rvv_flags(_blake3pp_rvv_pattern
+    BLAKE3PP_COMPILER_RVV_FIXED_VLEN "${_blake3pp_rvv_smoke}"
+    "-march=rv64gcv_zvl@VLEN@b -mrvv-vector-bits=zvl"
+    "-mcpu=baseline_rv64+v+zvl@VLEN@b -mrvv-vector-bits=@VLEN@")
+  if(_blake3pp_rvv_pattern)
     _blake3pp_fetch_xsimd()
-    blake3pp_add_kernel(rvv128 FORCE_XSIMD
-      ARCH_FLAGS -march=rv64gcv_zvl128b -mrvv-vector-bits=zvl)
-    blake3pp_add_kernel(rvv256 FORCE_XSIMD
-      ARCH_FLAGS -march=rv64gcv_zvl256b -mrvv-vector-bits=zvl)
-    blake3pp_add_kernel(rvv512 FORCE_XSIMD
-      ARCH_FLAGS -march=rv64gcv_zvl512b -mrvv-vector-bits=zvl)
+    foreach(vlen IN ITEMS 128 256 512)
+      string(REPLACE "@VLEN@" "${vlen}" _flags "${_blake3pp_rvv_pattern}")
+      separate_arguments(_flags UNIX_COMMAND "${_flags}")
+      blake3pp_add_kernel(rvv${vlen} FORCE_XSIMD ARCH_FLAGS ${_flags})
+    endforeach()
     # The Zvbb twins: same kernels, single-instruction vror rotates via
     # xor_rot's Zvbb branch (GCC does not fuse the generic pattern on its
     # own). Zvbb-less V hardware exists, hence separate variants.
-    set(CMAKE_REQUIRED_FLAGS
-      "-march=rv64gcv_zvbb_zvl256b -mrvv-vector-bits=zvl")
-    check_cxx_source_compiles([=[
-      #include <riscv_vector.h>
-      typedef vuint32m1_t fixed_u32
-          __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen)));
-      int main() {
-        fixed_u32 z =
-            __riscv_vmv_v_x_u32m1(0x80000001u, __riscv_v_fixed_vlen / 32);
-        fixed_u32 r = __riscv_vror_vx_u32m1(z, 7, __riscv_v_fixed_vlen / 32);
-        return __riscv_vmv_x_s_u32m1_u32(r) != 0u ? 0 : 1;
-      }
-    ]=] BLAKE3PP_COMPILER_RVV_ZVBB)
-    unset(CMAKE_REQUIRED_FLAGS)
-    if(BLAKE3PP_COMPILER_RVV_ZVBB)
-      blake3pp_add_kernel(rvv128_zvbb FORCE_XSIMD
-        ARCH_FLAGS -march=rv64gcv_zvbb_zvl128b -mrvv-vector-bits=zvl)
-      blake3pp_add_kernel(rvv256_zvbb FORCE_XSIMD
-        ARCH_FLAGS -march=rv64gcv_zvbb_zvl256b -mrvv-vector-bits=zvl)
-      blake3pp_add_kernel(rvv512_zvbb FORCE_XSIMD
-        ARCH_FLAGS -march=rv64gcv_zvbb_zvl512b -mrvv-vector-bits=zvl)
+    _blake3pp_probe_rvv_flags(_blake3pp_rvv_zvbb_pattern
+      BLAKE3PP_COMPILER_RVV_ZVBB "${_blake3pp_rvv_zvbb_smoke}"
+      "-march=rv64gcv_zvbb_zvl@VLEN@b -mrvv-vector-bits=zvl"
+      "-mcpu=baseline_rv64+v+zvbb+zvl@VLEN@b -mrvv-vector-bits=@VLEN@")
+    if(_blake3pp_rvv_zvbb_pattern)
+      foreach(vlen IN ITEMS 128 256 512)
+        string(REPLACE "@VLEN@" "${vlen}" _flags
+          "${_blake3pp_rvv_zvbb_pattern}")
+        separate_arguments(_flags UNIX_COMMAND "${_flags}")
+        blake3pp_add_kernel(rvv${vlen}_zvbb FORCE_XSIMD ARCH_FLAGS ${_flags})
+      endforeach()
     endif()
   endif()
   # T-Head XTheadVector (draft RVV 0.7.1): a hand-written standalone TU
