@@ -1,0 +1,182 @@
+# The test matrix: every containerizable preset, each job running INSIDE
+# its per-compiler toolchain image (the same images tools/tc uses locally,
+# built and pushed by toolchains.yml). One entry point, tools/ci-test.sh,
+# holds the per-architecture emulator matrices: qemu vector lengths and
+# feature-off fallbacks for the cross presets, Intel SDE for AVX-512 on
+# x86. Windows and macOS presets are not here; they need real machines
+# (see docs/windows-vm.md and the macos presets' Darwin condition).
+#
+# Ordering with image changes: when the push/PR touches docker/** (or the
+# image workflows), the `images` job rebuilds the toolchain images FIRST
+# (reusing toolchains.yml as a called workflow) and every test job then
+# pulls the immutable sha-<sha> tag that build pushed, so tests never race
+# a :latest update or run against stale images. When docker/** is
+# untouched, `images` is skipped and tests pull :latest as usual. Fork
+# PRs cannot push packages: their docker/** changes test against :latest
+# with a warning from the changes job.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "release/**"]
+  pull_request:
+    paths-ignore: ["**.md", "release/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # Which image tag should this run test against? :latest normally; the
+  # sha tag the `images` job is about to push when docker/** changed.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+      tag: ${{ steps.decide.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docker:
+              - "docker/**"
+              - "tools/build-msan-libcxx.sh"
+              - ".github/workflows/toolchains.yml"
+      - id: decide
+        env:
+          DOCKER_CHANGED: ${{ steps.filter.outputs.docker }}
+          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          if [ "$DOCKER_CHANGED" = "true" ] && [ "$IS_FORK_PR" != "true" ]; then
+            echo "tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$DOCKER_CHANGED" = "true" ]; then
+              echo "::warning::docker/** changed in a fork PR; cannot push images, testing against :latest"
+            fi
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Rebuild + push the toolchain images before any test touches them.
+  images:
+    needs: changes
+    if: needs.changes.outputs.tag != 'latest'
+    uses: ./.github/workflows/toolchains.yml
+    permissions:
+      contents: read
+      packages: write
+
+  test:
+    name: ${{ matrix.preset }}
+    needs: [changes, images]
+    # Run when images succeeded OR was skipped (no docker changes),
+    # but never on a failed/cancelled image build.
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.images.result == 'success' || needs.images.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native compiler cohort, oldest floor to newest.
+          - { preset: linux-gcc14-cxx23, image: gcc14 }
+          - { preset: linux-gcc16-cxx26, image: gcc16 }
+          - { preset: linux-clang18-cxx20-libstdcxx, image: clang18 }
+          - { preset: linux-clang20-cxx23, image: clang20 }
+          - { preset: linux-clang22-cxx26, image: clang22 }
+          # Execution-provider alternative (beman.execution).
+          - { preset: linux-clang22-cxx26-beman, image: clang22 }
+          # Sanitizers: one address, one memory (against the baked
+          # msan-libc++), one thread on the other compiler family.
+          - { preset: linux-clang22-cxx26-asan, image: clang22 }
+          - { preset: linux-clang22-cxx26-msan, image: clang22 }
+          - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
+          # Cross architectures, emulator-in-the-loop (vector-length and
+          # feature-off matrices live in tools/ci-test.sh).
+          - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
+          - { preset: linux-riscv64-gcc15-cxx23, image: riscv64-gcc15 }
+          # Static musl + mimalloc release chain, both architectures.
+          - { preset: linux-zigmusl-cxx23-static, image: zig }
+          - { preset: linux-arm64-zigmusl-cxx23-static, image: zig }
+          # WebAssembly (runs in node).
+          - { preset: wasm32-emcc-cxx23, image: emscripten }
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # Same as tools/tc and devcontainer.json runArgs: the sanitizer
+      # runtimes need ptrace and an unfiltered seccomp profile.
+      options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      CMAKE_GENERATOR: Ninja
+      # Mirrors tools/tc's sanitizer environment.
+      ASAN_SYMBOLIZER_PATH: /usr/local/bin/llvm-symbolizer
+      ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:strict_string_checks=1:symbolize=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1:report_error_type=1
+      TSAN_OPTIONS: second_deadlock_stack=1:halt_on_error=0
+      LSAN_OPTIONS: use_tls=0
+    steps:
+      - uses: actions/checkout@v4
+
+      # Container steps run as root while the version stamp shells out to
+      # git in a runner-owned checkout; without this git refuses with
+      # "dubious ownership" and the stamp falls back to the bare version.
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # The hermetic dependency cache (hfc): content-hash-keyed sources
+      # under thirdparty/cache, shared across presets: one restore serves
+      # every job, and a miss costs one population (stdexec is the big
+      # clone). Keyed on the files that carry the dependency pins.
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v4
+        with:
+          path: thirdparty/cache
+          key: hfc-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-
+
+      - name: Configure, build, test (full emulator matrix)
+        run: bash tools/ci-test.sh ${{ matrix.preset }}
+
+  # Real ARM silicon, no emulator: GitHub's free arm64 runners are Azure
+  # Cobalt 100: Neoverse N2, i.e. Armv9 SVE2 at VL=128, exactly the
+  # sve2_128 kernel's target hardware. This job is both coverage (the SVE
+  # exact-VL dispatch on a real CPU) and the standing empirical answer to
+  # "does the runner expose SVE?": read the variants line in the log.
+  # No toolchain image (those are amd64); the runner's own gcc-14 builds
+  # the C++23 configuration bare.
+  native-arm64:
+    name: native-arm64 (Cobalt 100 / Neoverse N2)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v4
+        with:
+          path: thirdparty/cache
+          key: hfc-arm64-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-arm64-
+      - name: Configure and build
+        run: |
+          cmake -S . -B build/native-arm64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_CXX_STANDARD=23
+          cmake --build build/native-arm64 -j"$(nproc)"
+      - name: What silicon is this really
+        run: |
+          lscpu | grep -iE 'model name|flags' | cut -c1-200 || true
+          build/native-arm64/cli/blake3ppsum --version
+      - name: Test
+        run: ctest --test-dir build/native-arm64 --output-on-failure

@@ -27,8 +27,11 @@ unsupported and unneeded.
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
 
 Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`, tags `latest` +
-immutable `sha-<short>`. Built and pushed by
-`.github/workflows/toolchains.yml` whenever `docker/**` changes.
+immutable `sha-<sha>`. Built and pushed by `.github/workflows/toolchains.yml`,
+which ci.yml invokes as a dependency job whenever `docker/**` changes; the
+test jobs then wait for the images and pull that run's sha tag, so CI never
+tests against stale images (PR-built images get only a sha tag; `latest`
+moves on main). `workflow_dispatch` it for a manual full refresh.
 
 ## Daily use
 

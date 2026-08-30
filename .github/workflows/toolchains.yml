@@ -11,14 +11,17 @@
 # REGISTRY and EXTRA_TAG are picked up by docker-bake.hcl as bake variables.
 name: toolchain-images
 
+# Normally invoked as a dependency job by ci.yml whenever a push/PR
+# touches docker/**: ci's test jobs wait for these images and pull the
+# immutable sha-<sha> tag this run pushed, so tests never race a :latest
+# update or run against stale images. On pull_request invocations the
+# :latest tag is NOT moved (only push/dispatch retag it): a PR must not
+# repoint everyone's images before it merges. workflow_dispatch remains
+# for a manual full refresh; there is deliberately no push trigger, as that
+# would double-build against ci.yml's invocation.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "docker/**"
-      - "tools/build-msan-libcxx.sh"
-      - ".github/workflows/toolchains.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -27,6 +30,10 @@ permissions:
 env:
   REGISTRY: ghcr.io/${{ github.repository }}
   CACHE: ghcr.io/${{ github.repository }}/toolchain-cache
+  # push/dispatch: publish sha tag AND move :latest. Called from a PR via
+  # ci.yml: publish the sha tag only.
+  TAG: ${{ github.event_name == 'pull_request' && format('sha-{0}', github.sha) || 'latest' }}
+  EXTRA: ${{ github.event_name == 'pull_request' && '' || format('sha-{0}', github.sha) }}
 
 jobs:
   bases:
@@ -41,7 +48,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push base images
         run: |
-          EXTRA_TAG="sha-${GITHUB_SHA::12}" \
+          TAG="${TAG}" EXTRA_TAG="${EXTRA}" \
           docker buildx bake -f docker/docker-bake.hcl base --push \
             --set "base-*.cache-from=type=registry,ref=${CACHE}:base" \
             --set "base-*.cache-to=type=registry,ref=${CACHE}:base,mode=max"
@@ -74,8 +81,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push ${{ matrix.target }}
         run: |
-          EXTRA_TAG="sha-${GITHUB_SHA::12}" \
+          BASE_TAG="sha-${GITHUB_SHA}"
+          if [ -z "${EXTRA}" ]; then BASE_TAG="${TAG}"; fi
+          TAG="${TAG}" EXTRA_TAG="${EXTRA}" \
           docker buildx bake -f docker/docker-bake.hcl "${{ matrix.target }}" --push \
-            --set "*.contexts.base=docker-image://${REGISTRY}/toolchain-base-${{ matrix.rel }}:sha-${GITHUB_SHA::12}" \
+            --set "*.contexts.base=docker-image://${REGISTRY}/toolchain-base-${{ matrix.rel }}:${BASE_TAG}" \
             --set "*.cache-from=type=registry,ref=${CACHE}:${{ matrix.target }}" \
             --set "*.cache-to=type=registry,ref=${CACHE}:${{ matrix.target }},mode=max"
