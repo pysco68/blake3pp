@@ -3,8 +3,11 @@
 # built and pushed by toolchains.yml). One entry point, tools/ci-test.sh,
 # holds the per-architecture emulator matrices: qemu vector lengths and
 # feature-off fallbacks for the cross presets, Intel SDE for AVX-512 on
-# x86. Windows and macOS presets are not here; they need real machines
-# (see docs/windows-vm.md and the macos presets' Darwin condition).
+# x86. Windows runs on the hosted windows-latest runners (x64 presets
+# built AND tested; arm64 presets cross-built via vcvarsall x64_arm64,
+# since x64 Windows cannot emulate arm64 and native arm64 testing is a gated
+# extra job for the windows-11-arm runners). macOS presets are not here
+# (Darwin condition; see the macos-* presets).
 #
 # Ordering with image changes, content-addressed: the toolchain images
 # are keyed by tree-<hash> (the docker/ git subtree + the msan script +
@@ -221,6 +224,78 @@ jobs:
           name: bench-report-x86_64
           path: bench-report.txt
           retention-days: 7
+
+  # Windows, on the hosted runners; no toolchain image (those are Linux/
+  # amd64); vswhere locates whatever VS the runner image ships and vcvars
+  # provides cl/clang-cl/ninja. The x64 presets build and test natively;
+  # the arm64 presets cross-build in the x64_arm64 environment
+  # (compile-proven; x64 Windows cannot emulate arm64 binaries).
+  windows:
+    name: ${{ matrix.preset }}
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { preset: windows-msvc2026-cxx23, vcvars: x64, run_tests: true }
+          - { preset: windows-clangcl-cxx23, vcvars: x64, run_tests: true }
+          - { preset: windows-arm64-msvc2026-cxx23, vcvars: x64_arm64, run_tests: false }
+          - { preset: windows-arm64-clangcl-cxx23, vcvars: x64_arm64, run_tests: false }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v4
+        with:
+          # Same path-free-content rule as the Linux jobs (see above);
+          # separate key prefix because Windows checkouts differ (CRLF, etc.).
+          path: |
+            thirdparty/cache
+            !thirdparty/cache/hfc
+            !thirdparty/cache/hfc.*
+            !thirdparty/cache/*-subbuild
+          key: hfc-src-win-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src-win-
+      - name: Ensure ninja
+        shell: pwsh
+        run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+      - name: Configure, build${{ matrix.run_tests && ', test' || ' (cross, compile-proven only)' }}
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find VC\Auxiliary\Build\vcvarsall.bat`) do set "VCVARSALL=%%i"
+          if not defined VCVARSALL (echo vswhere found no vcvarsall & exit /b 1)
+          call "%VCVARSALL%" ${{ matrix.vcvars }} || exit /b 1
+          cmake --preset ${{ matrix.preset }} || exit /b 1
+          cmake --build build\${{ matrix.preset }} -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          if "${{ matrix.run_tests }}"=="true" ctest --test-dir build\${{ matrix.preset }} --output-on-failure
+
+  # Native arm64 Windows testing on GitHub's windows-11-arm runners,
+  # gated (set the repository variable WIN_ARM64_NATIVE=1) because their
+  # availability for private repos has to be confirmed on this plan
+  # first; until then the arm64 presets above stay compile-proven.
+  windows-arm64-native:
+    name: windows-arm64 native test
+    if: vars.WIN_ARM64_NATIVE == '1'
+    runs-on: windows-11-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [windows-arm64-msvc2026-cxx23, windows-arm64-clangcl-cxx23]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure ninja
+        shell: pwsh
+        run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+      - name: Configure, build, test (native arm64)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find VC\Auxiliary\Build\vcvarsall.bat`) do set "VCVARSALL=%%i"
+          if not defined VCVARSALL (echo vswhere found no vcvarsall & exit /b 1)
+          call "%VCVARSALL%" arm64 || exit /b 1
+          cmake --preset ${{ matrix.preset }} || exit /b 1
+          cmake --build build\${{ matrix.preset }} -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          ctest --test-dir build\${{ matrix.preset }} --output-on-failure
 
   # The aarch64 static musl chain, built cross in the zig image (with its
   # qemu VL matrix), binaries handed to the Neoverse job below.
