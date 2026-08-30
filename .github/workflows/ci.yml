@@ -70,6 +70,11 @@ jobs:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           IS_MAIN_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
+          # Ground truth for the hardware-lane gates: what this run
+          # actually sees. Repository VARIABLES only (Variables tab, not
+          # Secrets; not environment-scoped) reach the vars. context;
+          # empty here means the gated job will skip, and why.
+          echo "gate vars: CLOUDV_RISCV64='${{ vars.CLOUDV_RISCV64 }}' LINUX_ARM64_NATIVE='${{ vars.LINUX_ARM64_NATIVE }}' WIN_ARM64_NATIVE='${{ vars.WIN_ARM64_NATIVE }}'"
           tag="tree-$(bash tools/toolchain-image-tag.sh)"
           missing=0
           for ref in $(TAG="${tag}" docker buildx bake -f docker/docker-bake.hcl --print 2>/dev/null \
