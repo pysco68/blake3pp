@@ -510,7 +510,10 @@ jobs:
   windows-arm64-native:
     name: windows-arm64 native test (${{ matrix.preset }})
     needs: windows
-    if: vars.WIN_ARM64_NATIVE == '1'
+    # Status-function form for the same reason as the other hardware
+    # lanes (see neoverse-test-bench): immune to transitive
+    # skip-poisoning should this chain ever gain a skippable ancestor.
+    if: ${{ !cancelled() && needs.windows.result == 'success' && vars.WIN_ARM64_NATIVE == '1' }}
     runs-on: windows-11-arm
     timeout-minutes: 30
     strategy:
@@ -650,7 +653,15 @@ jobs:
   neoverse-test-bench:
     name: neoverse-n2 test+bench (real SVE2 silicon)
     needs: build-arm64-static
-    if: vars.LINUX_ARM64_NATIVE == '1'
+    # The !cancelled() + explicit result check is LOAD-BEARING, not
+    # style: without a status function in the if, GitHub prepends an
+    # implicit success() that fails when ANY TRANSITIVE ancestor was
+    # skipped, and `images` is skipped on almost every run. The
+    # !cancelled() override upstream protects only the job carrying it;
+    # every descendant must break the cascade again. (This kept the
+    # hardware lanes skipping for a day while vars, labels and direct
+    # needs were all demonstrably correct.)
+    if: ${{ !cancelled() && needs.build-arm64-static.result == 'success' && vars.LINUX_ARM64_NATIVE == '1' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -701,7 +712,11 @@ jobs:
   riscv-boards:
     name: riscv64 ${{ matrix.board }} (Cloud-V)
     needs: binaries
-    if: vars.CLOUDV_RISCV64 == '1'
+    # Same load-bearing pattern as neoverse-test-bench above: the
+    # status function breaks the transitive skip-poisoning from the
+    # (almost always skipped) images job; the implicit success() would
+    # veto this job regardless of the var and the green direct need.
+    if: ${{ !cancelled() && needs.binaries.result == 'success' && vars.CLOUDV_RISCV64 == '1' }}
     runs-on: [self-hosted, "${{ matrix.board }}"]
     timeout-minutes: 60
     strategy:
