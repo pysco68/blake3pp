@@ -391,18 +391,18 @@ jobs:
             build/${{ matrix.preset }}/bench/blake3pp_bench
             build/${{ matrix.preset }}/bench/blake3pp_bench_file
 
-  # Native arm64 Windows testing on GitHub's windows-11-arm runners:
-  # runs the CROSS-BUILT binaries (the Neoverse pattern) so the arm64
-  # archives the release ships are exactly the bytes tested here.
-  # Gated (set the repository variable WIN_ARM64_NATIVE=1): the hosted
-  # windows-11-arm label is documented for public repos; on a private
-  # plan it may need a larger-runner setup, and an unresolvable label
-  # would queue this job forever and stall every run. Flip the variable
-  # once availability is confirmed.
+  # Native arm64 Windows testing on GitHub's windows-11-arm runners
+  # (actions/runner-images Windows11-Arm64 image): runs the CROSS-BUILT
+  # binaries (the Neoverse pattern) so the arm64 archives the release
+  # ships are exactly the bytes tested here. On by default: an
+  # unavailable HOSTED label fails fast rather than queueing, so if this
+  # plan turns out not to carry the image, the failure is one visible
+  # job, and setting the repository variable WIN_ARM64_NATIVE=0 switches
+  # the lane off.
   windows-arm64-native:
     name: windows-arm64 native test (${{ matrix.preset }})
     needs: windows
-    if: vars.WIN_ARM64_NATIVE == '1'
+    if: vars.WIN_ARM64_NATIVE != '0'
     runs-on: windows-11-arm
     timeout-minutes: 30
     strategy:
