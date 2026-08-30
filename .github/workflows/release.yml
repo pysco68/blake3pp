@@ -36,7 +36,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       - id: tag
@@ -57,7 +57,7 @@ jobs:
       # current ref on manual dispatch.
       RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_SHA }}
 
@@ -65,7 +65,7 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Cache hermetic dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Only the path-FREE content is cached: the *-src trees and the
           # shared sources store. The FetchContent subbuild dirs (and
@@ -89,7 +89,7 @@ jobs:
       # reuse, so it falls back to the full make-release.sh build.
       - name: Collect binaries from the ci run
         if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           # static-binaries-* (linux musl) and tool-binaries-* (windows
           # clang-cl x64, macos appleclang arm64)
@@ -181,7 +181,7 @@ jobs:
       - name: Collect hardware bench reports
         if: github.event_name == 'workflow_run'
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: bench-report-*
           path: bench-reports
@@ -219,7 +219,7 @@ jobs:
           } > release-notes.md
 
       - name: Publish prerelease
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ident.outputs.tag }}
           target_commitish: ${{ env.RELEASE_SHA }}

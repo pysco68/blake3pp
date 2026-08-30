@@ -57,8 +57,8 @@ jobs:
       build: ${{ steps.decide.outputs.build }}
       promote: ${{ steps.decide.outputs.promote }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -110,8 +110,8 @@ jobs:
     if: needs.changes.outputs.promote == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -178,7 +178,7 @@ jobs:
       TSAN_OPTIONS: second_deadlock_stack=1:halt_on_error=0
       LSAN_OPTIONS: use_tls=0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Container steps run as root while the version stamp shells out to
       # git in a runner-owned checkout; without this git refuses with
@@ -191,7 +191,7 @@ jobs:
       # every job, and a miss costs one population (stdexec is the big
       # clone). Keyed on the files that carry the dependency pins.
       - name: Cache hermetic dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Only the path-FREE content is cached: the *-src trees and the
           # shared sources store. The FetchContent subbuild dirs (and
@@ -224,7 +224,7 @@ jobs:
             build/${{ matrix.preset }}/cli/blake3ppsum --version < /dev/null
             build/${{ matrix.preset }}/bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.preset == 'linux-zigmusl-cxx23-static'
         with:
           name: bench-report-x86_64
@@ -234,7 +234,7 @@ jobs:
       # never rebuilds what ci already built and tested.
       - name: Upload static binaries
         if: contains(matrix.preset, 'zigmusl')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: static-binaries-${{ contains(matrix.preset, 'riscv64') && 'riscv64' || 'x86_64' }}
           retention-days: 3
@@ -250,7 +250,7 @@ jobs:
       # Pioneer runs it on real 0.7.1 silicon (no libc, runs anywhere).
       - name: Upload xthead verifier
         if: matrix.preset == 'linux-riscv64-gcc15-cxx23'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xthead-verify
           retention-days: 3
@@ -274,9 +274,9 @@ jobs:
           - { preset: windows-arm64-msvc2026-cxx23, vcvars: x64_arm64, run_tests: false, upload: true }
           - { preset: windows-arm64-clangcl-cxx23, vcvars: x64_arm64, run_tests: false, upload: true }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache hermetic dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Same path-free-content rule as the Linux jobs (see above);
           # separate key prefix because Windows checkouts differ (CRLF, etc.).
@@ -310,7 +310,7 @@ jobs:
           & "build\${{ matrix.preset }}\cli\blake3ppsum.exe" --version | Out-File bench-report.txt -Append -Encoding utf8
           & "build\${{ matrix.preset }}\bench\blake3pp_bench.exe" --reps 1 --cooldown 0 | Out-File bench-report.txt -Append -Encoding utf8
           Get-Content bench-report.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.run_tests
         with:
           name: bench-report-${{ matrix.preset }}
@@ -323,7 +323,7 @@ jobs:
       # arm64 Windows test path.
       - name: Upload tool binaries
         if: matrix.upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tool-binaries-${{ matrix.preset }}
           retention-days: 3
@@ -354,9 +354,9 @@ jobs:
     env:
       CMAKE_GENERATOR: Ninja
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache hermetic dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Same path-free-content rule as the Linux jobs; separate
           # Darwin prefix.
@@ -381,7 +381,7 @@ jobs:
             build/${{ matrix.preset }}/cli/blake3ppsum --version < /dev/null
             build/${{ matrix.preset }}/bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-report-${{ matrix.preset }}
           path: bench-report.txt
@@ -392,7 +392,7 @@ jobs:
       - name: Upload tool binaries
         if: matrix.preset == 'macos-appleclang-cxx23'
         run: strip build/${{ matrix.preset }}/cli/blake3ppsum build/${{ matrix.preset }}/cli/blake3ppgen build/${{ matrix.preset }}/bench/blake3pp_bench build/${{ matrix.preset }}/bench/blake3pp_bench_file
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: matrix.preset == 'macos-appleclang-cxx23'
         with:
           name: tool-binaries-macos-arm64
@@ -422,7 +422,7 @@ jobs:
       matrix:
         preset: [windows-arm64-msvc2026-cxx23, windows-arm64-clangcl-cxx23]
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: tool-binaries-${{ matrix.preset }}
       - name: What silicon is this really
@@ -443,7 +443,7 @@ jobs:
           & "cli\blake3ppsum.exe" --version | Out-File bench-report.txt -Append -Encoding utf8
           & "bench\blake3pp_bench.exe" --reps 1 --cooldown 0 | Out-File bench-report.txt -Append -Encoding utf8
           Get-Content bench-report.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-report-${{ matrix.preset }}-native
           path: bench-report.txt
@@ -464,11 +464,11 @@ jobs:
     env:
       CMAKE_GENERATOR: Ninja
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Trust the checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Cache hermetic dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Only the path-FREE content is cached: the *-src trees and the
           # shared sources store. The FetchContent subbuild dirs (and
@@ -495,7 +495,7 @@ jobs:
           cmake --preset linux-arm64-zigmusl-cxx23-static
           cmake --build build/linux-arm64-zigmusl-cxx23-static -j"$(nproc)"
           ctest --test-dir build/linux-arm64-zigmusl-cxx23-static --output-on-failure
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: static-binaries-aarch64
           retention-days: 3
@@ -521,7 +521,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: static-binaries-aarch64
       - name: What silicon is this really
@@ -538,7 +538,7 @@ jobs:
             cli/blake3ppsum --version < /dev/null
             bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-report-neoverse-n2
           path: bench-report.txt
@@ -578,10 +578,10 @@ jobs:
           - { board: bpi-f3, xthead: false }
           - { board: milkv-pioneer, xthead: true }
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: static-binaries-riscv64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: matrix.xthead
         with:
           name: xthead-verify
@@ -602,7 +602,7 @@ jobs:
             cli/blake3ppsum --version < /dev/null
             bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bench-report-riscv64-${{ matrix.board }}
           path: bench-report.txt
