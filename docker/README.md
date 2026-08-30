@@ -26,12 +26,16 @@ unsupported and unneeded.
 | `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*`, `tools/make-release.sh` | qemu-aarch64, aarch64 strip, prewarmed zig cache |
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
 
-Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`, tags `latest` +
-immutable `sha-<sha>`. Built and pushed by `.github/workflows/toolchains.yml`,
-which ci.yml invokes as a dependency job whenever `docker/**` changes; the
-test jobs then wait for the images and pull that run's sha tag, so CI never
-tests against stale images (PR-built images get only a sha tag; `latest`
-moves on main). `workflow_dispatch` it for a manual full refresh.
+Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`. The canonical tag
+is **content-addressed**: `tree-<hash>` over the `docker/` git subtree,
+`tools/build-msan-libcxx.sh` and the image workflow itself
+(`tools/toolchain-image-tag.sh` prints your checkout's). ci.yml checks
+whether that tag exists in GHCR and calls
+`.github/workflows/toolchains.yml` to build it only on a miss: identical
+content never rebuilds, and the test jobs always pull exactly the content
+tag their checkout implies. `latest` is a convenience alias for local
+`tools/tc` use, moved on main (fresh build or manifest retag) and by
+manual `workflow_dispatch` refreshes.
 
 ## Daily use
 

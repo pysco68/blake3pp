@@ -1,27 +1,35 @@
 # Build & push the per-compiler toolchain images to GHCR.
 #
-# Two stages: the two per-release base instantiations first, then a
-# per-image fan-out with one runner per toolchain image, each building FROM the exact base
-# digest pushed in this run (the --set contexts.base override below), so all
-# images of a distro cohort share identical base layers even across runners.
-# Layer cache lives registry-side (GHA's 10 GB cache is too small for this
-# set). First clang22 build is the long pole: the MSan libc++ stage compiles
-# LLVM runtimes from source (~60-90 min on 2 cores), cached afterwards.
+# Images are CONTENT-ADDRESSED: the canonical tag is tree-<hash>, where
+# the hash covers the docker/ git subtree, tools/build-msan-libcxx.sh and
+# this workflow file. Identical content (across rebases, reverts, and
+# merges) always maps to the same tag, so a build only ever happens when
+# that tag does not exist yet (ci.yml checks existence and calls this workflow
+# only on a miss). :latest is a convenience alias for local tools/tc use,
+# moved only when move_latest is set (manual dispatch, or ci on a main
+# push).
 #
-# REGISTRY and EXTRA_TAG are picked up by docker-bake.hcl as bake variables.
+# Two stages: the two per-release base instantiations first, then a
+# per-image fan-out with one runner per toolchain image, each building FROM
+# the exact base tag pushed in this run, so all images of a distro cohort
+# share identical base layers even across runners. Layer cache lives
+# registry-side (GHA's 10 GB cache is too small for this set). First
+# clang22 build is the long pole: the MSan libc++ stage compiles LLVM
+# runtimes from source (~60-90 min on 2 cores), cached afterwards.
 name: toolchain-images
 
-# Normally invoked as a dependency job by ci.yml whenever a push/PR
-# touches docker/**: ci's test jobs wait for these images and pull the
-# immutable sha-<sha> tag this run pushed, so tests never race a :latest
-# update or run against stale images. On pull_request invocations the
-# :latest tag is NOT moved (only push/dispatch retag it): a PR must not
-# repoint everyone's images before it merges. workflow_dispatch remains
-# for a manual full refresh; there is deliberately no push trigger, as that
-# would double-build against ci.yml's invocation.
 on:
   workflow_dispatch:
   workflow_call:
+    inputs:
+      tag:
+        description: "content tag to publish (computed when empty)"
+        type: string
+        default: ""
+      move_latest:
+        description: "also alias the images as :latest"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,13 +38,35 @@ permissions:
 env:
   REGISTRY: ghcr.io/${{ github.repository }}
   CACHE: ghcr.io/${{ github.repository }}/toolchain-cache
-  # push/dispatch: publish sha tag AND move :latest. Called from a PR via
-  # ci.yml: publish the sha tag only.
-  TAG: ${{ github.event_name == 'pull_request' && format('sha-{0}', github.sha) || 'latest' }}
-  EXTRA: ${{ github.event_name == 'pull_request' && '' || format('sha-{0}', github.sha) }}
 
 jobs:
+  ident:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      move_latest: ${{ steps.tag.outputs.move_latest }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_MOVE: ${{ inputs.move_latest }}
+        run: |
+          if [ -n "${INPUT_TAG}" ]; then
+            tag="${INPUT_TAG}"
+          else
+            tag="tree-$(bash tools/toolchain-image-tag.sh)"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          # Manual dispatch is a deliberate refresh: always move latest.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "move_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "move_latest=${INPUT_MOVE}" >> "$GITHUB_OUTPUT"
+          fi
+
   bases:
+    needs: ident
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,13 +78,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push base images
         run: |
-          TAG="${TAG}" EXTRA_TAG="${EXTRA}" \
+          TAG="${{ needs.ident.outputs.tag }}" \
+          EXTRA_TAG="${{ needs.ident.outputs.move_latest == 'true' && 'latest' || '' }}" \
           docker buildx bake -f docker/docker-bake.hcl base --push \
             --set "base-*.cache-from=type=registry,ref=${CACHE}:base" \
             --set "base-*.cache-to=type=registry,ref=${CACHE}:base,mode=max"
 
   images:
-    needs: bases
+    needs: [ident, bases]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -81,10 +112,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push ${{ matrix.target }}
         run: |
-          BASE_TAG="sha-${GITHUB_SHA}"
-          if [ -z "${EXTRA}" ]; then BASE_TAG="${TAG}"; fi
-          TAG="${TAG}" EXTRA_TAG="${EXTRA}" \
+          TAG="${{ needs.ident.outputs.tag }}" \
+          EXTRA_TAG="${{ needs.ident.outputs.move_latest == 'true' && 'latest' || '' }}" \
           docker buildx bake -f docker/docker-bake.hcl "${{ matrix.target }}" --push \
-            --set "*.contexts.base=docker-image://${REGISTRY}/toolchain-base-${{ matrix.rel }}:${BASE_TAG}" \
+            --set "*.contexts.base=docker-image://${REGISTRY}/toolchain-base-${{ matrix.rel }}:${{ needs.ident.outputs.tag }}" \
             --set "*.cache-from=type=registry,ref=${CACHE}:${{ matrix.target }}" \
             --set "*.cache-to=type=registry,ref=${CACHE}:${{ matrix.target }},mode=max"

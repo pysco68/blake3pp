@@ -6,14 +6,19 @@
 # x86. Windows and macOS presets are not here; they need real machines
 # (see docs/windows-vm.md and the macos presets' Darwin condition).
 #
-# Ordering with image changes: when the push/PR touches docker/** (or the
-# image workflows), the `images` job rebuilds the toolchain images FIRST
-# (reusing toolchains.yml as a called workflow) and every test job then
-# pulls the immutable sha-<sha> tag that build pushed, so tests never race
-# a :latest update or run against stale images. When docker/** is
-# untouched, `images` is skipped and tests pull :latest as usual. Fork
-# PRs cannot push packages: their docker/** changes test against :latest
-# with a warning from the changes job.
+# Ordering with image changes, content-addressed: the toolchain images
+# are keyed by tree-<hash> (the docker/ git subtree + the msan script +
+# toolchains.yml; see tools/toolchain-image-tag.sh), and the `changes`
+# job checks whether every image at that tag exists in GHCR. On a miss it
+# calls toolchains.yml to build them FIRST; every test job then pulls
+# exactly that content tag (never :latest), so tests can neither race a
+# tag update nor run against images that do not match the checkout.
+# Identical content never rebuilds: a rebase, revert or merge that lands
+# the same docker/ tree hits the existing tag and skips straight to the
+# tests. On main pushes the images are additionally aliased to :latest
+# (built fresh, or promoted by manifest retag if they already existed)
+# for local tools/tc users. Fork PRs cannot push packages: their image
+# changes fall back to :latest with a visible warning.
 name: ci
 
 on:
@@ -33,45 +38,83 @@ permissions:
   packages: read
 
 jobs:
-  # Which image tag should this run test against? :latest normally; the
-  # sha tag the `images` job is about to push when docker/** changed.
+  # Which content tag keys this checkout's toolchain images, and do they
+  # already exist in GHCR? The image list is read from docker-bake.hcl
+  # itself (bake --print), so there is no second list to drift.
   changes:
     runs-on: ubuntu-latest
     outputs:
-      docker: ${{ steps.filter.outputs.docker }}
       tag: ${{ steps.decide.outputs.tag }}
+      build: ${{ steps.decide.outputs.build }}
+      promote: ${{ steps.decide.outputs.promote }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
-        id: filter
+      - uses: docker/login-action@v3
         with:
-          filters: |
-            docker:
-              - "docker/**"
-              - "tools/build-msan-libcxx.sh"
-              - ".github/workflows/toolchains.yml"
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - id: decide
         env:
-          DOCKER_CHANGED: ${{ steps.filter.outputs.docker }}
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_MAIN_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
-          if [ "$DOCKER_CHANGED" = "true" ] && [ "$IS_FORK_PR" != "true" ]; then
-            echo "tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          else
-            if [ "$DOCKER_CHANGED" = "true" ]; then
-              echo "::warning::docker/** changed in a fork PR; cannot push images, testing against :latest"
+          tag="tree-$(bash tools/toolchain-image-tag.sh)"
+          missing=0
+          for ref in $(TAG="${tag}" docker buildx bake -f docker/docker-bake.hcl --print 2>/dev/null \
+                       | jq -r '.target[].tags[]' | sort -u); do
+            if ! docker manifest inspect "${ref}" > /dev/null 2>&1; then
+              echo "missing: ${ref}"
+              missing=1
             fi
+          done
+          if [ "${missing}" = 1 ] && [ "${IS_FORK_PR}" = "true" ]; then
+            echo "::warning::image content changed in a fork PR; cannot push images, testing against :latest"
             echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "promote=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "build=$([ "${missing}" = 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          # :latest promotion for local tools/tc users: on main pushes
+          # where the images already existed, alias them by manifest
+          # retag (the build path moves :latest itself via move_latest).
+          echo "promote=$([ "${missing}" = 0 ] && [ "${IS_MAIN_PUSH}" = "true" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-  # Rebuild + push the toolchain images before any test touches them.
+  # Build + push the missing images before any test touches them.
   images:
     needs: changes
-    if: needs.changes.outputs.tag != 'latest'
+    if: needs.changes.outputs.build == 'true'
     uses: ./.github/workflows/toolchains.yml
+    with:
+      tag: ${{ needs.changes.outputs.tag }}
+      move_latest: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     permissions:
       contents: read
       packages: write
+
+  # Cheap manifest-level :latest alias when the content tag already
+  # existed (nothing to build) but main advanced to it.
+  promote:
+    needs: changes
+    if: needs.changes.outputs.promote == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Alias content tags as latest
+        env:
+          TAG: ${{ needs.changes.outputs.tag }}
+        run: |
+          for ref in $(TAG="${TAG}" docker buildx bake -f docker/docker-bake.hcl --print 2>/dev/null \
+                       | jq -r '.target[].tags[]' | sort -u); do
+            docker buildx imagetools create -t "${ref%:*}:latest" "${ref}"
+          done
 
   test:
     name: ${{ matrix.preset }}
