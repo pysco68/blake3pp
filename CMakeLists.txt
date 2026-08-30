@@ -53,10 +53,10 @@ include(GNUInstallDirs)
 include(FetchContent)
 FetchContent_Populate(hfc
   GIT_REPOSITORY https://github.com/pysco68/hfc.git
-  # windows-support branch tip (2026-08-20), rebased to include the
+  # windows-support branch tip (2026-08-30), rebased to include the
   # SOURCE_SUBDIR precedence fix the interlocked stdexec population relies
   # on. Re-pin to a tipi-build/hfc mainline commit once merged upstream.
-  GIT_TAG ce030d44df549cb6d0c8169fd5918c486a3af077
+  GIT_TAG 8065c13e09624c04b5336ed03fb32d64913276fb
   SOURCE_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/src"
   SUBBUILD_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/subbuild"
   BINARY_DIR "${PROJECT_SOURCE_DIR}/thirdparty/cache/hfc/bin"
