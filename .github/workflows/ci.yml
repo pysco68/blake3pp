@@ -375,6 +375,26 @@ jobs:
           name: bench-report-${{ matrix.preset }}
           path: bench-report.txt
           retention-days: 7
+      # PE-machine audit for the cross legs: cl.exe takes its TARGET
+      # from the vcvars shell (clang-cl is pinned via -target), so a
+      # shell-arch mixup would build x64 bytes that windows-11-arm runs
+      # under TRANSPARENT x64 emulation: tests pass, just 5-10x slower.
+      # Assert the architecture instead of trusting the shell.
+      - name: PE machine audit (arm64 preset must emit ARM64)
+        if: ${{ !matrix.run_tests }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          foreach ($d in 'cli', 'bench', 'tests') {
+            Get-ChildItem "build\${{ matrix.preset }}\$d" -Filter *.exe | ForEach-Object {
+              $b = [IO.File]::ReadAllBytes($_.FullName)
+              $m = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3C) + 4)
+              Write-Host ("{0}: machine 0x{1:X4}" -f $_.Name, $m)
+              if ($m -ne 0xAA64) { $bad += $_.Name }
+            }
+          }
+          if ($bad) { throw "non-ARM64 PE in an arm64 preset: $bad" }
       # Tool binaries for release.yml: both x64 compilers (the msvc-vs-
       # clangcl kernel gap makes shipping both worthwhile) plus the
       # cross-built arm64 clang-cl binaries; those are compile-proven
@@ -495,6 +515,20 @@ jobs:
       - name: Show artifact layout
         shell: pwsh
         run: Get-ChildItem -Recurse -Name | Sort-Object
+      # x64 bytes would RUN here (transparently emulated, 5-10x slow),
+      # so prove these are arm64 before timing anything.
+      - name: PE machine audit (downloaded binaries are ARM64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          Get-ChildItem -Recurse -Filter *.exe | ForEach-Object {
+            $b = [IO.File]::ReadAllBytes($_.FullName)
+            $m = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3C) + 4)
+            Write-Host ("{0}: machine 0x{1:X4}" -f $_.Name, $m)
+            if ($m -ne 0xAA64) { $bad += $_.Name }
+          }
+          if ($bad) { throw "non-ARM64 PE downloaded onto the arm64 runner: $bad" }
       - name: CPU identity
         shell: pwsh
         run: (Get-CimInstance Win32_Processor).Name
