@@ -87,11 +87,13 @@ jobs:
       # The archives are PACKAGED from the binaries the triggering ci run
       # built and tested, never rebuilt. Manual dispatch has no ci run to
       # reuse, so it falls back to the full make-release.sh build.
-      - name: Collect static binaries from the ci run
+      - name: Collect binaries from the ci run
         if: github.event_name == 'workflow_run'
         uses: actions/download-artifact@v4
         with:
-          pattern: static-binaries-*
+          # static-binaries-* (linux musl) and tool-binaries-* (windows
+          # clang-cl x64, macos appleclang arm64)
+          pattern: "*-binaries-*"
           path: ci-binaries
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -125,6 +127,46 @@ jobs:
             tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
             rm -rf "$stage"
           done
+
+          # macOS (appleclang, tested natively on the Apple-silicon
+          # runner; stripped there, since GNU binutils cannot strip Mach-O).
+          src="ci-binaries/tool-binaries-macos-arm64"
+          if [ ! -d "$src" ]; then
+            echo "::error::ci run produced no macos binaries"; exit 1
+          fi
+          pkg="blake3pp-${VERSION}-macos-arm64"
+          stage="release/${pkg}"
+          mkdir -p "$stage"
+          cp "$src"/cli/blake3ppsum "$src"/cli/blake3ppgen \
+             "$src"/bench/blake3pp_bench "$src"/bench/blake3pp_bench_file \
+             "$stage"/
+          chmod +x "$stage"/*
+          cp README.md "$stage"/
+          tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
+          rm -rf "$stage"
+
+          # Windows (zip is the platform convention): both x64 compilers,
+          # tested natively, plus the cross-built arm64 clang-cl binaries
+          # (compile-proven only; flagged in the notes).
+          for pair in \
+            "windows-msvc2026-cxx23:windows-x86_64-msvc" \
+            "windows-clangcl-cxx23:windows-x86_64-clangcl" \
+            "windows-arm64-clangcl-cxx23:windows-arm64-clangcl"; do
+            preset="${pair%%:*}"
+            name="${pair#*:}"
+            src="ci-binaries/tool-binaries-${preset}"
+            if [ ! -d "$src" ]; then
+              echo "::error::ci run produced no ${name} binaries"; exit 1
+            fi
+            pkg="blake3pp-${VERSION}-${name}"
+            stage="release/${pkg}"
+            mkdir -p "$stage"
+            cp "$src"/cli/*.exe "$src"/bench/*.exe "$stage"/
+            cp README.md "$stage"/
+            (cd release && python3 -m zipfile -c "${pkg}.zip" "${pkg}")
+            rm -rf "$stage"
+          done
+
           ls -la release
 
       - name: Compute release identity
@@ -149,13 +191,20 @@ jobs:
       - name: Compose release notes
         run: |
           {
-            echo "Automated prerelease of commit ${RELEASE_SHA} (ci green)."
-            echo "Fully static musl+mimalloc tool builds (\`blake3ppsum\`,"
-            echo "\`blake3ppgen\`, benchmarks) for x86_64, aarch64 and riscv64:"
-            echo "the aarch64 archives carry the full NEON+SVE kernel chain,"
-            echo "the riscv64 ones the RVV/Zvbb chain (both with runtime"
-            echo "vector-length dispatch), and the x86_64 ones SSE4.2 through"
-            echo "AVX-512. Disposable: swept by release-cleanup after 90 days."
+            echo "Automated prerelease of commit ${RELEASE_SHA} (ci green):"
+            echo "every archive contains exactly the bytes that ci run tested."
+            echo
+            echo "Linux (fully static musl+mimalloc; \`blake3ppsum\`,"
+            echo "\`blake3ppgen\`, benchmarks): x86_64 (SSE4.2 through AVX-512),"
+            echo "aarch64 (full NEON+SVE chain), riscv64 (RVV/Zvbb chain);"
+            echo "runtime vector-length dispatch throughout. Plus"
+            echo "windows-x86_64 in both compilers (msvc and clang-cl;"
+            echo "clang-cl carries the faster byte-rotate kernels;"
+            echo "IOCP+direct I/O in both), macos-arm64 (Apple clang,"
+            echo "GCD + F_NOCACHE I/O), and windows-arm64-clangcl"
+            echo "(cross-built; tested natively only when the ci run's"
+            echo "windows-11-arm lane was enabled; check its jobs)."
+            echo "Disposable: swept by release-cleanup after 90 days."
             if ls bench-reports/*/bench-report.txt > /dev/null 2>&1; then
               echo
               echo "## Hardware test & bench reports (from the triggering ci run)"
@@ -176,5 +225,7 @@ jobs:
           target_commitish: ${{ env.RELEASE_SHA }}
           name: dev build ${{ steps.ident.outputs.short }}
           prerelease: true
-          files: release/*.tar.gz
+          files: |
+            release/*.tar.gz
+            release/*.zip
           body_path: release-notes.md
