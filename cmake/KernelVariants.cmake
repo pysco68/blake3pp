@@ -30,10 +30,13 @@ function(_blake3pp_register_x86_kernels)
     # SSE4.2. xsimd back-fills SSE4_2 -> SSE4_1 -> SSSE3 -> SSE3, so
     # __SSE4_2__ alone would do; all three are spelled out so this does
     # not depend on xsimd keeping that cascade.
-    blake3pp_add_kernel(sse42 ARCH_FLAGS /arch:SSE4.2
+    # /w14883 surfaces C4883 (optimizer size-budget bailout, silently
+    # emitting /Od-class code) at the default warning level; it produced a
+    # 250x cliff on the arm64 twin before it was made visible.
+    blake3pp_add_kernel(sse42 ARCH_FLAGS /arch:SSE4.2 /w14883
       -D__SSSE3__ -D__SSE4_1__ -D__SSE4_2__)
-    blake3pp_add_kernel(avx2 ARCH_FLAGS /arch:AVX2)
-    blake3pp_add_kernel(avx512 ARCH_FLAGS /arch:AVX512)
+    blake3pp_add_kernel(avx2 ARCH_FLAGS /arch:AVX2 /w14883)
+    blake3pp_add_kernel(avx512 ARCH_FLAGS /arch:AVX512 /w14883)
   else()
     blake3pp_add_kernel(sse42 ARCH_FLAGS -msse4.2)
     blake3pp_add_kernel(avx2 ARCH_FLAGS -mavx2)
@@ -45,8 +48,32 @@ function(_blake3pp_register_x86_kernels)
 endfunction()
 
 function(_blake3pp_register_aarch64_kernels)
-  # NEON is baseline on AArch64
-  blake3pp_add_kernel(neon)
+  # NEON is baseline on AArch64, with one diagnosed exception. Under
+  # pure cl.exe the kernel MEASURED <0.005 GiB/s on Cobalt 100 (~100x
+  # below scalar in the same binary) while validating byte-identical.
+  # Root cause, proven by disassembling the CI artifact and reproducing
+  # the compile with /w14883: warning C4883 "function size suppresses
+  # optimizations". MSVC's optimizer has an internal size budget, the
+  # flattened all_rounds/hash_batch/xof_wide blow it, and cl SILENTLY
+  # emits /Od-class code inside the /O2 build (2.24M instructions,
+  # 550k stack round-trips, 14.8MB object). The documented-by-Chromium
+  # /d2OptimizeHugeFunctions raises the budget: same TU drops to 29.4k
+  # instructions / 603 stack ops / 194KB, real NEON code. cl gets the
+  # kernel only with that flag, probed because /d2 options are
+  # version-fragile; /we4883 makes any FUTURE silent bailout a build
+  # error instead of a 250x mystery. Silicon verdict on the optimized
+  # kernel comes from the windows-11-arm lane (that leg ships in no
+  # release archive, so measuring it there is risk-free).
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set(CMAKE_REQUIRED_FLAGS "/d2OptimizeHugeFunctions /WX")
+    check_cxx_source_compiles("int main() { return 0; }" BLAKE3PP_MSVC_HUGE_FUNC_OPT)
+    set(CMAKE_REQUIRED_FLAGS "")
+    if(BLAKE3PP_MSVC_HUGE_FUNC_OPT)
+      blake3pp_add_kernel(neon ARCH_FLAGS /d2OptimizeHugeFunctions /we4883)
+    endif()
+  else()
+    blake3pp_add_kernel(neon)
+  endif()
   # Fixed-length SVE variants: one kernel per vector length, because VLS
   # code is only valid when the runtime VL EQUALS the compiled one (GCC
   # and Arm document exact-match only), and dispatch checks precisely that.
