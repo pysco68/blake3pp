@@ -184,9 +184,22 @@ jobs:
       - name: Cache hermetic dependencies
         uses: actions/cache@v4
         with:
-          path: thirdparty/cache
-          key: hfc-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-
+          # Only the path-FREE content is cached: the *-src trees and the
+          # shared sources store. The FetchContent subbuild dirs (and
+          # hfc's own clone) embed absolute workspace paths in their
+          # CMakeCache.txt, so a cache written under one mount poisons
+          # every job with another (a native-runner cache at
+          # /home/runner/... once killed all container jobs at /__w/...).
+          # Excluded dirs regenerate in seconds; the key prefix was also
+          # rotated (hfc-src-) so pre-fix poisoned entries can never be
+          # restored.
+          path: |
+            thirdparty/cache
+            !thirdparty/cache/hfc
+            !thirdparty/cache/hfc.*
+            !thirdparty/cache/*-subbuild
+          key: hfc-src-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src-
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
@@ -230,9 +243,22 @@ jobs:
       - name: Cache hermetic dependencies
         uses: actions/cache@v4
         with:
-          path: thirdparty/cache
-          key: hfc-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-
+          # Only the path-FREE content is cached: the *-src trees and the
+          # shared sources store. The FetchContent subbuild dirs (and
+          # hfc's own clone) embed absolute workspace paths in their
+          # CMakeCache.txt, so a cache written under one mount poisons
+          # every job with another (a native-runner cache at
+          # /home/runner/... once killed all container jobs at /__w/...).
+          # Excluded dirs regenerate in seconds; the key prefix was also
+          # rotated (hfc-src-) so pre-fix poisoned entries can never be
+          # restored.
+          path: |
+            thirdparty/cache
+            !thirdparty/cache/hfc
+            !thirdparty/cache/hfc.*
+            !thirdparty/cache/*-subbuild
+          key: hfc-src-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src-
       - name: Build and test under qemu (VL matrix)
         run: bash tools/ci-test.sh linux-arm64-zigmusl-cxx23-static
       - uses: actions/upload-artifact@v4
