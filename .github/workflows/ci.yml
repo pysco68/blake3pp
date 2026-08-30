@@ -6,8 +6,14 @@
 # x86. Windows runs on the hosted windows-latest runners (x64 presets
 # built AND tested; arm64 presets cross-built via vcvarsall x64_arm64,
 # since x64 Windows cannot emulate arm64 and native arm64 testing is a gated
-# extra job for the windows-11-arm runners). macOS presets are not here
-# (Darwin condition; see the macos-* presets).
+# extra job for the windows-11-arm runners). macOS runs both its presets
+# natively on the Apple-silicon macos-15 runners (Homebrew LLVM ships
+# preinstalled on those images).
+#
+# Every platform that runs natively also runs the FULL bench, one rep
+# (--reps 1 --cooldown 0), and uploads a bench-report-* artifact
+# (silicon identity, dispatch verdict, all rows) which release.yml folds
+# into the prerelease notes.
 #
 # Ordering with image changes, content-addressed: the toolchain images
 # are keyed by tree-<hash> (the docker/ git subtree + the msan script +
@@ -216,7 +222,7 @@ jobs:
           { echo "== x86_64, GitHub ubuntu-latest runner, static musl build =="
             grep -m1 "model name" /proc/cpuinfo || true
             build/${{ matrix.preset }}/cli/blake3ppsum --version < /dev/null
-            build/${{ matrix.preset }}/bench/blake3pp_bench --size 256 --reps 3 --cooldown 0
+            build/${{ matrix.preset }}/bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
       - uses: actions/upload-artifact@v4
         if: matrix.preset == 'linux-zigmusl-cxx23-static'
@@ -268,6 +274,73 @@ jobs:
           cmake --preset ${{ matrix.preset }} || exit /b 1
           cmake --build build\${{ matrix.preset }} -j %NUMBER_OF_PROCESSORS% || exit /b 1
           if "${{ matrix.run_tests }}"=="true" ctest --test-dir build\${{ matrix.preset }} --output-on-failure
+      # Full bench, one rep, per compiler: the MSVC-vs-clang kernel gap is
+      # a running storyline; this gives it a longitudinal record for free.
+      - name: Bench report (runner x64 silicon)
+        if: matrix.run_tests
+        shell: pwsh
+        run: |
+          "== x86_64 Windows, ${{ matrix.preset }}, GitHub windows-latest runner ==" | Out-File bench-report.txt -Encoding utf8
+          (Get-CimInstance Win32_Processor).Name | Out-File bench-report.txt -Append -Encoding utf8
+          & "build\${{ matrix.preset }}\cli\blake3ppsum.exe" --version | Out-File bench-report.txt -Append -Encoding utf8
+          & "build\${{ matrix.preset }}\bench\blake3pp_bench.exe" --reps 1 --cooldown 0 | Out-File bench-report.txt -Append -Encoding utf8
+          Get-Content bench-report.txt
+      - uses: actions/upload-artifact@v4
+        if: matrix.run_tests
+        with:
+          name: bench-report-${{ matrix.preset }}
+          path: bench-report.txt
+          retention-days: 7
+
+  # macOS on the Apple-silicon macos-15 runners, both presets natively:
+  # Apple clang exercises the GCD + F_NOCACHE I/O backend in CI for the
+  # first time; the Homebrew-LLVM preset rides the LLVM the runner image
+  # preinstalls (the toolchain file resolves /opt/homebrew/opt/llvm
+  # version-agnostically; the report's --version line records what it
+  # actually was).
+  macos:
+    name: ${{ matrix.preset }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [macos-appleclang-cxx23, macos-clang22-cxx26]
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v4
+        with:
+          # Same path-free-content rule as the Linux jobs; separate
+          # Darwin prefix.
+          path: |
+            thirdparty/cache
+            !thirdparty/cache/hfc
+            !thirdparty/cache/hfc.*
+            !thirdparty/cache/*-subbuild
+          key: hfc-src-mac-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src-mac-
+      - name: Ensure ninja
+        run: which ninja || brew install ninja
+      - name: Configure, build, test
+        run: |
+          cmake --preset ${{ matrix.preset }}
+          cmake --build build/${{ matrix.preset }} -j"$(sysctl -n hw.ncpu)"
+          ctest --test-dir build/${{ matrix.preset }} --output-on-failure
+      - name: Bench report (Apple silicon)
+        run: |
+          { echo "== aarch64, GitHub macos-15 runner ($(sysctl -n machdep.cpu.brand_string)), ${{ matrix.preset }} =="
+            echo "cores: $(sysctl -n hw.ncpu)"
+            build/${{ matrix.preset }}/cli/blake3ppsum --version < /dev/null
+            build/${{ matrix.preset }}/bench/blake3pp_bench --reps 1 --cooldown 0
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-${{ matrix.preset }}
+          path: bench-report.txt
+          retention-days: 7
 
   # Native arm64 Windows testing on GitHub's windows-11-arm runners,
   # gated (set the repository variable WIN_ARM64_NATIVE=1) because their
@@ -376,7 +449,7 @@ jobs:
           { echo "== aarch64, GitHub ubuntu-24.04-arm (Azure Cobalt 100 / Neoverse N2), static musl build =="
             lscpu | grep -iE "model name|flags" | cut -c1-200 || true
             cli/blake3ppsum --version < /dev/null
-            bench/blake3pp_bench --size 256 --reps 3 --cooldown 0
+            bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
       - uses: actions/upload-artifact@v4
         with:
@@ -419,7 +492,7 @@ jobs:
           { echo "== riscv64, Cloud-V self-hosted runner, native build =="
             { lscpu | head -20; } 2>/dev/null || sort -u /proc/cpuinfo | head -20
             build/riscv-native/cli/blake3ppsum --version < /dev/null
-            build/riscv-native/bench/blake3pp_bench --size 128 --reps 3 --cooldown 0
+            build/riscv-native/bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
       - uses: actions/upload-artifact@v4
         with:
