@@ -457,45 +457,73 @@ jobs:
           path: bench-report.txt
           retention-days: 7
 
-  # Native RISC-V validation on the project's Cloud-V runners
-  # (https://cloud-v.co), gated on the repository variable
-  # CLOUDV_RISCV64=1 (set it after registering runners; adjust the
-  # runs-on labels to whatever the runner registered with). Builds bare
-  # with the host toolchain (kernel probes degrade gracefully on older
-  # GCC: no fixed-vlen support simply registers fewer variants), then
-  # tests and writes the hardware bench report. Cross-built glibc
-  # binaries are deliberately NOT reused here (resolute glibc floor); the
-  # static musl riscv64 archives would run anywhere, but a native build
-  # additionally validates the toolchain path on real silicon. The runner
-  # must provide cmake >= 3.28, ninja, a C++20 compiler and network
-  # access (hermetic dependency fetch).
+  # Native RISC-V validation across the Cloud-V board fleet
+  # (https://cloud-v.co, runner docs: 10x-engineers.github.io/
+  # riscv-ci-partners): one board per vector story, so the dispatch
+  # matrix meets real silicon at every tier:
+  #   visionfive2   JH7110      RV64GC, NO vector: the scalar fallback
+  #   bpi-f3        SpacemiT K1 RVV 1.0 (VLEN=256): real rvv256
+  #   milkv-pioneer SG2042      XTheadVector (draft 0.7.1), 64 cores:
+  #                             the hand-written xthead kernel on the
+  #                             silicon it was written for
+  # Gated on the repository variable CLOUDV_RISCV64=1. Every job gets a
+  # fresh Ubuntu 24.04 riscv64 container (gcc/git/sudo preinstalled;
+  # cmake/ninja and g++-14 are apt-installed per run; g++-14 because the
+  # fixed-vlen and th intrinsics need GCC 14+; when it is unavailable the
+  # probes degrade gracefully to fewer variants). Same-board jobs
+  # serialize on the shared runner; different boards run in parallel.
+  # Cross-built glibc binaries are deliberately NOT reused (resolute
+  # glibc floor); the native build also validates the toolchain path.
   riscv-native:
-    name: riscv64 native (Cloud-V)
+    name: riscv64 ${{ matrix.board }} (Cloud-V)
     if: vars.CLOUDV_RISCV64 == '1'
-    runs-on: [self-hosted, riscv64]
-    timeout-minutes: 120
+    runs-on: [self-hosted, "${{ matrix.board }}"]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { board: visionfive2, xthead: false }
+          - { board: bpi-f3, xthead: false }
+          - { board: milkv-pioneer, xthead: true }
     steps:
       - uses: actions/checkout@v4
+      - name: Install build tools (fresh container every job)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3
+          sudo apt-get install -y g++-14 || echo "::warning::no g++-14; vector kernel probes will register fewer variants"
       - name: Configure and build (host toolchain)
         run: |
+          CXX=$(command -v g++-14 || command -v g++)
           cmake -S . -B build/riscv-native -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DBLAKE3PP_XTHEAD_KERNEL=${{ matrix.xthead && 'ON' || 'OFF' }}
           cmake --build build/riscv-native -j"$(nproc)"
       - name: What silicon is this really
         run: |
-          lscpu | head -20 || cat /proc/cpuinfo | sort -u | head -20
+          { lscpu | head -20; } 2>/dev/null || sort -u /proc/cpuinfo | head -20
           build/riscv-native/cli/blake3ppsum --version
       - name: Test on real silicon
         run: ctest --test-dir build/riscv-native --output-on-failure
+      # SG2042 only: the hwprobe vendor key needs Linux 6.13+, which
+      # vendor kernels predate, but on THIS silicon the assume-hook is
+      # simply the truth, so the oracle suite exercises the xthead kernel
+      # on real 0.7.1 hardware regardless of kernel vintage.
+      - name: xthead oracle run on real 0.7.1 silicon
+        if: matrix.xthead
+        run: BLAKE3PP_ASSUME_XTHEADVECTOR=1 build/riscv-native/tests/blake3pp_tests
       - name: Bench report (real RISC-V silicon)
         run: |
-          { echo "== riscv64, Cloud-V self-hosted runner, native build =="
+          { echo "== riscv64, Cloud-V ${{ matrix.board }}, native build =="
             { lscpu | head -20; } 2>/dev/null || sort -u /proc/cpuinfo | head -20
             build/riscv-native/cli/blake3ppsum --version < /dev/null
+            ${{ matrix.xthead && 'export BLAKE3PP_ASSUME_XTHEADVECTOR=1' || 'true' }}
             build/riscv-native/bench/blake3pp_bench --reps 1 --cooldown 0
           } | tee bench-report.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: bench-report-riscv64-cloudv
+          name: bench-report-riscv64-${{ matrix.board }}
           path: bench-report.txt
           retention-days: 7
