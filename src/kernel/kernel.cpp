@@ -17,6 +17,7 @@
 #error "kernel.cpp must be compiled with -DBLAKE3PP_ARCH_NS=<variant> (use blake3pp_add_kernel)"
 #endif
 
+#include "kernel/rotate.hpp"
 #include "kernel/simd_facade.hpp"
 #include "kernel/transpose.hpp"
 
