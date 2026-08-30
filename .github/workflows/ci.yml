@@ -352,15 +352,23 @@ jobs:
           if "${{ matrix.run_tests }}"=="true" ctest --test-dir build\${{ matrix.preset }} --output-on-failure
       # Full bench, one rep, per compiler: the MSVC-vs-clang kernel gap is
       # a running storyline; this gives it a longitudinal record for free.
+      # pwsh step discipline (every pwsh step in this file): the strict
+      # preamble makes the FIRST failing native command abort the step
+      # with its name and exit code; GitHub's default wrapper only
+      # propagates the LAST command's exit code, silently swallowing
+      # everything before it. Tee-Object streams live output into the
+      # log AND the report file, since Out-File buffering reads as a
+      # stuck step while the bench runs.
       - name: Bench report (runner x64 silicon)
         if: matrix.run_tests
         shell: pwsh
         run: |
-          "== x86_64 Windows, ${{ matrix.preset }}, GitHub windows-latest runner ==" | Out-File bench-report.txt -Encoding utf8
-          (Get-CimInstance Win32_Processor).Name | Out-File bench-report.txt -Append -Encoding utf8
-          & "build\${{ matrix.preset }}\cli\blake3ppsum.exe" --version | Out-File bench-report.txt -Append -Encoding utf8
-          & "build\${{ matrix.preset }}\bench\blake3pp_bench.exe" --reps 1 --cooldown 0 | Out-File bench-report.txt -Append -Encoding utf8
-          Get-Content bench-report.txt
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          "== x86_64 Windows, ${{ matrix.preset }}, GitHub windows-latest runner ==" | Tee-Object bench-report.txt
+          (Get-CimInstance Win32_Processor).Name | Tee-Object bench-report.txt -Append
+          & "build\${{ matrix.preset }}\cli\blake3ppsum.exe" --version 2>&1 | Tee-Object bench-report.txt -Append
+          & "build\${{ matrix.preset }}\bench\blake3pp_bench.exe" --reps 1 --cooldown 0 2>&1 | Tee-Object bench-report.txt -Append
       - uses: actions/upload-artifact@v7
         if: matrix.run_tests
         with:
@@ -480,24 +488,39 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: tool-binaries-${{ matrix.preset }}
-      - name: What silicon is this really
+      # One logical action per step from here on: when something fails,
+      # the step NAME is the diagnosis (a chained block reports only
+      # "exit code 1" with no culprit). The strict preamble in each pwsh
+      # step aborts on the first failing native command and names it.
+      - name: Show artifact layout
+        shell: pwsh
+        run: Get-ChildItem -Recurse -Name | Sort-Object
+      - name: CPU identity
+        shell: pwsh
+        run: (Get-CimInstance Win32_Processor).Name
+      - name: Startup smoke (blake3ppsum --version)
         shell: pwsh
         run: |
-          (Get-CimInstance Win32_Processor).Name
-          & "cli\blake3ppsum.exe" --version
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "cli\blake3ppsum.exe" --version 2>&1
       - name: Test the cross-built binaries on real arm64 Windows
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           & "tests\blake3pp_tests.exe"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # Tee-Object streams the bench live into the log while building
+      # the report file; Out-File buffering read as a stuck step.
       - name: Bench report (arm64 Windows silicon)
         shell: pwsh
         run: |
-          "== arm64 Windows, GitHub windows-11-arm runner, ${{ matrix.preset }} (cross-built) ==" | Out-File bench-report.txt -Encoding utf8
-          (Get-CimInstance Win32_Processor).Name | Out-File bench-report.txt -Append -Encoding utf8
-          & "cli\blake3ppsum.exe" --version | Out-File bench-report.txt -Append -Encoding utf8
-          & "bench\blake3pp_bench.exe" --reps 1 --cooldown 0 | Out-File bench-report.txt -Append -Encoding utf8
-          Get-Content bench-report.txt
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          "== arm64 Windows, GitHub windows-11-arm runner, ${{ matrix.preset }} (cross-built) ==" | Tee-Object bench-report.txt
+          (Get-CimInstance Win32_Processor).Name | Tee-Object bench-report.txt -Append
+          & "cli\blake3ppsum.exe" --version 2>&1 | Tee-Object bench-report.txt -Append
+          & "bench\blake3pp_bench.exe" --reps 1 --cooldown 0 2>&1 | Tee-Object bench-report.txt -Append
       - uses: actions/upload-artifact@v7
         with:
           name: bench-report-${{ matrix.preset }}-native
