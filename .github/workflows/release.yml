@@ -1,10 +1,11 @@
-# Automatic prerelease publishing: after every GREEN ci run on main, build
-# the static release archives (tools/make-release.sh: musl + mimalloc
-# tools for x86_64 and aarch64, test-passed under qemu) and attach them to
-# a prerelease keyed by the commit: tag dev-<sha12>, created at exactly
-# that commit. Triggering on ci's completion rather than on push does two
-# things at once: nothing is ever published from a red commit, and the
-# zig image pulled here is the one ci just refreshed if docker/** changed.
+# Automatic prerelease publishing: after every GREEN ci run on main,
+# PACKAGE the static musl+mimalloc archives (x86_64/aarch64/riscv64) from
+# the binaries that ci run built and tested (no rebuild) and attach
+# them to a prerelease keyed by the commit: tag dev-<sha12>, created at
+# exactly that commit. Triggering on ci's completion rather than on push
+# does two things at once: nothing is ever published from a red commit,
+# and only ci-tested bytes are ever shipped. Manual dispatch (no ci run
+# to reuse) falls back to a full tools/make-release.sh build.
 #
 # These dev-* prereleases are disposable by design; release-cleanup.yml
 # deletes them (and their anchor tags) after 90 days. Real releases are
@@ -83,8 +84,48 @@ jobs:
           key: hfc-src-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
           restore-keys: hfc-src-
 
-      - name: Build, test and package the static archives
-        run: sh tools/make-release.sh
+      # The archives are PACKAGED from the binaries the triggering ci run
+      # built and tested, never rebuilt. Manual dispatch has no ci run to
+      # reuse, so it falls back to the full make-release.sh build.
+      - name: Collect static binaries from the ci run
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: static-binaries-*
+          path: ci-binaries
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package the static archives
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_run" ]; then
+            sh tools/make-release.sh
+            exit 0
+          fi
+          VERSION=$(sed -n 's/^  VERSION \([0-9.]*\)$/\1/p' CMakeLists.txt)
+          mkdir -p release
+          for arch in x86_64 aarch64 riscv64; do
+            src="ci-binaries/static-binaries-${arch}"
+            if [ ! -d "$src" ]; then
+              echo "::error::ci run produced no ${arch} static binaries"
+              exit 1
+            fi
+            pkg="blake3pp-${VERSION}-linux-${arch}-static"
+            stage="release/${pkg}"
+            mkdir -p "$stage"
+            cp "$src"/cli/blake3ppsum "$src"/cli/blake3ppgen \
+               "$src"/bench/blake3pp_bench "$src"/bench/blake3pp_bench_file \
+               "$stage"/
+            chmod +x "$stage"/*
+            case "$arch" in
+              x86_64) strip "$stage"/* ;;
+              *)      "${arch}-linux-gnu-strip" "$stage"/* ;;
+            esac
+            cp README.md "$stage"/
+            tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
+            rm -rf "$stage"
+          done
+          ls -la release
 
       - name: Compute release identity
         id: ident

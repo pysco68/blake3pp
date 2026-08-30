@@ -230,6 +230,19 @@ jobs:
           name: bench-report-x86_64
           path: bench-report.txt
           retention-days: 7
+      # Static tool binaries for release.yml to package; the release
+      # never rebuilds what ci already built and tested.
+      - name: Upload static binaries
+        if: contains(matrix.preset, 'zigmusl')
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-binaries-${{ contains(matrix.preset, 'riscv64') && 'riscv64' || 'x86_64' }}
+          retention-days: 3
+          path: |
+            build/${{ matrix.preset }}/cli/blake3ppsum
+            build/${{ matrix.preset }}/cli/blake3ppgen
+            build/${{ matrix.preset }}/bench/blake3pp_bench
+            build/${{ matrix.preset }}/bench/blake3pp_bench_file
 
   # Windows, on the hosted runners; no toolchain image (those are Linux/
   # amd64); vswhere locates whatever VS the runner image ships and vcvars
@@ -370,8 +383,8 @@ jobs:
           cmake --build build\${{ matrix.preset }} -j %NUMBER_OF_PROCESSORS% || exit /b 1
           ctest --test-dir build\${{ matrix.preset }} --output-on-failure
 
-  # The aarch64 static musl chain, built cross in the zig image (with its
-  # qemu VL matrix), binaries handed to the Neoverse job below.
+  # The aarch64 static musl chain, built cross in the zig image, binaries
+  # handed to the Neoverse job below and to release.yml.
   build-arm64-static:
     needs: [changes, images]
     if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.images.result == 'success' || needs.images.result == 'skipped') }}
@@ -407,17 +420,25 @@ jobs:
             !thirdparty/cache/*-subbuild
           key: hfc-src-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
           restore-keys: hfc-src-
-      - name: Build and test under qemu (VL matrix)
-        run: bash tools/ci-test.sh linux-arm64-zigmusl-cxx23-static
+      # One default-config qemu ctest only: the SVE VL matrix already runs
+      # on the linux-arm64-gcc15 preset, and the Neoverse job covers VL=128
+      # on real silicon; repeating the emulation matrix here would only
+      # delay the runner waiting on this job's binaries.
+      - name: Build and test (default qemu config)
+        run: |
+          cmake --preset linux-arm64-zigmusl-cxx23-static
+          cmake --build build/linux-arm64-zigmusl-cxx23-static -j"$(nproc)"
+          ctest --test-dir build/linux-arm64-zigmusl-cxx23-static --output-on-failure
       - uses: actions/upload-artifact@v4
         with:
-          name: arm64-static-binaries
+          name: static-binaries-aarch64
           retention-days: 3
           path: |
             build/linux-arm64-zigmusl-cxx23-static/tests/blake3pp_tests
             build/linux-arm64-zigmusl-cxx23-static/cli/blake3ppsum
             build/linux-arm64-zigmusl-cxx23-static/cli/blake3ppgen
             build/linux-arm64-zigmusl-cxx23-static/bench/blake3pp_bench
+            build/linux-arm64-zigmusl-cxx23-static/bench/blake3pp_bench_file
 
   # Real ARM silicon, no emulator and no native toolchain: GitHub's free
   # arm64 runners are Azure Cobalt 100: Neoverse N2, Armv9 SVE2 at
@@ -436,7 +457,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: arm64-static-binaries
+          name: static-binaries-aarch64
       - name: What silicon is this really
         run: |
           chmod +x tests/blake3pp_tests cli/blake3ppsum cli/blake3ppgen bench/blake3pp_bench
