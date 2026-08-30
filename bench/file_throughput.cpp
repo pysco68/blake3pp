@@ -7,16 +7,28 @@
 //
 //   blake3pp_bench_file <FILE> [--reps N] [--window MiB] [--qd N]
 //                       [--no-direct] [--seq-only] [--cooldown S]
+//   blake3pp_bench_file <FILE> --io-sweep   # window x qd pacing matrix
 //   blake3pp_bench_file --make <MiB>   # create a test file and use it
 //
 // Note: with direct I/O the page cache is bypassed, so repetitions measure
 // the device (or the host-side cache of a virtualized disk), not RAM.
+//
+// --io-sweep exists because the right window/qd is a property of the
+// DEVICE (bandwidth x latency), not the CPU: the 8 MiB x qd4 defaults
+// were tuned on low-latency NVMe and measured 23-25% slow on GCP pd-class
+// volumes, where 32x16 recovered it. The sweep is
+// the stopwatch that settles it per machine.
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <unistd.h>  // sync(): flushes dirty pages before a cache drop
+#endif
 
 #include <CLI/CLI.hpp>
 #include <blake3pp/io.hpp>
@@ -40,6 +52,98 @@ std::string make_test_file(std::size_t mib) {
     out.write(block.data(), static_cast<std::streamsize>(block.size()));
   }
   return path;
+}
+
+// Best-effort page-cache drop (vm.drop_caches=3). Wants root; with the
+// default direct I/O the cache is bypassed anyway, so a failed drop only
+// leaves metadata/readahead state warm; reported once, not fatal.
+bool drop_caches() {
+#if defined(__linux__)
+  ::sync();
+  std::ofstream f("/proc/sys/vm/drop_caches");
+  if (!f.is_open()) {
+    return false;
+  }
+  f << "3" << std::flush;
+  return f.good();
+#else
+  return false;
+#endif
+}
+
+// The window x qd pacing matrix: same measurement as the main rows, swept.
+void io_sweep(const std::string& path, std::uint64_t bytes,
+              blake3pp::hash_file_options opts, int reps, double cooldown_s,
+              bool seq_only) {
+  constexpr std::size_t windows[] = {8, 16, 32, 64};
+  constexpr unsigned depths[] = {4, 8, 16, 32};
+
+  const bool cold = drop_caches();
+  println(stdout,
+          "window x qd sweep: {} hash of {:.0f} MiB, best of {}, {}\n"
+          "cache drops {} ({})\n",
+          seq_only ? "sequential" : "parallel",
+          static_cast<double>(bytes) / (1024.0 * 1024.0), reps,
+          opts.direct_io ? "direct I/O" : "--no-direct",
+          cold ? "active" : "unavailable",
+          cold ? "vm.drop_caches=3 before every combo"
+               : "not root; direct I/O bypasses the page cache anyway, but "
+                 "metadata/readahead state stays warm");
+
+  std::printf("  %10s", "window\\qd");
+  for (const unsigned qd : depths) {
+    std::printf("  qd=%-2u        ", qd);
+  }
+  std::printf("\n");
+
+  b3tool::cooldown cooldown(cooldown_s);
+  auto sched = blake3pp::get_parallel_scheduler();
+  double best_gibs = 0.0;
+  double default_gibs = 0.0;
+  std::size_t best_w = 0;
+  unsigned best_qd = 0;
+
+  for (const std::size_t w : windows) {
+    std::printf("  %6zu MiB", w);
+    for (const unsigned qd : depths) {
+      cooldown();
+      if (cold) {
+        drop_caches();
+      }
+      opts.window_bytes = w * 1024 * 1024;
+      opts.queue_depth = qd;
+      const double secs = b3tool::best_seconds(reps, /*warmup=*/false, [&] {
+        if (seq_only) {
+          (void)blake3pp::hash_file(path.c_str(), opts);
+        } else {
+          (void)blake3pp::hash_file(path.c_str(), sched, opts);
+        }
+      });
+      const double gibs =
+          b3tool::gib_per_s(static_cast<std::size_t>(bytes), secs);
+      std::printf("  %6.2f GiB/s", gibs);
+      std::fflush(stdout);
+      if (gibs > best_gibs) {
+        best_gibs = gibs;
+        best_w = w;
+        best_qd = qd;
+      }
+      if (w == 8 && qd == 4) {
+        default_gibs = gibs;
+      }
+    }
+    std::printf("\n");
+  }
+
+  println(stdout,
+          "\n  best: window {} MiB, qd {} ({:.2f} GiB/s), {:+.0f}% vs the "
+          "8 MiB x qd4 default ({:.2f} GiB/s)",
+          best_w, best_qd, best_gibs,
+          default_gibs > 0.0 ? 100.0 * (best_gibs / default_gibs - 1.0) : 0.0,
+          default_gibs);
+  println(stdout,
+          "  (a basin, not a slope: oversized windows fight the hash for "
+          "cache, over-deep queues add latency)");
 }
 
 }  // namespace
@@ -74,6 +178,11 @@ int main(int argc, char** argv) {
   app.add_flag("!--no-direct", opts.direct_io,
                "keep the OS page cache (no O_DIRECT)");
   app.add_flag("--seq-only", seq_only, "skip the parallel measurement");
+  bool sweep = false;
+  app.add_flag("--io-sweep", sweep,
+               "sweep the window x qd pacing matrix (8-64 MiB x 4-32) "
+               "instead of the standard rows; the optimum is a device "
+               "property, run this per machine");
   CLI11_PARSE(app, argc, argv);
 
   opts.window_bytes = window_mib * 1024 * 1024;
@@ -96,6 +205,11 @@ int main(int argc, char** argv) {
             path, static_cast<double>(bytes) / (1024.0 * 1024.0),
             probe.backend(), opts.window_bytes >> 20, opts.queue_depth);
   }
+  if (sweep) {
+    io_sweep(path, bytes, opts, reps, cooldown_s, seq_only);
+    return 0;
+  }
+
   const auto gibs = [&](double secs) {
     return b3tool::gib_per_s(static_cast<std::size_t>(bytes), secs);
   };
