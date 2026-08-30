@@ -67,22 +67,25 @@ jobs:
       - name: Cache hermetic dependencies
         uses: actions/cache@v6
         with:
-          # Only the path-FREE content is cached: the *-src trees and the
-          # shared sources store. The FetchContent subbuild dirs (and
-          # hfc's own clone) embed absolute workspace paths in their
-          # CMakeCache.txt, so a cache written under one mount poisons
-          # every job with another (a native-runner cache at
-          # /home/runner/... once killed all container jobs at /__w/...).
-          # Excluded dirs regenerate in seconds; the key prefix was also
-          # rotated (hfc-src-) so pre-fix poisoned entries can never be
-          # restored.
+          # POSITIVE globs only: just the path-free *-src trees (the
+          # sources store nests another subbuild, hence the second line).
+          # Everything else under thirdparty/cache embeds absolute
+          # workspace paths in CMakeCache.txt files, so a cache written
+          # under one mount poisons every job with another; it all
+          # regenerates in seconds. Two hard-won rules encoded here:
+          # !dir exclusion patterns do NOT reliably prune a directory's
+          # contents (a mac cache shipped hfc/subbuild through them), so
+          # never cache-by-subtraction; and per-OS key prefixes must be
+          # DISJOINT, not extensions of each other (restore-keys
+          # hfc-src- happily matched hfc-src-mac-*: macOS/Linux caches
+          # cross-restore freely; only Windows ones are fenced by
+          # enableCrossOsArchive). Generation src2: pre-fix entries can
+          # never be restored.
           path: |
-            thirdparty/cache
-            !thirdparty/cache/hfc
-            !thirdparty/cache/hfc.*
-            !thirdparty/cache/*-subbuild
-          key: hfc-src-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src-
+            thirdparty/cache/*-src
+            thirdparty/cache/sources/*-src
+          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src2-linux-
 
       # The archives are PACKAGED from the binaries the triggering ci run
       # built and tested, never rebuilt. Manual dispatch has no ci run to
