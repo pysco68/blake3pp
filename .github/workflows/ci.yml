@@ -145,9 +145,10 @@ jobs:
           # feature-off matrices live in tools/ci-test.sh).
           - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
           - { preset: linux-riscv64-gcc15-cxx23, image: riscv64-gcc15 }
-          # Static musl + mimalloc release chain, both architectures.
+          # Static musl + mimalloc release chain, x86_64. (The aarch64
+          # twin builds in its own job below so the Neoverse runner can
+          # pick up its binaries.)
           - { preset: linux-zigmusl-cxx23-static, image: zig }
-          - { preset: linux-arm64-zigmusl-cxx23-static, image: zig }
           # WebAssembly (runs in node).
           - { preset: wasm32-emcc-cxx23, image: emscripten }
     container:
@@ -189,37 +190,98 @@ jobs:
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
 
-  # Real ARM silicon, no emulator: GitHub's free arm64 runners are Azure
-  # Cobalt 100: Neoverse N2, i.e. Armv9 SVE2 at VL=128, exactly the
-  # sve2_128 kernel's target hardware. This job is both coverage (the SVE
-  # exact-VL dispatch on a real CPU) and the standing empirical answer to
-  # "does the runner expose SVE?": read the variants line in the log.
-  # No toolchain image (those are amd64); the runner's own gcc-14 builds
-  # the C++23 configuration bare.
-  native-arm64:
-    name: native-arm64 (Cobalt 100 / Neoverse N2)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 45
+  # The aarch64 static musl chain, built cross in the zig image (with its
+  # qemu VL matrix), binaries handed to the Neoverse job below.
+  build-arm64-static:
+    needs: [changes, images]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.images.result == 'success' || needs.images.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ needs.changes.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v4
-      - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Cache hermetic dependencies
         uses: actions/cache@v4
         with:
           path: thirdparty/cache
-          key: hfc-arm64-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-arm64-
-      - name: Configure and build
-        run: |
-          cmake -S . -B build/native-arm64 -G Ninja \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DCMAKE_CXX_COMPILER=g++-14 \
-            -DCMAKE_CXX_STANDARD=23
-          cmake --build build/native-arm64 -j"$(nproc)"
+          key: hfc-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-
+      - name: Build and test under qemu (VL matrix)
+        run: bash tools/ci-test.sh linux-arm64-zigmusl-cxx23-static
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm64-static-binaries
+          retention-days: 3
+          path: |
+            build/linux-arm64-zigmusl-cxx23-static/tests/blake3pp_tests
+            build/linux-arm64-zigmusl-cxx23-static/cli/blake3ppsum
+            build/linux-arm64-zigmusl-cxx23-static/cli/blake3ppgen
+            build/linux-arm64-zigmusl-cxx23-static/bench/blake3pp_bench
+
+  # Real ARM silicon, no emulator and no native toolchain: GitHub's free
+  # arm64 runners are Azure Cobalt 100: Neoverse N2, Armv9 SVE2 at
+  # VL=128, exactly the sve2_128 kernel's target hardware. Runs the
+  # cross-built static binaries: the full test suite (real-CPU dispatch
+  # coverage, and the standing answer to "does the runner expose SVE?";
+  # read the variants line), then a short indicative bench. Shared-runner
+  # numbers are NOT measurements (thermal/noisy-neighbor caveats apply),
+  # but a sve2_128-vs-neon ratio collapsing to 1.0 would still be a
+  # regression signal.
+  neoverse-test-bench:
+    name: neoverse-n2 test+bench (real SVE2 silicon)
+    needs: build-arm64-static
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: arm64-static-binaries
       - name: What silicon is this really
         run: |
+          chmod +x tests/blake3pp_tests cli/blake3ppsum cli/blake3ppgen bench/blake3pp_bench
           lscpu | grep -iE 'model name|flags' | cut -c1-200 || true
-          build/native-arm64/cli/blake3ppsum --version
-      - name: Test
-        run: ctest --test-dir build/native-arm64 --output-on-failure
+          cli/blake3ppsum --version
+      - name: Test on real silicon
+        run: tests/blake3pp_tests
+      - name: Indicative bench (shared runner; ratios, not numbers)
+        run: bench/blake3pp_bench --size 256 --reps 3 --cooldown 0
+
+  # Native RISC-V validation on Cloud-V runners (https://cloud-v.co).
+  # PREPARED but inert until runners are registered: create the
+  # self-hosted runner with a `riscv64` label, then set the repository
+  # variable CLOUDV_RISCV64=1 to arm this job. It builds bare with the
+  # host toolchain (kernel probes degrade gracefully on older GCC: no
+  # fixed-vlen support simply registers fewer variants), prints what the
+  # silicon actually supports, tests, and runs a short indicative bench.
+  # Cross-built binaries are deliberately NOT reused here: ours carry
+  # Ubuntu resolute's glibc floor, which real riscv distros are unlikely
+  # to meet yet. The runner environment must provide cmake >= 3.28, ninja,
+  # a C++20 compiler and network access (hermetic dependency fetch).
+  riscv-native:
+    name: riscv64 native (Cloud-V)
+    if: vars.CLOUDV_RISCV64 == '1'
+    runs-on: [self-hosted, riscv64]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure and build (host toolchain)
+        run: |
+          cmake -S . -B build/riscv-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build/riscv-native -j"$(nproc)"
+      - name: What silicon is this really
+        run: |
+          lscpu | head -20 || cat /proc/cpuinfo | sort -u | head -20
+          build/riscv-native/cli/blake3ppsum --version
+      - name: Test on real silicon
+        run: ctest --test-dir build/riscv-native --output-on-failure
+      - name: Indicative bench
+        run: build/riscv-native/bench/blake3pp_bench --size 128 --reps 3 --cooldown 0
