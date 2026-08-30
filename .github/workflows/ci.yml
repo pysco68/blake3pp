@@ -395,11 +395,11 @@ jobs:
             }
           }
           if ($bad) { throw "non-ARM64 PE in an arm64 preset: $bad" }
-      # Tool binaries for release.yml: both x64 compilers (the msvc-vs-
-      # clangcl kernel gap makes shipping both worthwhile) plus the
-      # cross-built arm64 clang-cl binaries; those are compile-proven
-      # only, flagged as such in the release notes, pending a native
-      # arm64 Windows test path.
+      # Tool binaries for release.yml: both compilers on both
+      # architectures (the msvc-vs-clangcl kernel gap makes shipping
+      # both worthwhile). The arm64 zips are cross-built, natively
+      # tested only when the windows-11-arm lane is enabled, and the
+      # release notes flag exactly that.
       - name: Upload tool binaries
         if: matrix.upload
         uses: actions/upload-artifact@v7

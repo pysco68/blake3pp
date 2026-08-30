@@ -148,12 +148,14 @@ jobs:
           tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
           rm -rf "$stage"
 
-          # Windows (zip is the platform convention): both x64 compilers,
-          # tested natively, plus the cross-built arm64 clang-cl binaries
-          # (compile-proven only; flagged in the notes).
+          # Windows (zip is the platform convention): both compilers on
+          # both architectures. x64 is tested natively on the build
+          # runner; arm64 is cross-built (tested natively when the
+          # windows-11-arm lane is enabled, and flagged in the notes).
           for pair in \
             "windows-msvc2026-cxx23:windows-x86_64-msvc" \
             "windows-clangcl-cxx23:windows-x86_64-clangcl" \
+            "windows-arm64-msvc2026-cxx23:windows-arm64-msvc" \
             "windows-arm64-clangcl-cxx23:windows-arm64-clangcl"; do
             preset="${pair%%:*}"
             name="${pair#*:}"
@@ -204,9 +206,10 @@ jobs:
             echo "windows-x86_64 in both compilers (msvc and clang-cl;"
             echo "clang-cl carries the faster byte-rotate kernels;"
             echo "IOCP+direct I/O in both), macos-arm64 (Apple clang,"
-            echo "GCD + F_NOCACHE I/O), and windows-arm64-clangcl"
-            echo "(cross-built; tested natively only when the ci run's"
-            echo "windows-11-arm lane was enabled; check its jobs)."
+            echo "GCD + F_NOCACHE I/O), and windows-arm64 in both"
+            echo "compilers (cross-built; tested natively only when the"
+            echo "ci run's windows-11-arm lane was enabled; check its"
+            echo "jobs)."
             echo "Disposable: swept by release-cleanup after 90 days."
             if ls bench-reports/*/bench-report.txt > /dev/null 2>&1; then
               echo
