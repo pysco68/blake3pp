@@ -62,8 +62,9 @@ function(_blake3pp_register_aarch64_kernels)
   # kernel only with that flag, probed because /d2 options are
   # version-fragile; /we4883 makes any FUTURE silent bailout a build
   # error instead of a 250x mystery. Silicon verdict on the optimized
-  # kernel comes from the windows-11-arm lane (that leg ships in no
-  # release archive, so measuring it there is risk-free).
+  # kernel comes from the windows-11-arm lane; the arm64-msvc zip ships
+  # in the release, so that lane doubles as its pre-ship gate whenever
+  # it is enabled.
   if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_REQUIRED_FLAGS "/d2OptimizeHugeFunctions /WX")
     check_cxx_source_compiles("int main() { return 0; }" BLAKE3PP_MSVC_HUGE_FUNC_OPT)
