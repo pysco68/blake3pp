@@ -8,6 +8,9 @@ needing. Everything runs from the repository root.
 | --- | --- |
 | `tc` | Run a CMake preset inside its per-compiler toolchain image (`tools/tc <preset>`, `tools/tc --shell <preset>`, `tools/tc --list`). |
 | `gen-toolchains.py` | Regenerate the CMake toolchain files under `cmake/toolchains/` for the whole matrix. |
+| `gen-environments.py` | Regenerate the cmake-re environment files next to the toolchain files, keyed by the toolchain image tag. |
+| `preset-args.py` | Print the configure arguments a CMake preset stands for, for tools that do not read presets (cmake-re). |
+| `toolchain-image-tag.sh` | The content hash that names the toolchain images. |
 | `ci-test.sh` | The CI entry point: configure, build, audit and run the preset's full test matrix (every emulator configuration its architecture supports). |
 | `make-release.sh` | Assemble the static Linux release archives. |
 | `build-msan-libcxx.sh` | Build the MemorySanitizer-instrumented libc++ the msan preset links. |
@@ -43,7 +46,7 @@ tools/objscan.py mnemonics --per-function BIN -x 'compress_in_place'
 tools/objscan.py quality build/windows-msvc2026-cxx23/CMakeFiles/blake3pp_kernel_sse42.dir/src/kernel/kernel.cpp.obj
 
 # Which functions use an instruction outside the kernel that owns it?
-tools/objscan.py find build/linux-gcc16-cxx26/cli/blake3ppsum '^v[a-z]' -x 'kern::(avx2|avx512)' --fail
+tools/objscan.py find build/linux-s390x-gcc15-cxx23/cli/blake3ppsum '^(vlbr|vnx|vnn|voc|vmsl)' -x 'kern::vxe' --fail
 
 # The disassembly of one function.
 tools/objscan.py disasm BIN 'kern::sve256::.*hash_batch'
@@ -70,7 +73,8 @@ tools/objscan.py audit build/<preset> [--binary build/<preset>/cli/blake3ppsum]
 `kernel-audit.json` states, per architecture and kernel variant, the
 instruction class the variant must contain, the classes it must not
 (the dispatch verdict does not gate them: no AVX-512 in the avx2 kernel,
-no SVE in the neon kernel, no Zvbb in the plain rvv kernels), the quality thresholds for
+no SVE in the neon kernel, no Zvbb in the plain rvv kernels, no z14/z15
+vector instruction outside the vxe kernel), the quality thresholds for
 the hot functions (no call outside the allow-list, a loop budget, a
 minimum vector count in the widest function), and the classes that must
 not appear in the linked binary outside the kernels that own them. A

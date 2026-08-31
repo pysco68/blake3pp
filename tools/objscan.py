@@ -58,10 +58,11 @@ import sys
 
 # ---------------------------------------------------------------- formats
 
-ELF_MACHINES = {62: "x86_64", 183: "aarch64", 243: "riscv64"}
+ELF_MACHINES = {62: "x86_64", 183: "aarch64", 243: "riscv64", 21: "ppc64", 22: "s390x"}
 PE_MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64"}
 MACHO_CPUTYPES = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
-BINUTILS_PREFIX = {"aarch64": "aarch64-linux-gnu-", "riscv64": "riscv64-linux-gnu-"}
+BINUTILS_PREFIX = {"aarch64": "aarch64-linux-gnu-", "riscv64": "riscv64-linux-gnu-",
+                   "ppc64": "powerpc64le-linux-gnu-", "s390x": "s390x-linux-gnu-"}
 
 
 def identify(path):
@@ -95,6 +96,8 @@ def identify(path):
 # llvm-objdump decodes only its default CPU's instructions on these targets.
 LLVM_FLAGS = {
     "riscv64": ["--mattr=+v,+zvbb"],
+    "ppc64": ["--mcpu=pwr10"],
+    "s390x": ["--mcpu=z16"],
 }
 
 
@@ -239,23 +242,31 @@ VECTOR = {
     "x86_64": (r"^v[a-z]", r"\b[xyz]mm\d+\b"),
     "aarch64": (None, r"\b[vzq]\d+\b|\bp\d+/[mz]"),
     "riscv64": (r"^(th\.)?v[a-z]", None),
+    "ppc64": (r"^(v[a-z]|xx|xv|xs|lxv|stxv|lvx|stvx)", None),
+    "s390x": (r"^[vw][a-z]", None),
 }
 # Control flow inside a function (loops) and out of it (calls).
 BRANCH = {
     "x86_64": r"^j",
     "aarch64": r"^(b(\.\w+)?|cbn?z|tbn?z)$",
     "riscv64": r"^(c\.)?(b[a-z]*|j)$",
+    "ppc64": r"^b(?!l$|lrl?$|ctrl?$|l[+-]$)",
+    "s390x": r"^(j\w*|br|brcl?|brctg?|bc|c[lg]?[ir]?j\w*)$",
 }
 CALL = {
     "x86_64": r"^call",
     "aarch64": r"^blr?$",
     "riscv64": r"^(jalr?|call)$",
+    "ppc64": r"^(bl|bctrl|bl[+-])$",
+    "s390x": r"^(brasl?|basr|bas)$",
 }
 # A memory operand through the stack pointer (or the frame pointer).
 STACK = {
     "x86_64": r"\(%r[sb]p\)|\[r[sb]p\b",
     "aarch64": r"\[(sp|x29)\b",
     "riscv64": r"\((sp|s0)\)",
+    "ppc64": r"\(r?1\)|\(r?31\)",
+    "s390x": r"\(%r1[15]\)",
 }
 
 
@@ -445,12 +456,15 @@ def rule_hits(insns, rule):
 
 
 def kernel_objects(build_dir):
-    """(variant, object) for every kernel object under a build tree
-    (multi-config generators add a configuration directory)."""
+    """(variant, object) for every kernel object under a build tree: the
+    OBJECT-library ones (multi-config generators add a configuration
+    directory) and the externally compiled ones."""
     found = []
     for obj in glob.glob(os.path.join(build_dir, "CMakeFiles", "blake3pp_kernel_*.dir", "**", "*kernel.cpp.o*"),
                          recursive=True):
         found.append((re.search(r"blake3pp_kernel_([^/\\]+)\.dir", obj).group(1), obj))
+    for obj in glob.glob(os.path.join(build_dir, "blake3pp_generated", "kernel_*.o*")):
+        found.append((re.search(r"kernel_([^/\\]+)\.o", os.path.basename(obj)).group(1), obj))
     return sorted(found)
 
 

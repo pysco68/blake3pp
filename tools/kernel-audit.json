@@ -74,5 +74,25 @@
       { "name": "vector", "mnemonic": "^(th\\.)?v[a-z]",
         "outside": "kern::(rvv|xthead)|cpu_detect|vsetvli|detail::(riscv|test)" }
     ]
+  },
+  "ppc64": {
+    "variants": [
+      { "match": "scalar" },
+      { "match": "vsx",
+        "require": { "name": "VSX", "mnemonic": "^(xx|xv|xs|lxv|stxv|v[a-z])" } }
+    ],
+    "binary": []
+  },
+  "s390x": {
+    "variants": [
+      { "match": "scalar",
+        "forbid": [ { "name": "z14/z15 vector", "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)" } ] },
+      { "match": "vxe",
+        "require": { "name": "z vector", "mnemonic": "^v[a-z]" } }
+    ],
+    "binary": [
+      { "name": "z14/z15 vector", "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)",
+        "outside": "kern::vxe" }
+    ]
   }
 }
