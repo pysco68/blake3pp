@@ -817,6 +817,7 @@ jobs:
       - name: What silicon is this really
         run: |
           chmod +x tests/blake3pp_tests cli/blake3ppsum cli/blake3ppgen bench/blake3pp_bench bench/blake3pp_bench_file
+          uname -a
           { lscpu | head -20; } 2>/dev/null || sort -u /proc/cpuinfo | head -20
           cli/blake3ppsum --version
       - name: Test the ci-built binaries on real silicon

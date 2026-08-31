@@ -17,8 +17,15 @@ RUN set -eux; \
     ln -s /opt/zig/zig /usr/local/bin/zig; \
     zig version
 
+# g++-riscv64-linux-gnu is here for exactly ONE translation unit: the
+# XTheadVector (RVV 0.7.1) kernel. LLVM never merged XTheadVector, so
+# zig/clang cannot compile it: the riscv64 musl static binary links a
+# GCC-built object for that kernel (see cmake/ArchKernels.cmake,
+# EXTERNAL_COMPILER) while zig builds everything else. Two compilers,
+# one fat binary, because no single compiler speaks every vector dialect.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-user binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
+        g++-riscv64-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
 # Prewarm zig's global cache for both musl targets. REQUIRED, not an

@@ -65,8 +65,10 @@ case "${preset}" in
     # fat binary; execution needs the Xuantie qemu fork (not in the CI
     # image; see docker/riscv64-gcc15.Dockerfile), so under mainline
     # qemu the variant reports unavailable and the suite proves exactly
-    # that. GCC presets only: riscv_th_vector.h is a GCC 14+ header, the
-    # zig/clang chain has nothing to compile it with.
+    # that. The gcc preset gets an extra opt-in build here; the MUSL
+    # preset carries xthead by DEFAULT via the external-gcc object route
+    # (LLVM never merged XTheadVector; see EXTERNAL_COMPILER in
+    # cmake/ArchKernels.cmake), covered by the plain matrix above.
     if [[ "${preset}" == *gcc* ]]; then
       xthead_dir="build/${preset}-xthead"
       cmake --preset "${preset}" -B "${xthead_dir}" -DBLAKE3PP_XTHEAD_KERNEL=ON

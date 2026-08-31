@@ -56,12 +56,13 @@
     },
     {
       "name": "linux-riscv64-zigmusl-cxx23-static",
-      "displayName": "Static musl release (riscv64, zig + mimalloc)",
+      "displayName": "Static musl release (riscv64, zig + mimalloc; xthead kernel via external gcc)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-riscv64-zigmusl-cxx23-static",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-zigmusl-cxx23.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "BLAKE3PP_XTHEAD_KERNEL": "ON"
       }
     },
     {
@@ -136,7 +137,7 @@
     },
     {
       "name": "windows-arm64-msvc2026-cxx23",
-      "displayName": "Windows arm64 cross (MSVC, scalar-only by verdict; see KernelVariants.cmake), vcvarsamd64_arm64 shell",
+      "displayName": "Windows arm64 cross (MSVC, scalar-only by verdict \u2014 see KernelVariants.cmake), vcvarsamd64_arm64 shell",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-arm64-msvc2026-cxx23",
       "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-msvc2026-cxx23.cmake",

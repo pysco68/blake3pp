@@ -280,9 +280,48 @@ function(_blake3pp_register_riscv64_kernels)
         ARCH_FLAGS -march=rv64gc_xtheadvector
                    -mno-riscv-attribute -Wa,-mno-arch-attr)
     else()
-      message(WARNING "blake3pp: BLAKE3PP_XTHEAD_KERNEL=ON but the "
-        "compiler cannot build XTheadVector (needs GCC 14+ with "
-        "riscv_th_vector.h); kernel skipped")
+      # The primary compiler cannot express XTheadVector: LLVM never
+      # merged it, so the zig/clang musl chain lands here. Borrow the
+      # distro GCC for this ONE TU (present in the zig toolchain image
+      # for exactly this purpose) and link its object into the fat
+      # binary: two compilers, one binary, because no single compiler
+      # speaks every vector dialect. Probed by actually compiling the
+      # same smoke snippet the native path uses.
+      find_program(BLAKE3PP_XTHEAD_GCC riscv64-linux-gnu-g++)
+      if(BLAKE3PP_XTHEAD_GCC)
+        set(_xthead_smoke "${CMAKE_BINARY_DIR}/blake3pp_generated/xthead_smoke.cpp")
+        file(WRITE "${_xthead_smoke}" [=[
+#include <riscv_th_vector.h>
+int probe() {
+  unsigned buf[4] = {1, 2, 3, 4};
+  vuint32m1_t a = __riscv_th_vlwu_v_u32m1(buf, 4);
+  a = __riscv_vadd_vv_u32m1(a, a, 4);
+  __riscv_th_vsw_v_u32m1(buf, a, 4);
+  return static_cast<int>(buf[0]) - 2;
+}
+]=])
+        execute_process(
+          COMMAND "${BLAKE3PP_XTHEAD_GCC}" -std=c++23
+                  -march=rv64gc_xtheadvector -fsyntax-only "${_xthead_smoke}"
+          RESULT_VARIABLE _xthead_gcc_rc
+          OUTPUT_QUIET ERROR_QUIET)
+        if(_xthead_gcc_rc EQUAL 0)
+          message(STATUS "blake3pp: xthead kernel via external ${BLAKE3PP_XTHEAD_GCC}")
+          blake3pp_add_kernel(xthead SOURCE src/kernel/xthead_kernel.cpp
+            EXTERNAL_COMPILER "${BLAKE3PP_XTHEAD_GCC}"
+            ARCH_FLAGS -march=rv64gc_xtheadvector
+                       -mno-riscv-attribute -Wa,-mno-arch-attr)
+        else()
+          message(WARNING "blake3pp: BLAKE3PP_XTHEAD_KERNEL=ON but neither "
+            "the primary compiler nor ${BLAKE3PP_XTHEAD_GCC} can build "
+            "XTheadVector (needs GCC 14+); kernel skipped")
+        endif()
+      else()
+        message(WARNING "blake3pp: BLAKE3PP_XTHEAD_KERNEL=ON but the "
+          "compiler cannot build XTheadVector (needs GCC 14+ with "
+          "riscv_th_vector.h) and no riscv64-linux-gnu-g++ exists for "
+          "the external-object route; kernel skipped")
+      endif()
     endif()
   endif()
 endfunction()
