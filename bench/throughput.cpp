@@ -415,9 +415,20 @@ int main(int argc, char** argv) {
   const unsigned nthreads =
       pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
   println(stdout, "\nparallel engine ({} threads)", nthreads);
-  b3tool::compute_pool engine_pool{nthreads};
+  // An OWNED pool at exactly nthreads, not b3tool::compute_pool, whose
+  // scheduler() has a threads>1 precondition (--threads 1 is a valid and
+  // interesting measurement here: pool machinery at zero parallelism).
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+  exec::static_thread_pool engine_pool{nthreads};
+#endif
+  auto engine_sched =
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+      engine_pool.get_scheduler();
+#else
+      blake3pp::get_parallel_scheduler();
+#endif
   {
-    auto sched = engine_pool.scheduler();
+    auto sched = engine_sched;
     row("blake3pp/pool",
         std::format("{} pool", blake3pp::execution_provider()),
         [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); },
@@ -444,7 +455,7 @@ int main(int argc, char** argv) {
   // The widest reference kernel on the same parallel engine: separates
   // kernel from scheduler in the rows above.
   if (asm_row != nullptr) {
-    auto sched = engine_pool.scheduler();
+    auto sched = engine_sched;
     row("reference/pool",
         std::format("{} kernel, {} pool", asm_row,
                     blake3pp::execution_provider()),
