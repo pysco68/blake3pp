@@ -311,6 +311,11 @@ jobs:
           - { preset: linux-riscv64-gcc15-cxx23, image: riscv64-gcc15 }
           - { preset: linux-zigmusl-cxx23-static, image: zig }
           - { preset: linux-riscv64-zigmusl-cxx23-static, image: zig }
+          # POWER and IBM z static musl: shipped release archives.
+          # No hardware lane exists for them (yet): the bytes are
+          # emulator-tested here and flagged as such in the notes.
+          - { preset: linux-ppc64le-zigmusl-cxx23-static, image: zig }
+          - { preset: linux-s390x-zigmusl-cxx23-static, image: zig }
     container:
       image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
       credentials:
@@ -359,7 +364,7 @@ jobs:
         if: contains(matrix.preset, 'zigmusl')
         uses: actions/upload-artifact@v7
         with:
-          name: static-binaries-${{ contains(matrix.preset, 'riscv64') && 'riscv64' || 'x86_64' }}
+          name: static-binaries-${{ contains(matrix.preset, 'riscv64') && 'riscv64' || contains(matrix.preset, 'ppc64le') && 'ppc64le' || contains(matrix.preset, 's390x') && 's390x' || 'x86_64' }}
           retention-days: 3
           # The tests binary rides along for the hardware jobs (Cloud-V
           # boards run it natively); release packaging ignores it.

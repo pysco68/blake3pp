@@ -184,6 +184,26 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
+    },
+    {
+      "name": "linux-ppc64le-zigmusl-cxx23-static",
+      "displayName": "Static musl release (ppc64le, zig + mimalloc, VSX)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-ppc64le-zigmusl-cxx23-static",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-ppc64le-zigmusl-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "linux-s390x-zigmusl-cxx23-static",
+      "displayName": "Static musl release (s390x, zig + mimalloc, z14 VXE, big-endian)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-s390x-zigmusl-cxx23-static",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-zigmusl-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [

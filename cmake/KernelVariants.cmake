@@ -338,17 +338,26 @@ function(_blake3pp_register_ppc64_kernels)
     return()
   endif()
   # Mirrors xsimd's own gate (XSIMD_WITH_VSX = __VEC__ && __VSX__)
-  # without needing its headers on the probe include path.
-  set(CMAKE_REQUIRED_FLAGS "-mcpu=power9")
-  check_cxx_source_compiles([=[
-    #if !(defined(__VEC__) && defined(__VSX__))
-    #error no vsx
-    #endif
-    int main() { return 0; }
-  ]=] BLAKE3PP_COMPILER_VSX)
-  set(CMAKE_REQUIRED_FLAGS "")
-  if(BLAKE3PP_COMPILER_VSX)
-    blake3pp_add_kernel(vsx FORCE_XSIMD ARCH_FLAGS -mcpu=power9)
+  # without needing its headers on the probe include path. Candidate
+  # spellings, the riscv precedent: GCC says power9, clang/zig say pwr9.
+  set(_vsx_flags "")
+  foreach(_cand "-mcpu=power9" "-mcpu=pwr9")
+    string(MAKE_C_IDENTIFIER "BLAKE3PP_COMPILER_VSX_${_cand}" _var)
+    set(CMAKE_REQUIRED_FLAGS "${_cand}")
+    check_cxx_source_compiles([=[
+      #if !(defined(__VEC__) && defined(__VSX__))
+      #error no vsx
+      #endif
+      int main() { return 0; }
+    ]=] ${_var})
+    set(CMAKE_REQUIRED_FLAGS "")
+    if(${_var})
+      set(_vsx_flags "${_cand}")
+      break()
+    endif()
+  endforeach()
+  if(_vsx_flags)
+    blake3pp_add_kernel(vsx FORCE_XSIMD ARCH_FLAGS ${_vsx_flags})
   endif()
 endfunction()
 
@@ -364,16 +373,26 @@ function(_blake3pp_register_s390x_kernels)
   endif()
   # Mirrors xsimd's own gate (XSIMD_WITH_VXE = __VEC__ >= 10304 &&
   # __ARCH__ >= 12) without needing its headers on the probe path.
-  set(CMAKE_REQUIRED_FLAGS "-march=z14 -mzvector")
-  check_cxx_source_compiles([=[
-    #if !(defined(__VEC__) && __VEC__ >= 10304 && defined(__ARCH__) && __ARCH__ >= 12)
-    #error no vxe
-    #endif
-    int main() { return 0; }
-  ]=] BLAKE3PP_COMPILER_VXE)
-  set(CMAKE_REQUIRED_FLAGS "")
-  if(BLAKE3PP_COMPILER_VXE)
-    blake3pp_add_kernel(vxe FORCE_XSIMD ARCH_FLAGS -march=z14 -mzvector)
+  # Candidate spellings: GCC takes -march=z14, clang/zig -mcpu=z14.
+  set(_vxe_flags "")
+  foreach(_cand "-march=z14;-mzvector" "-mcpu=z14;-mzvector")
+    string(MAKE_C_IDENTIFIER "BLAKE3PP_COMPILER_VXE_${_cand}" _var)
+    string(REPLACE ";" " " _cand_str "${_cand}")
+    set(CMAKE_REQUIRED_FLAGS "${_cand_str}")
+    check_cxx_source_compiles([=[
+      #if !(defined(__VEC__) && __VEC__ >= 10304 && defined(__ARCH__) && __ARCH__ >= 12)
+      #error no vxe
+      #endif
+      int main() { return 0; }
+    ]=] ${_var})
+    set(CMAKE_REQUIRED_FLAGS "")
+    if(${_var})
+      set(_vxe_flags "${_cand}")
+      break()
+    endif()
+  endforeach()
+  if(_vxe_flags)
+    blake3pp_add_kernel(vxe FORCE_XSIMD ARCH_FLAGS ${_vxe_flags})
   endif()
 endfunction()
 

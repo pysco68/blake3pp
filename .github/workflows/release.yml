@@ -71,7 +71,7 @@ jobs:
           done
           [ -n "$STRIP" ] || echo "::warning::no llvm-strip on runner; shipping unstripped linux binaries"
 
-          for arch in x86_64 aarch64 riscv64; do
+          for arch in x86_64 aarch64 riscv64 ppc64le s390x; do
             src="ci-binaries/static-binaries-${arch}"
             if [ ! -d "$src" ]; then
               echo "::error::ci run produced no ${arch} static binaries"
@@ -179,8 +179,10 @@ jobs:
             echo
             echo "Linux (fully static musl+mimalloc; \`blake3ppsum\`,"
             echo "\`blake3ppgen\`, benchmarks): x86_64 (SSE4.2 through AVX-512),"
-            echo "aarch64 (full NEON+SVE chain), riscv64 (RVV/Zvbb chain);"
-            echo "runtime vector-length dispatch throughout. Plus"
+            echo "aarch64 (full NEON+SVE chain), riscv64 (RVV/Zvbb chain),"
+            echo "ppc64le (POWER VSX), s390x (z14 VXE, big-endian; both"
+            echo "emulator-tested, no hardware lane yet); runtime"
+            echo "dispatch throughout. Plus"
             echo "windows-x86_64 in both compilers (msvc and clang-cl;"
             echo "clang-cl carries the faster byte-rotate kernels;"
             echo "IOCP+direct I/O in both), macos-arm64 (Apple clang,"
