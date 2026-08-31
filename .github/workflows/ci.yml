@@ -253,6 +253,23 @@ jobs:
           restore-keys: hfc-src2-linux-
       - name: Configure, build, test (node)
         run: bash tools/ci-test.sh wasm32-emcc-cxx23
+      # The container shares the runner's CPU, so this benches v8's
+      # SIMD128 JIT on real x86 silicon, the same logic that lets the
+      # x86_64 static leg bench in place. Upstream BLAKE3 has no wasm
+      # SIMD kernel, so the reference rows double as the story.
+      - name: Bench report (wasm under node, runner x86_64 silicon)
+        run: |
+          { echo "== wasm32-simd128, node on the GitHub ubuntu-latest runner =="
+            grep -m1 "model name" /proc/cpuinfo || true
+            node --version
+            node build/wasm32-emcc-cxx23/cli/blake3ppsum.js --version < /dev/null
+            node build/wasm32-emcc-cxx23/bench/blake3pp_bench.js --reps 1 --cooldown 0
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-report-wasm32
+          path: bench-report.txt
+          retention-days: 7
       - name: Upload tool binaries
         uses: actions/upload-artifact@v7
         with:
