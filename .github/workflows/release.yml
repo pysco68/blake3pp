@@ -203,17 +203,27 @@ jobs:
             fi
           } > release-notes.md
 
-      - name: Publish prerelease
+      # Two-phase publish: this repo has IMMUTABLE releases, which forbid
+      # attaching assets after publication, yet the action publishes
+      # before uploading. Create a DRAFT (drafts stay mutable), let the
+      # assets land in it, then flip it live in the next step.
+      - name: Create draft prerelease with assets
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ident.outputs.tag }}
           target_commitish: ${{ env.RELEASE_SHA }}
           name: dev build ${{ steps.ident.outputs.short }}
           prerelease: true
+          draft: true
           files: |
             release/*.tar.gz
             release/*.zip
           body_path: release-notes.md
+
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ steps.ident.outputs.tag }}" --draft=false --prerelease --repo "$GITHUB_REPOSITORY"
 
   # ----- manual fallback: no ci run to reuse, full rebuild in the zig
   # image, the one path that still needs a toolchain container. The
@@ -262,12 +272,20 @@ jobs:
           short=$(git rev-parse HEAD | cut -c1-12)
           echo "tag=dev-${short}" >> "$GITHUB_OUTPUT"
           echo "short=${short}" >> "$GITHUB_OUTPUT"
-      - name: Publish prerelease
+      # Same two-phase dance as the prerelease job: immutable releases
+      # only accept assets while still a draft.
+      - name: Create draft prerelease with assets
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.ident.outputs.tag }}
           name: dev build ${{ steps.ident.outputs.short }} (manual rebuild)
           prerelease: true
+          draft: true
           files: |
             release/*.tar.gz
             release/*.zip
+
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ steps.ident.outputs.tag }}" --draft=false --prerelease --repo "$GITHUB_REPOSITORY"
