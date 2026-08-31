@@ -1,11 +1,17 @@
 # Automatic prerelease publishing: after every GREEN ci run on main,
-# PACKAGE the static musl+mimalloc archives (x86_64/aarch64/riscv64) from
-# the binaries that ci run built and tested (no rebuild) and attach
-# them to a prerelease keyed by the commit: tag dev-<sha12>, created at
-# exactly that commit. Triggering on ci's completion rather than on push
-# does two things at once: nothing is ever published from a red commit,
-# and only ci-tested bytes are ever shipped. Manual dispatch (no ci run
-# to reuse) falls back to a full tools/make-release.sh build.
+# PACKAGE the archives from the binaries that ci run built and tested
+# (no rebuild) and attach them to a prerelease keyed by the commit: tag
+# dev-<sha12>, created at exactly that commit. Triggering on ci's
+# completion rather than on push does two things at once: nothing is
+# ever published from a red commit, and only ci-tested bytes are ever
+# shipped.
+#
+# The packaging path deliberately runs on the PLAIN runner, no toolchain
+# container: it compiles nothing, and the one cross-arch tool it needs,
+# stripping foreign-ELF binaries, is llvm-strip, which handles every
+# target from the stock image. Only the manual-dispatch fallback (a full
+# tools/make-release.sh rebuild, for when there is no ci run to reuse)
+# still runs in the zig image.
 #
 # These dev-* prereleases are disposable by design; release-cleanup.yml
 # deletes them (and their anchor tags) after 90 days. Real releases are
@@ -24,91 +30,47 @@ permissions:
   actions: read  # download the triggering ci run's bench-report artifacts
 
 jobs:
-  # The zig image is pulled by CONTENT tag (same scheme as ci.yml) so the
-  # release always builds in the image matching its commit's docker/ tree;
-  # ci already guaranteed that tag exists for any green main commit.
-  ident:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.head_branch == 'main')
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-      - id: tag
-        run: echo "tag=tree-$(bash tools/toolchain-image-tag.sh)" >> "$GITHUB_OUTPUT"
-
   prerelease:
-    needs: ident
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    container:
-      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ needs.ident.outputs.tag }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 30
     env:
-      CMAKE_GENERATOR: Ninja
-      # The commit being released: the ci run's head on workflow_run, the
-      # current ref on manual dispatch.
-      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_SHA }}
 
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
-        with:
-          # POSITIVE globs only: just the path-free *-src trees (the
-          # sources store nests another subbuild, hence the second line).
-          # Everything else under thirdparty/cache embeds absolute
-          # workspace paths in CMakeCache.txt files, so a cache written
-          # under one mount poisons every job with another; it all
-          # regenerates in seconds. Two hard-won rules encoded here:
-          # !dir exclusion patterns do NOT reliably prune a directory's
-          # contents (a mac cache shipped hfc/subbuild through them), so
-          # never cache-by-subtraction; and per-OS key prefixes must be
-          # DISJOINT, not extensions of each other (restore-keys
-          # hfc-src- happily matched hfc-src-mac-*: macOS/Linux caches
-          # cross-restore freely; only Windows ones are fenced by
-          # enableCrossOsArchive). Generation src2: pre-fix entries can
-          # never be restored.
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-linux-
-
       # The archives are PACKAGED from the binaries the triggering ci run
-      # built and tested, never rebuilt. Manual dispatch has no ci run to
-      # reuse, so it falls back to the full make-release.sh build.
+      # built and tested, never rebuilt.
       - name: Collect binaries from the ci run
-        if: github.event_name == 'workflow_run'
         uses: actions/download-artifact@v8
         with:
-          # static-binaries-* (linux musl) and tool-binaries-* (windows
-          # clang-cl x64, macos appleclang arm64)
+          # static-binaries-* (linux musl), tool-binaries-* (windows,
+          # macos, wasm)
           pattern: "*-binaries-*"
           path: ci-binaries
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Package the static archives
+      - name: Package the archives
         run: |
-          if [ "${{ github.event_name }}" != "workflow_run" ]; then
-            sh tools/make-release.sh
-            exit 0
-          fi
           VERSION=$(sed -n 's/^  VERSION \([0-9.]*\)$/\1/p' CMakeLists.txt)
           mkdir -p release
+
+          # llvm-strip handles every ELF target from the stock runner:
+          # the whole reason this job needs no toolchain container. If
+          # the image ever drops it, foreign-arch binaries ship
+          # unstripped with a warning rather than failing the release.
+          STRIP=""
+          for c in llvm-strip llvm-strip-20 llvm-strip-19 llvm-strip-18; do
+            if command -v "$c" > /dev/null 2>&1; then STRIP="$c"; break; fi
+          done
+          [ -n "$STRIP" ] || echo "::warning::no llvm-strip on runner; shipping unstripped linux binaries"
+
           for arch in x86_64 aarch64 riscv64; do
             src="ci-binaries/static-binaries-${arch}"
             if [ ! -d "$src" ]; then
@@ -122,17 +84,15 @@ jobs:
                "$src"/bench/blake3pp_bench "$src"/bench/blake3pp_bench_file \
                "$stage"/
             chmod +x "$stage"/*
-            case "$arch" in
-              x86_64) strip "$stage"/* ;;
-              *)      "${arch}-linux-gnu-strip" "$stage"/* ;;
-            esac
+            [ -z "$STRIP" ] || "$STRIP" "$stage"/*
             cp README.md "$stage"/
             tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
             rm -rf "$stage"
           done
 
           # macOS (appleclang, tested natively on the Apple-silicon
-          # runner; stripped there, since GNU binutils cannot strip Mach-O).
+          # runner; already stripped there, since GNU/LLVM ELF strippers
+          # are not for Mach-O).
           src="ci-binaries/tool-binaries-macos-arm64"
           if [ ! -d "$src" ]; then
             echo "::error::ci run produced no macos binaries"; exit 1
@@ -190,17 +150,19 @@ jobs:
 
           ls -la release
 
+      # POSIX substring, not ${VAR:0:12}: container steps default to
+      # sh/dash where that bashism dies with "Bad substitution" (it took
+      # a release run down); `cut` never surprises anyone.
       - name: Compute release identity
         id: ident
         run: |
-          echo "tag=dev-${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
-          echo "short=${RELEASE_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          short=$(printf %s "$RELEASE_SHA" | cut -c1-12)
+          echo "tag=dev-${short}" >> "$GITHUB_OUTPUT"
+          echo "short=${short}" >> "$GITHUB_OUTPUT"
 
-      # The hardware test+bench reports the ci run produced: x86_64 (the
-      # runner itself), aarch64 (Neoverse N2), riscv64 (Cloud-V). Whatever
+      # The hardware test+bench reports the ci run produced. Whatever
       # subset exists gets appended to the release notes.
       - name: Collect hardware bench reports
-        if: github.event_name == 'workflow_run'
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
@@ -252,3 +214,60 @@ jobs:
             release/*.tar.gz
             release/*.zip
           body_path: release-notes.md
+
+  # ----- manual fallback: no ci run to reuse, full rebuild in the zig
+  # image, the one path that still needs a toolchain container. The
+  # image is pulled by CONTENT tag (same scheme as ci.yml) so the build
+  # matches its commit's docker/ tree.
+  ident:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: tag
+        run: echo "tag=tree-$(bash tools/toolchain-image-tag.sh)" >> "$GITHUB_OUTPUT"
+
+  manual-release:
+    needs: ident
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ needs.ident.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v7
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v6
+        with:
+          # Same positive-glob scheme as ci.yml; the reasoning lives there.
+          path: |
+            thirdparty/cache/*-src
+            thirdparty/cache/sources/*-src
+          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src2-linux-
+      - name: Full release build
+        run: sh tools/make-release.sh
+      - name: Compute release identity
+        id: ident
+        run: |
+          short=$(git rev-parse HEAD | cut -c1-12)
+          echo "tag=dev-${short}" >> "$GITHUB_OUTPUT"
+          echo "short=${short}" >> "$GITHUB_OUTPUT"
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.ident.outputs.tag }}
+          name: dev build ${{ steps.ident.outputs.short }} (manual rebuild)
+          prerelease: true
+          files: |
+            release/*.tar.gz
+            release/*.zip
