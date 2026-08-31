@@ -230,6 +230,7 @@ int main(int argc, char** argv) {
   std::size_t mib = 512;
   int reps = 5;
   double cooldown_s = 5.0;
+  unsigned pool_threads = 0;
   bool sweep_t16 = false;
   std::vector<blake3pp::arch> arches;
 
@@ -245,6 +246,8 @@ int main(int argc, char** argv) {
   app.add_option("--cooldown", cooldown_s,
                  "idle seconds between measurements (0 disables)")
       ->capture_default_str();
+  app.add_option("--threads", pool_threads,
+                 "parallel-engine threads (0 = hardware concurrency)");
   app.add_flag("--t16-sweep", sweep_t16,
                "diagnose the AVX-512 transpose tuner: rank the three "
                "strategies across working-set sizes and strategy orders");
@@ -395,12 +398,26 @@ int main(int argc, char** argv) {
   });
 #endif
 
+  // Our own full pipeline, single thread: the discriminator between
+  // "the pool scales badly" and "our pipeline (subtree/CV machinery)
+  // costs more than the raw kernel loop at this width". The reference
+  // e2e row above has had this mirror all along; ours was the blind
+  // spot while chasing the width-16 pool anomaly.
+  println(stdout, "\nblake3pp end-to-end (single thread)");
+  row("blake3pp", "", [&] {
+    return blake3pp::hash(std::span<const std::byte>{input});
+  });
+
   // The sender-based parallel engine over the whole tree: the numbers that
   // matter for feeding modern storage. Rows are kernel/scheduler pairings.
-  const unsigned nthreads = std::thread::hardware_concurrency();
+  // --threads is honored exactly under stdexec (an owned pool of that
+  // size); other providers fall back to the process-wide scheduler.
+  const unsigned nthreads =
+      pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
   println(stdout, "\nparallel engine ({} threads)", nthreads);
+  b3tool::compute_pool engine_pool{nthreads};
   {
-    auto sched = blake3pp::get_parallel_scheduler();
+    auto sched = engine_pool.scheduler();
     row("blake3pp/pool",
         std::format("{} pool", blake3pp::execution_provider()),
         [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); },
@@ -427,7 +444,7 @@ int main(int argc, char** argv) {
   // The widest reference kernel on the same parallel engine: separates
   // kernel from scheduler in the rows above.
   if (asm_row != nullptr) {
-    auto sched = blake3pp::get_parallel_scheduler();
+    auto sched = engine_pool.scheduler();
     row("reference/pool",
         std::format("{} kernel, {} pool", asm_row,
                     blake3pp::execution_provider()),
