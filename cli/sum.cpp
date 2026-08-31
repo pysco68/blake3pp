@@ -52,7 +52,18 @@ std::string version_text() {
                    blake3pp::to_string(a),
                    blake3pp::is_available(a) ? "" : "[no cpu support]");
   }
-  return std::format(
+  // The confession line: variants the CPU could run but this binary does
+  // not carry (e.g. xthead on T-Head silicon in a build whose compiler
+  // could not express it). Silence when there is nothing to confess.
+  std::string uncompiled;
+  for (const auto a : blake3pp::all_arches()) {
+    if (a != blake3pp::arch::auto_detect && blake3pp::cpu_supports(a) &&
+        !blake3pp::is_available(a)) {
+      std::format_to(std::back_inserter(uncompiled), " {}",
+                     blake3pp::to_string(a));
+    }
+  }
+  std::string text = std::format(
       "blake3ppsum (blake3pp {})\n"
       "simd provider: {}\n"
       "execution provider: {}\n"
@@ -60,6 +71,11 @@ std::string version_text() {
       blake3pp::version(), blake3pp::simd_provider(),
       blake3pp::execution_provider(), variants,
       blake3pp::to_string(blake3pp::best_available()));
+  if (!uncompiled.empty()) {
+    std::format_to(std::back_inserter(text),
+                   "\ncpu also supports:{} (not compiled in)", uncompiled);
+  }
+  return text;
 }
 
 std::string to_hex(std::span<const std::byte> bytes) {

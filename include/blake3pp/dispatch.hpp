@@ -32,6 +32,15 @@ enum class arch : std::uint8_t {
 /// @param a  Any variant; auto_detect is always available.
 [[nodiscard]] bool is_available(arch a) noexcept;
 
+/// True if the running CPU and OS could execute the variant, whether or
+/// not this binary carries it.
+///
+/// is_available(a) == (compiled_arches() contains a) && cpu_supports(a).
+/// Lets tools report "the machine supports X, this build does not carry
+/// it" (blake3ppsum --version does).
+/// @param a  Any variant.
+[[nodiscard]] bool cpu_supports(arch a) noexcept;
+
 /// The variant auto_detect resolves to on this machine.
 [[nodiscard]] arch best_available() noexcept;
 

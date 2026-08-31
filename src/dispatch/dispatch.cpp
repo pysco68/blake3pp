@@ -129,7 +129,7 @@ bool compiled_in(arch a) noexcept {
   return false;
 }
 
-bool cpu_supports(arch a) noexcept {
+bool cpu_supports_impl(arch a) noexcept {
   switch (a) {
     case arch::auto_detect:
     case arch::scalar:
@@ -157,7 +157,7 @@ std::span<const arch> available_impl() noexcept {
       std::size_t count = 0;
     } t;
     for (const arch a : compiled_sorted) {
-      if (cpu_supports(a)) {
+      if (cpu_supports_impl(a)) {
         t.entries[t.count++] = a;
       }
     }
@@ -169,8 +169,10 @@ std::span<const arch> available_impl() noexcept {
 }  // namespace
 
 bool is_available(arch a) noexcept {
-  return compiled_in(a) && cpu_supports(a);
+  return compiled_in(a) && cpu_supports_impl(a);
 }
+
+bool cpu_supports(arch a) noexcept { return cpu_supports_impl(a); }
 
 arch best_available() noexcept { return available_impl().front(); }
 
@@ -223,7 +225,7 @@ std::optional<arch> arch_from_string(std::string_view name) noexcept {
 namespace detail {
 
 const kern::kernel_ops* resolve(arch a) noexcept {
-  if (a == arch::auto_detect || !cpu_supports(a)) {
+  if (a == arch::auto_detect || !cpu_supports_impl(a)) {
     a = best_available();
   }
   for (const registry_entry& e : registry) {
