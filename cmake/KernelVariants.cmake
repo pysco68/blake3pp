@@ -14,6 +14,56 @@ include_guard(GLOBAL)
 
 include(CheckCXXSourceCompiles)
 
+# Probe candidate flag sets against a source snippet; the first set that
+# compiles wins (empty result: none did). Grown out of four hand-rolled
+# copies of the same loop: every cross family needs it, because the
+# same feature spells differently per driver (gcc -march vs zig/clang
+# -mcpu; power9 vs pwr9...). Each CANDIDATE is one flag set; multi-flag
+# sets are |-joined ("-march=z14|-mzvector") because CMake's argument
+# parsing flattens ;-lists. The winner is returned with | intact, and
+# callers convert (string REPLACE "|" ";") before ARCH_FLAGS. @VLEN@ in
+# a candidate is substituted with PROBE_VLEN for the probe compile only
+# (the caller expands the winning pattern per variant);
+# PROBE_EXTRA_FLAGS are appended for the probe only.
+function(blake3pp_probe_flag_candidates out_var probe_name)
+  cmake_parse_arguments(PARSE_ARGV 2 PF "" "SOURCE;PROBE_VLEN"
+    "CANDIDATES;PROBE_EXTRA_FLAGS")
+  set(result "")
+  foreach(cand IN LISTS PF_CANDIDATES)
+    string(MAKE_C_IDENTIFIER "${probe_name}_${cand}" var)
+    set(trial "${cand}")
+    if(PF_PROBE_VLEN)
+      string(REPLACE "@VLEN@" "${PF_PROBE_VLEN}" trial "${trial}")
+    endif()
+    string(REPLACE "|" " " trial "${trial}")
+    string(REPLACE ";" " " extra "${PF_PROBE_EXTRA_FLAGS}")
+    set(CMAKE_REQUIRED_FLAGS "${trial} ${extra}")
+    check_cxx_source_compiles("${PF_SOURCE}" ${var})
+    set(CMAKE_REQUIRED_FLAGS "")
+    if(${var})
+      set(result "${cand}")
+      break()
+    endif()
+  endforeach()
+  set(${out_var} "${result}" PARENT_SCOPE)
+endfunction()
+
+# Smoke-test an EXTERNAL cross compiler (the two-compiler-binary route:
+# xthead via riscv gcc, vxe via s390x gcc) by actually compiling the
+# same snippet the native path probes. Trailing args are the flags.
+function(_blake3pp_external_gcc_smoke out_var compiler smoke_name source)
+  set(_src "${CMAKE_BINARY_DIR}/blake3pp_generated/${smoke_name}.cpp")
+  file(WRITE "${_src}" "${source}")
+  execute_process(
+    COMMAND "${compiler}" -std=c++23 ${ARGN} -fsyntax-only "${_src}"
+    RESULT_VARIABLE _rc OUTPUT_QUIET ERROR_QUIET)
+  if(_rc EQUAL 0)
+    set(${out_var} TRUE PARENT_SCOPE)
+  else()
+    set(${out_var} FALSE PARENT_SCOPE)
+  endif()
+endfunction()
+
 function(_blake3pp_register_x86_kernels)
   if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     # Pure cl.exe: /arch is the only ISA dial. /arch:SSE4.2 DOES exist
@@ -103,24 +153,15 @@ function(_blake3pp_register_aarch64_kernels)
   # Two candidate spellings per generation: GCC/Clang take the -march
   # form; zig cc rejects aarch64 -march outright (its flag model wants
   # -mcpu=<cpu>+<features>), and both clang and zig accept the -mcpu
-  # form. First candidate that passes the smoke test wins.
-  function(_blake3pp_probe_sve_flags out_var probe_name)
-    set(result "")
-    foreach(cand IN LISTS ARGN)
-      string(MAKE_C_IDENTIFIER "${probe_name}_${cand}" var)
-      set(CMAKE_REQUIRED_FLAGS "${cand} -msve-vector-bits=256")
-      check_cxx_source_compiles("${_blake3pp_sve_smoke}" ${var})
-      if(${var})
-        set(result "${cand}")
-        break()
-      endif()
-    endforeach()
-    set(${out_var} "${result}" PARENT_SCOPE)
-  endfunction()
-  _blake3pp_probe_sve_flags(_blake3pp_sve1_flag BLAKE3PP_COMPILER_SVE_VLS
-    "-march=armv8.2-a+sve" "-mcpu=generic+sve")
-  _blake3pp_probe_sve_flags(_blake3pp_sve2_flag BLAKE3PP_COMPILER_SVE2_VLS
-    "-march=armv8.5-a+sve2" "-mcpu=generic+sve2")
+  # form.
+  blake3pp_probe_flag_candidates(_blake3pp_sve1_flag BLAKE3PP_COMPILER_SVE_VLS
+    SOURCE "${_blake3pp_sve_smoke}"
+    PROBE_EXTRA_FLAGS -msve-vector-bits=256
+    CANDIDATES "-march=armv8.2-a+sve" "-mcpu=generic+sve")
+  blake3pp_probe_flag_candidates(_blake3pp_sve2_flag BLAKE3PP_COMPILER_SVE2_VLS
+    SOURCE "${_blake3pp_sve_smoke}"
+    PROBE_EXTRA_FLAGS -msve-vector-bits=256
+    CANDIDATES "-march=armv8.5-a+sve2" "-mcpu=generic+sve2")
   if(_blake3pp_sve1_flag OR _blake3pp_sve2_flag)
     # The SVE kernels pin themselves to xsimd (FORCE_XSIMD) even when the
     # project provider is a std one: libstdc++'s experimental::simd SVE
@@ -197,26 +238,12 @@ function(_blake3pp_register_riscv64_kernels)
   # clang wants the numeric -mrvv-vector-bits. The zig base cpu must be
   # baseline_rv64 (IMAFDC), NOT generic_rv64: -mcpu REPLACES the feature
   # set wholesale, and generic_rv64 is bare RV64I, so musl's atomics fail
-  # to assemble the moment anything links. First pattern whose 256-bit
-  # expansion passes the smoke test wins.
-  function(_blake3pp_probe_rvv_flags out_var probe_name smoke)
-    set(result "")
-    foreach(cand IN LISTS ARGN)
-      string(REPLACE "@VLEN@" "256" trial "${cand}")
-      string(MAKE_C_IDENTIFIER "${probe_name}_${cand}" var)
-      set(CMAKE_REQUIRED_FLAGS "${trial}")
-      check_cxx_source_compiles("${smoke}" ${var})
-      if(${var})
-        set(result "${cand}")
-        break()
-      endif()
-    endforeach()
-    set(${out_var} "${result}" PARENT_SCOPE)
-  endfunction()
-  _blake3pp_probe_rvv_flags(_blake3pp_rvv_pattern
-    BLAKE3PP_COMPILER_RVV_FIXED_VLEN "${_blake3pp_rvv_smoke}"
-    "-march=rv64gcv_zvl@VLEN@b -mrvv-vector-bits=zvl"
-    "-mcpu=baseline_rv64+v+zvl@VLEN@b -mrvv-vector-bits=@VLEN@")
+  # to assemble the moment anything links.
+  blake3pp_probe_flag_candidates(_blake3pp_rvv_pattern
+    BLAKE3PP_COMPILER_RVV_FIXED_VLEN
+    SOURCE "${_blake3pp_rvv_smoke}" PROBE_VLEN 256
+    CANDIDATES "-march=rv64gcv_zvl@VLEN@b -mrvv-vector-bits=zvl"
+               "-mcpu=baseline_rv64+v+zvl@VLEN@b -mrvv-vector-bits=@VLEN@")
   if(_blake3pp_rvv_pattern)
     _blake3pp_fetch_xsimd()
     foreach(vlen IN ITEMS 128 256 512)
@@ -227,10 +254,11 @@ function(_blake3pp_register_riscv64_kernels)
     # The Zvbb twins: same kernels, single-instruction vror rotates via
     # xor_rot's Zvbb branch (GCC does not fuse the generic pattern on its
     # own). Zvbb-less V hardware exists, hence separate variants.
-    _blake3pp_probe_rvv_flags(_blake3pp_rvv_zvbb_pattern
-      BLAKE3PP_COMPILER_RVV_ZVBB "${_blake3pp_rvv_zvbb_smoke}"
-      "-march=rv64gcv_zvbb_zvl@VLEN@b -mrvv-vector-bits=zvl"
-      "-mcpu=baseline_rv64+v+zvbb+zvl@VLEN@b -mrvv-vector-bits=@VLEN@")
+    blake3pp_probe_flag_candidates(_blake3pp_rvv_zvbb_pattern
+      BLAKE3PP_COMPILER_RVV_ZVBB
+      SOURCE "${_blake3pp_rvv_zvbb_smoke}" PROBE_VLEN 256
+      CANDIDATES "-march=rv64gcv_zvbb_zvl@VLEN@b -mrvv-vector-bits=zvl"
+                 "-mcpu=baseline_rv64+v+zvbb+zvl@VLEN@b -mrvv-vector-bits=@VLEN@")
     if(_blake3pp_rvv_zvbb_pattern)
       foreach(vlen IN ITEMS 128 256 512)
         string(REPLACE "@VLEN@" "${vlen}" _flags
@@ -289,8 +317,8 @@ function(_blake3pp_register_riscv64_kernels)
       # same smoke snippet the native path uses.
       find_program(BLAKE3PP_XTHEAD_GCC riscv64-linux-gnu-g++)
       if(BLAKE3PP_XTHEAD_GCC)
-        set(_xthead_smoke "${CMAKE_BINARY_DIR}/blake3pp_generated/xthead_smoke.cpp")
-        file(WRITE "${_xthead_smoke}" [=[
+        _blake3pp_external_gcc_smoke(_xthead_gcc_ok
+          "${BLAKE3PP_XTHEAD_GCC}" xthead_smoke [=[
 #include <riscv_th_vector.h>
 int probe() {
   unsigned buf[4] = {1, 2, 3, 4};
@@ -299,13 +327,8 @@ int probe() {
   __riscv_th_vsw_v_u32m1(buf, a, 4);
   return static_cast<int>(buf[0]) - 2;
 }
-]=])
-        execute_process(
-          COMMAND "${BLAKE3PP_XTHEAD_GCC}" -std=c++23
-                  -march=rv64gc_xtheadvector -fsyntax-only "${_xthead_smoke}"
-          RESULT_VARIABLE _xthead_gcc_rc
-          OUTPUT_QUIET ERROR_QUIET)
-        if(_xthead_gcc_rc EQUAL 0)
+]=] -march=rv64gc_xtheadvector)
+        if(_xthead_gcc_ok)
           message(STATUS "blake3pp: xthead kernel via external ${BLAKE3PP_XTHEAD_GCC}")
           blake3pp_add_kernel(xthead SOURCE src/kernel/xthead_kernel.cpp
             EXTERNAL_COMPILER "${BLAKE3PP_XTHEAD_GCC}"
@@ -339,23 +362,16 @@ function(_blake3pp_register_ppc64_kernels)
   endif()
   # Mirrors xsimd's own gate (XSIMD_WITH_VSX = __VEC__ && __VSX__)
   # without needing its headers on the probe include path. Candidate
-  # spellings, the riscv precedent: GCC says power9, clang/zig say pwr9.
-  set(_vsx_flags "")
-  foreach(_cand "-mcpu=power9" "-mcpu=pwr9")
-    string(MAKE_C_IDENTIFIER "BLAKE3PP_COMPILER_VSX_${_cand}" _var)
-    set(CMAKE_REQUIRED_FLAGS "${_cand}")
-    check_cxx_source_compiles([=[
-      #if !(defined(__VEC__) && defined(__VSX__))
-      #error no vsx
-      #endif
-      int main() { return 0; }
-    ]=] ${_var})
-    set(CMAKE_REQUIRED_FLAGS "")
-    if(${_var})
-      set(_vsx_flags "${_cand}")
-      break()
-    endif()
-  endforeach()
+  # spellings: GCC says power9, clang/zig say pwr9.
+  set(_blake3pp_vsx_smoke [=[
+    #if !(defined(__VEC__) && defined(__VSX__))
+    #error no vsx
+    #endif
+    int main() { return 0; }
+  ]=])
+  blake3pp_probe_flag_candidates(_vsx_flags BLAKE3PP_COMPILER_VSX
+    SOURCE "${_blake3pp_vsx_smoke}"
+    CANDIDATES "-mcpu=power9" "-mcpu=pwr9")
   if(_vsx_flags)
     blake3pp_add_kernel(vsx FORCE_XSIMD ARCH_FLAGS ${_vsx_flags})
   endif()
@@ -374,23 +390,16 @@ function(_blake3pp_register_s390x_kernels)
   # Mirrors xsimd's own gate (XSIMD_WITH_VXE = __VEC__ >= 10304 &&
   # __ARCH__ >= 12) without needing its headers on the probe path.
   # Candidate spellings: GCC takes -march=z14, clang/zig -mcpu=z14.
-  set(_vxe_flags "")
-  foreach(_cand "-march=z14;-mzvector" "-mcpu=z14;-mzvector")
-    string(MAKE_C_IDENTIFIER "BLAKE3PP_COMPILER_VXE_${_cand}" _var)
-    string(REPLACE ";" " " _cand_str "${_cand}")
-    set(CMAKE_REQUIRED_FLAGS "${_cand_str}")
-    check_cxx_source_compiles([=[
-      #if !(defined(__VEC__) && __VEC__ >= 10304 && defined(__ARCH__) && __ARCH__ >= 12)
-      #error no vxe
-      #endif
-      int main() { return 0; }
-    ]=] ${_var})
-    set(CMAKE_REQUIRED_FLAGS "")
-    if(${_var})
-      set(_vxe_flags "${_cand}")
-      break()
-    endif()
-  endforeach()
+  set(_blake3pp_vxe_smoke [=[
+    #if !(defined(__VEC__) && __VEC__ >= 10304 && defined(__ARCH__) && __ARCH__ >= 12)
+    #error no vxe
+    #endif
+    int main() { return 0; }
+  ]=])
+  blake3pp_probe_flag_candidates(_vxe_flags BLAKE3PP_COMPILER_VXE
+    SOURCE "${_blake3pp_vxe_smoke}"
+    CANDIDATES "-march=z14|-mzvector" "-mcpu=z14|-mzvector")
+  string(REPLACE "|" ";" _vxe_flags "${_vxe_flags}")
   if(_vxe_flags)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
       blake3pp_add_kernel(vxe FORCE_XSIMD ARCH_FLAGS ${_vxe_flags})
@@ -405,7 +414,13 @@ function(_blake3pp_register_s390x_kernels)
       # zig image for exactly this TU), or not at all: correct-but-
       # scalar wearing a vector name is not shipped.
       find_program(BLAKE3PP_VXE_GCC s390x-linux-gnu-g++)
+      set(_vxe_gcc_ok FALSE)
       if(BLAKE3PP_VXE_GCC)
+        _blake3pp_external_gcc_smoke(_vxe_gcc_ok "${BLAKE3PP_VXE_GCC}"
+          vxe_smoke "${_blake3pp_vxe_smoke}" -march=z14 -mzvector)
+      endif()
+      if(_vxe_gcc_ok)
+        message(STATUS "blake3pp: vxe kernel via external ${BLAKE3PP_VXE_GCC}")
         blake3pp_add_kernel(vxe FORCE_XSIMD
           EXTERNAL_COMPILER "${BLAKE3PP_VXE_GCC}"
           ARCH_FLAGS -march=z14 -mzvector)
