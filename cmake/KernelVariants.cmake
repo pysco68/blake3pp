@@ -392,7 +392,29 @@ function(_blake3pp_register_s390x_kernels)
     endif()
   endforeach()
   if(_vxe_flags)
-    blake3pp_add_kernel(vxe FORCE_XSIMD ARCH_FLAGS ${_vxe_flags})
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      blake3pp_add_kernel(vxe FORCE_XSIMD ARCH_FLAGS ${_vxe_flags})
+    else()
+      # clang/LLVM SystemZ SCALARIZES xsimd's VXE ops. Measured on the
+      # zig musl build: 10 vector instructions in the whole binary vs
+      # GCC's thousands (vaf/vx/verllf), and TCG showing gcc's kernel
+      # 3.6x over scalar where clang's ties it. A compile probe cannot
+      # see that (the mislabeled-kernel lesson, again), so under a
+      # non-GNU primary the kernel comes from the distro s390x GCC as
+      # an EXTERNAL object (the xthead pattern; the gcc lives in the
+      # zig image for exactly this TU), or not at all: correct-but-
+      # scalar wearing a vector name is not shipped.
+      find_program(BLAKE3PP_VXE_GCC s390x-linux-gnu-g++)
+      if(BLAKE3PP_VXE_GCC)
+        blake3pp_add_kernel(vxe FORCE_XSIMD
+          EXTERNAL_COMPILER "${BLAKE3PP_VXE_GCC}"
+          ARCH_FLAGS -march=z14 -mzvector)
+      else()
+        message(STATUS "blake3pp: vxe kernel skipped; non-GNU compiler "
+          "scalarizes it and no s390x-linux-gnu-g++ found for the "
+          "external-object route")
+      endif()
+    endif()
   endif()
 endfunction()
 

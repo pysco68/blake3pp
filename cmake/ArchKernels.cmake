@@ -121,6 +121,28 @@ function(blake3pp_add_kernel ns)
     foreach(d IN LISTS _ak_switches)
       list(APPEND _ak_defs "-D${d}")
     endforeach()
+    # Facade kernels built externally need the xsimd headers and the
+    # provider pin on the external command line too (the vxe kernel is
+    # the customer: clang scalarizes xsimd's VXE ops, GCC emits real
+    # vector code including verllf hardware rotates).
+    if(AK_FORCE_XSIMD)
+      # Registration can run before the hermetic fetch has set
+      # xsimd_SOURCE_DIR; the populated source tree in the shared cache
+      # is content-addressed and equally authoritative.
+      set(_ak_xsimd_inc "")
+      if(xsimd_SOURCE_DIR)
+        set(_ak_xsimd_inc "${xsimd_SOURCE_DIR}/include")
+      else()
+        file(GLOB _ak_xsimd_candidates
+             "${PROJECT_SOURCE_DIR}/thirdparty/cache/xsimd-*-src/include")
+        list(GET _ak_xsimd_candidates 0 _ak_xsimd_inc)
+      endif()
+      if(NOT _ak_xsimd_inc OR NOT EXISTS "${_ak_xsimd_inc}")
+        message(FATAL_ERROR "external kernel ${ns}: FORCE_XSIMD but no xsimd headers found (populate xsimd first)")
+      endif()
+      list(APPEND _ak_defs "-DBLAKE3PP_HAS_XSIMD=1" "-DBLAKE3PP_FORCE_XSIMD=1"
+           "-I${_ak_xsimd_inc}")
+    endif()
     add_custom_command(OUTPUT "${_ak_obj}"
       COMMAND "${AK_EXTERNAL_COMPILER}" -std=c++23 -O3
               -fno-exceptions -fno-rtti -fno-stack-protector

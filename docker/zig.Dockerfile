@@ -17,15 +17,18 @@ RUN set -eux; \
     ln -s /opt/zig/zig /usr/local/bin/zig; \
     zig version
 
-# g++-riscv64-linux-gnu is here for exactly ONE translation unit: the
-# XTheadVector (RVV 0.7.1) kernel. LLVM never merged XTheadVector, so
+# The cross g++ packages are here for exactly ONE translation unit
+# each: riscv64 for the XTheadVector (RVV 0.7.1) kernel, s390x for the
+# z14 vxe kernel (clang/LLVM scalarizes xsimd's VXE ops; measured: 10
+# vector instructions in the whole binary vs GCC's thousands including
+# verllf hardware rotates). LLVM never merged XTheadVector, so
 # zig/clang cannot compile it: the riscv64 musl static binary links a
 # GCC-built object for that kernel (see cmake/ArchKernels.cmake,
 # EXTERNAL_COMPILER) while zig builds everything else. Two compilers,
 # one fat binary, because no single compiler speaks every vector dialect.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-user binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
-        g++-riscv64-linux-gnu \
+        g++-riscv64-linux-gnu g++-s390x-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
 # Prewarm zig's global cache for both musl targets. REQUIRED, not an
