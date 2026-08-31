@@ -101,29 +101,56 @@ long hwprobe_one(std::int64_t key, std::uint64_t* value) noexcept {
 // initializer below (so exactly one thread runs it, and it runs before
 // any hashing happens); the SIGILL handler is scoped to the one csrr
 // and restored immediately.
-sigjmp_buf g_vlenb_jmp;
+sigjmp_buf g_probe_jmp;
 
-void vlenb_sigill(int) { siglongjmp(g_vlenb_jmp, 1); }
+void probe_sigill(int) { siglongjmp(g_probe_jmp, 1); }
 
-unsigned long guarded_vlenb() noexcept {
+// Run one probe under a scoped SIGILL guard. Only ever called from the
+// magic-static initializer below (single thread, before any hashing);
+// the handler is restored immediately.
+template <class F>
+bool guarded(F&& body) noexcept {
   struct sigaction sa {};
   struct sigaction old {};
-  sa.sa_handler = &vlenb_sigill;
+  sa.sa_handler = &probe_sigill;
   sigemptyset(&sa.sa_mask);
   if (sigaction(SIGILL, &sa, &old) != 0) {
-    return 0;  // cannot make the read safe -> classify as "no vector"
+    return false;  // cannot make the probe safe -> claim nothing
   }
-  unsigned long vlenb = 0;
-  if (sigsetjmp(g_vlenb_jmp, 1) == 0) {
-    asm volatile(
-        ".option push\n\t"
-        ".option arch, +v\n\t"
-        "csrr %0, vlenb\n\t"
-        ".option pop"
-        : "=r"(vlenb));
-  }  // trapped: vlenb stays 0 -> pre-v0.9 vector, i.e. 0.7.1
+  bool ok = false;
+  if (sigsetjmp(g_probe_jmp, 1) == 0) {
+    body();
+    ok = true;
+  }
   sigaction(SIGILL, &old, nullptr);
+  return ok;
+}
+
+unsigned long guarded_vlenb() noexcept {
+  unsigned long vlenb = 0;
+  if (!guarded([&] {
+        asm volatile(
+            ".option push\n\t"
+            ".option arch, +v\n\t"
+            "csrr %0, vlenb\n\t"
+            ".option pop"
+            : "=r"(vlenb));
+      })) {
+    return 0;  // trapped: pre-v0.9 vector (no vlenb CSR), i.e. 0.7.1
+  }
   return vlenb;
+}
+
+// Does the kernel let user mode touch the vector unit at all? vsetvli
+// shares its encoding shape between draft 0.7.1 and ratified 1.0 (only
+// the vtype immediate layout differs), so this single instruction
+// executes on EITHER dialect, and traps iff the kernel left the unit
+// disabled. Hand-encoded (.word: vsetvli t0, x0, 0) because this TU is
+// compiled flag-neutral by compilers that may know neither dialect.
+bool guarded_vector_unit_enabled() noexcept {
+  return guarded([] {
+    asm volatile(".word 0x000072D7" ::: "t0");
+  });
 }
 
 struct vec_state {
@@ -163,9 +190,23 @@ const vec_state& vec_probe() noexcept {
         // Rung 2: HWCAP says V, hwprobe says no V, the core is T-Head.
         // That is the vendor-kernel 0.7.1 lie, caught in the act.
         st.xthead = true;
+      } else if (!hwcap_v &&
+                 hwprobe_one(RISCV_HWPROBE_KEY_MVENDORID, &vendor) == 0 &&
+                 vendor == BLAKE3PP_MVENDORID_THEAD &&
+                 guarded_vector_unit_enabled()) {
+        // Rung 2.5, the SG2042 6.6-pioneer shape: hwprobe exists but
+        // predates the vendor key, and the kernel advertises no V
+        // ANYWHERE (no hwcap bit, no IMA_V), yet the vendor patch
+        // enables and context-switches the T-Head vector unit. The
+        // guarded vsetvli settles it: it traps iff the unit is off. A
+        // unit that is ON while the kernel claims no standard V, on a
+        // T-Head core, is the vendor th path; a kernel managing REAL
+        // 1.0 state advertises it through the standard has_vector()
+        // plumbing every >=6.4 kernel shares, so it cannot land here.
+        st.xthead = true;
       }
-      // HWCAP-V + no hwprobe-V + NOT T-Head: some other vendor's
-      // fiction; claim nothing rather than execute a guess.
+      // Any other contradiction: claim nothing rather than execute a
+      // guess.
     } else if (hwcap_v) {
       // Rung 3: pre-hwprobe vendor kernel. vlenb postdates 0.7.1, so
       // the guarded read classifies: a value is legacy RVV 1.0 (K230
@@ -188,6 +229,9 @@ bool xthead_supported() noexcept {
     const char* assume = std::getenv("BLAKE3PP_ASSUME_XTHEADVECTOR");
     if (assume != nullptr && assume[0] == '1') {
       return true;
+    }
+    if (assume != nullptr && assume[0] == '0') {
+      return false;  // explicit opt-out: the ladder's emergency brake
     }
     return vec_probe().xthead;
   }();
