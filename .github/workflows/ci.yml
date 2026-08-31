@@ -1,7 +1,7 @@
 # Every containerizable preset runs INSIDE its per-compiler toolchain
 # image (the same images tools/tc uses locally, built and pushed by
-# toolchains.yml), split into two matrices: `test` (pure validation:
-# compiler cohort, sanitizers, wasm, arm64 emulation) and `binaries`
+# toolchains.yml), split into matrices: `test` (pure validation:
+# compiler cohort, sanitizers, arm64 emulation), `wasm` (ships), and `binaries`
 # (the legs whose outputs ship or meet hardware), so the hardware lanes
 # wait only on the bytes they run, never on a sanitizer suite. One
 # entry point, tools/ci-test.sh, holds the per-architecture emulator
@@ -132,8 +132,8 @@ jobs:
             docker buildx imagetools create -t "${ref%:*}:latest" "${ref}"
           done
 
-  # Pure validation: the native compiler cohort, the sanitizers, wasm,
-  # and the arm64 emulator matrix. Produces NOTHING downstream: no
+  # Pure validation: the native compiler cohort, the sanitizers, and
+  # the arm64 emulator matrix. Produces NOTHING downstream: no
   # artifacts, no hardware lane waits on it. It still gates the release
   # with everything else (release.yml fires only on a fully green run);
   # splitting it out just means the riscv boards do not idle behind an
@@ -168,8 +168,6 @@ jobs:
           # feature-off matrices live in tools/ci-test.sh; the aarch64
           # STATIC build is build-arm64-static below, feeding Neoverse).
           - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
-          # WebAssembly (runs in node).
-          - { preset: wasm32-emcc-cxx23, image: emscripten }
     container:
       image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
       credentials:
@@ -224,6 +222,51 @@ jobs:
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
+
+  # WebAssembly, tested in node and SHIPPED (js+wasm pairs in the
+  # release). Its own job rather than a `binaries` leg, so the Cloud-V
+  # boards never wait on an unrelated wasm build.
+  wasm:
+    needs: [changes, images]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.images.result == 'success' || needs.images.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-emscripten:${{ needs.changes.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v7
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Cache hermetic dependencies
+        uses: actions/cache@v6
+        with:
+          # Same positive-glob scheme as the test job above.
+          path: |
+            thirdparty/cache/*-src
+            thirdparty/cache/sources/*-src
+          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+          restore-keys: hfc-src2-linux-
+      - name: Configure, build, test (node)
+        run: bash tools/ci-test.sh wasm32-emcc-cxx23
+      - name: Upload tool binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: tool-binaries-wasm32
+          retention-days: 3
+          path: |
+            build/wasm32-emcc-cxx23/cli/blake3ppsum.js
+            build/wasm32-emcc-cxx23/cli/blake3ppsum.wasm
+            build/wasm32-emcc-cxx23/cli/blake3ppgen.js
+            build/wasm32-emcc-cxx23/cli/blake3ppgen.wasm
+            build/wasm32-emcc-cxx23/bench/blake3pp_bench.js
+            build/wasm32-emcc-cxx23/bench/blake3pp_bench.wasm
+            build/wasm32-emcc-cxx23/bench/blake3pp_bench_file.js
+            build/wasm32-emcc-cxx23/bench/blake3pp_bench_file.wasm
 
   # The legs whose OUTPUTS ship or meet hardware: the static musl release
   # chains (x86_64 + riscv64; the aarch64 twin is build-arm64-static

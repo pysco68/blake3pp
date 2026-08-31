@@ -148,6 +148,22 @@ jobs:
           tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
           rm -rf "$stage"
 
+          # WebAssembly: node-runnable js+wasm pairs, SIMD128 kernel with
+          # runtime dispatch to scalar where wasm SIMD is unavailable.
+          src="ci-binaries/tool-binaries-wasm32"
+          if [ ! -d "$src" ]; then
+            echo "::error::ci run produced no wasm binaries"; exit 1
+          fi
+          pkg="blake3pp-${VERSION}-wasm32-simd128"
+          stage="release/${pkg}"
+          mkdir -p "$stage"
+          cp "$src"/cli/*.js "$src"/cli/*.wasm \
+             "$src"/bench/*.js "$src"/bench/*.wasm "$stage"/
+          cp README.md "$stage"/
+          printf 'Run with node >= 16 (SIMD on by default):\n  node blake3ppsum.js -- --help\n' > "$stage"/RUNNING.txt
+          tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
+          rm -rf "$stage"
+
           # Windows (zip is the platform convention): both compilers on
           # both architectures. x64 is tested natively on the build
           # runner; arm64 is cross-built (tested natively when the
@@ -206,7 +222,8 @@ jobs:
             echo "windows-x86_64 in both compilers (msvc and clang-cl;"
             echo "clang-cl carries the faster byte-rotate kernels;"
             echo "IOCP+direct I/O in both), macos-arm64 (Apple clang,"
-            echo "GCD + F_NOCACHE I/O), and windows-arm64 in both"
+            echo "GCD + F_NOCACHE I/O), wasm32-simd128 (node-runnable"
+            echo "js+wasm, SIMD128 kernel), and windows-arm64 in both"
             echo "compilers (cross-built; tested natively only when the"
             echo "ci run's windows-11-arm lane was enabled; check its"
             echo "jobs)."
