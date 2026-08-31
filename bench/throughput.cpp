@@ -219,9 +219,14 @@ void t16_sweep(int reps, double cooldown_s) {
   }
   blake3pp::set_transpose16(saved);
   cooldown();
-  println(stdout, "\n  tune_transpose16() picks: {}   (its own race uses a "
-                  "16 KiB working set)",
-          blake3pp::to_string(blake3pp::tune_transpose16()));
+  // This line once claimed "its own race uses a 16 KiB working set",
+  // which was only true of an old tuner revision. Print facts, not
+  // memories: the race sizes itself to the tuned-for bytes (capped).
+  println(stdout,
+          "\n  tune_transpose16() picks: {}   (raced at its default "
+          "{} MiB working set, interleaved best-of-3)",
+          blake3pp::to_string(blake3pp::tune_transpose16()),
+          blake3pp::default_tune_bytes >> 20);
   blake3pp::set_transpose16(saved);
 }
 }  // namespace

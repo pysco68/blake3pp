@@ -130,29 +130,41 @@ transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
                      out.data());
     }
   };
-  const auto race = [&](transpose16 mode) {
+  // INTERLEAVED repetitions, not per-strategy blocks: under drifting
+  // conditions (laptop boost droop, a power-clamped OS profile, noisy
+  // cloud neighbors) a sequential race hands later strategies a worse
+  // environment; a power-clamped Windows box measurably picked the
+  // second-raced strategy over a 37%-faster one that raced last. Round-
+  // robin spreads the drift evenly; best-of per strategy still filters
+  // one-off stalls. (The bench's --t16-sweep guards against the same
+  // effect with its order-reversed 'rev' rows.)
+  constexpr transpose16 modes[] = {transpose16::staging, transpose16::tree,
+                                   transpose16::quartered};
+  std::chrono::steady_clock::duration best[3] = {
+      std::chrono::steady_clock::duration::max(),
+      std::chrono::steady_clock::duration::max(),
+      std::chrono::steady_clock::duration::max()};
+  for (const transpose16 mode : modes) {
     set_transpose16(mode);
-    one_pass();  // warm-up: frequency ramp, page faults, TLB
-    auto best = std::chrono::steady_clock::duration::max();
-    for (int rep = 0; rep < 3; ++rep) {
+    one_pass();  // warm-up: frequency ramp, page faults, TLB, per mode
+  }
+  for (int rep = 0; rep < 3; ++rep) {
+    for (std::size_t i = 0; i < 3; ++i) {
+      set_transpose16(modes[i]);
       const auto t0 = std::chrono::steady_clock::now();
       one_pass();
       const auto dt = std::chrono::steady_clock::now() - t0;
-      if (dt < best) {
-        best = dt;
+      if (dt < best[i]) {
+        best[i] = dt;
       }
     }
-    return best;
-  };
-
+  }
   transpose16 winner = saved;
   auto winner_time = std::chrono::steady_clock::duration::max();
-  for (const transpose16 mode : {transpose16::staging, transpose16::tree,
-                                 transpose16::quartered}) {
-    const auto t = race(mode);
-    if (t < winner_time) {
-      winner_time = t;
-      winner = mode;
+  for (std::size_t i = 0; i < 3; ++i) {
+    if (best[i] < winner_time) {
+      winner_time = best[i];
+      winner = modes[i];
     }
   }
   std::free(data);
