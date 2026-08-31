@@ -98,8 +98,15 @@ TEST_CASE("compress_xof's first 32 bytes agree with compress_in_place") {
   scalar::ops.compress_xof(cv.data(), block, block_len, 42, flag_root, wide);
   scalar::ops.compress_in_place(cv.data(), block, block_len, 42, flag_root);
   for (std::size_t w = 0; w < 8; ++w) {
-    std::uint32_t word = 0;
-    std::memcpy(&word, wide + 4 * w, 4);  // LE host assumed in tests
+    // Decode the spec-mandated little-endian bytes explicitly: the old
+    // memcpy-into-uint32 read them NATIVE, an endianness bug the s390x
+    // lane exposed. The bug was in the TEST, not the kernel (the
+    // official-vector suite already proved the kernel's byte stream).
+    const std::uint32_t word =
+        static_cast<std::uint32_t>(wide[4 * w]) |
+        (static_cast<std::uint32_t>(wide[4 * w + 1]) << 8) |
+        (static_cast<std::uint32_t>(wide[4 * w + 2]) << 16) |
+        (static_cast<std::uint32_t>(wide[4 * w + 3]) << 24);
     CHECK(word == cv[w]);
   }
 }

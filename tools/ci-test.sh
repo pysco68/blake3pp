@@ -95,6 +95,29 @@ case "${preset}" in
         "${vd}/main.o" "${vd}/scalar.o" "${vd}/xthead.o"
     fi
     ;;
+  *ppc64le*)
+    # VSX is POWER7+ and Ubuntu's ppc64le USERLAND is built power9+
+    # (a power8 CPU model SIGILLs the distro libstdc++ before main),
+    # so the meaningful qemu spread is the supported
+    # generations. The scalar fallback path is exercised by the generic
+    # all-arch tests; no ppc64le model is vector-less.
+    run_ctest default
+    run_ctest power9 power9
+    run_ctest power10 power10
+    ;;
+  *s390x*)
+    # BIG-ENDIAN lane. qemu's max carries z14 vector-enhancements (the
+    # vxe kernel runs). Named machine models (z13...) demand KVM-only
+    # facilities under qemu-user TCG, so the fallbacks are driven by
+    # FEATURE dials instead: vxeh=off keeps base vector but removes the
+    # z14 facility (dispatch must refuse vxe), vx=off removes vector
+    # entirely; both land on scalar.
+    run_ctest default
+    run_ctest no-vxe "max,vxeh=off"
+    # (max,vx=off is NOT a runnable config: Ubuntu's s390x userland
+    # baseline is z13-with-vector, and removing vx kills ld.so before
+    # main, the same class as ppc64le's power9+ userland baseline.)
+    ;;
   wasm32-*)
     run_ctest default
     ;;

@@ -35,7 +35,7 @@ variable "NINJA_VERSION" { default = "1.13.2" }
 variable "ZIG_VERSION"   { default = "0.16.0" }
 
 group "default" {
-  targets = ["base", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "zig",
+  targets = ["base", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "ppc64le-gcc15", "s390x-gcc15", "zig",
              "emscripten"]
 }
 
@@ -120,4 +120,18 @@ target "emscripten" {
   dockerfile = "docker/emscripten.Dockerfile"
   contexts   = { base = "target:base-2604" }
   tags       = tc_tags("emscripten")
+}
+
+target "ppc64le-gcc15" {
+  context    = "."
+  dockerfile = "docker/ppc64le-gcc15.Dockerfile"
+  contexts   = { base = "target:base-2604" }
+  tags       = tc_tags("ppc64le-gcc15")
+}
+
+target "s390x-gcc15" {
+  context    = "."
+  dockerfile = "docker/s390x-gcc15.Dockerfile"
+  contexts   = { base = "target:base-2604" }
+  tags       = tc_tags("s390x-gcc15")
 }

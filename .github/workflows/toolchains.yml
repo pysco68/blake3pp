@@ -100,6 +100,8 @@ jobs:
           - { target: clang22,     rel: "2604" }
           - { target: arm64-gcc15, rel: "2604" }
           - { target: riscv64-gcc15, rel: "2604" }
+          - { target: ppc64le-gcc15, rel: "2604" }
+          - { target: s390x-gcc15, rel: "2604" }
           - { target: zig,         rel: "2604" }
           - { target: emscripten,  rel: "2604" }
     steps:

@@ -164,6 +164,11 @@ jobs:
           - { preset: linux-clang22-cxx26-asan, image: clang22 }
           - { preset: linux-clang22-cxx26-msan, image: clang22 }
           - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
+          # POWER and IBM z crosses, emulator-in-the-loop: vsx (POWER9+)
+          # and the project's first BIG-ENDIAN lane, vxe (z14); qemu CPU
+          # matrices live in tools/ci-test.sh.
+          - { preset: linux-ppc64le-gcc15-cxx23, image: ppc64le-gcc15 }
+          - { preset: linux-s390x-gcc15-cxx23, image: s390x-gcc15 }
           # arm64 cross, emulator-in-the-loop (the SVE vector-length and
           # feature-off matrices live in tools/ci-test.sh; the aarch64
           # STATIC build is build-arm64-static below, feeding Neoverse).

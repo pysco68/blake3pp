@@ -326,6 +326,57 @@ int probe() {
   endif()
 endfunction()
 
+function(_blake3pp_register_ppc64_kernels)
+  # POWER VSX through the xsimd facade (128-bit, width 4). The distro
+  # ppc64le baseline is POWER8, but xsimd's VSX backend and this kernel
+  # are probed at power9 (the first probe that passed; relaxing to
+  # power8 is a candidate-flag exercise for whoever has such silicon).
+  # Correctness was validated byte-identical against the x86 golden
+  # under qemu-ppc64le before this family existed. GNU-frontend
+  # spelling only, like the other cross ISAs.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    return()
+  endif()
+  # Mirrors xsimd's own gate (XSIMD_WITH_VSX = __VEC__ && __VSX__)
+  # without needing its headers on the probe include path.
+  set(CMAKE_REQUIRED_FLAGS "-mcpu=power9")
+  check_cxx_source_compiles([=[
+    #if !(defined(__VEC__) && defined(__VSX__))
+    #error no vsx
+    #endif
+    int main() { return 0; }
+  ]=] BLAKE3PP_COMPILER_VSX)
+  set(CMAKE_REQUIRED_FLAGS "")
+  if(BLAKE3PP_COMPILER_VSX)
+    blake3pp_add_kernel(vsx FORCE_XSIMD ARCH_FLAGS -mcpu=power9)
+  endif()
+endfunction()
+
+function(_blake3pp_register_s390x_kernels)
+  # IBM z vector-enhancements-1 (z14) through the xsimd facade, the
+  # first BIG-ENDIAN SIMD target. BLAKE3 is defined little-endian; the
+  # kernel's load32/store32 byteswap on BE and the whole path was
+  # validated byte-identical against the x86 golden under qemu-s390x
+  # before this family existed. -mzvector is what unlocks xsimd's
+  # VXE backend.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    return()
+  endif()
+  # Mirrors xsimd's own gate (XSIMD_WITH_VXE = __VEC__ >= 10304 &&
+  # __ARCH__ >= 12) without needing its headers on the probe path.
+  set(CMAKE_REQUIRED_FLAGS "-march=z14 -mzvector")
+  check_cxx_source_compiles([=[
+    #if !(defined(__VEC__) && __VEC__ >= 10304 && defined(__ARCH__) && __ARCH__ >= 12)
+    #error no vxe
+    #endif
+    int main() { return 0; }
+  ]=] BLAKE3PP_COMPILER_VXE)
+  set(CMAKE_REQUIRED_FLAGS "")
+  if(BLAKE3PP_COMPILER_VXE)
+    blake3pp_add_kernel(vxe FORCE_XSIMD ARCH_FLAGS -march=z14 -mzvector)
+  endif()
+endfunction()
+
 function(_blake3pp_register_wasm_kernels)
   # WASM SIMD128 is a module-level feature (engines reject SIMD-bearing
   # modules wholesale if unsupported), so this really is a compile-time
@@ -343,6 +394,10 @@ function(blake3pp_register_kernels)
     _blake3pp_register_aarch64_kernels()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64)$")
     _blake3pp_register_riscv64_kernels()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ppc64le|powerpc64le|ppc64)$")
+    _blake3pp_register_ppc64_kernels()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(s390x)$")
+    _blake3pp_register_s390x_kernels()
   elseif(EMSCRIPTEN)
     _blake3pp_register_wasm_kernels()
   endif()

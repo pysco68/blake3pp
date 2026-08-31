@@ -120,6 +120,8 @@ add_library(blake3pp STATIC
   src/dispatch/cpu_detect_x86.cpp
   src/dispatch/cpu_detect_arm.cpp
   src/dispatch/cpu_detect_riscv.cpp
+  src/dispatch/cpu_detect_ppc.cpp
+  src/dispatch/cpu_detect_s390.cpp
   src/dispatch/transpose16.cpp
   src/io/file_reader.cpp
   src/io/file_writer.cpp

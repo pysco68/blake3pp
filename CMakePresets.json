@@ -164,6 +164,26 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "linux-ppc64le-gcc15-cxx23",
+      "displayName": "POWER cross (GCC 15, VSX via xsimd, qemu-ppc64le)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-ppc64le-gcc15-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-ppc64le-gcc15-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "linux-s390x-gcc15-cxx23",
+      "displayName": "IBM z cross (GCC 15, z14 VXE via xsimd, BIG-endian, qemu-s390x)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-s390x-gcc15-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-gcc15-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
     }
   ],
   "buildPresets": [
@@ -248,6 +268,14 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       }
+    },
+    {
+      "name": "linux-ppc64le-gcc15-cxx23",
+      "configurePreset": "linux-ppc64le-gcc15-cxx23"
+    },
+    {
+      "name": "linux-s390x-gcc15-cxx23",
+      "configurePreset": "linux-s390x-gcc15-cxx23"
     }
   ],
   "testPresets": [
@@ -379,6 +407,20 @@
     {
       "name": "linux-clang22-cxx26-asan",
       "configurePreset": "linux-clang22-cxx26-asan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-ppc64le-gcc15-cxx23",
+      "configurePreset": "linux-ppc64le-gcc15-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-s390x-gcc15-cxx23",
+      "configurePreset": "linux-s390x-gcc15-cxx23",
       "output": {
         "outputOnFailure": true
       }

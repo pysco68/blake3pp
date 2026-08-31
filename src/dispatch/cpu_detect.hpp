@@ -26,6 +26,12 @@
 #elif defined(__riscv) && __riscv_xlen == 64
 #define BLAKE3PP_CPU_DETECT_RISCV 1
 #define BLAKE3PP_HAS_CPU_DETECT 1
+#elif defined(__powerpc64__)
+#define BLAKE3PP_CPU_DETECT_PPC 1
+#define BLAKE3PP_HAS_CPU_DETECT 1
+#elif defined(__s390x__)
+#define BLAKE3PP_CPU_DETECT_S390 1
+#define BLAKE3PP_HAS_CPU_DETECT 1
 #endif
 
 namespace blake3pp::detail {

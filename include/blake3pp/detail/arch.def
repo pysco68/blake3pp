@@ -1,21 +1,22 @@
-/// @file
-/// The one canonical list of instruction-set variants: the single source
-/// the enum, the name strings, and the dispatch preference order are all
-/// generated from (same include-me-under-a-macro pattern as the build-time
-/// kernel registry). Consumers define BLAKE3PP_ARCH(enumerator, "name",
-/// rank) and include this file; no include guard on purpose.
-///
-/// Two orders live here, deliberately separated:
-///   * LINE ORDER is ABI order. The enum's underlying values follow it, so
-///     entries are APPEND-ONLY: never reorder, never insert, never remove.
-///   * RANK is the dispatch preference, lower wins, unique (asserted).
-///     auto_detect must hold the lowest rank; scalar the highest. Ranks are
-///     spaced by 10 so a measured reordering is a one-number edit with no
-///     ABI consequence.
-///
-/// The enumerator doubles as the kernel namespace token and the CMake
-/// registration name (see cmake/ArchKernels.cmake); they must all agree.
-/// The display name is separate only where convention demands it ("auto").
+// The one canonical list of instruction-set variants: the single source
+// the enum, the name strings, and the dispatch preference order are all
+// generated from (same include-me-under-a-macro pattern as the build-time
+// kernel registry). Consumers define BLAKE3PP_ARCH(enumerator, "name",
+// rank) and include this file; no include guard on purpose.
+//
+// Two orders live here, deliberately separated:
+//   * LINE ORDER is ABI order. The enum's underlying values follow it, so
+//     entries are APPEND-ONLY: never reorder, never insert, never remove.
+//   * RANK is the dispatch preference, lower wins, unique (asserted).
+//     auto_detect must hold the lowest rank; scalar the highest. Ranks are
+//     spaced by 10 so a measured reordering is a one-number edit with no
+//     ABI consequence.
+//
+// The enumerator doubles as the kernel namespace token and the CMake
+// registration name (see cmake/ArchKernels.cmake); they must all agree.
+// The display name is separate only where convention demands it ("auto").
+// The /// comments are the enumerators' documentation (they attach to the
+// enum's members through the macro expansion).
 
 /// Resolves to the best usable variant at runtime.
 BLAKE3PP_ARCH(auto_detect, "auto", 0)
@@ -82,3 +83,11 @@ BLAKE3PP_ARCH(rvv128_zvbb, "rvv128_zvbb", 150)
 BLAKE3PP_ARCH(rvv256_zvbb, "rvv256_zvbb", 130)
 /// RISC-V RVV 1.0 plus Zvbb at exactly 512 bits.
 BLAKE3PP_ARCH(rvv512_zvbb, "rvv512_zvbb", 110)
+/// POWER VSX, 128-bit lanes (the ppc64le baseline is POWER8 with VSX;
+/// the kernel probes at power9). Detected through the HWCAP VSX bit,
+/// checked rather than assumed.
+BLAKE3PP_ARCH(vsx, "vsx", 175)
+/// IBM z Vector-Enhancements-1 (z14+), 128-bit lanes: the big-endian
+/// SIMD target, every word load and store byteswapped (BLAKE3 is defined
+/// little-endian). Detected through HWCAP_S390_VXRS_EXT.
+BLAKE3PP_ARCH(vxe, "vxe", 176)
