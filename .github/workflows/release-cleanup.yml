@@ -1,8 +1,22 @@
-# Sweeps the automated dev-* prereleases (created by release.yml) that
-# are older than 90 days, deleting both the release and its anchor tag.
-# Scope is deliberately narrow: only releases that are (a) marked
-# prerelease AND (b) tagged dev-* are candidates; hand-tagged releases
-# (v*), including hand-tagged prereleases, are never touched.
+# Time-based garbage collection for the two things CI mints on every
+# green run: dev-* prereleases and content-addressed toolchain images.
+#
+# Releases: automated dev-* prereleases (created by release.yml) older
+# than 90 days are deleted along with their anchor tags. Scope is
+# deliberately narrow: only releases that are (a) marked prerelease AND
+# (b) tagged dev-* are candidates; hand-tagged releases (v*),
+# including hand-tagged prereleases, are never touched.
+#
+# Images: GHCR versions of the blake3pp/toolchain-* packages whose tags
+# are ALL tree-* and older than 30 days are deleted. Images are pure
+# cache (anything still referenced by a checkout rebuilds on the next
+# run's miss), so the window is shorter than the release one. Never
+# deleted: any version carrying the `latest` tag, the version matching
+# THIS checkout's content tag (even if old, it is the one main still
+# uses), and untagged versions entirely (buildx pushes attestation/
+# child manifests as untagged versions; deleting a live index's
+# children corrupts it, and telling orphans from children is not worth
+# the risk for a few MB).
 name: release-cleanup
 
 on:
@@ -12,9 +26,10 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
-  sweep:
+  sweep-releases:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -38,4 +53,46 @@ jobs:
             else
               echo "keeping  ${tag} (created ${created})"
             fi
+          done
+
+  sweep-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KEEP_DAYS: 30
+    steps:
+      # Checkout so the CURRENT content tag can be computed and kept;
+      # main may sit on an old tag for weeks when docker/ is quiet.
+      - uses: actions/checkout@v7
+      - name: Delete stale tree-* image versions
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d "${KEEP_DAYS} days ago" +%Y-%m-%dT%H:%M:%SZ)
+          current="tree-$(bash tools/toolchain-image-tag.sh)"
+          owner="${GITHUB_REPOSITORY_OWNER}"
+          echo "current content tag: ${current}; deleting tree-* versions before ${cutoff}"
+          gh api "/users/${owner}/packages?package_type=container" --paginate \
+            --jq '.[].name' | grep '^blake3pp/toolchain-' | while read -r pkg; do
+            enc="${pkg//\//%2F}"
+            echo "== ${pkg}"
+            gh api "/users/${owner}/packages/container/${enc}/versions" --paginate \
+              --jq '.[] | [.id, .created_at, ((.metadata.container.tags // []) | join(" "))] | @tsv' |
+            while IFS=$'\t' read -r id created tags; do
+              # keep: untagged (attestation/child manifests), latest,
+              # the current content tag, anything not purely tree-*
+              [[ -z "${tags}" ]] && continue
+              keep=""
+              for t in ${tags}; do
+                [[ "${t}" == "latest" || "${t}" == "${current}" ]] && keep=1
+                [[ "${t}" != tree-* && "${t}" != "latest" ]] && keep=1
+              done
+              if [[ -z "${keep}" && "${created}" < "${cutoff}" ]]; then
+                echo "  deleting version ${id} (${tags}, created ${created})"
+                gh api -X DELETE \
+                  "/users/${owner}/packages/container/${enc}/versions/${id}"
+              else
+                echo "  keeping  version ${id} (${tags:-untagged}, created ${created})"
+              fi
+            done
           done
