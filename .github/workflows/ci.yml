@@ -171,7 +171,7 @@ jobs:
           - { preset: linux-s390x-gcc15-cxx23, image: s390x-gcc15 }
           # arm64 cross, emulator-in-the-loop (the SVE vector-length and
           # feature-off matrices live in tools/ci-test.sh; the aarch64
-          # STATIC build is build-arm64-static below, feeding Neoverse).
+          # STATIC twin ships from the binaries job, feeding Neoverse).
           - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
     container:
       image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
@@ -191,39 +191,9 @@ jobs:
       LSAN_OPTIONS: use_tls=0
     steps:
       - uses: actions/checkout@v7
-
-      # Container steps run as root while the version stamp shells out to
-      # git in a runner-owned checkout; without this git refuses with
-      # "dubious ownership" and the stamp falls back to the bare version.
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      # The hermetic dependency cache (hfc): content-hash-keyed sources
-      # under thirdparty/cache, shared across presets: one restore serves
-      # every job, and a miss costs one population (stdexec is the big
-      # clone). Keyed on the files that carry the dependency pins.
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
+      - uses: ./.github/actions/setup-workspace
         with:
-          # POSITIVE globs only: just the path-free *-src trees (the
-          # sources store nests another subbuild, hence the second line).
-          # Everything else under thirdparty/cache embeds absolute
-          # workspace paths in CMakeCache.txt files, so a cache written
-          # under one mount poisons every job with another; it all
-          # regenerates in seconds. Two hard-won rules encoded here:
-          # !dir exclusion patterns do NOT reliably prune a directory's
-          # contents (a mac cache shipped hfc/subbuild through them), so
-          # never cache-by-subtraction; and per-OS key prefixes must be
-          # DISJOINT, not extensions of each other (restore-keys
-          # hfc-src- happily matched hfc-src-mac-*: macOS/Linux caches
-          # cross-restore freely; only Windows ones are fenced by
-          # enableCrossOsArchive). Generation src2: pre-fix entries can
-          # never be restored.
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-linux-
+          cache-prefix: hfc-src2-linux-
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
@@ -245,17 +215,9 @@ jobs:
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v7
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
+      - uses: ./.github/actions/setup-workspace
         with:
-          # Same positive-glob scheme as the test job above.
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-linux-
+          cache-prefix: hfc-src2-linux-
       - name: Configure, build, test (node)
         run: bash tools/ci-test.sh wasm32-emcc-cxx23
       # The container shares the runner's CPU, so this benches v8's
@@ -290,14 +252,15 @@ jobs:
             build/wasm32-emcc-cxx23/bench/blake3pp_bench_file.js
             build/wasm32-emcc-cxx23/bench/blake3pp_bench_file.wasm
 
-  # The legs whose OUTPUTS ship or meet hardware: the static musl release
-  # chains (x86_64 + riscv64; the aarch64 twin is build-arm64-static
-  # below) and the riscv64 gcc cross job, which runs the full RVV qemu
-  # matrix and builds the freestanding xthead verifier the Pioneer
-  # executes. This job, not the validation matrix above, is what the
-  # Cloud-V boards wait on: scarce serialized board time starts as soon
-  # as the bytes it will run are built and emulator-proven, without
-  # idling behind sanitizer suites.
+  # The legs whose OUTPUTS ship or meet hardware: the five static musl
+  # release chains and the riscv64 gcc cross job (full RVV qemu matrix
+  # plus the freestanding xthead verifier the Pioneer executes). This
+  # job, not the validation matrix above, is what the hardware lanes
+  # wait on (Cloud-V boards, Neoverse): scarce serialized board time
+  # starts as soon as the bytes it will run are built and
+  # emulator-proven, without idling behind sanitizer suites. `artifact`
+  # names the static-binaries-* upload; legs without one upload no
+  # static binaries.
   binaries:
     name: ${{ matrix.preset }}
     needs: [changes, images]
@@ -309,13 +272,14 @@ jobs:
       matrix:
         include:
           - { preset: linux-riscv64-gcc15-cxx23, image: riscv64-gcc15 }
-          - { preset: linux-zigmusl-cxx23-static, image: zig }
-          - { preset: linux-riscv64-zigmusl-cxx23-static, image: zig }
+          - { preset: linux-zigmusl-cxx23-static, image: zig, artifact: x86_64 }
+          - { preset: linux-arm64-zigmusl-cxx23-static, image: zig, artifact: aarch64 }
+          - { preset: linux-riscv64-zigmusl-cxx23-static, image: zig, artifact: riscv64 }
           # POWER and IBM z static musl: shipped release archives.
           # No hardware lane exists for them (yet): the bytes are
           # emulator-tested here and flagged as such in the notes.
-          - { preset: linux-ppc64le-zigmusl-cxx23-static, image: zig }
-          - { preset: linux-s390x-zigmusl-cxx23-static, image: zig }
+          - { preset: linux-ppc64le-zigmusl-cxx23-static, image: zig, artifact: ppc64le }
+          - { preset: linux-s390x-zigmusl-cxx23-static, image: zig, artifact: s390x }
     container:
       image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
       credentials:
@@ -325,18 +289,9 @@ jobs:
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v7
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
+      - uses: ./.github/actions/setup-workspace
         with:
-          # Same positive-glob scheme as the test job above; the full
-          # reasoning lives there.
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-linux-
+          cache-prefix: hfc-src2-linux-
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
@@ -361,10 +316,10 @@ jobs:
       # Static tool binaries for release.yml to package; the release
       # never rebuilds what ci already built and tested.
       - name: Upload static binaries
-        if: contains(matrix.preset, 'zigmusl')
+        if: matrix.artifact
         uses: actions/upload-artifact@v7
         with:
-          name: static-binaries-${{ contains(matrix.preset, 'riscv64') && 'riscv64' || contains(matrix.preset, 'ppc64le') && 'ppc64le' || contains(matrix.preset, 's390x') && 's390x' || 'x86_64' }}
+          name: static-binaries-${{ matrix.artifact }}
           retention-days: 3
           # The tests binary rides along for the hardware jobs (Cloud-V
           # boards run it natively); release packaging ignores it.
@@ -403,16 +358,9 @@ jobs:
           - { preset: windows-arm64-clangcl-cxx23, vcvars: x64_arm64, run_tests: false, upload: true }
     steps:
       - uses: actions/checkout@v7
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
+      - uses: ./.github/actions/setup-workspace
         with:
-          # Same positive-glob rule as the Linux jobs (see the test job);
-          # disjoint win- prefix (Windows checkouts differ: CRLF etc.).
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-win-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-win-
+          cache-prefix: hfc-src2-win-
       - name: Ensure ninja
         shell: pwsh
         run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
@@ -518,16 +466,9 @@ jobs:
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v7
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
+      - uses: ./.github/actions/setup-workspace
         with:
-          # Same positive-glob rule as the Linux jobs (see the test job);
-          # disjoint mac- prefix.
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-mac-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-mac-
+          cache-prefix: hfc-src2-mac-
       - name: Ensure ninja
         run: which ninja || brew install ninja
       - name: Configure, build, test
@@ -667,66 +608,6 @@ jobs:
           path: bench-report.txt
           retention-days: 7
 
-  # The aarch64 static musl chain, built cross in the zig image, binaries
-  # handed to the Neoverse job below and to release.yml.
-  build-arm64-static:
-    needs: [changes, images]
-    if: ${{ !cancelled() && needs.changes.result == 'success' && (needs.images.result == 'success' || needs.images.result == 'skipped') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    container:
-      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ needs.changes.outputs.tag }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      CMAKE_GENERATOR: Ninja
-    steps:
-      - uses: actions/checkout@v7
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
-        with:
-          # POSITIVE globs only: just the path-free *-src trees (the
-          # sources store nests another subbuild, hence the second line).
-          # Everything else under thirdparty/cache embeds absolute
-          # workspace paths in CMakeCache.txt files, so a cache written
-          # under one mount poisons every job with another; it all
-          # regenerates in seconds. Two hard-won rules encoded here:
-          # !dir exclusion patterns do NOT reliably prune a directory's
-          # contents (a mac cache shipped hfc/subbuild through them), so
-          # never cache-by-subtraction; and per-OS key prefixes must be
-          # DISJOINT, not extensions of each other (restore-keys
-          # hfc-src- happily matched hfc-src-mac-*: macOS/Linux caches
-          # cross-restore freely; only Windows ones are fenced by
-          # enableCrossOsArchive). Generation src2: pre-fix entries can
-          # never be restored.
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-linux-
-      # One default-config qemu ctest only: the SVE VL matrix already runs
-      # on the linux-arm64-gcc15 preset, and the Neoverse job covers VL=128
-      # on real silicon; repeating the emulation matrix here would only
-      # delay the runner waiting on this job's binaries.
-      - name: Build and test (default qemu config)
-        run: |
-          cmake --preset linux-arm64-zigmusl-cxx23-static
-          cmake --build build/linux-arm64-zigmusl-cxx23-static -j"$(nproc)"
-          ctest --test-dir build/linux-arm64-zigmusl-cxx23-static --output-on-failure
-      - uses: actions/upload-artifact@v7
-        with:
-          name: static-binaries-aarch64
-          retention-days: 3
-          path: |
-            build/linux-arm64-zigmusl-cxx23-static/tests/blake3pp_tests
-            build/linux-arm64-zigmusl-cxx23-static/cli/blake3ppsum
-            build/linux-arm64-zigmusl-cxx23-static/cli/blake3ppgen
-            build/linux-arm64-zigmusl-cxx23-static/bench/blake3pp_bench
-            build/linux-arm64-zigmusl-cxx23-static/bench/blake3pp_bench_file
-
   # Real ARM silicon, no emulator and no native toolchain: GitHub's free
   # arm64 runners are Azure Cobalt 100: Neoverse N2, Armv9 SVE2 at
   # VL=128, exactly the sve2_128 kernel's target hardware. Runs the
@@ -742,7 +623,7 @@ jobs:
   # hardware lanes are a deliberate opt-in spend, not a default.
   neoverse-test-bench:
     name: neoverse-n2 test+bench (real SVE2 silicon)
-    needs: build-arm64-static
+    needs: binaries
     # The !cancelled() + explicit result check is LOAD-BEARING, not
     # style: without a status function in the if, GitHub prepends an
     # implicit success() that fails when ANY TRANSITIVE ancestor was
@@ -751,7 +632,7 @@ jobs:
     # every descendant must break the cascade again. (This kept the
     # hardware lanes skipping for a day while vars, labels and direct
     # needs were all demonstrably correct.)
-    if: ${{ !cancelled() && needs.build-arm64-static.result == 'success' && vars.LINUX_ARM64_NATIVE == '1' }}
+    if: ${{ !cancelled() && needs.binaries.result == 'success' && vars.LINUX_ARM64_NATIVE == '1' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:

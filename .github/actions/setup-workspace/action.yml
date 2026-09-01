@@ -1,0 +1,45 @@
+name: setup-workspace
+description: >
+  git-trust + the hermetic dependency cache: the shared opening of
+  every build job, extracted after the copy grew to six. The CHECKOUT
+  is deliberately NOT in here and must precede this action in the job:
+  a local `uses: ./...` action is resolved from the workspace, so it
+  cannot perform the checkout it depends on (learned from a failed
+  run, not the docs).
+inputs:
+  cache-prefix:
+    description: >
+      Per-OS cache key prefix (hfc-src2-linux- / hfc-src2-win- /
+      hfc-src2-mac-). PREFIXES MUST BE DISJOINT, not extensions of one
+      another: restore-keys does string-prefix matching, and a bare
+      "hfc-src-" once restored a macOS cache into a Linux container
+      (macOS/Linux caches cross-restore freely; only Windows ones are
+      fenced by enableCrossOsArchive). The src2 generation exists so no
+      pre-fix cache entry is restorable.
+    required: true
+runs:
+  using: composite
+  steps:
+    # Container steps run as root while the version stamp shells out to
+    # git in a runner-owned checkout; without this git refuses with
+    # "dubious ownership" and the stamp falls back to the bare version.
+    # Harmless on the native windows/macos runners.
+    - name: Trust the checkout
+      shell: bash
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+    # POSITIVE globs only: just the path-free *-src trees (the sources
+    # store nests another subbuild, hence the second line). Everything
+    # else under thirdparty/cache embeds absolute workspace paths in
+    # CMakeCache.txt files, so a cache written under one mount poisons
+    # every job with another; it all regenerates in seconds. !dir
+    # exclusion patterns do not reliably prune a directory's contents
+    # (a macOS cache once shipped hfc/subbuild straight through them),
+    # so list the cached paths explicitly instead of excluding.
+    - name: Cache hermetic dependencies
+      uses: actions/cache@v6
+      with:
+        path: |
+          thirdparty/cache/*-src
+          thirdparty/cache/sources/*-src
+        key: ${{ inputs.cache-prefix }}${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
+        restore-keys: ${{ inputs.cache-prefix }}

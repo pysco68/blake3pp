@@ -255,17 +255,9 @@ jobs:
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v7
-      - name: Trust the checkout
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - name: Cache hermetic dependencies
-        uses: actions/cache@v6
+      - uses: ./.github/actions/setup-workspace
         with:
-          # Same positive-glob scheme as ci.yml; the reasoning lives there.
-          path: |
-            thirdparty/cache/*-src
-            thirdparty/cache/sources/*-src
-          key: hfc-src2-linux-${{ hashFiles('CMakeLists.txt', 'cmake/**/*.cmake', 'tests/CMakeLists.txt', 'bench/CMakeLists.txt', 'cli/CMakeLists.txt') }}
-          restore-keys: hfc-src2-linux-
+          cache-prefix: hfc-src2-linux-
       - name: Full release build
         run: sh tools/make-release.sh
       - name: Compute release identity

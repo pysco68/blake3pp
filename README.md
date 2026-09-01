@@ -38,10 +38,15 @@ the default allocator on every supported target (`BLAKE3PP_TOOL_MIMALLOC`,
 off only for wasm): full malloc override on POSIX, global operator
 new/delete override on Windows (the reliable static route there), keeping
 single-file executables. The library itself stays allocator-neutral.
-Binary releases are fully static Linux executables (x86_64 + aarch64,
-musl + mimalloc, built via `tools/make-release.sh` with the zig toolchain
-presets): no glibc version coupling, no dynamic loader, runtime SIMD
-dispatch intact, one file that runs on any distro.
+Binary releases cover five fully static Linux architectures (x86_64,
+aarch64, riscv64, ppc64le, s390x; musl + mimalloc via the zig toolchain
+presets: no glibc version coupling, no dynamic loader, runtime SIMD
+dispatch intact, one file per arch that runs on any distro), plus
+Windows x64/arm64 in both msvc and clang-cl, macOS (Apple silicon), and
+a node-runnable wasm32-simd128 build. CI publishes them as dev-*
+prereleases from every green main run; the riscv64 and s390x archives
+each carry one GCC-built kernel object inside an otherwise clang-built
+binary, because no single compiler speaks every vector dialect.
 
 Everything lives in `namespace blake3pp`, and
 `#include <blake3pp/blake3pp.hpp>` gets you all of it. Compile-cost-aware
