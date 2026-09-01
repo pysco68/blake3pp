@@ -173,42 +173,50 @@ jobs:
 
       - name: Compose release notes
         run: |
+          short=$(printf %s "$RELEASE_SHA" | cut -c1-12)
           {
-            echo "Automated prerelease of commit ${RELEASE_SHA} (ci green):"
-            echo "every archive contains exactly the bytes that ci run tested."
-            echo
-            echo "Linux (fully static musl+mimalloc; \`blake3ppsum\`,"
-            echo "\`blake3ppgen\`, benchmarks): x86_64 (SSE4.2 through AVX-512),"
-            echo "aarch64 (full NEON+SVE chain), riscv64 (RVV/Zvbb chain),"
-            echo "ppc64le (POWER VSX), s390x (z14 VXE, big-endian; both"
-            echo "emulator-tested, no hardware lane yet); runtime"
-            echo "dispatch throughout. Plus"
-            echo "windows-x86_64 in both compilers (msvc and clang-cl;"
-            echo "clang-cl carries the faster byte-rotate kernels;"
-            echo "IOCP+direct I/O in both), macos-arm64 (Apple clang,"
-            echo "GCD + F_NOCACHE I/O), wasm32-simd128 (node-runnable"
-            echo "js+wasm, SIMD128 kernel), and windows-arm64 in both"
-            echo "compilers (cross-built; tested natively only when the"
-            echo "ci run's windows-11-arm lane was enabled; check its"
-            echo "jobs)."
-            echo "Disposable: swept by release-cleanup after 90 days."
+            printf 'Automated prerelease of commit `%s` - every archive contains exactly the bytes this [ci run](%s/%s/actions/runs/%s) built and tested. Disposable: swept by release-cleanup after 90 days.\n\n' \
+              "$short" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "${{ github.event.workflow_run.id }}"
+            # The heredoc is indented to satisfy the YAML block scalar;
+            # sed strips exactly that indent back off.
+            sed -e 's/^          //' << 'NOTES'
+          Each archive ships `blake3ppsum`, `blake3ppgen`, and the benchmarks. All carry runtime SIMD dispatch: one binary, every listed kernel, the best one selected on the machine it runs on.
+
+          | archive | platform | SIMD kernels | validated on |
+          |---|---|---|---|
+          | `linux-x86_64-static` | Linux x86_64, static musl+mimalloc | sse42 / avx2 / avx512 | runner silicon + Intel SDE |
+          | `linux-aarch64-static` | Linux arm64, static | neon / sve256 / sve512 / sve2_128 | qemu SVE matrix; Neoverse N2 when the lane runs |
+          | `linux-riscv64-static` | Linux riscv64, static | rvv128-512 (+Zvbb twins), xthead (RVV 0.7.1, GCC-built object) | qemu VLEN matrix; Cloud-V boards when the lane runs |
+          | `linux-ppc64le-static` | Linux POWER, static | vsx (POWER9) | qemu only - no hardware lane yet |
+          | `linux-s390x-static` | Linux IBM z, static, **big-endian** | vxe (z14, GCC-built object) | qemu only - no hardware lane yet |
+          | `windows-x86_64-msvc` / `-clangcl` | Windows x64 | sse42 / avx2 / avx512 (clang-cl carries the faster byte-rotate kernels) | native runner; IOCP + direct I/O |
+          | `windows-arm64-clangcl` | Windows arm64 (cross-built) | neon | windows-11-arm runner when the lane runs |
+          | `windows-arm64-msvc` | Windows arm64 (cross-built) | scalar only - a deliberate verdict, see cmake/KernelVariants.cmake | windows-11-arm runner when the lane runs |
+          | `macos-arm64` | macOS Apple silicon | neon; GCD + F_NOCACHE I/O | native runner |
+          | `wasm32-simd128` | node >= 16 (js+wasm pairs) | simd128 | node on the runner |
+
+          Notes:
+          - The static Linux binaries have no glibc coupling and no dynamic loader - one file per architecture, runs on any distro.
+          - The static binaries are built with zig (clang + musl - the easiest fully-static route). Two kernels exceed what that toolchain can express - LLVM never merged XTheadVector, and its s390x backend scalarizes the z14 vector ops - so the riscv64 and s390x archives link those two kernel objects from GCC instead.
+          - `blake3ppsum --version` prints the compiled variants, the dispatch verdict for the running machine, and any variants the CPU supports that the build does not carry.
+          NOTES
             if ls bench-reports/*/bench-report.txt > /dev/null 2>&1; then
               echo
               echo "## Hardware test & bench reports (from the triggering ci run)"
               echo "_Shared-runner numbers are indicative ratios, not measurements._"
               for f in bench-reports/*/bench-report.txt; do
                 echo
+                echo '<details><summary>'
+                head -1 "$f" | sed 's/^== //; s/ ==$//'
+                echo '</summary>'
+                echo
                 echo '```'
                 cat "$f"
                 echo '```'
+                echo '</details>'
               done
             fi
           } > release-notes.md
-
-      # Two-phase publish: this repo has IMMUTABLE releases, which forbid
-      # attaching assets after publication, yet the action publishes
-      # before uploading. Create a DRAFT (drafts stay mutable), let the
-      # assets land in it, then flip it live in the next step.
       - name: Create draft prerelease with assets
         uses: softprops/action-gh-release@v3
         with:

@@ -44,9 +44,11 @@ presets: no glibc version coupling, no dynamic loader, runtime SIMD
 dispatch intact, one file per arch that runs on any distro), plus
 Windows x64/arm64 in both msvc and clang-cl, macOS (Apple silicon), and
 a node-runnable wasm32-simd128 build. CI publishes them as dev-*
-prereleases from every green main run; the riscv64 and s390x archives
-each carry one GCC-built kernel object inside an otherwise clang-built
-binary, because no single compiler speaks every vector dialect.
+prereleases from every green main run. The static binaries come from
+zig's clang+musl toolchain, the easiest fully-static route, and where
+that toolchain cannot express a kernel (LLVM never merged XTheadVector;
+its s390x backend scalarizes the z14 vector ops), the riscv64 and s390x
+archives link those two kernel objects from GCC instead.
 
 Everything lives in `namespace blake3pp`, and
 `#include <blake3pp/blake3pp.hpp>` gets you all of it. Compile-cost-aware
