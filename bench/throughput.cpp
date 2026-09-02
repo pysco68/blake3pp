@@ -3,26 +3,44 @@
 // pipeline, the reference implementation end-to-end, and the parallel
 // engine under different schedulers/kernels.
 //
-//   blake3pp_bench [--size MiB] [--reps N] [--cooldown S] [ARCH...]
+//   blake3pp_bench [--size MiB] [--reps N] [--cooldown S] [--pin CPU] [ARCH...]
 //
 // With no ARCH arguments, measures every variant available on this machine.
 // Reports the best of N repetitions, the interesting number for a
 // throughput ceiling; interference only ever slows a run down. Deliberately
 // framework-free: pair it with hyperfine when process-level statistics are
 // wanted.
+//
+// The single-thread rows run INTERLEAVED (pass = one rep of every row,
+// start row rotated per pass) rather than row-by-row, and each row prints
+// the CPUs it ran on. Both are scar tissue from the same incident: on a
+// heterogeneous phone (Exynos 2600) the row-by-row order let EAS upmigrate
+// the run onto the prime core over time, so whichever rows ran LAST won a
+// core class, not a comparison: a 21% phantom that looked exactly like a
+// microarchitecture finding. Interleaving makes placement and thermal
+// history symmetric across rows; --pin removes the variable entirely; the
+// per-row CPU report is how a reader of someone else's output can tell
+// which regime they are looking at.
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
 
 #include <CLI/CLI.hpp>
 #include <blake3pp/blake3pp.hpp>
@@ -138,6 +156,19 @@ constexpr asm_kernel asm_kernels[] = {
 namespace {
 using b3tool::println;
 
+// The interleaved passes print nothing until every pass has run, so a
+// human at a terminal gets a pass counter on stderr; logs (CI captures,
+// pipes) get silence instead of carriage-return soup.
+bool stderr_is_tty() {
+#if defined(_WIN32)
+  return _isatty(_fileno(stderr)) != 0;
+#elif defined(__unix__) || defined(__APPLE__)
+  return ::isatty(::fileno(stderr)) != 0;
+#else
+  return false;
+#endif
+}
+
 // Why the t16 tuner can disagree with the table above, settled by
 // measurement rather than argument. tune_transpose16() races the three
 // strategies over a 16 KiB working set reused hundreds of times (L1
@@ -235,6 +266,7 @@ int main(int argc, char** argv) {
   std::size_t mib = 512;
   int reps = 5;
   double cooldown_s = 5.0;
+  int pin_cpu = -1;
   unsigned pool_threads = 0;
   bool sweep_t16 = false;
   std::vector<blake3pp::arch> arches;
@@ -249,8 +281,12 @@ int main(int argc, char** argv) {
       ->check(CLI::PositiveNumber)
       ->capture_default_str();
   app.add_option("--cooldown", cooldown_s,
-                 "idle seconds between measurements (0 disables)")
+                 "idle seconds between interleaved passes (0 disables)")
       ->capture_default_str();
+  app.add_option("--pin", pin_cpu,
+                 "pin the single-thread rows to this CPU (the parallel rows "
+                 "always run with the startup affinity mask restored)")
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--threads", pool_threads,
                  "parallel-engine threads (0 = hardware concurrency)");
   app.add_flag("--t16-sweep", sweep_t16,
@@ -267,8 +303,26 @@ int main(int argc, char** argv) {
       ->transform(CLI::CheckedTransformer(arch_names, CLI::ignore_case));
   CLI11_PARSE(app, argc, argv);
 
+  // Startup affinity captured before any pin, so the parallel section can
+  // restore exactly what the process was given (which on Android/cpuset
+  // systems may already be less than the machine).
+  b3tool::thread_pin placement;
+  if (pin_cpu >= 0) {
+    if (!b3tool::thread_pin::supported()) {
+      println(stderr, "--pin: no thread-affinity API on this platform");
+      return 2;
+    }
+    if (!placement.pin(pin_cpu)) {
+      println(stderr,
+              "--pin {}: pinning failed (CPU offline, or outside this "
+              "process's cpuset?)",
+              pin_cpu);
+      return 2;
+    }
+  }
+
   if (sweep_t16) {
-    t16_sweep(reps, cooldown_s);
+    t16_sweep(reps, cooldown_s);  // single-threaded throughout: --pin holds
     return 0;
   }
 
@@ -284,30 +338,17 @@ int main(int argc, char** argv) {
     input[i] = static_cast<std::byte>(i % 251);
   }
 
-  println(stdout, "blake3pp throughput, {} MiB, best of {}, {:.0f}s cooldown",
+  println(stdout,
+          "blake3pp throughput, {} MiB, best of {} interleaved passes, "
+          "{:.0f}s cooldown",
           mib, reps, cooldown_s);
+  if (pin_cpu >= 0) {
+    println(stdout, "single-thread rows pinned to cpu {}", pin_cpu);
+  }
   println(stdout, "auto resolves to: {}\n",
           blake3pp::to_string(blake3pp::best_available()));
 
   b3tool::cooldown cooldown(cooldown_s);
-
-  // One measured table row: cool down, time the best of `reps` (plus an
-  // uncounted warmup), print. Every row in every section goes through here.
-  const auto row = [&](std::string_view label, std::string_view note,
-                       auto&& fn, int width = 10) {
-    cooldown();
-    blake3pp::digest d{};
-    const double best =
-        b3tool::best_seconds(reps, /*warmup=*/true, [&] { d = fn(); });
-    const double gib = b3tool::gib_per_s(input.size(), best);
-    if (note.empty()) {
-      println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)", label, width, gib,
-              d.to_hex().substr(0, 16));
-    } else {
-      println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)  [{}]", label, width,
-              gib, d.to_hex().substr(0, 16), note);
-    }
-  };
 
   // Hashes the whole input with one kernel table, sequentially.
   const auto hash_with = [&](const blake3pp::kern::kernel_ops* ops) {
@@ -316,40 +357,84 @@ int main(int argc, char** argv) {
     return h.finalize();
   };
 
-  println(stdout, "blake3pp kernels (single thread)");
+  // The single-thread rows are REGISTERED first and measured afterwards,
+  // interleaved (see the file comment): sections exist for printing only
+  // and say nothing about execution order.
+  struct bench_row {
+    std::string label;
+    std::string note;
+    int width = 10;
+    std::function<blake3pp::digest()> fn;  // null: info-only line
+    std::string info;
+    double best = 1e100;
+    blake3pp::digest d{};
+    std::set<int> cpus;  // every CPU any rep of this row ended on
+  };
+  struct bench_section {
+    std::string title;
+    std::vector<bench_row> rows;
+    std::function<void()> footer;  // extra print under the rows
+  };
+  std::vector<bench_section> sections;
+  const auto add_section = [&](std::string title) {
+    sections.emplace_back();
+    sections.back().title = std::move(title);
+  };
+  const auto add_row = [&](std::string label, std::string note,
+                           std::function<blake3pp::digest()> fn,
+                           int width = 10) {
+    bench_row r;
+    r.label = std::move(label);
+    r.note = std::move(note);
+    r.width = width;
+    r.fn = std::move(fn);
+    sections.back().rows.push_back(std::move(r));
+  };
+
+  add_section("blake3pp kernels (single thread)");
   for (const auto a : arches) {
     if (!blake3pp::is_available(a)) {
-      println(stdout, "  {:<10} unavailable on this machine",
-              blake3pp::to_string(a));
+      bench_row r;
+      r.label = std::string{blake3pp::to_string(a)};
+      r.info = "unavailable on this machine";
+      sections.back().rows.push_back(std::move(r));
       continue;
     }
-    row(blake3pp::to_string(a), "",
-        [&] { return hash_with(blake3pp::detail::resolve(a)); });
+    add_row(std::string{blake3pp::to_string(a)}, "",
+            [&, a] { return hash_with(blake3pp::detail::resolve(a)); });
   }
 
   // The width-16 transpose strategies, raced in-process (the dial is
   // runtime; no per-strategy binaries needed), plus what the tuner picks.
+  // Interleaved execution means the dial must be set per REP, inside fn,
+  // and put back so the neighboring rows see the default.
   if (const auto w16 = first_w16_arch(); w16.has_value()) {
     const auto saved = blake3pp::active_transpose16();
     for (const auto strat :
          {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
           blake3pp::transpose16::quartered}) {
-      blake3pp::set_transpose16(strat);
-      row(std::format("  t16-{}", blake3pp::to_string(strat)), "",
-          [&] { return hash_with(blake3pp::detail::resolve(*w16)); },
+      add_row(
+          std::format("  t16-{}", blake3pp::to_string(strat)), "",
+          [&, w16, strat, saved] {
+            blake3pp::set_transpose16(strat);
+            const auto d = hash_with(blake3pp::detail::resolve(*w16));
+            blake3pp::set_transpose16(saved);
+            return d;
+          },
           14);
     }
-    blake3pp::set_transpose16(saved);
-    cooldown();
-    // Tuned for THIS run's input size, so the verdict is comparable to the
-    // three rows above it. The winner depends on the size (cache-resident
-    // inputs rank the strategies differently from streaming ones), so a
-    // tuner asked about a different size than the table measures has every
-    // right to disagree with it.
-    println(stdout, "    t16 tuner picks: {} (tuned for {} MiB)",
-            blake3pp::to_string(blake3pp::tune_transpose16(input.size())),
-            mib);
-    blake3pp::set_transpose16(saved);
+    sections.back().footer = [&, saved] {
+      cooldown();
+      // Tuned for THIS run's input size, so the verdict is comparable to
+      // the three rows above it. The winner depends on the size
+      // (cache-resident inputs rank the strategies differently from
+      // streaming ones), so a tuner asked about a different size than the
+      // table measures has every right to disagree with it.
+      println(stdout, "    t16 tuner picks: {} (tuned for {} MiB)",
+              blake3pp::to_string(blake3pp::tune_transpose16(input.size())),
+              mib);
+      blake3pp::set_transpose16(saved);
+    };
   }
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
@@ -360,16 +445,14 @@ int main(int argc, char** argv) {
   // <-> avx512); always compare a reference row against its same-ISA twin,
   // never against the end-to-end `reference` row, which picks its own
   // best ISA.
-  println(stdout,
-          "\nreference impl. kernels in the blake3pp pipeline "
-          "(single thread, BLAKE3 {})",
-          BLAKE3_VERSION_STRING);
-  {
-    blake3pp::kern::kernel_ops port_ops =
-        *blake3pp::detail::resolve(blake3pp::arch::scalar);
-    port_ops.hash_many = &portable_hash_many;
-    row("portable", "", [&] { return hash_with(&port_ops); });
-  }
+  add_section(
+      std::format("reference impl. kernels in the blake3pp pipeline "
+                  "(single thread, BLAKE3 {})",
+                  BLAKE3_VERSION_STRING));
+  blake3pp::kern::kernel_ops port_ops =
+      *blake3pp::detail::resolve(blake3pp::arch::scalar);
+  port_ops.hash_many = &portable_hash_many;
+  add_row("portable", "", [&] { return hash_with(&port_ops); });
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
   // One row per wide reference kernel this machine can run. The widest one
@@ -381,18 +464,21 @@ int main(int argc, char** argv) {
     if (!blake3pp::is_available(k.variant)) {
       continue;
     }
-    blake3pp::kern::kernel_ops ops = *blake3pp::detail::resolve(k.variant);
-    ops.hash_many = k.hash_many;  // compress_in_place stays portable
-    row(k.row, k.note, [&] { return hash_with(&ops); });
-    asm_ops = ops;
+    add_row(k.row, k.note, [&, k] {
+      blake3pp::kern::kernel_ops ops = *blake3pp::detail::resolve(k.variant);
+      ops.hash_many = k.hash_many;  // compress_in_place stays portable
+      return hash_with(&ops);
+    });
+    asm_ops = *blake3pp::detail::resolve(k.variant);
+    asm_ops.hash_many = k.hash_many;
     asm_row = k.row;
   }
 #endif
 
   // The reference implementation as shipped: its own runtime dispatch, same
   // input. The digest must match every row above.
-  println(stdout, "\nreference impl. end-to-end (single thread, own dispatch)");
-  row("reference", "", [&] {
+  add_section("reference impl. end-to-end (single thread, own dispatch)");
+  add_row("reference", "", [&] {
     blake3_hasher h;
     blake3_hasher_init(&h);
     blake3_hasher_update(&h, input.data(), input.size());
@@ -408,18 +494,130 @@ int main(int argc, char** argv) {
   // costs more than the raw kernel loop at this width". The reference
   // e2e row above has had this mirror all along; ours was the blind
   // spot while chasing the width-16 pool anomaly.
-  println(stdout, "\nblake3pp end-to-end (single thread)");
-  row("blake3pp", "", [&] {
+  add_section("blake3pp end-to-end (single thread)");
+  add_row("blake3pp", "", [&] {
     return blake3pp::hash(std::span<const std::byte>{input});
   });
+
+  // --- measurement: rep-outer, row-inner, start row rotated per pass ---
+  // Pass -1 is the uncounted warmup. Cooldown idles between PASSES, not
+  // rows: an idle gap between rows is exactly what let EAS reset its
+  // upmigration on the Exynos, handing the post-gap row a different core
+  // class than its neighbors. Rotation gives every row every position in
+  // the pass order across reps, so whatever thermal/placement drift a
+  // position carries is spread evenly before best-of picks the ceiling.
+  std::vector<bench_row*> flat;
+  for (auto& s : sections) {
+    for (auto& r : s.rows) {
+      if (r.fn) {
+        flat.push_back(&r);
+      }
+    }
+  }
+  const bool progress = stderr_is_tty();
+  for (int pass = 0; pass <= reps && !flat.empty(); ++pass) {
+    cooldown();
+    if (progress) {
+      b3tool::print(stderr, "\r[pass {}/{}{}] ", pass + 1, reps + 1,
+                    pass == 0 ? ", warmup" : "");
+      std::fflush(stderr);
+    }
+    for (std::size_t i = 0; i < flat.size(); ++i) {
+      bench_row& r = *flat[(i + static_cast<std::size_t>(pass)) % flat.size()];
+      const auto t0 = std::chrono::steady_clock::now();
+      r.d = r.fn();
+      const auto t1 = std::chrono::steady_clock::now();
+      if (const int cpu = b3tool::current_cpu(); cpu >= 0) {
+        r.cpus.insert(cpu);
+      }
+      const double s = std::chrono::duration<double>(t1 - t0).count();
+      if (pass > 0 && s < r.best) {
+        r.best = s;
+      }
+    }
+  }
+  if (progress) {
+    b3tool::print(stderr, "\r{:24}\r", "");
+    std::fflush(stderr);
+  }
+
+  const auto join_cpus = [](const std::set<int>& cpus) {
+    std::string out;
+    for (const int c : cpus) {
+      out += out.empty() ? std::format("{}", c) : std::format(",{}", c);
+    }
+    return out;
+  };
+
+  std::set<int> cpus_seen;
+  bool first_section = true;
+  for (auto& s : sections) {
+    println(stdout, "{}{}", first_section ? "" : "\n", s.title);
+    first_section = false;
+    for (auto& r : s.rows) {
+      if (!r.fn) {
+        println(stdout, "  {:<{}} {}", r.label, r.width, r.info);
+        continue;
+      }
+      cpus_seen.insert(r.cpus.begin(), r.cpus.end());
+      std::string note{r.note};
+      if (!r.cpus.empty()) {
+        note += std::format("{}cpu {}", note.empty() ? "" : ", ",
+                            join_cpus(r.cpus));
+      }
+      const double gib = b3tool::gib_per_s(input.size(), r.best);
+      if (note.empty()) {
+        println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)", r.label, r.width,
+                gib, r.d.to_hex().substr(0, 16));
+      } else {
+        println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)  [{}]", r.label,
+                r.width, gib, r.d.to_hex().substr(0, 16), note);
+      }
+    }
+    if (s.footer) {
+      s.footer();
+    }
+  }
+  if (cpus_seen.size() > 1) {
+    println(stdout,
+            "\n  note: the single-thread rows ran on {} different CPUs "
+            "({}). On machines with more than one core class such rows "
+            "are not comparable; rerun with --pin <cpu>.",
+            cpus_seen.size(), join_cpus(cpus_seen));
+  }
 
   // The sender-based parallel engine over the whole tree: the numbers that
   // matter for feeding modern storage. Rows are kernel/scheduler pairings.
   // --threads is honored exactly under stdexec (an owned pool of that
   // size); other providers fall back to the process-wide scheduler.
+  // The pool must see the machine, not the pin: restore the startup mask
+  // BEFORE the pool is constructed, since on Linux new threads inherit the
+  // creating thread's affinity, so a leaked --pin 9 would silently turn
+  // the N-thread rows into one-core numbers. The affinity count in the
+  // header is the receipt (and also exposes an Android cpuset that hands
+  // the process fewer CPUs than the machine has).
+  placement.restore();
   const unsigned nthreads =
       pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
-  println(stdout, "\nparallel engine ({} threads)", nthreads);
+  const int affinity = b3tool::affinity_cpu_count();
+  println(stdout, "\nparallel engine ({} threads{})", nthreads,
+          affinity > 0 ? std::format(", affinity mask: {} cpus", affinity)
+                       : std::string{});
+
+  // A parallel table row, measured and printed immediately (interleaving
+  // exists for the single-thread comparisons; these rows use every core by
+  // construction, so placement symmetry is moot).
+  const auto row = [&](std::string_view label, std::string_view note,
+                       auto&& fn, int width = 15) {
+    cooldown();
+    blake3pp::digest d{};
+    const double best =
+        b3tool::best_seconds(reps, /*warmup=*/true, [&] { d = fn(); });
+    const double gib = b3tool::gib_per_s(input.size(), best);
+    println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)  [{}]", label, width,
+            gib, d.to_hex().substr(0, 16), note);
+  };
+
   // An OWNED pool at exactly nthreads, not b3tool::compute_pool, whose
   // scheduler() has a threads>1 precondition (--threads 1 is a valid and
   // interesting measurement here: pool machinery at zero parallelism).
@@ -436,8 +634,7 @@ int main(int argc, char** argv) {
     auto sched = engine_sched;
     row("blake3pp/pool",
         std::format("{} pool", blake3pp::execution_provider()),
-        [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); },
-        15);
+        [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); });
   }
 
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)

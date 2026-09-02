@@ -1,7 +1,9 @@
 #pragma once
 
+#include <bit>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <format>
 #include <thread>
@@ -21,8 +23,18 @@
 #endif
 
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <fcntl.h>
 #include <io.h>
+#include <windows.h>
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace b3tool {
@@ -97,6 +109,142 @@ class compute_pool {
   std::optional<exec::static_thread_pool> pool_;
 #endif
 };
+
+// --- Thread placement -------------------------------------------------------
+// Heterogeneous machines (phone big.LITTLE, M-series P/E) migrate a busy
+// thread between core CLASSES mid-run, so single-thread rows from the same
+// run are not automatically comparable (measured as a 21% phantom on an
+// Exynos 2600, where the row that happened to run last inherited the prime
+// core). These helpers make placement visible (current_cpu per row) and
+// controllable (--pin).
+//
+// Linux goes through raw syscalls rather than sched_setaffinity()/
+// sched_getcpu(): the libc wrappers hide behind _GNU_SOURCE, which musl
+// does not define for us under every frontend we ship, and a header is the
+// wrong place to define it. Same visible-moving-parts spirit as the
+// io_uring and hwprobe call sites.
+
+// Which CPU the calling thread is on right now, -1 where the OS offers no
+// answer (macOS has no API for it). Printed per bench row: the Exynos
+// failure was not "could not pin" but "did not know the rows ran on
+// different cores"; a reader of someone else's bench output has no other
+// way to see it.
+inline int current_cpu() noexcept {
+#if defined(__linux__)
+  unsigned cpu = 0;
+  return ::syscall(SYS_getcpu, &cpu, nullptr, nullptr) == 0
+             ? static_cast<int>(cpu)
+             : -1;
+#elif defined(_WIN32)
+  return static_cast<int>(::GetCurrentProcessorNumber());
+#else
+  return -1;
+#endif
+}
+
+// Pins the CALLING thread and restores the startup mask on request. The
+// restore MUST happen before any thread pool is constructed: on Linux new
+// threads inherit the creating thread's affinity, so a leaked pin silently
+// turns an N-thread pool into a one-core pool. (Windows threads inherit
+// the process mask instead; the restore is harmless there.)
+class thread_pin {
+ public:
+#if defined(__linux__)
+  // 1024 CPUs, the same ceiling glibc's cpu_set_t defaults to.
+  struct mask {
+    unsigned long bits[128 / sizeof(unsigned long)] = {};
+  };
+
+  thread_pin() noexcept {
+    saved_ok_ =
+        ::syscall(SYS_sched_getaffinity, 0, sizeof(saved_), &saved_) > 0;
+  }
+
+  [[nodiscard]] bool pin(int cpu) noexcept {
+    if (cpu < 0 || static_cast<unsigned>(cpu) >= sizeof(mask) * 8) {
+      return false;
+    }
+    mask m;
+    m.bits[static_cast<unsigned>(cpu) / (sizeof(unsigned long) * 8)] |=
+        1ul << (static_cast<unsigned>(cpu) % (sizeof(unsigned long) * 8));
+    return ::syscall(SYS_sched_setaffinity, 0, sizeof(m), &m) == 0;
+  }
+
+  void restore() noexcept {
+    if (saved_ok_) {
+      ::syscall(SYS_sched_setaffinity, 0, sizeof(saved_), &saved_);
+    }
+  }
+
+ private:
+  mask saved_{};
+  bool saved_ok_ = false;
+#elif defined(_WIN32)
+  thread_pin() noexcept {
+    DWORD_PTR sys = 0;
+    saved_ok_ = ::GetProcessAffinityMask(::GetCurrentProcess(), &saved_,
+                                         &sys) != 0;
+  }
+
+  [[nodiscard]] bool pin(int cpu) noexcept {
+    if (cpu < 0 || cpu >= static_cast<int>(sizeof(DWORD_PTR) * 8)) {
+      return false;
+    }
+    return ::SetThreadAffinityMask(::GetCurrentThread(),
+                                   DWORD_PTR{1} << cpu) != 0;
+  }
+
+  void restore() noexcept {
+    if (saved_ok_) {
+      ::SetThreadAffinityMask(::GetCurrentThread(), saved_);
+    }
+  }
+
+ private:
+  DWORD_PTR saved_ = 0;
+  bool saved_ok_ = false;
+#else
+  thread_pin() noexcept = default;
+  [[nodiscard]] static bool pin(int) noexcept { return false; }
+  static void restore() noexcept {}
+#endif
+
+ public:
+  static constexpr bool supported() noexcept {
+#if defined(__linux__) || defined(_WIN32)
+    return true;
+#else
+    return false;
+#endif
+  }
+};
+
+// How many CPUs the calling thread may run on, -1 if unknowable. Printed
+// in the parallel-engine header so a leaked --pin (or an Android cpuset
+// hiding cores) is visible in the output instead of silently shrinking
+// an "N-thread" number.
+inline int affinity_cpu_count() noexcept {
+#if defined(__linux__)
+  thread_pin::mask m;
+  if (::syscall(SYS_sched_getaffinity, 0, sizeof(m), &m) <= 0) {
+    return -1;
+  }
+  int n = 0;
+  for (const unsigned long w : m.bits) {
+    n += std::popcount(w);
+  }
+  return n;
+#elif defined(_WIN32)
+  DWORD_PTR proc = 0;
+  DWORD_PTR sys = 0;
+  if (!::GetProcessAffinityMask(::GetCurrentProcess(), &proc, &sys)) {
+    return -1;
+  }
+  return std::popcount(static_cast<std::uint64_t>(proc));
+#else
+  return -1;
+#endif
+}
 
 // --- Measurement ------------------------------------------------------------
 // The benchmarks are deliberately framework-free (pair them with hyperfine

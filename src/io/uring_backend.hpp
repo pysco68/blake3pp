@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -54,11 +55,33 @@ inline int sys_io_uring_enter(int ring_fd, unsigned to_submit,
                                     min_complete, flags, nullptr, 0));
 }
 
+// Names the reason the ring is absent, for the fallback backend name the
+// tools print. Without this, "blocked by policy" (Android's seccomp
+// filter, EPERM) and "kernel too old" (ENOSYS) are indistinguishable in
+// bench output: a fourth kind of quiet degradation the backend line
+// otherwise wouldn't confess to, in the same spirit as --version's "cpu
+// also supports X (not compiled in)".
+inline std::string no_uring_suffix(int err) {
+  switch (err) {
+    case EPERM:
+      return " [io_uring: EPERM, blocked by policy]";
+    case ENOSYS:
+      return " [io_uring: ENOSYS, kernel too old]";
+    default:
+      return " [io_uring: errno " + std::to_string(err) + "]";
+  }
+}
+
 // The mapped rings, reduced to what this pipeline needs. Kernel-shared
 // integers are accessed through atomic_ref with acquire/release, per the
 // io_uring memory-ordering contract.
 struct uring {
   int fd = -1;
+  // errno from a failed io_uring_setup. EPERM (a seccomp policy forbids
+  // the syscall; Android does) and ENOSYS (kernel predates io_uring) are
+  // the same observable with entirely different causes, so the fallback
+  // name below reports which one fired.
+  int setup_errno = 0;
   unsigned sq_entries = 0;
   unsigned cq_entries = 0;
   void* sq_ring = nullptr;
@@ -85,6 +108,7 @@ struct uring {
     std::memset(&p, 0, sizeof(p));
     fd = sys_io_uring_setup(entries, &p);
     if (fd < 0) {
+      setup_errno = errno;
       return false;
     }
     sq_entries = p.sq_entries;
@@ -209,6 +233,9 @@ class uring_reader {
     }
     name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
                        : (f_.direct ? "pread+direct" : "pread");
+    if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
+      name_ += no_uring_suffix(ring_.setup_errno);
+    }
   }
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
@@ -273,7 +300,7 @@ class uring_reader {
   std::vector<slot> slots_;
   std::uint64_t size_ = 0;
   bool use_uring_ = false;
-  std::string_view name_ = "pread";
+  std::string name_ = "pread";
 };
 
 class uring_writer {
@@ -300,6 +327,9 @@ class uring_writer {
     }
     name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
                        : (f_.direct ? "pwrite+direct" : "pwrite");
+    if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
+      name_ += no_uring_suffix(ring_.setup_errno);
+    }
   }
 
   [[nodiscard]] std::string_view name() const noexcept { return name_; }
@@ -370,7 +400,7 @@ class uring_writer {
   std::vector<slot> slots_;
   std::uint64_t prealloc_ = 0;
   bool use_uring_ = false;
-  std::string_view name_ = "pwrite";
+  std::string name_ = "pwrite";
 };
 
 // Definition-site conformance check. Concepts only verify use-sites, so
