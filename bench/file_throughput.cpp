@@ -22,8 +22,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <format>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__)
@@ -71,10 +73,44 @@ bool drop_caches() {
 #endif
 }
 
+// --threads resolved to a scheduler: an owned pool of exactly that size
+// under stdexec, the process-wide scheduler elsewhere. The option exists
+// as a DIAGNOSTIC for the sync-tier oversubscription question (the pread
+// fallback's reader is an implicit extra thread the pool doesn't know
+// about, i.e. 11 runnable threads on a 10-core phone): sweep N-1/N/N+1 to
+// separate reader starvation from other shortfalls.
+class engine_threads {
+ public:
+  explicit engine_threads(unsigned threads)
+      : threads_(threads != 0 ? threads : std::thread::hardware_concurrency())
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+        ,
+        pool_(threads_)
+#endif
+  {
+  }
+
+  [[nodiscard]] unsigned count() const noexcept { return threads_; }
+
+  [[nodiscard]] blake3pp::parallel_scheduler_t scheduler() {
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+    return pool_.get_scheduler();
+#else
+    return blake3pp::get_parallel_scheduler();
+#endif
+  }
+
+ private:
+  unsigned threads_;
+#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+  exec::static_thread_pool pool_;
+#endif
+};
+
 // The window x qd pacing matrix: same measurement as the main rows, swept.
 void io_sweep(const std::string& path, std::uint64_t bytes,
               blake3pp::hash_file_options opts, int reps, double cooldown_s,
-              bool seq_only) {
+              bool seq_only, unsigned pool_threads) {
   constexpr std::size_t windows[] = {8, 16, 32, 64};
   constexpr unsigned depths[] = {4, 8, 16, 32};
 
@@ -97,7 +133,8 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
   std::printf("\n");
 
   b3tool::cooldown cooldown(cooldown_s);
-  auto sched = blake3pp::get_parallel_scheduler();
+  engine_threads engine(pool_threads);
+  auto sched = engine.scheduler();
   double best_gibs = 0.0;
   double default_gibs = 0.0;
   std::size_t best_w = 0;
@@ -154,6 +191,7 @@ int main(int argc, char** argv) {
   double cooldown_s = 5.0;
   std::size_t window_mib = 8;
   std::size_t make_mib = 0;
+  unsigned pool_threads = 0;
   bool seq_only = false;
   blake3pp::hash_file_options opts;
 
@@ -175,6 +213,10 @@ int main(int argc, char** argv) {
   app.add_option("--qd", opts.queue_depth, "I/O queue depth")
       ->check(CLI::Range(2u, 32u))
       ->capture_default_str();
+  app.add_option("--threads", pool_threads,
+                 "parallel-engine threads (0 = hardware concurrency); "
+                 "diagnostic: sweep N-1/N/N+1 to test whether the sync-tier "
+                 "reader is starving as the N+1th runnable thread");
   app.add_flag("!--no-direct", opts.direct_io,
                "keep the OS page cache (no O_DIRECT)");
   app.add_flag("--seq-only", seq_only, "skip the parallel measurement");
@@ -206,7 +248,7 @@ int main(int argc, char** argv) {
             probe.backend(), opts.window_bytes >> 20, opts.queue_depth);
   }
   if (sweep) {
-    io_sweep(path, bytes, opts, reps, cooldown_s, seq_only);
+    io_sweep(path, bytes, opts, reps, cooldown_s, seq_only, pool_threads);
     return 0;
   }
 
@@ -246,7 +288,13 @@ int main(int argc, char** argv) {
   run("seq", [&] { return blake3pp::hash_file(path.c_str(), opts); });
 
   if (!seq_only) {
-    auto sched = blake3pp::get_parallel_scheduler();
+    engine_threads engine(pool_threads);
+    auto sched = engine.scheduler();
+    println(stdout, "parallel:   {} threads, affinity mask: {}",
+            engine.count(),
+            b3tool::affinity_cpu_count() > 0
+                ? std::format("{} cpus", b3tool::affinity_cpu_count())
+                : std::string{"unknown"});
     run("parallel",
         [&] { return blake3pp::hash_file(path.c_str(), sched, opts); });
   }
