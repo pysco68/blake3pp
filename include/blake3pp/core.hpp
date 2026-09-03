@@ -140,8 +140,7 @@ class output_reader {
 /// h.update(header);
 /// h.update(body);                      // std::span<const std::byte> or string_view
 /// blake3pp::digest d = h.finalize();   // non-destructive
-/// std::array<std::byte, 64> wide;
-/// h.finalize(wide);                    // the first 64 bytes of the XOF stream
+/// auto wide = h.finalize<64>();        // the first 64 bytes of the XOF stream
 /// @endcode
 class hasher {
  public:
@@ -180,6 +179,12 @@ class hasher {
   /// @param a        The variant to run on.
   [[nodiscard]] static hasher derive_key(std::string_view context,
                                          arch a = arch::auto_detect) noexcept;
+  /// Key-derivation mode on a caller-supplied kernel table (see the expert
+  /// constructor).
+  /// @param context  The domain-separation string.
+  /// @param ops      The kernel table; must outlive the hasher.
+  [[nodiscard]] static hasher derive_key(std::string_view context,
+                                         const kern::kernel_ops* ops) noexcept;
 
   /// Absorbs the next bytes of the message.
   /// @param input  Any length, including zero.

@@ -166,10 +166,10 @@ auto storage_key =
 
 Both modes compose with everything else: `hasher::keyed`/
 `hasher::derive_key` give incremental hashing, `keyed_hash(key, data,
-sched)` and a keyed `parallel_hasher` constructor go multi-core, and a
-keyed or derive_key hasher takes file input through `update_file()`.
-Authenticated file manifests at full pipeline speed are one line either
-way:
+sched)` and the keyed and derive_key `parallel_hasher` constructors go
+multi-core, and a keyed or derive_key hasher takes file input through
+`update_file()`. Authenticated file manifests at full pipeline speed are
+one line either way:
 
 ```cpp
 auto tag = blake3pp::hash_file(path, pool.get_scheduler(), {.key = key});
@@ -335,8 +335,10 @@ The sender/receiver provider itself is a build-time choice
 [beman.execution]: https://github.com/bemanproject/execution
 
 When the data arrives in pieces, `parallel_hasher` has the exact
-interface of `hasher`, with the multi-core fan-out (and all of BLAKE3's
-subtree-alignment and final-chunk discipline) handled internally:
+interface of `hasher` (all three modes, the whole finalize family
+including `finalize_xof()`), with the multi-core fan-out and all of
+BLAKE3's subtree-alignment and final-chunk discipline handled
+internally:
 
 ```cpp
 blake3pp::parallel_hasher ph{blake3pp::get_parallel_scheduler()};

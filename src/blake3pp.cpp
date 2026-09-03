@@ -50,7 +50,11 @@ hasher hasher::keyed(std::span<const std::byte, 32> key,
 }
 
 hasher hasher::derive_key(std::string_view context, arch a) noexcept {
-  const kern::kernel_ops* const ops = detail::resolve(a);
+  return derive_key(context, detail::resolve(a));
+}
+
+hasher hasher::derive_key(std::string_view context,
+                          const kern::kernel_ops* ops) noexcept {
   // Stage 1: hash the context string in DERIVE_KEY_CONTEXT mode...
   hasher ctx(ops, kern::iv, kern::flag_derive_key_context);
   ctx.update(context);

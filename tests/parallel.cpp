@@ -1,4 +1,6 @@
+#include <array>
 #include <cstddef>
+#include <string_view>
 #include <vector>
 
 #include <blake3pp/parallel.hpp>
@@ -96,6 +98,50 @@ TEST_CASE("keyed mode propagates through every parallel quadrant") {
   ph.update(std::span{input}.first(1024 * 1024 + 3));
   ph.update(std::span{input}.subspan(1024 * 1024 + 3));
   CHECK(ph.finalize() == expected);
+}
+
+TEST_CASE("derive_key mode matches sequential through parallel_hasher") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  const auto material = make_input(3 * 1024 * 1024 + 41);
+  constexpr std::string_view context = "blake3pp tests 2026-09 derive";
+
+  blake3pp::hasher seq = blake3pp::hasher::derive_key(context);
+  seq.update(material);
+
+  blake3pp::parallel_hasher ph{sched, context, {.window_bytes = 512 * 1024}};
+  ph.update(material);
+  CHECK(ph.finalize() == seq.finalize());
+  CHECK(ph.finalize() != blake3pp::hash(material));  // the context matters
+}
+
+// The XOF finalize family must produce the sequential hasher's stream
+// bit for bit, and stay non-destructive on the parallel side too.
+TEST_CASE("parallel_hasher XOF forms match the sequential stream") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  const auto input = make_input(5 * 1024 * 1024 + 259);
+
+  blake3pp::hasher seq;
+  seq.update(input);
+
+  blake3pp::parallel_hasher ph{sched, {.window_bytes = 512 * 1024}};
+  ph.update(input);
+
+  CHECK(ph.finalize<131>() == seq.finalize<131>());
+
+  std::array<std::byte, 200> wide{};
+  ph.finalize(wide);
+  std::array<std::byte, 200> wide_seq{};
+  seq.finalize(wide_seq);
+  CHECK(wide == wide_seq);
+
+  auto r = ph.finalize_xof();
+  r.seek(1'000'000);
+  auto rs = seq.finalize_xof();
+  rs.seek(1'000'000);
+  CHECK(r.take<64>() == rs.take<64>());
+
+  // Still non-destructive: the plain digest survives all of the above.
+  CHECK(ph.finalize() == seq.finalize());
 }
 
 TEST_CASE("parallel hash is deterministic across runs") {

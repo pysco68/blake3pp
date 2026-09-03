@@ -337,6 +337,19 @@ class parallel_hasher {
         window_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
+  /// Key-derivation mode: the input is the key material, domain-separated
+  /// by context (see hasher::derive_key).
+  /// @param sched    Where the subtree reductions run.
+  /// @param context  The domain-separation string; not a secret.
+  /// @param opts     The variant and the window size.
+  parallel_hasher(Scheduler sched, std::string_view context,
+                  const parallel_hasher_options& opts = {})
+      : sched_(std::move(sched)),
+        ops_(detail::resolve(opts.a)),
+        h_(hasher::derive_key(context, ops_)),
+        window_(std::bit_floor(
+            std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
+
   /// Absorbs the next bytes of the message; complete windows are fanned
   /// out over the scheduler from here.
   /// @param input  Any length, including zero.
@@ -364,10 +377,24 @@ class parallel_hasher {
   }
 
   /// The digest of everything absorbed so far; the hasher stays usable.
-  [[nodiscard]] digest finalize() const {
-    hasher h = h_;  // flat value type; copying keeps finalize() const
-    h.update(std::span<const std::byte>{window_.data(), filled_});
-    return h.finalize();
+  [[nodiscard]] digest finalize() const { return drained().finalize(); }
+
+  /// Extended output: fills out with the first out.size() bytes of the
+  /// output stream.
+  /// @param out  Any length.
+  void finalize(std::span<std::byte> out) const { drained().finalize(out); }
+
+  /// Extended output by value: the first N bytes of the output stream.
+  /// @tparam N  The number of bytes to return.
+  template <std::size_t N>
+  [[nodiscard]] std::array<std::byte, N> finalize() const {
+    return drained().template finalize<N>();
+  }
+
+  /// Extended output as a seekable stream, independent of this
+  /// parallel_hasher afterwards.
+  [[nodiscard]] output_reader finalize_xof() const {
+    return drained().finalize_xof();
   }
 
   /// Returns the hasher to its just-constructed state, keeping its mode,
@@ -384,6 +411,15 @@ class parallel_hasher {
   }
 
  private:
+  // The finalize seam: a copy of the flat internal hasher with the
+  // buffered tail absorbed. Copying is what keeps every finalize form
+  // const and non-destructive, exactly like hasher's.
+  [[nodiscard]] hasher drained() const {
+    hasher h = h_;
+    h.update(std::span<const std::byte>{window_.data(), filled_});
+    return h;
+  }
+
   void flush_window() {
     const std::size_t chunks = window_.size() / chunk_size;
     detail::hash_window_parallel(ops_, sched_, h_, window_.data(), chunks,
