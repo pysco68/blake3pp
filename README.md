@@ -2,13 +2,21 @@
 
 A C++20-and-later BLAKE3 implementation built as a case study in
 hardware-saturating, portable C++26-forward design: `std::simd` and
-`std::execution` where the standard library provides them, drop-in polyfills
-(xsimd, stdexec) where it doesn't, multi-architecture SIMD kernels compiled
-into a single binary with zero-overhead runtime dispatch, covering SSE4.2
-through AVX-512 on x86, NEON plus fixed-length SVE/SVE2 on ARM, RVV 1.0
-with its Zvbb rotate (and, opt-in, T-Head's draft-0.7.1 XTheadVector) on
-RISC-V, and SIMD128 on wasm; plus OS-native direct I/O behind a unified
-interface.
+`std::execution` where the standard library provides them, drop-in
+polyfills (xsimd, stdexec) where it doesn't, OS-native direct I/O behind
+a unified interface, and multi-architecture SIMD kernels compiled into a
+single binary with zero-overhead runtime dispatch:
+
+| architecture  | kernels |
+|---------------|---------|
+| x86-64        | SSE4.2, AVX2, AVX-512 |
+| ARM (aarch64) | NEON; fixed-length SVE 256/512 and SVE2 128 (more VLs opt-in) |
+| RISC-V        | RVV 1.0 at VLEN 128/256/512, each with a Zvbb-rotate twin; opt-in T-Head draft-0.7.1 XTheadVector |
+| POWER         | VSX |
+| IBM z         | VXE (z14+, **big-endian**) |
+| wasm          | SIMD128 (see [The wasm build](#the-wasm-build)) |
+
+Every build also carries a scalar kernel as fallback option. 
 
 ## Using the library
 
@@ -38,17 +46,22 @@ the default allocator on every supported target (`BLAKE3PP_TOOL_MIMALLOC`,
 off only for wasm): full malloc override on POSIX, global operator
 new/delete override on Windows (the reliable static route there), keeping
 single-file executables. The library itself stays allocator-neutral.
-Binary releases cover five fully static Linux architectures (x86_64,
-aarch64, riscv64, ppc64le, s390x; musl + mimalloc via the zig toolchain
-presets: no glibc version coupling, no dynamic loader, runtime SIMD
-dispatch intact, one file per arch that runs on any distro), plus
-Windows x64/arm64 in both msvc and clang-cl, macOS (Apple silicon), and
-a node-runnable wasm32-simd128 build. CI publishes them as dev-*
-prereleases from every green main run. The static binaries come from
-zig's clang+musl toolchain, the easiest fully-static route, and where
-that toolchain cannot express a kernel (LLVM never merged XTheadVector;
-its s390x backend scalarizes the z14 vector ops), the riscv64 and s390x
-archives link those two kernel objects from GCC instead.
+
+CI publishes binary releases as dev-* prereleases from every green main
+run:
+
+| release | targets | toolchain |
+|---------|---------|-----------|
+| Linux, fully static | x86_64, aarch64, riscv64, ppc64le, s390x | zig (clang + musl) |
+| Windows | x64 and arm64, each in msvc AND clang-cl | VS toolset |
+| macOS | Apple silicon | Apple clang |
+| wasm | wasm32-simd128, node-runnable js+wasm pairs | Emscripten |
+
+The static Linux binaries are one file per architecture that runs on
+any distro: no glibc version coupling, no dynamic loader, runtime SIMD
+dispatch intact. Two of them are even the work of two compilers at
+once. How that works, and why it holds up, is explained in
+[docs/static-linux-binaries.md](docs/static-linux-binaries.md).
 
 Everything lives in `namespace blake3pp`, and
 `#include <blake3pp/blake3pp.hpp>` gets you all of it. Compile-cost-aware
@@ -253,6 +266,30 @@ std::cout << std::format("blake3pp {} (simd: {}, execution: {})\n",
 // e.g. "blake3pp 0.1.0 (simd: std::simd, execution: stdexec)"
 ```
 
+### The wasm build
+
+The wasm32-simd128 build is the one target where the fat-binary premise
+cannot hold, because of how WebAssembly validates modules. On native
+ISAs an unsupported instruction is harmless as long as it never
+executes; that is exactly what lets one binary carry AVX-512 next to
+SSE4.2 and choose at runtime. A wasm engine instead validates the
+entire module at load time: if the engine does not support SIMD128, a
+module containing any SIMD opcode is rejected before a single
+instruction runs, whether those opcodes would ever have executed or
+not.
+
+So there is nothing to select between inside one module. Code that is
+running has by definition already passed validation, so SIMD128 is
+simply available (`available_arches()` reports it unconditionally
+there). The scalar kernel is still compiled in and can be pinned for
+comparison runs, but it is not a fallback: an engine without SIMD128
+never gets far enough to reach it. Graceful degradation on wasm means
+shipping two modules and picking one at load time on the embedder side
+(feeding `WebAssembly.validate()` a small SIMD probe module is the
+standard test). Every current mainstream engine supports SIMD128
+(node 16+ has it on by default), which is why the release ships the
+simd128 build only.
+
 ### Multi-core hashing (std::execution / stdexec)
 
 One-shot and incremental hashing are each available sequentially or
@@ -280,11 +317,14 @@ directly and passes its scheduler instead (e.g. stdexec's
 `exec::static_thread_pool pool(8); ... hash(big_buffer, pool.get_scheduler())`).
 
 The sender/receiver provider itself is a build-time choice
-(`-DBLAKE3PP_EXECUTION_PROVIDER=auto|std|beman|stdexec`): `std::execution`
-where the standard library ships it, [beman.execution]
-(conformance-first, C++23+) or NVIDIA stdexec (the default polyfill,
-C++20+) otherwise. `blake3pp::execution_provider()` reports which one a
-binary carries.
+(`-DBLAKE3PP_EXECUTION_PROVIDER=auto|std|beman|stdexec`), and
+`blake3pp::execution_provider()` reports which one a binary carries:
+
+| provider | floor | role |
+|----------|-------|------|
+| `std::execution` | a standard library that ships it | preferred when available |
+| [beman.execution] | C++23 | conformance-first polyfill |
+| NVIDIA stdexec | C++20 | default polyfill |
 
 [beman.execution]: https://github.com/bemanproject/execution
 
@@ -307,11 +347,17 @@ blake3pp::parallel_hasher tuned{blake3pp::get_parallel_scheduler(),
 ### Hashing files at storage speed
 
 The file pipeline streams a file through fixed windows using the fastest
-OS-native mechanism (io_uring + `O_DIRECT` on Linux, IOCP +
-`FILE_FLAG_NO_BUFFERING` on Windows, GCD/libdispatch + `F_NOCACHE` on
-macOS), bypassing the page cache and overlapping reads with hashing; it
-degrades gracefully per feature
-(no direct I/O -> buffered async -> plain synchronous reads -> stdio). Paths are
+OS-native mechanism, bypassing the page cache and overlapping reads with
+hashing:
+
+| OS | async engine | page-cache bypass |
+|----|--------------|-------------------|
+| Linux | io_uring | `O_DIRECT` |
+| Windows | IOCP | `FILE_FLAG_NO_BUFFERING` |
+| macOS | GCD (libdispatch) | `F_NOCACHE` |
+
+Each feature degrades independently at runtime: no direct I/O ->
+buffered async -> plain synchronous reads -> stdio. Paths are
 `std::filesystem::path`; every entry point has a throwing form and a
 `std::error_code` form, mirroring the standard library.
 
@@ -383,11 +429,15 @@ benchmark plugs upstream's hand-written assembly into this pipeline.
 Two utilities build alongside the library (top-level builds only):
 
 **`blake3ppsum`** is a `sha1sum`-style checksum tool covering the full
-spec: `--keyed FILE` (MAC mode; key as 32 raw bytes or 64 hex chars,
-never on the command line), `--derive-key CONTEXT`, `--length N`
-(extended output), plus `--check` verification, `--arch`/`--threads`, and
-the I/O pipeline knobs. `--version` reports the providers and SIMD
-variants baked into the binary.
+spec:
+
+- `--keyed FILE`: MAC mode; the key is 32 raw bytes or 64 hex chars,
+  read from a file so it never appears on the command line
+- `--derive-key CONTEXT`: domain-separated KDF mode
+- `--length N`: extended (XOF) output
+- `--check`: verify previously printed checksum lines
+- `--arch`, `--threads`, and the I/O pipeline knobs
+- `--version`: the providers and SIMD variants baked into the binary
 
 ```bash
 blake3ppsum big.iso                          # multi-core, direct-I/O
@@ -479,13 +529,22 @@ doubt, vendor.
 
 ### Guarantees and caveats
 
-- Compute paths never allocate: `hasher` is a flat value type, subtree
-  buffers live on the stack, the I/O pipeline allocates only its buffer
-  ring at setup.
+- The sequential compute paths never allocate: `hasher` is a flat value
+  type, subtree buffers live on the stack, and the I/O pipeline
+  allocates only its buffer ring at setup. The parallel engine is the
+  exception: `parallel_hasher` allocates its accumulation window at
+  construction, and each bulk launch allocates whatever the execution
+  provider needs (stdexec: one small task array per launch).
 - A `hasher` instance is not thread-safe; distinct instances and all free
   functions are.
-- Only the I/O layer throws (`std::system_error`, or use the `error_code`
-  overloads); compute APIs are `noexcept`.
+- The sequential compute API (`core.hpp`, `dispatch.hpp`) is `noexcept`
+  end to end, with one exception: `digest::to_hex()` builds a
+  `std::string` (use `to_hex_chars()` for the allocation-free,
+  nonthrowing form). The I/O layer throws `std::system_error`, or
+  reports through the `std::error_code` overloads, which also fold
+  allocation failure into an error code. The scheduler-taking parallel
+  APIs propagate whatever the execution provider raises, plus
+  `bad_alloc`.
 - Full BLAKE3 spec surface: plain, keyed and derive_key modes, each with
   arbitrary-length (XOF) output; every mode is verified against all 131
   output bytes of the official test vectors.
@@ -498,13 +557,21 @@ ctest --preset linux-gcc16-cxx26
 ```
 
 Any name from `cmake/toolchains/` works as a preset (see
-`CMakePresets-toolchains.json`); test presets exist for `linux-gcc16-cxx26`,
-`linux-clang22-cxx26`, `linux-clang18-cxx20-libstdcxx` (the C++20 polyfill path), and the
-two `-asan` variants. On a Mac, `macos-appleclang-cxx23` is the native
-preset (Apple clang, GCD + F_NOCACHE I/O) and `macos-clang22-cxx26`
-builds with Homebrew LLVM 22 against its bundled libc++ (`brew install
-llvm`). Without a preset, a bare `cmake -S . -B build` configures the
-C++20 baseline with the default compiler.
+`CMakePresets-toolchains.json`). Test presets exist for:
+
+- `linux-gcc16-cxx26` and `linux-clang22-cxx26`
+- `linux-clang18-cxx20-libstdcxx`: the C++20 polyfill path
+- the two `-asan` variants
+
+On a Mac:
+
+- `macos-appleclang-cxx23`: the native preset (Apple clang, GCD +
+  F_NOCACHE I/O)
+- `macos-clang22-cxx26`: Homebrew LLVM 22 against its bundled libc++
+  (`brew install llvm`)
+
+Without a preset, a bare `cmake -S . -B build` configures the C++20
+baseline with the default compiler.
 
 The devcontainer carries only the default gcc/clang pair; every other preset
 runs inside its per-compiler toolchain image via `tools/tc <preset>`;
@@ -514,10 +581,12 @@ and the static musl trio `linux-{,arm64-,riscv64-}zigmusl-cxx23-static`)
 run their whole test suites under qemu-user with a selectable vector
 length, so one build exercises every SVE VL or RVV VLEN; the emulator
 recipes are in `docker/README.md` too. Two kernel sets are opt-in:
-`-DBLAKE3PP_SVE_ALL_VARIANTS=ON` adds the SVE variants matching no
-shipping silicon (emulator targets), and `-DBLAKE3PP_XTHEAD_KERNEL=ON`
-compiles the hand-written T-Head XTheadVector (draft RVV 0.7.1) kernel,
-which only T-Head's qemu fork can execute.
+
+- `-DBLAKE3PP_SVE_ALL_VARIANTS=ON` adds the SVE variants matching no
+  shipping silicon (emulator targets)
+- `-DBLAKE3PP_XTHEAD_KERNEL=ON` compiles the hand-written T-Head
+  XTheadVector (draft RVV 0.7.1) kernel, which only T-Head's qemu fork
+  can execute
 
 ### Kernel tuning switches
 
@@ -546,16 +615,21 @@ cmake --preset macos-clang22-cxx26 -DBLAKE3PP_KERNEL_INLINE_ENFORCEMENT=off
 compiler flags to the kernel TUs only, for one-off flag trials that have
 not earned a switch.
 
-Layout: public API in `include/blake3pp/`, arch-agnostic tree logic in
-`src/core/`, the per-architecture kernel (one TU, compiled once per variant
-by `cmake/ArchKernels.cmake`; variants registered per ISA family in
-`cmake/KernelVariants.cmake`) in `src/kernel/`, runtime routing in
-`src/dispatch/` (per-platform CPU probes in `cpu_detect_*.cpp`; the
-canonical variant list (enum, names, preference ranking) is generated
-from `include/blake3pp/detail/arch.def`). `cmake/StdFeatures.cmake` probes
-what the active standard library really ships (by compiling usage, not
-trusting feature-test macros), and `tests/` verifies every configuration
-against the official BLAKE3 test vectors.
+Layout:
+
+- `include/blake3pp/`: the public API; the canonical variant list (enum,
+  names, preference ranking) is generated from `detail/arch.def`
+- `src/core/`: arch-agnostic tree logic
+- `src/kernel/`: the per-architecture kernel, one TU compiled once per
+  variant by `cmake/ArchKernels.cmake`; variants are registered per ISA
+  family in `cmake/KernelVariants.cmake`
+- `src/dispatch/`: runtime routing, with per-platform CPU probes in
+  `cpu_detect_*.cpp`
+- `cmake/StdFeatures.cmake`: probes what the active standard library
+  really ships, by compiling usage rather than trusting feature-test
+  macros
+- `tests/`: verifies every configuration against the official BLAKE3
+  test vectors
 
 ## License
 
