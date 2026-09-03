@@ -537,6 +537,13 @@ doubt, vendor.
   provider needs (stdexec: one small task array per launch).
 - A `hasher` instance is not thread-safe; distinct instances and all free
   functions are.
+- The library never mutates process-global state as a side effect:
+  default CPU detection is auxv/hwprobe/CPUID reads only. The one
+  detection step that needs more (RISC-V vendor-kernel shapes, where
+  the classifier is an instruction probed under a scoped SIGILL guard)
+  is opt-in via `blake3pp::run_trap_probes()`; without the call, those
+  machines conservatively report scalar. The CLI tools opt in at
+  startup, since a standalone binary owns its process.
 - The sequential compute API (`core.hpp`, `dispatch.hpp`) is `noexcept`
   end to end, with one exception: `digest::to_hex()` builds a
   `std::string` (use `to_hex_chars()` for the allocation-free,

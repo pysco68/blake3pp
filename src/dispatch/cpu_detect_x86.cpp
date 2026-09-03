@@ -28,7 +28,13 @@ void x86_cpuid(unsigned leaf, unsigned subleaf, unsigned out[4]) noexcept {
     out[i] = static_cast<unsigned>(r[i]);
   }
 #else
-  __get_cpuid_count(leaf, subleaf, &out[0], &out[1], &out[2], &out[3]);
+  // Returns 0 WITHOUT writing the outputs when the CPU's max basic
+  // leaf is below the request; zero them so feature tests read a
+  // deterministic "absent" instead of stale registers.
+  if (__get_cpuid_count(leaf, subleaf, &out[0], &out[1], &out[2],
+                        &out[3]) == 0) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+  }
 #endif
 }
 
@@ -75,6 +81,10 @@ bool platform_cpu_supports(arch a) noexcept {
   }
   return false;
 }
+
+// No detection rung on this platform needs a trap-guarded probe; the
+// syscall/CPUID rungs tell the whole story (see cpu_detect.hpp).
+bool platform_run_trap_probes() noexcept { return false; }
 
 }  // namespace blake3pp::detail
 

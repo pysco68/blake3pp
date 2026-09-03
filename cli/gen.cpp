@@ -61,6 +61,9 @@ std::uint64_t parse_size(const std::string& text) {
 
 int main(int argc, char** argv) {
   b3tool::set_binary_std_streams();
+  // A standalone tool owns its process: opt into the trap-guarded
+  // detection rungs (a no-op except on riscv vendor-kernel shapes).
+  blake3pp::run_trap_probes();
   std::string seed;
   std::string seed_file;
   std::string context;

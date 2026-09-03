@@ -220,6 +220,9 @@ int run_check(engine& eng, std::istream& in, std::string_view list_name) {
 
 int main(int argc, char** argv) {
   b3tool::set_binary_std_streams();
+  // A standalone tool owns its process: opt into the trap-guarded
+  // detection rungs (a no-op except on riscv vendor-kernel shapes).
+  blake3pp::run_trap_probes();
   options o;
   std::size_t window_mib = 8;
 

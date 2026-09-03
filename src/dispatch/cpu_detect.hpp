@@ -41,6 +41,14 @@ namespace blake3pp::detail {
 // enumerators need answering; dispatch.cpp resolves auto_detect, scalar
 // and simd128 before calling here, and anything foreign returns false.
 [[nodiscard]] bool platform_cpu_supports(arch a) noexcept;
+
+// Backs blake3pp::run_trap_probes(): runs any detection rungs the
+// platform deferred because they need a trap-guarded probe (a scoped
+// signal-handler swap), and upgrades the state platform_cpu_supports()
+// reads. Thread-safe and idempotent; returns whether anything new was
+// learned. Every platform TU defines it; only riscv64 has deferred
+// rungs today, the rest return false.
+bool platform_run_trap_probes() noexcept;
 #endif
 
 }  // namespace blake3pp::detail

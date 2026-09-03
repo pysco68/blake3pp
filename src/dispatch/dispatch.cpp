@@ -18,6 +18,7 @@
 #include "blake3pp_version_stamp.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 
 #include "dispatch/cpu_detect.hpp"
@@ -149,27 +150,57 @@ bool cpu_supports_impl(arch a) noexcept {
   }
 }
 
-// Built once; storage is static, so the returned span never dangles.
-std::span<const arch> available_impl() noexcept {
-  static const auto table = [] {
-    struct {
-      std::array<arch, num_kernels> entries{};
-      std::size_t count = 0;
-    } t;
-    for (const arch a : compiled_sorted) {
-      if (cpu_supports_impl(a)) {
-        t.entries[t.count++] = a;
-      }
+struct avail_table {
+  std::array<arch, num_kernels> entries{};
+  std::size_t count = 0;
+};
+
+avail_table build_available() noexcept {
+  avail_table t;
+  for (const arch a : compiled_sorted) {
+    if (cpu_supports_impl(a)) {
+      t.entries[t.count++] = a;
     }
-    return t;
-  }();
-  return {table.entries.data(), table.count};
+  }
+  return t;
+}
+
+// The base table is built once; run_trap_probes() may publish an
+// upgraded rebuild through the atomic pointer. Both live in static
+// storage, so the returned span never dangles, and readers see either
+// snapshot as one consistent unit.
+avail_table g_avail_upgraded;
+std::atomic<const avail_table*> g_avail_active{nullptr};
+
+std::span<const arch> available_impl() noexcept {
+  static const avail_table base = build_available();
+  const avail_table* p = g_avail_active.load(std::memory_order_acquire);
+  const avail_table& t = p != nullptr ? *p : base;
+  return {t.entries.data(), t.count};
 }
 
 }  // namespace
 
 bool is_available(arch a) noexcept {
   return compiled_in(a) && cpu_supports_impl(a);
+}
+
+bool run_trap_probes() noexcept {
+#if defined(BLAKE3PP_HAS_CPU_DETECT)
+  // The magic static serializes concurrent callers and makes the call
+  // idempotent; the platform hook itself is once-guarded too.
+  static const bool changed = [] {
+    if (!detail::platform_run_trap_probes()) {
+      return false;
+    }
+    g_avail_upgraded = build_available();
+    g_avail_active.store(&g_avail_upgraded, std::memory_order_release);
+    return true;
+  }();
+  return changed;
+#else
+  return false;
+#endif
 }
 
 bool cpu_supports(arch a) noexcept { return cpu_supports_impl(a); }

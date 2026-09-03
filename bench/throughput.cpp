@@ -263,6 +263,9 @@ void t16_sweep(int reps, double cooldown_s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // A standalone tool owns its process: opt into the trap-guarded
+  // detection rungs (a no-op except on riscv vendor-kernel shapes).
+  blake3pp::run_trap_probes();
   std::size_t mib = 512;
   int reps = 5;
   double cooldown_s = 5.0;

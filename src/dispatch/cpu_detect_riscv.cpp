@@ -22,9 +22,17 @@
 //    vlenb CSR itself: it entered the spec at v0.9, so 0.7.1 hardware
 //    TRAPS on it while 1.0 hardware returns the vector length. The
 //    read runs under a scoped SIGILL guard: the instruction that
-//    would have crashed IS the classifier. (This also fixes what the
-//    previous revision would have done on such kernels: read vlenb
-//    unguarded straight into the trap.)
+//    would have crashed IS the classifier.
+//
+// The trap-guarded rungs (the vsetvli unit probe on the SG2042 shape
+// and the vlenb classifier on pre-hwprobe kernels) do NOT run during
+// default detection: swapping the SIGILL disposition, however briefly,
+// is a process-global side effect, and the library never does that as
+// a side effect of hashing. Default detection records that one of
+// those shapes is present and conservatively claims nothing (scalar).
+// blake3pp::run_trap_probes() is the explicit opt-in: it runs the
+// guarded rungs once and upgrades the detection state. The shipped
+// tools call it at startup; they own their process.
 //
 // Never parse /proc/cpuinfo: old vendor kernels print a bare "v" for
 // 0.7.1, and every fact this file needs is available through auxv,
@@ -42,6 +50,7 @@
 
 #if defined(BLAKE3PP_CPU_DETECT_RISCV)
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 
@@ -97,17 +106,20 @@ long hwprobe_one(std::int64_t key, std::uint64_t* value) noexcept {
   return 0;
 }
 
-// The rung-3 classifier. Only ever called once, from the magic-static
-// initializer below (so exactly one thread runs it, and it runs before
-// any hashing happens); the SIGILL handler is scoped to the one csrr
-// and restored immediately.
+// The trap-rung classifier state. Only ever touched from
+// platform_run_trap_probes() below, whose magic static guarantees
+// exactly one thread runs the guarded probes, exactly once; the SIGILL
+// handler is scoped to the probed instruction and restored immediately.
 sigjmp_buf g_probe_jmp;
 
 void probe_sigill(int) { siglongjmp(g_probe_jmp, 1); }
 
-// Run one probe under a scoped SIGILL guard. Only ever called from the
-// magic-static initializer below (single thread, before any hashing);
-// the handler is restored immediately.
+// Run one probe under a scoped SIGILL guard. Only ever called from
+// platform_run_trap_probes() (single thread via its magic static);
+// the handler is restored immediately. Signal disposition is
+// process-global while the swap lasts, which is exactly why these
+// probes run only behind the explicit blake3pp::run_trap_probes()
+// opt-in and never as a side effect of default detection.
 template <class F>
 bool guarded(F&& body) noexcept {
   struct sigaction sa {};
@@ -158,9 +170,21 @@ struct vec_state {
   bool xthead = false;  // draft 0.7.1, T-Head encoding
   bool zvbb = false;
   unsigned long vlenb = 0;
+  // Shapes the syscall rungs recognized but could not settle without a
+  // trap-guarded probe; resolved only by platform_run_trap_probes().
+  bool pending_vendor_unit = false;  // rung 2.5 (SG2042 6.6-pioneer)
+  bool pending_legacy = false;       // rung 3 (pre-hwprobe kernels)
 };
 
-const vec_state& vec_probe() noexcept {
+// Filled once by platform_run_trap_probes(); readers reach it through
+// the acquire-loaded pointer, so the upgrade publishes as one unit.
+vec_state g_trap_upgraded;
+std::atomic<const vec_state*> g_trap_active{nullptr};
+
+// Default detection: the syscall-only rungs. Never installs a signal
+// handler; where only a trap-guarded probe could answer, it records the
+// pending shape and claims nothing.
+const vec_state& base_probe() noexcept {
   static const vec_state s = [] {
     vec_state st{};
     // Rung 1: the authoritative answer, where the kernel is new enough.
@@ -188,58 +212,99 @@ const vec_state& vec_probe() noexcept {
                  hwprobe_one(RISCV_HWPROBE_KEY_MVENDORID, &vendor) == 0 &&
                  vendor == BLAKE3PP_MVENDORID_THEAD) {
         // Rung 2: HWCAP says V, hwprobe says no V, the core is T-Head.
-        // That is the vendor-kernel 0.7.1 lie, caught in the act.
+        // That is the vendor-kernel 0.7.1 lie, caught in the act. Pure
+        // syscall evidence, so it stays in default detection.
         st.xthead = true;
       } else if (!hwcap_v &&
                  hwprobe_one(RISCV_HWPROBE_KEY_MVENDORID, &vendor) == 0 &&
-                 vendor == BLAKE3PP_MVENDORID_THEAD &&
-                 guarded_vector_unit_enabled()) {
-        // Rung 2.5, the SG2042 6.6-pioneer shape: hwprobe exists but
+                 vendor == BLAKE3PP_MVENDORID_THEAD) {
+        // Rung 2.5 SHAPE, the SG2042 6.6-pioneer: hwprobe exists but
         // predates the vendor key, and the kernel advertises no V
-        // ANYWHERE (no hwcap bit, no IMA_V), yet the vendor patch
-        // enables and context-switches the T-Head vector unit. The
-        // guarded vsetvli settles it: it traps iff the unit is off. A
-        // unit that is ON while the kernel claims no standard V, on a
-        // T-Head core, is the vendor th path; a kernel managing REAL
-        // 1.0 state advertises it through the standard has_vector()
-        // plumbing every >=6.4 kernel shares, so it cannot land here.
-        st.xthead = true;
+        // ANYWHERE (no hwcap bit, no IMA_V). The vendor patch may
+        // still be enabling and context-switching the T-Head vector
+        // unit; only the guarded vsetvli can settle that (it traps iff
+        // the unit is off), and that probe waits for the opt-in.
+        st.pending_vendor_unit = true;
       }
       // Any other contradiction: claim nothing rather than execute a
       // guess.
     } else if (hwcap_v) {
-      // Rung 3: pre-hwprobe vendor kernel. vlenb postdates 0.7.1, so
-      // the guarded read classifies: a value is legacy RVV 1.0 (K230
-      // era), a trap is T-Head 0.7.1.
-      const unsigned long vlenb = guarded_vlenb();
-      if (vlenb != 0) {
-        st.rvv = true;
-        st.vlenb = vlenb;  // zvbb undetectable here; stays false
-      } else {
-        st.xthead = true;
-      }
+      // Rung 3 SHAPE: pre-hwprobe vendor kernel. vlenb postdates
+      // 0.7.1, so the guarded read classifies (a value is legacy RVV
+      // 1.0, a trap is T-Head 0.7.1); it waits for the opt-in.
+      st.pending_legacy = true;
     }
     return st;
   }();
   return s;
 }
 
+// The state everyone reads: the trap-upgraded snapshot once it exists,
+// the syscall-only base until then.
+const vec_state& vec_probe() noexcept {
+  const vec_state* p = g_trap_active.load(std::memory_order_acquire);
+  return p != nullptr ? *p : base_probe();
+}
+
 bool xthead_supported() noexcept {
-  static const bool s = [] {
-    const char* assume = std::getenv("BLAKE3PP_ASSUME_XTHEADVECTOR");
-    if (assume != nullptr && assume[0] == '1') {
-      return true;
+  // The env hook is parsed once; the probe state is re-read every time
+  // so a later run_trap_probes() upgrade is visible here.
+  static const int assume = [] {
+    const char* v = std::getenv("BLAKE3PP_ASSUME_XTHEADVECTOR");
+    if (v != nullptr && v[0] == '1') {
+      return 1;
     }
-    if (assume != nullptr && assume[0] == '0') {
-      return false;  // explicit opt-out: the ladder's emergency brake
+    if (v != nullptr && v[0] == '0') {
+      return 0;  // explicit opt-out: the ladder's emergency brake
     }
-    return vec_probe().xthead;
+    return -1;
   }();
-  return s;
+  if (assume >= 0) {
+    return assume == 1;
+  }
+  return vec_probe().xthead;
 }
 #endif  // BLAKE3PP_RISCV64_LINUX
 
 }  // namespace
+
+// The explicit opt-in (see blake3pp::run_trap_probes): runs the
+// trap-guarded rungs the default detection deferred, once, and
+// publishes the upgraded state. Returns whether anything was learned.
+bool platform_run_trap_probes() noexcept {
+#if defined(BLAKE3PP_RISCV64_LINUX)
+  static const bool changed = [] {
+    const vec_state& b = base_probe();
+    vec_state up = b;
+    up.pending_vendor_unit = false;
+    up.pending_legacy = false;
+    if (b.pending_vendor_unit && guarded_vector_unit_enabled()) {
+      // A unit that is ON while the kernel claims no standard V, on a
+      // T-Head core, is the vendor th path; a kernel managing REAL 1.0
+      // state advertises it through the standard has_vector() plumbing
+      // every >=6.4 kernel shares, so it cannot land here.
+      up.xthead = true;
+    } else if (b.pending_legacy) {
+      const unsigned long vlenb = guarded_vlenb();
+      if (vlenb != 0) {
+        up.rvv = true;
+        up.vlenb = vlenb;  // zvbb undetectable here; stays false
+      } else {
+        up.xthead = true;
+      }
+    }
+    if (up.rvv == b.rvv && up.xthead == b.xthead) {
+      return false;  // probes ran (or nothing was pending): no news
+    }
+    g_trap_upgraded = up;
+    g_trap_active.store(&g_trap_upgraded, std::memory_order_release);
+    return true;
+  }();
+  return changed;
+#else
+  return false;
+#endif
+}
 
 // Exact-match on the runtime vlenb, same reasoning as SVE: fixed-vlen
 // code pins vscale min AND max, and its whole-register moves are only

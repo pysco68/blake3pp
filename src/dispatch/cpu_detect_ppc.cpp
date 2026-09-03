@@ -29,6 +29,10 @@ bool platform_cpu_supports(arch a) noexcept {
   return false;
 }
 
+// No detection rung on this platform needs a trap-guarded probe; the
+// syscall/CPUID rungs tell the whole story (see cpu_detect.hpp).
+bool platform_run_trap_probes() noexcept { return false; }
+
 }  // namespace blake3pp::detail
 
 #endif  // BLAKE3PP_CPU_DETECT_PPC

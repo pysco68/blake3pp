@@ -1,5 +1,10 @@
 #pragma once
 
+/// @file
+/// Instruction-set variants and runtime dispatch: which kernels this
+/// binary carries, which the running CPU can use, pinning, and the build
+/// introspection the tools print. Standard library only.
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -54,6 +59,26 @@ enum class arch : std::uint8_t {
 /// The compiled variants this CPU can run, best-first; never empty, and
 /// available_arches().front() == best_available().
 [[nodiscard]] std::span<const arch> available_arches() noexcept;
+
+/// Runs the deferred, trap-guarded detection probes once and upgrades the
+/// dispatch verdict with what they learn.
+///
+/// On most machines the default detection (auxv, hwprobe, CPUID reads)
+/// tells the whole story and this is a no-op. On RISC-V vendor-kernel
+/// shapes (T-Head boards whose kernel predates the hwprobe vendor key,
+/// and pre-6.4 kernels without hwprobe) part of the answer can only be
+/// learned by executing an instruction that may trap, under a scoped
+/// SIGILL guard. Default detection never does that, because swapping a
+/// signal disposition is briefly process-global; it reports scalar on
+/// those shapes instead. This call is the explicit opt-in: thread-safe
+/// and idempotent, it upgrades cpu_supports(), available_arches() and
+/// auto-dispatch. Call it where the application is not concurrently
+/// manipulating SIGILL handling; the shipped CLI tools call it at
+/// startup, since a standalone binary owns its process. The
+/// BLAKE3PP_ASSUME_XTHEADVECTOR environment hook is independent of this
+/// and needs no probe.
+/// @return true if anything new was learned.
+bool run_trap_probes() noexcept;
 
 /// The canonical lowercase name of a variant ("auto", "sse42", "avx2").
 /// @param a  Any variant.
