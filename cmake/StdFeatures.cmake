@@ -150,6 +150,25 @@ endif()
 message(STATUS "blake3pp: execution provider = ${_blake3pp_execution_provider} "
   "(BLAKE3PP_EXECUTION_PROVIDER=${BLAKE3PP_EXECUTION_PROVIDER})")
 
+# Does this toolchain have OS threads at all?  A freestanding target
+# typically does not: the Zephyr SDK's libstdc++, for instance, is built
+# without gthreads, so <thread>, <mutex> and <condition_variable> are
+# empty headers there.  <blake3pp/parallel.hpp> uses the answer to decide
+# whether it can offer a process-wide pool behind get_parallel_scheduler();
+# the scheduler-taking hash overloads, which are the primary API, work
+# either way.
+_blake3pp_probe(BLAKE3PP_HAS_STD_THREAD [[
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+int main() {
+  std::mutex m;
+  std::condition_variable cv;
+  (void)m; (void)cv;
+  return static_cast<int>(std::thread::hardware_concurrency());
+}
+]])
+
 # stdexec is needed by the stdexec provider AND by the beman bridge backend
 # (which drives beman's parallel_scheduler with stdexec's pool until beman
 # ships a default backend).

@@ -36,8 +36,10 @@
 #elif defined(BLAKE3PP_EXECUTION_BEMAN)
 #include <beman/execution/execution.hpp>
 #else  // BLAKE3PP_EXECUTION_STDEXEC
-#include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>
+#if BLAKE3PP_HAS_STD_THREAD
+#include <exec/static_thread_pool.hpp>
+#endif
 #endif
 
 namespace blake3pp {
@@ -95,7 +97,7 @@ using parallel_scheduler_t = beman::execution::parallel_scheduler;
   return beman::execution::get_parallel_scheduler();
 }
 
-#else  // BLAKE3PP_EXECUTION_STDEXEC
+#elif BLAKE3PP_HAS_STD_THREAD  // BLAKE3PP_EXECUTION_STDEXEC
 
 namespace detail {
 // Function-local static: constructed on first use, threads joined during
@@ -122,7 +124,10 @@ using parallel_scheduler_t =
   return detail::process_pool().get_scheduler();
 }
 
-#endif
+#endif  // no process pool without std::thread: see BLAKE3PP_HAS_STD_THREAD.
+        // The scheduler-taking hash overloads below are unaffected, and are
+        // the primary API in any case -- a freestanding caller brings its
+        // own scheduler because only it knows what its agents should be.
 
 namespace detail {
 
