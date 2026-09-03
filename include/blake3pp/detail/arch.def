@@ -71,7 +71,8 @@ BLAKE3PP_ARCH(rvv512, "rvv512", 120)
 /// T-Head XTheadVector, the draft-RVV-0.7.1 encoding of C906/C910
 /// silicon (Allwinner D1, SG2042, TH1520). Hand-written kernel, opt-in
 /// build (BLAKE3PP_XTHEAD_KERNEL=ON); detected through the hwprobe
-/// vendor-extension key (Linux 6.13+).
+/// vendor-extension key (Linux 6.13+) or the trap-guarded probes behind
+/// run_trap_probes().
 BLAKE3PP_ARCH(xthead, "xthead", 170)
 // RVV 1.0 + Zvbb: the same fixed-VLEN kernels with the 3-op shift-or
 // rotate replaced by Zvbb's single vror (base RVV has no rotate); the

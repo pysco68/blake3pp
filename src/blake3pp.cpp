@@ -232,8 +232,11 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
       cached_block_ = block_index;
       cache_valid_ = true;
     }
+    // Explicit std::size_t: kern::block_len is uint32_t, so on a 32-bit
+    // target the two arguments deduce to different types and the call is
+    // ambiguous.  Both values are bounded by out.size() and 64.
     const std::size_t take =
-        std::min(out.size() - done, kern::block_len - in_block);
+        std::min<std::size_t>(out.size() - done, kern::block_len - in_block);
     std::copy_n(cache_.data() + in_block, take, out.data() + done);
     done += take;
     position_ += take;

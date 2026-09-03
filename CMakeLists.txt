@@ -114,6 +114,12 @@ else()
   target_compile_options(blake3pp_warnings INTERFACE -Wall -Wextra -Wconversion -Wshadow)
 endif()
 
+# The file-I/O layer needs a filesystem, 64-bit seeks and (on the native
+# backends) OS-specific async I/O.  A freestanding target -- an RTOS on a
+# microcontroller, say -- has none of that and wants none of the code:
+# turn this off and the library is hasher, digest and dispatch only.
+option(BLAKE3PP_WITH_IO "Build the file I/O layer (hash_file and friends)" ON)
+
 add_library(blake3pp STATIC
   src/blake3pp.cpp
   src/dispatch/dispatch.cpp
@@ -122,10 +128,14 @@ add_library(blake3pp STATIC
   src/dispatch/cpu_detect_riscv.cpp
   src/dispatch/cpu_detect_ppc.cpp
   src/dispatch/cpu_detect_s390.cpp
-  src/dispatch/transpose16.cpp
-  src/io/file_reader.cpp
-  src/io/file_writer.cpp
-  src/io_hash.cpp)
+  src/dispatch/transpose16.cpp)
+if(BLAKE3PP_WITH_IO)
+  target_sources(blake3pp PRIVATE
+    src/io/file_reader.cpp
+    src/io/file_writer.cpp
+    src/io_hash.cpp)
+  target_compile_definitions(blake3pp PUBLIC BLAKE3PP_WITH_IO=1)
+endif()
 add_library(blake3pp::blake3pp ALIAS blake3pp)
 
 target_compile_features(blake3pp PUBLIC cxx_std_20)

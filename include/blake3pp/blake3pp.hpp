@@ -16,9 +16,14 @@
 ///                            library only)
 ///   <blake3pp/parallel_io.hpp> the same over a scheduler (io.hpp +
 ///                            parallel.hpp)
+///
+/// The I/O headers follow the BLAKE3PP_WITH_IO build option: a
+/// freestanding build has no filesystem to offer them.
 
 #include <blake3pp/core.hpp>
 #include <blake3pp/dispatch.hpp>
-#include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
+#if BLAKE3PP_WITH_IO
+#include <blake3pp/io.hpp>
 #include <blake3pp/parallel_io.hpp>
+#endif
