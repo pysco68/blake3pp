@@ -80,6 +80,9 @@ The last column is the one that matters when you install blake3pp rather
 than build it: only the scheduler-taking headers include an execution
 library (stdexec, beman.execution, or `<execution>`). Hashing buffers and
 hashing files sequentially compile against the standard library alone.
+The two I/O headers exist only when the library is built with
+`BLAKE3PP_WITH_IO=ON` (the default); see
+[Freestanding and RTOS builds](#freestanding-and-rtos-builds).
 
 ### One-shot hashing
 
@@ -526,6 +529,33 @@ only valid for toolchains ABI-compatible with the one that built it; the
 package version file declares `SameMajorVersion` compatibility, which
 covers blake3pp's own API but says nothing about your compiler. If in
 doubt, vendor.
+
+### Freestanding and RTOS builds
+
+The library core runs on targets with no filesystem and no OS threads;
+what drove this was a Zephyr SMP port running blake3pp on the RP2350
+in both of its personalities (Cortex-M33 and Hazard3 RISC-V). Two
+build-time switches make it fit:
+
+- `-DBLAKE3PP_WITH_IO=OFF` drops the file-I/O layer entirely. It needs
+  a filesystem, 64-bit seeks and OS-specific async I/O, none of which
+  a microcontroller RTOS has; without it the library is `hasher`,
+  `digest`, dispatch and the scheduler-taking parallel API. The
+  umbrella header follows the option, and tests, tools and the file
+  bench gate themselves on it (the in-memory bench and the non-I/O
+  test suite still build).
+- Toolchains without OS threads are detected, not fought: where
+  `<thread>`/`<mutex>` are empty (the Zephyr SDK's libstdc++ is built
+  without gthreads), the `BLAKE3PP_HAS_STD_THREAD` probe comes back
+  negative and `get_parallel_scheduler()` simply does not exist.
+  Nothing else is lost: the scheduler-taking `hash()` overloads are
+  the primary API anyway, and a freestanding caller brings its own
+  scheduler because only it knows what its execution agents should be
+  (on Zephyr SMP, for instance, one per core).
+
+Everything else adapts by the existing probes: 32-bit targets are
+supported, and the SIMD/execution polyfills select exactly as on
+hosted platforms.
 
 ### Guarantees and caveats
 

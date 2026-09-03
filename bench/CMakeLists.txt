@@ -15,12 +15,15 @@ target_link_libraries(blake3pp_bench PRIVATE
 # upstream's assembly, which needs the internal kernel boundary header.
 target_include_directories(blake3pp_bench PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
-add_executable(blake3pp_bench_file file_throughput.cpp)
-target_link_libraries(blake3pp_bench_file PRIVATE
-  blake3pp::blake3pp
-  blake3pp_warnings
-  blake3pp::tooling
-  blake3pp::tool_allocator)
+# The file bench measures the I/O pipeline; it has no subject without it.
+if(BLAKE3PP_WITH_IO)
+  add_executable(blake3pp_bench_file file_throughput.cpp)
+  target_link_libraries(blake3pp_bench_file PRIVATE
+    blake3pp::blake3pp
+    blake3pp_warnings
+    blake3pp::tooling
+    blake3pp::tool_allocator)
+endif()
 
 if(BLAKE3PP_BENCH_UPSTREAM)
   # The upstream library is C plus hand-written assembly; enabling the
@@ -59,5 +62,7 @@ endif()
 # parallel_scheduler backend (see src/execution/beman_backend.cpp).
 if(TARGET blake3pp_beman_backend)
   target_link_libraries(blake3pp_bench PRIVATE blake3pp::beman_backend)
-  target_link_libraries(blake3pp_bench_file PRIVATE blake3pp::beman_backend)
+  if(TARGET blake3pp_bench_file)
+    target_link_libraries(blake3pp_bench_file PRIVATE blake3pp::beman_backend)
+  endif()
 endif()

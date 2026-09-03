@@ -332,7 +332,9 @@ if(BLAKE3PP_BUILD_BENCH AND BLAKE3PP_HAS_FORMAT)
 endif()
 
 option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility" ${PROJECT_IS_TOP_LEVEL})
-if(BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT)
+# Both tools are file tools (hash_file, the direct-I/O writer): without
+# the I/O layer there is nothing for them to be.
+if(BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT AND BLAKE3PP_WITH_IO)
   add_subdirectory(cli)
 endif()
 
