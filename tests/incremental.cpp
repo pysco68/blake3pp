@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <span>
@@ -98,6 +99,42 @@ TEST_CASE("finalize is non-destructive") {
 
   h.update(std::span{input}.subspan(1500));
   CHECK(h.finalize() == blake3pp::hash(input));
+}
+
+// The by-value extended-output form is a pure convenience over the span
+// overload; both must produce the same stream, whose first 32 bytes are
+// the plain digest.
+TEST_CASE("finalize<N> matches the span overload and the digest prefix") {
+  const auto input = make_input(4097);
+  blake3pp::hasher h;
+  h.update(input);
+
+  const auto by_value = h.finalize<131>();
+  std::array<std::byte, 131> by_span{};
+  h.finalize(std::span<std::byte>{by_span});
+  CHECK(by_value == by_span);
+
+  const auto d = h.finalize();
+  CHECK(std::equal(d.bytes.begin(), d.bytes.end(), by_value.begin()));
+}
+
+// take<N> is fill() by value: consecutive takes walk the same stream a
+// single fill would produce, advancing the position identically.
+TEST_CASE("output_reader take<N> reads and advances like fill") {
+  const auto input = make_input(100);
+  blake3pp::hasher h;
+  h.update(input);
+
+  auto r1 = h.finalize_xof();
+  const auto a = r1.take<40>();
+  const auto b = r1.take<24>();
+  CHECK(r1.position() == 64);
+
+  auto r2 = h.finalize_xof();
+  std::array<std::byte, 64> whole{};
+  r2.fill(whole);
+  CHECK(std::equal(a.begin(), a.end(), whole.begin()));
+  CHECK(std::equal(b.begin(), b.end(), whole.begin() + 40));
 }
 
 TEST_CASE("count reports bytes absorbed across every ingestion path") {

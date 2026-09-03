@@ -189,11 +189,14 @@ take the seekable reader:
 blake3pp::hasher h;
 h.update(seed_material);
 
-std::array<std::byte, 64> wide_key;
-h.finalize(wide_key);                       // any output length
+auto wide_key = h.finalize<64>();           // std::array<std::byte, 64>
+
+std::vector<std::byte> runtime_sized(n);
+h.finalize(runtime_sized);                  // any length, caller's buffer
 
 blake3pp::output_reader r = h.finalize_xof();
 r.fill(first_chunk);                        // stream sequentially...
+auto next = r.take<32>();                   // ...same, by value
 r.seek(10'000'000'000);                     // ...or jump: O(1) random access
 r.fill(deep_chunk);                         // byte 10 GB costs same as byte 0
 ```

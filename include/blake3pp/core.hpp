@@ -88,6 +88,19 @@ class output_reader {
   /// @param out  Any length; the stream is unbounded.
   void fill(std::span<std::byte> out) noexcept;
 
+  /// Returns the next N bytes of the stream by value and advances past
+  /// them.
+  ///
+  /// The length is a template argument because it shapes the return type;
+  /// runtime lengths use fill().
+  /// @tparam N  The number of bytes to take.
+  template <std::size_t N>
+  [[nodiscard]] std::array<std::byte, N> take() noexcept {
+    std::array<std::byte, N> out;
+    fill(std::span<std::byte>{out});
+    return out;
+  }
+
   /// Positions the stream at an absolute byte offset, in constant time.
   /// @param byte_offset  The offset of the next byte fill() will produce.
   void seek(std::uint64_t byte_offset) noexcept {
@@ -185,6 +198,18 @@ class hasher {
   /// Extended output as a seekable stream, independent of the hasher
   /// afterwards.
   [[nodiscard]] output_reader finalize_xof() const noexcept;
+
+  /// Extended output by value: the first N bytes of the output stream.
+  ///
+  /// The length is a template argument because it shapes the return type;
+  /// runtime lengths go through the span overload or finalize_xof().
+  /// @tparam N  The number of bytes to return.
+  template <std::size_t N>
+  [[nodiscard]] std::array<std::byte, N> finalize() const noexcept {
+    std::array<std::byte, N> out;
+    finalize(std::span<std::byte>{out});
+    return out;
+  }
 
   /// Returns the hasher to its just-constructed state, keeping its mode,
   /// key and variant.
