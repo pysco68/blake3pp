@@ -63,24 +63,37 @@ TEST_CASE("derive_key matches every official vector") {
   }
 }
 
-TEST_CASE("keyed and derive_key match vectors on every available arch") {
+// Every compiled variant that this machine can run, against the full
+// 131-byte vectors in all three modes: the wide-output kernel
+// (xof_many) is vector-verified per variant, not only the digest.
+TEST_CASE("all modes match the full 131-byte vectors on every available arch") {
   constexpr std::string_view key_str = blake3pp::testvec::key;
   const auto key =
       std::as_bytes(std::span<const char, 32>{key_str.data(), 32});
+  using blake3pp::to_hex;
+
   for (const auto a : blake3pp::available_arches()) {
     CAPTURE(arch_name(a));
     for (const auto& c : blake3pp::testvec::cases) {
       CAPTURE(c.input_len);
       const auto input = make_input(c.input_len);
+      std::vector<std::byte> out(std::string_view{c.hash}.size() / 2);  // 131
+
+      blake3pp::hasher h{a};
+      h.update(input);
+      h.finalize(out);
+      CHECK(to_hex(out) == c.hash);
+
       blake3pp::hasher kh = blake3pp::hasher::keyed(key, a);
       kh.update(input);
-      CHECK(kh.finalize().to_hex() ==
-            std::string(c.keyed_hash).substr(0, 64));
+      kh.finalize(out);
+      CHECK(to_hex(out) == c.keyed_hash);
+
       blake3pp::hasher dk =
           blake3pp::hasher::derive_key(blake3pp::testvec::context, a);
       dk.update(input);
-      CHECK(dk.finalize().to_hex() ==
-            std::string(c.derive_key).substr(0, 64));
+      dk.finalize(out);
+      CHECK(to_hex(out) == c.derive_key);
     }
   }
 }

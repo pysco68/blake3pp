@@ -46,10 +46,13 @@ struct xsimd_backend {
                                    std::endian::native == std::endian::little;
 
   // CRITICAL gate for the byte-rotate: the hardware must actually HAVE a
-  // byte shuffle. MSVC has no /arch:SSE4.2, so the "sse42" kernel is
-  // xsimd-sse2 there, and xsimd's sse2 u8 swizzle is a per-byte scalar
-  // loop that measured 4x WORSE than shift-or. x86 needs ssse3+; NEON and
-  // wasm carry their byte shuffles natively.
+  // byte shuffle. Below ssse3, xsimd's sse2 u8 swizzle is a per-byte
+  // scalar loop that measured 4x WORSE than shift-or, so any pre-ssse3
+  // instantiation must stay on shift-or. (Every shipped x86 kernel is
+  // sse4.2 or wider today, MSVC included: KernelVariants.cmake passes
+  // /arch:SSE4.2 plus the __SSSE3__/__SSE4_1__/__SSE4_2__ defines xsimd
+  // keys on, so the gate is open there; it remains the guard for any
+  // narrower build.) NEON and wasm carry their byte shuffles natively.
   static constexpr bool is_x86 =
       std::is_base_of_v<xsimd::sse2, typename u32v::impl::arch_type>;
   static constexpr bool has_byte_shuffle =
