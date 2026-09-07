@@ -109,6 +109,10 @@ std::cout << std::format("digest: {}\n", d);          // std::format-able
 // Allocation-free hex for hot paths and C interop: 64 chars, NUL-terminated.
 std::array<char, 65> hex = d.to_hex_chars();
 std::printf("%s\n", hex.data());
+
+// Any byte sequence, any length (extended output, keys): by value or
+// into a caller's buffer.
+std::string wide_hex = blake3pp::to_hex(h.finalize<64>());
 ```
 
 `digest` is a regular value type: compare with `==`, round-trip through

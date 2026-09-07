@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
     const std::size_t take = remaining.take(buf.size());
     fill(std::span{buf}.first(take));
     if (hex) {
-      const std::string line = b3tool::to_hex(std::span{buf}.first(take));
+      const std::string line = blake3pp::to_hex(std::span{buf}.first(take));
       if (std::fwrite(line.data(), 1, line.size(), stdout) != line.size()) {
         break;  // downstream closed (e.g. head); not an error
       }

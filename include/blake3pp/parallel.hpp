@@ -246,7 +246,7 @@ template <class Scheduler>
 /// Multi-core keyed one-shot: the MAC/PRF of input under a 32-byte key,
 /// same decomposition as hash().
 /// @tparam Scheduler  Any std::execution-style scheduler.
-/// @param key    Exactly 32 bytes, enforced by the span extent.
+/// @param key    Exactly key_size bytes, enforced by the span extent.
 /// @param input  Any length.
 /// @param sched  Where the subtree reductions run.
 /// @param a      The variant to run on.
@@ -265,7 +265,7 @@ template <class Scheduler>
 
 /// Multi-core keyed one-shot of a string's bytes.
 /// @tparam Scheduler  Any std::execution-style scheduler.
-/// @param key    Exactly 32 bytes.
+/// @param key    Exactly key_size bytes.
 /// @param input  The bytes of the string.
 /// @param sched  Where the subtree reductions run.
 /// @param a      The variant to run on.
@@ -402,7 +402,7 @@ class parallel_hasher {
 
   /// Keyed (MAC/PRF) mode.
   /// @param sched  Where the subtree reductions run.
-  /// @param key    Exactly 32 bytes, enforced by the span extent.
+  /// @param key    Exactly key_size bytes, enforced by the span extent.
   /// @param opts   The variant and the window size.
   parallel_hasher(Scheduler sched, std::span<const std::byte, key_size> key,
                   const parallel_hasher_options& opts = {})

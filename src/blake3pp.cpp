@@ -330,22 +330,30 @@ bool digest::matches(std::string_view hex) const noexcept {
   return from_hex(hex) == *this;  // optional's heterogeneous, CT inner ==
 }
 
-std::array<char, 65> digest::to_hex_chars() const noexcept {
+void to_hex(std::span<const std::byte> bytes, std::span<char> out) noexcept {
   static constexpr char alphabet[] = "0123456789abcdef";
-  std::array<char, 65> out;
+  assert(out.size() >= 2 * bytes.size());
   for (std::size_t i = 0; i < bytes.size(); ++i) {
     const auto v = std::to_integer<unsigned>(bytes[i]);
     out[2 * i] = alphabet[v >> 4];
     out[2 * i + 1] = alphabet[v & 0xF];
   }
+}
+
+std::string to_hex(std::span<const std::byte> bytes) {
+  std::string s(2 * bytes.size(), '\0');
+  to_hex(bytes, s);
+  return s;
+}
+
+std::array<char, 65> digest::to_hex_chars() const noexcept {
+  std::array<char, 65> out;
+  blake3pp::to_hex(bytes, out);
   out[64] = '\0';
   return out;
 }
 
-std::string digest::to_hex() const {
-  const auto chars = to_hex_chars();
-  return std::string{chars.data(), 64};
-}
+std::string digest::to_hex() const { return blake3pp::to_hex(bytes); }
 
 bool operator==(const digest& lhs, const digest& rhs) noexcept {
   // Accumulate the whole difference before deciding: no data-dependent

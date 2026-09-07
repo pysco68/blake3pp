@@ -92,15 +92,7 @@ TEST_CASE("extended output matches the full 131-byte vectors, all modes") {
   const auto key =
       std::as_bytes(std::span<const char, 32>{key_str.data(), 32});
 
-  const auto to_hex = [](std::span<const std::byte> bytes) {
-    static constexpr char alphabet[] = "0123456789abcdef";
-    std::string s;
-    for (const std::byte b : bytes) {
-      s += alphabet[std::to_integer<unsigned>(b) >> 4];
-      s += alphabet[std::to_integer<unsigned>(b) & 0xF];
-    }
-    return s;
-  };
+  using blake3pp::to_hex;
 
   for (const auto& c : blake3pp::testvec::cases) {
     CAPTURE(c.input_len);

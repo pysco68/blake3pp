@@ -34,7 +34,6 @@ namespace {
 
 using b3tool::print;
 using b3tool::println;
-using b3tool::to_hex;
 
 struct options {
   blake3pp::hash_file_options io;
@@ -156,7 +155,7 @@ class engine {
   std::string hash_hex(const std::string& path, std::size_t out_len) {
     std::vector<std::byte> out(out_len);
     hash_source(path).finalize(out);
-    return to_hex(out);
+    return blake3pp::to_hex(out);
   }
 
  private:

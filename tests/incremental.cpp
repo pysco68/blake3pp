@@ -199,6 +199,24 @@ TEST_CASE("string_view overload matches span") {
         blake3pp::hash(std::as_bytes(std::span{sv.data(), sv.size()})));
 }
 
+// The free to_hex covers any length; digest::to_hex is it over 32 bytes.
+TEST_CASE("free to_hex matches digest::to_hex and handles any length") {
+  const auto d = blake3pp::hash(std::string_view{"hex me"});
+  CHECK(blake3pp::to_hex(d.bytes) == d.to_hex());
+
+  blake3pp::hasher h;
+  h.update(std::string_view{"hex me"});
+  const auto wide = h.finalize<48>();
+  const std::string s = blake3pp::to_hex(wide);
+  CHECK(s.size() == 96);
+  CHECK(s.substr(0, 64) == d.to_hex());
+
+  std::array<char, 96> chars{};
+  blake3pp::to_hex(wide, chars);
+  CHECK(std::string_view{chars.data(), chars.size()} == s);
+  CHECK(blake3pp::to_hex(std::span<const std::byte>{}).empty());
+}
+
 TEST_CASE("digest to_hex format") {
   const auto d = blake3pp::hash(std::string_view{});
   CHECK(d.to_hex().size() == 64u);

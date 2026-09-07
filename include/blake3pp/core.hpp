@@ -1,5 +1,11 @@
 #pragma once
 
+/// @file
+/// The sequential core: the digest value type, the incremental hasher in
+/// its three modes (plain, keyed, derive_key), extended output, and the
+/// one-shot functions. Standard library only; never allocates except in
+/// the std::string-returning conveniences.
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +35,17 @@ inline constexpr std::size_t digest_size = 32;
 /// The key length of keyed mode in bytes (hasher::keyed, keyed_hash,
 /// hash_file_options::key take exactly this many).
 inline constexpr std::size_t key_size = 32;
+
+/// Writes the lowercase hex of any byte sequence into a caller's buffer.
+///
+/// Neither allocates nor NUL-terminates.
+/// @param bytes  The bytes to encode (extended output, a key, a digest).
+/// @param out    Receives 2 * bytes.size() characters; must be that large.
+void to_hex(std::span<const std::byte> bytes, std::span<char> out) noexcept;
+/// Returns the lowercase hex of any byte sequence as a string.
+/// @param bytes  The bytes to encode.
+/// @return 2 * bytes.size() lowercase hex characters.
+[[nodiscard]] std::string to_hex(std::span<const std::byte> bytes);
 
 namespace detail {
 
@@ -176,13 +193,13 @@ class hasher {
   explicit hasher(const kern::kernel_ops* custom_ops) noexcept;
 
   /// A hasher in keyed mode: BLAKE3's MAC/PRF, its replacement for HMAC.
-  /// @param key  Exactly 32 bytes, enforced by the span extent.
+  /// @param key  Exactly key_size bytes, enforced by the span extent.
   /// @param a    The variant to run on.
   [[nodiscard]] static hasher keyed(std::span<const std::byte, key_size> key,
                                     arch a = arch::auto_detect) noexcept;
   /// Keyed mode on a caller-supplied kernel table (see the expert
   /// constructor).
-  /// @param key  Exactly 32 bytes.
+  /// @param key  Exactly key_size bytes.
   /// @param ops  The kernel table; must outlive the hasher.
   [[nodiscard]] static hasher keyed(std::span<const std::byte, key_size> key,
                                     const kern::kernel_ops* ops) noexcept;
@@ -298,12 +315,12 @@ class hasher {
 [[nodiscard]] digest hash(std::string_view input) noexcept;
 
 /// One-shot keyed hash: the MAC/PRF of input under a 32-byte key.
-/// @param key    Exactly 32 bytes, enforced by the span extent.
+/// @param key    Exactly key_size bytes, enforced by the span extent.
 /// @param input  Any length.
 [[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::span<const std::byte> input) noexcept;
 /// One-shot keyed hash of a string's bytes.
-/// @param key    Exactly 32 bytes.
+/// @param key    Exactly key_size bytes.
 /// @param input  The bytes of the string.
 [[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::string_view input) noexcept;
