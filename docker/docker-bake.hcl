@@ -32,6 +32,7 @@ variable "UBUNTU" {
 
 variable "CMAKE_VERSION" { default = "4.3.2" }
 variable "NINJA_VERSION" { default = "1.13.2" }
+variable "CMAKE_RE_VERSION" { default = "0.0.87" }
 variable "ZIG_VERSION"   { default = "0.16.0" }
 
 group "default" {
@@ -47,9 +48,10 @@ target "base" {
   context    = "."
   dockerfile = "docker/base.Dockerfile"
   args = {
-    BASE_IMAGE    = UBUNTU[item.rel]
-    CMAKE_VERSION = CMAKE_VERSION
-    NINJA_VERSION = NINJA_VERSION
+    BASE_IMAGE       = UBUNTU[item.rel]
+    CMAKE_VERSION    = CMAKE_VERSION
+    NINJA_VERSION    = NINJA_VERSION
+    CMAKE_RE_VERSION = CMAKE_RE_VERSION
   }
   tags = tc_tags("base-${item.rel}")
 }

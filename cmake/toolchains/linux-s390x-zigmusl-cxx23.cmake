@@ -4,8 +4,16 @@
 # lore on module scanning, push-state, and --dependency-file).
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR s390x)
-set(CMAKE_C_COMPILER "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers/zig-cc-s390x-musl")
-set(CMAKE_CXX_COMPILER "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers/zig-cxx-s390x-musl")
+# The wrappers by name: on PATH in the toolchain image (/usr/local/bin),
+# in tools/zig-wrappers/ in a checkout. Looked up rather than spelled as a
+# path relative to this file because cmake-re copies toolchain files into
+# its own environment directory, where a relative path resolves nowhere.
+find_program(BLAKE3PP_ZIG_CC zig-cc-s390x-musl
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
+find_program(BLAKE3PP_ZIG_CXX zig-cxx-s390x-musl
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
+set(CMAKE_C_COMPILER "${BLAKE3PP_ZIG_CC}")
+set(CMAKE_CXX_COMPILER "${BLAKE3PP_ZIG_CXX}")
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

@@ -64,7 +64,7 @@ run_in_image() {
   if [ -t 0 ] && [ -t 1 ]; then tty_args=(-it); fi
   docker run --rm "${tty_args[@]}" --init \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit core=0 \
-    -u 1000:1000 \
+    -u 1000:1000 --group-add 1001 \
     -v "$(host_workspace):${WORKDIR}" \
     -w "${WORKDIR}" \
     -e CMAKE_GENERATOR=Ninja \

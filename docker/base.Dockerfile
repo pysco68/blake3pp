@@ -74,3 +74,59 @@ RUN set -eux; \
     chown -R ${USERNAME}:${USERNAME} /home/${USERNAME}
 
 ENV CMAKE_GENERATOR=Ninja
+
+# tipi cmake-re (portable package): the remote-execution front end that
+# replaced ccache in the plan. The zip is flat, so its binaries go straight
+# to /usr/local/bin; LICENSE/NOTICE/version.txt keep company under
+# share/doc. The tipi-*-driver files are one binary dispatching on
+# argv[0]; the zip lacks the tipi-test-driver name that cmake-re registers
+# as CMAKE_TEST_LAUNCHER (ctest reports every test "Not Run" without it),
+# so that one is a link. x86_64 package only; an arm64 base gets none.
+#
+# TIPI_DISTRO_MODE=none, set before any of the binaries runs for the first
+# time: without it that first run provisions tipi's whole distro into
+# /usr/local/share/.tipi (its own cmake, ninja, make, reclient, ~900 MB,
+# fetched from third-party buckets) next to the ones this image already
+# carries. In "none" mode it uses what is on PATH.
+ARG CMAKE_RE_VERSION=0.0.87
+ENV TIPI_DISTRO_MODE=none
+RUN set -eux; \
+    if [ "$(dpkg --print-architecture)" != amd64 ]; then echo "cmake-re: x86_64 only, skipping"; exit 0; fi; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://github.com/tipi-build/cli/releases/download/v${CMAKE_RE_VERSION}/cmake-re-portable-v${CMAKE_RE_VERSION}-linux-x86_64.zip" \
+      -o /tmp/cmake-re.zip; \
+    mkdir -p /tmp/cmake-re /usr/local/share/doc/cmake-re; \
+    unzip -q /tmp/cmake-re.zip -d /tmp/cmake-re; \
+    mv /tmp/cmake-re/LICENSE /tmp/cmake-re/NOTICE /tmp/cmake-re/version.txt \
+       /usr/local/share/doc/cmake-re/; \
+    install -m 0755 /tmp/cmake-re/* /usr/local/bin/; \
+    rm -rf /tmp/cmake-re /tmp/cmake-re.zip; \
+    ln -s tipi /usr/local/bin/tipi-test-driver; \
+    cmake-re --version
+
+# tipi keeps its state in /usr/local/share/.tipi (hard-wired; it refuses to
+# run without it) and, depending on how a container is entered, any of
+# three uids is the one using it: vscode (1000, tools/tc and the
+# devcontainer), tipi (1001) or tipi-rbe (108, the RBE worker uid). Each
+# container is ephemeral, so the requirement is only that every one of
+# them can write there, not that they share files: one group holds all
+# three, the tree is group-writable, and setgid keeps whatever gets
+# created inside it in that group. Family images that add other shared
+# caches (zig's) apply the same treatment. The checks run as each user.
+RUN set -eux; \
+    groupadd --gid 1001 tipi; \
+    useradd --system --uid 1001 --gid tipi --create-home --shell /bin/bash tipi; \
+    groupadd --gid 108 tipi-rbe; \
+    useradd --system --uid 108 --gid tipi-rbe -G tipi --create-home --shell /bin/bash tipi-rbe; \
+    usermod -aG tipi ${USERNAME}; \
+    for uid in ${USER_UID} 1001 108; do \
+      mkdir -p /run/user/${uid}; chown ${uid}:${uid} /run/user/${uid}; chmod 0700 /run/user/${uid}; \
+    done; \
+    mkdir -p /usr/local/share/.tipi; \
+    chgrp tipi /usr/local/share/.tipi; \
+    chmod 2775 /usr/local/share/.tipi; \
+    for user in ${USERNAME} tipi tipi-rbe; do \
+      su "${user}" -c "cmake-re --version >/dev/null && \
+        touch /usr/local/share/.tipi/probe-${user} && rm /usr/local/share/.tipi/probe-${user}"; \
+    done; \
+    test "$(du -s /usr/local/share/.tipi | cut -f1)" -le 8

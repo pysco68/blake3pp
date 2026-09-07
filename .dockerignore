@@ -5,3 +5,4 @@
 *
 !docker/
 !tools/build-msan-libcxx.sh
+!tools/zig-wrappers/

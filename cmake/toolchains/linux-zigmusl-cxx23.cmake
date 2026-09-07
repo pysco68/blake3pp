@@ -10,8 +10,16 @@
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
-set(CMAKE_C_COMPILER "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers/zig-cc-x86_64-musl")
-set(CMAKE_CXX_COMPILER "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers/zig-cxx-x86_64-musl")
+# The wrappers by name: on PATH in the toolchain image (/usr/local/bin),
+# in tools/zig-wrappers/ in a checkout. Looked up rather than spelled as a
+# path relative to this file because cmake-re copies toolchain files into
+# its own environment directory, where a relative path resolves nowhere.
+find_program(BLAKE3PP_ZIG_CC zig-cc-x86_64-musl
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
+find_program(BLAKE3PP_ZIG_CXX zig-cxx-x86_64-musl
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
+set(CMAKE_C_COMPILER "${BLAKE3PP_ZIG_CC}")
+set(CMAKE_CXX_COMPILER "${BLAKE3PP_ZIG_CXX}")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

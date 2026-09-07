@@ -24,4 +24,8 @@ string(APPEND CMAKE_EXE_LINKER_FLAGS_INIT
        " -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296"
        " -sSTACK_SIZE=1048576 -sEXIT_RUNTIME=1")
 
-set(CMAKE_CROSSCOMPILING_EMULATOR "node")
+# Resolved to an absolute path: ctest would find a bare "node" on PATH, but
+# a test launcher that execs its argument literally (cmake-re's
+# tipi-test-driver does) fails with "execve: No such file or directory".
+find_program(BLAKE3PP_NODE NAMES node nodejs REQUIRED NO_CACHE)
+set(CMAKE_CROSSCOMPILING_EMULATOR "${BLAKE3PP_NODE}")

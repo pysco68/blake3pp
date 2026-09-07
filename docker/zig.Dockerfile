@@ -44,3 +44,21 @@ RUN set -eux; \
     qemu-aarch64 /tmp/hello-aarch64; \
     rm -f /tmp/hello*; \
     chown -R 1000:1000 /opt/zig-cache
+
+# The zig wrappers on PATH, so a cmake-re toolchain can name them bare
+# (cmake-re copies toolchain files into its own environment directory,
+# where a path relative to the file resolves nowhere). zig's prewarmed
+# cache gets the base image's shared-group treatment, since any of the
+# three uids may drive a build; the checks compile through a wrapper as
+# each user, which writes the cache.
+COPY tools/zig-wrappers/ /usr/local/bin/
+RUN set -eux; \
+    chgrp -R tipi /opt/zig-cache; \
+    chmod -R g+rwX /opt/zig-cache; \
+    find /opt/zig-cache -type d -exec chmod g+s {} +; \
+    printf 'int main() { return 0; }\n' > /tmp/probe.c; \
+    for user in vscode tipi tipi-rbe; do \
+      su "${user}" -c "zig-cc-x86_64-musl -O2 -static /tmp/probe.c -o /tmp/probe-${user} && /tmp/probe-${user}"; \
+    done; \
+    su tipi-rbe -c "zig-cc-aarch64-musl -O2 -static /tmp/probe.c -o /tmp/probe-a64 && qemu-aarch64 /tmp/probe-a64"; \
+    rm -f /tmp/probe*

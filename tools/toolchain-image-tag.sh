@@ -11,6 +11,6 @@
 # reports the tag of its last commit, which is what CI will build.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-git rev-parse HEAD:docker HEAD:tools/build-msan-libcxx.sh \
+git rev-parse HEAD:docker HEAD:tools/build-msan-libcxx.sh HEAD:tools/zig-wrappers \
     HEAD:.github/workflows/toolchains.yml \
   | sha256sum | cut -c1-16

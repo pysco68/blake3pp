@@ -25,7 +25,7 @@ unsupported and unneeded.
 | `toolchain-riscv64-gcc15` | 26.04 | (riscv64 sysroot) | `linux-riscv64-gcc15-*` | qemu-riscv64 (RVV 1.0, `QEMU_CPU=max,vlen=<bits>`); opt-in Xuantie-qemu stage for XTheadVector (`--set riscv64-gcc15.args.WITH_XUANTIE_QEMU=1`, builds T-Head's fork in a pinned 22.04 stage; verify the 0.7.1 kernel with the freestanding `tests/xthead_verify.cpp` harness under `qemu-riscv64-xuantie -cpu c906fdv`; glibc binaries cannot run on the th CPU models, see the harness header) |
 | `toolchain-ppc64le-gcc15` | 26.04 | (ppc64le sysroot) | `linux-ppc64le-gcc15-*` | qemu-ppc64le (`QEMU_CPU=power8/9/10`) |
 | `toolchain-s390x-gcc15` | 26.04 | (s390x sysroot) | `linux-s390x-gcc15-*` | qemu-s390x (big-endian; `QEMU_CPU=max,vxeh=off` for the scalar fallback) |
-| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, prewarmed zig cache |
+| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, prewarmed zig cache (group-shared), the zig wrappers on PATH |
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
 
 Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`. The canonical tag
@@ -54,6 +54,36 @@ tools/tc --pull                            # refresh after a CI image push
 `tc` mounts the workspace at `/workspaces/blake3pp` (the devcontainer's own
 path), so build trees and
 `compile_commands.json` are valid on both sides.
+
+### cmake-re (every image)
+
+The base recipe installs tipi's cmake-re (the portable package, its
+binaries in `/usr/local/bin`) with `TIPI_DISTRO_MODE=none`, so it drives
+the image's own cmake, ninja and compilers instead of provisioning tipi's
+distro (~900 MB) on first use. Three uids may be the one running it,
+depending on how a container is entered (vscode 1000 via tools/tc, tipi
+1001, tipi-rbe 108); they share group `tipi`, which owns
+`/usr/local/share/.tipi` (tipi's hard-wired state directory) and, in the
+zig image, the prewarmed zig cache, so `tools/tc` adds that group to its
+`-u 1000:1000`. cmake-re knows nothing about presets: pass the toolchain
+file, and put `--build` first when building. The build directory becomes
+a symlink into cmake-re's mirror of the checkout under `.tipi`, so `cd`
+into it (or use `ctest --test-dir`) rather than reasoning about the
+path. cmake-re writes a git note into the source checkout, so the uid
+running it must own that checkout.
+
+```sh
+tools/tc --shell linux-zigmusl-cxx23-static
+cmake-re --host -S . -B build/cmake-re-zig -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-zigmusl-cxx23.cmake \
+    -DCMAKE_BUILD_TYPE=Release
+cmake-re --build build/cmake-re-zig --host -j 8
+ctest --test-dir build/cmake-re-zig
+```
+
+The zigmusl toolchain files find the wrappers by name for the same
+reason: cmake-re copies the toolchain file into its own environment
+directory, where a path relative to the file resolves nowhere.
 
 ### SVE testing: one binary, every vector length
 
