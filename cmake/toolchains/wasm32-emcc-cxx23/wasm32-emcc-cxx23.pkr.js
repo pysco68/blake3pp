@@ -3,7 +3,7 @@
   "builders": [
     {
       "type": "docker",
-      "image": "ghcr.io/pysco68/blake3pp/toolchain-emscripten:tree-9e322f00700085c3",
+      "image": "ghcr.io/pysco68/blake3pp/toolchain-emscripten:tree-ebac5e47c084eeba",
       "commit": true
     }
   ]

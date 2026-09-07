@@ -18,6 +18,12 @@ file is not composed into a child's environment, measured on v0.0.87).
 That pairing is what lets cmake-re run the same build remotely
 (--remote, RBE) instead of on this host.
 
+The immutable form is not written here: once cmake-re has resolved the
+image (locally or by pulling it) it writes <name>.container.lock beside
+the toolchain, with the registry manifest digest and the environment
+hash, and marks it for version control. Those lock files are the digest
+pins to commit, produced against the real images rather than guessed.
+
 The preset-to-image patterns mirror tools/tc's; keep the two in step.
 """
 
