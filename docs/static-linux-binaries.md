@@ -39,7 +39,7 @@ The static presets (`linux-{,arm64-,riscv64-,ppc64le-,s390x-}zigmusl-`
 `<arch>-linux-musl`. zig ships musl headers and sources for every
 supported target, so a single toolchain cross-builds all five
 architectures with no per-architecture sysroots to assemble. The
-toolchain files live in `cmake/toolchains/linux-*zigmusl*.cmake` and
+toolchain files live in `cmake/toolchains/linux-*zigmusl*/` and
 document the zig-specific plumbing (wrapper scripts, linker-probe
 workarounds) in place.
 

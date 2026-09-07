@@ -2,7 +2,7 @@
 
 One Docker image per compiler, so CI jobs and local matrix runs pull a small
 prebuilt image instead of the old 8.6 GB kitchen-sink devcontainer. The
-`cmake/toolchains/*.cmake` files are unchanged: they name compilers by bare
+`cmake/toolchains/<name>/<name>.cmake` files are unchanged: they name compilers by bare
 PATH name, which resolves inside the right image.
 
 ## The mapping
@@ -72,10 +72,23 @@ into it (or use `ctest --test-dir`) rather than reasoning about the
 path. cmake-re writes a git note into the source checkout, so the uid
 running it must own that checkout.
 
+Each toolchain lives in its own folder because that folder is cmake-re's
+environment unit: everything beside the toolchain file is copied into the
+environment and hashed into its identity. For a containerized toolchain
+the folder holds `<name>.cmake`, `<name>.pkr.js` (the image it builds in,
+pinned to the content tag) and, where the toolchain includes
+`../common.cmake`, a `<name>.layers.json` pulling that one file in. The
+environment files are written by `tools/gen-environments.py`, which
+shares tools/tc's preset-to-image table; rerun it after anything that
+moves the content tag (the `docker/` tree, the msan script, the zig
+wrappers, the image workflow), and `--check` says whether they are
+stale. They are what `cmake-re --remote` needs to run the same build on
+tipi's infrastructure instead of here.
+
 ```sh
 tools/tc --shell linux-zigmusl-cxx23-static
 cmake-re --host -S . -B build/cmake-re-zig -G Ninja \
-    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-zigmusl-cxx23.cmake \
+    -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/linux-zigmusl-cxx23/linux-zigmusl-cxx23.cmake \
     -DCMAKE_BUILD_TYPE=Release
 cmake-re --build build/cmake-re-zig --host -j 8
 ctest --test-dir build/cmake-re-zig

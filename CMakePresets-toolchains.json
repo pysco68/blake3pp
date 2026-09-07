@@ -6,7 +6,7 @@
       "displayName": "GCC 14 with libstdc++ 14, C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-gcc14-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc14-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc14-cxx23/linux-gcc14-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -16,7 +16,7 @@
       "displayName": "GCC 14 with libstdc++ 14, C++26",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-gcc14-cxx26",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc14-cxx26.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc14-cxx26/linux-gcc14-cxx26.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -26,7 +26,7 @@
       "displayName": "GCC 16 with libstdc++ 16, C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-gcc16-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx23/linux-gcc16-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -36,7 +36,7 @@
       "displayName": "GCC 16 with libstdc++ 16, C++26",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-gcc16-cxx26",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26/linux-gcc16-cxx26.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -46,7 +46,7 @@
       "displayName": "Clang 20 with libc++ (system), C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang20-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx23/linux-clang20-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -56,7 +56,7 @@
       "displayName": "Clang 20 with libc++ (system), C++26",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang20-cxx26",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx26.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx26/linux-clang20-cxx26.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -66,7 +66,7 @@
       "displayName": "Clang 22 with libc++ (system), C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx23/linux-clang22-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -76,7 +76,7 @@
       "displayName": "Clang 22 with libc++ (system), C++26",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26/linux-clang22-cxx26.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -86,7 +86,7 @@
       "displayName": "Clang 18 against libstdc++ 14 (pinned), C++20",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang18-cxx20-libstdcxx",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang18-cxx20-libstdcxx.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang18-cxx20-libstdcxx/linux-clang18-cxx20-libstdcxx.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -96,7 +96,7 @@
       "displayName": "Clang 20 against libstdc++ 14 (pinned), C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang20-cxx23-libstdcxx",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx23-libstdcxx.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang20-cxx23-libstdcxx/linux-clang20-cxx23-libstdcxx.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -106,7 +106,7 @@
       "displayName": "Clang 22 against libstdc++ 16 (pinned), C++23",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx23-libstdcxx",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx23-libstdcxx.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx23-libstdcxx/linux-clang22-cxx23-libstdcxx.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -116,7 +116,7 @@
       "displayName": "Clang 22 with libc++, experimental -std=c++2c (post-C++26 working draft)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx2c",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx2c.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx2c/linux-clang22-cxx2c.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -126,7 +126,7 @@
       "displayName": "GCC 16 with libstdc++ 16, C++26 + asan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-gcc16-cxx26-asan",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-asan.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-asan/linux-gcc16-cxx26-asan.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -136,7 +136,7 @@
       "displayName": "GCC 16 with libstdc++ 16, C++26 + tsan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-gcc16-cxx26-tsan",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-tsan.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-tsan/linux-gcc16-cxx26-tsan.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -146,7 +146,7 @@
       "displayName": "GCC 16 with libstdc++ 16, C++26 + coverage",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-gcc16-cxx26-coverage",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-coverage.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-coverage/linux-gcc16-cxx26-coverage.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"
       }
@@ -156,7 +156,7 @@
       "displayName": "Clang 22 with libc++ (system), C++26 + asan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-asan",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-asan.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-asan/linux-clang22-cxx26-asan.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -166,7 +166,7 @@
       "displayName": "Clang 22 with libc++ (system), C++26 + tsan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-tsan",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-tsan.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-tsan/linux-clang22-cxx26-tsan.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -176,7 +176,7 @@
       "displayName": "Clang 22 with libc++ (system), C++26 + msan",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-msan",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-msan.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-msan/linux-clang22-cxx26-msan.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -186,7 +186,7 @@
       "displayName": "Clang 22 with libc++ (system), C++26 + fuzzer",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-fuzzer",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-fuzzer.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-fuzzer/linux-clang22-cxx26-fuzzer.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -196,7 +196,7 @@
       "displayName": "Clang 22 with libc++ (system), C++26 + coverage",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-coverage",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-coverage.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-coverage/linux-clang22-cxx26-coverage.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"
       }

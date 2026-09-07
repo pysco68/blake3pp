@@ -1,4 +1,4 @@
-# cmake/toolchains/common.cmake
+# cmake/toolchains/common.cmake (included by every toolchain as ../common.cmake)
 #
 # Shared engine for every toolchain file in this directory. A concrete file sets
 # a handful of TC_* variables and then includes this one:
@@ -7,7 +7,7 @@
 #     set(TC_STDLIB        libc++)
 #     set(TC_CXX_STANDARD  26)
 #     set(TC_SANITIZERS    address undefined)
-#     include("${CMAKE_CURRENT_LIST_DIR}/common.cmake")
+#     include("${CMAKE_CURRENT_LIST_DIR}/../common.cmake")
 #
 # Everything is set inside the toolchain file itself rather than passed on the
 # command line. That is deliberate:

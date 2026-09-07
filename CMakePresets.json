@@ -9,7 +9,7 @@
       "displayName": "clang 22, C++26, beman.execution provider",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-beman",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26/linux-clang22-cxx26.cmake",
       "cacheVariables": {
         "BLAKE3PP_EXECUTION_PROVIDER": "beman"
       }
@@ -19,7 +19,7 @@
       "displayName": "aarch64 Linux cross (GCC 15, C++23, runs via qemu-user)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-arm64-gcc15-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-gcc15-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-gcc15-cxx23/linux-arm64-gcc15-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -29,7 +29,7 @@
       "displayName": "riscv64 Linux cross (GCC 15, C++23, runs via qemu-user)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-riscv64-gcc15-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-gcc15-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-gcc15-cxx23/linux-riscv64-gcc15-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -39,7 +39,7 @@
       "displayName": "WebAssembly (Emscripten, SIMD128 + threads, runs via node)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/wasm32-emcc-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/wasm32-emcc-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/wasm32-emcc-cxx23/wasm32-emcc-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
@@ -49,7 +49,7 @@
       "displayName": "Static musl release (aarch64, zig + mimalloc)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-arm64-zigmusl-cxx23-static",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-zigmusl-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-zigmusl-cxx23/linux-arm64-zigmusl-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
@@ -59,7 +59,7 @@
       "displayName": "Static musl release (riscv64, zig + mimalloc; xthead kernel via external gcc)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-riscv64-zigmusl-cxx23-static",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-zigmusl-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-zigmusl-cxx23/linux-riscv64-zigmusl-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BLAKE3PP_XTHEAD_KERNEL": "ON"
@@ -70,7 +70,7 @@
       "displayName": "Static musl release (x86_64, zig + mimalloc)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-zigmusl-cxx23-static",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-zigmusl-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-zigmusl-cxx23/linux-zigmusl-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
@@ -95,7 +95,7 @@
       "displayName": "macOS Homebrew LLVM 22, C++26 (bundled libc++, GCD + F_NOCACHE I/O)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/macos-clang22-cxx26",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/macos-clang22-cxx26.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/macos-clang22-cxx26/macos-clang22-cxx26.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -110,7 +110,7 @@
       "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-msvc2026-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-msvc2026-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-msvc2026-cxx23/windows-msvc2026-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -125,7 +125,7 @@
       "displayName": "Windows clang-cl (VS LLVM toolset), C++23 (vcvars64 shell)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-clangcl-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-clangcl-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-clangcl-cxx23/windows-clangcl-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -140,7 +140,7 @@
       "displayName": "Windows arm64 cross (MSVC, scalar-only by verdict \u2014 see KernelVariants.cmake), vcvarsamd64_arm64 shell",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-arm64-msvc2026-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-msvc2026-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-msvc2026-cxx23/windows-arm64-msvc2026-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -155,7 +155,7 @@
       "displayName": "Windows arm64 cross (clang-cl, full NEON), vcvarsamd64_arm64 shell",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/windows-arm64-clangcl-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-clangcl-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64-clangcl-cxx23/windows-arm64-clangcl-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
@@ -170,7 +170,7 @@
       "displayName": "POWER cross (GCC 15, VSX via xsimd, qemu-ppc64le)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-ppc64le-gcc15-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-ppc64le-gcc15-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-ppc64le-gcc15-cxx23/linux-ppc64le-gcc15-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -180,7 +180,7 @@
       "displayName": "IBM z cross (GCC 15, z14 VXE via xsimd, BIG-endian, qemu-s390x)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-s390x-gcc15-cxx23",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-gcc15-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-gcc15-cxx23/linux-s390x-gcc15-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -190,7 +190,7 @@
       "displayName": "Static musl release (ppc64le, zig + mimalloc, VSX)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-ppc64le-zigmusl-cxx23-static",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-ppc64le-zigmusl-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-ppc64le-zigmusl-cxx23/linux-ppc64le-zigmusl-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
@@ -200,7 +200,7 @@
       "displayName": "Static musl release (s390x, zig + mimalloc, z14 VXE, big-endian)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-s390x-zigmusl-cxx23-static",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-zigmusl-cxx23.cmake",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-zigmusl-cxx23/linux-s390x-zigmusl-cxx23.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
