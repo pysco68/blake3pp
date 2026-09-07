@@ -11,7 +11,7 @@ set(TC_CXX_COMPILER "clang++-22")
 set(TC_STDLIB "libc++")
 set(TC_CXX_STANDARD "26")
 set(TC_LINKER "lld-22")
-set(TC_DEFAULT_BUILD_TYPE "Debug")
+set(TC_DEFAULT_BUILD_TYPE "RelWithDebInfo")
 set(TC_SANITIZERS memory)
 set(TC_MSAN_LIBCXX_PREFIX "/opt/libcxx-msan")
 

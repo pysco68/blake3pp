@@ -9,7 +9,7 @@
 set(TC_C_COMPILER "gcc-16")
 set(TC_CXX_COMPILER "g++-16")
 set(TC_CXX_STANDARD "26")
-set(TC_DEFAULT_BUILD_TYPE "Debug")
+set(TC_DEFAULT_BUILD_TYPE "RelWithDebInfo")
 set(TC_SANITIZERS address undefined)
 
 include("${CMAKE_CURRENT_LIST_DIR}/common.cmake")

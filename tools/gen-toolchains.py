@@ -59,10 +59,17 @@ DEFAULT_CLANG = 22
 # clang_version - 6 for anything not listed. Adjust if you hit a bad pair.
 CLANG_TO_GCC = {17: 14, 18: 14, 19: 14, 20: 15, 21: 15, 22: 16, 23: 16}
 
+# Sanitizers run on optimised code, the same RelWithDebInfo (-O2 -g) the
+# plain presets use: the runtimes are designed for -O1 and up, the shipped
+# kernels only exist under optimisation (the xsimd/std::simd layers are
+# call chains at -O0, and MSan's origin tracking multiplies that), and
+# optimiser-dependent bugs need the optimiser to show. -fno-omit-frame-
+# pointer and -fno-optimize-sibling-calls keep the traces honest. Coverage
+# stays Debug: it wants unoptimised control flow.
 INSTRUMENTATIONS = {
-    "asan": {"sanitizers": ["address", "undefined"], "build_type": "Debug"},
-    "tsan": {"sanitizers": ["thread"], "build_type": "Debug"},
-    "msan": {"sanitizers": ["memory"], "build_type": "Debug", "clang_only": True},
+    "asan": {"sanitizers": ["address", "undefined"], "build_type": "RelWithDebInfo"},
+    "tsan": {"sanitizers": ["thread"], "build_type": "RelWithDebInfo"},
+    "msan": {"sanitizers": ["memory"], "build_type": "RelWithDebInfo", "clang_only": True},
     "fuzzer": {"sanitizers": ["fuzzer", "address", "undefined"], "clang_only": True},
     "coverage": {"coverage": "auto", "build_type": "Debug"},
 }
@@ -258,8 +265,7 @@ def main() -> int:
                     "toolchainFile": "${sourceDir}/" + f"{rel}/{name}.cmake",
                     "cacheVariables": {
                         "CMAKE_BUILD_TYPE": (
-                            "Debug" if any(k in name for k in ("asan", "tsan", "msan", "coverage"))
-                            else "RelWithDebInfo")
+                            "Debug" if "coverage" in name else "RelWithDebInfo")
                     },
                 }
                 for name, desc, _ in configs

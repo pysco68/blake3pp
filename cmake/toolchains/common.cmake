@@ -211,10 +211,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # ------------------------------------------------------- default build type
 # Normally a build type is a per-invocation concern, not a toolchain one. But
 # when presets are unavailable the toolchain file is the only thing a consumer
-# passes, and an -O0-less sanitizer build is close to useless, so instrumented
-# toolchains carry a sensible default. An explicit -DCMAKE_BUILD_TYPE always
-# wins: cache entries from the command line are already populated by the time
-# this file is read.
+# passes, and a sanitizer build without a build type would land on no
+# optimisation at all, so instrumented toolchains carry a default: the same
+# RelWithDebInfo as the plain presets (sanitizers want -O1 or better; see
+# INSTRUMENTATIONS in tools/gen-toolchains.py), Debug for coverage. An
+# explicit -DCMAKE_BUILD_TYPE always wins: cache entries from the command
+# line are already populated by the time this file is read.
 if(DEFINED TC_DEFAULT_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE "${TC_DEFAULT_BUILD_TYPE}" CACHE STRING "Build type" FORCE)
 endif()
