@@ -1,3 +1,4 @@
+#include <array>
 #include <cstddef>
 #include <span>
 #include <ostream>
@@ -111,6 +112,38 @@ TEST_CASE("count reports bytes absorbed across every ingestion path") {
   CHECK(h.count() == input.size());
   h.reset();
   CHECK(h.count() == 0);
+}
+
+// push_subtree_cv() after update() has consumed an exact chunk multiple.
+// The hasher keeps its last full chunk open (it may still turn out to be
+// ROOT), so the seam has to close it out before the subtree lands, or the
+// subtree's counter is off by one and that chunk is silently dropped.
+// This is the shape update_file() produces when files hash in sequence.
+TEST_CASE("push_subtree_cv follows an update() ending on a chunk boundary") {
+  constexpr std::size_t chunk = blake3pp::chunk_size;
+  const auto input = make_input(8 * chunk + 100);
+  const auto expected = blake3pp::hash(input);
+  const std::span<const std::byte> bytes{input};
+
+  // Leads are 2-chunk aligned positions, as the seam requires.
+  for (const std::size_t lead : {std::size_t{2 * chunk}, std::size_t{4 * chunk},
+                                 std::size_t{6 * chunk}}) {
+    CAPTURE(lead);
+    blake3pp::hasher h;
+    h.update(bytes.first(lead));
+    REQUIRE(h.count() == lead);
+
+    // Subtree of the next 2 chunks at counter lead/chunk, then the rest
+    // through update() so the final chunk stays with the hasher.
+    std::array<std::uint32_t, 8> cv;
+    blake3pp::detail::compress_subtree_cv(
+        blake3pp::detail::resolve(h.selected_arch()), bytes.data() + lead,
+        2, lead / chunk, h.key_words(), h.mode_flags(), cv);
+    h.push_subtree_cv(cv, 2);
+    CHECK(h.count() == lead + 2 * chunk);
+    h.update(bytes.subspan(lead + 2 * chunk));
+    CHECK(h.finalize() == expected);
+  }
 }
 
 TEST_CASE("reset reuses the instance") {

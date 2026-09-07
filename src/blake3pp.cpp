@@ -104,21 +104,28 @@ void hasher::push_cv(std::span<const std::uint32_t, 8> cv,
   cv_stack_len_++;
 }
 
+// A full chunk is only closed out when more input arrives: the final
+// chunk of the message must stay open for possible ROOT finalization. So
+// "on a chunk boundary" has two shapes, an empty chunk state or a full
+// one, and every path that appends after the boundary (update() and
+// push_subtree_cv()) starts by collapsing the second into the first.
+void hasher::close_full_chunk() noexcept {
+  if (core::chunk_len(chunk_) == kern::chunk_len) {
+    std::array<std::uint32_t, 8> chunk_cv;
+    core::chaining_value(*ops_, core::chunk_output(chunk_, base_flags_),
+                         chunk_cv);
+    const std::uint64_t total_chunks = chunk_.chunk_counter + 1;
+    push_cv(chunk_cv, total_chunks, 1);
+    core::chunk_init(chunk_, key_words_, total_chunks);
+  }
+}
+
 void hasher::update(std::span<const std::byte> input) noexcept {
   const auto* p = reinterpret_cast<const std::uint8_t*>(input.data());
   std::size_t len = input.size();
 
   while (len > 0) {
-    // A full chunk is only closed out when more input arrives: the final
-    // chunk of the message must stay open for possible ROOT finalization.
-    if (core::chunk_len(chunk_) == kern::chunk_len) {
-      std::array<std::uint32_t, 8> chunk_cv;
-      core::chaining_value(*ops_, core::chunk_output(chunk_, base_flags_),
-                           chunk_cv);
-      const std::uint64_t total_chunks = chunk_.chunk_counter + 1;
-      push_cv(chunk_cv, total_chunks, 1);
-      core::chunk_init(chunk_, key_words_, total_chunks);
-    }
+    close_full_chunk();
 
     // Subtree fast path: aligned on a chunk boundary with more than one
     // whole chunk ahead, reduce the largest power-of-2, position-aligned
@@ -231,6 +238,7 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
 
 void hasher::push_subtree_cv(std::span<const std::uint32_t, 8> cv,
                              std::uint64_t subtree_chunks) noexcept {
+  close_full_chunk();
   push_cv(cv, chunk_.chunk_counter + subtree_chunks, subtree_chunks);
   chunk_.chunk_counter += subtree_chunks;
 }

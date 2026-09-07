@@ -233,6 +233,7 @@ class hasher {
   void push_cv(std::span<const std::uint32_t, 8> cv,
                std::uint64_t total_chunks,
                std::uint64_t subtree_chunks) noexcept;
+  void close_full_chunk() noexcept;
 
   const kern::kernel_ops* ops_;
   std::array<std::uint32_t, 8> key_words_;
