@@ -2,17 +2,17 @@
 
 /// @file
 /// File hashing driven by a scheduler: the intersection of io.hpp (which
-/// windows a file at storage speed) and parallel.hpp (which hashes subtrees
-/// across threads). It is its own header because that intersection is the
-/// only part of the file API that needs an execution provider: io.hpp on
-/// its own compiles against the standard library alone, and parallel.hpp on
-/// its own knows nothing about files.
+/// windows a file at storage speed) and parallel.hpp (which hashes
+/// subtrees across threads). It is its own header because that
+/// intersection is the only part of the file API that needs an execution
+/// provider: io.hpp on its own compiles against the standard library
+/// alone, and parallel.hpp on its own knows nothing about files.
 ///
-/// Every full window is a power-of-2, subtree-aligned run of chunks, so its
-/// chaining values drop into the hasher through the same push_subtree_cv
-/// seam the in-memory parallel engine uses. The final window (which may be
-/// partial and contains the message end) goes through hasher::update to
-/// keep ROOT finalization correct.
+/// Every full window is a power-of-2, subtree-aligned run of chunks, so
+/// its chaining values drop into the hasher through the same
+/// push_subtree_cv seam the in-memory parallel engine uses. The final
+/// window (which may be partial and contains the message end) goes
+/// through hasher::update to keep ROOT finalization correct.
 ///
 /// Same shape as io.hpp: update_file() is the primitive, hash_file() the
 /// one-shot convenience, each with a throwing and a std::error_code form.
@@ -154,8 +154,11 @@ template <detail::foreign_path P, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const P& path, Scheduler&& sched,
                  std::error_code& ec, const file_io_options& opts = {}) noexcept {
-  update_file(h, std::filesystem::path(path.native()),
-              std::forward<Scheduler>(sched), ec, opts);
+  // The path conversion allocates, so it belongs inside the guard too.
+  detail::with_error_code(ec, [&] {
+    update_file(h, std::filesystem::path(path.native()),
+                std::forward<Scheduler>(sched), opts);
+  });
 }
 
 /// hash_file() over a scheduler for a foreign path type.
@@ -182,8 +185,10 @@ template <detail::foreign_path P, class Scheduler>
 [[nodiscard]] digest hash_file(const P& path, Scheduler&& sched,
                                std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept {
-  return hash_file(std::filesystem::path(path.native()),
-                   std::forward<Scheduler>(sched), ec, opts);
+  return detail::with_error_code(ec, [&] {
+    return hash_file(std::filesystem::path(path.native()),
+                     std::forward<Scheduler>(sched), opts);
+  });
 }
 
 }  // namespace blake3pp

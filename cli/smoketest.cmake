@@ -45,6 +45,23 @@ elseif(CASE STREQUAL "empty_stdin")
     message(FATAL_ERROR "empty-stdin digest wrong (rc=${res}): ${out}")
   endif()
 
+elseif(CASE STREQUAL "stdin_parallel")
+  # A multi-window stream on stdin hashes through parallel_hasher when a
+  # pool runs; it must agree with the sequential read and with the file
+  # pipeline over the same bytes.
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed stdin --length 20000000
+    OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
+  run_sum(par res1 ARGS --threads 4 - STDIN "${WORK}/stream")
+  run_sum(seq res2 ARGS --threads 1 - STDIN "${WORK}/stream")
+  run_sum(file res3 ARGS --threads 4 stream)
+  string(SUBSTRING "${par}" 0 64 par_hex)
+  string(SUBSTRING "${seq}" 0 64 seq_hex)
+  string(SUBSTRING "${file}" 0 64 file_hex)
+  if(NOT r0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0 OR NOT res3 EQUAL 0
+     OR NOT par_hex STREQUAL seq_hex OR NOT par_hex STREQUAL file_hex)
+    message(FATAL_ERROR "stdin digests diverge: par=${par_hex} seq=${seq_hex} file=${file_hex}")
+  endif()
+
 elseif(CASE STREQUAL "check_roundtrip")
   file(WRITE "${WORK}/f" "hello blake3pp")
   run_sum(sums res ARGS f)

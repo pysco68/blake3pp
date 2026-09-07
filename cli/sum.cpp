@@ -114,48 +114,83 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
-    if (!o.derive_context.empty()) {
-      proto_ = blake3pp::hasher::derive_key(o.derive_context, o.io.a);
-    } else if (!o.key_file.empty()) {
-      const auto key = load_key(o.key_file);
-      proto_ = blake3pp::hasher::keyed(key, o.io.a);
-    } else {
-      proto_ = blake3pp::hasher{o.io.a};
+    if (!o.key_file.empty()) {
+      key_ = load_key(o.key_file);
     }
   }
 
-  // Hashes stdin or a file into a fresh copy of the mode prototype. Every
-  // mode gets async windowed reads, and multi-core when a pool exists.
-  blake3pp::hasher hash_source(const std::string& path) {
-    blake3pp::hasher h = proto_.value();  // hashers are cheap flat copies
+  // Hex of the requested output length over stdin or a file. Files stream
+  // through the library's pipeline (async windowed reads, multi-core when
+  // a pool exists); stdin has no file to hand over, so it is read in
+  // buffers into a parallel_hasher when a pool exists, the plain hasher
+  // otherwise. Either way the mode comes from the options.
+  std::string hash_hex(const std::string& path, std::size_t out_len) {
+    std::vector<std::byte> out(out_len);
+    const auto finish = [&](const auto& h) {
+      h.finalize(out);
+      return blake3pp::to_hex(out);
+    };
     if (path == "-") {
-      std::vector<std::byte> buf(b3tool::stream_buffer_bytes);
-      std::size_t n = 0;
-      while ((n = std::fread(buf.data(), 1, buf.size(), stdin)) > 0) {
-        h.update(std::span{buf}.first(n));
+      if (pool_.parallel()) {
+        auto ph = make_parallel_hasher();
+        read_stdin_into(ph);
+        return finish(ph);
       }
-      if (std::ferror(stdin) != 0) {
-        throw std::system_error(errno, std::generic_category(), "reading standard input");
-      }
-      return h;
+      blake3pp::hasher h = make_hasher();
+      read_stdin_into(h);
+      return finish(h);
     }
+    blake3pp::hasher h = make_hasher();
     if (pool_.parallel()) {
       blake3pp::update_file(h, path, pool_.scheduler(), opts_.io);
     } else {
       blake3pp::update_file(h, path, opts_.io);
     }
-    return h;
-  }
-
-  std::string hash_hex(const std::string& path, std::size_t out_len) {
-    std::vector<std::byte> out(out_len);
-    hash_source(path).finalize(out);
-    return blake3pp::to_hex(out);
+    return finish(h);
   }
 
  private:
+  blake3pp::hasher make_hasher() const {
+    if (!opts_.derive_context.empty()) {
+      return blake3pp::hasher::derive_key(opts_.derive_context, opts_.io.a);
+    }
+    if (key_) {
+      return blake3pp::hasher::keyed(*key_, opts_.io.a);
+    }
+    return blake3pp::hasher{opts_.io.a};
+  }
+
+  blake3pp::parallel_hasher<blake3pp::parallel_scheduler_t>
+  make_parallel_hasher() {
+    const blake3pp::parallel_hasher_options popts{.a = opts_.io.a};
+    if (!opts_.derive_context.empty()) {
+      return blake3pp::parallel_hasher{pool_.scheduler(),
+                                       std::string_view{opts_.derive_context},
+                                       popts};
+    }
+    if (key_) {
+      return blake3pp::parallel_hasher{
+          pool_.scheduler(), std::span<const std::byte, blake3pp::key_size>{*key_},
+          popts};
+    }
+    return blake3pp::parallel_hasher{pool_.scheduler(), popts};
+  }
+
+  template <class Sink>
+  static void read_stdin_into(Sink& sink) {
+    std::vector<std::byte> buf(b3tool::stream_buffer_bytes);
+    std::size_t n = 0;
+    while ((n = std::fread(buf.data(), 1, buf.size(), stdin)) > 0) {
+      sink.update(std::span{buf}.first(n));
+    }
+    if (std::ferror(stdin) != 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "reading standard input");
+    }
+  }
+
   options opts_;
-  std::optional<blake3pp::hasher> proto_;
+  std::optional<std::array<std::byte, blake3pp::key_size>> key_;
   b3tool::compute_pool pool_;
 };
 

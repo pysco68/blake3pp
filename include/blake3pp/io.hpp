@@ -16,12 +16,12 @@
 /// without this header knowing about them. hash_file() is the one-shot
 /// convenience on top: construct, update_file, finalize.
 ///
-/// This header is deliberately free of any execution-provider dependency:
-/// core.hpp, dispatch.hpp and io.hpp compile against the standard library
-/// alone. Reads still overlap hashing here (the reader is asynchronous);
-/// what is sequential is the compute. The scheduler-taking overloads,
-/// which fan each window out over cores, live in parallel_io.hpp, the one
-/// public header that needs stdexec/beman/std::execution.
+/// This header is free of any execution-provider dependency: core.hpp,
+/// dispatch.hpp and io.hpp compile against the standard library alone.
+/// Reads still overlap hashing here (the reader is asynchronous); what is
+/// sequential is the compute. The scheduler-taking overloads, which fan
+/// each window out over cores, live in parallel_io.hpp, the one public
+/// header that needs stdexec/beman/std::execution.
 ///
 /// std::filesystem::path is the path currency throughout (string literals
 /// and std::string convert implicitly). Each entry point follows the
@@ -201,7 +201,10 @@ void update_file(hasher& h, const P& path, const file_io_options& opts = {}) {
 template <detail::foreign_path P>
 void update_file(hasher& h, const P& path, std::error_code& ec,
                  const file_io_options& opts = {}) noexcept {
-  update_file(h, std::filesystem::path(path.native()), ec, opts);
+  // The path conversion allocates, so it belongs inside the guard too.
+  detail::with_error_code(ec, [&] {
+    update_file(h, std::filesystem::path(path.native()), opts);
+  });
 }
 
 /// hash_file() for a foreign path type.
@@ -221,7 +224,9 @@ template <detail::foreign_path P>
 template <detail::foreign_path P>
 [[nodiscard]] digest hash_file(const P& path, std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept {
-  return hash_file(std::filesystem::path(path.native()), ec, opts);
+  return detail::with_error_code(ec, [&] {
+    return hash_file(std::filesystem::path(path.native()), opts);
+  });
 }
 
 }  // namespace blake3pp
