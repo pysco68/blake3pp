@@ -21,6 +21,9 @@ namespace blake3pp {
 /// (hasher::push_subtree_cv, <blake3pp/parallel.hpp>) is expressed in
 /// units of this.
 inline constexpr std::size_t chunk_size = 1024;
+/// The compression block in bytes: the granularity of extended output
+/// (each block of the XOF stream is one compression with its own counter).
+inline constexpr std::size_t block_size = 64;
 
 namespace detail {
 
@@ -125,6 +128,15 @@ class output_reader {
   bool cache_valid_ = false;
   std::array<std::byte, 64> cache_ = {};
 };
+
+/// Free-function spelling of output_reader::fill(), so the sequential and
+/// the scheduler-taking form (<blake3pp/parallel.hpp>) read alike:
+/// fill(r, out) and fill(r, out, sched).
+/// @param r    The reader to advance.
+/// @param out  Receives the next out.size() bytes of r's stream.
+inline void fill(output_reader& r, std::span<std::byte> out) noexcept {
+  r.fill(out);
+}
 
 /// The incremental BLAKE3 hasher: plain, keyed (MAC/PRF) or key-derivation
 /// mode, with a non-destructive finalize family.

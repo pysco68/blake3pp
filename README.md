@@ -73,7 +73,7 @@ consumers can pick granular headers instead:
 | `<blake3pp/dispatch.hpp>`    | `arch` introspection, SIMD variant selection | no |
 | `<blake3pp/core.hpp>`        | `digest`, `hasher`, one-shot `hash()` | no |
 | `<blake3pp/io.hpp>`          | `update_file()` and `hash_file()`, the async direct-I/O pipeline | no |
-| `<blake3pp/parallel.hpp>`    | multi-core `hash()` and `parallel_hasher` | yes |
+| `<blake3pp/parallel.hpp>`    | multi-core `hash()`, `parallel_hasher`, multi-core XOF `fill()` | yes |
 | `<blake3pp/parallel_io.hpp>` | `update_file()` and `hash_file()` over a scheduler (the two combined) | yes |
 
 The last column is the one that matters when you install blake3pp rather
@@ -200,6 +200,13 @@ auto next = r.take<32>();                   // ...same, by value
 r.seek(10'000'000'000);                     // ...or jump: O(1) random access
 r.fill(deep_chunk);                         // byte 10 GB costs same as byte 0
 ```
+
+O(1) seek also makes the stream embarrassingly parallel: with a
+scheduler (`<blake3pp/parallel.hpp>`), `blake3pp::fill(r, big_buffer,
+sched)` splits the request into segments that fill on every core, each
+straight into its slice of the buffer, and leaves `r` positioned exactly
+as `blake3pp::fill(r, big_buffer)` (the free spelling of `r.fill()`)
+would have. That is what `blake3ppgen --threads` runs on.
 
 Extended output works in all three modes (plain, keyed, derive_key): a
 keyed hasher's `finalize_xof()` streams the MAC'd output, and

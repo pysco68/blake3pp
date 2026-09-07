@@ -1,5 +1,6 @@
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -142,6 +143,62 @@ TEST_CASE("parallel_hasher XOF forms match the sequential stream") {
 
   // Still non-destructive: the plain digest survives all of the above.
   CHECK(ph.finalize() == seq.finalize());
+}
+
+// The scheduler-taking fill() must be indistinguishable from
+// output_reader::fill(): same bytes, same position afterwards, from
+// aligned and unaligned starting offsets, across segment boundaries and
+// through the sequential fallback for requests of one segment or less.
+TEST_CASE("parallel fill matches the sequential output stream") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  h.update(std::string_view{"parallel xof fill"});
+  constexpr std::size_t segment = 4096;
+
+  for (const std::uint64_t start : {std::uint64_t{0}, std::uint64_t{100},
+                                    std::uint64_t{1} << 40}) {
+    for (const std::size_t len :
+         {std::size_t{64}, segment, segment + 1, 3 * segment,
+          10 * segment + 777, std::size_t{100 * 1024 + 3}}) {
+      CAPTURE(start);
+      CAPTURE(len);
+      auto seq = h.finalize_xof();
+      seq.seek(start);
+      std::vector<std::byte> expected(len);
+      seq.fill(expected);
+
+      auto par = h.finalize_xof();
+      par.seek(start);
+      std::vector<std::byte> got(len);
+      blake3pp::fill(par, got, sched, segment);
+      CHECK(got == expected);
+      CHECK(par.position() == seq.position());
+
+      // And the stream continues from where the fill left it.
+      CHECK(par.take<32>() == seq.take<32>());
+    }
+  }
+
+  // The free sequential spelling is the member.
+  {
+    auto a = h.finalize_xof();
+    auto b = h.finalize_xof();
+    std::vector<std::byte> va(300);
+    std::vector<std::byte> vb(300);
+    a.fill(va);
+    blake3pp::fill(b, vb);
+    CHECK(va == vb);
+    CHECK(a.position() == b.position());
+  }
+
+  // A segment request below one block is rounded up to a block.
+  auto seq = h.finalize_xof();
+  std::vector<std::byte> expected(1000);
+  seq.fill(expected);
+  auto par = h.finalize_xof();
+  std::vector<std::byte> got(1000);
+  blake3pp::fill(par, got, sched, 7);
+  CHECK(got == expected);
 }
 
 TEST_CASE("parallel hash is deterministic across runs") {

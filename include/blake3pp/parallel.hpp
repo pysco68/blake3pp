@@ -436,4 +436,42 @@ class parallel_hasher {
   std::uint64_t chunk_counter_ = 0;
 };
 
+/// Fills a buffer from an output reader on every core: the request is
+/// split into segments, and each task copies the reader, seeks its own
+/// segment and fills it straight into the caller's buffer.
+///
+/// Extended output is seekable in O(1), which makes this exact. r advances
+/// past out afterwards exactly as r.fill(out) would have. Requests of one
+/// segment or less take the sequential path.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param r              The reader to advance.
+/// @param out            Receives the next out.size() bytes of r's stream.
+/// @param sched          Where the segments are filled.
+/// @param segment_bytes  Bytes per task; rounded down to a multiple of
+///                       block_size so every task starts on the wide path.
+///                       The default matches a generator's natural write
+///                       granularity.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void fill(output_reader& r, std::span<std::byte> out, Scheduler&& sched,
+          std::size_t segment_bytes = 4 * 1024 * 1024) {
+  const std::size_t segment = std::max(
+      segment_bytes - segment_bytes % block_size, block_size);
+  if (out.size() <= segment) {
+    r.fill(out);
+    return;
+  }
+  const std::uint64_t base = r.position();
+  const std::size_t n_segs = (out.size() + segment - 1) / segment;
+  auto work = ex::schedule(sched) |
+              ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
+                output_reader part = r;
+                const std::size_t off = i * segment;
+                part.seek(base + off);
+                part.fill(out.subspan(off, std::min(segment, out.size() - off)));
+              });
+  ex::sync_wait(std::move(work));
+  r.seek(base + out.size());
+}
+
 }  // namespace blake3pp

@@ -153,28 +153,13 @@ int main(int argc, char** argv) {
   stream.seek(seek);
 
   // Fills `out` from the stream's current position and advances it,
-  // fanning out over the pool when one is running: each task copies the
-  // reader, seeks its own segment, and fills it. O(1) seek makes the
-  // stream embarrassingly parallel.
+  // multi-core over the pool when one is running.
   const auto fill = [&](std::span<std::byte> out) {
-    if (pool.parallel() && out.size() > segment) {
-      namespace ex = blake3pp::ex;
-      auto sched = pool.scheduler();
-      const std::uint64_t base = stream.position();
-      const std::size_t n_segs = (out.size() + segment - 1) / segment;
-      auto work =
-          ex::schedule(sched) |
-          ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
-            blake3pp::output_reader r = stream;
-            r.seek(base + i * segment);
-            const std::size_t off = i * segment;
-            r.fill(out.subspan(off, std::min(segment, out.size() - off)));
-          });
-      ex::sync_wait(std::move(work));
-      stream.seek(base + out.size());
-      return;
+    if (pool.parallel()) {
+      blake3pp::fill(stream, out, pool.scheduler(), segment);
+    } else {
+      blake3pp::fill(stream, out);
     }
-    stream.fill(out);
   };
 
   if (output != "-") {
