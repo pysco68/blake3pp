@@ -11,18 +11,21 @@
 // material; --hex prints hex instead of raw bytes. --output FILE writes
 // through io_uring + O_DIRECT where available: the generator fills the
 // writer's aligned buffers in place, so bytes go from the XOF kernel to
-// the device with no page cache and no intermediate copy.
+// the device with no page cache and no intermediate copy. --seed-file
+// takes the same road in: it streams through the library's file pipeline
+// (direct async reads, multi-core windows when --threads allows) rather
+// than being copied into memory first.
 
 #include <cstdio>
 #include <format>
-#include <fstream>
 #include <span>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include <CLI/CLI.hpp>
 #include <blake3pp/detail/file_writer.hpp>
-#include <blake3pp/parallel.hpp>
+#include <blake3pp/parallel_io.hpp>
 
 #include <thread>
 
@@ -117,29 +120,34 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  if (threads == 0) {
+    threads = std::thread::hardware_concurrency();
+  }
+  constexpr std::size_t segment = 4 * 1024 * 1024;
+  b3tool::compute_pool pool(threads);
+
+  // Seed ingestion: the hasher carries the mode, and a seed file streams
+  // into it on the same pool that will generate the output.
   blake3pp::hasher h = context.empty()
                            ? blake3pp::hasher{}
                            : blake3pp::hasher::derive_key(context);
   if (!seed_file.empty()) {
-    std::ifstream in(seed_file, std::ios::binary);
-    if (!in) {
-      println(stderr, "blake3ppgen: cannot open {}", seed_file);
+    std::error_code ec;
+    if (pool.parallel()) {
+      blake3pp::update_file(h, seed_file, pool.scheduler(), ec);
+    } else {
+      blake3pp::update_file(h, seed_file, ec);
+    }
+    if (ec) {
+      println(stderr, "blake3ppgen: {}: {}", seed_file, ec.message());
       return 2;
     }
-    const std::string content(std::istreambuf_iterator<char>(in), {});
-    h.update(content);
   } else {
     h.update(seed);
   }
 
   blake3pp::output_reader stream = h.finalize_xof();
   stream.seek(seek);
-
-  if (threads == 0) {
-    threads = std::thread::hardware_concurrency();
-  }
-  constexpr std::size_t segment = 4 * 1024 * 1024;
-  b3tool::compute_pool pool(threads);
 
   // Fills `out` from the stream's current position and advances it,
   // fanning out over the pool when one is running: each task copies the

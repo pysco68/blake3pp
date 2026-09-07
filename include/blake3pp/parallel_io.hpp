@@ -8,10 +8,16 @@
 /// its own compiles against the standard library alone, and parallel.hpp on
 /// its own knows nothing about files.
 ///
-/// Each entry point mirrors io.hpp's dual-overload idiom: the plain form
-/// throws std::system_error on I/O failure, the std::error_code& form
-/// reports through ec instead.
+/// Every full window is a power-of-2, subtree-aligned run of chunks, so its
+/// chaining values drop into the hasher through the same push_subtree_cv
+/// seam the in-memory parallel engine uses. The final window (which may be
+/// partial and contains the message end) goes through hasher::update to
+/// keep ROOT finalization correct.
+///
+/// Same shape as io.hpp: update_file() is the primitive, hash_file() the
+/// one-shot convenience, each with a throwing and a std::error_code form.
 
+#include <cstdint>
 #include <filesystem>
 #include <span>
 #include <system_error>
@@ -24,6 +30,62 @@
 #include <blake3pp/parallel.hpp>
 
 namespace blake3pp {
+
+/// Streams a file into a hasher with every complete window fanned out
+/// over a scheduler; the final window is absorbed by h itself.
+///
+/// Same contract as io.hpp's update_file(): h keeps its mode, stays open
+/// for more input and for every finalize form, and files hash in
+/// sequence. A window is offloaded as a subtree only when h sits on a
+/// boundary aligned to it: always the case for a fresh hasher, and after
+/// files whose sizes are multiples of the window. Elsewhere the window
+/// goes through h.update() instead, so the digest is the same either way
+/// and only the parallelism varies.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param h      The hasher to stream into.
+/// @param path   The file to read.
+/// @param sched  Where the subtree reductions run.
+/// @param opts   The pipeline knobs.
+/// @throws std::system_error on I/O failure, and whatever the execution
+///         provider raises.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void update_file(hasher& h, const std::filesystem::path& path,
+                 Scheduler&& sched, const file_io_options& opts = {}) {
+  detail::file_reader reader(
+      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
+  const kern::kernel_ops* const ops = detail::resolve(h.selected_arch());
+  const std::uint64_t base = h.count();
+  const bool on_chunk_boundary = base % chunk_size == 0;
+  while (auto w = reader.next()) {
+    const std::uint64_t chunks = w->bytes / chunk_size;
+    const std::uint64_t counter = base / chunk_size + w->offset / chunk_size;
+    if (!w->last && on_chunk_boundary && counter % chunks == 0) {
+      detail::hash_window_parallel(ops, sched, h, w->data, chunks, counter);
+    } else {
+      h.update(std::span<const std::byte>{w->data, w->bytes});
+    }
+    reader.release(*w);
+  }
+}
+
+/// Streams a file into a hasher over a scheduler, reporting failure
+/// through ec instead of throwing.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param h      The hasher to stream into.
+/// @param path   The file to read.
+/// @param sched  Where the subtree reductions run.
+/// @param ec     Cleared on success; the error otherwise.
+/// @param opts   The pipeline knobs.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void update_file(hasher& h, const std::filesystem::path& path,
+                 Scheduler&& sched, std::error_code& ec,
+                 const file_io_options& opts = {}) noexcept {
+  detail::with_error_code(ec, [&] {
+    update_file(h, path, std::forward<Scheduler>(sched), opts);
+  });
+}
 
 /// One-shot digest of a file over the full pipeline: a hasher shaped by
 /// opts (SIMD variant, optional key), the file streamed through it
@@ -45,20 +107,8 @@ template <class Scheduler>
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                Scheduler&& sched,
                                const hash_file_options& opts = {}) {
-  detail::file_reader reader(
-      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
-  const kern::kernel_ops* const ops = detail::resolve(opts.a);
-  hasher h = detail::make_hasher(opts, ops);
-  while (auto w = reader.next()) {
-    if (!w->last) {
-      detail::hash_window_parallel(ops, sched, h, w->data,
-                                   w->bytes / chunk_size, w->offset /
-                                       chunk_size);
-    } else {
-      h.update(std::span<const std::byte>{w->data, w->bytes});
-    }
-    reader.release(*w);
-  }
+  hasher h = detail::make_hasher(opts, detail::resolve(opts.a));
+  update_file(h, path, std::forward<Scheduler>(sched), opts);
   return h.finalize();
 }
 
@@ -75,15 +125,37 @@ template <class Scheduler>
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                Scheduler&& sched, std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept {
-  try {
-    ec.clear();
+  return detail::with_error_code(ec, [&] {
     return hash_file(path, std::forward<Scheduler>(sched), opts);
-  } catch (const std::system_error& e) {
-    ec = e.code();
-  } catch (...) {
-    ec = std::make_error_code(std::errc::not_enough_memory);
-  }
-  return digest{};
+  });
+}
+
+/// update_file() over a scheduler for a foreign path type (see io.hpp).
+/// @param h      The hasher to stream into.
+/// @param path   The file to read.
+/// @param sched  Where the subtree reductions run.
+/// @param opts   The pipeline knobs.
+template <detail::foreign_path P, class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void update_file(hasher& h, const P& path, Scheduler&& sched,
+                 const file_io_options& opts = {}) {
+  update_file(h, std::filesystem::path(path.native()),
+              std::forward<Scheduler>(sched), opts);
+}
+
+/// update_file() over a scheduler for a foreign path type, reporting
+/// through ec.
+/// @param h      The hasher to stream into.
+/// @param path   The file to read.
+/// @param sched  Where the subtree reductions run.
+/// @param ec     Cleared on success; the error otherwise.
+/// @param opts   The pipeline knobs.
+template <detail::foreign_path P, class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void update_file(hasher& h, const P& path, Scheduler&& sched,
+                 std::error_code& ec, const file_io_options& opts = {}) noexcept {
+  update_file(h, std::filesystem::path(path.native()),
+              std::forward<Scheduler>(sched), ec, opts);
 }
 
 /// hash_file() over a scheduler for a foreign path type.

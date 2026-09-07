@@ -135,24 +135,10 @@ class engine {
       }
       return h;
     }
-    blake3pp::detail::file_reader reader(
-        std::filesystem::path(path),
-        {opts_.io.window_bytes, opts_.io.queue_depth, opts_.io.direct_io,
-         true});
-    const auto* const ops = blake3pp::detail::resolve(h.selected_arch());
-    while (auto w = reader.next()) {
-      // Every window but the last may be offloaded; the final one stays
-      // with the hasher for ROOT finalization.
-      if (pool_.parallel() && !w->last) {
-        auto sched = pool_.scheduler();
-        blake3pp::detail::hash_window_parallel(
-            ops, sched, h, w->data, w->bytes / blake3pp::chunk_size,
-            w->offset / blake3pp::chunk_size);
-        reader.release(w.value());
-        continue;
-      }
-      h.update(std::span<const std::byte>{w->data, w->bytes});
-      reader.release(w.value());
+    if (pool_.parallel()) {
+      blake3pp::update_file(h, path, pool_.scheduler(), opts_.io);
+    } else {
+      blake3pp::update_file(h, path, opts_.io);
     }
     return h;
   }

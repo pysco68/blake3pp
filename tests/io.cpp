@@ -129,6 +129,128 @@ TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
         expected);
 }
 
+// update_file() is hasher::update() with a file as the source, so every
+// mode and every finalize form must compose with it: here derive_key
+// with extended output, sequential and over a scheduler, against the
+// in-memory hasher fed the same bytes.
+TEST_CASE("update_file composes with derive_key and extended output") {
+  const auto content = make_input(3 * 1024 * 1024 + 4321);
+  const temp_file f(content);
+  constexpr std::string_view context = "blake3pp 2026-09-07 io test";
+
+  blake3pp::hasher reference = blake3pp::hasher::derive_key(context);
+  reference.update(content);
+  std::vector<std::byte> expected(100);
+  reference.finalize(expected);
+
+  blake3pp::hasher seq = blake3pp::hasher::derive_key(context);
+  blake3pp::update_file(seq, f.path, {.window_bytes = 1024 * 1024});
+  std::vector<std::byte> got(100);
+  seq.finalize(got);
+  CHECK(got == expected);
+  CHECK(seq.finalize() == reference.finalize());
+
+  blake3pp::hasher par = blake3pp::hasher::derive_key(context);
+  blake3pp::update_file(par, f.path, blake3pp::get_parallel_scheduler(),
+                        {.window_bytes = 1024 * 1024});
+  par.finalize(got);
+  CHECK(got == expected);
+
+  // The seekable reader too: a slice deep into the stream.
+  auto stream = par.finalize_xof();
+  stream.seek(1 << 20);
+  std::vector<std::byte> slice(64);
+  stream.fill(slice);
+  auto ref_stream = reference.finalize_xof();
+  ref_stream.seek(1 << 20);
+  std::vector<std::byte> ref_slice(64);
+  ref_stream.fill(ref_slice);
+  CHECK(slice == ref_slice);
+}
+
+// Files hash in sequence. The parallel form can only offload a window as
+// a subtree when the hasher sits on a window-aligned boundary, so the
+// first file's size steers it: a window multiple keeps the second file
+// on the fast path, anything else forces the fallback through update().
+// Both must agree with the in-memory hash of the concatenation.
+TEST_CASE("update_file hashes files in sequence, aligned and not") {
+  constexpr std::size_t window = 1024 * 1024;
+  const blake3pp::file_io_options opts{.window_bytes = window};
+  auto sched = blake3pp::get_parallel_scheduler();
+
+  for (const std::size_t first_len :
+       {std::size_t{2 * window}, std::size_t{2 * window + 1},
+        std::size_t{100 * 1024 + 3}, std::size_t{0}}) {
+    CAPTURE(first_len);
+    const auto a = make_input(first_len);
+    const auto b = make_input(3 * window + 555);
+    const temp_file fa(a);
+    const temp_file fb(b);
+
+    std::vector<std::byte> joined(a);
+    joined.insert(joined.end(), b.begin(), b.end());
+    const auto expected = blake3pp::hash(joined);
+
+    blake3pp::hasher seq;
+    blake3pp::update_file(seq, fa.path, opts);
+    blake3pp::update_file(seq, fb.path, opts);
+    CHECK(seq.finalize() == expected);
+
+    blake3pp::hasher par;
+    blake3pp::update_file(par, fa.path, sched, opts);
+    blake3pp::update_file(par, fb.path, sched, opts);
+    CHECK(par.finalize() == expected);
+    CHECK(par.count() == joined.size());
+
+    // Mixed: a sequential file followed by a parallel one.
+    blake3pp::hasher mixed;
+    blake3pp::update_file(mixed, fa.path, opts);
+    blake3pp::update_file(mixed, fb.path, sched, opts);
+    CHECK(mixed.finalize() == expected);
+  }
+}
+
+TEST_CASE("update_file error_code form leaves the hasher usable") {
+  const auto content = make_input(4096);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+
+  blake3pp::hasher h;
+  std::error_code ec;
+  blake3pp::update_file(h, "/nonexistent/blake3pp/no/such/file", ec);
+  CHECK(ec == std::errc::no_such_file_or_directory);
+  blake3pp::update_file(h, "/nonexistent/blake3pp/no/such/file",
+                        blake3pp::get_parallel_scheduler(), ec);
+  CHECK(ec == std::errc::no_such_file_or_directory);
+
+  h.reset();
+  blake3pp::update_file(h, f.path, ec);
+  CHECK(!ec);
+  CHECK(h.finalize() == expected);
+
+  h.reset();
+  blake3pp::update_file(h, f.path, blake3pp::get_parallel_scheduler(), ec);
+  CHECK(!ec);
+  CHECK(h.finalize() == expected);
+
+  blake3pp::hasher thrower;
+  CHECK_THROWS_AS(
+      blake3pp::update_file(thrower, "/nonexistent/blake3pp/no/such/file"),
+      std::system_error);
+}
+
+// One options object drives both entry points: hash_file_options converts
+// to the pipeline's file_io_options.
+TEST_CASE("hash_file_options drives update_file") {
+  const auto content = make_input(2 * 1024 * 1024 + 1);
+  const temp_file f(content);
+  const blake3pp::hash_file_options opts{.window_bytes = 1024 * 1024,
+                                         .queue_depth = 2};
+  blake3pp::hasher h;
+  blake3pp::update_file(h, f.path, opts);
+  CHECK(h.finalize() == blake3pp::hash_file(f.path, opts));
+}
+
 TEST_CASE("missing file throws system_error") {
   CHECK_THROWS_AS(
       (void)blake3pp::hash_file("/nonexistent/blake3pp/no/such/file"),
@@ -241,6 +363,21 @@ TEST_CASE("foreign path-like types (boost::filesystem shape) forward") {
   CHECK(blake3pp::hash_file(bp, blake3pp::get_parallel_scheduler(), fec) ==
         expected);
   CHECK(!fec);
+
+  blake3pp::hasher h;
+  blake3pp::update_file(h, bp);
+  CHECK(h.finalize() == expected);
+  h.reset();
+  blake3pp::update_file(h, bp, ec);
+  CHECK(!ec);
+  CHECK(h.finalize() == expected);
+  h.reset();
+  blake3pp::update_file(h, bp, blake3pp::get_parallel_scheduler());
+  CHECK(h.finalize() == expected);
+  h.reset();
+  blake3pp::update_file(h, bp, blake3pp::get_parallel_scheduler(), fec);
+  CHECK(!fec);
+  CHECK(h.finalize() == expected);
 }
 
 TEST_CASE("digest hex round trip and std::format") {

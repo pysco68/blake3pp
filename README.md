@@ -49,9 +49,9 @@ consumers can pick granular headers instead:
 | `<blake3pp/blake3pp.hpp>`    | umbrella: everything below | yes |
 | `<blake3pp/dispatch.hpp>`    | `arch` introspection, SIMD variant selection | no |
 | `<blake3pp/core.hpp>`        | `digest`, `hasher`, one-shot `hash()` | no |
-| `<blake3pp/io.hpp>`          | `hash_file()`, the async direct-I/O pipeline | no |
+| `<blake3pp/io.hpp>`          | `update_file()` and `hash_file()`, the async direct-I/O pipeline | no |
 | `<blake3pp/parallel.hpp>`    | multi-core `hash()` and `parallel_hasher` | yes |
-| `<blake3pp/parallel_io.hpp>` | `hash_file()` over a scheduler (the two combined) | yes |
+| `<blake3pp/parallel_io.hpp>` | `update_file()` and `hash_file()` over a scheduler (the two combined) | yes |
 
 The last column is the one that matters when you install blake3pp rather
 than build it: only the scheduler-taking headers include an execution
@@ -140,12 +140,17 @@ auto storage_key =
 
 Both modes compose with everything else: `hasher::keyed`/
 `hasher::derive_key` give incremental hashing, `keyed_hash(key, data,
-sched)` and a keyed `parallel_hasher` constructor go multi-core, and
-`hash_file`'s options take a key, for authenticated file manifests at
-full pipeline speed:
+sched)` and a keyed `parallel_hasher` constructor go multi-core, and a
+keyed or derive_key hasher takes file input through `update_file()`.
+Authenticated file manifests at full pipeline speed are one line either
+way:
 
 ```cpp
 auto tag = blake3pp::hash_file(path, pool.get_scheduler(), {.key = key});
+
+blake3pp::hasher mac = blake3pp::hasher::keyed(key);   // same thing, spelled out
+blake3pp::update_file(mac, path, pool.get_scheduler());
+auto tag2 = mac.finalize();
 ```
 
 ### Extended output (XOF)
@@ -264,14 +269,19 @@ blake3pp::parallel_hasher tuned{blake3pp::get_parallel_scheduler(),
 
 ### Hashing files at storage speed
 
-`hash_file()` streams the file through fixed windows using the fastest
+The file pipeline streams a file through fixed windows using the fastest
 OS-native mechanism (io_uring + `O_DIRECT` on Linux, IOCP +
 `FILE_FLAG_NO_BUFFERING` on Windows, GCD/libdispatch + `F_NOCACHE` on
 macOS), bypassing the page cache and overlapping reads with hashing; it
 degrades gracefully per feature
 (no direct I/O -> buffered async -> plain synchronous reads -> stdio). Paths are
 `std::filesystem::path`; every entry point has a throwing form and a
-`std::error_code` form, mirroring the standard library:
+`std::error_code` form, mirroring the standard library.
+
+`hash_file()` is the one-shot form. `update_file()` is the primitive
+underneath it: `hasher::update()` with a file as the source. It streams
+into a hasher you own and returns, so the hasher's mode and every
+finalize form apply to file input, and files hash in sequence:
 
 ```cpp
 #include <blake3pp/io.hpp>   // sequential; standard library only
@@ -281,10 +291,24 @@ auto d = blake3pp::hash_file("dataset.parquet");        // throws system_error
 std::error_code ec;
 auto d2 = blake3pp::hash_file(config.input_path, ec);   // reports via ec
 if (ec) { log_error(ec.message()); }
+
+// A derived key from a file's bytes, as a seekable stream:
+blake3pp::hasher h = blake3pp::hasher::derive_key("fixture v3 2026-09");
+blake3pp::update_file(h, "seed.bin");
+auto stream = h.finalize_xof();
+
+// The hash of several files as one message:
+blake3pp::hasher all;
+for (const auto& part : parts) { blake3pp::update_file(all, part); }
+auto d4 = all.finalize();
 ```
 
 Adding cores means adding a scheduler, and that is the one thing that
-pulls in an execution provider, so it lives in its own header:
+pulls in an execution provider, so it lives in its own header. Both entry
+points take one; the pipeline's knobs are `file_io_options`, and
+`hash_file_options` (which adds the SIMD variant and an optional key for
+the hasher it builds) converts to them, so one options object can drive
+both:
 
 ```cpp
 #include <blake3pp/parallel_io.hpp>   // io.hpp + parallel.hpp
@@ -293,7 +317,16 @@ pulls in an execution provider, so it lives in its own header:
 auto d3 = blake3pp::hash_file(path, pool.get_scheduler(),
                               {.window_bytes = 16 * 1024 * 1024,
                                .queue_depth  = 8});
+
+blake3pp::update_file(h, path, pool.get_scheduler(),
+                      {.window_bytes = 16 * 1024 * 1024});
 ```
+
+The parallel form hands each complete window to the scheduler as a
+subtree, which needs the hasher to sit on a window-aligned boundary when
+the file starts: true for a fresh hasher and after files whose sizes are
+window multiples, and otherwise the windows go through `update()`
+instead. The digest is the same either way; only the parallelism varies.
 
 Codebases on Boost.Filesystem work transparently: any path-like type
 with a `native()` observer is accepted structurally, so
@@ -326,15 +359,16 @@ blake3ppsum --derive-key "backup 2026 v1" --length 64 master.key
 ```
 
 **`blake3ppgen`** is a deterministic, *seekable* byte-stream generator
-built on extended output: the same seed always yields the same infinite
-stream, and `--seek` is O(1), so materializing a slice at offset 10 GB
-costs the same as offset 0. Generation runs lanes-parallel in the kernel
-(~3.8 GiB/s per core) and `--threads` fans segments across cores via the
-O(1) seek (13+ GiB/s), so the sink is the bottleneck; `--output`
-removes even that overhead, writing through io_uring + O_DIRECT on
-Linux, IOCP + no-buffering on Windows or GCD + F_NOCACHE on macOS with
-the stream generated straight into the write buffers, bypassing the page
-cache entirely:
+built on extended output: the same seed (`--seed`, or the bytes of a
+`--seed-file` streamed through the file pipeline) always yields the same
+infinite stream, and `--seek` is O(1), so materializing a slice at
+offset 10 GB costs the same as offset 0. Generation runs lanes-parallel
+in the kernel (~3.8 GiB/s per core) and `--threads` fans segments across
+cores via the O(1) seek (13+ GiB/s), so the sink is the bottleneck;
+`--output` removes even that overhead, writing through io_uring +
+O_DIRECT on Linux, IOCP + no-buffering on Windows or GCD + F_NOCACHE on
+macOS with the stream generated straight into the write buffers,
+bypassing the page cache entirely:
 
 ```bash
 blake3ppgen --seed run42 --length 1G > testdata.bin

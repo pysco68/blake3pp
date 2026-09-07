@@ -21,7 +21,7 @@ target_link_libraries(blake3ppgen PRIVATE
 # and the --check round trip including corruption detection.
 foreach(case version empty_stdin check_roundtrip length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
-    gen_output)
+    gen_output gen_seed_file)
   add_test(NAME cli_${case}
     COMMAND ${CMAKE_COMMAND}
       "-DSUM=$<TARGET_FILE:blake3ppsum>"

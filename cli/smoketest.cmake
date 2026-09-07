@@ -147,6 +147,32 @@ elseif(CASE STREQUAL "gen_threads")
     message(FATAL_ERROR "threaded generation diverges from sequential")
   endif()
 
+elseif(CASE STREQUAL "gen_seed_file")
+  # --seed-file streams through the library's file pipeline: a seed
+  # spanning several windows must hash identically sequentially and
+  # multi-core, and cross-checks against blake3ppsum's extended output of
+  # the same file (gen's stream IS that XOF).
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed material --length 20000000
+    OUTPUT_FILE "${WORK}/seed" RESULT_VARIABLE r0)
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${WORK}/seed" --length 4000000 --threads 1
+    OUTPUT_FILE "${WORK}/one" RESULT_VARIABLE r1)
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${WORK}/seed" --length 4000000 --threads 4
+    OUTPUT_FILE "${WORK}/four" RESULT_VARIABLE r2)
+  execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
+    "${WORK}/one" "${WORK}/four" RESULT_VARIABLE same)
+  if(NOT r0 EQUAL 0 OR NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT same EQUAL 0)
+    message(FATAL_ERROR "seed-file ingestion diverges between 1 and 4 threads")
+  endif()
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${WORK}/seed" --length 64 --hex --threads 4
+    OUTPUT_VARIABLE g RESULT_VARIABLE r3)
+  execute_process(COMMAND ${EMULATOR} "${SUM}" --length 64 "${WORK}/seed"
+    OUTPUT_VARIABLE s RESULT_VARIABLE r4)
+  string(SUBSTRING "${g}" 0 128 g)
+  string(SUBSTRING "${s}" 0 128 s)
+  if(NOT r3 EQUAL 0 OR NOT r4 EQUAL 0 OR NOT g STREQUAL s)
+    message(FATAL_ERROR "gen --seed-file stream != blake3ppsum --length 64 of the seed")
+  endif()
+
 elseif(CASE STREQUAL "gen_output")
   # --output (direct async I/O when available) must be byte-identical to
   # the stdout stream. Odd length: exercises the unaligned-tail path and
