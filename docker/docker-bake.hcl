@@ -33,6 +33,7 @@ variable "UBUNTU" {
 variable "CMAKE_VERSION" { default = "4.3.2" }
 variable "NINJA_VERSION" { default = "1.13.2" }
 variable "CMAKE_RE_VERSION" { default = "0.0.87" }
+variable "DOCKER_CLI_VERSION" { default = "28.3.3" }
 variable "ZIG_VERSION"   { default = "0.16.0" }
 
 group "default" {
@@ -52,6 +53,7 @@ target "base" {
     CMAKE_VERSION    = CMAKE_VERSION
     NINJA_VERSION    = NINJA_VERSION
     CMAKE_RE_VERSION = CMAKE_RE_VERSION
+    DOCKER_CLI_VERSION = DOCKER_CLI_VERSION
   }
   tags = tc_tags("base-${item.rel}")
 }

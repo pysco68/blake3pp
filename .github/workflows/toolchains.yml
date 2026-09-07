@@ -16,6 +16,13 @@
 # registry-side (GHA's 10 GB cache is too small for this set). First
 # clang22 build is the long pole: the MSan libc++ stage compiles LLVM
 # runtimes from source (~60-90 min on 2 cores), cached afterwards.
+#
+# The cluster behind `cmake-re --distributed` pulls the environment
+# images itself, and GHCR is private, so every image also goes to a
+# public mirror as a manifest copy (no rebuild): the repository variable
+# BLAKE3PP_RBE_ENV_REGISTRY names it (e.g. docker.io/<namespace>), the
+# secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN log in. Without them the
+# mirror step is skipped.
 name: toolchain-images
 
 on:
@@ -87,6 +94,9 @@ jobs:
   images:
     needs: [ident, bases]
     runs-on: ubuntu-latest
+    env:
+      MIRROR: ${{ vars.BLAKE3PP_RBE_ENV_REGISTRY }}
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,3 +130,18 @@ jobs:
             --set "*.contexts.base=docker-image://${REGISTRY}/toolchain-base-${{ matrix.rel }}:${{ needs.ident.outputs.tag }}" \
             --set "*.cache-from=type=registry,ref=${CACHE}:${{ matrix.target }}" \
             --set "*.cache-to=type=registry,ref=${CACHE}:${{ matrix.target }},mode=max"
+      - uses: docker/login-action@v4
+        if: env.MIRROR != '' && env.DOCKERHUB_USERNAME != ''
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Mirror ${{ matrix.target }} for the cluster
+        if: env.MIRROR != '' && env.DOCKERHUB_USERNAME != ''
+        run: |
+          src="${REGISTRY}/toolchain-${{ matrix.target }}:${{ needs.ident.outputs.tag }}"
+          dst="${MIRROR}/blake3pp-toolchain-${{ matrix.target }}"
+          docker buildx imagetools create --tag "${dst}:${{ needs.ident.outputs.tag }}" "${src}"
+          if [ "${{ needs.ident.outputs.move_latest }}" = "true" ]; then
+            docker buildx imagetools create --tag "${dst}:latest" "${src}"
+          fi

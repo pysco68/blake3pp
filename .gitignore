@@ -4,3 +4,7 @@ compile_commands.json
 blake3pp-bin.zip
 release/
 /thirdparty/
+
+# cmake-re writes these beside the toolchain when it resolves an environment
+# image; they pin a registry digest for that run and are regenerated on demand.
+cmake/toolchains/*/*.container.lock

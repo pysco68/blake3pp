@@ -1,0 +1,51 @@
+#!/bin/bash
+# zig as a cross compiler for s390x-linux-musl: CMake wants a single argv[0], so the
+# target lives here. Named like a GNU/LLVM cross compiler because build
+# tooling that classifies compilers by name (reclient's dependency scanner
+# among them) knows "<triple>-clang++" and knows nothing under "zig-cxx".
+#
+# zig needs a cache directory and derives the default from $HOME; scanners
+# and remote executors run compilers under a scrubbed environment or as a
+# uid that cannot write the prewarmed one, so the choice is made here:
+# the configured directory if writable, else one under $HOME, else /tmp.
+zig="${ZIG:-zig}"
+if [ -z "$ZIG_GLOBAL_CACHE_DIR" ] || [ ! -d "$ZIG_GLOBAL_CACHE_DIR" ] || [ ! -w "$ZIG_GLOBAL_CACHE_DIR" ]; then
+  if [ -n "$HOME" ] && mkdir -p "$HOME/.cache/zig" 2>/dev/null; then
+    ZIG_GLOBAL_CACHE_DIR="$HOME/.cache/zig"
+  else
+    ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache-$(id -u)"
+  fi
+fi
+export ZIG_GLOBAL_CACHE_DIR
+
+# A dependency scanner (reclient's, built from goma) asks a compiler what it
+# is by running it with -v / -### / --version / -print-* and parsing the
+# answer as clang's: it wants the "-cc1" line to name a clang binary and
+# -resource-dir to be a directory that exists. zig's embedded clang prints
+# its own binary there and a resource directory it never uses (it carries
+# the builtin headers under lib/include and passes -nobuiltininc). For
+# those probe invocations, and only those, answer in clang's format:
+# <zig dir>/clang is a symlink to zig, the resource dir is the real one,
+# and the stderr banner precedes the preprocessed stdout as clang's does.
+probe=0
+for a in "$@"; do
+  case "$a" in
+    -v|-###|--version|-dumpversion|-dumpmachine|-print-resource-dir|-print-search-dirs|-print-prog-name=*|-print-file-name=*|-print-libgcc-file-name) probe=1 ;;
+  esac
+done
+if [ "$probe" = 0 ]; then
+  exec "$zig" c++ -target s390x-linux-musl "$@"
+fi
+zigbin="$(readlink -f "$(command -v "$zig")")"
+zigdir="$(dirname "$zigbin")"
+if [ "$#" = 1 ] && [ "$1" = -print-resource-dir ]; then
+  echo "$zigdir/lib/include"
+  exit 0
+fi
+filter="s|\"$zigbin\" -cc1|\"$zigdir/clang\" -cc1|g; s|\"$zigbin\" \"-cc1\"|\"$zigdir/clang\" \"-cc1\"|g; s|-resource-dir [^ ]*|-resource-dir $zigdir/lib/include|g; s|\"-resource-dir\" \"[^\"]*\"|\"-resource-dir\" \"$zigdir/lib/include\"|g"
+out="$(mktemp)"; err="$(mktemp)"
+"$zig" c++ -target s390x-linux-musl "$@" >"$out" 2>"$err"; rc=$?
+sed "$filter" "$err" >&2
+sed "$filter" "$out"
+rm -f "$out" "$err"
+exit $rc

@@ -15,6 +15,7 @@ RUN set -eux; \
     tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
     rm -f /tmp/zig.tar.xz; \
     ln -s /opt/zig/zig /usr/local/bin/zig; \
+    ln -s zig /opt/zig/clang; \
     zig version
 
 # The cross g++ packages are here for exactly ONE translation unit
@@ -33,7 +34,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Prewarm zig's global cache for both musl targets. REQUIRED, not an
 # optimization: tc containers are --rm-ephemeral, and without this layer every
-# run rebuilds musl/compiler-rt/libc++ from scratch for minutes.
+# run rebuilds musl/compiler-rt/libc++ from scratch for minutes. Ownership
+# and modes are settled in this same layer: any uid may use the cache (the
+# three local ones, and whatever uid a remote execution worker runs the
+# wrapper as), and a chmod in a later layer would re-record the whole tree.
 ENV ZIG_GLOBAL_CACHE_DIR=/opt/zig-cache
 RUN set -eux; \
     mkdir -p /opt/zig-cache; \
@@ -43,22 +47,23 @@ RUN set -eux; \
     /tmp/hello-x86_64; \
     qemu-aarch64 /tmp/hello-aarch64; \
     rm -f /tmp/hello*; \
-    chown -R 1000:1000 /opt/zig-cache
+    chgrp -R tipi /opt/zig-cache; \
+    chmod -R a+rwX /opt/zig-cache; \
+    find /opt/zig-cache -type d -exec chmod g+s {} +
 
 # The zig wrappers on PATH, so a cmake-re toolchain can name them bare
 # (cmake-re copies toolchain files into its own environment directory,
-# where a path relative to the file resolves nowhere). zig's prewarmed
-# cache gets the base image's shared-group treatment, since any of the
-# three uids may drive a build; the checks compile through a wrapper as
-# each user, which writes the cache.
+# where a path relative to the file resolves nowhere). The /opt/zig/clang
+# link above is what the wrappers report as the -cc1 program to
+# dependency scanners (see tools/zig-wrappers). The checks compile
+# through a wrapper as each user, which writes the prewarmed cache.
 COPY tools/zig-wrappers/ /usr/local/bin/
 RUN set -eux; \
-    chgrp -R tipi /opt/zig-cache; \
-    chmod -R g+rwX /opt/zig-cache; \
-    find /opt/zig-cache -type d -exec chmod g+s {} +; \
     printf 'int main() { return 0; }\n' > /tmp/probe.c; \
     for user in vscode tipi tipi-rbe; do \
-      su "${user}" -c "zig-cc-x86_64-musl -O2 -static /tmp/probe.c -o /tmp/probe-${user} && /tmp/probe-${user}"; \
+      su "${user}" -c "x86_64-linux-musl-clang -O2 -static /tmp/probe.c -o /tmp/probe-${user} && /tmp/probe-${user}"; \
     done; \
-    su tipi-rbe -c "zig-cc-aarch64-musl -O2 -static /tmp/probe.c -o /tmp/probe-a64 && qemu-aarch64 /tmp/probe-a64"; \
-    rm -f /tmp/probe*
+    su tipi-rbe -c "aarch64-linux-musl-clang -O2 -static /tmp/probe.c -o /tmp/probe-a64 && qemu-aarch64 /tmp/probe-a64"; \
+    rm -f /tmp/probe*; \
+    find /opt/zig-cache ! -perm -o=rw -exec chmod a+rwX {} +; \
+    test "$(find /opt/zig-cache ! -perm -o=rw | wc -l)" = 0

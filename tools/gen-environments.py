@@ -37,6 +37,11 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLCHAINS = os.path.join(REPO, "cmake", "toolchains")
 REGISTRY = os.environ.get("BLAKE3PP_TC_REGISTRY", "ghcr.io/pysco68/blake3pp")
+# How an image name is formed from the registry and the image's short name.
+# GHCR nests repositories (registry/toolchain-zig); Docker Hub allows only
+# <namespace>/<name>, so a public mirror there is spelled
+#   BLAKE3PP_TC_IMAGE_TEMPLATE="docker.io/<ns>/blake3pp-toolchain-{image}"
+IMAGE_TEMPLATE = os.environ.get("BLAKE3PP_TC_IMAGE_TEMPLATE", "{registry}/toolchain-{image}")
 
 # Same table as tools/tc (image_for_preset), preset glob -> image name.
 IMAGE_FOR = [
@@ -74,7 +79,7 @@ def environment(name, tag):
         "variables": {},
         "builders": [{
             "type": "docker",
-            "image": f"{REGISTRY}/toolchain-{image_for(name)}:{tag}",
+            "image": IMAGE_TEMPLATE.format(registry=REGISTRY, image=image_for(name)) + f":{tag}",
             "commit": True,
         }],
     }, indent=2) + "\n"

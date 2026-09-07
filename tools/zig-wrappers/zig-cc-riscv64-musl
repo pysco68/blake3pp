@@ -1,4 +1,0 @@
-#!/bin/sh
-# zig-as-cross-compiler wrapper: $ZIG (or zig on PATH) targeting riscv64-linux-musl.
-# CMake needs a single argv[0] compiler; the target flag lives here.
-exec "${ZIG:-zig}" cc -target riscv64-linux-musl "$@"

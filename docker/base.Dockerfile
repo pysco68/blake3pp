@@ -75,6 +75,37 @@ RUN set -eux; \
 
 ENV CMAKE_GENERATOR=Ninja
 
+# A docker CLIENT (the static tarball; Ubuntu's only docker package is the
+# whole runtime), for cmake-re: given the host's socket it resolves an
+# environment's image locally, pulls it, or builds its "digital twin" from
+# it, and writes the container.lock. A GitHub job container gets the
+# socket by default and its own image is already on the runner's daemon,
+# so cmake-re --remote works from inside it with nothing installed on the
+# runner. openssh-server is what cmake-re's local containerized mode runs
+# the build through: it starts the environment container with
+# `ssh-keygen -A; /usr/sbin/sshd -D` and talks to it over a published
+# port 22 (tipi's images are set up the same way; ssh-rsa stays accepted
+# for its generated keys). Nothing listens at image-build time.
+ARG DOCKER_CLI_VERSION=28.3.3
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) DK_ARCH=x86_64 ;; \
+      arm64) DK_ARCH=aarch64 ;; \
+      *) echo "unsupported arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 5 --retry-all-errors \
+      "https://download.docker.com/linux/static/stable/${DK_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz" \
+      -o /tmp/docker.tgz; \
+    tar -xzf /tmp/docker.tgz -C /tmp docker/docker; \
+    install -m 0755 /tmp/docker/docker /usr/local/bin/docker; \
+    rm -rf /tmp/docker /tmp/docker.tgz; \
+    docker --version; \
+    apt-get update && apt-get install -y --no-install-recommends openssh-server \
+    && rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /run/sshd /etc/ssh/sshd_config.d; \
+    printf 'PubkeyAcceptedKeyTypes +ssh-rsa\n' > /etc/ssh/sshd_config.d/add-ssh-rsa.conf; \
+    ssh-keygen -A; /usr/sbin/sshd -t; rm -f /etc/ssh/ssh_host_*
+
 # tipi cmake-re (portable package): the remote-execution front end that
 # replaced ccache in the plan. The zip is flat, so its binaries go straight
 # to /usr/local/bin; LICENSE/NOTICE/version.txt keep company under
@@ -119,6 +150,7 @@ RUN set -eux; \
     groupadd --gid 108 tipi-rbe; \
     useradd --system --uid 108 --gid tipi-rbe -G tipi --create-home --shell /bin/bash tipi-rbe; \
     usermod -aG tipi ${USERNAME}; \
+    mkdir -p /home/tipi/.ssh; chown tipi:tipi /home/tipi/.ssh; chmod 0700 /home/tipi/.ssh; \
     for uid in ${USER_UID} 1001 108; do \
       mkdir -p /run/user/${uid}; chown ${uid}:${uid} /run/user/${uid}; chmod 0700 /run/user/${uid}; \
     done; \

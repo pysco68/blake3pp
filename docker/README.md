@@ -25,7 +25,7 @@ unsupported and unneeded.
 | `toolchain-riscv64-gcc15` | 26.04 | (riscv64 sysroot) | `linux-riscv64-gcc15-*` | qemu-riscv64 (RVV 1.0, `QEMU_CPU=max,vlen=<bits>`); opt-in Xuantie-qemu stage for XTheadVector (`--set riscv64-gcc15.args.WITH_XUANTIE_QEMU=1`, builds T-Head's fork in a pinned 22.04 stage; verify the 0.7.1 kernel with the freestanding `tests/xthead_verify.cpp` harness under `qemu-riscv64-xuantie -cpu c906fdv`; glibc binaries cannot run on the th CPU models, see the harness header) |
 | `toolchain-ppc64le-gcc15` | 26.04 | (ppc64le sysroot) | `linux-ppc64le-gcc15-*` | qemu-ppc64le (`QEMU_CPU=power8/9/10`) |
 | `toolchain-s390x-gcc15` | 26.04 | (s390x sysroot) | `linux-s390x-gcc15-*` | qemu-s390x (big-endian; `QEMU_CPU=max,vxeh=off` for the scalar fallback) |
-| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, prewarmed zig cache (group-shared), the zig wrappers on PATH |
+| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, prewarmed zig cache (group-shared), the zig wrappers on PATH as `<triple>-clang`/`-clang++` |
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
 
 Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`. The canonical tag
@@ -72,6 +72,28 @@ into it (or use `ctest --test-dir`) rather than reasoning about the
 path. cmake-re writes a git note into the source checkout, so the uid
 running it must own that checkout.
 
+The base recipe also carries a docker client (the static tarball) and
+openssh-server for cmake-re's other modes. With the host's docker socket
+in the container (`-v /var/run/docker.sock:/var/run/docker.sock`; a
+GitHub job container has it by default), cmake-re resolves the
+environment's image on the daemon, pulls it if it is not there, writes
+`<name>.container.lock` beside the toolchain (the registry digest it
+resolved to; gitignored, regenerated on demand) and, for the local
+containerized mode, starts the environment container running sshd and
+builds through it. A job container's own image is already on the
+runner's daemon, so `cmake-re --remote` works from inside it with
+nothing installed on the runner.
+
+The cluster behind `cmake-re --distributed` pulls the environment images
+itself, and GHCR is private, so toolchains.yml copies every image it
+builds to a public mirror: the repository variable
+`BLAKE3PP_RBE_ENV_REGISTRY` names it (e.g. `docker.io/<namespace>`), the
+secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` log in, and each image
+lands there as `blake3pp-toolchain-<image>` at the same content tag (a
+manifest copy, no rebuild), which is the spelling
+`BLAKE3PP_TC_IMAGE_TEMPLATE` gives `gen-environments.py` for the
+environment files.
+
 Each toolchain lives in its own folder because that folder is cmake-re's
 environment unit: everything beside the toolchain file is copied into the
 environment and hashed into its identity. For a containerized toolchain
@@ -96,7 +118,12 @@ ctest --test-dir build/cmake-re-zig
 
 The zigmusl toolchain files find the wrappers by name for the same
 reason: cmake-re copies the toolchain file into its own environment
-directory, where a path relative to the file resolves nowhere.
+directory, where a path relative to the file resolves nowhere. The
+wrappers are named `<triple>-clang` and `<triple>-clang++` because
+reclient's dependency scanner classifies a compiler by its basename and
+aborts on anything it does not recognise, and they choose zig's cache
+directory themselves because the scanner (and a remote executor) runs
+compilers under a scrubbed environment where zig cannot derive one.
 
 ### SVE testing: one binary, every vector length
 

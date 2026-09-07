@@ -8,9 +8,9 @@ set(CMAKE_SYSTEM_PROCESSOR ppc64le)
 # in tools/zig-wrappers/ in a checkout. Looked up rather than spelled as a
 # path relative to this file because cmake-re copies toolchain files into
 # its own environment directory, where a relative path resolves nowhere.
-find_program(BLAKE3PP_ZIG_CC zig-cc-ppc64le-musl
+find_program(BLAKE3PP_ZIG_CC powerpc64le-linux-musl-clang
   HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
-find_program(BLAKE3PP_ZIG_CXX zig-cxx-ppc64le-musl
+find_program(BLAKE3PP_ZIG_CXX powerpc64le-linux-musl-clang++
   HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
 set(CMAKE_C_COMPILER "${BLAKE3PP_ZIG_CC}")
 set(CMAKE_CXX_COMPILER "${BLAKE3PP_ZIG_CXX}")
