@@ -1,6 +1,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -113,7 +114,32 @@ TEST_CASE("derive_key mode matches sequential through parallel_hasher") {
   ph.update(material);
   CHECK(ph.finalize() == seq.finalize());
   CHECK(ph.finalize() != blake3pp::hash(material));  // the context matters
+
+  // derive_key one-shot, multi-core
+  CHECK(blake3pp::derive_key(context, material, sched) == seq.finalize());
 }
+
+// core.hpp's one-shots come in span and string_view spellings; the
+// scheduler-taking pairs must accept the same arguments, and the
+// scheduler constraint must keep them out of the sequential overloads'
+// way (an arch or a string_view in the scheduler's seat is not a match).
+TEST_CASE("multi-core one-shots mirror the sequential spellings") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  const std::string text(2 * 1024 * 1024 + 9, 'q');
+  const std::string_view sv{text};
+  std::array<std::byte, 32> key{};
+  key[3] = std::byte{42};
+  const std::span<const std::byte, 32> key_span{key};
+
+  CHECK(blake3pp::hash(sv, sched) == blake3pp::hash(sv));
+  CHECK(blake3pp::keyed_hash(key_span, sv, sched) ==
+        blake3pp::keyed_hash(key_span, sv));
+  CHECK(blake3pp::derive_key("ctx 2026-09", sv, sched) ==
+        blake3pp::derive_key("ctx 2026-09", sv));
+  // Sequential overloads still resolve with parallel.hpp included.
+  CHECK(blake3pp::hash(std::as_bytes(std::span{sv})) == blake3pp::hash(sv));
+}
+
 
 // The XOF finalize family must produce the sequential hasher's stream
 // bit for bit, and stay non-destructive on the parallel side too.

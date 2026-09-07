@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -188,6 +189,12 @@ template <class Scheduler>
 
 }  // namespace detail
 
+// The multi-core one-shots: core.hpp's hash / keyed_hash / derive_key
+// family with a scheduler added, same spellings, same string_view
+// conveniences. Every template is constrained on the scheduler concept
+// so none of them can hijack a core overload (an arch enum or a
+// string_view in the scheduler's position simply fails to match).
+
 /// Expert: multi-core hash on a caller-supplied kernel table, the same
 /// seam hasher's expert constructor exposes.
 /// @tparam Scheduler  Any std::execution-style scheduler.
@@ -195,6 +202,7 @@ template <class Scheduler>
 /// @param sched  Where the subtree reductions run.
 /// @param ops    The kernel table; must outlive the call.
 template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           const kern::kernel_ops* ops) {
   hasher h{ops};
@@ -216,9 +224,23 @@ template <class Scheduler>
 /// blake3pp::digest d = blake3pp::hash(big_buffer, sched);
 /// @endcode
 template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           arch a = arch::auto_detect) {
   return hash(input, std::forward<Scheduler>(sched), detail::resolve(a));
+}
+
+/// Multi-core one-shot hash of a string's bytes.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param input  The bytes of the string.
+/// @param sched  Where the subtree reductions run.
+/// @param a      The variant to run on.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest hash(std::string_view input, Scheduler&& sched,
+                          arch a = arch::auto_detect) {
+  return hash(std::as_bytes(std::span{input.data(), input.size()}),
+              std::forward<Scheduler>(sched), a);
 }
 
 /// Multi-core keyed one-shot: the MAC/PRF of input under a 32-byte key,
@@ -239,6 +261,59 @@ template <class Scheduler>
   const kern::kernel_ops* const ops = detail::resolve(a);
   hasher h = hasher::keyed(key, ops);
   return detail::hash_into(h, input, std::forward<Scheduler>(sched), ops);
+}
+
+/// Multi-core keyed one-shot of a string's bytes.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param key    Exactly 32 bytes.
+/// @param input  The bytes of the string.
+/// @param sched  Where the subtree reductions run.
+/// @param a      The variant to run on.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+                                std::string_view input, Scheduler&& sched,
+                                arch a = arch::auto_detect) {
+  return keyed_hash(key, std::as_bytes(std::span{input.data(), input.size()}),
+                    std::forward<Scheduler>(sched), a);
+}
+
+/// Multi-core key derivation, for key material large enough to matter (a
+/// file's worth of entropy, a whole seed image); see core.hpp's
+/// derive_key() for the context contract.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param context       The domain-separation string; not a secret.
+/// @param key_material  The secret to derive from.
+/// @param sched         Where the subtree reductions run.
+/// @param a             The variant to run on.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest derive_key(std::string_view context,
+                                std::span<const std::byte> key_material,
+                                Scheduler&& sched,
+                                arch a = arch::auto_detect) {
+  const kern::kernel_ops* const ops = detail::resolve(a);
+  hasher h = hasher::derive_key(context, ops);
+  return detail::hash_into(h, key_material, std::forward<Scheduler>(sched),
+                           ops);
+}
+
+/// Multi-core key derivation from a string's bytes.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param context       The domain-separation string; not a secret.
+/// @param key_material  The secret to derive from.
+/// @param sched         Where the subtree reductions run.
+/// @param a             The variant to run on.
+template <class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+[[nodiscard]] digest derive_key(std::string_view context,
+                                std::string_view key_material,
+                                Scheduler&& sched,
+                                arch a = arch::auto_detect) {
+  return derive_key(
+      context,
+      std::as_bytes(std::span{key_material.data(), key_material.size()}),
+      std::forward<Scheduler>(sched), a);
 }
 
 namespace detail {
