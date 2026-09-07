@@ -88,10 +88,7 @@ class budget {
 }  // namespace
 
 int main(int argc, char** argv) {
-  b3tool::set_binary_std_streams();
-  // A standalone tool owns its process: opt into the trap-guarded
-  // detection rungs (a no-op except on riscv vendor-kernel shapes).
-  blake3pp::run_trap_probes();
+  b3tool::tool_startup();
   std::string seed;
   std::string seed_file;
   std::string context;
@@ -126,7 +123,7 @@ int main(int argc, char** argv) {
   app.add_flag("--no-direct", no_direct, "with --output: no direct I/O (write through the page cache)")->needs(output_opt);
   app.add_flag("--no-async", no_async, "with --output: no async queue (synchronous writes)")->needs(output_opt);
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
-  b3tool::add_threads_option(app, threads, "generator threads");
+  app.add_option("--threads", threads, "generator threads (1 = sequential; default: all)")->check(b3tool::at_least_one_thread)->capture_default_str();
   CLI11_PARSE(app, argc, argv);
 
   std::optional<std::uint64_t> length;

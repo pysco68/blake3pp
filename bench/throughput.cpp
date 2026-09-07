@@ -29,7 +29,6 @@
 #include <cstring>
 #include <format>
 #include <functional>
-#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -263,14 +262,12 @@ void t16_sweep(int reps, double cooldown_s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  // A standalone tool owns its process: opt into the trap-guarded
-  // detection rungs (a no-op except on riscv vendor-kernel shapes).
-  blake3pp::run_trap_probes();
+  b3tool::tool_startup();
   std::size_t mib = 512;
   int reps = 5;
   double cooldown_s = 5.0;
   int pin_cpu = -1;
-  unsigned pool_threads = 0;
+  unsigned pool_threads = b3tool::default_threads();
   bool sweep_t16 = false;
   std::vector<blake3pp::arch> arches;
 
@@ -291,19 +288,15 @@ int main(int argc, char** argv) {
                  "always run with the startup affinity mask restored)")
       ->check(CLI::NonNegativeNumber);
   app.add_option("--threads", pool_threads,
-                 "parallel-engine threads (0 = hardware concurrency)");
+                 "parallel-engine threads (1 = a one-thread pool; default: all)")
+      ->check(b3tool::at_least_one_thread)
+      ->capture_default_str();
   app.add_flag("--t16-sweep", sweep_t16,
                "diagnose the AVX-512 transpose tuner: rank the three "
                "strategies across working-set sizes and strategy orders");
 
-  // The name<->enum mapping comes from the library's canonical list; the
-  // bench never re-enumerates the arch enum.
-  std::map<std::string, blake3pp::arch> arch_names;
-  for (const auto a : blake3pp::all_arches()) {
-    arch_names.emplace(blake3pp::to_string(a), a);
-  }
   app.add_option("arch", arches, "SIMD variants to measure")
-      ->transform(CLI::CheckedTransformer(arch_names, CLI::ignore_case));
+      ->transform(b3tool::arch_transformer());
   CLI11_PARSE(app, argc, argv);
 
   // Startup affinity captured before any pin, so the parallel section can
@@ -313,14 +306,14 @@ int main(int argc, char** argv) {
   if (pin_cpu >= 0) {
     if (!b3tool::thread_pin::supported()) {
       println(stderr, "--pin: no thread-affinity API on this platform");
-      return 2;
+      return b3tool::exit_usage;
     }
     if (!placement.pin(pin_cpu)) {
       println(stderr,
               "--pin {}: pinning failed (CPU offline, or outside this "
               "process's cpuset?)",
               pin_cpu);
-      return 2;
+      return b3tool::exit_usage;
     }
   }
 
@@ -600,8 +593,7 @@ int main(int argc, char** argv) {
   // header is the receipt (and also exposes an Android cpuset that hands
   // the process fewer CPUs than the machine has).
   placement.restore();
-  const unsigned nthreads =
-      pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
+  const unsigned nthreads = pool_threads;
   const int affinity = b3tool::affinity_cpu_count();
   println(stdout, "\nparallel engine ({} threads{})", nthreads,
           affinity > 0 ? std::format(", affinity mask: {} cpus", affinity)

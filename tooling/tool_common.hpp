@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
+#include <limits>
+#include <map>
 #include <string>
 #include <thread>
 #include <utility>
@@ -81,25 +83,44 @@ inline constexpr std::size_t stream_buffer_bytes = std::size_t{1} << 20;
   return n == 0 ? 1 : n;
 }
 
-// The --threads option, identical across the tools: `what` names the
-// threads in the help text ("compute threads", "generator threads");
-// 1 means sequential and 0 is rejected with a message that says so.
-inline CLI::Option* add_threads_option(CLI::App& app, unsigned& threads,
-                                       const char* what) {
-  static const CLI::Validator at_least_one(
-      [](std::string& value) {
-        long long n = 0;
-        const bool numeric = CLI::detail::lexical_cast(value, n);
-        return numeric && n < 1
-                   ? std::string{"must be at least 1 (1 = sequential)"}
-                   : std::string{};  // non-numbers fail the UINT conversion
-      },
-      "THREADS");
-  return app
-      .add_option("--threads", threads,
-                  std::format("{} (1 = sequential; default: all)", what))
-      ->check(at_least_one)
-      ->capture_default_str();
+// --threads value check: the count must be at least 1 (the tools treat 1
+// as sequential, the benches as a one-thread pool); 0 is rejected with a
+// message that says so. Pair it with default_threads() as the default.
+inline const CLI::Validator at_least_one_thread(
+    [](std::string& value) {
+      long long n = 0;
+      const bool numeric = CLI::detail::lexical_cast(value, n);
+      return numeric && n < 1 ? std::string{"must be at least 1"}
+                              : std::string{};  // non-numbers fail the
+                                                // UINT conversion
+    },
+    "THREADS");
+
+// --window transform: typed in MiB, stored in bytes (bind the option
+// straight to window_bytes and give it default_str(window_mib)).
+inline const CLI::Validator mib_to_bytes(
+    [](std::string& value) {
+      unsigned long long mib = 0;
+      if (!CLI::detail::lexical_cast(value, mib) || mib == 0 ||
+          mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+        return std::string{"must be a positive number of MiB"};
+      }
+      value = std::to_string(mib << 20);
+      return std::string{};
+    },
+    "MiB");
+
+// --arch / ARCH... transform: the name<->enum mapping comes from the
+// library's canonical list; no tool re-enumerates the arch enum.
+inline const CLI::CheckedTransformer& arch_transformer() {
+  static const CLI::CheckedTransformer transformer = [] {
+    std::map<std::string, blake3pp::arch> names;
+    for (const auto a : blake3pp::all_arches()) {
+      names.emplace(blake3pp::to_string(a), a);
+    }
+    return CLI::CheckedTransformer(names, CLI::ignore_case);
+  }();
+  return transformer;
 }
 
 // Windows opens std streams in text mode, which translates line endings,
@@ -110,6 +131,15 @@ inline void set_binary_std_streams() noexcept {
   _setmode(_fileno(stdin), _O_BINARY);
   _setmode(_fileno(stdout), _O_BINARY);
 #endif
+}
+
+// First line of every tool's main(): binary std streams, and the opt-in
+// a standalone binary can make because it owns its process, the
+// trap-guarded detection rungs (a no-op except on riscv vendor-kernel
+// shapes; a library must never do this on a caller's behalf).
+inline void tool_startup() noexcept {
+  set_binary_std_streams();
+  blake3pp::run_trap_probes();
 }
 
 // --threads, resolved to a scheduler. Both tools share the convention:

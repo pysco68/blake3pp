@@ -17,7 +17,6 @@
 #include <format>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -103,16 +102,13 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
     }
     return key;
   }
-  while (!content.empty() &&
-         (content.back() == '\n' || content.back() == '\r' ||
-          content.back() == ' ')) {
+  while (!content.empty() && (content.back() == '\n' || content.back() == '\r' || content.back() == ' ')) {
     content.pop_back();
   }
   if (const auto parsed = blake3pp::digest::from_hex(content)) {
     return parsed.value().bytes;
   }
-  throw std::runtime_error(
-      "key must be exactly 32 raw bytes or 64 hex characters");
+  throw std::runtime_error("key must be exactly 32 raw bytes or 64 hex characters");
 }
 
 class engine {
@@ -139,8 +135,7 @@ class engine {
         h.update(std::span{buf}.first(n));
       }
       if (std::ferror(stdin) != 0) {
-        throw std::system_error(errno, std::generic_category(),
-                                "reading standard input");
+        throw std::system_error(errno, std::generic_category(), "reading standard input");
       }
       return h;
     }
@@ -176,10 +171,8 @@ int run_check(engine& eng, std::istream& in, std::string_view list_name) {
     }
     const std::size_t hex_end = sv.find(' ');
     const std::string_view hex = sv.substr(0, hex_end);
-    if (hex_end == std::string_view::npos || hex.size() < 2 ||
-        hex.size() % 2 != 0) {
-      println(stderr, "blake3ppsum: {}:{}: malformed line", list_name,
-              line_no);
+    if (hex_end == std::string_view::npos || hex.size() < 2 || hex.size() % 2 != 0) {
+      println(stderr, "blake3ppsum: {}:{}: malformed line", list_name, line_no);
       failures++;
       continue;
     }
@@ -212,73 +205,54 @@ int run_check(engine& eng, std::istream& in, std::string_view list_name) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  b3tool::set_binary_std_streams();
-  // A standalone tool owns its process: opt into the trap-guarded
-  // detection rungs (a no-op except on riscv vendor-kernel shapes).
-  blake3pp::run_trap_probes();
+  b3tool::tool_startup();
   options o;
   constexpr std::size_t mib = std::size_t{1} << 20;
-  std::size_t window_mib = o.io.window_bytes / mib;
+  bool no_direct = false;
 
   CLI::App app{
       "Print or check BLAKE3 checksums.\n"
       "With no FILE, or FILE of '-', read standard input."};
   app.set_version_flag("--version", version_text);
 
-  app.add_flag("-c,--check", o.check,
-               "read checksum lines from FILEs and verify them");
-  auto* keyed =
-      app.add_option("--keyed", o.key_file,
-                     "keyed (MAC) mode; FILE holds the 32-byte key as raw "
-                     "bytes or 64 hex chars ('-' reads it from stdin)");
-  auto* derive = app.add_option("--derive-key", o.derive_context,
-                                "key-derivation mode with this context "
-                                "string");
+  app.add_flag("-c,--check", o.check, "read checksum lines from FILEs and verify them");
+  auto* keyed = app.add_option("--keyed", o.key_file, "keyed (MAC) mode; FILE holds the 32-byte key as raw bytes or 64 hex chars ('-' reads it from stdin)");
+  auto* derive = app.add_option("--derive-key", o.derive_context, "key-derivation mode with this context string");
   keyed->excludes(derive);
   derive->excludes(keyed);
-  app.add_option("--length", o.out_len,
-                 "output length in bytes (extended output)")
+
+  app.add_option("--length", o.out_len, "output length in bytes (extended output)")
       ->check(CLI::Range(std::size_t{1}, mib))
       ->capture_default_str();
 
-  // The name<->enum mapping comes from the library's canonical list; the
-  // CLI never re-enumerates the arch enum.
-  std::map<std::string, blake3pp::arch> arch_names;
-  for (const auto a : blake3pp::all_arches()) {
-    arch_names.emplace(blake3pp::to_string(a), a);
-  }
   app.add_option("--arch", o.io.a, "pin a SIMD variant")
-      ->transform(CLI::CheckedTransformer(arch_names, CLI::ignore_case))
+      ->transform(b3tool::arch_transformer())
       ->default_str("auto");
 
-  b3tool::add_threads_option(app, o.threads, "compute threads");
-  app.add_option("--window", window_mib, "I/O window size in MiB")
-      ->check(CLI::PositiveNumber)
+  app.add_option("--threads", o.threads, "compute threads (1 = sequential; default: all)")
+      ->check(b3tool::at_least_one_thread)
       ->capture_default_str();
-  app.add_option("--qd", o.io.queue_depth,
-                 "I/O queue depth (the reader clamps it to its range)")
+
+  app.add_option("--window", o.io.window_bytes, "I/O window size in MiB")
+      ->transform(b3tool::mib_to_bytes)
+      ->default_str(std::to_string(o.io.window_bytes / mib));
+
+  app.add_option("--qd", o.io.queue_depth, "I/O queue depth (the reader clamps it to its range)")
       ->capture_default_str();
-  app.add_flag("!--no-direct", o.io.direct_io,
-               "keep the OS page cache (no O_DIRECT)");
+
+  app.add_flag("--no-direct", no_direct, "keep the OS page cache (no O_DIRECT)");
   app.add_option("files", o.files, "files to hash (or checksum lists)");
 
   CLI11_PARSE(app, argc, argv);
 
-  o.io.window_bytes = window_mib * mib;
-  if (o.io.a != blake3pp::arch::auto_detect &&
-      !blake3pp::is_available(o.io.a)) {
-    println(stderr,
-            "blake3ppsum: arch '{}' not available on this machine "
-            "(auto -> {})",
-            blake3pp::to_string(o.io.a),
-            blake3pp::to_string(blake3pp::best_available()));
+  o.io.direct_io = !no_direct;
+  if (o.io.a != blake3pp::arch::auto_detect && !blake3pp::is_available(o.io.a)) {
+    println(stderr, "blake3ppsum: arch '{}' not available on this machine (auto -> {})", blake3pp::to_string(o.io.a), blake3pp::to_string(blake3pp::best_available()));
     return b3tool::exit_usage;
   }
-  if (o.key_file == "-" &&
-      (o.files.empty() ||
-       std::find(o.files.begin(), o.files.end(), "-") != o.files.end())) {
-    println(stderr,
-            "blake3ppsum: with the key on stdin, data must come from files");
+
+  if (o.key_file == "-" && (o.files.empty() || std::find(o.files.begin(), o.files.end(), "-") != o.files.end())) {
+    println(stderr, "blake3ppsum: with the key on stdin, data must come from files");
     return b3tool::exit_usage;
   }
 
@@ -304,9 +278,7 @@ int main(int argc, char** argv) {
         failures += run_check(eng, in, f);
       }
       if (failures > 0) {
-        println(stderr,
-                "blake3ppsum: WARNING: {} computed checksum(s) did NOT match",
-                failures);
+        println(stderr, "blake3ppsum: WARNING: {} computed checksum(s) did NOT match", failures);
       }
       return failures == 0 ? 0 : b3tool::exit_failure;
     }
@@ -323,5 +295,6 @@ int main(int argc, char** argv) {
     println(stderr, "blake3ppsum: {}", e.what());
     return b3tool::exit_usage;
   }
+
   return failures == 0 ? 0 : b3tool::exit_failure;
 }

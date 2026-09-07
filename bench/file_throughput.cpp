@@ -186,16 +186,14 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
 }  // namespace
 
 int main(int argc, char** argv) {
-  // A standalone tool owns its process: opt into the trap-guarded
-  // detection rungs (a no-op except on riscv vendor-kernel shapes).
-  blake3pp::run_trap_probes();
+  b3tool::tool_startup();
   std::string path;
   int reps = 3;
   double cooldown_s = 5.0;
-  std::size_t window_mib = 8;
   std::size_t make_mib = 0;
-  unsigned pool_threads = 0;
+  unsigned pool_threads = b3tool::default_threads();
   bool seq_only = false;
+  bool no_direct = false;
   blake3pp::hash_file_options opts;
 
   CLI::App app{
@@ -210,18 +208,20 @@ int main(int argc, char** argv) {
   app.add_option("--cooldown", cooldown_s,
                  "idle seconds between measurements (0 disables)")
       ->capture_default_str();
-  app.add_option("--window", window_mib, "I/O window size in MiB")
-      ->check(CLI::PositiveNumber)
+  app.add_option("--window", opts.window_bytes, "I/O window size in MiB")
+      ->transform(b3tool::mib_to_bytes)
+      ->default_str(std::to_string(opts.window_bytes >> 20));
+  app.add_option("--qd", opts.queue_depth,
+                 "I/O queue depth (the reader clamps it to its range)")
       ->capture_default_str();
-  app.add_option("--qd", opts.queue_depth, "I/O queue depth")
-      ->check(CLI::Range(2u, 32u))
-      ->capture_default_str();
-  app.add_option("--threads", pool_threads,
-                 "parallel-engine threads (0 = hardware concurrency); "
-                 "diagnostic: sweep N-1/N/N+1 to test whether the sync-tier "
-                 "reader is starving as the N+1th runnable thread");
-  app.add_flag("!--no-direct", opts.direct_io,
+  app.add_flag("--no-direct", no_direct,
                "keep the OS page cache (no O_DIRECT)");
+  app.add_option("--threads", pool_threads,
+                 "parallel-engine threads (1 = a one-thread pool; default: "
+                 "all); diagnostic: sweep N-1/N/N+1 to test whether the "
+                 "sync-tier reader is starving as the N+1th runnable thread")
+      ->check(b3tool::at_least_one_thread)
+      ->capture_default_str();
   app.add_flag("--seq-only", seq_only, "skip the parallel measurement");
   bool sweep = false;
   app.add_flag("--io-sweep", sweep,
@@ -230,14 +230,14 @@ int main(int argc, char** argv) {
                "property, run this per machine");
   CLI11_PARSE(app, argc, argv);
 
-  opts.window_bytes = window_mib * 1024 * 1024;
+  opts.direct_io = !no_direct;
   if (make_mib > 0) {
     path = make_test_file(make_mib);
     println(stdout, "created {} ({} MiB)", path, make_mib);
   }
   if (path.empty()) {
     println(stderr, "blake3pp_bench_file: give a FILE, or --make <MiB>");
-    return 2;
+    return b3tool::exit_usage;
   }
 
   std::uint64_t bytes = 0;
