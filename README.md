@@ -463,7 +463,8 @@ spec:
 - `--derive-key CONTEXT`: domain-separated KDF mode
 - `--length N`: extended (XOF) output
 - `--check`: verify previously printed checksum lines
-- `--arch`, `--threads`, and the I/O pipeline knobs
+- `--arch`, `--threads` (default: all cores; 1 = sequential), and the
+  I/O pipeline knobs
 - `--version`: the providers and SIMD variants baked into the binary
 
 ```bash
@@ -487,8 +488,7 @@ bypassing the page cache entirely:
 ```bash
 blake3ppgen --seed run42 --length 1G > testdata.bin
 blake3ppgen --seed run42 --seek 10G --length 1M > slice.bin   # instant
-blake3ppgen --seed run42 --length 100G --threads 0 \
-            --output fixture.bin                              # device-bound
+blake3ppgen --seed run42 --length 100G --output fixture.bin   # device-bound
 ```
 
 ### Consuming via CMake

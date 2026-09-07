@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstdio>
+#include <exception>
 #include <format>
 #include <fstream>
 #include <iostream>
@@ -22,7 +23,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
 #include <vector>
 
 #include <CLI/CLI.hpp>
@@ -34,12 +34,13 @@ namespace {
 
 using b3tool::print;
 using b3tool::println;
+using b3tool::to_hex;
 
 struct options {
   blake3pp::hash_file_options io;
-  unsigned threads = std::thread::hardware_concurrency();
+  unsigned threads = b3tool::default_threads();
   bool check = false;
-  std::size_t out_len = 32;
+  std::size_t out_len = blake3pp::digest_size;
   std::string key_file;        // --keyed: path to 32 raw bytes or 64 hex
   std::string derive_context;  // --derive-key
   std::vector<std::string> files;
@@ -78,22 +79,15 @@ std::string version_text() {
   return text;
 }
 
-std::string to_hex(std::span<const std::byte> bytes) {
-  std::string s;
-  for (const std::byte b : bytes) {
-    std::format_to(std::back_inserter(s), "{:02x}",
-                   std::to_integer<unsigned>(b));
-  }
-  return s;
-}
-
 // Accepts a file holding either exactly 32 raw bytes or 64 hex characters
 // (trailing whitespace tolerated); "-" reads the key from stdin, in which
 // case the data must come from files.
-std::array<std::byte, 32> load_key(const std::string& source) {
+std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
   std::string content;
   if (source == "-") {
-    std::array<char, 128> buf;
+    // Room for the hex form plus a line ending; anything longer is not a
+    // key and fails the checks below.
+    std::array<char, 2 * blake3pp::key_size + 4> buf;
     const std::size_t n = std::fread(buf.data(), 1, buf.size(), stdin);
     content.assign(buf.data(), n);
   } else {
@@ -103,9 +97,9 @@ std::array<std::byte, 32> load_key(const std::string& source) {
     }
     content.assign(std::istreambuf_iterator<char>(in), {});
   }
-  if (content.size() == 32) {
-    std::array<std::byte, 32> key;
-    for (std::size_t i = 0; i < 32; ++i) {
+  if (content.size() == blake3pp::key_size) {
+    std::array<std::byte, blake3pp::key_size> key;
+    for (std::size_t i = 0; i < key.size(); ++i) {
       key[i] = static_cast<std::byte>(static_cast<unsigned char>(content[i]));
     }
     return key;
@@ -124,7 +118,7 @@ std::array<std::byte, 32> load_key(const std::string& source) {
 
 class engine {
  public:
-  engine(const options& o) : opts_(o), pool_(o.threads) {
+  explicit engine(const options& o) : opts_(o), pool_(o.threads) {
     if (!o.derive_context.empty()) {
       proto_ = blake3pp::hasher::derive_key(o.derive_context, o.io.a);
     } else if (!o.key_file.empty()) {
@@ -140,7 +134,7 @@ class engine {
   blake3pp::hasher hash_source(const std::string& path) {
     blake3pp::hasher h = proto_.value();  // hashers are cheap flat copies
     if (path == "-") {
-      std::vector<std::byte> buf(1024 * 1024);
+      std::vector<std::byte> buf(b3tool::stream_buffer_bytes);
       std::size_t n = 0;
       while ((n = std::fread(buf.data(), 1, buf.size(), stdin)) > 0) {
         h.update(std::span{buf}.first(n));
@@ -224,7 +218,8 @@ int main(int argc, char** argv) {
   // detection rungs (a no-op except on riscv vendor-kernel shapes).
   blake3pp::run_trap_probes();
   options o;
-  std::size_t window_mib = 8;
+  constexpr std::size_t mib = std::size_t{1} << 20;
+  std::size_t window_mib = o.io.window_bytes / mib;
 
   CLI::App app{
       "Print or check BLAKE3 checksums.\n"
@@ -244,7 +239,7 @@ int main(int argc, char** argv) {
   derive->excludes(keyed);
   app.add_option("--length", o.out_len,
                  "output length in bytes (extended output)")
-      ->check(CLI::Range(std::size_t{1}, std::size_t{1} << 20))
+      ->check(CLI::Range(std::size_t{1}, mib))
       ->capture_default_str();
 
   // The name<->enum mapping comes from the library's canonical list; the
@@ -257,13 +252,12 @@ int main(int argc, char** argv) {
       ->transform(CLI::CheckedTransformer(arch_names, CLI::ignore_case))
       ->default_str("auto");
 
-  app.add_option("--threads", o.threads,
-                 "compute threads (0 = sequential; default: all)");
+  b3tool::add_threads_option(app, o.threads, "compute threads");
   app.add_option("--window", window_mib, "I/O window size in MiB")
       ->check(CLI::PositiveNumber)
       ->capture_default_str();
-  app.add_option("--qd", o.io.queue_depth, "I/O queue depth")
-      ->check(CLI::Range(2u, 32u))
+  app.add_option("--qd", o.io.queue_depth,
+                 "I/O queue depth (the reader clamps it to its range)")
       ->capture_default_str();
   app.add_flag("!--no-direct", o.io.direct_io,
                "keep the OS page cache (no O_DIRECT)");
@@ -271,7 +265,7 @@ int main(int argc, char** argv) {
 
   CLI11_PARSE(app, argc, argv);
 
-  o.io.window_bytes = window_mib * 1024 * 1024;
+  o.io.window_bytes = window_mib * mib;
   if (o.io.a != blake3pp::arch::auto_detect &&
       !blake3pp::is_available(o.io.a)) {
     println(stderr,
@@ -279,14 +273,14 @@ int main(int argc, char** argv) {
             "(auto -> {})",
             blake3pp::to_string(o.io.a),
             blake3pp::to_string(blake3pp::best_available()));
-    return 2;
+    return b3tool::exit_usage;
   }
   if (o.key_file == "-" &&
       (o.files.empty() ||
        std::find(o.files.begin(), o.files.end(), "-") != o.files.end())) {
     println(stderr,
             "blake3ppsum: with the key on stdin, data must come from files");
-    return 2;
+    return b3tool::exit_usage;
   }
 
   int failures = 0;
@@ -315,7 +309,7 @@ int main(int argc, char** argv) {
                 "blake3ppsum: WARNING: {} computed checksum(s) did NOT match",
                 failures);
       }
-      return failures == 0 ? 0 : 1;
+      return failures == 0 ? 0 : b3tool::exit_failure;
     }
 
     for (const auto& f : o.files) {
@@ -328,7 +322,7 @@ int main(int argc, char** argv) {
     }
   } catch (const std::exception& e) {
     println(stderr, "blake3ppsum: {}", e.what());
-    return 2;
+    return b3tool::exit_usage;
   }
-  return failures == 0 ? 0 : 1;
+  return failures == 0 ? 0 : b3tool::exit_failure;
 }

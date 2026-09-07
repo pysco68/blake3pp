@@ -76,7 +76,7 @@ struct hash_file_options {
   /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
   /// derive_key and extended output have no shortcut here: build the
   /// hasher yourself and use update_file().
-  std::optional<std::array<std::byte, 32>> key = std::nullopt;
+  std::optional<std::array<std::byte, key_size>> key = std::nullopt;
 
   /// The pipeline knobs alone, so one options object drives update_file()
   /// too.
@@ -90,7 +90,7 @@ namespace detail {
 inline hasher make_hasher(const hash_file_options& opts,
                           const kern::kernel_ops* ops) noexcept {
   if (opts.key.has_value()) {
-    return hasher::keyed(std::span<const std::byte, 32>{opts.key.value()},
+    return hasher::keyed(std::span<const std::byte, key_size>{opts.key.value()},
                          ops);
   }
   return hasher{ops};

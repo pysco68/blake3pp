@@ -4,20 +4,20 @@
 /// Parallel BLAKE3 over the sender/receiver model.
 ///
 /// BLAKE3's binary Merkle tree makes the parallel decomposition exact, not
-/// heuristic: any power-of-2, position-aligned run of chunks reduces to one
-/// chaining value independently of everything else. So the engine partitions
-/// the input into equal such subtrees, bulk-schedules the (allocation-free)
-/// subtree reductions across the scheduler's execution agents, then absorbs
-/// the CVs in order through the hasher's CV-stack discipline and finishes
-/// the tail sequentially. The merge work after the parallel phase is
-/// O(parts) scalar compressions, which is noise.
+/// heuristic: any power-of-2, position-aligned run of chunks reduces to
+/// one chaining value independently of everything else. So the engine
+/// partitions the input into equal such subtrees, bulk-schedules the
+/// (allocation-free) subtree reductions across the scheduler's execution
+/// agents, then absorbs the CVs in order through the hasher's CV-stack
+/// discipline and finishes the tail sequentially. The merge work after
+/// the parallel phase is O(parts) scalar compressions, which is noise.
 ///
 /// The provider is a build-time choice (BLAKE3PP_EXECUTION_PROVIDER):
 /// std::execution where the standard library ships it, beman.execution as
 /// the conformance-first polyfill, NVIDIA stdexec as the performance
 /// workhorse (same source, same story as the simd providers). No heap
-/// allocations in this header: the CV table lives on the caller's stack and
-/// sender operation states live inside sync_wait's frame.
+/// allocations in this header: the CV table lives on the caller's stack
+/// and sender operation states live inside sync_wait's frame.
 
 #include <algorithm>
 #include <bit>
@@ -252,7 +252,7 @@ template <class Scheduler>
 /// @param a      The variant to run on.
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
-[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::span<const std::byte> input,
                                 Scheduler&& sched,
                                 arch a = arch::auto_detect) {
@@ -271,7 +271,7 @@ template <class Scheduler>
 /// @param a      The variant to run on.
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
-[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::string_view input, Scheduler&& sched,
                                 arch a = arch::auto_detect) {
   return keyed_hash(key, std::as_bytes(std::span{input.data(), input.size()}),
@@ -404,7 +404,7 @@ class parallel_hasher {
   /// @param sched  Where the subtree reductions run.
   /// @param key    Exactly 32 bytes, enforced by the span extent.
   /// @param opts   The variant and the window size.
-  parallel_hasher(Scheduler sched, std::span<const std::byte, 32> key,
+  parallel_hasher(Scheduler sched, std::span<const std::byte, key_size> key,
                   const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),

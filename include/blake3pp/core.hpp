@@ -24,6 +24,11 @@ inline constexpr std::size_t chunk_size = 1024;
 /// The compression block in bytes: the granularity of extended output
 /// (each block of the XOF stream is one compression with its own counter).
 inline constexpr std::size_t block_size = 64;
+/// The default digest length in bytes; extended output continues past it.
+inline constexpr std::size_t digest_size = 32;
+/// The key length of keyed mode in bytes (hasher::keyed, keyed_hash,
+/// hash_file_options::key take exactly this many).
+inline constexpr std::size_t key_size = 32;
 
 namespace detail {
 
@@ -48,7 +53,7 @@ struct chunk_state {
 /// standard library provides <format>.
 struct digest {
   /// The digest bytes.
-  std::array<std::byte, 32> bytes;
+  std::array<std::byte, digest_size> bytes;
 
   /// Constant-time equality (matching the Rust reference): the safe
   /// default for a value that is compared in security-sensitive contexts,
@@ -173,13 +178,13 @@ class hasher {
   /// A hasher in keyed mode: BLAKE3's MAC/PRF, its replacement for HMAC.
   /// @param key  Exactly 32 bytes, enforced by the span extent.
   /// @param a    The variant to run on.
-  [[nodiscard]] static hasher keyed(std::span<const std::byte, 32> key,
+  [[nodiscard]] static hasher keyed(std::span<const std::byte, key_size> key,
                                     arch a = arch::auto_detect) noexcept;
   /// Keyed mode on a caller-supplied kernel table (see the expert
   /// constructor).
   /// @param key  Exactly 32 bytes.
   /// @param ops  The kernel table; must outlive the hasher.
-  [[nodiscard]] static hasher keyed(std::span<const std::byte, 32> key,
+  [[nodiscard]] static hasher keyed(std::span<const std::byte, key_size> key,
                                     const kern::kernel_ops* ops) noexcept;
 
   /// A hasher in key-derivation mode: the input is the key material, and
@@ -295,12 +300,12 @@ class hasher {
 /// One-shot keyed hash: the MAC/PRF of input under a 32-byte key.
 /// @param key    Exactly 32 bytes, enforced by the span extent.
 /// @param input  Any length.
-[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::span<const std::byte> input) noexcept;
 /// One-shot keyed hash of a string's bytes.
 /// @param key    Exactly 32 bytes.
 /// @param input  The bytes of the string.
-[[nodiscard]] digest keyed_hash(std::span<const std::byte, 32> key,
+[[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::string_view input) noexcept;
 
 /// One-shot key derivation: 32 bytes derived from key_material, bound to a
