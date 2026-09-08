@@ -21,7 +21,7 @@ RUN set -eux; \
     if [ "${USE_LLVM_APT}" = "1" ]; then \
       apt-get update; \
       apt-get install -y --no-install-recommends gnupg lsb-release software-properties-common; \
-      wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh; \
+      wget -q --tries=5 --waitretry=10 -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh; \
       chmod +x /tmp/llvm.sh; \
       /tmp/llvm.sh "${CLANG_VERSION}"; \
       rm -f /tmp/llvm.sh; \
