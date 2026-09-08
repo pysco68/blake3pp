@@ -113,6 +113,11 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 else()
   target_compile_options(blake3pp_warnings INTERFACE -Wall -Wextra -Wconversion -Wshadow)
 endif()
+# clang checks the doc comments (a @param naming no parameter, a @return
+# on void) against the declarations they document.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(blake3pp_warnings INTERFACE -Wdocumentation)
+endif()
 
 # The file-I/O layer needs a filesystem, 64-bit seeks and (on the native
 # backends) OS-specific async I/O.  A freestanding target -- an RTOS on a

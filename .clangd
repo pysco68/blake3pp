@@ -1,0 +1,3 @@
+# clangd reads the compile flags from a configured build tree.
+CompileFlags:
+  CompilationDatabase: build/linux-gcc16-cxx26
