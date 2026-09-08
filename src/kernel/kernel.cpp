@@ -322,8 +322,15 @@ void compress_xof(const std::uint32_t cv[8],
 }
 
 // Every lane's 64-bit counter, split lane-wise into the two u32 state
-// words.
-BLAKE3PP_FORCE_INLINE std::pair<u32v, u32v> counter_lanes(
+// words. An aggregate rather than std::pair: MSVC leaves the pair's
+// constructor out of line for the 64-byte AVX-512 vectors, a call in
+// every hash_batch and xof_wide prologue.
+struct counter_words {
+  u32v lo;
+  u32v hi;
+};
+
+BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
     std::uint64_t counter, bool increment_counter) noexcept {
   std::uint32_t lo[u32v::width];
   std::uint32_t hi[u32v::width];
