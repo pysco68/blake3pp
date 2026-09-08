@@ -37,7 +37,10 @@ set(CMAKE_C_FLAGS_INIT "-D__NR_riscv_hwprobe=258")
 set(CMAKE_CXX_FLAGS_INIT "-D__NR_riscv_hwprobe=258")
 
 # Static binaries need no -L sysroot under qemu-user.
-set(CMAKE_CROSSCOMPILING_EMULATOR "qemu-riscv64")
+# Resolved to an absolute path: under cmake-re the test launcher
+# (tipi-test-driver) execve's the command literally, no PATH search.
+find_program(BLAKE3PP_QEMU NAMES qemu-riscv64 REQUIRED NO_CACHE)
+set(CMAKE_CROSSCOMPILING_EMULATOR "${BLAKE3PP_QEMU}")
 
 # zig 0.16 segfaults on lld's --dependency-file flag, which CMake >= 3.27
 # passes for link-dependency tracking; disable that feature here.

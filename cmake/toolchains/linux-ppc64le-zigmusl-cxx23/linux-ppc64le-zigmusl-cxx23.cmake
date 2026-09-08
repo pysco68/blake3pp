@@ -18,7 +18,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-static")
-set(CMAKE_CROSSCOMPILING_EMULATOR "qemu-ppc64le")
+# Resolved to an absolute path: under cmake-re the test launcher
+# (tipi-test-driver) execve's the command literally, no PATH search.
+find_program(BLAKE3PP_QEMU NAMES qemu-ppc64le REQUIRED NO_CACHE)
+set(CMAKE_CROSSCOMPILING_EMULATOR "${BLAKE3PP_QEMU}")
 set(CMAKE_LINK_DEPENDS_USE_LINKER OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_C_LINKER_PUSHPOP_STATE_SUPPORTED FALSE)
