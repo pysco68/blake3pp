@@ -3,11 +3,11 @@ description: >
   Everything a container job needs before tools/ci-test.sh can run with
   BLAKE3PP_CMAKE_RE=1 (cmake-re, compiles on the EngFlow cluster): the
   mTLS credentials from the repository secrets into RBE_* variables,
-  the cmake-re environment files retargeted at a registry the cluster
-  can pull from (optional; until GHCR is public that is the Docker Hub
-  mirror), and cmake-re's mirror restored from the actions cache. The
-  job's own image is already on the runner's daemon, which is how
-  cmake-re resolves the environment locally.
+  the cmake-re environment files written at this run's tag and digests
+  (from the environments job's artifact), retargeted at a registry the
+  cluster can pull from (optional; until GHCR is public that is the
+  Docker Hub mirror), and cmake-re's mirror restored from the actions
+  cache. cmake-re pulls the environment image by digest itself.
 inputs:
   preset:
     description: the configure preset the job builds (one per job)
@@ -28,7 +28,7 @@ inputs:
     description: contents of the mTLS client certificate (PEM; distributed only)
     default: ""
   env-registry:
-    description: registry the cluster pulls environment images from (empty keeps the committed GHCR files)
+    description: registry the cluster pulls environment images from, a Docker Hub namespace spelled without docker.io/ (empty keeps the GHCR names)
     default: ""
   env-image-template:
     description: image name template for the environment files
@@ -53,9 +53,14 @@ runs:
           echo "RBE_tls_client_auth_key=$RUNNER_TEMP/rbe/client.key"
           echo "RBE_tls_client_auth_cert=$RUNNER_TEMP/rbe/client.crt"
         } >> "$GITHUB_ENV"
-    # The environment files at the tag this job runs with (the committed
-    # ones may lag; ci proposes their update as a PR), on the registry
-    # the cluster can reach when one is given.
+    # The environment files at the tag and digests this run resolved
+    # (the committed ones may lag; ci proposes their update as a PR), on
+    # the registry the cluster can reach when one is given. The mirror
+    # is a manifest copy, so the digests are the same there.
+    - uses: actions/download-artifact@v8
+      with:
+        name: toolchain-environments
+        path: ${{ runner.temp }}/toolchain-environments
     - name: Environments at this run's image tag
       shell: bash
       run: |
@@ -64,7 +69,8 @@ runs:
           export BLAKE3PP_TC_REGISTRY='${{ inputs.env-registry }}'
           export BLAKE3PP_TC_IMAGE_TEMPLATE='${{ inputs.env-image-template }}'
         fi
-        python3 tools/gen-environments.py --tag '${{ inputs.image-tag }}'
+        python3 tools/gen-environments.py --tag '${{ inputs.image-tag }}' \
+          --digests "$RUNNER_TEMP/toolchain-environments/toolchain-digests.json"
         tc=$(python3 tools/preset-args.py --toolchain '${{ inputs.preset }}')
         grep -h '"image"' "${tc%.cmake}.pkr.js"
     - uses: ./.github/actions/cache-tipi-mirror

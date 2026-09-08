@@ -678,12 +678,14 @@ spelling above.
 
 Each toolchain lives in its own folder under `cmake/toolchains/`,
 together with the `.pkr.js` and `.layers.json` that name its image at
-the content tag: that folder is the environment cmake-re copies when it
-is not told `--host`, and the cluster pulls the same image for the
-compile actions. `tools/gen-environments.py` writes these files
-(`--check` reports stale ones), and `BLAKE3PP_TC_IMAGE_TEMPLATE`
-retargets them at a registry mirror the cluster can reach. CI does not
-depend on them being current: every run writes the tag it builds with
+the content tag and the manifest digest that tag resolves to: that
+folder is the environment cmake-re copies when it is not told `--host`,
+and the cluster pulls the same image for the compile actions.
+`tools/gen-environments.py` writes these files (`--check` reports stale
+ones; the digests come from the registry or from a `--digests` map),
+and `BLAKE3PP_TC_REGISTRY` with `BLAKE3PP_TC_IMAGE_TEMPLATE` retarget
+them at a registry mirror the cluster can reach. CI does not depend on
+them being current: every run writes the tag and digests it builds with
 into them and builds on that, and when the committed files lag, a run
 of `main` opens one draft pull request (`ci/toolchain-environments`,
 updated in place while the tag keeps moving) proposing the update, and
@@ -701,7 +703,7 @@ cluster involved) unless `BLAKE3PP_CMAKE_RE_MODE` (or the
 | `BLAKE3PP_CMAKE_RE_MODE` | variable | `host` (default) or `distributed`; everything below matters only for `distributed` |
 | `RBE_SERVICE` | secret | cluster address |
 | `RBE_TLS_CLIENT_AUTH_KEY`, `RBE_TLS_CLIENT_AUTH_CERT` | secrets | the mTLS client credentials, PEM |
-| `BLAKE3PP_RBE_ENV_REGISTRY` | variable | the public mirror the cluster pulls the environment images from (`docker.io/<namespace>`); `toolchains.yml` copies every image it builds there |
+| `BLAKE3PP_RBE_ENV_REGISTRY` | variable | the public mirror the cluster pulls the environment images from: a Docker Hub namespace, spelled without `docker.io/` (cmake-re matches the daemon's digests, which never carry that host); `toolchains.yml` copies every image it builds there |
 | `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` | secrets | the mirror's credentials |
 
 cmake-re's mirror of the checkout is restored from the actions cache

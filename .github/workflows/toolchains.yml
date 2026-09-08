@@ -20,7 +20,9 @@
 # The cluster behind `cmake-re --distributed` pulls the environment
 # images itself, and GHCR is private, so every image also goes to a
 # public mirror as a manifest copy (no rebuild): the repository variable
-# BLAKE3PP_RBE_ENV_REGISTRY names it (e.g. docker.io/<namespace>), the
+# BLAKE3PP_RBE_ENV_REGISTRY names it (a Docker Hub namespace, spelled
+# without docker.io/: cmake-re matches the daemon's RepoDigests, which
+# never carry that host), the
 # secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN log in. Without them the
 # mirror step is skipped.
 name: toolchain-images

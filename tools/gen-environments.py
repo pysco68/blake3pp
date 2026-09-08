@@ -11,7 +11,8 @@ is copied into the environment and hashed into its identity. So each
 toolchain lives in its own folder, cmake/toolchains/<name>/, holding
 <name>.cmake, <name>.pkr.js (the environment: the image the toolchain
 builds in, pinned to the content tag tools/toolchain-image-tag.sh computes
-for the checkout, the hard reference tipi's docs ask for) and, only where
+for the checkout and to the manifest digest that tag resolves to, the
+hard reference tipi's docs ask for) and, only where
 the toolchain includes sibling files (../common.cmake, or the base
 toolchain of a hand-written variant), a <name>.layers.json that pulls
 them in ("../" navigation is honoured; a parent-level layers file is not
@@ -19,11 +20,21 @@ composed into a child's environment, measured on v0.0.87).
 That pairing is what lets cmake-re run the same build remotely
 (--remote, RBE) instead of on this host.
 
-The immutable form is not written here: once cmake-re has resolved the
-image (locally or by pulling it) it writes <name>.container.lock beside
-the toolchain, with the registry manifest digest and the environment
-hash, and marks it for version control. Those lock files are the digest
-pins to commit, produced against the real images rather than guessed.
+The digest comes from the registry (docker buildx imagetools inspect,
+so the docker client must be logged in where the images live, and the
+images must be pushed at the tag) or from --digests, a JSON map of image
+name to digest that a previous run wrote with --write-digests; ci
+resolves once per run and hands the map to every lane. With the digest
+in the reference cmake-re neither guesses the pin nor pushes the image
+through a temporary registry to learn it, and takes the image from the
+registry when the daemon does not have it.
+
+Docker Hub names are spelled without the docker.io/ host: the daemon
+reports RepoDigests for Hub images without it, and cmake-re (v0.0.87)
+matches the reference it pulled against those verbatim, so a
+docker.io/-prefixed environment image is "missing on the registry" right
+after a successful pull. A docker.io/ prefix on BLAKE3PP_TC_REGISTRY is
+dropped here for that reason.
 
 The preset-to-image patterns mirror tools/tc's; keep the two in step.
 """
@@ -38,11 +49,11 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLCHAINS = os.path.join(REPO, "cmake", "toolchains")
-REGISTRY = os.environ.get("BLAKE3PP_TC_REGISTRY", "ghcr.io/pysco68/blake3pp")
+REGISTRY = os.environ.get("BLAKE3PP_TC_REGISTRY", "ghcr.io/pysco68/blake3pp").removeprefix("docker.io/")
 # How an image name is formed from the registry and the image's short name.
 # GHCR nests repositories (registry/toolchain-zig); Docker Hub allows only
 # <namespace>/<name>, so a public mirror there is spelled
-#   BLAKE3PP_TC_IMAGE_TEMPLATE="docker.io/<ns>/blake3pp-toolchain-{image}"
+#   BLAKE3PP_TC_REGISTRY=<ns> BLAKE3PP_TC_IMAGE_TEMPLATE="{registry}/blake3pp-toolchain-{image}"
 IMAGE_TEMPLATE = os.environ.get("BLAKE3PP_TC_IMAGE_TEMPLATE", "{registry}/toolchain-{image}")
 
 # Same table as tools/tc (image_for_preset), preset glob -> image name.
@@ -76,12 +87,29 @@ def content_tag():
     return f"tree-{out}"
 
 
-def environment(name, tag):
+def image_ref(name, tag):
+    return IMAGE_TEMPLATE.format(registry=REGISTRY, image=image_for(name)) + f":{tag}"
+
+
+def resolve_digest(ref):
+    """The manifest digest the registry serves for ref: the image index of
+    a buildx-built image, the digest a pull of the tag reports."""
+    r = subprocess.run(["docker", "buildx", "imagetools", "inspect",
+                        "--format", "{{.Manifest.Digest}}", ref],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"gen-environments: cannot resolve {ref}: {r.stderr.strip()}\n"
+                 "(pushed at this tag, and the docker client logged in to its "
+                 "registry? --digests FILE supplies the map instead)")
+    return r.stdout.strip()
+
+
+def environment(name, tag, digest):
     return json.dumps({
         "variables": {},
         "builders": [{
             "type": "docker",
-            "image": IMAGE_TEMPLATE.format(registry=REGISTRY, image=image_for(name)) + f":{tag}",
+            "image": f"{image_ref(name, tag)}@{digest}",
             "commit": True,
         }],
     }, indent=2) + "\n"
@@ -105,8 +133,15 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tag", help="image tag (default: tree-<hash> of HEAD's docker tree)")
     ap.add_argument("--check", action="store_true", help="report stale files, write nothing")
+    ap.add_argument("--digests", metavar="FILE",
+                    help="JSON map of image name to manifest digest (no registry lookup)")
+    ap.add_argument("--write-digests", metavar="FILE", help="write the resolved map here")
     args = ap.parse_args()
     tag = args.tag or content_tag()
+    digests = {}
+    if args.digests:
+        with open(args.digests) as fh:
+            digests = json.load(fh)
 
     stale = []
     for name in sorted(os.listdir(TOOLCHAINS)):
@@ -116,8 +151,11 @@ def main():
             continue
         if image_for(name) is None:
             sys.exit(f"gen-environments: no image pattern for {name}; extend IMAGE_FOR (and tools/tc)")
+        image = image_for(name)
+        if image not in digests:
+            digests[image] = resolve_digest(image_ref(name, tag))
         wanted = {
-            os.path.join(TOOLCHAINS, name, f"{name}.pkr.js"): environment(name, tag),
+            os.path.join(TOOLCHAINS, name, f"{name}.pkr.js"): environment(name, tag, digests[image]),
             os.path.join(TOOLCHAINS, name, f"{name}.layers.json"): layers(name),
         }
         for path, content in wanted.items():
@@ -132,6 +170,10 @@ def main():
             else:
                 with open(path, "w") as fh:
                     fh.write(content)
+    if args.write_digests:
+        with open(args.write_digests, "w") as fh:
+            json.dump(digests, fh, indent=2, sort_keys=True)
+            fh.write("\n")
     if args.check:
         for path in stale:
             print(f"stale: {path}")

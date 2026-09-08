@@ -117,7 +117,10 @@ nothing installed on the runner.
 The cluster behind `cmake-re --distributed` pulls the environment images
 itself, and GHCR is private, so toolchains.yml copies every image it
 builds to a public mirror: the repository variable
-`BLAKE3PP_RBE_ENV_REGISTRY` names it (e.g. `docker.io/<namespace>`), the
+`BLAKE3PP_RBE_ENV_REGISTRY` names it (a Docker Hub namespace, spelled
+without `docker.io/`: cmake-re matches the daemon's RepoDigests, which
+never carry that host, and calls a `docker.io/`-prefixed image missing
+right after pulling it), the
 secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` log in, and each image
 lands there as `blake3pp-toolchain-<image>` at the same content tag (a
 manifest copy, no rebuild), which is the spelling
@@ -127,12 +130,16 @@ environment files.
 Each toolchain lives in its own folder because that folder is cmake-re's
 environment unit: everything beside the toolchain file is copied into the
 environment and hashed into its identity. For a containerized toolchain
-the folder holds `<name>.cmake`, `<name>.pkr.js` (the image it builds in,
-pinned to the content tag) and, where the toolchain includes
-`../common.cmake`, a `<name>.layers.json` pulling that one file in. The
-environment files are written by `tools/gen-environments.py`, which
-shares tools/tc's preset-to-image table; `--check` says whether they
-are stale against the content tag. ci writes the tag it runs with into
+the folder holds `<name>.cmake`, `<name>.pkr.js` (the image it builds
+in, pinned to the content tag and to the manifest digest the tag
+resolves to, so cmake-re pulls exactly that image and never has to push
+it through a temporary registry to learn its digest) and, where the
+toolchain includes `../common.cmake`, a `<name>.layers.json` pulling
+that one file in. The environment files are written by
+`tools/gen-environments.py`, which shares tools/tc's preset-to-image
+table; `--check` says whether they are stale against the content tag
+and the registry. ci resolves the digests once per run and writes the
+tag and digests it runs with into
 them before building (a dirty checkout, which cmake-re mirrors as such)
 and, on `main`, proposes the committed update as one self-updating pull
 request, so a moved tag never blocks a run. They are what
