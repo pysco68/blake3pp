@@ -1,0 +1,4 @@
+# Labels of the self-hosted riscv boards (the riscv-boards job), so
+# actionlint does not flag them as unknown runners.
+self-hosted-runner:
+  labels: [riscv64, visionfive2, bpi-f3, milkv-pioneer]
