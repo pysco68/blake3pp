@@ -25,7 +25,7 @@ unsupported and unneeded.
 | `toolchain-riscv64-gcc15` | 26.04 | (riscv64 sysroot) | `linux-riscv64-gcc15-*` | qemu-riscv64 (RVV 1.0, `QEMU_CPU=max,vlen=<bits>`); opt-in Xuantie-qemu stage for XTheadVector (`--set riscv64-gcc15.args.WITH_XUANTIE_QEMU=1`, builds T-Head's fork in a pinned 22.04 stage; verify the 0.7.1 kernel with the freestanding `tests/xthead_verify.cpp` harness under `qemu-riscv64-xuantie -cpu c906fdv`; glibc binaries cannot run on the th CPU models, see the harness header) |
 | `toolchain-ppc64le-gcc15` | 26.04 | (ppc64le sysroot) | `linux-ppc64le-gcc15-*` | qemu-ppc64le (`QEMU_CPU=power8/9/10`) |
 | `toolchain-s390x-gcc15` | 26.04 | (s390x sysroot) | `linux-s390x-gcc15-*` | qemu-s390x (big-endian; `QEMU_CPU=max,vxeh=off` for the scalar fallback) |
-| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, prewarmed zig cache (group-shared), the zig wrappers on PATH as `<triple>-clang`/`-clang++` |
+| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64, ppc64le, s390x), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, zig cache prewarmed for all five musl targets (world-writable; `musl-run <arch> <binary>` runs a static binary through qemu when foreign), the zig wrappers on PATH as `<triple>-clang`/`-clang++` |
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
 
 Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`. The canonical tag
@@ -63,14 +63,33 @@ the image's own cmake, ninja and compilers instead of provisioning tipi's
 distro (~900 MB) on first use. Three uids may be the one running it,
 depending on how a container is entered (vscode 1000 via tools/tc, tipi
 1001, tipi-rbe 108); they share group `tipi`, which owns
-`/usr/local/share/.tipi` (tipi's hard-wired state directory) and, in the
-zig image, the prewarmed zig cache, so `tools/tc` adds that group to its
-`-u 1000:1000`. cmake-re knows nothing about presets: pass the toolchain
-file, and put `--build` first when building. The build directory becomes
+`/usr/local/share/.tipi` (tipi's hard-wired state directory), so
+`tools/tc` adds that group to its `-u 1000:1000`; the zig image's
+prewarmed cache is world-writable instead, since a remote worker runs
+the wrapper as whatever uid it likes. cmake-re knows nothing about
+presets: pass the toolchain file, put `--build` first when building, and
+pass `-DCMAKE_BUILD_TYPE` explicitly (cmake-re configures Debug when
+none is given, where plain cmake would leave the toolchain's default). The build directory becomes
 a symlink into cmake-re's mirror of the checkout under `.tipi`, so `cd`
 into it (or use `ctest --test-dir`) rather than reasoning about the
 path. cmake-re writes a git note into the source checkout, so the uid
 running it must own that checkout.
+
+`.github/workflows/rbe.yml` is the same shape as a job: it boots into the
+toolchain image, takes the EngFlow credentials from repository secrets
+(`RBE_SERVICE`, `RBE_TLS_CLIENT_AUTH_KEY`, `RBE_TLS_CLIENT_AUTH_CERT`),
+runs `cmake-re --host --distributed` so every compile action executes on
+the cluster with the remote action cache serving repeats, tests the result
+where it lands, and uploads the publishable form: the release archives
+from `tools/make-release.sh` (its `BLAKE3PP_CMAKE_RE=1` mode drives the
+same three steps through cmake-re) for the static musl lanes, the tool
+binaries for everything else. It is `workflow_dispatch` only; the lane
+list is an input. Two settings ride along with every cmake-re run:
+`TIPI_DISABLE_AR_RANLIB_DRIVER=ON`, because tipi's ranlib action rewrites
+its input archive in place, which the remote sandbox denies, and a `USER`
+for the dependency scanner. The zig wrappers answer that scanner's probes
+in clang's format (see tools/zig-wrappers), which is what lets the musl
+lanes distribute at all.
 
 The base recipe also carries a docker client (the static tarball) and
 openssh-server for cmake-re's other modes. With the host's docker socket
