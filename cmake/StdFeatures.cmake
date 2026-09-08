@@ -30,6 +30,10 @@ function(_blake3pp_probe var code)
   if(NOT DEFINED CACHE{${var}})
     set(src "${CMAKE_BINARY_DIR}/CMakeFiles/blake3pp_probes/${var}.cpp")
     file(WRITE "${src}" "${code}")
+    # Compile-only: these are header/usability questions, and a linked
+    # probe makes zig build its runtime libraries for the probe's
+    # optimisation mode first (see blake3pp_probe_flag_candidates).
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
     try_compile(${var} SOURCES "${src}")
   endif()
   if(${var})

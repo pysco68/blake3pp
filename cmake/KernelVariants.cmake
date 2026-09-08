@@ -25,9 +25,18 @@ include(CheckCXXSourceCompiles)
 # a candidate is substituted with PROBE_VLEN for the probe compile only
 # (the caller expands the winning pattern per variant);
 # PROBE_EXTRA_FLAGS are appended for the probe only.
+#
+# Compile-only: the question is whether the driver accepts the flags and
+# the intrinsics compile, and linking a probe executable costs real time
+# on some toolchains. zig builds its libc++/compiler-rt/musl per CPU
+# model and optimisation mode at link time, ~40 s and 2000+ cache
+# files for every -march candidate a probe would link with, in every
+# fresh container; the kernel objects themselves are compile-only and
+# the final link carries no per-kernel flags, so nothing else pays it.
 function(blake3pp_probe_flag_candidates out_var probe_name)
   cmake_parse_arguments(PARSE_ARGV 2 PF "" "SOURCE;PROBE_VLEN"
     "CANDIDATES;PROBE_EXTRA_FLAGS")
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
   set(result "")
   foreach(cand IN LISTS PF_CANDIDATES)
     string(MAKE_C_IDENTIFIER "${probe_name}_${cand}" var)
