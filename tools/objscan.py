@@ -166,7 +166,7 @@ def disassemble(path, objdump, arch):
             functions[current].append(last)
             continue
         m = FUNC.match(line)
-        if m:
+        if m and not line.startswith("Disassembly of section"):
             name = m.group("gnu") or m.group("bare")
             # Local labels (RISC-V keeps .L* for relaxation, llvm's Mach-O
             # writer emits ltmp*) are not function boundaries.
@@ -189,6 +189,19 @@ def disassemble(path, objdump, arch):
             if insn.callee is None and prev is not None and prev.mnemonic == "auipc" and prev.callee:
                 insn.callee = prev.callee
             prev = insn
+        # An AArch64 call through the GOT (Mach-O: adrp x16, sym@GOTPAGE;
+        # ldr x16, [x16, sym@GOTPAGEOFF]; blr x16, how Apple's stack probe
+        # ___chkstk_darwin is reached) carries its relocations on the
+        # loads; the blr takes over the symbol of the load into its
+        # register.
+        for i, insn in enumerate(fns):
+            if insn.mnemonic != "blr" or insn.callee is not None:
+                continue
+            reg = insn.operands.strip()
+            for p in reversed(fns[max(0, i - 4):i]):
+                if p.callee and p.mnemonic in ("ldr", "adrp") and p.operands.startswith(reg + ","):
+                    insn.callee = p.callee
+                    break
     return functions
 
 
@@ -378,7 +391,7 @@ def cmd_disasm(args):
 
 
 HOT = r"::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof)\("
-ALLOW = (r"^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck"
+ALLOW = (r"^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck"
          r"|__asan_\w+|__hwasan_\w+|__ubsan_\w+|__tsan_\w+|__msan_\w+|__sanitizer_\w+|__gcov\w*|__llvm_\w+)$"
          r"|kern::\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\(")
 
