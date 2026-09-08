@@ -28,7 +28,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_CROSSCOMPILING_EMULATOR "qemu-riscv64;-L;/usr/riscv64-linux-gnu")
+# Resolved to an absolute path: under cmake-re the test launcher
+# (tipi-test-driver) execve's the command literally, no PATH search.
+find_program(BLAKE3PP_QEMU NAMES qemu-riscv64 REQUIRED NO_CACHE)
+set(CMAKE_CROSSCOMPILING_EMULATOR "${BLAKE3PP_QEMU};-L;/usr/riscv64-linux-gnu")
 
 set(CMAKE_FIND_ROOT_PATH /usr/riscv64-linux-gnu)
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

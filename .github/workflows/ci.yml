@@ -33,6 +33,20 @@
 # (built fresh, or promoted by manifest retag if they already existed)
 # for local tools/tc users. Fork PRs cannot push packages: their image
 # changes fall back to :latest with a visible warning.
+#
+# Build driver, one switch for every Linux container lane: the
+# repository variable BLAKE3PP_CI_DRIVER (Variables tab) set to
+# `cmake-re` runs configure and build through cmake-re with the compile
+# actions on the EngFlow cluster when the variable BLAKE3PP_CMAKE_RE_MODE
+# (or the cmake-re-mode dispatch input) is `distributed` (secrets
+# RBE_SERVICE, RBE_TLS_CLIENT_AUTH_KEY, RBE_TLS_CLIENT_AUTH_CERT;
+# optionally the variable BLAKE3PP_RBE_ENV_REGISTRY, the registry the
+# cluster pulls
+# environment images from until GHCR is public), anything else runs
+# plain cmake. The `driver` dispatch input overrides the variable for
+# one run. Both drivers go through tools/ci-test.sh, so tests, emulator
+# matrices and coverage are the same; only where the compiler runs
+# differs. Windows and macOS are always native.
 name: ci
 
 on:
@@ -42,6 +56,17 @@ on:
   pull_request:
     paths-ignore: ["**.md", "release/**"]
   workflow_dispatch:
+    inputs:
+      driver:
+        description: "build driver for the Linux lanes (auto: the BLAKE3PP_CI_DRIVER repository variable, else cmake)"
+        type: choice
+        options: ["auto", "cmake", "cmake-re"]
+        default: "auto"
+      cmake-re-mode:
+        description: "where cmake-re builds (auto: the BLAKE3PP_CMAKE_RE_MODE repository variable, else host)"
+        type: choice
+        options: ["auto", "host", "distributed"]
+        default: "auto"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -61,6 +86,8 @@ jobs:
       tag: ${{ steps.decide.outputs.tag }}
       build: ${{ steps.decide.outputs.build }}
       promote: ${{ steps.decide.outputs.promote }}
+      driver: ${{ steps.decide.outputs.driver }}
+      cmake-re-mode: ${{ steps.decide.outputs.cmake_re_mode }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/login-action@v4
@@ -78,6 +105,17 @@ jobs:
           # Secrets; not environment-scoped) reach the vars. context;
           # empty here means the gated job will skip, and why.
           echo "gate vars: CLOUDV_RISCV64='${{ vars.CLOUDV_RISCV64 }}' LINUX_ARM64_NATIVE='${{ vars.LINUX_ARM64_NATIVE }}' WIN_ARM64_NATIVE='${{ vars.WIN_ARM64_NATIVE }}'"
+          driver="${{ inputs.driver != 'auto' && inputs.driver || vars.BLAKE3PP_CI_DRIVER }}"
+          [ "${driver}" = cmake-re ] || driver=cmake
+          echo "build driver: ${driver}"
+          echo "driver=${driver}" >> "$GITHUB_OUTPUT"
+          # Where cmake-re builds: --host alone (the image's own
+          # compilers, no cluster and no secrets needed) unless the mode
+          # says distributed.
+          mode="${{ inputs.cmake-re-mode != 'auto' && inputs.cmake-re-mode || vars.BLAKE3PP_CMAKE_RE_MODE }}"
+          [ "${mode}" = distributed ] || mode=host
+          echo "cmake-re mode: ${mode}"
+          echo "cmake_re_mode=${mode}" >> "$GITHUB_OUTPUT"
           tag="tree-$(bash tools/toolchain-image-tag.sh)"
           missing=0
           for ref in $(TAG="${tag}" docker buildx bake -f docker/docker-bake.hcl --print 2>/dev/null \
@@ -201,6 +239,16 @@ jobs:
       options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
     env:
       CMAKE_GENERATOR: Ninja
+      # The build driver (see the header): tools/ci-test.sh switches on
+      # BLAKE3PP_CMAKE_RE. The TIPI_* and USER settings only matter to
+      # cmake-re: the portable cmake-re must not provision tipi's distro,
+      # its ranlib driver rewrites the archive in place (denied by the
+      # remote sandbox), and goma wants a username.
+      BLAKE3PP_CMAKE_RE: ${{ needs.changes.outputs.driver == 'cmake-re' && '1' || '0' }}
+      BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
+      TIPI_DISTRO_MODE: none
+      TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      USER: runner
       # Mirrors tools/tc's sanitizer environment.
       ASAN_SYMBOLIZER_PATH: /usr/local/bin/llvm-symbolizer
       ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:strict_string_checks=1:symbolize=1
@@ -212,6 +260,16 @@ jobs:
       - uses: ./.github/actions/setup-workspace
         with:
           cache-prefix: hfc-src2-linux-
+      - uses: ./.github/actions/setup-cmake-re
+        if: needs.changes.outputs.driver == 'cmake-re'
+        with:
+          preset: ${{ matrix.preset }}
+          image-tag: ${{ needs.changes.outputs.tag }}
+          rbe-service: ${{ secrets.RBE_SERVICE }}
+          rbe-tls-client-auth-key: ${{ secrets.RBE_TLS_CLIENT_AUTH_KEY }}
+          rbe-tls-client-auth-cert: ${{ secrets.RBE_TLS_CLIENT_AUTH_CERT }}
+          env-registry: ${{ vars.BLAKE3PP_RBE_ENV_REGISTRY }}
+          distributed: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' }}
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
@@ -241,11 +299,27 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       CMAKE_GENERATOR: Ninja
+      # The build driver (see the header) and cmake-re's process settings.
+      BLAKE3PP_CMAKE_RE: ${{ needs.changes.outputs.driver == 'cmake-re' && '1' || '0' }}
+      BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
+      TIPI_DISTRO_MODE: none
+      TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      USER: runner
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           cache-prefix: hfc-src2-linux-
+      - uses: ./.github/actions/setup-cmake-re
+        if: needs.changes.outputs.driver == 'cmake-re'
+        with:
+          preset: wasm32-emcc-cxx23
+          image-tag: ${{ needs.changes.outputs.tag }}
+          rbe-service: ${{ secrets.RBE_SERVICE }}
+          rbe-tls-client-auth-key: ${{ secrets.RBE_TLS_CLIENT_AUTH_KEY }}
+          rbe-tls-client-auth-cert: ${{ secrets.RBE_TLS_CLIENT_AUTH_CERT }}
+          env-registry: ${{ vars.BLAKE3PP_RBE_ENV_REGISTRY }}
+          distributed: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' }}
       - name: Configure, build, test (node)
         run: bash tools/ci-test.sh wasm32-emcc-cxx23
       # The container shares the runner's CPU, so this benches v8's
@@ -315,11 +389,27 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       CMAKE_GENERATOR: Ninja
+      # The build driver (see the header) and cmake-re's process settings.
+      BLAKE3PP_CMAKE_RE: ${{ needs.changes.outputs.driver == 'cmake-re' && '1' || '0' }}
+      BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
+      TIPI_DISTRO_MODE: none
+      TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      USER: runner
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           cache-prefix: hfc-src2-linux-
+      - uses: ./.github/actions/setup-cmake-re
+        if: needs.changes.outputs.driver == 'cmake-re'
+        with:
+          preset: ${{ matrix.preset }}
+          image-tag: ${{ needs.changes.outputs.tag }}
+          rbe-service: ${{ secrets.RBE_SERVICE }}
+          rbe-tls-client-auth-key: ${{ secrets.RBE_TLS_CLIENT_AUTH_KEY }}
+          rbe-tls-client-auth-cert: ${{ secrets.RBE_TLS_CLIENT_AUTH_CERT }}
+          env-registry: ${{ vars.BLAKE3PP_RBE_ENV_REGISTRY }}
+          distributed: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' }}
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}

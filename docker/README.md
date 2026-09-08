@@ -75,22 +75,27 @@ into it (or use `ctest --test-dir`) rather than reasoning about the
 path. cmake-re writes a git note into the source checkout, so the uid
 running it must own that checkout.
 
-`.github/workflows/rbe.yml` is the same shape as a job: it boots into the
-toolchain image, takes the EngFlow credentials from repository secrets
-(`RBE_SERVICE`, `RBE_TLS_CLIENT_AUTH_KEY`, `RBE_TLS_CLIENT_AUTH_CERT`),
-runs `cmake-re --host --distributed` so every compile action executes on
-the cluster with the remote action cache serving repeats, tests the result
-where it lands, and uploads the publishable form: the release archives
-from `tools/make-release.sh` (its `BLAKE3PP_CMAKE_RE=1` mode drives the
-same three steps through cmake-re) for the static musl lanes, the tool
-binaries for everything else. It is `workflow_dispatch` only; the lane
-list is an input. cmake-re's working directory (`cmake-re --info json`,
+In CI the same build runs through cmake-re when the repository variable
+`BLAKE3PP_CI_DRIVER` is `cmake-re` (or the `driver` dispatch input says
+so): every Linux container lane of ci.yml then calls tools/ci-test.sh
+with `BLAKE3PP_CMAKE_RE=1`, which configures and builds through
+`cmake-re --host` (the image's own compilers) or, when the variable
+`BLAKE3PP_CMAKE_RE_MODE` is `distributed`, `cmake-re --host
+--distributed` (compiles on the EngFlow cluster, the remote action cache
+serving repeats), tests where the build lands, and uploads the same
+artifacts as the plain-cmake run. The cmake-re-only preparation is one
+composite action, .github/actions/setup-cmake-re: for the distributed
+mode the EngFlow credentials from the repository secrets (`RBE_SERVICE`,
+`RBE_TLS_CLIENT_AUTH_KEY`, `RBE_TLS_CLIENT_AUTH_CERT`), the environment
+files retargeted at the registry the cluster can pull from (the variable
+`BLAKE3PP_RBE_ENV_REGISTRY`, the Docker Hub mirror until GHCR is public),
+and cmake-re's working directory (`cmake-re --info json`,
 `tipi_workdir`: the mirrored source, its build tree, the hfc dependency
-builds) is cached between runs per lane, image tag and cmake-re distro
-(`.github/actions/cache-tipi-mirror`), so a rerun configures in seconds
-and builds only what changed; the version stamp looks through cmake-re's
-sync commit so that an unchanged tree stays a no-op. Two settings ride
-along with every cmake-re run:
+builds) restored from the actions cache per lane, image tag and cmake-re
+distro (.github/actions/cache-tipi-mirror), so a rerun configures in
+seconds and builds only what changed; the version stamp looks through
+cmake-re's sync commit so that an unchanged tree stays a no-op. Two
+settings ride along with every cmake-re run:
 `TIPI_DISABLE_AR_RANLIB_DRIVER=ON`, because tipi's ranlib action rewrites
 its input archive in place, which the remote sandbox denies, and a `USER`
 for the dependency scanner. The zig wrappers answer that scanner's probes

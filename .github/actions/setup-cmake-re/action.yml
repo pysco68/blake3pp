@@ -1,0 +1,69 @@
+name: setup-cmake-re
+description: >
+  Everything a container job needs before tools/ci-test.sh can run with
+  BLAKE3PP_CMAKE_RE=1 (cmake-re, compiles on the EngFlow cluster): the
+  mTLS credentials from the repository secrets into RBE_* variables,
+  the cmake-re environment files retargeted at a registry the cluster
+  can pull from (optional; until GHCR is public that is the Docker Hub
+  mirror), and cmake-re's mirror restored from the actions cache. The
+  job's own image is already on the runner's daemon, which is how
+  cmake-re resolves the environment locally.
+inputs:
+  preset:
+    description: the configure preset the job builds (one per job)
+    required: true
+  distributed:
+    description: "true when the build sends its compile actions to the cluster (installs the credentials); false for --host alone"
+    default: "false"
+  image-tag:
+    description: content tag of the toolchain image the job runs in
+    required: true
+  rbe-service:
+    description: cluster address, e.g. rbe.example.com:443 (distributed only)
+    default: ""
+  rbe-tls-client-auth-key:
+    description: contents of the mTLS client key (PEM; distributed only)
+    default: ""
+  rbe-tls-client-auth-cert:
+    description: contents of the mTLS client certificate (PEM; distributed only)
+    default: ""
+  env-registry:
+    description: registry the cluster pulls environment images from (empty keeps the committed GHCR files)
+    default: ""
+  env-image-template:
+    description: image name template for the environment files
+    default: "{registry}/blake3pp-toolchain-{image}"
+runs:
+  using: composite
+  steps:
+    - name: EngFlow credentials
+      if: inputs.distributed == 'true'
+      shell: bash
+      env:
+        RBE_KEY: ${{ inputs.rbe-tls-client-auth-key }}
+        RBE_CERT: ${{ inputs.rbe-tls-client-auth-cert }}
+      run: |
+        set -euo pipefail
+        umask 077
+        mkdir -p "$RUNNER_TEMP/rbe"
+        printf '%s' "$RBE_KEY"  > "$RUNNER_TEMP/rbe/client.key"
+        printf '%s' "$RBE_CERT" > "$RUNNER_TEMP/rbe/client.crt"
+        {
+          echo "RBE_service=${{ inputs.rbe-service }}"
+          echo "RBE_tls_client_auth_key=$RUNNER_TEMP/rbe/client.key"
+          echo "RBE_tls_client_auth_cert=$RUNNER_TEMP/rbe/client.crt"
+        } >> "$GITHUB_ENV"
+    - name: Environments on the registry the cluster can reach
+      if: inputs.env-registry != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        BLAKE3PP_TC_REGISTRY='${{ inputs.env-registry }}' \
+        BLAKE3PP_TC_IMAGE_TEMPLATE='${{ inputs.env-image-template }}' \
+          python3 tools/gen-environments.py
+        tc=$(python3 tools/preset-args.py --toolchain '${{ inputs.preset }}')
+        grep -h '"image"' "${tc%.cmake}.pkr.js"
+    - uses: ./.github/actions/cache-tipi-mirror
+      with:
+        preset: ${{ inputs.preset }}
+        image-tag: ${{ inputs.image-tag }}

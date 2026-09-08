@@ -15,8 +15,33 @@ set -euo pipefail
 preset=${1:?usage: ci-test.sh <preset>}
 build_dir="build/${preset}"
 
-cmake --preset "${preset}"
-cmake --build "${build_dir}" -j"$(nproc)"
+# The build driver. BLAKE3PP_CMAKE_RE=1 configures and builds through
+# cmake-re (BLAKE3PP_CMAKE_RE_FLAGS selects where: --host, the default,
+# builds with the image's own compilers; --host --distributed sends the
+# compile actions to the cluster), the same switch tools/make-release.sh
+# has. cmake-re knows no presets, so tools/preset-args.py unrolls the
+# preset, and it places build/<preset> as a symlink into its mirror,
+# which everything below reads through. Tests, emulator matrices and the
+# coverage report are the same under both drivers.
+configure_and_build() {  # <preset> <build-dir> [extra cmake args...]
+  local p=$1 dir=$2; shift 2
+  if [ "${BLAKE3PP_CMAKE_RE:-0}" = 1 ]; then
+    local flags=${BLAKE3PP_CMAKE_RE_FLAGS:---host}
+    rm -rf "${dir}"
+    # The preset's own -B is replaced by the directory asked for (the
+    # xthead extra build uses a sibling directory).
+    local -a args
+    read -r -a args <<< "$(python3 tools/preset-args.py "${p}" | sed -E 's# -B [^ ]+##')"
+    # shellcheck disable=SC2086  # one flag per word, on purpose
+    cmake-re ${flags} -S . "${args[@]}" -B "${dir}" "$@"
+    cmake-re --build "${dir}" ${flags} -j"$(nproc)"
+  else
+    cmake --preset "${p}" -B "${dir}" "$@"
+    cmake --build "${dir}" -j"$(nproc)"
+  fi
+}
+
+configure_and_build "${preset}" "${build_dir}"
 
 # The kernel audit (tools/objscan.py, rules in tools/kernel-audit.json):
 # every variant's object carries its instruction class and nothing above
@@ -92,8 +117,7 @@ case "${preset}" in
     # cmake/ArchKernels.cmake), covered by the plain matrix above.
     if [[ "${preset}" == *gcc* ]]; then
       xthead_dir="build/${preset}-xthead"
-      cmake --preset "${preset}" -B "${xthead_dir}" -DBLAKE3PP_XTHEAD_KERNEL=ON
-      cmake --build "${xthead_dir}" -j"$(nproc)"
+      configure_and_build "${preset}" "${xthead_dir}" -DBLAKE3PP_XTHEAD_KERNEL=ON
       audit_kernels "${xthead_dir}"
       echo "::group::ctest ${preset} [xthead-compiled-in]"
       ctest --test-dir "${xthead_dir}" --output-on-failure
