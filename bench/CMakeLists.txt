@@ -66,3 +66,14 @@ if(TARGET blake3pp_beman_backend)
     target_link_libraries(blake3pp_bench_file PRIVATE blake3pp::beman_backend)
   endif()
 endif()
+
+# Smoke: the benches are shipped tools, so one tiny run each proves they
+# start, find their kernels and print; it also runs the shared tooling
+# (pinning, cooldown, timing) the CLI smoke tests never reach, which the
+# coverage lanes would otherwise report as dead.
+add_test(NAME bench_smoke
+  COMMAND blake3pp_bench --size 4 --reps 1 --cooldown 0 --threads 2)
+if(TARGET blake3pp_bench_file)
+  add_test(NAME bench_file_smoke
+    COMMAND blake3pp_bench_file --make 8 --reps 1 --cooldown 0 --threads 2)
+endif()

@@ -209,6 +209,80 @@ elseif(CASE STREQUAL "gen_output")
     message(FATAL_ERROR "--output file diverges from the stdout stream")
   endif()
 
+elseif(CASE STREQUAL "sum_errors")
+  # The failure paths: a missing input, a --check list with comments,
+  # a malformed line and a missing file, a missing list, and the one
+  # usage error (key and data both on stdin).
+  run_sum(out res ARGS missing.bin)
+  if(res EQUAL 0)
+    message(FATAL_ERROR "a missing input did not fail")
+  endif()
+  file(WRITE "${WORK}/f" "hello blake3pp")
+  run_sum(sums res ARGS f)
+  if(NOT res EQUAL 0)
+    message(FATAL_ERROR "hashing failed (rc=${res})")
+  endif()
+  string(REPEAT "0" 64 zeros)
+  file(WRITE "${WORK}/list" "# a comment\n\n${sums}abc f\n${zeros}  nofile\n")
+  run_sum(out res ARGS --check list)
+  if(res EQUAL 0 OR NOT out MATCHES "f: OK" OR NOT out MATCHES "FAILED open or read")
+    message(FATAL_ERROR "--check did not report the bad lines (rc=${res}): ${out}")
+  endif()
+  run_sum(out res ARGS --check nolist)
+  if(res EQUAL 0)
+    message(FATAL_ERROR "--check of a missing list did not fail")
+  endif()
+  run_sum(out res ARGS --keyed - - STDIN "${WORK}/f")
+  if(res EQUAL 0)
+    message(FATAL_ERROR "key and data both on stdin was accepted")
+  endif()
+
+elseif(CASE STREQUAL "key_forms")
+  # A 32-byte raw key equals its 64-hex spelling; the key may come from
+  # stdin; keyed and derived digests of a large file (the parallel path)
+  # equal their single-threaded ones.
+  file(WRITE "${WORK}/rawkey" "0123456789abcdef0123456789abcdef")
+  file(WRITE "${WORK}/hexkey"
+    "3031323334353637383961626364656630313233343536373839616263646566")
+  file(WRITE "${WORK}/f" "keyed payload")
+  run_sum(a r1 ARGS --keyed rawkey f)
+  run_sum(b r2 ARGS --keyed hexkey f)
+  run_sum(c r3 ARGS --keyed - f STDIN "${WORK}/hexkey")
+  if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT r3 EQUAL 0
+     OR NOT a STREQUAL b OR NOT a STREQUAL c)
+    message(FATAL_ERROR "key forms disagree: raw=${a} hex=${b} stdin=${c}")
+  endif()
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed k --length 20000000
+    OUTPUT_FILE "${WORK}/big" RESULT_VARIABLE rg)
+  run_sum(p1 s1 ARGS --keyed hexkey big)
+  run_sum(p2 s2 ARGS --keyed hexkey --threads 1 big)
+  run_sum(d1 s3 ARGS --derive-key ctx big)
+  run_sum(d2 s4 ARGS --derive-key ctx --threads 1 big)
+  if(NOT rg EQUAL 0 OR NOT s1 EQUAL 0 OR NOT s2 EQUAL 0 OR NOT s3 EQUAL 0
+     OR NOT s4 EQUAL 0 OR NOT p1 STREQUAL p2 OR NOT d1 STREQUAL d2)
+    message(FATAL_ERROR "keyed/derived parallel path diverges from sequential")
+  endif()
+
+elseif(CASE STREQUAL "gen_errors")
+  # Size parsing (suffixes, a bad suffix, garbage), an infinite --seek, a
+  # missing seed file and an unwritable --output all fail cleanly; 1K
+  # means 1024.
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 1K --hex
+    OUTPUT_VARIABLE a RESULT_VARIABLE r1)
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 1024 --hex
+    OUTPUT_VARIABLE b RESULT_VARIABLE r2)
+  if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT a STREQUAL b)
+    message(FATAL_ERROR "--length 1K is not 1024 bytes")
+  endif()
+  foreach(bad "--length;12X" "--length;abc" "--seek;inf"
+              "--seed-file;${WORK}/nope" "--output;${WORK}/no/such/dir/out")
+    execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 16 ${bad}
+      OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE r)
+    if(r EQUAL 0)
+      message(FATAL_ERROR "gen accepted '${bad}'")
+    endif()
+  endforeach()
+
 else()
   message(FATAL_ERROR "unknown CASE '${CASE}'")
 endif()
