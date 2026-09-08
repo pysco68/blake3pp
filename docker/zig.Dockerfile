@@ -49,18 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # arg so a per-target image is a bake entry away.
 ENV ZIG_GLOBAL_CACHE_DIR=/opt/zig-cache
 ARG ZIG_TARGETS="x86_64 aarch64 riscv64 powerpc64le s390x"
-COPY --chmod=0755 <<'EOF' /usr/local/bin/musl-run
-#!/bin/sh
-# musl-run <zig-arch> <binary> [args...]: run a static musl binary built
-# for <zig-arch> (zig's spelling), through qemu-user when it is foreign.
-set -eu
-arch=$1; shift
-case "$arch" in
-  "$(uname -m)") exec "$@" ;;
-  powerpc64le)   exec qemu-ppc64le "$@" ;;
-  *)             exec "qemu-$arch" "$@" ;;
-esac
-EOF
+COPY --chmod=0755 docker/wrappers/zig/musl-run /usr/local/bin/musl-run
 RUN set -eux; umask 000; \
     mkdir -p /opt/zig-cache; chmod 0777 /opt/zig-cache; \
     printf '#include <cstdio>\nint main() { std::puts("ok"); }\n' > /tmp/hello.cpp; \
@@ -78,11 +67,11 @@ RUN set -eux; umask 000; \
 # (cmake-re copies toolchain files into its own environment directory,
 # where a path relative to the file resolves nowhere). The /opt/zig/clang
 # link above is what the wrappers report as the -cc1 program to
-# dependency scanners (see tools/zig-wrappers). The checks compile
+# dependency scanners (see docker/wrappers/zig). The checks compile
 # through a wrapper as each user, which writes the prewarmed cache; one
 # source per user, since a container is single-user and zig's manifest
 # for a source is not meant to be handed from one uid to the next.
-COPY tools/zig-wrappers/ /usr/local/bin/
+COPY --chmod=0755 docker/wrappers/zig/ /usr/local/bin/
 RUN set -eux; \
     arch=${ZIG_TARGETS%% *}; \
     for user in vscode tipi tipi-rbe; do \

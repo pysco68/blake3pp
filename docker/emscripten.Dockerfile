@@ -25,3 +25,11 @@ RUN set -eux; \
       /tmp/hello.cpp -o /tmp/hello.js; \
     node /tmp/hello.js; \
     rm -f /tmp/hello*
+
+# The drivers under clang-shaped names (reclient's dependency scanner
+# classifies a compiler by its basename and aborts on emcc/em++, taking
+# its scanner service down) and the link launcher that declares the
+# .wasm sidecar of a remote link; the toolchain's Platform/Emscripten.cmake
+# shim selects both when present.
+COPY --chmod=0755 docker/wrappers/emscripten/ /usr/local/bin/
+RUN wasm32-emscripten-clang++ --version | head -1

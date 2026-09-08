@@ -12,7 +12,10 @@
 #   simd128             enabled per-kernel (ARCH_FLAGS), not globally: the
 #                       scalar variant stays honestly scalar
 
-include(/usr/share/emscripten/cmake/Modules/Platform/Emscripten.cmake)
+# Platform/Emscripten.cmake beside this file wraps emscripten's own; see
+# the shim for why the compiler names are set there and not here.
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+include(Platform/Emscripten)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -3,7 +3,7 @@
   "builders": [
     {
       "type": "docker",
-      "image": "ghcr.io/pysco68/blake3pp/toolchain-clang22:tree-9ec4ecc3f57706ea",
+      "image": "ghcr.io/pysco68/blake3pp/toolchain-clang22:tree-36c1387fc54e1960",
       "commit": true
     }
   ]

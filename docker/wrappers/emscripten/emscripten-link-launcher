@@ -1,0 +1,25 @@
+#!/bin/bash
+# Link launcher for emscripten under cmake-re (selected by the toolchain's
+# Platform/Emscripten.cmake shim, ahead of tipi's linker driver).
+#
+# emscripten's link writes two files for one -o: <out>.js and the
+# <out>.wasm sidecar. A remote link returns declared outputs only, so the
+# sidecar stayed on the worker and every test failed with ENOENT. This
+# declares it: rewrapper reads RBE_output_files from the environment as
+# its -output_files flag (exec-root-relative, comma-separated), and the
+# launcher then hands over to whatever follows (tipi-linker-driver, or the
+# compiler itself in a plain build, where the variable is harmless).
+args=("$@")
+out=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[i]}" in
+    -o) out=${args[i + 1]-} ;;
+  esac
+done
+if [ -n "${out}" ] && [ "${out%.js}" != "${out}" ]; then
+  wasm="$(realpath -m -- "${out%.js}").wasm"
+  # cmake-re's mirror lives under .tipi/vT.w, which is reclient's exec root.
+  rel=${wasm#*/.tipi/vT.w/}
+  export RBE_output_files="${RBE_output_files:+${RBE_output_files},}${rel}"
+fi
+exec "$@"

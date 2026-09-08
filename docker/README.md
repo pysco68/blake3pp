@@ -21,12 +21,12 @@ unsupported and unneeded.
 | `toolchain-clang18` | 24.04 | 2.39 | `linux-clang18-*` | g++-14 tree for the libstdcxx pin |
 | `toolchain-clang20` | 24.04 | 2.39 | `linux-clang20-*` | g++-14 tree; clang from apt.llvm.org noble-20 |
 | `toolchain-clang22` | 26.04 | ~2.42 | `linux-clang22-*` (incl. asan/tsan/msan/fuzzer/coverage/cxx2c) | g++-16 tree, libfuzzer/libomp, gdb, valgrind, Intel SDE, **/opt/libcxx-msan** |
-| `toolchain-arm64-gcc15` | 26.04 | (aarch64 sysroot) | `linux-arm64-gcc15-*` | qemu-aarch64 |
+| `toolchain-arm64-gcc15` | 26.04 | (aarch64 sysroot) | `linux-arm64-gcc15-*` | qemu-aarch64; the gcc/g++ drivers behind `reclient-gcc-driver`, which neutralises the one probe line reclient's dependency scanner cannot ask an aarch64 GCC (`__has_attribute(__arm_streaming)`, an SME keyword there) |
 | `toolchain-riscv64-gcc15` | 26.04 | (riscv64 sysroot) | `linux-riscv64-gcc15-*` | qemu-riscv64 (RVV 1.0, `QEMU_CPU=max,vlen=<bits>`); opt-in Xuantie-qemu stage for XTheadVector (`--set riscv64-gcc15.args.WITH_XUANTIE_QEMU=1`, builds T-Head's fork in a pinned 22.04 stage; verify the 0.7.1 kernel with the freestanding `tests/xthead_verify.cpp` harness under `qemu-riscv64-xuantie -cpu c906fdv`; glibc binaries cannot run on the th CPU models, see the harness header) |
 | `toolchain-ppc64le-gcc15` | 26.04 | (ppc64le sysroot) | `linux-ppc64le-gcc15-*` | qemu-ppc64le (`QEMU_CPU=power8/9/10`) |
 | `toolchain-s390x-gcc15` | 26.04 | (s390x sysroot) | `linux-s390x-gcc15-*` | qemu-s390x (big-endian; `QEMU_CPU=max,vxeh=off` for the scalar fallback) |
-| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64, ppc64le, s390x), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, zig cache prewarmed for all five musl targets (world-writable; `musl-run <arch> <binary>` runs a static binary through qemu when foreign), the zig wrappers on PATH as `<triple>-clang`/`-clang++` |
-| `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd |
+| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64, ppc64le, s390x), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, zig cache prewarmed for all five musl targets (world-writable; `musl-run <arch> <binary>` runs a static binary through qemu when foreign), the zig wrappers (docker/wrappers/zig) on PATH as `<triple>-clang`/`-clang++` |
+| `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd; `wasm32-emscripten-clang`/`-clang++` wrap emcc/em++ under names reclient's dependency scanner accepts (the toolchain's Platform/Emscripten.cmake shim selects them) |
 
 Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`. The canonical tag
 is **content-addressed**: `tree-<hash>` over the `docker/` git subtree,
@@ -94,7 +94,7 @@ along with every cmake-re run:
 `TIPI_DISABLE_AR_RANLIB_DRIVER=ON`, because tipi's ranlib action rewrites
 its input archive in place, which the remote sandbox denies, and a `USER`
 for the dependency scanner. The zig wrappers answer that scanner's probes
-in clang's format (see tools/zig-wrappers), which is what lets the musl
+in clang's format (see docker/wrappers/zig), which is what lets the musl
 lanes distribute at all.
 
 The base recipe also carries a docker client (the static tarball) and
@@ -177,6 +177,25 @@ docker buildx bake -f docker/docker-bake.hcl clang22      # one image
 
 Version pins (Ubuntu digests, CMake, Ninja, zig, SDE) live at the top of
 `docker-bake.hcl` and in the family Dockerfiles' ARG defaults.
+
+## Wrappers
+
+Every script an image puts in front of a compiler lives in
+`docker/wrappers/<image>/` and is COPY'd to `/usr/local/bin` (or over the
+versioned driver, for arm64-gcc15) by that image's recipe, so the recipe,
+the wrapper and its reason sit together and the content tag covers them:
+
+| directory | scripts | why |
+|---|---|---|
+| `wrappers/zig/` | `<triple>-linux-musl-clang`, `-clang++` (five targets), `musl-run` | zig under names reclient's dependency scanner accepts, answering its probes in clang's format; `musl-run` executes a static musl binary through qemu when foreign |
+| `wrappers/arm64-gcc15/` | `reclient-gcc-driver` | installed over `aarch64-linux-gnu-gcc-15`/`g++-15`; neutralises the one scanner probe line an aarch64 GCC rejects (`__has_attribute(__arm_streaming)`) |
+| `wrappers/emscripten/` | `wasm32-emscripten-clang`, `-clang++`, `emscripten-link-launcher` | emcc/em++ under accepted names; the launcher declares the `.wasm` sidecar of a remote link (`RBE_output_files`) so it comes back with the `.js` |
+
+The toolchain files name the wrappers bare (they are on PATH in the
+image; the zig ones are also found in a checkout by the `HINTS` path), and
+the wasm toolchain's `Platform/Emscripten.cmake` shim selects the
+emscripten ones only when they exist, so the presets still configure on a
+machine without them.
 
 ## Gotchas
 

@@ -1,0 +1,10 @@
+#!/bin/sh
+# musl-run <zig-arch> <binary> [args...]: run a static musl binary built
+# for <zig-arch> (zig's spelling), through qemu-user when it is foreign.
+set -eu
+arch=$1; shift
+case "$arch" in
+  "$(uname -m)") exec "$@" ;;
+  powerpc64le)   exec qemu-ppc64le "$@" ;;
+  *)             exec "qemu-$arch" "$@" ;;
+esac

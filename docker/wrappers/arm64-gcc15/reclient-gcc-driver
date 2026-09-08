@@ -1,0 +1,23 @@
+#!/bin/bash
+# Driver wrapper for a cross GCC behind reclient (cmake-re --distributed).
+#
+# reclient's dependency scanner learns a compiler by preprocessing a
+# generated file of clang-style __has_feature/__has_attribute/__has_builtin
+# queries, one per line, and requires exit status 0. On aarch64 GCC 14+
+# one of them is an error rather than 0: __arm_streaming is an SME keyword
+# there, and __has_attribute() of a keyword attribute is rejected by the
+# preprocessor. The scanner then declares the compiler unknown and no
+# action can go remote. This wrapper turns that one query into a constant
+# before the real driver sees the file; everything else passes through.
+#
+# Installed OVER the versioned driver (aarch64-linux-gnu-gcc-15 becomes
+# aarch64-linux-gnu-gcc-15.real, this script takes its name) because the
+# scanner resolves symlinks and runs the real path, so a wrapper at the
+# alternatives link is never invoked for the probe.
+for a in "$@"; do
+  case "$a" in
+    */goma_compiler_proxy_check_features_*)
+      sed -i 's/^__has_attribute(__arm_streaming)$/0/' "$a" ;;
+  esac
+done
+exec "$(readlink -f "$0").real" "$@"

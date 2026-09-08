@@ -7,20 +7,20 @@
 # (see the gcc15 toolchain file) does not exist here by construction; the
 # rvv kernel TUs opt in per-TU via the -mcpu spellings the build probes.
 #
-# Requires the zig binary on PATH or via $ZIG (see tools/zig-wrappers/,
+# Requires the zig binary on PATH or via $ZIG (see docker/wrappers/zig/,
 # whose <triple>-clang/-clang++ wrappers this file names).
 
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR riscv64)
 
 # The wrappers by name: on PATH in the toolchain image (/usr/local/bin),
-# in tools/zig-wrappers/ in a checkout. Looked up rather than spelled as a
+# in docker/wrappers/zig/ in a checkout. Looked up rather than spelled as a
 # path relative to this file because cmake-re copies toolchain files into
 # its own environment directory, where a relative path resolves nowhere.
 find_program(BLAKE3PP_ZIG_CC riscv64-linux-musl-clang
-  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../docker/wrappers/zig" REQUIRED NO_CACHE)
 find_program(BLAKE3PP_ZIG_CXX riscv64-linux-musl-clang++
-  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../tools/zig-wrappers" REQUIRED NO_CACHE)
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../docker/wrappers/zig" REQUIRED NO_CACHE)
 set(CMAKE_C_COMPILER "${BLAKE3PP_ZIG_CC}")
 set(CMAKE_CXX_COMPILER "${BLAKE3PP_ZIG_CXX}")
 

@@ -1,8 +1,7 @@
 # Keep docker build contexts lean. Allowlist style: the toolchain images COPY
-# only tools/build-msan-libcxx.sh and nothing else, while build/ holds
-# gigabytes of configured trees. The devcontainer build (context ..) COPYs
-# nothing.
+# only docker/ (recipes and docker/wrappers/) and tools/build-msan-libcxx.sh,
+# while build/ holds gigabytes of configured trees. The devcontainer build
+# (context ..) COPYs nothing.
 *
 !docker/
 !tools/build-msan-libcxx.sh
-!tools/zig-wrappers/
