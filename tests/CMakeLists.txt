@@ -84,7 +84,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" AND CMAKE_SYSTEM_NAME STREQUAL "Linu
   target_include_directories(blake3pp_riscv_probe_shapes PRIVATE
     "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/include")
   target_link_libraries(blake3pp_riscv_probe_shapes PRIVATE blake3pp_warnings)
-  foreach(shape vendor thead-lie sg2042 sg2042-off legacy legacy-trap modern nothing assume-1 assume-0)
+  foreach(shape vendor thead-lie sg2042 sg2042-off legacy legacy-trap legacy-071 modern nothing assume-1 assume-0)
     add_test(NAME riscv_probe_${shape} COMMAND blake3pp_riscv_probe_shapes ${shape})
   endforeach()
 endif()

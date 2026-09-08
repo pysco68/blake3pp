@@ -207,6 +207,32 @@ unsigned long guarded_vlenb() noexcept {
   return vlenb;
 }
 
+// Which dialect is the vector unit speaking? The vtype immediate layout
+// differs: ratified 1.0 keeps vsew in bits 5:3 and vlmul in 2:0, draft
+// 0.7.1 keeps vsew in 4:2 and vlmul in 1:0. One vsetvli with zimm =
+// 0b0001000 (rs1 = x0: vl becomes VLMAX; rd = a0) therefore selects
+// e16/m1 on 1.0 hardware and e32/m1 on 0.7.1 hardware, and VLMAX comes
+// out as vlenb/2 or vlenb/4. Hand-encoded for the same reason as below.
+// Returns 0 if the instruction trapped.
+unsigned long guarded_vsetvli_lanes([[maybe_unused]] unsigned long vlenb) noexcept {
+#if defined(BLAKE3PP_TEST_PROBE_SHAPES)
+  if (test::g_machine.active && test::g_machine.dialect_071) {
+    return vlenb / 4;
+  }
+#endif
+  unsigned long lanes = 0;
+  if (!guarded([&] {
+        // The hand-encoded word writes a0; a register-bound local inside
+        // the lambda (a captured one may not live in a register).
+        register unsigned long a0 asm("a0") = 0;
+        asm volatile(".word 0x00807557" : "=r"(a0));  // vsetvli a0, x0, 0b0001000
+        lanes = a0;
+      })) {
+    return 0;
+  }
+  return lanes;
+}
+
 // Does the kernel let user mode touch the vector unit at all? vsetvli
 // shares its encoding shape between draft 0.7.1 and ratified 1.0 (only
 // the vtype immediate layout differs), so this single instruction
@@ -343,11 +369,20 @@ bool platform_run_trap_probes() noexcept {
       up.xthead = true;
     } else if (b.pending_legacy) {
       const unsigned long vlenb = guarded_vlenb();
-      if (vlenb != 0) {
-        up.rvv = true;
-        up.vlenb = vlenb;  // zvbb undetectable here; stays false
+      if (vlenb == 0) {
+        up.xthead = true;  // no vlenb CSR at all: draft 0.7.1
       } else {
-        up.xthead = true;
+        // A readable vlenb does not settle the dialect after all: the
+        // C906 under its 5.10 vendor kernel (LicheeRV Nano, 2026-09-08)
+        // reads it fine and speaks 0.7.1. The vtype layout does settle it.
+        const unsigned long lanes = guarded_vsetvli_lanes(vlenb);
+        if (lanes == vlenb / 2) {
+          up.rvv = true;
+          up.vlenb = vlenb;  // zvbb undetectable here; stays false
+        } else if (lanes == vlenb / 4) {
+          up.xthead = true;
+        }
+        // Anything else: claim nothing rather than execute a guess.
       }
     }
     if (up.rvv == b.rvv && up.xthead == b.xthead) {

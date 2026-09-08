@@ -58,13 +58,19 @@ const shape shapes[] = {
      .m = {.active = true, .mvendorid = thead, .force_trap = true},
      .expect_learned = false, .expect_xthead = false, .expect_rvv = false},
     // Rung 3: a pre-6.4 kernel (no hwprobe at all) advertising HWCAP V.
-    // The guarded vlenb read classifies; a value means RVV 1.0.
+    // The guarded vlenb read plus the vsetvli dialect probe classify;
+    // qemu answers as 1.0 hardware, so RVV.
     {.name = "legacy",
      .m = {.active = true, .hwcap_v = true, .hwprobe = false},
      .expect_learned = true, .expect_xthead = false, .expect_rvv = true},
     // The same with the read trapping: no vlenb CSR, so T-Head 0.7.1.
     {.name = "legacy-trap",
      .m = {.active = true, .hwcap_v = true, .hwprobe = false, .force_trap = true},
+     .expect_learned = true, .expect_xthead = true, .expect_rvv = false},
+    // The C906 shape (LicheeRV Nano): vlenb readable, but the vtype
+    // layout says 0.7.1, so T-Head.
+    {.name = "legacy-071",
+     .m = {.active = true, .hwcap_v = true, .hwprobe = false, .dialect_071 = true},
      .expect_learned = true, .expect_xthead = true, .expect_rvv = false},
     // Rung 1's standard path: the kernel vouches for V and Zvbb.
     {.name = "modern",

@@ -36,12 +36,41 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <unistd.h>
 #elif defined(__linux__)
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
+#include <unistd.h>
+#else
 #include <unistd.h>
 #endif
 
 namespace b3tool {
+
+// Physical memory in bytes, 0 when unknown: for defaults that have to fit
+// the machine (a 512 MiB bench buffer met a 128 MB board with no swap on
+// the LicheeRV Nano, and the OOM killer answered).
+[[nodiscard]] inline std::uint64_t physical_memory_bytes() noexcept {
+#if defined(_WIN32)
+  MEMORYSTATUSEX st{};
+  st.dwLength = sizeof st;
+  return GlobalMemoryStatusEx(&st) ? st.ullTotalPhys : 0;
+#elif defined(__APPLE__)
+  std::uint64_t mem = 0;
+  std::size_t len = sizeof mem;
+  return sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 ? mem : 0;
+#elif defined(__linux__)
+  struct sysinfo si {};
+  return sysinfo(&si) == 0 ? std::uint64_t{si.totalram} * si.mem_unit : 0;
+#else
+  const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+  return pages > 0 && page > 0
+             ? static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(page)
+             : 0;
+#endif
+}
 
 // The project's provider pattern in miniature: std::print where the
 // standard library ships it (C++23), a std::format shim on the C++20

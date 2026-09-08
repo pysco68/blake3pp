@@ -263,7 +263,13 @@ void t16_sweep(int reps, double cooldown_s) {
 
 int main(int argc, char** argv) {
   b3tool::tool_startup();
+  // 512 MiB streams past every cache; on a small board (128 MB and no
+  // swap: the LicheeRV Nano) that buffer belongs to the OOM killer, so
+  // the default is a quarter of physical memory where that is less.
   std::size_t mib = 512;
+  if (const std::uint64_t ram = b3tool::physical_memory_bytes(); ram != 0) {
+    mib = std::min(mib, std::max<std::size_t>(1, static_cast<std::size_t>(ram / 4 >> 20)));
+  }
   int reps = 5;
   double cooldown_s = 5.0;
   int pin_cpu = -1;
