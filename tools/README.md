@@ -51,6 +51,10 @@ tools/objscan.py find build/linux-s390x-gcc15-cxx23/cli/blake3ppsum '^(vlbr|vnx|
 # The disassembly of one function.
 tools/objscan.py disasm BIN 'kern::sve256::.*hash_batch'
 
+# Which instruction crashes under this emulator configuration? The
+# mnemonics one binary has and another lacks, with their users.
+tools/objscan.py diff bench-arch13 bench-z13
+
 # Whose address is that? (qemu -d in_asm prints load-biased addresses.)
 tools/objscan.py resolve build/linux-riscv64-gcc15-cxx23/cli/blake3ppsum 0x5555556a0b2c --bias 0x555555554000
 ```

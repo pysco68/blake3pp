@@ -24,6 +24,10 @@ address is that in the emulator's trace.
         block loop and little else), calls that survived inlining (with
         their callees; anything outside --allow is an inlining failure)
         and vector traffic through the stack frame (spills).
+    tools/objscan.py diff A B [--all] [--limit N]
+        Mnemonics used in A but not in B, with the functions of A that
+        use them. Comparing a binary that crashes under an emulator
+        configuration with one that survives it names the instruction.
     tools/objscan.py resolve BIN ADDR [--bias HEX]
         The symbol and source line at ADDR; --bias subtracts the load
         address of a position-independent executable, as reported by a
@@ -415,6 +419,26 @@ def cmd_quality(args):
             print(f"{'':20}   unexpected call: {c} x{n}")
 
 
+def cmd_diff(args):
+    arch_a, fa = load(args.a, args.objdump)
+    arch_b, fb = load(args.b, args.objdump)
+    if arch_a != arch_b:
+        sys.exit(f"objscan: {args.a} is {arch_a}, {args.b} is {arch_b}")
+    only_a = {mn for _, mn in selected(fa, arch_a, args.all, None)} \
+        - {mn for _, mn in selected(fb, arch_b, args.all, None)}
+    if not only_a:
+        print(f"no mnemonic in {args.a} that {args.b} lacks")
+        return
+    users = collections.defaultdict(collections.Counter)
+    for fn, mn in selected(fa, arch_a, args.all, None):
+        if mn in only_a:
+            users[mn][fn] += 1
+    for mn in sorted(only_a):
+        print(mn)
+        for fn, n in users[mn].most_common(args.limit):
+            print(f"    {n:6d} {fn}")
+
+
 def cmd_resolve(args):
     arch, fmt = identify(args.binary)
     addr = int(args.address, 16) - (int(args.bias, 16) if args.bias else 0)
@@ -565,6 +589,9 @@ def main():
     p.add_argument("--hot", metavar="RE", default=HOT, help="functions to measure")
     p.add_argument("--allow", metavar="RE", default=ALLOW, help="callees that are not inlining failures")
     p.set_defaults(fn=cmd_quality)
+    p = sub.add_parser("diff"); p.add_argument("a"); p.add_argument("b")
+    p.add_argument("--all", action="store_true"); p.add_argument("--limit", type=int, default=5)
+    p.set_defaults(fn=cmd_diff)
     p = sub.add_parser("resolve"); p.add_argument("binary"); p.add_argument("address")
     p.add_argument("--bias", help="load address to subtract (PIE)")
     p.set_defaults(fn=cmd_resolve)
