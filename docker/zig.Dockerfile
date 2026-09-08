@@ -29,6 +29,7 @@ RUN set -eux; \
 # one fat binary, because no single compiler speaks every vector dialect.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-user binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
+        binutils-powerpc64le-linux-gnu \
         g++-riscv64-linux-gnu g++-s390x-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
