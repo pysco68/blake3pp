@@ -259,15 +259,15 @@ jobs:
         include:
           # Native compiler cohort, oldest floor to newest.
           - { preset: linux-gcc14-cxx23, image: gcc14 }
-          # - { preset: linux-gcc16-cxx26, image: gcc16 }
+          - { preset: linux-gcc16-cxx26, image: gcc16 }
           # - { preset: linux-clang18-cxx20-libstdcxx, image: clang18 }
           # - { preset: linux-clang20-cxx23, image: clang20 }
-          # - { preset: linux-clang22-cxx26, image: clang22 }
+          - { preset: linux-clang22-cxx26, image: clang22 }
           # Execution-provider alternative (beman.execution).
           # - { preset: linux-clang22-cxx26-beman, image: clang22 }
           # Sanitizers: one address, one memory (against the baked
           # msan-libc++), one thread on the other compiler family.
-          # - { preset: linux-clang22-cxx26-asan, image: clang22 }
+          - { preset: linux-clang22-cxx26-asan, image: clang22 }
           # - { preset: linux-clang22-cxx26-msan, image: clang22 }
           # - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
           # Coverage: LLVM source-based, the report (summary, lcov, html)
@@ -290,7 +290,7 @@ jobs:
           # arm64 cross, emulator-in-the-loop (the SVE vector-length and
           # feature-off matrices live in tools/ci-test.sh; the aarch64
           # STATIC twin ships from the binaries job, feeding Neoverse).
-          # - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
+          - { preset: linux-arm64-gcc15-cxx23, image: arm64-gcc15 }
     container:
       image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
       credentials:
