@@ -31,8 +31,14 @@
 # the same docker/ tree hits the existing tag and skips straight to the
 # tests. On main pushes the images are additionally aliased to :latest
 # (built fresh, or promoted by manifest retag if they already existed)
-# for local tools/tc users. Fork PRs cannot push packages: their image
-# changes fall back to :latest with a visible warning.
+# for local tools/tc users.
+#
+# Pull requests from forks do not run this workflow at all: every root
+# job (changes, windows, macos; everything else hangs off them) is gated
+# on the head repository being this one. The minutes are billed here,
+# the lanes read repository secrets, and the hardware lanes are shared
+# boards. The repository setting "Fork pull request workflows: require
+# approval for all outside collaborators" is the second lock.
 #
 # Build driver, one switch for every Linux container lane: the
 # repository variable BLAKE3PP_CI_DRIVER (Variables tab) set to
@@ -86,6 +92,7 @@ jobs:
   # itself (bake --print), so there is no second list to drift.
   changes:
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # contents/pull-requests: write for the environment-files PR below.
     permissions:
       contents: write
@@ -107,7 +114,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: decide
         env:
-          IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
           IS_MAIN_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           # Ground truth for the hardware-lane gates: what this run
@@ -135,13 +141,6 @@ jobs:
               missing=1
             fi
           done
-          if [ "${missing}" = 1 ] && [ "${IS_FORK_PR}" = "true" ]; then
-            echo "::warning::image content changed in a fork PR; cannot push images, testing against :latest"
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-            echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "promote=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "build=$([ "${missing}" = 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           # :latest promotion for local tools/tc users: on main pushes
@@ -510,6 +509,7 @@ jobs:
   windows:
     name: ${{ matrix.preset }}
     runs-on: windows-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -620,6 +620,7 @@ jobs:
   macos:
     name: ${{ matrix.preset }}
     runs-on: macos-15
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 90
     strategy:
       fail-fast: false
