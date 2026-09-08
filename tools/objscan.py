@@ -120,6 +120,10 @@ def tool(arch, fmt, name, override=None):
     for candidate in candidates:
         if shutil.which(candidate):
             return candidate
+    if fmt == "pe" and name == "objdump":
+        found = msvc_tool("dumpbin")
+        if found:
+            return found
     sys.exit(f"objscan: no {name} for {arch}/{fmt} on PATH (tried {', '.join(candidates)})")
 
 
@@ -185,12 +189,24 @@ def disassemble(path, objdump, arch):
         m = RELOC.match(line)
         if m and last is not None and not m.group(1).startswith("*"):  # *ABS* is R_RISCV_RELAX's
             last.callee = m.group(1)
-    names = demangle({i.callee for fns in functions.values() for i in fns if i.callee})
+    # dumpbin prints its headings decorated (llvm-objdump's -C demangles
+    # them) and names a call's target in the operands rather than on a
+    # relocation line, so headings and those targets join the callees in
+    # the demangling pass.
+    is_call = re.compile(CALL[arch])
+    names = demangle({i.callee for fns in functions.values() for i in fns if i.callee}
+                     | {fn for fn in functions if fn.startswith(("?", "_Z", "__Z"))}
+                     | {i.operands for fns in functions.values() for i in fns
+                        if i.callee is None and i.operands.startswith("?") and is_call.match(i.mnemonic)})
+    if any(fn in names for fn in functions):
+        functions = collections.OrderedDict((names.get(fn, fn), insns) for fn, insns in functions.items())
     for fns in functions.values():
         prev = None
         for insn in fns:
             if insn.callee in names:
                 insn.callee = names[insn.callee]
+            elif insn.callee is None and is_call.match(insn.mnemonic) and insn.operands in names:
+                insn.callee = names[insn.operands]
             # RISC-V's call is an auipc/jalr pair whose relocation sits on
             # the auipc; the jalr takes it over.
             if insn.callee is None and prev is not None and prev.mnemonic == "auipc" and prev.callee:
@@ -210,6 +226,24 @@ def disassemble(path, objdump, arch):
                     insn.callee = p.callee
                     break
     return functions
+
+
+def msvc_tool(name):
+    """<name>.exe from the Visual Studio installation, for a shell that never
+    ran vcvars. dumpbin and undname live only in the toolchain's bin
+    directory, and a plain PowerShell step (as CI's audit is) has none of it
+    on PATH."""
+    if os.name != "nt":
+        return None
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.exists(vswhere):
+        return None
+    run = subprocess.run([vswhere, "-products", "*", "-latest", "-find",
+                          rf"VC\Tools\MSVC\**\{name}.exe"], capture_output=True, text=True)
+    hits = [line.strip() for line in run.stdout.splitlines() if line.strip()]
+    host = "Host" + os.environ.get("PROCESSOR_ARCHITECTURE", "AMD64").replace("AMD64", "x64").lower()
+    return next((h for h in hits if host in h.lower()), hits[0] if hits else None)
 
 
 def versioned(name):
@@ -234,16 +268,33 @@ def demangle(names):
         if len(out) == len(itanium):
             result.update(zip(itanium, out))
     msvc = sorted(n for n in names if n.startswith("?"))
-    undname = shutil.which("llvm-undname") or versioned("llvm-undname") or shutil.which("undname")
-    if msvc and undname:
+    undname = (shutil.which("llvm-undname") or versioned("llvm-undname")
+               or shutil.which("undname") or msvc_tool("undname"))
+    # Both take the names as arguments, so they go in batches: Windows caps
+    # a command line at 32767 characters and a linked image has thousands of
+    # symbols.
+    for batch in batched(msvc, 8000) if undname else []:
         # llvm-undname prints the mangled name, the demangled one and a
         # blank line per symbol; undname prints 'is :- "..."'.
-        out = subprocess.run([undname] + msvc, capture_output=True, text=True).stdout
+        out = subprocess.run([undname] + batch, capture_output=True, text=True).stdout
         found = re.findall(r'is :- "(.*)"', out) or [
             l for l in out.splitlines() if l and not l.startswith("?")]
-        if len(found) == len(msvc):
-            result.update(zip(msvc, found))
+        if len(found) == len(batch):
+            result.update(zip(batch, found))
     return result
+
+
+def batched(names, budget):
+    """<names> in groups whose arguments fit one command line."""
+    group, size = [], 0
+    for name in names:
+        if group and size + len(name) > budget:
+            yield group
+            group, size = [], 0
+        group.append(name)
+        size += len(name) + 1
+    if group:
+        yield group
 
 
 def call_target(fn, insn):
