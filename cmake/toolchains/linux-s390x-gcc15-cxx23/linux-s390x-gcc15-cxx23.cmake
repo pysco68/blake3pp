@@ -16,6 +16,16 @@ set(CMAKE_CXX_COMPILER s390x-linux-gnu-g++)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# Baseline z13 (vector facility, no enhancements) for everything except
+# the vxe kernel, which cmake/KernelVariants.cmake compiles with its own
+# -march=z14. Ubuntu 26.04's s390x GCC defaults to arch13 (z15), which
+# would let any TU, the dependencies included, emit z14/z15 instructions
+# the dispatch verdict does not gate; the no-vxe fallback config in
+# tools/ci-test.sh (qemu max,vxeh=off) is only a legitimate target for
+# the project's own code with this pin. The sysroot's own libraries stay
+# whatever the distro built them for.
+set(CMAKE_C_FLAGS_INIT "-march=z13")
+set(CMAKE_CXX_FLAGS_INIT "-march=z13")
 
 set(CMAKE_CROSSCOMPILING_EMULATOR "qemu-s390x;-L;/usr/s390x-linux-gnu")
 

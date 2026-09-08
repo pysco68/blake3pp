@@ -133,6 +133,12 @@ case "${preset}" in
     # FEATURE dials instead: vxeh=off keeps base vector but removes the
     # z14 facility (dispatch must refuse vxe), vx=off removes vector
     # entirely; both land on scalar.
+    # The toolchain pins -march=z13 for everything but the vxe kernel:
+    # this GCC defaults to arch13 (z15), and at that default the upstream
+    # reference's keyed init (bench only) carried a vlbrf, a z15 vector
+    # instruction, which SIGILLed here (2026-09-08). The config is a
+    # legitimate target for the project's own code only; the sysroot's
+    # libraries are the distro's.
     run_ctest default
     run_ctest no-vxe "max,vxeh=off"
     # (max,vx=off is NOT a runnable config: Ubuntu's s390x userland
