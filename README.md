@@ -680,20 +680,35 @@ Each toolchain lives in its own folder under `cmake/toolchains/`,
 together with the `.pkr.js` and `.layers.json` that name its image at
 the content tag: that folder is the environment cmake-re copies when it
 is not told `--host`, and the cluster pulls the same image for the
-compile actions. `tools/gen-environments.py` rewrites these files after
-any change under `docker/` (`--check` reports stale ones), and
-`BLAKE3PP_TC_IMAGE_TEMPLATE` retargets them at a registry mirror the
-cluster can reach.
+compile actions. `tools/gen-environments.py` writes these files
+(`--check` reports stale ones), and `BLAKE3PP_TC_IMAGE_TEMPLATE`
+retargets them at a registry mirror the cluster can reach. CI does not
+depend on them being current: every run writes the tag it builds with
+into them and builds on that, and when the committed files lag, a run
+of `main` opens one draft pull request (`ci/toolchain-environments`,
+updated in place while the tag keeps moving) proposing the update, and
+marking it ready for review runs CI on it; a release built on injected
+files is named and annotated as a dirty build.
 
 In CI the repository variable `BLAKE3PP_CI_DRIVER=cmake-re` (or the
 `driver` input of a manual run) switches every Linux container lane to
-cmake-re; the secrets `RBE_SERVICE`, `RBE_TLS_CLIENT_AUTH_KEY` and
-`RBE_TLS_CLIENT_AUTH_CERT` carry the credentials, the optional variable
-`BLAKE3PP_RBE_ENV_REGISTRY` names the mirror, and cmake-re's mirror is
-restored from the actions cache per lane, so a rerun configures in
-seconds and builds only what changed. Windows and macOS stay native.
-`tools/make-release.sh` takes the same switch (`BLAKE3PP_CMAKE_RE=1`,
-`BLAKE3PP_CMAKE_RE_FLAGS` choosing `--host` or `--host --distributed`).
+cmake-re, building with `--host` alone (the image's own compilers, no
+cluster involved) unless `BLAKE3PP_CMAKE_RE_MODE` (or the
+`cmake-re-mode` input) says `distributed`. The settings behind it:
+
+| Setting | Kind | Purpose |
+| --- | --- | --- |
+| `BLAKE3PP_CMAKE_RE_MODE` | variable | `host` (default) or `distributed`; everything below matters only for `distributed` |
+| `RBE_SERVICE` | secret | cluster address |
+| `RBE_TLS_CLIENT_AUTH_KEY`, `RBE_TLS_CLIENT_AUTH_CERT` | secrets | the mTLS client credentials, PEM |
+| `BLAKE3PP_RBE_ENV_REGISTRY` | variable | the public mirror the cluster pulls the environment images from (`docker.io/<namespace>`); `toolchains.yml` copies every image it builds there |
+| `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` | secrets | the mirror's credentials |
+
+cmake-re's mirror of the checkout is restored from the actions cache
+per lane, so a rerun configures in seconds and builds only what
+changed. Windows and macOS stay native. `tools/make-release.sh` takes
+the same switch (`BLAKE3PP_CMAKE_RE=1`, `BLAKE3PP_CMAKE_RE_FLAGS`
+choosing `--host` or `--host --distributed`).
 
 [tipi cmake-re]: https://tipi.build
 

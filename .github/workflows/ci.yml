@@ -54,6 +54,10 @@ on:
     branches: [main]
     paths-ignore: ["**.md", "release/**"]
   pull_request:
+    # ready_for_review: the environment-files PR below is opened as a
+    # draft (a PR opened with GITHUB_TOKEN gets no workflow run of its
+    # own); marking it ready is the user-made event that runs CI on it.
+    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore: ["**.md", "release/**"]
   workflow_dispatch:
     inputs:
@@ -82,12 +86,18 @@ jobs:
   # itself (bake --print), so there is no second list to drift.
   changes:
     runs-on: ubuntu-latest
+    # contents/pull-requests: write for the environment-files PR below.
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: read
     outputs:
       tag: ${{ steps.decide.outputs.tag }}
       build: ${{ steps.decide.outputs.build }}
       promote: ${{ steps.decide.outputs.promote }}
       driver: ${{ steps.decide.outputs.driver }}
       cmake-re-mode: ${{ steps.decide.outputs.cmake_re_mode }}
+      environments-stale: ${{ steps.environments.outputs.stale }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/login-action@v4
@@ -138,6 +148,41 @@ jobs:
           # where the images already existed, alias them by manifest
           # retag (the build path moves :latest itself via move_latest).
           echo "promote=$([ "${missing}" = 0 ] && [ "${IS_MAIN_PUSH}" = "true" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      # The cmake-re environment files (cmake/toolchains/<name>/*.pkr.js)
+      # name the image at a content tag. The pipeline writes the tag it
+      # runs with into them and builds on that, dirty checkout or not;
+      # when the committed files lag, one PR proposes the update, on main
+      # pushes only, updated in place while the tag keeps moving. The
+      # release notes of a run that built on injected files say so.
+      - id: environments
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          canon=$(grep -ho '"image": *"[^"]*"' cmake/toolchains/linux-gcc16-cxx26/linux-gcc16-cxx26.pkr.js | sed 's/.*://; s/"//')
+          python3 tools/gen-environments.py --tag "${TAG}"
+          if git diff --quiet -- cmake/toolchains; then stale=false; else stale=true; fi
+          echo "environment files: image tag ${TAG}, committed ${canon}, stale=${stale}"
+          echo "stale=${stale}" >> "$GITHUB_OUTPUT"
+          printf 'stale=%s\ntag=%s\ncanon=%s\n' "${stale}" "${TAG}" "${canon}" > toolchain-environments.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toolchain-environments
+          path: toolchain-environments.txt
+      # Opened as a draft: GitHub starts no workflow for events made
+      # with GITHUB_TOKEN, so the PR gets its CI run when someone marks
+      # it ready for review (ready_for_review in the trigger above).
+      - name: Propose the committed environment files
+        if: steps.environments.outputs.stale == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: ci/toolchain-environments
+          draft: true
+          delete-branch: true
+          add-paths: cmake/toolchains
+          commit-message: "toolchains: environment files at image tag ${{ steps.decide.outputs.tag }}"
+          title: "toolchains: environment files at image tag ${{ steps.decide.outputs.tag }}"
+          body: |
+            The toolchain images of `main` are at content tag `${{ steps.decide.outputs.tag }}`; the committed cmake-re environment files still name an older tag. The ci runs of `main` build on the injected tag meanwhile (their releases are marked as built on uncommitted environment files); merging this makes the checkout clean again. Updated in place by ci while the tag moves; mark it ready for review to run CI on it.
 
   # Build + push the missing images before any test touches them.
   images:

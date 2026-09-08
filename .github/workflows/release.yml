@@ -153,12 +153,28 @@ jobs:
       # POSIX substring, not ${VAR:0:12}: container steps default to
       # sh/dash where that bashism dies with "Bad substitution" (it took
       # a release run down); `cut` never surprises anyone.
+      # Whether the ci run built on environment files it injected (their
+      # committed versions lagged the image tag): such a build is marked
+      # in the release name and notes.
+      - name: Collect the environment-files record
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: toolchain-environments
+          path: toolchain-environments
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Compute release identity
         id: ident
         run: |
           short=$(printf %s "$RELEASE_SHA" | cut -c1-12)
           echo "tag=dev-${short}" >> "$GITHUB_OUTPUT"
           echo "short=${short}" >> "$GITHUB_OUTPUT"
+          suffix=""
+          if grep -qs '^stale=true' toolchain-environments/toolchain-environments.txt; then
+            suffix=" (dirty: uncommitted environment files)"
+          fi
+          echo "suffix=${suffix}" >> "$GITHUB_OUTPUT"
 
       # The hardware test+bench reports the ci run produced. Whatever
       # subset exists gets appended to the release notes.
@@ -238,6 +254,10 @@ jobs:
           {
             printf 'Automated prerelease of commit `%s` - every archive contains exactly the bytes this [ci run](%s/%s/actions/runs/%s) built and tested. Disposable: swept by release-cleanup after 90 days.\n\n' \
               "$short" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "${{ github.event.workflow_run.id }}"
+            if grep -qs '^stale=true' toolchain-environments/toolchain-environments.txt; then
+              printf '**Dirty build.** The cmake-re environment files were injected with image tag `%s` (the committed files name `%s`); the checkout was not clean, and the version stamps say so. The PR `ci/toolchain-environments` brings the committed files up to date.\n\n' \
+                "$(sed -n 's/^tag=//p' toolchain-environments/toolchain-environments.txt)" "$(sed -n 's/^canon=//p' toolchain-environments/toolchain-environments.txt)"
+            fi
             # The heredoc is indented to satisfy the YAML block scalar;
             # sed strips exactly that indent back off.
             sed -e 's/^          //' << 'NOTES'
@@ -314,7 +334,7 @@ jobs:
         with:
           tag_name: ${{ steps.ident.outputs.tag }}
           target_commitish: ${{ env.RELEASE_SHA }}
-          name: dev build ${{ steps.ident.outputs.short }}
+          name: dev build ${{ steps.ident.outputs.short }}${{ steps.ident.outputs.suffix }}
           prerelease: true
           draft: true
           files: |

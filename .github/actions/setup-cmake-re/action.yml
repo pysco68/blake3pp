@@ -53,14 +53,18 @@ runs:
           echo "RBE_tls_client_auth_key=$RUNNER_TEMP/rbe/client.key"
           echo "RBE_tls_client_auth_cert=$RUNNER_TEMP/rbe/client.crt"
         } >> "$GITHUB_ENV"
-    - name: Environments on the registry the cluster can reach
-      if: inputs.env-registry != ''
+    # The environment files at the tag this job runs with (the committed
+    # ones may lag; ci proposes their update as a PR), on the registry
+    # the cluster can reach when one is given.
+    - name: Environments at this run's image tag
       shell: bash
       run: |
         set -euo pipefail
-        BLAKE3PP_TC_REGISTRY='${{ inputs.env-registry }}' \
-        BLAKE3PP_TC_IMAGE_TEMPLATE='${{ inputs.env-image-template }}' \
-          python3 tools/gen-environments.py
+        if [ -n '${{ inputs.env-registry }}' ]; then
+          export BLAKE3PP_TC_REGISTRY='${{ inputs.env-registry }}'
+          export BLAKE3PP_TC_IMAGE_TEMPLATE='${{ inputs.env-image-template }}'
+        fi
+        python3 tools/gen-environments.py --tag '${{ inputs.image-tag }}'
         tc=$(python3 tools/preset-args.py --toolchain '${{ inputs.preset }}')
         grep -h '"image"' "${tc%.cmake}.pkr.js"
     - uses: ./.github/actions/cache-tipi-mirror

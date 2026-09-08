@@ -131,11 +131,13 @@ the folder holds `<name>.cmake`, `<name>.pkr.js` (the image it builds in,
 pinned to the content tag) and, where the toolchain includes
 `../common.cmake`, a `<name>.layers.json` pulling that one file in. The
 environment files are written by `tools/gen-environments.py`, which
-shares tools/tc's preset-to-image table; rerun it after anything that
-moves the content tag (the `docker/` tree, the msan script, the zig
-wrappers, the image workflow), and `--check` says whether they are
-stale. They are what `cmake-re --remote` needs to run the same build on
-tipi's infrastructure instead of here.
+shares tools/tc's preset-to-image table; `--check` says whether they
+are stale against the content tag. ci writes the tag it runs with into
+them before building (a dirty checkout, which cmake-re mirrors as such)
+and, on `main`, proposes the committed update as one self-updating pull
+request, so a moved tag never blocks a run. They are what
+`cmake-re --remote` needs to run the same build on tipi's
+infrastructure instead of here.
 
 ```sh
 tools/tc --shell linux-zigmusl-cxx23-static
