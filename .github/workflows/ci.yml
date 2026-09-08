@@ -260,33 +260,33 @@ jobs:
           # Native compiler cohort, oldest floor to newest.
           - { preset: linux-gcc14-cxx23, image: gcc14 }
           - { preset: linux-gcc16-cxx26, image: gcc16 }
-          # - { preset: linux-clang18-cxx20-libstdcxx, image: clang18 }
-          # - { preset: linux-clang20-cxx23, image: clang20 }
+          - { preset: linux-clang18-cxx20-libstdcxx, image: clang18 }
+          - { preset: linux-clang20-cxx23, image: clang20 }
           - { preset: linux-clang22-cxx26, image: clang22 }
           # Execution-provider alternative (beman.execution).
-          # - { preset: linux-clang22-cxx26-beman, image: clang22 }
+          - { preset: linux-clang22-cxx26-beman, image: clang22 }
           # Sanitizers: one address, one memory (against the baked
           # msan-libc++), one thread on the other compiler family.
           - { preset: linux-clang22-cxx26-asan, image: clang22 }
-          # - { preset: linux-clang22-cxx26-msan, image: clang22 }
-          # - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
+          - { preset: linux-clang22-cxx26-msan, image: clang22 }
+          - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
           # Coverage: LLVM source-based, the report (summary, lcov, html)
           # is written by tools/ci-test.sh and uploaded below. The SDE
           # pass runs instrumented too, so the AVX-512 kernel counts.
-          # - { preset: linux-clang22-cxx26-coverage, image: clang22 }
+          - { preset: linux-clang22-cxx26-coverage, image: clang22 }
           # The gcov lanes are what release.yml merges into the cross-
           # platform total (one instrumentation model, so their line sets
           # agree): x86 plus every cross, each through its qemu matrix.
-          # - { preset: linux-gcc16-cxx26-coverage, image: gcc16 }
-          # - { preset: linux-arm64-gcc15-cxx23-coverage, image: arm64-gcc15 }
-          # - { preset: linux-riscv64-gcc15-cxx23-coverage, image: riscv64-gcc15 }
-          # - { preset: linux-ppc64le-gcc15-cxx23-coverage, image: ppc64le-gcc15 }
-          # - { preset: linux-s390x-gcc15-cxx23-coverage, image: s390x-gcc15 }
+          - { preset: linux-gcc16-cxx26-coverage, image: gcc16 }
+          - { preset: linux-arm64-gcc15-cxx23-coverage, image: arm64-gcc15 }
+          - { preset: linux-riscv64-gcc15-cxx23-coverage, image: riscv64-gcc15 }
+          - { preset: linux-ppc64le-gcc15-cxx23-coverage, image: ppc64le-gcc15 }
+          - { preset: linux-s390x-gcc15-cxx23-coverage, image: s390x-gcc15 }
           # POWER and IBM z crosses, emulator-in-the-loop: vsx (POWER9+)
           # and the project's first BIG-ENDIAN lane, vxe (z14); qemu CPU
           # matrices live in tools/ci-test.sh.
-          # - { preset: linux-ppc64le-gcc15-cxx23, image: ppc64le-gcc15 }
-          # - { preset: linux-s390x-gcc15-cxx23, image: s390x-gcc15 }
+          - { preset: linux-ppc64le-gcc15-cxx23, image: ppc64le-gcc15 }
+          - { preset: linux-s390x-gcc15-cxx23, image: s390x-gcc15 }
           # arm64 cross, emulator-in-the-loop (the SVE vector-length and
           # feature-off matrices live in tools/ci-test.sh; the aarch64
           # STATIC twin ships from the binaries job, feeding Neoverse).
@@ -351,7 +351,7 @@ jobs:
   # boards never wait on an unrelated wasm build.
   wasm:
     needs: [changes, images, environments]
-    if: false  # paused while the cmake-re lanes are brought up
+    if: ${{ !cancelled() && needs.environments.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     container:
@@ -428,7 +428,7 @@ jobs:
   binaries:
     name: ${{ matrix.preset }}
     needs: [changes, images, environments]
-    if: false  # paused while the cmake-re lanes are brought up
+    if: ${{ !cancelled() && needs.environments.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -527,7 +527,7 @@ jobs:
   windows:
     name: ${{ matrix.preset }}
     runs-on: windows-latest
-    if: false  # paused while the cmake-re lanes are brought up
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 120
     strategy:
       fail-fast: false
