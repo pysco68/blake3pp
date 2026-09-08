@@ -88,6 +88,12 @@ void portable_hash_many(const std::uint8_t* const* inputs,
 }
 }  // namespace
 
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#endif
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
 #if defined(__x86_64__) || defined(_M_X64)
 extern "C" void blake3_hash_many_avx2(
@@ -110,7 +116,10 @@ extern "C" void blake3_hash_many_neon(
 
 namespace {
 // One forwarding wrapper per reference kernel; the only work is widening
-// the flag arguments back to the blake3pp signature.
+// the flag arguments back to the blake3pp signature. The hand-written
+// kernels are assembly, which MemorySanitizer cannot instrument, so
+// their output is marked initialized by hand or every byte of it reads
+// as poisoned downstream.
 template <auto ReferenceFn>
 void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
                    std::size_t blocks, const std::uint32_t key[8],
@@ -121,6 +130,11 @@ void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
               static_cast<std::uint8_t>(flags),
               static_cast<std::uint8_t>(flags_start),
               static_cast<std::uint8_t>(flags_end), out);
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+  __msan_unpoison(out, num_inputs * blake3pp::kern::out_len);
+#endif
+#endif
 }
 
 // Everything that varies by host architecture, decided once: which wide
@@ -487,6 +501,12 @@ int main(int argc, char** argv) {
     blake3pp::digest d{};
     blake3_hasher_finalize(&h, reinterpret_cast<std::uint8_t*>(d.bytes.data()),
                            BLAKE3_OUT_LEN);
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+    // The reference dispatches to its assembly kernels internally.
+    __msan_unpoison(d.bytes.data(), d.bytes.size());
+#endif
+#endif
     return d;
   });
 #endif
