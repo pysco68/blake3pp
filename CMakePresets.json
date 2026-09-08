@@ -11,6 +11,7 @@
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-beman",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26/linux-clang22-cxx26.cmake",
       "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BLAKE3PP_EXECUTION_PROVIDER": "beman"
       }
     },

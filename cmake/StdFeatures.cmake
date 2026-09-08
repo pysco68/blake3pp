@@ -226,8 +226,11 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
     HERMETIC_TOOLCHAIN_EXTENSION [=[
       set(BEMAN_USE_MODULES OFF CACHE BOOL "" FORCE)
       # beman gates its (large, occasionally non-compiling) test suite on
-      # its own option, not BUILD_TESTING; hermetic makes it top-level,
+      # its own option, not BUILD_TESTING. Hermetic makes it top-level,
       # which would default the tests on.
+      # No semicolons anywhere in this block, comments included: hfc
+      # carries the extension through a CMake list and drops everything
+      # after the first one.
       set(BEMAN_EXECUTION_BUILD_TESTS OFF CACHE BOOL "" FORCE)
       set(BEMAN_EXECUTION_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
       set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
