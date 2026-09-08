@@ -15,7 +15,7 @@
   "min_vector_instructions": 500,
   "quality": {
     "hot": "::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof)\\(",
-    "allow_calls": "^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck|__asan_\\w+|__hwasan_\\w+|__ubsan_\\w+|__tsan_\\w+|__msan_\\w+|__sanitizer_\\w+|__gcov\\w*|__llvm_\\w+)$|kern::\\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\\(",
+    "allow_calls": "^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck|__asan_\\w+|__hwasan_\\w+|__ubsan_\\w+|__tsan_\\w+|__msan_\\w+|__sanitizer_\\w+|__gcov\\w*|__llvm_\\w+)$|kern::\\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\\(|std::_Atomic_storage<.*>::load\\(",
     "max_loops": 24,
     "min_vector": 500
   },

@@ -222,15 +222,28 @@ def versioned(name):
 
 
 def demangle(names):
-    """{mangled: demangled} for the relocation symbols (the disassembler
-    demangles only the names it prints itself)."""
-    mangled = sorted(n for n in names if n.startswith(("_Z", "__Z", "?")))
+    """{mangled: demangled} for the relocation symbols and the callees the
+    disassembler prints undecorated: Itanium names through llvm-cxxfilt or
+    c++filt, MSVC names (?...@@...) through llvm-undname or undname."""
+    result = {}
+    itanium = sorted(n for n in names if n.startswith(("_Z", "__Z")))
     filt = shutil.which("llvm-cxxfilt") or versioned("llvm-cxxfilt") or shutil.which("c++filt")
-    if not mangled or not filt:
-        return {}
-    out = subprocess.run([filt], input="\n".join(n[1:] if n.startswith("__Z") else n for n in mangled) + "\n",
-                         capture_output=True, text=True).stdout.splitlines()
-    return dict(zip(mangled, out)) if len(out) == len(mangled) else {}
+    if itanium and filt:
+        out = subprocess.run([filt], input="\n".join(n[1:] if n.startswith("__Z") else n for n in itanium) + "\n",
+                             capture_output=True, text=True).stdout.splitlines()
+        if len(out) == len(itanium):
+            result.update(zip(itanium, out))
+    msvc = sorted(n for n in names if n.startswith("?"))
+    undname = shutil.which("llvm-undname") or versioned("llvm-undname") or shutil.which("undname")
+    if msvc and undname:
+        # llvm-undname prints the mangled name, the demangled one and a
+        # blank line per symbol; undname prints 'is :- "..."'.
+        out = subprocess.run([undname] + msvc, capture_output=True, text=True).stdout
+        found = re.findall(r'is :- "(.*)"', out) or [
+            l for l in out.splitlines() if l and not l.startswith("?")]
+        if len(found) == len(msvc):
+            result.update(zip(msvc, found))
+    return result
 
 
 def call_target(fn, insn):
@@ -400,7 +413,10 @@ def cmd_disasm(args):
 HOT = r"::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof)\("
 ALLOW = (r"^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck"
          r"|__asan_\w+|__hwasan_\w+|__ubsan_\w+|__tsan_\w+|__msan_\w+|__sanitizer_\w+|__gcov\w*|__llvm_\w+)$"
-         r"|kern::\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\(")
+         r"|kern::\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\("
+         # MSVC keeps std::atomic<T>::load out of line; the kernels read the
+         # transpose16 dial once per batch through it.
+         r"|std::_Atomic_storage<.*>::load\(")
 
 # The runtimes instrumented code calls (sanitizers, gcov, llvm profiling),
 # plus the internals of a statically linked libgcov as they appear in a
@@ -416,6 +432,8 @@ def short(fn):
     if fn.startswith("("):
         return fn  # the (indirect) and (unresolved) markers
     fn = re.sub(r"\(anonymous namespace\)|`anonymous namespace'", "{anon}", fn)
+    # undname spells the return type and calling convention first.
+    fn = re.sub(r"^(?:public: |private: |protected: )?.*\b__(?:cdecl|vectorcall|fastcall|stdcall) ", "", fn)
     return re.sub(r"\(.*$", "", fn)
 
 
@@ -594,7 +612,16 @@ def cmd_audit(args):
         # profiling runtime is exempt from the outside-the-kernels check.
         runtime = re.compile(RUNTIME) if glob.glob(os.path.join(args.build_dir, "CMakeFiles", "**", "*.gcno"),
                                                     recursive=True) else None
-        for check in rules.get(arch, {}).get("binary", []):
+        # Without a symbol table a linked image disassembles as one block per
+        # section, so no instruction can be attributed to a kernel: a PE keeps
+        # its symbols in the PDB, a stripped ELF has none. Say so instead of
+        # reporting the whole section as a violation.
+        checks = rules.get(arch, {}).get("binary", [])
+        if checks and functions and all(fn.startswith(".") for fn in functions):
+            print(f"  {os.path.basename(args.binary):<12} SKIP  no function symbols: "
+                  "the outside-the-kernels checks need a symbolized binary")
+            checks = []
+        for check in checks:
             outside = re.compile(check["outside"])
             hits = collections.Counter()
             for fn, insns in functions.items():
