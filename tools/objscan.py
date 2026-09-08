@@ -156,7 +156,14 @@ def disassemble(path, objdump, arch):
         cmd = [objdump, "-d", "-r", "--no-show-raw-insn", "-C", path]
         if base.startswith("llvm-objdump"):
             cmd[1:1] = LLVM_FLAGS.get(arch, [])
-    out = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=True).stdout
+    run = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    if run.returncode:
+        # Usually a host disassembler handed a foreign object: binutils is
+        # built per target, and the generic objdump refuses what it cannot
+        # decode. Name the tool and the target instead of a traceback.
+        sys.exit(f"objscan: {os.path.basename(objdump)} failed on {path} ({arch}): "
+                 + (run.stderr.strip().splitlines() or ["exit " + str(run.returncode)])[0])
+    out = run.stdout
     functions = collections.OrderedDict()
     current, last = None, None
     for line in out.splitlines():
