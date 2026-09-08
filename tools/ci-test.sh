@@ -206,6 +206,9 @@ report_coverage() {
       gcov=$(command -v "${gcov_name}" \
              || command -v "${gcov_name}-$("${cxx}" -dumpversion | cut -d. -f1)")
       mkdir -p "${coverage_dir}/html"
+      # gcovr writes its intermediate .gcov files into the current
+      # directory and cleans them up only on success; sweep them on
+      # failure so a crash does not litter the checkout.
       gcovr --root . --object-directory "${build_dir}" -j"$(nproc)" \
         --gcov-executable "${gcov}" \
         --gcov-exclude-directories '.*/_deps/.*' \
@@ -216,7 +219,7 @@ report_coverage() {
         --txt "${coverage_dir}/summary.txt" \
         --lcov "${coverage_dir}/coverage.lcov" \
         --html-details "${coverage_dir}/html/index.html" \
-        "${build_dir}"
+        "${build_dir}" || { rm -f ./*'##'*.gcov; return 1; }
       cat "${coverage_dir}/summary.txt"
       ;;
   esac

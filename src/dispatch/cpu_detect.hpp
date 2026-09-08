@@ -34,6 +34,26 @@
 #define BLAKE3PP_HAS_CPU_DETECT 1
 #endif
 
+#if defined(BLAKE3PP_TEST_PROBE_SHAPES)
+#include <cstdint>
+// The riscv detection ladder's test seam (see cpu_detect_riscv.cpp): a
+// machine description standing in for HWCAP and hwprobe, compiled only
+// into tests/riscv_probe_shapes.
+namespace blake3pp::detail::test {
+struct machine {
+  bool active = false;
+  bool hwcap_v = false;
+  bool hwprobe = true;                   // false: pre-6.4 kernel (ENOSYS)
+  bool vendor_key = false;               // hwprobe knows VENDOR_EXT_THEAD_0
+  std::uint64_t vendor_ext_thead_0 = 0;
+  std::uint64_t ima_ext_0 = 0;
+  std::uint64_t mvendorid = 0;
+  bool force_trap = false;               // the guarded probes hit an illegal instruction
+};
+void set_machine(const machine& m) noexcept;
+}  // namespace blake3pp::detail::test
+#endif
+
 namespace blake3pp::detail {
 
 #if defined(BLAKE3PP_HAS_CPU_DETECT)

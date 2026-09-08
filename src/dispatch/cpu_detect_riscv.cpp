@@ -86,11 +86,45 @@
 #define BLAKE3PP_MVENDORID_THEAD 0x5b7ULL
 #endif
 
+#if defined(BLAKE3PP_TEST_PROBE_SHAPES) && defined(BLAKE3PP_RISCV64_LINUX)
+// Test build only (tests/riscv_probe_shapes.cpp compiles this TU with the
+// define): the kernel's answers, HWCAP and hwprobe, come from a machine
+// description instead of the syscalls, so every rung of the ladder below
+// runs against a shape qemu-user cannot present (it reports no vendor id
+// and never lacks hwprobe). The guarded probes still execute the real
+// instructions; force_trap swaps in an illegal one so the SIGILL guard's
+// unwind runs too (qemu-user executes vector instructions whatever the
+// CPU model says). The shipped library never sees any of this.
+namespace blake3pp::detail::test {
+machine g_machine{};
+void set_machine(const machine& m) noexcept { g_machine = m; }
+}  // namespace blake3pp::detail::test
+#endif
+
 namespace blake3pp::detail {
 namespace {
 
 #if defined(BLAKE3PP_RISCV64_LINUX)
 long hwprobe_one(std::int64_t key, std::uint64_t* value) noexcept {
+#if defined(BLAKE3PP_TEST_PROBE_SHAPES)
+  if (test::g_machine.active) {
+    const test::machine& m = test::g_machine;
+    if (!m.hwprobe) {
+      return -1;
+    }
+    switch (key) {
+      case RISCV_HWPROBE_KEY_MVENDORID: *value = m.mvendorid; return 0;
+      case RISCV_HWPROBE_KEY_IMA_EXT_0: *value = m.ima_ext_0; return 0;
+      case RISCV_HWPROBE_KEY_VENDOR_EXT_THEAD_0:
+        if (!m.vendor_key) {
+          return -1;
+        }
+        *value = m.vendor_ext_thead_0;
+        return 0;
+      default: return -1;
+    }
+  }
+#endif
   struct {
     std::int64_t key;
     std::uint64_t value;
@@ -105,6 +139,23 @@ long hwprobe_one(std::int64_t key, std::uint64_t* value) noexcept {
   *value = pair.value;
   return 0;
 }
+
+bool hwcap_has_v() noexcept {
+#if defined(BLAKE3PP_TEST_PROBE_SHAPES)
+  if (test::g_machine.active) {
+    return test::g_machine.hwcap_v;
+  }
+#endif
+  return (getauxval(AT_HWCAP) & (1UL << ('V' - 'A'))) != 0;
+}
+
+#if defined(BLAKE3PP_TEST_PROBE_SHAPES)
+bool test_force_trap() noexcept {
+  return test::g_machine.active && test::g_machine.force_trap;
+}
+#else
+constexpr bool test_force_trap() noexcept { return false; }
+#endif
 
 // The trap-rung classifier state. Only ever touched from
 // platform_run_trap_probes() below, whose magic static guarantees
@@ -141,6 +192,9 @@ bool guarded(F&& body) noexcept {
 unsigned long guarded_vlenb() noexcept {
   unsigned long vlenb = 0;
   if (!guarded([&] {
+        if (test_force_trap()) {
+          asm volatile("unimp");
+        }
         asm volatile(
             ".option push\n\t"
             ".option arch, +v\n\t"
@@ -161,6 +215,9 @@ unsigned long guarded_vlenb() noexcept {
 // compiled flag-neutral by compilers that may know neither dialect.
 bool guarded_vector_unit_enabled() noexcept {
   return guarded([] {
+    if (test_force_trap()) {
+      asm volatile("unimp");
+    }
     asm volatile(".word 0x000072D7" ::: "t0");
   });
 }
@@ -194,7 +251,7 @@ const vec_state& base_probe() noexcept {
       st.xthead = true;
       return st;
     }
-    const bool hwcap_v = (getauxval(AT_HWCAP) & (1UL << ('V' - 'A'))) != 0;
+    const bool hwcap_v = hwcap_has_v();
     std::uint64_t ima = 0;
     if (hwprobe_one(RISCV_HWPROBE_KEY_IMA_EXT_0, &ima) == 0) {
       if ((ima & RISCV_HWPROBE_IMA_V) != 0) {
