@@ -395,6 +395,14 @@ ALLOW = (r"^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|_
          r"|__asan_\w+|__hwasan_\w+|__ubsan_\w+|__tsan_\w+|__msan_\w+|__sanitizer_\w+|__gcov\w*|__llvm_\w+)$"
          r"|kern::\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\(")
 
+# The runtimes instrumented code calls (sanitizers, gcov, llvm profiling),
+# plus the internals of a statically linked libgcov as they appear in a
+# linked binary (libgcov-driver.c's static helpers).
+RUNTIME = r"_?__(asan|hwasan|ubsan|tsan|msan|sanitizer|gcov|llvm)_|^_?(gcov_|mangle_path$)"
+# GCC's outline atomics on AArch64 (-moutline-atomics, the default): the
+# LSE-or-fallback helpers a __atomic read-modify-write becomes below armv8.1.
+OUTLINE_ATOMICS = r"^__aarch64_(cas|swp|ldadd|ldclr|ldeor|ldset)\d+_(relax|acq|rel|acq_rel|sync)$"
+
 
 def short(fn):
     """A function name without its parameter list, for tables."""
@@ -543,12 +551,18 @@ def cmd_audit(args):
         print(f"  {variant:<12} {len(insns):6d} insns  {verdict(ok)}  {'; '.join(notes)}")
         failures += not ok
         limits = {**quality, **spec.get("quality", {})}
-        rows = list(quality_rows(arch, functions, hot, allow))
-        # A sanitizer or coverage runtime in the callees means instrumented
-        # code: its check blocks branch back into the fast path by the
-        # hundred, so the loop budget does not apply.
-        instrumented = any(re.match(r"_?__(asan|hwasan|ubsan|tsan|msan|sanitizer|gcov|llvm)_", c)
-                           for _, q in rows for c in q["calls"])
+        # Instrumented code is a different shape: a sanitizer's check blocks
+        # branch back into the fast path by the hundred, and gcov's counter
+        # bumps split every block, so the loop budget does not apply. A
+        # sanitizer announces itself through the runtime it calls; gcov
+        # calls nothing from the hot path (its counters are plain or atomic
+        # adds), so the notes file it writes beside the object is the tell.
+        # With -fprofile-update=atomic on the armv8.0 baseline those adds
+        # are GCC's outline-atomics helpers, which nothing else in a kernel
+        # has any business calling.
+        gcov = os.path.exists(re.sub(r"\.o(bj)?$", ".gcno", obj))
+        rows = list(quality_rows(arch, functions, hot, allow + "|" + OUTLINE_ATOMICS if gcov else allow))
+        instrumented = gcov or any(re.match(RUNTIME, c) for _, q in rows for c in q["calls"])
         for fn, q in rows:
             good = not q["unexpected"] and (instrumented or q["loops"] <= limits.get("max_loops", 24))
             print(f"    {verdict(good)} {format_row(short(fn).split('::')[-1], q)}")
@@ -558,7 +572,7 @@ def cmd_audit(args):
                 print(f"{'':11}indirect call site: {site}")
             failures += not good
         if instrumented:
-            print(f"    {'':4} instrumented (sanitizer or coverage runtime called): loop budget not applied")
+            print(f"    {'':4} instrumented ({'gcov notes beside the object' if gcov else 'sanitizer or coverage runtime called'}): loop budget not applied")
         if req and rows:
             # The unrolled core: the hot function carrying the most vector
             # instructions (the others may be drivers around it).
@@ -568,11 +582,16 @@ def cmd_audit(args):
             failures += widest < need
     if args.binary:
         arch, functions = load(args.binary, args.objdump)
+        # A coverage build links libgcov, compiled at the distribution's
+        # baseline (RVA23 on Ubuntu's riscv64, vector included), so the
+        # profiling runtime is exempt from the outside-the-kernels check.
+        runtime = re.compile(RUNTIME) if glob.glob(os.path.join(args.build_dir, "CMakeFiles", "**", "*.gcno"),
+                                                    recursive=True) else None
         for check in rules.get(arch, {}).get("binary", []):
             outside = re.compile(check["outside"])
             hits = collections.Counter()
             for fn, insns in functions.items():
-                if not outside.search(fn):
+                if not outside.search(fn) and not (runtime and runtime.match(fn)):
                     n = rule_hits(insns, check)
                     if n:
                         hits[fn] += n
