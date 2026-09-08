@@ -51,13 +51,14 @@ case "${preset}" in
     ;;
 esac
 
-run_ctest() {  # <label> [QEMU_CPU value]
+run_ctest() {  # <label> [QEMU_CPU value] [extra ctest args...]
   local label=$1 cpu=${2-}
+  shift; [ $# -gt 0 ] && shift
   echo "::group::ctest ${preset} [${label}]"
   if [ -n "${cpu}" ]; then
-    QEMU_CPU="${cpu}" ctest --test-dir "${build_dir}" --output-on-failure
+    QEMU_CPU="${cpu}" ctest --test-dir "${build_dir}" --output-on-failure "$@"
   else
-    env -u QEMU_CPU ctest --test-dir "${build_dir}" --output-on-failure
+    env -u QEMU_CPU ctest --test-dir "${build_dir}" --output-on-failure "$@"
   fi
   echo "::endgroup::"
 }
@@ -196,12 +197,14 @@ report_coverage() {
       "${cov}" show -format=html -output-dir "${coverage_dir}/html" "${args[@]}"
       ;;
     gcov)
-      # g++-16 -> gcov-16; a cross g++ has only the versioned gcov. The
+      # g++-16 -> gcov-16; a cross g++ has only the versioned gcov, and
+      # may itself be a wrapper elsewhere on PATH, so resolve by name. The
       # search path (last argument) matters: without it gcovr walks the
       # whole checkout and folds every other build tree's .gcda in.
-      local gcov="${cxx/g++/gcov}"
-      command -v "${gcov}" > /dev/null \
-        || gcov="${gcov}-$("${cxx}" -dumpversion | cut -d. -f1)"
+      local gcov_name gcov
+      gcov_name=$(basename "${cxx}"); gcov_name=${gcov_name/g++/gcov}
+      gcov=$(command -v "${gcov_name}" \
+             || command -v "${gcov_name}-$("${cxx}" -dumpversion | cut -d. -f1)")
       mkdir -p "${coverage_dir}/html"
       gcovr --root . --object-directory "${build_dir}" -j"$(nproc)" \
         --gcov-executable "${gcov}" \
