@@ -12,9 +12,10 @@ toolchain lives in its own folder, cmake/toolchains/<name>/, holding
 <name>.cmake, <name>.pkr.js (the environment: the image the toolchain
 builds in, pinned to the content tag tools/toolchain-image-tag.sh computes
 for the checkout, the hard reference tipi's docs ask for) and, only where
-the toolchain includes ../common.cmake, a <name>.layers.json that pulls
-that one file in ("../" navigation is honoured; a parent-level layers
-file is not composed into a child's environment, measured on v0.0.87).
+the toolchain includes sibling files (../common.cmake, or the base
+toolchain of a hand-written variant), a <name>.layers.json that pulls
+them in ("../" navigation is honoured; a parent-level layers file is not
+composed into a child's environment, measured on v0.0.87).
 That pairing is what lets cmake-re run the same build remotely
 (--remote, RBE) instead of on this host.
 
@@ -31,6 +32,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -86,10 +88,15 @@ def environment(name, tag):
 
 
 def layers(name):
-    """The layers file, or None when the folder's own files are the environment."""
+    """The layers file, or None when the folder's own files are the environment.
+
+    Every include() of a sibling path (../common.cmake for the generated
+    toolchains, ../<base>/<base>.cmake for the hand-written variants) is a
+    layer the environment must carry."""
     with open(os.path.join(TOOLCHAINS, name, f"{name}.cmake")) as fh:
-        if '../common.cmake")' in fh.read():
-            return json.dumps(["../common.cmake"], indent=2) + "\n"
+        found = re.findall(r'include\("\$\{CMAKE_CURRENT_LIST_DIR\}/(\.\./[^"]+)"\)', fh.read())
+    if found:
+        return json.dumps(sorted(set(found)), indent=2) + "\n"
     return None
 
 

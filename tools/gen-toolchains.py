@@ -65,13 +65,16 @@ CLANG_TO_GCC = {17: 14, 18: 14, 19: 14, 20: 15, 21: 15, 22: 16, 23: 16}
 # call chains at -O0, and MSan's origin tracking multiplies that), and
 # optimiser-dependent bugs need the optimiser to show. -fno-omit-frame-
 # pointer and -fno-optimize-sibling-calls keep the traces honest. Coverage
-# stays Debug: it wants unoptimised control flow.
+# is optimised for the same reason: the report should describe the code
+# that ships, and the emulator passes (SDE, qemu) are minutes at -O0.
+# LLVM's source-based mapping is optimisation-independent; gcov's line
+# attribution blurs a little under inlining, measured and accepted.
 INSTRUMENTATIONS = {
     "asan": {"sanitizers": ["address", "undefined"], "build_type": "RelWithDebInfo"},
     "tsan": {"sanitizers": ["thread"], "build_type": "RelWithDebInfo"},
     "msan": {"sanitizers": ["memory"], "build_type": "RelWithDebInfo", "clang_only": True},
     "fuzzer": {"sanitizers": ["fuzzer", "address", "undefined"], "clang_only": True},
-    "coverage": {"coverage": "auto", "build_type": "Debug"},
+    "coverage": {"coverage": "auto", "build_type": "RelWithDebInfo"},
 }
 # ---------------------------------------------------------------------------
 
@@ -268,8 +271,7 @@ def main() -> int:
                     "binaryDir": "${sourceDir}/build/" + name,
                     "toolchainFile": "${sourceDir}/" + f"{rel}/{name}/{name}.cmake",
                     "cacheVariables": {
-                        "CMAKE_BUILD_TYPE": (
-                            "Debug" if "coverage" in name else "RelWithDebInfo")
+                        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
                     },
                 }
                 for name, desc, _ in configs

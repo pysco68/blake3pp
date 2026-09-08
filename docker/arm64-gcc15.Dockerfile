@@ -10,7 +10,7 @@ FROM base
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      g++-15-aarch64-linux-gnu qemu-user; \
+      g++-15-aarch64-linux-gnu qemu-user gcovr; \
     rm -rf /var/lib/apt/lists/*; \
     update-alternatives --install /usr/bin/aarch64-linux-gnu-gcc \
       aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-gcc-15 100 \

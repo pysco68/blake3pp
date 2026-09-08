@@ -148,7 +148,7 @@
       "binaryDir": "${sourceDir}/build/linux-gcc16-cxx26-coverage",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-coverage/linux-gcc16-cxx26-coverage.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
     },
     {
@@ -198,7 +198,7 @@
       "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-coverage",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-coverage/linux-clang22-cxx26-coverage.cmake",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
     }
   ],

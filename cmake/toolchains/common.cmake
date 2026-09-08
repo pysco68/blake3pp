@@ -161,8 +161,11 @@ if(DEFINED TC_COVERAGE AND NOT TC_COVERAGE STREQUAL "")
     list(APPEND _c_flags    "-fprofile-instr-generate" "-fcoverage-mapping")
     list(APPEND _link_flags "-fprofile-instr-generate")
   elseif(TC_COVERAGE STREQUAL "gcov")
-    list(APPEND _cxx_flags  "--coverage")
-    list(APPEND _c_flags    "--coverage")
+    # Atomic counter updates: the parallel tests race the plain ones and
+    # gcov then reports negative branch counts (GCC bug 68080), which
+    # gcovr refuses to parse.
+    list(APPEND _cxx_flags  "--coverage" "-fprofile-update=atomic")
+    list(APPEND _c_flags    "--coverage" "-fprofile-update=atomic")
     list(APPEND _link_flags "--coverage")
   else()
     message(FATAL_ERROR "toolchain: TC_COVERAGE must be llvm, gcov or empty")

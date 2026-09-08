@@ -8,7 +8,7 @@
 FROM base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        g++-15-powerpc64le-linux-gnu qemu-user \
+        g++-15-powerpc64le-linux-gnu qemu-user gcovr \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/powerpc64le-linux-gnu-gcc-15 /usr/local/bin/powerpc64le-linux-gnu-gcc \
     && ln -s /usr/bin/powerpc64le-linux-gnu-g++-15 /usr/local/bin/powerpc64le-linux-gnu-g++

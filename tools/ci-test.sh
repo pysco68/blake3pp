@@ -31,6 +31,26 @@ audit_kernels() {  # <build-dir>
 }
 audit_kernels "${build_dir}"
 
+# Coverage presets (TC_COVERAGE in the toolchain): every test run below,
+# the SDE pass included, contributes to one report written at the end
+# to build/<preset>/coverage (summary.txt, coverage.lcov, html/). The
+# clang presets use LLVM's source-based coverage, the gcc presets gcov
+# through gcovr; both tools ship in the toolchain images.
+coverage=""
+case "${preset}" in
+  *coverage*)
+    coverage_dir="${build_dir}/coverage"
+    rm -rf "${coverage_dir}"
+    mkdir -p "${coverage_dir}/profraw"
+    if [[ "${preset}" == *clang* ]]; then
+      coverage=llvm
+      export LLVM_PROFILE_FILE="${PWD}/${coverage_dir}/profraw/%p-%m.profraw"
+    else
+      coverage=gcov
+    fi
+    ;;
+esac
+
 run_ctest() {  # <label> [QEMU_CPU value]
   local label=$1 cpu=${2-}
   echo "::group::ctest ${preset} [${label}]"
@@ -126,11 +146,18 @@ case "${preset}" in
     # available variants...
     run_ctest default
     # ...and Intel SDE supplies what it lacks: AVX-512 (qemu's TCG never
-    # implemented it). The kernel-oracle and official-vector suites are in
-    # the doctest binary; CLI smoke under SDE would add minutes for no
-    # dispatch coverage. Skipped for sanitizer presets (SDE's DBT and the
-    # sanitizer runtimes fight over the address space).
-    if command -v sde64 > /dev/null 2>&1 && [[ "${preset}" != *san* ]] \
+    # implemented it). Only when it is lacking: the hosted runner pool is
+    # mixed (Emerald Rapids Xeons and Zen 4 EPYCs have AVX-512, Zen 3
+    # EPYCs do not), a native run already covers the kernel where the
+    # silicon has it, and the emulated pass costs minutes (about 17 for
+    # an instrumented coverage binary). The kernel-oracle and
+    # official-vector suites are in the doctest binary; CLI smoke under
+    # SDE would add minutes for no dispatch coverage. Skipped for
+    # sanitizer presets (SDE's DBT and the sanitizer runtimes fight over
+    # the address space).
+    if grep -q -w avx512f /proc/cpuinfo 2> /dev/null; then
+      echo "avx512 native on this runner ($(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //')): SDE pass skipped"
+    elif command -v sde64 > /dev/null 2>&1 && [[ "${preset}" != *san* ]] \
        && [ -x "${build_dir}/tests/blake3pp_tests" ]; then
       echo "::group::SDE avx512 ${preset}"
       sde64 -skx -- "${build_dir}/tests/blake3pp_tests"
@@ -138,3 +165,75 @@ case "${preset}" in
     fi
     ;;
 esac
+
+# The coverage report: library, headers and tools only (dependencies,
+# tests and benches excluded). The tool version follows the toolchain's
+# compiler (clang++-22 -> llvm-cov-22, g++-16 -> gcov-16), read from
+# CMake's compiler record (a toolchain-set compiler is not in the cache).
+report_coverage() {
+  local cxx objects=() f
+  cxx=$(sed -n 's/^set(CMAKE_CXX_COMPILER "\(.*\)")$/\1/p' \
+        "${build_dir}"/CMakeFiles/*/CMakeCXXCompiler.cmake | head -1)
+  [ -n "${cxx}" ] || { echo "coverage: no compiler record under ${build_dir}" >&2; return 1; }
+  for f in tests/blake3pp_tests cli/blake3ppsum cli/blake3ppgen \
+           bench/blake3pp_bench bench/blake3pp_bench_file; do
+    [ -x "${build_dir}/${f}" ] && objects+=("${build_dir}/${f}")
+  done
+  echo "::group::coverage report ${preset}"
+  case "${coverage}" in
+    llvm)
+      local profdata="llvm-profdata-${cxx##*-}" cov="llvm-cov-${cxx##*-}"
+      command -v "${profdata}" > /dev/null || profdata=llvm-profdata
+      command -v "${cov}" > /dev/null || cov=llvm-cov
+      "${profdata}" merge -sparse "${coverage_dir}"/profraw/*.profraw \
+        -o "${coverage_dir}/merged.profdata"
+      local -a args=(-instr-profile "${coverage_dir}/merged.profdata"
+                     -ignore-filename-regex='(/_deps/|/thirdparty/|/tests/|/bench/|^/usr/)'
+                     "${objects[0]}")
+      for f in "${objects[@]:1}"; do args+=(-object "${f}"); done
+      "${cov}" report "${args[@]}" | tee "${coverage_dir}/summary.txt"
+      "${cov}" export -format=lcov "${args[@]}" > "${coverage_dir}/coverage.lcov"
+      "${cov}" show -format=html -output-dir "${coverage_dir}/html" "${args[@]}"
+      ;;
+    gcov)
+      # g++-16 -> gcov-16; a cross g++ has only the versioned gcov. The
+      # search path (last argument) matters: without it gcovr walks the
+      # whole checkout and folds every other build tree's .gcda in.
+      local gcov="${cxx/g++/gcov}"
+      command -v "${gcov}" > /dev/null \
+        || gcov="${gcov}-$("${cxx}" -dumpversion | cut -d. -f1)"
+      mkdir -p "${coverage_dir}/html"
+      gcovr --root . --object-directory "${build_dir}" -j"$(nproc)" \
+        --gcov-executable "${gcov}" \
+        --gcov-exclude-directories '.*/_deps/.*' \
+        --gcov-exclude-directories '.*/CMakeFiles/[0-9.]+/.*' \
+        --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+        --filter 'src/' --filter 'include/' --filter 'cli/' --filter 'tooling/' \
+        --exclude-throw-branches \
+        --txt "${coverage_dir}/summary.txt" \
+        --lcov "${coverage_dir}/coverage.lcov" \
+        --html-details "${coverage_dir}/html/index.html" \
+        "${build_dir}"
+      cat "${coverage_dir}/summary.txt"
+      ;;
+  esac
+  # One lcov dialect for every lane, so release.yml can merge them:
+  # repo-relative paths, no test names and no per-file version stamps
+  # (gcovr writes both, llvm-cov neither, and lcov keeps records apart on
+  # either difference), and no generated files from the build tree.
+  # (gcovr also writes a non-numeric block id, BRDA:<line>,None,..., for
+  # branches gcov reports without one; lcov rejects the file over it.)
+  sed -i -e "s#^SF:${PWD}/#SF:#" -e '/^TN:/d' -e '/^VER:/d' \
+    -e 's/^BRDA:\([0-9]*\),None,/BRDA:\1,0,/' "${coverage_dir}/coverage.lcov"
+  awk '/^SF:build\//{skip=1} !skip{print} /^end_of_record/{skip=0}' \
+    "${coverage_dir}/coverage.lcov" > "${coverage_dir}/coverage.lcov.tmp"
+  mv "${coverage_dir}/coverage.lcov.tmp" "${coverage_dir}/coverage.lcov"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    { echo "### coverage: ${preset}"; echo '```'
+      cat "${coverage_dir}/summary.txt"; echo '```'; } >> "${GITHUB_STEP_SUMMARY}"
+  fi
+  echo "::endgroup::"
+}
+if [ -n "${coverage}" ]; then
+  report_coverage
+fi

@@ -26,11 +26,31 @@
       }
     },
     {
+      "name": "linux-arm64-gcc15-cxx23-coverage",
+      "displayName": "aarch64 Linux cross (GCC 15, C++23, runs via qemu-user) + gcov coverage",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-arm64-gcc15-cxx23-coverage",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-gcc15-cxx23-coverage/linux-arm64-gcc15-cxx23-coverage.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
       "name": "linux-riscv64-gcc15-cxx23",
       "displayName": "riscv64 Linux cross (GCC 15, C++23, runs via qemu-user)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-riscv64-gcc15-cxx23",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-gcc15-cxx23/linux-riscv64-gcc15-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "linux-riscv64-gcc15-cxx23-coverage",
+      "displayName": "riscv64 Linux cross (GCC 15, C++23, runs via qemu-user) + gcov coverage",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-riscv64-gcc15-cxx23-coverage",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-riscv64-gcc15-cxx23-coverage/linux-riscv64-gcc15-cxx23-coverage.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -177,11 +197,31 @@
       }
     },
     {
+      "name": "linux-ppc64le-gcc15-cxx23-coverage",
+      "displayName": "POWER cross (GCC 15, VSX via xsimd, qemu-ppc64le) + gcov coverage",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-ppc64le-gcc15-cxx23-coverage",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-ppc64le-gcc15-cxx23-coverage/linux-ppc64le-gcc15-cxx23-coverage.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
       "name": "linux-s390x-gcc15-cxx23",
       "displayName": "IBM z cross (GCC 15, z14 VXE via xsimd, BIG-endian, qemu-s390x)",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/linux-s390x-gcc15-cxx23",
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-gcc15-cxx23/linux-s390x-gcc15-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "linux-s390x-gcc15-cxx23-coverage",
+      "displayName": "IBM z cross (GCC 15, z14 VXE via xsimd, BIG-endian, qemu-s390x) + gcov coverage",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-s390x-gcc15-cxx23-coverage",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-s390x-gcc15-cxx23-coverage/linux-s390x-gcc15-cxx23-coverage.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -217,8 +257,16 @@
       "configurePreset": "linux-arm64-gcc15-cxx23"
     },
     {
+      "name": "linux-arm64-gcc15-cxx23-coverage",
+      "configurePreset": "linux-arm64-gcc15-cxx23-coverage"
+    },
+    {
       "name": "linux-riscv64-gcc15-cxx23",
       "configurePreset": "linux-riscv64-gcc15-cxx23"
+    },
+    {
+      "name": "linux-riscv64-gcc15-cxx23-coverage",
+      "configurePreset": "linux-riscv64-gcc15-cxx23-coverage"
     },
     {
       "name": "wasm32-emcc-cxx23",
@@ -295,8 +343,16 @@
       "configurePreset": "linux-ppc64le-gcc15-cxx23"
     },
     {
+      "name": "linux-ppc64le-gcc15-cxx23-coverage",
+      "configurePreset": "linux-ppc64le-gcc15-cxx23-coverage"
+    },
+    {
       "name": "linux-s390x-gcc15-cxx23",
       "configurePreset": "linux-s390x-gcc15-cxx23"
+    },
+    {
+      "name": "linux-s390x-gcc15-cxx23-coverage",
+      "configurePreset": "linux-s390x-gcc15-cxx23-coverage"
     }
   ],
   "testPresets": [
@@ -315,8 +371,22 @@
       }
     },
     {
+      "name": "linux-arm64-gcc15-cxx23-coverage",
+      "configurePreset": "linux-arm64-gcc15-cxx23-coverage",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "linux-riscv64-gcc15-cxx23",
       "configurePreset": "linux-riscv64-gcc15-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-riscv64-gcc15-cxx23-coverage",
+      "configurePreset": "linux-riscv64-gcc15-cxx23-coverage",
       "output": {
         "outputOnFailure": true
       }
@@ -440,8 +510,22 @@
       }
     },
     {
+      "name": "linux-ppc64le-gcc15-cxx23-coverage",
+      "configurePreset": "linux-ppc64le-gcc15-cxx23-coverage",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "linux-s390x-gcc15-cxx23",
       "configurePreset": "linux-s390x-gcc15-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-s390x-gcc15-cxx23-coverage",
+      "configurePreset": "linux-s390x-gcc15-cxx23-coverage",
       "output": {
         "outputOnFailure": true
       }

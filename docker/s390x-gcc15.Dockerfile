@@ -7,7 +7,7 @@
 FROM base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        g++-15-s390x-linux-gnu qemu-user \
+        g++-15-s390x-linux-gnu qemu-user gcovr \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/s390x-linux-gnu-gcc-15 /usr/local/bin/s390x-linux-gnu-gcc \
     && ln -s /usr/bin/s390x-linux-gnu-g++-15 /usr/local/bin/s390x-linux-gnu-g++

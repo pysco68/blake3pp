@@ -43,7 +43,7 @@ FROM base
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-      g++-15-riscv64-linux-gnu qemu-user libglib2.0-0; \
+      g++-15-riscv64-linux-gnu qemu-user libglib2.0-0 gcovr; \
     rm -rf /var/lib/apt/lists/*; \
     update-alternatives --install /usr/bin/riscv64-linux-gnu-gcc \
       riscv64-linux-gnu-gcc /usr/bin/riscv64-linux-gnu-gcc-15 100 \

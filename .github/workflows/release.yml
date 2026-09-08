@@ -27,7 +27,7 @@ on:
 permissions:
   contents: write
   packages: read
-  actions: read  # download the triggering ci run's bench-report artifacts
+  actions: read  # download the triggering ci run's bench-report and coverage artifacts
 
 jobs:
   prerelease:
@@ -171,9 +171,70 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # The coverage reports the ci run produced (coverage-<preset>:
+      # summary.txt, coverage.lcov, html/). Each becomes a release asset,
+      # and the notes get an overview table computed from the lcov files,
+      # the one format both llvm-cov and gcovr write.
+      - name: Collect coverage reports
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-*
+          path: coverage-reports
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The cross-platform total: the gcov lanes (x86 and the four crosses
+      # through their emulator matrices) merged into one tracefile. gcov
+      # lanes only: llvm and gcov instrument different line sets, so a
+      # union across the two would mix two definitions of "line"; the
+      # clang lane keeps its own row. lcov's genhtml renders the merged
+      # view from this checkout's sources.
+      - name: Merge the gcov lanes
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends lcov > /dev/null
+          args=(); lanes=()
+          for d in coverage-reports/coverage-*/; do
+            name=$(basename "$d")
+            case "$name" in *clang*) continue ;; esac
+            [ -f "${d}coverage.lcov" ] || continue
+            args+=(-a "${d}coverage.lcov"); lanes+=("${name#coverage-}")
+          done
+          [ "${#args[@]}" -gt 0 ] || { echo "no gcov lanes to merge"; exit 0; }
+          mkdir -p coverage-reports/coverage-merged-gcov
+          lcov -q "${args[@]}" -o coverage-reports/coverage-merged-gcov/coverage.lcov \
+            --ignore-errors unsupported,inconsistent
+          printf '%s\n' "${lanes[@]}" > coverage-reports/coverage-merged-gcov/lanes.txt
+          genhtml -q -o coverage-reports/coverage-merged-gcov/html \
+            --ignore-errors unsupported,inconsistent,source \
+            coverage-reports/coverage-merged-gcov/coverage.lcov
+          lcov --summary coverage-reports/coverage-merged-gcov/coverage.lcov \
+            --ignore-errors unsupported,inconsistent | tee coverage-reports/coverage-merged-gcov/summary.txt
+
+      - name: Package the coverage reports
+        run: |
+          set -euo pipefail
+          for d in coverage-reports/coverage-*/; do
+            [ -f "${d}coverage.lcov" ] || continue
+            name=$(basename "$d")
+            tar -C coverage-reports -czf "release/blake3pp-${name}.tar.gz" "$name"
+          done
+          ls -la release/
+
       - name: Compose release notes
         run: |
           short=$(printf %s "$RELEASE_SHA" | cut -c1-12)
+          tag="${{ steps.ident.outputs.tag }}"
+          # lines / functions / branches from an lcov file: "hit/found (pct)"
+          lcov_totals() {
+            awk -F: '
+              /^LF:/ {lf+=$2} /^LH:/ {lh+=$2}
+              /^FNF:/ {ff+=$2} /^FNH:/ {fh+=$2}
+              /^BRF:/ {bf+=$2} /^BRH:/ {bh+=$2}
+              function cell(h, f) { return f ? sprintf("%.1f%% (%d/%d)", 100*h/f, h, f) : "n/a" }
+              END { printf "%s|%s|%s\n", cell(lh, lf), cell(fh, ff), cell(bh, bf) }' "$1"
+          }
           {
             printf 'Automated prerelease of commit `%s` - every archive contains exactly the bytes this [ci run](%s/%s/actions/runs/%s) built and tested. Disposable: swept by release-cleanup after 90 days.\n\n' \
               "$short" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "${{ github.event.workflow_run.id }}"
@@ -212,6 +273,37 @@ jobs:
                 echo
                 echo '```'
                 cat "$f"
+                echo '```'
+                echo '</details>'
+              done
+            fi
+            if ls coverage-reports/coverage-*/coverage.lcov > /dev/null 2>&1; then
+              echo
+              echo "## Test coverage (from the triggering ci run)"
+              echo "_Library, headers and tools; dependencies, tests and benches excluded. Hardware-specific kernels count only where the lane's machine or emulator runs them; the merged row is the union over the gcov lanes (functions and branches are not comparable across compilers and are left per lane)._"
+              echo
+              echo "| lane | lines | functions | branches | report |"
+              echo "|---|---|---|---|---|"
+              for d in coverage-reports/coverage-*/; do
+                name=$(basename "$d"); lane=${name#coverage-}
+                IFS='|' read -r lines funcs branches < <(lcov_totals "${d}coverage.lcov")
+                if [ -f "${d}lanes.txt" ]; then
+                  lane="**all gcov lanes merged** ($(paste -sd' ' "${d}lanes.txt"))"
+                  funcs="-"; branches="-"
+                else
+                  lane="\`${lane}\`"
+                fi
+                printf '| %s | %s | %s | %s | [%s.tar.gz](%s/%s/releases/download/%s/blake3pp-%s.tar.gz) |\n' \
+                  "$lane" "$lines" "$funcs" "$branches" "blake3pp-${name}" \
+                  "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$tag" "$name"
+              done
+              for d in coverage-reports/coverage-*/; do
+                [ -f "${d}summary.txt" ] || continue
+                echo
+                echo "<details><summary>$(basename "$d" | sed 's/^coverage-//'): per-file summary</summary>"
+                echo
+                echo '```'
+                cat "${d}summary.txt"
                 echo '```'
                 echo '</details>'
               done

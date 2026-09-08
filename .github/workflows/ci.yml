@@ -6,7 +6,10 @@
 # wait only on the bytes they run, never on a sanitizer suite. One
 # entry point, tools/ci-test.sh, holds the per-architecture emulator
 # matrices: qemu vector lengths and feature-off fallbacks for the cross
-# presets, Intel SDE for AVX-512 on x86. Windows runs on the hosted windows-latest runners (x64 presets
+# presets, Intel SDE for AVX-512 on x86 runners whose silicon lacks it,
+# and the coverage report for the coverage presets (uploaded as
+# coverage-<preset>, folded into the release notes by release.yml).
+# Windows runs on the hosted windows-latest runners (x64 presets
 # built AND tested; arm64 presets cross-built via vcvarsall x64_arm64,
 # since x64 Windows cannot emulate arm64 and native arm64 testing is a gated
 # extra job for the windows-11-arm runners). macOS runs the appleclang
@@ -167,6 +170,18 @@ jobs:
           - { preset: linux-clang22-cxx26-asan, image: clang22 }
           - { preset: linux-clang22-cxx26-msan, image: clang22 }
           - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
+          # Coverage: LLVM source-based, the report (summary, lcov, html)
+          # is written by tools/ci-test.sh and uploaded below. The SDE
+          # pass runs instrumented too, so the AVX-512 kernel counts.
+          - { preset: linux-clang22-cxx26-coverage, image: clang22 }
+          # The gcov lanes are what release.yml merges into the cross-
+          # platform total (one instrumentation model, so their line sets
+          # agree): x86 plus every cross, each through its qemu matrix.
+          - { preset: linux-gcc16-cxx26-coverage, image: gcc16 }
+          - { preset: linux-arm64-gcc15-cxx23-coverage, image: arm64-gcc15 }
+          - { preset: linux-riscv64-gcc15-cxx23-coverage, image: riscv64-gcc15 }
+          - { preset: linux-ppc64le-gcc15-cxx23-coverage, image: ppc64le-gcc15 }
+          - { preset: linux-s390x-gcc15-cxx23-coverage, image: s390x-gcc15 }
           # POWER and IBM z crosses, emulator-in-the-loop: vsx (POWER9+)
           # and the project's first BIG-ENDIAN lane, vxe (z14); qemu CPU
           # matrices live in tools/ci-test.sh.
@@ -200,6 +215,16 @@ jobs:
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
+      - name: Upload coverage report
+        if: contains(matrix.preset, 'coverage')
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.preset }}
+          retention-days: 14
+          path: |
+            build/${{ matrix.preset }}/coverage/summary.txt
+            build/${{ matrix.preset }}/coverage/coverage.lcov
+            build/${{ matrix.preset }}/coverage/html/
 
   # WebAssembly, tested in node and SHIPPED (js+wasm pairs in the
   # release). Its own job rather than a `binaries` leg, so the Cloud-V
