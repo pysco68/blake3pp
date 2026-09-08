@@ -1,0 +1,49 @@
+name: cache-tipi-mirror
+description: >
+  Restores and saves cmake-re's working directory (the mirrored source
+  and its displaced build trees, hfc dependency builds included) so a
+  cmake-re lane starts from an up-to-date tree: configure reuses every
+  dependency and the build has only what changed since the cached run.
+  The path comes from `cmake-re --info json` (tipi_workdir), never
+  hard-coded. One lane per job, one entry per lane: the key carries
+  the preset, the toolchain image tag and cmake-re's distro id, so a
+  new compiler or a new cmake-re starts a fresh line and the old one
+  ages out; restore-keys never cross that boundary. The archive keeps
+  cmake-re's symlinks (actions/cache tars without --dereference and
+  with -P), and their absolute targets hold because every container
+  job sees the same paths. cmake-re's mirror is keyed by ABI hash
+  underneath, so even a mismatched restore cannot feed one toolchain
+  another's objects.
+inputs:
+  preset:
+    description: the configure preset the job builds (one per job)
+    required: true
+  image-tag:
+    description: content tag of the toolchain image the job runs in
+    required: true
+  os:
+    description: cache-key OS segment (prefixes must stay disjoint)
+    default: linux
+runs:
+  using: composite
+  steps:
+    - name: Locate cmake-re's working directory
+      id: tipi
+      shell: bash
+      run: |
+        set -euo pipefail
+        # python3 rather than jq: the toolchain images carry the former.
+        cmake-re --info json > "$RUNNER_TEMP/cmake-re-info.json"
+        python3 - "$RUNNER_TEMP/cmake-re-info.json" "$GITHUB_OUTPUT" <<'PY'
+        import json, sys
+        info = json.load(open(sys.argv[1]))
+        print(json.dumps(info, indent=2))
+        with open(sys.argv[2], "a") as out:
+            out.write(f"workdir={info['tipi_workdir']}\ndistro={info['distro_id']}\n")
+        PY
+    - name: Cache the mirror
+      uses: actions/cache@v6
+      with:
+        path: ${{ steps.tipi.outputs.workdir }}
+        key: mirror-${{ inputs.os }}-${{ inputs.preset }}-${{ inputs.image-tag }}-${{ steps.tipi.outputs.distro }}-${{ github.sha }}
+        restore-keys: mirror-${{ inputs.os }}-${{ inputs.preset }}-${{ inputs.image-tag }}-${{ steps.tipi.outputs.distro }}-

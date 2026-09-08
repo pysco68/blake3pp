@@ -11,6 +11,14 @@
 # here; detached and shallow checkouts can't answer branch questions
 # reliably.
 #
+# Under cmake-re the source tree is a mirror whose HEAD may be a synthetic
+# "[tipi.build uncommited changes]" commit carrying the checkout's
+# uncommitted files, with a new hash every sync. The stamp looks through
+# it: the hash and the tag questions go to its parent (the real commit)
+# and the tree counts as dirty, which is what it is. Without this every
+# remote build carried a hash nobody can look up, and a no-change rerun
+# on a restored mirror rebuilt everything downstream of the stamp.
+#
 # Inputs: SOURCE_DIR, OUTPUT_FILE, FALLBACK_VERSION.
 # The output header is written through copy_if_different, so its timestamp
 # only moves when the version string actually changes: a no-change build
@@ -22,8 +30,20 @@ set(_version "${FALLBACK_VERSION}")
 
 find_package(Git QUIET)
 if(GIT_FOUND AND EXISTS "${SOURCE_DIR}/.git")
+  set(_ref HEAD)
+  set(_dirty "")
   execute_process(
-    COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" rev-parse --short=12 HEAD
+    COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" log -1 --format=%s HEAD
+    OUTPUT_VARIABLE _subject OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE _subject_rc ERROR_QUIET)
+  if(_subject_rc EQUAL 0
+     AND _subject MATCHES "^\\[tipi\\.build uncommited changes\\]")
+    set(_ref "HEAD~1")
+    set(_dirty ".dirty")
+  endif()
+
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" rev-parse --short=12 "${_ref}"
     OUTPUT_VARIABLE _hash OUTPUT_STRIP_TRAILING_WHITESPACE
     RESULT_VARIABLE _rc ERROR_QUIET)
   if(_rc EQUAL 0)
@@ -32,14 +52,13 @@ if(GIT_FOUND AND EXISTS "${SOURCE_DIR}/.git")
     execute_process(
       COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" status --porcelain -uno
       OUTPUT_VARIABLE _status ERROR_QUIET)
-    set(_dirty "")
     if(NOT _status STREQUAL "")
       set(_dirty ".dirty")
     endif()
 
     execute_process(
       COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" describe --tags
-              --exact-match --match "v[0-9]*" --match "[0-9]*"
+              --exact-match --match "v[0-9]*" --match "[0-9]*" "${_ref}"
       OUTPUT_VARIABLE _exact_tag OUTPUT_STRIP_TRAILING_WHITESPACE
       RESULT_VARIABLE _exact_rc ERROR_QUIET)
 
@@ -48,7 +67,7 @@ if(GIT_FOUND AND EXISTS "${SOURCE_DIR}/.git")
     else()
       execute_process(
         COMMAND "${GIT_EXECUTABLE}" -C "${SOURCE_DIR}" describe --tags
-                --abbrev=0 --match "v[0-9]*" --match "[0-9]*"
+                --abbrev=0 --match "v[0-9]*" --match "[0-9]*" "${_ref}"
         OUTPUT_VARIABLE _last_tag OUTPUT_STRIP_TRAILING_WHITESPACE
         RESULT_VARIABLE _last_rc ERROR_QUIET)
       if(_last_rc EQUAL 0

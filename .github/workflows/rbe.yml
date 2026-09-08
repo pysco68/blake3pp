@@ -14,6 +14,11 @@
 # produces them: tools/make-release.sh for the static musl lanes, the tool
 # binaries copied out of the build tree for the rest. cmake-re places the
 # build tree as a symlink into its mirror; both routes read through it.
+# The mirror itself is cached between runs (actions/cache-tipi-mirror):
+# a lane then configures in seconds with every hfc dependency reused and
+# builds only what changed, and the remote action cache answers for the
+# rest. The version stamp looks through cmake-re's sync commit
+# (cmake/GitVersionStamp.cmake), so an unchanged tree really is a no-op.
 #
 # Secrets (settings -> secrets -> actions):
 #   RBE_SERVICE              cluster address, e.g. rbe.example.com:443
@@ -144,6 +149,11 @@ jobs:
             python3 tools/gen-environments.py
           tc=$(python3 tools/preset-args.py --toolchain '${{ matrix.lane.preset }}')
           grep -h '"image"' "${tc%.cmake}.pkr.js"
+
+      - uses: ./.github/actions/cache-tipi-mirror
+        with:
+          preset: ${{ matrix.lane.preset }}
+          image-tag: ${{ needs.plan.outputs.tag }}
 
       - name: Configure (cmake-re, host)
         shell: bash

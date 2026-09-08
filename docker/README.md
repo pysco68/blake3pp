@@ -84,7 +84,13 @@ where it lands, and uploads the publishable form: the release archives
 from `tools/make-release.sh` (its `BLAKE3PP_CMAKE_RE=1` mode drives the
 same three steps through cmake-re) for the static musl lanes, the tool
 binaries for everything else. It is `workflow_dispatch` only; the lane
-list is an input. Two settings ride along with every cmake-re run:
+list is an input. cmake-re's working directory (`cmake-re --info json`,
+`tipi_workdir`: the mirrored source, its build tree, the hfc dependency
+builds) is cached between runs per lane, image tag and cmake-re distro
+(`.github/actions/cache-tipi-mirror`), so a rerun configures in seconds
+and builds only what changed; the version stamp looks through cmake-re's
+sync commit so that an unchanged tree stays a no-op. Two settings ride
+along with every cmake-re run:
 `TIPI_DISABLE_AR_RANLIB_DRIVER=ON`, because tipi's ranlib action rewrites
 its input archive in place, which the remote sandbox denies, and a `USER`
 for the dependency scanner. The zig wrappers answer that scanner's probes
