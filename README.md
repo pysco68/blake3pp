@@ -86,8 +86,8 @@ value types (`update`, `finalize`, `finalize_xof`, `fill`, `take`,
 `seek`). Free functions are the entry points that bring in a resource
 the type does not own, a scheduler or a file, and each comes as a pair
 so call sites read alike with and without cores: `hash(data)` /
-`hash(data, sched)`, `update_file(h, path)` / `update_file(h, path,
-sched)`, `fill(r, out)` / `fill(r, out, sched)`. The scheduler-taking
+`hash(data, sched)`, `update_file(h, path)` / `update_file(h, path, sched)`,
+ `fill(r, out)` / `fill(r, out, sched)`. The scheduler-taking
 half of each pair lives in the header that owns the dependency.
 The two I/O headers exist only when the library is built with
 `BLAKE3PP_WITH_IO=ON` (the default); see
@@ -178,11 +178,10 @@ auto storage_key =
 ```
 
 Both modes compose with everything else: `hasher::keyed`/
-`hasher::derive_key` give incremental hashing, `keyed_hash(key, data,
-sched)` and the keyed and derive_key `parallel_hasher` constructors go
-multi-core, and a keyed or derive_key hasher takes file input through
-`update_file()`. Authenticated file manifests at full pipeline speed are
-one line either way:
+`hasher::derive_key` give incremental hashing, `keyed_hash(key, data, sched)` 
+and the keyed and derive_key `parallel_hasher` constructors go multi-core, 
+and a keyed or derive_key hasher takes file input through `update_file()`. 
+Authenticated file manifests at full pipeline speed are one line either way:
 
 ```cpp
 auto tag = blake3pp::hash_file(path, pool.get_scheduler(), {.key = key});
@@ -244,8 +243,7 @@ Requesting a variant the CPU can't run silently falls back to the best
 available one; `is_available()` tells you beforehand.
 
 On machines with a width-16 kernel (AVX-512; SVE-512 on ARM; RVV at
-VLEN=512) one more
-dial exists: the 16-lane message transpose has three implementation
+VLEN=512) one more dial exists: the 16-lane message transpose has three implementation
 strategies, and which is fastest is not predictable from the CPU. It
 depends on whether the vector datapath is full-width or double-pumped
 (no CPUID bit reports that) and, on the same machine, on whether the
@@ -482,8 +480,8 @@ built on extended output: the same seed (`--seed`, or the bytes of a
 `--seed-file` streamed through the file pipeline) always yields the same
 infinite stream, and `--seek` is O(1), so materializing a slice at
 offset 10 GB costs the same as offset 0. Generation runs lanes-parallel
-in the kernel (~3.8 GiB/s per core) and `--threads` fans segments across
-cores via the O(1) seek (13+ GiB/s), so the sink is the bottleneck;
+in the kernel and `--threads` fans segments across cores via the O(1) seek, 
+so the sink is the bottleneck;
 `--output` removes even that overhead, writing through io_uring +
 O_DIRECT on Linux, IOCP + no-buffering on Windows or GCD + F_NOCACHE on
 macOS with the stream generated straight into the write buffers,
@@ -652,6 +650,52 @@ recipes are in `docker/README.md` too. Two kernel sets are opt-in:
 - `-DBLAKE3PP_XTHEAD_KERNEL=ON` compiles the hand-written T-Head
   XTheadVector (draft RVV 0.7.1) kernel, which only T-Head's qemu fork
   can execute
+
+### Building through cmake-re
+
+Every containerized preset also builds through [tipi cmake-re], which
+runs the compile actions on a remote-execution cluster (EngFlow, through
+reclient) and serves repeats from its action cache; the tests, emulator
+matrices and artifacts are the same as with plain cmake. cmake-re ships
+in every x86_64 toolchain image (`TIPI_DISTRO_MODE=none`, so it drives
+the image's own compilers). It knows nothing about presets, so
+`tools/preset-args.py` unrolls one into plain configure arguments:
+
+```bash
+tools/tc linux-gcc16-cxx26 -- bash -c '
+  cmake-re --host -S . $(python3 tools/preset-args.py linux-gcc16-cxx26)
+  cmake-re --build build/linux-gcc16-cxx26 --host -j"$(nproc)"
+  ctest --test-dir build/linux-gcc16-cxx26 --output-on-failure'
+```
+
+`--host` builds inside the image the command runs in; add
+`--distributed` to send the compiles to the cluster, with the mTLS
+credentials in `RBE_service`, `RBE_tls_client_auth_key` and
+`RBE_tls_client_auth_cert`, and `TIPI_DISABLE_AR_RANLIB_DRIVER=ON` and
+`USER` set. The build directory becomes a symlink into cmake-re's mirror
+of the checkout under `.tipi`, which is why `ctest --test-dir` is the
+spelling above.
+
+Each toolchain lives in its own folder under `cmake/toolchains/`,
+together with the `.pkr.js` and `.layers.json` that name its image at
+the content tag: that folder is the environment cmake-re copies when it
+is not told `--host`, and the cluster pulls the same image for the
+compile actions. `tools/gen-environments.py` rewrites these files after
+any change under `docker/` (`--check` reports stale ones), and
+`BLAKE3PP_TC_IMAGE_TEMPLATE` retargets them at a registry mirror the
+cluster can reach.
+
+In CI the repository variable `BLAKE3PP_CI_DRIVER=cmake-re` (or the
+`driver` input of a manual run) switches every Linux container lane to
+cmake-re; the secrets `RBE_SERVICE`, `RBE_TLS_CLIENT_AUTH_KEY` and
+`RBE_TLS_CLIENT_AUTH_CERT` carry the credentials, the optional variable
+`BLAKE3PP_RBE_ENV_REGISTRY` names the mirror, and cmake-re's mirror is
+restored from the actions cache per lane, so a rerun configures in
+seconds and builds only what changed. Windows and macOS stay native.
+`tools/make-release.sh` takes the same switch (`BLAKE3PP_CMAKE_RE=1`,
+`BLAKE3PP_CMAKE_RE_FLAGS` choosing `--host` or `--host --distributed`).
+
+[tipi cmake-re]: https://tipi.build
 
 ### Kernel tuning switches
 
