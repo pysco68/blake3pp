@@ -1,0 +1,187 @@
+# Remote-executed builds through cmake-re: the same toolchain images and
+# presets as ci.yml, but every compile action runs on the EngFlow cluster
+# (reclient/reproxy, `cmake-re --host --distributed`) and the remote action
+# cache serves repeats. Opt-in by design: workflow_dispatch only, and the
+# lane list is an input, so it costs nothing until someone runs it.
+#
+# Shape, per lane: the job boots straight into the toolchain image (its own
+# image is then already on the runner's daemon, which is how cmake-re
+# resolves the environment without a registry round trip), cmake-re is in
+# the image (docker/base.Dockerfile), tools/preset-args.py unrolls the
+# preset for it (cmake-re knows no presets, and configures Debug when no
+# build type is given), the EngFlow credentials come from repository
+# secrets, and the artifacts come back the way the release job
+# produces them: tools/make-release.sh for the static musl lanes, the tool
+# binaries copied out of the build tree for the rest. cmake-re places the
+# build tree as a symlink into its mirror; both routes read through it.
+#
+# Secrets (settings -> secrets -> actions):
+#   RBE_SERVICE              cluster address, e.g. rbe.example.com:443
+#   RBE_TLS_CLIENT_AUTH_KEY  contents of the mTLS client key (PEM)
+#   RBE_TLS_CLIENT_AUTH_CERT contents of the mTLS client certificate (PEM)
+#
+# Until the GHCR images are public, the cluster pulls the environment image
+# from the Docker Hub mirror (docker.io/pysco68/blake3pp-toolchain-<image>,
+# pushed manually at the content tag); the `env-registry` input points the
+# environment files there for the run without touching the committed ones.
+
+name: rbe
+
+on:
+  workflow_dispatch:
+    inputs:
+      presets:
+        description: "space-separated presets to build (containerized linux ones)"
+        default: "linux-zigmusl-cxx23-static linux-clang22-cxx26-asan linux-gcc16-cxx26-tsan"
+        type: string
+      env-registry:
+        description: "registry the cluster pulls environment images from"
+        default: "docker.io/pysco68"
+        type: string
+      env-image-template:
+        description: "image name template for the environment files"
+        default: "{registry}/blake3pp-toolchain-{image}"
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  # The content tag of the toolchain images, computed exactly as ci.yml
+  # does (tools/toolchain-image-tag.sh over the checkout), and the lane
+  # matrix from the dispatch input.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      lanes: ${{ steps.plan.outputs.lanes }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tag=tree-$(bash tools/toolchain-image-tag.sh)" >> "$GITHUB_OUTPUT"
+          # preset -> image, the table tools/tc keeps.
+          lanes='['
+          for preset in ${{ inputs.presets }}; do
+            case "$preset" in
+              linux-gcc14-*)         image=gcc14 ;;
+              linux-gcc16-*)         image=gcc16 ;;
+              linux-clang18-*)       image=clang18 ;;
+              linux-clang20-*)       image=clang20 ;;
+              linux-clang22-*)       image=clang22 ;;
+              linux-arm64-gcc15-*)   image=arm64-gcc15 ;;
+              linux-riscv64-gcc15-*) image=riscv64-gcc15 ;;
+              linux-ppc64le-gcc15-*) image=ppc64le-gcc15 ;;
+              linux-s390x-gcc15-*)   image=s390x-gcc15 ;;
+              *zigmusl*)             image=zig ;;
+              wasm32-*)              image=emscripten ;;
+              *) echo "::error::preset '$preset' is not containerized"; exit 1 ;;
+            esac
+            lanes="$lanes{\"preset\":\"$preset\",\"image\":\"$image\"},"
+          done
+          echo "lanes=${lanes%,}]" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(needs.plan.outputs.lanes) }}
+    name: ${{ matrix.lane.preset }}
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.lane.image }}:${{ needs.plan.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # Same as ci.yml: the sanitizer runtimes need ptrace and an
+      # unfiltered seccomp profile (the sanitized binaries run here, under
+      # ctest; only the compiles go remote).
+      options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      CMAKE_GENERATOR: Ninja
+      # A standalone process owns these: the portable cmake-re must not
+      # provision tipi's distro, the ranlib driver rewrites its input
+      # archive in place (denied on the remote sandbox), and goma wants a
+      # username.
+      TIPI_DISTRO_MODE: none
+      TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      USER: runner
+      ASAN_SYMBOLIZER_PATH: /usr/local/bin/llvm-symbolizer
+      ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1:strict_string_checks=1:symbolize=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1:report_error_type=1
+      TSAN_OPTIONS: second_deadlock_stack=1:halt_on_error=0
+      LSAN_OPTIONS: use_tls=0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-workspace
+        with:
+          cache-prefix: hfc-src2-linux-
+
+      - name: EngFlow credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/rbe"
+          printf '%s' "${{ secrets.RBE_TLS_CLIENT_AUTH_KEY }}"  > "$RUNNER_TEMP/rbe/client.key"
+          printf '%s' "${{ secrets.RBE_TLS_CLIENT_AUTH_CERT }}" > "$RUNNER_TEMP/rbe/client.crt"
+          {
+            echo "RBE_service=${{ secrets.RBE_SERVICE }}"
+            echo "RBE_tls_client_auth_key=$RUNNER_TEMP/rbe/client.key"
+            echo "RBE_tls_client_auth_cert=$RUNNER_TEMP/rbe/client.crt"
+          } >> "$GITHUB_ENV"
+
+      - name: Environments on the registry the cluster can reach
+        shell: bash
+        run: |
+          set -euo pipefail
+          BLAKE3PP_TC_REGISTRY='${{ inputs.env-registry }}' \
+          BLAKE3PP_TC_IMAGE_TEMPLATE='${{ inputs.env-image-template }}' \
+            python3 tools/gen-environments.py
+          tc=$(python3 tools/preset-args.py --toolchain '${{ matrix.lane.preset }}')
+          grep -h '"image"' "${tc%.cmake}.pkr.js"
+
+      - name: Configure (cmake-re, host)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046  # one argument per word, on purpose
+          cmake-re --host --distributed -S . $(python3 tools/preset-args.py '${{ matrix.lane.preset }}')
+
+      - name: Build (cmake-re, distributed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake-re --build 'build/${{ matrix.lane.preset }}' --host --distributed -j"$(nproc)"
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir 'build/${{ matrix.lane.preset }}' --output-on-failure
+
+      # The publishable form: the release archives for the static musl
+      # lanes (what the release job ships), the tool binaries for the rest.
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          preset='${{ matrix.lane.preset }}'
+          mkdir -p artifacts
+          case "$preset" in
+            *zigmusl*)
+              BLAKE3PP_CMAKE_RE=1 BLAKE3PP_CMAKE_RE_FLAGS="--host --distributed" sh tools/make-release.sh
+              cp release/*.tar.gz artifacts/ ;;
+            *)
+              for bin in cli/blake3ppsum cli/blake3ppgen bench/blake3pp_bench bench/blake3pp_bench_file; do
+                cp "build/$preset/$bin" artifacts/
+              done ;;
+          esac
+          ls -la artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rbe-${{ matrix.lane.preset }}
+          path: artifacts/
+          if-no-files-found: error

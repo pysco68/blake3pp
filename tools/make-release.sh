@@ -4,11 +4,33 @@
 # Run from the repo root; needs zig on PATH (or $ZIG) and qemu-aarch64
 # for the aarch64 test pass. Library consumers build from source; these
 # archives carry only the tools and benchmarks.
+#
+# BLAKE3PP_CMAKE_RE=1 drives the same three steps through cmake-re instead
+# of cmake (BLAKE3PP_CMAKE_RE_FLAGS, e.g. "--host --distributed", selects
+# where it builds; default --host). cmake-re knows no presets, so
+# tools/preset-args.py unrolls the preset into plain arguments, and it
+# places a symlink at build/<preset> pointing into its mirror, which the
+# packaging below reads through like any build tree.
 set -eu
 
 VERSION=$(sed -n 's/^  VERSION \([0-9.]*\)$/\1/p' CMakeLists.txt)
 OUT=release
 rm -rf "$OUT" && mkdir -p "$OUT"
+
+configure_build_test() {  # <preset>
+  if [ "${BLAKE3PP_CMAKE_RE:-0}" = 1 ]; then
+    flags=${BLAKE3PP_CMAKE_RE_FLAGS:---host}
+    rm -rf "build/$1"
+    # shellcheck disable=SC2046  # word-split on purpose: one argument per word
+    cmake-re $flags -S . $(python3 tools/preset-args.py "$1")
+    cmake-re --build "build/$1" $flags -j"$(nproc)"
+    ctest --test-dir "build/$1" --output-on-failure
+  else
+    cmake --preset "$1"
+    cmake --build --preset "$1"
+    ctest --preset "$1" --output-on-failure
+  fi
+}
 
 for preset in linux-zigmusl-cxx23-static linux-arm64-zigmusl-cxx23-static \
               linux-riscv64-zigmusl-cxx23-static; do
@@ -17,9 +39,7 @@ for preset in linux-zigmusl-cxx23-static linux-arm64-zigmusl-cxx23-static \
     *riscv64*) arch=riscv64 ;;
     *)         arch=x86_64 ;;
   esac
-  cmake --preset "$preset"
-  cmake --build --preset "$preset"
-  ctest --preset "$preset" --output-on-failure
+  configure_build_test "$preset"
 
   pkg="blake3pp-$VERSION-linux-$arch-static"
   stage="$OUT/$pkg"

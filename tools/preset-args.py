@@ -13,6 +13,7 @@ the repository root. One line, shell-quoted, ready for $(...).
        -DCMAKE_BUILD_TYPE=Release -DBLAKE3PP_XTHEAD_KERNEL=ON
 
     python3 tools/preset-args.py --binary-dir <preset>   # just the build dir
+    python3 tools/preset-args.py --toolchain <preset>    # just the toolchain file
 """
 import argparse
 import json
@@ -66,8 +67,8 @@ def expand(value):
 
 
 def cache_value(v):
-    if isinstance(v, dict):
-        return f"{v['value']}" if "type" not in v else f"{v['value']}"
+    if isinstance(v, dict):  # {"type": ..., "value": ...} form
+        v = v["value"]
     if isinstance(v, bool):
         return "ON" if v else "OFF"
     return str(v)
@@ -78,11 +79,16 @@ def main():
     ap.add_argument("preset")
     ap.add_argument("--binary-dir", action="store_true",
                     help="print only the preset's binary directory")
+    ap.add_argument("--toolchain", action="store_true",
+                    help="print only the preset's toolchain file")
     args = ap.parse_args()
     p = resolve(load_presets(os.path.join(REPO, "CMakePresets.json")), args.preset)
     binary_dir = expand(p.get("binaryDir", f"build/{args.preset}"))
     if args.binary_dir:
         print(binary_dir)
+        return
+    if args.toolchain:
+        print(expand(p.get("toolchainFile", "")))
         return
     words = ["-G", p.get("generator", "Ninja"), "-B", binary_dir]
     if "toolchainFile" in p:
