@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <format>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <string>
@@ -373,6 +374,24 @@ template <class F>
     }
   }
   return best;
+}
+
+// A throughput cell, 14 characters wide: bytes per second scaled into
+// the largest binary unit that keeps the mantissa below 1024, printed
+// with three significant digits. One rule for a 25 GiB/s AVX-512 row and
+// a 40 MiB/s C906 row alike; a fixed GiB/s with two decimals showed the
+// LicheeRV Nano as "0.03 vs 0.04" and hid the ratio.
+[[nodiscard]] inline std::string rate(std::size_t bytes, double seconds) {
+  static constexpr const char* units[] = {"B/s", "KiB/s", "MiB/s", "GiB/s",
+                                          "TiB/s"};
+  double v = seconds > 0.0 ? static_cast<double>(bytes) / seconds : 0.0;
+  std::size_t u = 0;
+  while (v >= 1024.0 && u + 1 < std::size(units)) {
+    v /= 1024.0;
+    ++u;
+  }
+  const int decimals = v >= 100.0 ? 0 : v >= 10.0 ? 1 : 2;
+  return std::format("{:8.{}f} {:>5}", v, decimals, units[u]);
 }
 
 [[nodiscard]] inline double gib_per_s(std::size_t bytes,

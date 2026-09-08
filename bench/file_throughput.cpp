@@ -158,7 +158,8 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
       });
       const double gibs =
           b3tool::gib_per_s(static_cast<std::size_t>(bytes), secs);
-      std::printf("  %6.2f GiB/s", gibs);
+      std::printf("  %s",
+                  b3tool::rate(static_cast<std::size_t>(bytes), secs).c_str());
       std::fflush(stdout);
       if (gibs > best_gibs) {
         best_gibs = gibs;
@@ -255,10 +256,6 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  const auto gibs = [&](double secs) {
-    return b3tool::gib_per_s(static_cast<std::size_t>(bytes), secs);
-  };
-
   // The raw-io pass below runs unconditionally and heats the machine, so
   // the first hashing measurement must cool down too.
   b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/false);
@@ -276,16 +273,17 @@ int main(int argc, char** argv) {
       w = r.next();
     }
   });
-  println(stdout, "{:<10} {:8.2f} GiB/s   [device ceiling, no hashing]",
-          "raw io", gibs(raw_s));
+  println(stdout, "{:<10} {}   [device ceiling, no hashing]",
+          "raw io", b3tool::rate(static_cast<std::size_t>(bytes), raw_s));
 
   const auto run = [&](const char* label, auto&& fn) {
     cooldown();
     blake3pp::digest d{};
     const double best =
         b3tool::best_seconds(reps, /*warmup=*/false, [&] { d = fn(); });
-    println(stdout, "{:<10} {:8.2f} GiB/s   ({}...)  [{:3.0f}% of raw]", label,
-            gibs(best), d.to_hex().substr(0, 16), 100.0 * raw_s / best);
+    println(stdout, "{:<10} {}   ({}...)  [{:3.0f}% of raw]", label,
+            b3tool::rate(static_cast<std::size_t>(bytes), best),
+            d.to_hex().substr(0, 16), 100.0 * raw_s / best);
   };
 
   run("seq", [&] { return blake3pp::hash_file(path.c_str(), opts); });

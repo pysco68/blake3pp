@@ -567,13 +567,13 @@ int main(int argc, char** argv) {
         note += std::format("{}cpu {}", note.empty() ? "" : ", ",
                             join_cpus(r.cpus));
       }
-      const double gib = b3tool::gib_per_s(input.size(), r.best);
+      const std::string rate = b3tool::rate(input.size(), r.best);
       if (note.empty()) {
-        println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)", r.label, r.width,
-                gib, r.d.to_hex().substr(0, 16));
+        println(stdout, "  {:<{}} {}   ({}...)", r.label, r.width, rate,
+                r.d.to_hex().substr(0, 16));
       } else {
-        println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)  [{}]", r.label,
-                r.width, gib, r.d.to_hex().substr(0, 16), note);
+        println(stdout, "  {:<{}} {}   ({}...)  [{}]", r.label, r.width,
+                rate, r.d.to_hex().substr(0, 16), note);
       }
     }
     if (s.footer) {
@@ -614,9 +614,8 @@ int main(int argc, char** argv) {
     blake3pp::digest d{};
     const double best =
         b3tool::best_seconds(reps, /*warmup=*/true, [&] { d = fn(); });
-    const double gib = b3tool::gib_per_s(input.size(), best);
-    println(stdout, "  {:<{}} {:8.2f} GiB/s   ({}...)  [{}]", label, width,
-            gib, d.to_hex().substr(0, 16), note);
+    println(stdout, "  {:<{}} {}   ({}...)  [{}]", label, width,
+            b3tool::rate(input.size(), best), d.to_hex().substr(0, 16), note);
   };
 
   // An OWNED pool at exactly nthreads, not b3tool::compute_pool, whose
