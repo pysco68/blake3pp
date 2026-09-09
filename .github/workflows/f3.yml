@@ -1,0 +1,221 @@
+# The RISC-V boards, and nothing else.
+#
+# This branch carries ONE workflow on purpose: the RISC-V hardware is
+# the only thing being exercised here, and every other pipeline is
+# deleted so a push cannot spend hosted minutes on the full matrix or,
+# worse, rebuild the toolchain images. Board time is free, so all three
+# boards run; only the build costs anything.
+#
+# A push runs the whole thing, board suite included. GitHub only offers
+# "Run workflow" for files that exist on the DEFAULT branch, and this one
+# exists on no branch but its own, so a dispatch input gating the build
+# would be a switch nobody can reach.
+#
+# The default path spends NO hosted minutes at all: the alignment probe
+# is one C file and the board has a compiler, so it is built where it is
+# run. The library build is the expensive part, a toolchain image pull
+# plus the dependency tree, so it happens only when a dispatch asks for
+# the suite.
+#
+# Nothing here fails the run except a build error. Every board step
+# reports its exit code and carries on, because the interesting output
+# is WHICH steps die: a fault kills the process it happens in, and
+# stopping there would hide the rest of the evidence.
+name: f3
+
+on:
+  push:
+    branches: [riscv-f3-repro]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: toolchain image tag for the build
+        default: latest
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  PRESET: linux-riscv64-zigmusl-cxx23-static
+
+jobs:
+  # What does this core do with a misaligned access, per access class?
+  # The class decides the signal, and the signal identifies the fault: a
+  # misaligned vle32.v is an illegal instruction here, so a bus error has
+  # to come from somewhere else. Runs entirely on the board.
+  # One C file in the toolchain image, which already carries the riscv
+  # cross compiler: a pull and a compile, no dependency tree and no
+  # cmake. The board has no compiler of its own (the runner user found
+  # neither cc, gcc nor clang), so this is what a probe run costs.
+  probe-build:
+    name: cross-build the probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ inputs.image_tag || 'latest' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      # Static, so no glibc version has to match the board's.
+      - name: Build the probe
+        run: |
+          riscv64-linux-musl-clang -O1 -static \
+            tools/riscv-align-probe.c -o align-probe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: align-probe
+          path: align-probe
+          retention-days: 3
+
+  # What does this core do with a misaligned access, per access class?
+  # The class decides the signal, and the signal identifies the fault: a
+  # misaligned vle32.v is an illegal instruction here, so a bus error has
+  # to come from somewhere else.
+  # One board per vector story, the same fleet the main pipeline uses:
+  # the VisionFive2 has no vector unit, the Pioneer speaks XTheadVector
+  # 0.7.1, and the F3 is RVV 1.0. Their answers differ, which is the
+  # point.
+  probe:
+    name: probe ${{ matrix.board }}
+    needs: probe-build
+    runs-on: [self-hosted, "${{ matrix.board }}"]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [bpi-f3, visionfive2, milkv-pioneer]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: align-probe
+      - name: What this core does with each misaligned access
+        continue-on-error: true
+        run: |
+          set +e
+          chmod +x align-probe
+          ./align-probe
+          echo "exit=$?"
+      - name: What the kernel logged
+        continue-on-error: true
+        run: |
+          set +e
+          # A pipeline hides dmesg's own failure, so ask it on its own.
+          if dmesg > dmesg.txt 2>/dev/null || sudo dmesg > dmesg.txt 2>/dev/null; then
+            tail -40 dmesg.txt
+          else
+            echo "dmesg unavailable to this user"
+          fi
+      - name: Does the kernel emulate misaligned access, and at what cost
+        continue-on-error: true
+        run: |
+          set +e
+          for f in /sys/kernel/misaligned_access/* /proc/sys/kernel/unaligned*; do
+            [ -e "$f" ] && printf '%s: %s\n' "$f" "$(cat "$f" 2>/dev/null)"
+          done
+          echo "(no lines above means the kernel exposes no such knob)"
+      # For the next round: is there any compiler here under another name?
+      - name: Compilers on the board, if any
+        continue-on-error: true
+        run: |
+          set +e
+          ls /usr/bin/*gcc* /usr/bin/*clang* /usr/bin/cc 2>/dev/null \
+            || echo "no compiler binaries under /usr/bin"
+
+  # The one job that costs hosted minutes.
+  build:
+    name: build riscv64 static musl
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ inputs.image_tag || 'latest' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-workspace
+        with:
+          cache-prefix: hfc-src2-linux-
+      # Only the three executables the board needs, and no ctest: the
+      # emulator matrix already passes on these bytes, which is the whole
+      # point of the exercise.
+      - name: Configure
+        run: cmake --preset "${PRESET}"
+      - name: Build the board's binaries
+        run: |
+          cmake --build "build/${PRESET}" -j"$(nproc)" \
+            --target blake3pp_tests blake3pp_bench blake3ppsum
+      - uses: actions/upload-artifact@v7
+        with:
+          name: f3-binaries
+          retention-days: 3
+          path: |
+            build/${{ env.PRESET }}/tests/blake3pp_tests
+            build/${{ env.PRESET }}/bench/blake3pp_bench
+            build/${{ env.PRESET }}/cli/blake3ppsum
+
+  suite:
+    name: suite on ${{ matrix.board }}
+    needs: build
+    runs-on: [self-hosted, "${{ matrix.board }}"]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [bpi-f3, visionfive2, milkv-pioneer]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: f3-binaries
+      - name: What silicon is this really
+        run: |
+          chmod +x tests/blake3pp_tests bench/blake3pp_bench cli/blake3ppsum
+          uname -a
+          cli/blake3ppsum --version < /dev/null
+
+      # Whole suite, one process per case: a fault takes down the process
+      # it happens in, so a single run stops at the first one and names
+      # none of the others.
+      - name: Every test case, one process each
+        continue-on-error: true
+        run: |
+          set +e
+          tests/blake3pp_tests --list-test-cases \
+            | sed '/^\[doctest\]/d; /^=\+$/d; /^$/d; s/^ *//' > cases.txt
+          echo "cases: $(wc -l < cases.txt)"
+          failed=0
+          while IFS= read -r c; do
+            [ -n "$c" ] || continue
+            # doctest splits filters on commas, so a comma in a name
+            # becomes its single-character wildcard.
+            pattern=$(printf '%s' "$c" | sed 's/,/?/g')
+            if tests/blake3pp_tests -tc="${pattern}" > case.log 2>&1; then
+              printf 'ok    %s\n' "$c"
+            else
+              rc=$?
+              failed=$((failed + 1))
+              printf 'EXIT%-3d %s\n' "$rc" "$c"
+              sed -n '1,15p' case.log | sed 's/^/        /'
+            fi
+          done < cases.txt
+          echo "failing cases: ${failed}"
+
+      - name: Bench report
+        continue-on-error: true
+        run: |
+          { echo "== riscv64, ${{ matrix.board }}, ci-built static musl binaries =="
+            cli/blake3ppsum --version < /dev/null
+            bench/blake3pp_bench --reps 1 --cooldown 0
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-report-${{ matrix.board }}
+          path: bench-report.txt
+          retention-days: 7
+          if-no-files-found: ignore
