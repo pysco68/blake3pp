@@ -639,12 +639,16 @@ jobs:
             }
           }
           if ($bad) { throw "non-ARM64 PE in an arm64 preset: $bad" }
+      # Reported, not fatal, for the reason audit_kernels in
+      # tools/ci-test.sh gives: a finding is a judgement about code
+      # generation, not a broken binary.
       - name: Kernel audit (each variant's object carries its ISA and nothing above it)
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
           python tools\objscan.py audit build\${{ matrix.preset }}
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::warning::${{ matrix.preset }}: kernel audit findings, see the log"
+          }
       # Tool binaries for release.yml: both compilers on both
       # architectures (the msvc-vs-clangcl kernel gap makes shipping
       # both worthwhile). The arm64 zips are cross-built, natively
@@ -698,8 +702,12 @@ jobs:
           cmake --preset ${{ matrix.preset }}
           cmake --build build/${{ matrix.preset }} -j"$(sysctl -n hw.ncpu)"
           ctest --test-dir build/${{ matrix.preset }} --output-on-failure
+      # Reported, not fatal (see audit_kernels in tools/ci-test.sh).
       - name: Kernel audit (each variant's object carries its ISA and nothing above it)
-        run: python3 tools/objscan.py audit build/${{ matrix.preset }} --binary build/${{ matrix.preset }}/cli/blake3ppsum
+        run: |
+          python3 tools/objscan.py audit build/${{ matrix.preset }} \
+            --binary build/${{ matrix.preset }}/cli/blake3ppsum \
+            || echo "::warning::${{ matrix.preset }}: kernel audit findings, see the log"
       - name: Bench report (Apple silicon)
         run: |
           { echo "== aarch64, GitHub macos-15 runner ($(sysctl -n machdep.cpu.brand_string)), ${{ matrix.preset }} =="

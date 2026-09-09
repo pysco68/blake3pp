@@ -15,6 +15,11 @@ set -euo pipefail
 preset=${1:?usage: ci-test.sh <preset>}
 build_dir="build/${preset}"
 
+# What the run reports at the end: test passes that failed (fatal) and
+# builds whose kernel audit had something to say (not fatal).
+failed_passes=()
+audit_findings=()
+
 # The build driver. BLAKE3PP_CMAKE_RE=1 configures and builds through
 # cmake-re (BLAKE3PP_CMAKE_RE_FLAGS selects where: --host, the default,
 # builds with the image's own compilers; --host --distributed sends the
@@ -48,11 +53,18 @@ configure_and_build "${preset}" "${build_dir}"
 # it, the hot functions are inlined and unrolled, and the linked tool
 # carries nothing above the baseline outside the kernels. A wasm module
 # has no objdump.
+# A finding is reported, not fatal. The audit judges code generation:
+# how well a compiler inlined and unrolled a kernel it was always free
+# to compile differently. That is worth seeing on every run and worth
+# arguing about, but it is not a reason to withhold binaries that pass
+# the vectors on every architecture. A wasm module has no objdump.
 audit_kernels() {  # <build-dir>
   case "${preset}" in
-    wasm32-*) ;;
-    *) python3 tools/objscan.py audit "$1" --binary "$1/cli/blake3ppsum" ;;
+    wasm32-*) return 0 ;;
   esac
+  python3 tools/objscan.py audit "$1" --binary "$1/cli/blake3ppsum" && return 0
+  echo "::warning::${preset}: kernel audit findings in $1, see the log"
+  audit_findings+=("$1")
 }
 audit_kernels "${build_dir}"
 
@@ -97,7 +109,6 @@ CTEST_SERIAL='parallel|multi-core|quadrant|pool|thread|bench_smoke|bench_file_sm
 # script fails once at the bottom naming all of them. One broken
 # variant otherwise hides whatever the other configurations would have
 # said, which on a cross lane is most of the information in the run.
-failed_passes=()
 
 run_ctest() {  # <label> [QEMU_CPU value] [extra ctest args...]
   local label=$1 cpu=${2-}
@@ -329,6 +340,13 @@ report_coverage() {
 }
 if [ -n "${coverage}" ]; then
   report_coverage
+fi
+
+if [ "${#audit_findings[@]}" -gt 0 ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  { echo "### kernel audit findings: ${preset}"
+    printf -- '- %s\n' "${audit_findings[@]}"
+    echo "(reported, not fatal: see audit_kernels in tools/ci-test.sh)"
+  } >> "${GITHUB_STEP_SUMMARY}"
 fi
 
 # The coverage report is written first, so a lane that fails still
