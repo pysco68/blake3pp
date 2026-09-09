@@ -167,10 +167,25 @@ BLAKE3PP_FORCE_INLINE u32v xor_rot(u32v x, u32v y) noexcept {
     // Same dependent-lambda shield as rot's sri escape above: keeps the
     // bit_casts out of TUs whose impl is not the fixed-length SVE size.
     return [](auto ix, auto iy) BLAKE3PP_LAMBDA_FORCE_INLINE {
-      const sve_fixed_u32 r = svxar_n_u32(std::bit_cast<sve_fixed_u32>(ix),
-                                          std::bit_cast<sve_fixed_u32>(iy),
-                                          N);
-      return u32v{std::bit_cast<decltype(ix)>(r)};
+      // The provider's register itself where it exposes one, rather than
+      // a reinterpret of the object holding it. Both spellings name the
+      // same fixed-length SVE type, but clang under the MSVC ABI
+      // declines to inline a reinterpret of the batch CLASS even with
+      // always_inline: it emitted an out-of-line `ldr q0, [x0]; ret` and
+      // spilled a live vector at every use, 448 calls and 224 spills in
+      // hash_many, which is two per rotate. The same clang targeting
+      // Linux, and GCC, fold it away. The SVE kernels are pinned to
+      // xsimd (FORCE_XSIMD in cmake/KernelVariants.cmake), so the member
+      // is always there; the reinterpret stays as the general spelling.
+      if constexpr (requires { ix.data; }) {
+        const sve_fixed_u32 r = svxar_n_u32(ix.data, iy.data, N);
+        return u32v{decltype(ix){r}};
+      } else {
+        const sve_fixed_u32 r = svxar_n_u32(std::bit_cast<sve_fixed_u32>(ix),
+                                            std::bit_cast<sve_fixed_u32>(iy),
+                                            N);
+        return u32v{std::bit_cast<decltype(ix)>(r)};
+      }
     }(x.v, y.v);
   }
 #endif
