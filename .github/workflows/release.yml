@@ -124,14 +124,16 @@ jobs:
           tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
           rm -rf "$stage"
 
-          # Windows (zip is the platform convention): both compilers on
-          # both architectures. x64 is tested natively on the build
+          # Windows (zip is the platform convention), clang-cl only:
+          # what cl produces is both slower to build and slower to run
+          # (the kernel translation unit costs 15-20x the compile time,
+          # and the shipped binary hashes at roughly half the rate), so
+          # the MSVC presets are a conformance lane rather than a
+          # release artifact. x64 is tested natively on the build
           # runner; arm64 is cross-built (tested natively when the
           # windows-11-arm lane is enabled, and flagged in the notes).
           for pair in \
-            "windows-msvc2026-cxx23:windows-x86_64-msvc" \
             "windows-clangcl-cxx23:windows-x86_64-clangcl" \
-            "windows-arm64-msvc2026-cxx23:windows-arm64-msvc" \
             "windows-arm64-clangcl-cxx23:windows-arm64-clangcl"; do
             preset="${pair%%:*}"
             name="${pair#*:}"
@@ -270,9 +272,8 @@ jobs:
           | `linux-riscv64-static` | Linux riscv64, static | rvv128-512 (+Zvbb twins), xthead (RVV 0.7.1, GCC-built object) | qemu VLEN matrix; Cloud-V boards when the lane runs |
           | `linux-ppc64le-static` | Linux POWER, static | vsx (POWER9) | qemu only - no hardware lane yet |
           | `linux-s390x-static` | Linux IBM z, static, **big-endian** | vxe (z14, GCC-built object) | qemu only - no hardware lane yet |
-          | `windows-x86_64-msvc` / `-clangcl` | Windows x64 | sse42 / avx2 / avx512 (clang-cl carries the faster byte-rotate kernels) | native runner; IOCP + direct I/O |
+          | `windows-x86_64-clangcl` | Windows x64 | sse42 / avx2 / avx512 | native runner; IOCP + direct I/O |
           | `windows-arm64-clangcl` | Windows arm64 (cross-built) | neon | windows-11-arm runner when the lane runs |
-          | `windows-arm64-msvc` | Windows arm64 (cross-built) | scalar only - a deliberate verdict, see cmake/KernelVariants.cmake | windows-11-arm runner when the lane runs |
           | `macos-arm64` | macOS Apple silicon | neon; GCD + F_NOCACHE I/O | native runner |
           | `wasm32-simd128` | node >= 16 (js+wasm pairs) | simd128 | node on the runner |
 
