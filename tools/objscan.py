@@ -112,19 +112,23 @@ def tool(arch, fmt, name, override=None):
     candidates = []
     if fmt == "elf":
         candidates.append(BINUTILS_PREFIX.get(arch, "") + name)
-    candidates += ["llvm-" + name, name]
+    # The versioned llvm tool comes before the unprefixed one: a distro
+    # that ships only llvm-objdump-22 still has the right disassembler,
+    # and falling through to the host objdump means a foreign target
+    # cannot be decoded at all.
+    candidates += ["llvm-" + name, versioned("llvm-" + name) or "", name]
     if fmt == "pe" and name == "objdump":
         candidates.append("dumpbin")
     if fmt == "macho" and name == "objdump":
         candidates.append("otool")
     for candidate in candidates:
-        if shutil.which(candidate):
+        if candidate and shutil.which(candidate):
             return candidate
     if fmt == "pe" and name == "objdump":
         found = msvc_tool("dumpbin")
         if found:
             return found
-    sys.exit(f"objscan: no {name} for {arch}/{fmt} on PATH (tried {', '.join(candidates)})")
+    sys.exit(f"objscan: no {name} for {arch}/{fmt} on PATH (tried {', '.join(c for c in candidates if c)})")
 
 
 # ------------------------------------------------------------ disassembly
