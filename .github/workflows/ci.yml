@@ -102,6 +102,8 @@ jobs:
       promote: ${{ steps.decide.outputs.promote }}
       driver: ${{ steps.decide.outputs.driver }}
       cmake-re-mode: ${{ steps.decide.outputs.cmake_re_mode }}
+      windows-matrix: ${{ steps.decide.outputs.windows_matrix }}
+      windows-arm64-matrix: ${{ steps.decide.outputs.windows_arm64_matrix }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/login-action@v4
@@ -117,7 +119,31 @@ jobs:
           # actually sees. Repository VARIABLES only (Variables tab, not
           # Secrets; not environment-scoped) reach the vars. context;
           # empty here means the gated job will skip, and why.
-          echo "gate vars: CLOUDV_RISCV64='${{ vars.CLOUDV_RISCV64 }}' LINUX_ARM64_NATIVE='${{ vars.LINUX_ARM64_NATIVE }}' WIN_ARM64_NATIVE='${{ vars.WIN_ARM64_NATIVE }}'"
+          echo "gate vars: CLOUDV_RISCV64='${{ vars.CLOUDV_RISCV64 }}' LINUX_ARM64_NATIVE='${{ vars.LINUX_ARM64_NATIVE }}' WIN_ARM64_NATIVE='${{ vars.WIN_ARM64_NATIVE }}' WINDOWS_MSVC='${{ vars.WINDOWS_MSVC }}'"
+          # The Windows legs, as a matrix rather than a job gate: cl
+          # compiles the vector kernel TU 15 to 20 times slower than
+          # clang-cl does (36 s for the scalar variant against 500-700 s
+          # for each vector one, measured on the same machine), which
+          # makes windows-msvc2026-cxx23 the longest job in the run at
+          # 16 minutes. Nothing ships from them either: the release
+          # packages clang-cl only, since what cl produces hashes at
+          # roughly half the rate. WINDOWS_MSVC=1 puts both presets
+          # back, as the conformance check they are.
+          clangcl='{"preset":"windows-clangcl-cxx23","vcvars":"x64","run_tests":true,"upload":true}'
+          clangcl_arm='{"preset":"windows-arm64-clangcl-cxx23","vcvars":"x64_arm64","run_tests":false,"upload":true}'
+          msvc='{"preset":"windows-msvc2026-cxx23","vcvars":"x64","run_tests":true,"upload":true}'
+          msvc_arm='{"preset":"windows-arm64-msvc2026-cxx23","vcvars":"x64_arm64","run_tests":false,"upload":true}'
+          if [ "${{ vars.WINDOWS_MSVC }}" = 1 ]; then
+            windows="[${msvc},${clangcl},${msvc_arm},${clangcl_arm}]"
+            windows_arm64='["windows-arm64-msvc2026-cxx23","windows-arm64-clangcl-cxx23"]'
+            echo "windows: MSVC lanes ON"
+          else
+            windows="[${clangcl},${clangcl_arm}]"
+            windows_arm64='["windows-arm64-clangcl-cxx23"]'
+            echo "windows: MSVC lanes off (set WINDOWS_MSVC=1 to run them)"
+          fi
+          echo "windows_matrix=${windows}" >> "$GITHUB_OUTPUT"
+          echo "windows_arm64_matrix=${windows_arm64}" >> "$GITHUB_OUTPUT"
           driver="${{ inputs.driver != 'auto' && inputs.driver || vars.BLAKE3PP_CI_DRIVER }}"
           [ "${driver}" = cmake-re ] || driver=cmake
           echo "build driver: ${driver}"
@@ -541,17 +567,16 @@ jobs:
   # (compile-proven; x64 Windows cannot emulate arm64 binaries).
   windows:
     name: ${{ matrix.preset }}
+    needs: changes
     runs-on: windows-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 120
     strategy:
       fail-fast: false
+      # Which presets run is decided in changes, since a matrix cannot
+      # gate its own legs (see WINDOWS_MSVC there).
       matrix:
-        include:
-          - { preset: windows-msvc2026-cxx23, vcvars: x64, run_tests: true, upload: true }
-          - { preset: windows-clangcl-cxx23, vcvars: x64, run_tests: true, upload: true }
-          - { preset: windows-arm64-msvc2026-cxx23, vcvars: x64_arm64, run_tests: false, upload: true }
-          - { preset: windows-arm64-clangcl-cxx23, vcvars: x64_arm64, run_tests: false, upload: true }
+        include: ${{ fromJSON(needs.changes.outputs.windows-matrix) }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
@@ -717,7 +742,7 @@ jobs:
   # by construction, and Windows on Arm exposes no user-mode SVE anyway.
   windows-arm64-native:
     name: windows-arm64 native test (${{ matrix.preset }})
-    needs: windows
+    needs: [changes, windows]
     # Status-function form for the same reason as the other hardware
     # lanes (see neoverse-test-bench): immune to transitive
     # skip-poisoning should this chain ever gain a skippable ancestor.
@@ -727,7 +752,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [windows-arm64-msvc2026-cxx23, windows-arm64-clangcl-cxx23]
+        # Only the presets the windows job actually built.
+        preset: ${{ fromJSON(needs.changes.outputs.windows-arm64-matrix) }}
     steps:
       - uses: actions/download-artifact@v8
         with:
