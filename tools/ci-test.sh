@@ -61,6 +61,15 @@ audit_kernels "${build_dir}"
 # to build/<preset>/coverage (summary.txt, coverage.lcov, html/). The
 # clang presets use LLVM's source-based coverage, the gcc presets gcov
 # through gcovr; both tools ship in the toolchain images.
+# The source root the build compiled against: the checkout under plain
+# cmake, the tipi mirror's copy under cmake-re.
+cov_source_root() {
+  local root
+  root=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' \
+         "${build_dir}/CMakeCache.txt" 2> /dev/null)
+  echo "${root:-${PWD}}"
+}
+
 coverage=""
 case "${preset}" in
   *coverage*)
@@ -236,20 +245,34 @@ report_coverage() {
       gcov=$(command -v "${gcov_name}" \
              || command -v "${gcov_name}-$("${cxx}" -dumpversion | cut -d. -f1)")
       mkdir -p "${coverage_dir}/html"
+      # The report runs FROM the source root the build compiled against,
+      # not from the checkout: gcovr resolves a relative --filter against
+      # the current directory rather than against --root, and a cmake-re
+      # build compiles a copy of the tree inside its mirror, so filters
+      # written against the checkout match nothing and the report comes
+      # out empty. CMakeCache.txt names the root either driver used, and
+      # everything the report reads or writes is absolute from here.
+      local src_root abs_build abs_cov
+      src_root=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' \
+                 "${build_dir}/CMakeCache.txt")
+      [ -n "${src_root}" ] || src_root=${PWD}
+      abs_build=$(cd "${build_dir}" && pwd -P)
+      abs_cov=$(cd "${coverage_dir}" && pwd -P)
       # gcovr writes its intermediate .gcov files into the current
       # directory and cleans them up only on success; sweep them on
-      # failure so a crash does not litter the checkout.
-      gcovr --root . --object-directory "${build_dir}" -j"$(nproc)" \
-        --gcov-executable "${gcov}" \
-        --gcov-exclude-directories '.*/_deps/.*' \
-        --gcov-exclude-directories '.*/CMakeFiles/[0-9.]+/.*' \
-        --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
-        --filter 'src/' --filter 'include/' --filter 'cli/' --filter 'tooling/' \
-        --exclude-throw-branches \
-        --txt "${coverage_dir}/summary.txt" \
-        --lcov "${coverage_dir}/coverage.lcov" \
-        --html-details "${coverage_dir}/html/index.html" \
-        "${build_dir}" || { rm -f ./*'##'*.gcov; return 1; }
+      # failure so a crash does not litter the tree.
+      ( cd "${src_root}" &&
+        gcovr --root . --object-directory "${abs_build}" -j"$(nproc)" \
+          --gcov-executable "${gcov}" \
+          --gcov-exclude-directories '.*/_deps/.*' \
+          --gcov-exclude-directories '.*/CMakeFiles/[0-9.]+/.*' \
+          --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
+          --filter 'src/' --filter 'include/' --filter 'cli/' --filter 'tooling/' \
+          --exclude-throw-branches \
+          --txt "${abs_cov}/summary.txt" \
+          --lcov "${abs_cov}/coverage.lcov" \
+          --html-details "${abs_cov}/html/index.html" \
+          "${abs_build}" ) || { rm -f "${src_root}"/*'##'*.gcov; return 1; }
       cat "${coverage_dir}/summary.txt"
       ;;
   esac
@@ -259,7 +282,10 @@ report_coverage() {
   # either difference), and no generated files from the build tree.
   # (gcovr also writes a non-numeric block id, BRDA:<line>,None,..., for
   # branches gcov reports without one; lcov rejects the file over it.)
-  sed -i -e "s#^SF:${PWD}/#SF:#" -e '/^TN:/d' -e '/^VER:/d' \
+  # Both roots: the checkout, and the mirror a cmake-re build compiled
+  # from, which is what llvm-cov reads out of the binaries.
+  sed -i -e "s#^SF:${PWD}/#SF:#" -e "s#^SF:$(cov_source_root)/#SF:#" \
+    -e '/^TN:/d' -e '/^VER:/d' \
     -e 's/^BRDA:\([0-9]*\),None,/BRDA:\1,0,/' "${coverage_dir}/coverage.lcov"
   awk '/^SF:build\//{skip=1} !skip{print} /^end_of_record/{skip=0}' \
     "${coverage_dir}/coverage.lcov" > "${coverage_dir}/coverage.lcov.tmp"

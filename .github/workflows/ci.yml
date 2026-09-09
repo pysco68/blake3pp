@@ -310,6 +310,11 @@ jobs:
       BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
       TIPI_DISTRO_MODE: none
       TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      # tipi's own build cache needs a tipi.build account this CI has
+      # not got, so every run ends in a failed upload. Read what is
+      # there, publish nothing.
+      TIPI_CACHE_CONSUME_ONLY: "ON"
+      TIPI_CACHE_FORCE_ENABLE: "OFF"
       USER: runner
       # Mirrors tools/tc's sanitizer environment.
       ASAN_SYMBOLIZER_PATH: /usr/local/bin/llvm-symbolizer
@@ -366,6 +371,11 @@ jobs:
       BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
       TIPI_DISTRO_MODE: none
       TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      # tipi's own build cache needs a tipi.build account this CI has
+      # not got, so every run ends in a failed upload. Read what is
+      # there, publish nothing.
+      TIPI_CACHE_CONSUME_ONLY: "ON"
+      TIPI_CACHE_FORCE_ENABLE: "OFF"
       USER: runner
     steps:
       - uses: actions/checkout@v7
@@ -456,6 +466,11 @@ jobs:
       BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
       TIPI_DISTRO_MODE: none
       TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      # tipi's own build cache needs a tipi.build account this CI has
+      # not got, so every run ends in a failed upload. Read what is
+      # there, publish nothing.
+      TIPI_CACHE_CONSUME_ONLY: "ON"
+      TIPI_CACHE_FORCE_ENABLE: "OFF"
       USER: runner
     steps:
       - uses: actions/checkout@v7
