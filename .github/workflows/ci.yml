@@ -55,16 +55,24 @@
 # differs. Windows and macOS are always native.
 name: ci
 
+# BRANCH-LOCAL DEACTIVATION, NOT FOR MAIN. This branch exists to run the
+# arm64 Windows SVE lane on its own, so the automatic triggers are
+# removed here and the full matrix cannot start from a push or from a
+# pull request opened off this branch. Restore this block before any of
+# these commits reach main; the deactivation is its own commit so it can
+# be dropped on its own.
+#
+# on:
+#   push:
+#     branches: [main]
+#     paths-ignore: ["**.md", "release/**"]
+#   pull_request:
+#     # ready_for_review: the environment-files PR below is opened as a
+#     # draft (a PR opened with GITHUB_TOKEN gets no workflow run of its
+#     # own); marking it ready is the user-made event that runs CI on it.
+#     types: [opened, synchronize, reopened, ready_for_review]
+#     paths-ignore: ["**.md", "release/**"]
 on:
-  push:
-    branches: [main]
-    paths-ignore: ["**.md", "release/**"]
-  pull_request:
-    # ready_for_review: the environment-files PR below is opened as a
-    # draft (a PR opened with GITHUB_TOKEN gets no workflow run of its
-    # own); marking it ready is the user-made event that runs CI on it.
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths-ignore: ["**.md", "release/**"]
   workflow_dispatch:
     inputs:
       driver:
