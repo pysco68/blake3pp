@@ -18,6 +18,15 @@ single binary with zero-overhead runtime dispatch:
 
 Every build also carries a scalar kernel as fallback option. 
 
+The SVE kernels are vector-length-specific: dispatch selects one only
+when the CPU's runtime vector length equals the length the kernel was
+compiled for, since that is the only case the ABI guarantees. That
+length comes from `prctl` on Linux and from `rdvl` on Windows, which
+reports whether SVE is present but not how wide it is. Compiling them
+needs a compiler that accepts a fixed vector length: `clang-cl` does, in
+its cc1 spelling, and `cl` does not, so an arm64 Windows build carries
+SVE kernels only when clang-cl builds it.
+
 ## Using the library
 
 blake3pp is normally consumed **from source**: vendor it with FetchContent

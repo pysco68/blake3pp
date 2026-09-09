@@ -43,6 +43,9 @@ function(blake3pp_probe_flag_candidates out_var probe_name)
     set(trial "${cand}")
     if(PF_PROBE_VLEN)
       string(REPLACE "@VLEN@" "${PF_PROBE_VLEN}" trial "${trial}")
+      # SVE's cc1 spelling counts 128-bit granules, not bits.
+      math(EXPR _vscale "${PF_PROBE_VLEN} / 128")
+      string(REPLACE "@VSCALE@" "${_vscale}" trial "${trial}")
     endif()
     string(REPLACE "|" " " trial "${trial}")
     string(REPLACE ";" " " extra "${PF_PROBE_EXTRA_FLAGS}")
@@ -106,6 +109,37 @@ function(_blake3pp_register_x86_kernels)
   endif()
 endfunction()
 
+# <pattern> <vlen> <out>: the probed candidate with its vector length
+# filled in, split into arguments.
+function(_blake3pp_sve_flags pattern vlen out)
+  math(EXPR _vscale "${vlen} / 128")
+  string(REPLACE "@VLEN@" "${vlen}" _f "${pattern}")
+  string(REPLACE "@VSCALE@" "${_vscale}" _f "${_f}")
+  separate_arguments(_f UNIX_COMMAND "${_f}")
+  # -Xclang applies to the ONE argument after it, and CMake removes
+  # duplicate compile options: a plain list holding it twice reaches the
+  # compiler with a single -Xclang, so the second flag lands on the
+  # driver instead and is ignored. Such a build still succeeds and still
+  # registers a kernel, which then holds NEON code. SHELL: keeps each
+  # pair together and exempt from de-duplication.
+  set(_out "")
+  list(LENGTH _f _n)
+  set(_i 0)
+  while(_i LESS _n)
+    list(GET _f ${_i} _item)
+    math(EXPR _next "${_i} + 1")
+    if(_item STREQUAL "-Xclang" AND _next LESS _n)
+      list(GET _f ${_next} _arg)
+      list(APPEND _out "SHELL:-Xclang ${_arg}")
+      math(EXPR _i "${_i} + 2")
+    else()
+      list(APPEND _out "${_item}")
+      math(EXPR _i "${_i} + 1")
+    endif()
+  endwhile()
+  set(${out} "${_out}" PARENT_SCOPE)
+endfunction()
+
 function(_blake3pp_register_aarch64_kernels)
   # NEON is baseline on AArch64, except under pure cl.exe, which is
   # scalar-only BY VERDICT, not by inability. The full story: xsimd 14.3
@@ -130,13 +164,15 @@ function(_blake3pp_register_aarch64_kernels)
   # and Arm document exact-match only), and dispatch checks precisely that.
   # sve256/sve512 are SVE1 so Graviton3/Neoverse-V1-class parts qualify;
   # sve2_128 is the Grace/Graviton4-class variant and carries the XAR
-  # fused rotate. GNU-frontend compilers only (MSVC has no
-  # -msve-vector-bits); the probe keeps unusual cross setups honest: no
-  # probe pass, no kernel registered.
+  # fused rotate. The probe keeps unusual cross setups honest: no probe
+  # pass, no kernel registered.
   option(BLAKE3PP_SVE_ALL_VARIANTS
     "Also compile the SVE variants matching no shipping silicon (sve128, sve2_256, sve2_512), for emulator targets"
     OFF)
-  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  # cl has no SVE in any spelling, but clang-cl does, so the gate is on
+  # the compiler rather than on the frontend it imitates: gating on the
+  # MSVC frontend variant leaves arm64 Windows with neon and scalar.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     return()
   endif()
   # The exact constructs the kernel relies on: a fixed-length SVE type,
@@ -163,14 +199,23 @@ function(_blake3pp_register_aarch64_kernels)
   # form; zig cc rejects aarch64 -march outright (its flag model wants
   # -mcpu=<cpu>+<features>), and both clang and zig accept the -mcpu
   # form.
+  # The vector length is part of the candidate because its spelling
+  # varies with the driver, not with the compiler: clang-cl rejects
+  # -msve-vector-bits= as a GNU-driver flag, and routing it through
+  # -Xclang does not help either, since cc1 spells the same thing as a
+  # vscale range counted in 128-bit granules. Without the third
+  # candidate an arm64 Windows build registers no SVE kernel at all.
   blake3pp_probe_flag_candidates(_blake3pp_sve1_flag BLAKE3PP_COMPILER_SVE_VLS
-    SOURCE "${_blake3pp_sve_smoke}"
-    PROBE_EXTRA_FLAGS -msve-vector-bits=256
-    CANDIDATES "-march=armv8.2-a+sve" "-mcpu=generic+sve")
+    SOURCE "${_blake3pp_sve_smoke}" PROBE_VLEN 256
+    CANDIDATES "-march=armv8.2-a+sve -msve-vector-bits=@VLEN@"
+               "-mcpu=generic+sve -msve-vector-bits=@VLEN@"
+               "-march=armv8.2-a+sve -Xclang -mvscale-min=@VSCALE@ -Xclang -mvscale-max=@VSCALE@")
   blake3pp_probe_flag_candidates(_blake3pp_sve2_flag BLAKE3PP_COMPILER_SVE2_VLS
-    SOURCE "${_blake3pp_sve_smoke}"
-    PROBE_EXTRA_FLAGS -msve-vector-bits=256
-    CANDIDATES "-march=armv8.5-a+sve2" "-mcpu=generic+sve2")
+    SOURCE "${_blake3pp_sve_smoke}" PROBE_VLEN 256
+    CANDIDATES "-march=armv8.5-a+sve2 -msve-vector-bits=@VLEN@"
+               "-mcpu=generic+sve2 -msve-vector-bits=@VLEN@"
+               "-march=armv8.5-a+sve2 -Xclang -mvscale-min=@VSCALE@ -Xclang -mvscale-max=@VSCALE@")
+
   if(_blake3pp_sve1_flag OR _blake3pp_sve2_flag)
     # The SVE kernels pin themselves to xsimd (FORCE_XSIMD) even when the
     # project provider is a std one: libstdc++'s experimental::simd SVE
@@ -180,23 +225,23 @@ function(_blake3pp_register_aarch64_kernels)
     _blake3pp_fetch_xsimd()
   endif()
   if(_blake3pp_sve1_flag)
-    blake3pp_add_kernel(sve256 FORCE_XSIMD
-      ARCH_FLAGS ${_blake3pp_sve1_flag} -msve-vector-bits=256)
-    blake3pp_add_kernel(sve512 FORCE_XSIMD
-      ARCH_FLAGS ${_blake3pp_sve1_flag} -msve-vector-bits=512)
+    _blake3pp_sve_flags("${_blake3pp_sve1_flag}" 256 _flags)
+    blake3pp_add_kernel(sve256 FORCE_XSIMD ARCH_FLAGS ${_flags})
+    _blake3pp_sve_flags("${_blake3pp_sve1_flag}" 512 _flags)
+    blake3pp_add_kernel(sve512 FORCE_XSIMD ARCH_FLAGS ${_flags})
     if(BLAKE3PP_SVE_ALL_VARIANTS)
-      blake3pp_add_kernel(sve128 FORCE_XSIMD
-        ARCH_FLAGS ${_blake3pp_sve1_flag} -msve-vector-bits=128)
+      _blake3pp_sve_flags("${_blake3pp_sve1_flag}" 128 _flags)
+      blake3pp_add_kernel(sve128 FORCE_XSIMD ARCH_FLAGS ${_flags})
     endif()
   endif()
   if(_blake3pp_sve2_flag)
-    blake3pp_add_kernel(sve2_128 FORCE_XSIMD
-      ARCH_FLAGS ${_blake3pp_sve2_flag} -msve-vector-bits=128)
+    _blake3pp_sve_flags("${_blake3pp_sve2_flag}" 128 _flags)
+    blake3pp_add_kernel(sve2_128 FORCE_XSIMD ARCH_FLAGS ${_flags})
     if(BLAKE3PP_SVE_ALL_VARIANTS)
-      blake3pp_add_kernel(sve2_256 FORCE_XSIMD
-        ARCH_FLAGS ${_blake3pp_sve2_flag} -msve-vector-bits=256)
-      blake3pp_add_kernel(sve2_512 FORCE_XSIMD
-        ARCH_FLAGS ${_blake3pp_sve2_flag} -msve-vector-bits=512)
+      _blake3pp_sve_flags("${_blake3pp_sve2_flag}" 256 _flags)
+      blake3pp_add_kernel(sve2_256 FORCE_XSIMD ARCH_FLAGS ${_flags})
+      _blake3pp_sve_flags("${_blake3pp_sve2_flag}" 512 _flags)
+      blake3pp_add_kernel(sve2_512 FORCE_XSIMD ARCH_FLAGS ${_flags})
     endif()
   endif()
 endfunction()
