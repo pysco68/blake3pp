@@ -48,6 +48,26 @@ BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept 
 #endif
 }
 
+// The clang that zig 0.16 bundles, 21.1.0, merges the byte-wise word
+// loads of the message below into element-width vector loads reading the
+// caller's pointer directly. Where a misaligned vector access faults that
+// turns a legal load into a bus error: RISC-V lets an implementation
+// refuse such an access and the SpacemiT X60 (RVV 1.0) does, while x86
+// and AArch64 perform them in hardware.
+//
+// Measured on one preprocessed source, counting loads whose base is the
+// block parameter in compress_in_place: zig 0.16 (clang 21.1.0) three,
+// Ubuntu clang 21.1.8 none, zig 0.17-dev (clang 22.1.8) none, Ubuntu
+// clang 22.1.8 none, GCC 15 none. So a 21.1.x patch release or zig's own
+// build of it is the dividing line, and the version bound below is
+// deliberately conservative: it also covers clang 21 builds that do not
+// need it, and lifts itself when the musl builds move to zig 0.17.
+#if defined(__riscv) && defined(__riscv_v) && defined(__clang__) && __clang_major__ < 22
+#define BLAKE3PP_ALIGN_MESSAGE_BLOCK 1
+#else
+#define BLAKE3PP_ALIGN_MESSAGE_BLOCK 0
+#endif
+
 BLAKE3PP_FORCE_INLINE std::uint32_t load32(const std::uint8_t* p) noexcept {
   std::uint32_t v;
   std::memcpy(&v, p, sizeof v);
@@ -274,9 +294,27 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
                      const std::uint8_t block[block_len], std::uint32_t len,
                      std::uint64_t counter, std::uint32_t flags,
                      std::array<std::uint32_t, 16>& out) noexcept {
+  // See BLAKE3PP_ALIGN_MESSAGE_BLOCK: where the merged load would fault,
+  // an unaligned block is copied once so that the address really is
+  // aligned. Staging it unconditionally does not work, since the
+  // optimizer forwards the copy and rebuilds the loads from the original
+  // pointer; the aligned case, which is the common one, pays one
+  // predictable branch and no copy.
+  const std::uint8_t* src = block;
+#if BLAKE3PP_ALIGN_MESSAGE_BLOCK
+  alignas(std::uint32_t) std::uint8_t staged[block_len];
+  if ((reinterpret_cast<std::uintptr_t>(src) &
+       (alignof(std::uint32_t) - 1)) != 0) {
+    std::memcpy(staged, src, block_len);
+    src = staged;
+  }
+  src = static_cast<const std::uint8_t*>(
+      __builtin_assume_aligned(src, alignof(std::uint32_t)));
+#endif
+
   std::uint32_t m[16];
   for (std::size_t i = 0; i < 16; ++i) {
-    m[i] = load32(block + 4 * i);
+    m[i] = load32(src + 4 * i);
   }
 
   std::array<std::uint32_t, 16> v = {
