@@ -745,9 +745,12 @@ jobs:
   # (observed 2026-08-30: a run completed on Cobalt 100 silicon), but
   # private-repo hosted minutes are BILLED, Windows ones at a premium,
   # so hardware lanes stay a deliberate opt-in rather than a default
-  # spend. Bench note from that first run: on Windows this Neoverse N2
-  # runs the NEON kernel: the clang-cl build registers no SVE variants
-  # by construction, and Windows on Arm exposes no user-mode SVE anyway.
+  # spend. The first run (2026-08-30) reported the NEON kernel on this
+  # Neoverse N2, which was a property of the build rather than of the
+  # platform: clang-cl takes the SVE vector length only in its cc1
+  # spelling, and until the probe learned that one, no SVE variant was
+  # compiled in. Windows does expose SVE, through
+  # IsProcessorFeaturePresent.
   windows-arm64-native:
     name: windows-arm64 native test (${{ matrix.preset }})
     needs: [changes, windows]

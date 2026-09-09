@@ -1,0 +1,178 @@
+# The arm64 Windows SVE lane, on its own, on demand.
+#
+# ci.yml already carries both halves of this: the `windows` job
+# cross-builds the arm64 presets in the x64_arm64 environment, and
+# `windows-arm64-native` runs those bytes on GitHub's windows-11-arm
+# runners (Cobalt 100: Neoverse N2, SVE2 at VL=128). That lane is gated
+# behind the repository variable WIN_ARM64_NATIVE because private-repo
+# Windows minutes are billed at a premium.
+#
+# This workflow is the pair on its own, ungated, so the clang-cl SVE
+# kernels can be exercised on real arm64 Windows without paying for the
+# full matrix. It triggers only on its own branch and on manual
+# dispatch, so merging it to main leaves it dormant.
+#
+# What it is trying to learn, in one line: whether Windows reports SVE
+# through IsProcessorFeaturePresent, what vector length rdvl reports,
+# and whether the sve2_128 kernel is therefore selected over neon on a
+# core that has SVE2 at 128 bits.
+name: win-arm64-sve
+
+on:
+  push:
+    branches: [win-arm64-sve]
+  workflow_dispatch:
+
+concurrency:
+  group: win-arm64-sve-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PRESET: windows-arm64-clangcl-cxx23
+
+jobs:
+  # x64 Windows cannot run arm64 binaries, so this half only proves the
+  # build. The kernels it produces are what the native job then runs.
+  cross-build:
+    name: cross-build (clang-cl, x64_arm64)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-workspace
+        with:
+          cache-prefix: hfc-src2-win-
+      - name: Ensure ninja
+        shell: pwsh
+        run: if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+      # The SVE probe accepts one of three flag spellings and clang-cl
+      # takes the third (a cc1 vscale range), so the compiler version is
+      # part of the evidence when no SVE kernel registers.
+      - name: clang-cl identity
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find VC\Tools\Llvm\x64\bin\clang-cl.exe`) do set "CLANGCL=%%i"
+          if not defined CLANGCL (echo vswhere found no clang-cl & exit /b 1)
+          "%CLANGCL%" --version
+      - name: Configure and build
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find VC\Auxiliary\Build\vcvarsall.bat`) do set "VCVARSALL=%%i"
+          if not defined VCVARSALL (echo vswhere found no vcvarsall & exit /b 1)
+          call "%VCVARSALL%" x64_arm64 || exit /b 1
+          cmake --preset %PRESET% || exit /b 1
+          cmake --build build\%PRESET% -j %NUMBER_OF_PROCESSORS%
+      # The point of the lane. Without this the build still succeeds and
+      # still ships a binary, it just holds neon and scalar, which is
+      # exactly the failure this branch exists to detect.
+      - name: Assert the SVE kernels registered
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dirs = Get-ChildItem "build\$env:PRESET\CMakeFiles" -Directory -Filter 'blake3pp_kernel_*'
+          $names = $dirs.Name -replace '^blake3pp_kernel_', '' -replace '\.dir$', ''
+          Write-Host "kernels built: $($names -join ' ')"
+          if (-not ($names | Where-Object { $_ -like 'sve*' })) {
+            throw "no SVE kernel registered: the probe found no flag spelling this clang-cl accepts"
+          }
+      # A kernel that compiled but holds NEON is the silent failure mode
+      # (an -Xclang flag reaching the driver instead of cc1), and the
+      # audit counts SVE registers per variant rather than trusting the
+      # flags. ci.yml reports its findings as a warning because a
+      # finding there is a judgement about code generation; here a
+      # NEON-holding SVE kernel is the thing under test, so it fails.
+      - name: Kernel audit (each SVE variant must carry SVE)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          python tools\objscan.py audit "build\$env:PRESET"
+      - name: PE machine audit (must be ARM64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          foreach ($d in 'cli', 'bench', 'tests') {
+            Get-ChildItem "build\$env:PRESET\$d" -Filter *.exe | ForEach-Object {
+              $b = [IO.File]::ReadAllBytes($_.FullName)
+              $m = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3C) + 4)
+              Write-Host ("{0}: machine 0x{1:X4}" -f $_.Name, $m)
+              if ($m -ne 0xAA64) { $bad += $_.Name }
+            }
+          }
+          if ($bad) { throw "non-ARM64 PE in an arm64 preset: $bad" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: win-arm64-sve-binaries
+          retention-days: 3
+          path: |
+            build/${{ env.PRESET }}/cli/blake3ppsum.exe
+            build/${{ env.PRESET }}/cli/blake3ppgen.exe
+            build/${{ env.PRESET }}/bench/blake3pp_bench.exe
+            build/${{ env.PRESET }}/bench/blake3pp_bench_file.exe
+            build/${{ env.PRESET }}/tests/blake3pp_tests.exe
+
+  # Real arm64 Windows. Billed at the Windows premium on a private
+  # repository, which is why ci.yml keeps its twin behind a variable.
+  native-test:
+    name: native test and bench (windows-11-arm)
+    needs: cross-build
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: win-arm64-sve-binaries
+      # x64 bytes would run here under transparent emulation, passing
+      # every test at a fraction of the speed, so prove the architecture
+      # before timing anything.
+      - name: PE machine audit (downloaded binaries are ARM64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          Get-ChildItem -Recurse -Filter *.exe | ForEach-Object {
+            $b = [IO.File]::ReadAllBytes($_.FullName)
+            $m = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3C) + 4)
+            Write-Host ("{0}: machine 0x{1:X4}" -f $_.Name, $m)
+            if ($m -ne 0xAA64) { $bad += $_.Name }
+          }
+          if ($bad) { throw "non-ARM64 PE downloaded onto the arm64 runner: $bad" }
+      - name: CPU identity
+        shell: pwsh
+        run: (Get-CimInstance Win32_Processor).Name
+      # The answer this branch exists for. The variants line names every
+      # kernel compiled in, marks the ones the CPU cannot run, and gives
+      # the one dispatch chose: sve2_128 here means Windows reported SVE2
+      # and rdvl returned 16 bytes.
+      - name: Dispatch verdict
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "cli\blake3ppsum.exe" --version
+      - name: Test suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "tests\blake3pp_tests.exe"
+      # Tee-Object streams the bench into the log while writing the
+      # report; Out-File buffering reads as a stuck step.
+      - name: Bench report
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          "== arm64 Windows, windows-11-arm runner, clang-cl, SVE lane ==" | Tee-Object bench-report.txt
+          (Get-CimInstance Win32_Processor).Name | Tee-Object bench-report.txt -Append
+          & "cli\blake3ppsum.exe" --version 2>&1 | Tee-Object bench-report.txt -Append
+          & "bench\blake3pp_bench.exe" --reps 1 --cooldown 0 2>&1 | Tee-Object bench-report.txt -Append
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-report-win-arm64-sve
+          path: bench-report.txt
+          retention-days: 7

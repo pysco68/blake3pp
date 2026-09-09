@@ -273,7 +273,7 @@ jobs:
           | `linux-ppc64le-static` | Linux POWER, static | vsx (POWER9) | qemu only - no hardware lane yet |
           | `linux-s390x-static` | Linux IBM z, static, **big-endian** | vxe (z14, GCC-built object) | qemu only - no hardware lane yet |
           | `windows-x86_64-clangcl` | Windows x64 | sse42 / avx2 / avx512 | native runner; IOCP + direct I/O |
-          | `windows-arm64-clangcl` | Windows arm64 (cross-built) | neon | windows-11-arm runner when the lane runs |
+          | `windows-arm64-clangcl` | Windows arm64 (cross-built) | neon / sve256 / sve512 / sve2_128 | windows-11-arm runner when the lane runs |
           | `macos-arm64` | macOS Apple silicon | neon; GCD + F_NOCACHE I/O | native runner |
           | `wasm32-simd128` | node >= 16 (js+wasm pairs) | simd128 | node on the runner |
 
