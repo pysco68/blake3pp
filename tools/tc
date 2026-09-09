@@ -58,6 +58,19 @@ docker-outside-of-docker mounts)"
   fi
 }
 
+# The mount root is the workspace, which holds this repository as a
+# subdirectory; run from the repository so CMakePresets.json and
+# build/<preset> resolve. Inside the devcontainer the repository's path is
+# already its in-image path, because the workspace mounts at the same
+# place. Outside one, the mount root is the repository itself.
+container_workdir() {
+  if [ -n "${LOCAL_WORKSPACE_FOLDER:-}" ]; then
+    (cd "$(dirname "$0")/.." && pwd)
+  else
+    echo "${WORKDIR}"
+  fi
+}
+
 run_in_image() {
   local image="$1"; shift
   local -a tty_args=()
@@ -66,7 +79,7 @@ run_in_image() {
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit core=0 \
     -u 1000:1000 --group-add 1001 \
     -v "$(host_workspace):${WORKDIR}" \
-    -w "${WORKDIR}" \
+    -w "$(container_workdir)" \
     -e CMAKE_GENERATOR=Ninja \
     -e CMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -e ASAN_SYMBOLIZER_PATH=/usr/local/bin/llvm-symbolizer \
