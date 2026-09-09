@@ -246,7 +246,10 @@ def msvc_tool(name):
     run = subprocess.run([vswhere, "-products", "*", "-latest", "-find",
                           rf"VC\Tools\MSVC\**\{name}.exe"], capture_output=True, text=True)
     hits = [line.strip() for line in run.stdout.splitlines() if line.strip()]
-    host = "Host" + os.environ.get("PROCESSOR_ARCHITECTURE", "AMD64").replace("AMD64", "x64").lower()
+    # An installation carries a toolchain per host architecture; picking one
+    # built for another host yields a binary that cannot run.
+    host = {"amd64": "hostx64", "arm64": "hostarm64", "x86": "hostx86"}.get(
+        os.environ.get("PROCESSOR_ARCHITECTURE", "AMD64").lower(), "hostx64")
     return next((h for h in hits if host in h.lower()), hits[0] if hits else None)
 
 
@@ -313,6 +316,11 @@ def call_target(fn, insn):
         if sym.startswith(fn + "+"):
             return "(unresolved)"
         return re.sub(r"\+0x[0-9a-fA-F]+$", "", sym)
+    # A register name can be valid hex: RISC-V's a5 and s0, AArch64's x1d.
+    # The register test comes first, so `jalr a5` is an indirect call and
+    # not a call to address 0xa5.
+    if REGISTER.match(insn.operands):
+        return "(indirect)"
     if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", insn.operands):
         return "0x" + insn.operands.removeprefix("0x")
     if re.fullmatch(r"[?_a-zA-Z@$.][\w?@$.]*", insn.operands) and not REGISTER.match(insn.operands):
@@ -644,7 +652,14 @@ def cmd_audit(args):
         rows = list(quality_rows(arch, functions, hot, allow + "|" + OUTLINE_ATOMICS if gcov else allow))
         instrumented = gcov or any(re.match(RUNTIME, c) for _, q in rows for c in q["calls"])
         for fn, q in rows:
-            good = not q["unexpected"] and (instrumented or q["loops"] <= limits.get("max_loops", 24))
+            # Instrumented code is not the code that ships, and both quality
+            # measures read it wrong: the counters split every block, and a
+            # tail call becomes a real call because the counter has to run
+            # after it (the xthead kernel delegates its single-block entries
+            # to the scalar table that way). The ISA rules above still hold,
+            # which is what a coverage lane is there to check.
+            good = instrumented or (not q["unexpected"] and
+                                    q["loops"] <= limits.get("max_loops", 24))
             print(f"    {verdict(good)} {format_row(short(fn).split('::')[-1], q)}")
             for c, n in q["unexpected"].most_common():
                 print(f"{'':11}unexpected call: {c} x{n}")
@@ -652,7 +667,7 @@ def cmd_audit(args):
                 print(f"{'':11}indirect call site: {site}")
             failures += not good
         if instrumented:
-            print(f"    {'':4} instrumented ({'gcov notes beside the object' if gcov else 'sanitizer or coverage runtime called'}): loop budget not applied")
+            print(f"    {'':4} instrumented ({'gcov notes beside the object' if gcov else 'sanitizer or coverage runtime called'}): loop and call budgets not applied")
         if req and rows:
             # The unrolled core: the hot function carrying the most vector
             # instructions (the others may be drivers around it).
