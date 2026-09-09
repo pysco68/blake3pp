@@ -85,16 +85,45 @@ case "${preset}" in
     ;;
 esac
 
+# Tests that run threads of their own, or measure something: giving them
+# a core each while the rest of the suite saturates the machine makes
+# both slower and the timing-sensitive ones flaky. Everything else is a
+# single-core computation and parallelises freely (measured on a full
+# qemu lane: 18 s serial against 5 s at -j8, same 80 passes).
+CTEST_SERIAL='parallel|multi-core|quadrant|pool|thread|bench_smoke|bench_file_smoke|stdin_parallel|gen_threads|hashes files in sequence'
+
+# A failing pass does not stop the rest: every configuration of the
+# emulator matrix, and both halves of each, run to the end, and the
+# script fails once at the bottom naming all of them. One broken
+# variant otherwise hides whatever the other configurations would have
+# said, which on a cross lane is most of the information in the run.
+failed_passes=()
+
 run_ctest() {  # <label> [QEMU_CPU value] [extra ctest args...]
   local label=$1 cpu=${2-}
   shift; [ $# -gt 0 ] && shift
   echo "::group::ctest ${preset} [${label}]"
-  if [ -n "${cpu}" ]; then
-    QEMU_CPU="${cpu}" ctest --test-dir "${build_dir}" --output-on-failure "$@"
-  else
-    env -u QEMU_CPU ctest --test-dir "${build_dir}" --output-on-failure "$@"
-  fi
+  # --no-tests=ignore: a preset whose suite is one aggregate entry (wasm)
+  # matches neither half, and an empty selection is not a failure here.
+  local -a env_prefix=(env -u QEMU_CPU)
+  [ -n "${cpu}" ] && env_prefix=(env "QEMU_CPU=${cpu}")
+  "${env_prefix[@]}" ctest --test-dir "${build_dir}" --output-on-failure \
+    --no-tests=ignore -j"$(nproc)" -E "${CTEST_SERIAL}" "$@" \
+    || failed_passes+=("${label} (parallel)")
+  "${env_prefix[@]}" ctest --test-dir "${build_dir}" --output-on-failure \
+    --no-tests=ignore -R "${CTEST_SERIAL}" "$@" \
+    || failed_passes+=("${label} (serial)")
   echo "::endgroup::"
+}
+
+# The emulator matrix (VLEN, feature-off configurations) runs where it
+# earns its minutes: on the musl presets, whose binaries are the ones
+# released and run on real boards, and on the coverage presets, where
+# each configuration selects a different kernel and so contributes
+# different lines. A plain cross lane proves the compiler builds and
+# passes, which the default configuration already shows.
+full_emulator_matrix() {
+  [[ "${preset}" == *zigmusl* || "${preset}" == *coverage* ]]
 }
 
 case "${preset}" in
@@ -103,34 +132,32 @@ case "${preset}" in
     # 16 -> sve2_128, sve=off -> the NEON-only regression, the config
     # that catches load-time SVE leaks (the experimental::simd trap).
     run_ctest default
-    run_ctest sve-vl256 "max,sve-default-vector-length=32"
-    run_ctest sve-vl128 "max,sve-default-vector-length=16"
-    run_ctest no-sve "max,sve=off"
+    if full_emulator_matrix; then
+      run_ctest sve-vl256 "max,sve-default-vector-length=32"
+      run_ctest sve-vl128 "max,sve-default-vector-length=16"
+      run_ctest no-sve "max,sve=off"
+    fi
     ;;
   *riscv64*)
     # RVV VLEN matrix (bits; qemu's default max CPU is VLEN=128 with V and
     # Zvbb on), the Zvbb-off and V-off fallbacks. NOT -cpu rv64: it cannot
     # even run a resolute-glibc binary (RVA23 userland).
     run_ctest default
-    run_ctest rvv-vlen256 "max,vlen=256"
-    run_ctest rvv-vlen512 "max,vlen=512"
-    run_ctest no-zvbb "max,zvbb=false"
-    run_ctest no-v "max,v=false"
-    # XTheadVector compile coverage: the kernel builds and links into the
-    # fat binary; execution needs the Xuantie qemu fork (not in the CI
-    # image; see docker/riscv64-gcc15.Dockerfile), so under mainline
-    # qemu the variant reports unavailable and the suite proves exactly
-    # that. The gcc preset gets an extra opt-in build here; the MUSL
-    # preset carries xthead by DEFAULT via the external-gcc object route
+    if full_emulator_matrix; then
+      run_ctest rvv-vlen256 "max,vlen=256"
+      run_ctest rvv-vlen512 "max,vlen=512"
+      run_ctest no-zvbb "max,zvbb=false"
+      run_ctest no-v "max,v=false"
+    fi
+    # The XTheadVector kernel is NOT built a second time here. The musl
+    # preset carries it by default through the external-gcc object route
     # (LLVM never merged XTheadVector; see EXTERNAL_COMPILER in
-    # cmake/ArchKernels.cmake), covered by the plain matrix above.
+    # cmake/ArchKernels.cmake), so the same source goes through the same
+    # GCC in the lane whose binaries ship, and the Cloud-V Pioneer runs
+    # that kernel on real 0.7.1 silicon. A second full build here proved
+    # only that it compiles, for a variant mainline qemu cannot execute,
+    # at the price of building the whole project twice.
     if [[ "${preset}" == *gcc* ]]; then
-      xthead_dir="build/${preset}-xthead"
-      configure_and_build "${preset}" "${xthead_dir}" -DBLAKE3PP_XTHEAD_KERNEL=ON
-      audit_kernels "${xthead_dir}"
-      echo "::group::ctest ${preset} [xthead-compiled-in]"
-      ctest --test-dir "${xthead_dir}" --output-on-failure
-      echo "::endgroup::"
       # Freestanding xthead verifier (tests/xthead_verify.cpp): no libc,
       # raw syscalls, runs on ANY riscv64 Linux. Built here so the
       # Cloud-V Pioneer job can exercise the 0.7.1 kernel on real
@@ -156,8 +183,10 @@ case "${preset}" in
     # generations. The scalar fallback path is exercised by the generic
     # all-arch tests; no ppc64le model is vector-less.
     run_ctest default
-    run_ctest power9 power9
-    run_ctest power10 power10
+    if full_emulator_matrix; then
+      run_ctest power9 power9
+      run_ctest power10 power10
+    fi
     ;;
   *s390x*)
     # BIG-ENDIAN lane. qemu's max carries z14 vector-enhancements (the
@@ -173,7 +202,9 @@ case "${preset}" in
     # legitimate target for the project's own code only; the sysroot's
     # libraries are the distro's.
     run_ctest default
-    run_ctest no-vxe "max,vxeh=off"
+    if full_emulator_matrix; then
+      run_ctest no-vxe "max,vxeh=off"
+    fi
     # (max,vx=off is NOT a runnable config: Ubuntu's s390x userland
     # baseline is z13-with-vector, and removing vx kills ld.so before
     # main, the same class as ppc64le's power9+ userland baseline.)
@@ -298,4 +329,15 @@ report_coverage() {
 }
 if [ -n "${coverage}" ]; then
   report_coverage
+fi
+
+# The coverage report is written first, so a lane that fails still
+# uploads what its passing tests covered.
+if [ "${#failed_passes[@]}" -gt 0 ]; then
+  echo "::error::${preset}: ${#failed_passes[@]} failing test pass(es): ${failed_passes[*]}"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    { echo "### failing test passes: ${preset}"
+      printf -- '- %s\n' "${failed_passes[@]}"; } >> "${GITHUB_STEP_SUMMARY}"
+  fi
+  exit 1
 fi
