@@ -92,3 +92,9 @@ BLAKE3PP_ARCH(vsx, "vsx", 175)
 /// SIMD target, every word load and store byteswapped (BLAKE3 is defined
 /// little-endian). Detected through HWCAP_S390_VXRS_EXT.
 BLAKE3PP_ARCH(vxe, "vxe", 176)
+/// MIPS MSA, 128-bit lanes (MIPS32r5/MIPS64r5 and later). Built through
+/// the vector-extension provider: no std provider deduces a width on this
+/// target and xsimd has no MSA backend. Detected through HWCAP_MIPS_MSA.
+/// EMULATOR-ONLY: validated under qemu against the golden vectors, never
+/// on MSA silicon.
+BLAKE3PP_ARCH(msa, "msa", 177)

@@ -30,6 +30,13 @@ variable "UBUNTU" {
   }
 }
 
+# The MIPS lane's anchor. Ubuntu carries no mips64el cross compiler at any
+# release, so this one image sits on Debian instead; base.Dockerfile's
+# package list is distro-neutral and takes it unchanged.
+variable "DEBIAN" {
+  default = "debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
+}
+
 variable "CMAKE_VERSION" { default = "4.3.2" }
 variable "NINJA_VERSION" { default = "1.13.2" }
 variable "CMAKE_RE_VERSION" { default = "0.0.87" }
@@ -37,8 +44,8 @@ variable "DOCKER_CLI_VERSION" { default = "28.3.3" }
 variable "ZIG_VERSION"   { default = "0.16.0" }
 
 group "default" {
-  targets = ["base", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "ppc64le-gcc15", "s390x-gcc15", "zig",
-             "emscripten"]
+  targets = ["base", "base-debian13", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "ppc64le-gcc15",
+             "s390x-gcc15", "mips64el-gcc14", "zig", "emscripten"]
 }
 
 # One recipe instantiated per release. Pushed too (cheap) so CI matrix jobs
@@ -56,6 +63,22 @@ target "base" {
     DOCKER_CLI_VERSION = DOCKER_CLI_VERSION
   }
   tags = tc_tags("base-${item.rel}")
+}
+
+# Same recipe, Debian rather than Ubuntu, for the one target Ubuntu has no
+# cross compiler for. Not part of the base matrix above: it is an exception,
+# and spelling it separately keeps the glibc-floor story of that matrix intact.
+target "base-debian13" {
+  context    = "."
+  dockerfile = "docker/base.Dockerfile"
+  args = {
+    BASE_IMAGE       = DEBIAN
+    CMAKE_VERSION    = CMAKE_VERSION
+    NINJA_VERSION    = NINJA_VERSION
+    CMAKE_RE_VERSION = CMAKE_RE_VERSION
+    DOCKER_CLI_VERSION = DOCKER_CLI_VERSION
+  }
+  tags = tc_tags("base-debian13")
 }
 
 target "gcc" {
@@ -138,4 +161,11 @@ target "s390x-gcc15" {
   dockerfile = "docker/s390x-gcc15.Dockerfile"
   contexts   = { base = "target:base-2604" }
   tags       = tc_tags("s390x-gcc15")
+}
+
+target "mips64el-gcc14" {
+  context    = "."
+  dockerfile = "docker/mips64el-gcc14.Dockerfile"
+  contexts   = { base = "target:base-debian13" }
+  tags       = tc_tags("mips64el-gcc14")
 }

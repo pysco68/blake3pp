@@ -220,6 +220,24 @@ case "${preset}" in
     # baseline is z13-with-vector, and removing vx kills ld.so before
     # main, the same class as ppc64le's power9+ userland baseline.)
     ;;
+  *mips64el*)
+    # The only lane whose DEFAULT model is the vector-less one: MSA is a
+    # MIPS32r5/MIPS64r5 extension and qemu's default mips64el core is
+    # r2-era, so the unset-QEMU_CPU pass is a genuine
+    # dispatch-must-refuse test rather than a formality.
+    #
+    # Loongson-3A4000 is the model that supplies MSA. It is also the only
+    # one that supplies it correctly: qemu's XBurstR2 (Ingenic XBurst2,
+    # the core family that actually ships MSA in silicon) executes the
+    # encodings, leaves HWCAP_MIPS_MSA clear and returns wrong answers.
+    # Nothing traps. The capability check is what stands between that
+    # core and a silently wrong digest, which is the whole argument for
+    # checking rather than assuming.
+    run_ctest default
+    if full_emulator_matrix; then
+      run_ctest msa Loongson-3A4000
+    fi
+    ;;
   wasm32-*)
     run_ctest default
     ;;

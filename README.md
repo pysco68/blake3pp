@@ -14,9 +14,25 @@ single binary with zero-overhead runtime dispatch:
 | RISC-V        | RVV 1.0 at VLEN 128/256/512, each with a Zvbb-rotate twin; opt-in T-Head draft-0.7.1 XTheadVector |
 | POWER         | VSX |
 | IBM z         | VXE (z14+, **big-endian**) |
+| MIPS          | MSA (MIPS32r5/MIPS64r5+) — **emulator-tested only**, see below |
 | wasm          | SIMD128 (see [The wasm build](#the-wasm-build)) |
 
 Every build also carries a scalar kernel as fallback option. 
+
+The MSA kernel carries an asterisk the others do not. It is validated
+against the official test vectors under qemu, byte-identical to the
+x86-64 result, and its dispatch is validated both ways: an emulated core
+without MSA falls back to scalar, one with it selects the kernel. No MSA
+silicon has ever run it, and none is reachable, so it ships with no
+throughput number and should be treated as untested on hardware. It is
+built by GCC through the vector-extension provider, because no std
+provider deduces a vector width on this target and xsimd has no MSA
+backend, and clang emits no MSA from the same source at all. That is
+why the MIPS archive links a static glibc where the others link a
+static musl: it is equally standalone, with no interpreter, no dynamic
+section and no `GLIBC_` version symbol, so it carries no glibc floor.
+The one thing a static glibc gives up is NSS, which this tool never
+asks for.
 
 The SVE kernels are vector-length-specific: dispatch selects one only
 when the CPU's runtime vector length equals the length the kernel was

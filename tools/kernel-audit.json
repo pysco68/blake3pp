@@ -21,78 +21,240 @@
   },
   "x86_64": {
     "variants": [
-      { "match": "scalar",
-        "forbid": [ { "name": "VEX or AVX-512", "mnemonic": "^v[a-z]", "operand": "\\b[yz]mm\\d|%?k[0-7]\\b" } ] },
-      { "match": "sse42",
-        "require": { "name": "xmm", "operand": "\\bxmm\\d+" },
-        "forbid": [ { "name": "VEX or AVX-512", "mnemonic": "^v[a-z]", "operand": "\\b[yz]mm\\d|%?k[0-7]\\b" } ] },
-      { "match": "avx2",
-        "require": { "name": "ymm", "operand": "\\bymm\\d+" },
-        "forbid": [ { "name": "AVX-512", "operand": "\\bzmm\\d|%?k[0-7]\\b" } ] },
-      { "match": "avx512",
-        "require": { "name": "zmm", "operand": "\\bzmm\\d+" } }
+      {
+        "match": "scalar",
+        "forbid": [
+          {
+            "name": "VEX or AVX-512",
+            "mnemonic": "^v[a-z]",
+            "operand": "\\b[yz]mm\\d|%?k[0-7]\\b"
+          }
+        ]
+      },
+      {
+        "match": "sse42",
+        "require": {
+          "name": "xmm",
+          "operand": "\\bxmm\\d+"
+        },
+        "forbid": [
+          {
+            "name": "VEX or AVX-512",
+            "mnemonic": "^v[a-z]",
+            "operand": "\\b[yz]mm\\d|%?k[0-7]\\b"
+          }
+        ]
+      },
+      {
+        "match": "avx2",
+        "require": {
+          "name": "ymm",
+          "operand": "\\bymm\\d+"
+        },
+        "forbid": [
+          {
+            "name": "AVX-512",
+            "operand": "\\bzmm\\d|%?k[0-7]\\b"
+          }
+        ]
+      },
+      {
+        "match": "avx512",
+        "require": {
+          "name": "zmm",
+          "operand": "\\bzmm\\d+"
+        }
+      }
     ],
     "binary": [
-      { "name": "VEX or AVX-512", "mnemonic": "^v[a-z]", "operand": "\\b[yz]mm\\d",
-        "outside": "kern::(avx2|avx512)::|_avx|_evex" }
+      {
+        "name": "VEX or AVX-512",
+        "mnemonic": "^v[a-z]",
+        "operand": "\\b[yz]mm\\d",
+        "outside": "kern::(avx2|avx512)::|_avx|_evex"
+      }
     ]
   },
   "aarch64": {
     "variants": [
-      { "match": "scalar",
-        "forbid": [ { "name": "SVE", "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]" } ] },
-      { "match": "neon",
-        "require": { "name": "NEON", "operand": "\\bv\\d+\\b" },
-        "forbid": [ { "name": "SVE", "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]" } ] },
-      { "match": "sve\\d+",
-        "require": { "name": "SVE", "operand": "\\bz\\d+\\b" },
-        "forbid": [ { "name": "SVE2", "mnemonic": "^(xar|eor3|bcax)$", "operand": "\\bz\\d+\\b", "all": true } ] },
-      { "match": "sve2_\\d+",
-        "require": { "name": "SVE2 (xar, eor3)", "mnemonic": "^(xar|eor3|bcax)$", "operand": "\\bz\\d+\\b", "all": true, "min": 50 } }
+      {
+        "match": "scalar",
+        "forbid": [
+          {
+            "name": "SVE",
+            "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]"
+          }
+        ]
+      },
+      {
+        "match": "neon",
+        "require": {
+          "name": "NEON",
+          "operand": "\\bv\\d+\\b"
+        },
+        "forbid": [
+          {
+            "name": "SVE",
+            "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]"
+          }
+        ]
+      },
+      {
+        "match": "sve\\d+",
+        "require": {
+          "name": "SVE",
+          "operand": "\\bz\\d+\\b"
+        },
+        "forbid": [
+          {
+            "name": "SVE2",
+            "mnemonic": "^(xar|eor3|bcax)$",
+            "operand": "\\bz\\d+\\b",
+            "all": true
+          }
+        ]
+      },
+      {
+        "match": "sve2_\\d+",
+        "require": {
+          "name": "SVE2 (xar, eor3)",
+          "mnemonic": "^(xar|eor3|bcax)$",
+          "operand": "\\bz\\d+\\b",
+          "all": true,
+          "min": 50
+        }
+      }
     ],
     "binary": [
-      { "name": "SVE", "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]", "outside": "kern::sve" }
+      {
+        "name": "SVE",
+        "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]",
+        "outside": "kern::sve"
+      }
     ]
   },
   "riscv64": {
     "variants": [
-      { "match": "scalar",
-        "forbid": [ { "name": "vector", "mnemonic": "^(th\\.)?v[a-z]" } ] },
-      { "match": "rvv\\d+",
-        "require": { "name": "RVV", "mnemonic": "^v[a-z]" },
-        "forbid": [ { "name": "Zvbb", "mnemonic": "^v(ror|rol|andn|brev8?|rev8|clz|ctz|cpop|wsll)\\." },
-                    { "name": "XTheadVector", "mnemonic": "^th\\." } ] },
-      { "match": "rvv\\d+_zvbb",
-        "require": { "name": "Zvbb rotates", "mnemonic": "^vro[rl]\\.", "min": 50 },
-        "forbid": [ { "name": "XTheadVector", "mnemonic": "^th\\." } ] },
-      { "match": "xthead",
-        "require": { "name": "XTheadVector", "mnemonic": "^th\\.v" },
-        "quality": { "min_vector": 400 },
-        "forbid": [ { "name": "RVV 1.0", "mnemonic": "^v(setvli|setivli|le\\d+|se\\d+|ror|rol|mv)\\." } ] }
+      {
+        "match": "scalar",
+        "forbid": [
+          {
+            "name": "vector",
+            "mnemonic": "^(th\\.)?v[a-z]"
+          }
+        ]
+      },
+      {
+        "match": "rvv\\d+",
+        "require": {
+          "name": "RVV",
+          "mnemonic": "^v[a-z]"
+        },
+        "forbid": [
+          {
+            "name": "Zvbb",
+            "mnemonic": "^v(ror|rol|andn|brev8?|rev8|clz|ctz|cpop|wsll)\\."
+          },
+          {
+            "name": "XTheadVector",
+            "mnemonic": "^th\\."
+          }
+        ]
+      },
+      {
+        "match": "rvv\\d+_zvbb",
+        "require": {
+          "name": "Zvbb rotates",
+          "mnemonic": "^vro[rl]\\.",
+          "min": 50
+        },
+        "forbid": [
+          {
+            "name": "XTheadVector",
+            "mnemonic": "^th\\."
+          }
+        ]
+      },
+      {
+        "match": "xthead",
+        "require": {
+          "name": "XTheadVector",
+          "mnemonic": "^th\\.v"
+        },
+        "quality": {
+          "min_vector": 400
+        },
+        "forbid": [
+          {
+            "name": "RVV 1.0",
+            "mnemonic": "^v(setvli|setivli|le\\d+|se\\d+|ror|rol|mv)\\."
+          }
+        ]
+      }
     ],
     "binary": [
-      { "name": "vector", "mnemonic": "^(th\\.)?v[a-z]",
-        "outside": "kern::(rvv|xthead)|cpu_detect|vsetvli|detail::(riscv|test)" }
+      {
+        "name": "vector",
+        "mnemonic": "^(th\\.)?v[a-z]",
+        "outside": "kern::(rvv|xthead)|cpu_detect|vsetvli|detail::(riscv|test)"
+      }
     ]
   },
   "ppc64": {
     "variants": [
-      { "match": "scalar" },
-      { "match": "vsx",
-        "require": { "name": "VSX", "mnemonic": "^(xx|xv|xs|lxv|stxv|v[a-z])" } }
+      {
+        "match": "scalar"
+      },
+      {
+        "match": "vsx",
+        "require": {
+          "name": "VSX",
+          "mnemonic": "^(xx|xv|xs|lxv|stxv|v[a-z])"
+        }
+      }
     ],
     "binary": []
   },
   "s390x": {
     "variants": [
-      { "match": "scalar",
-        "forbid": [ { "name": "z14/z15 vector", "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)" } ] },
-      { "match": "vxe",
-        "require": { "name": "z vector", "mnemonic": "^v[a-z]" } }
+      {
+        "match": "scalar",
+        "forbid": [
+          {
+            "name": "z14/z15 vector",
+            "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)"
+          }
+        ]
+      },
+      {
+        "match": "vxe",
+        "require": {
+          "name": "z vector",
+          "mnemonic": "^v[a-z]"
+        }
+      }
     ],
     "binary": [
-      { "name": "z14/z15 vector", "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)",
-        "outside": "kern::vxe" }
+      {
+        "name": "z14/z15 vector",
+        "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)",
+        "outside": "kern::vxe"
+      }
     ]
+  },
+  "mips64": {
+    "variants": [
+      {
+        "match": "scalar"
+      },
+      {
+        "match": "msa",
+        "require": {
+          "name": "MSA",
+          "operand": "\\$w\\d+\\b"
+        }
+      }
+    ],
+    "binary": []
   }
 }

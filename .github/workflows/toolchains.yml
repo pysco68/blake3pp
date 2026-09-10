@@ -89,7 +89,7 @@ jobs:
         run: |
           TAG="${{ needs.ident.outputs.tag }}" \
           EXTRA_TAG="${{ needs.ident.outputs.move_latest == 'true' && 'latest' || '' }}" \
-          docker buildx bake -f docker/docker-bake.hcl base --push \
+          docker buildx bake -f docker/docker-bake.hcl base base-debian13 --push \
             --set "base-*.cache-from=type=registry,ref=${CACHE}:base" \
             --set "base-*.cache-to=type=registry,ref=${CACHE}:base,mode=max"
 
@@ -114,6 +114,9 @@ jobs:
           - { target: riscv64-gcc15, rel: "2604" }
           - { target: ppc64le-gcc15, rel: "2604" }
           - { target: s390x-gcc15, rel: "2604" }
+          # The one image on a Debian base: no Ubuntu release packages a
+          # mips64el cross compiler (see base-debian13 in the bake file).
+          - { target: mips64el-gcc14, rel: "debian13" }
           - { target: zig,         rel: "2604" }
           - { target: emscripten,  rel: "2604" }
     steps:

@@ -66,6 +66,7 @@ IMAGE_FOR = [
     ("linux-arm64-gcc15-*", "arm64-gcc15"),
     ("linux-riscv64-gcc15-*", "riscv64-gcc15"),
     ("linux-ppc64le-gcc15-*", "ppc64le-gcc15"),
+    ("linux-mips64el-gcc14-*", "mips64el-gcc14"),
     ("linux-s390x-gcc15-*", "s390x-gcc15"),
     ("*zigmusl*", "zig"),
     ("wasm32-*", "emscripten"),

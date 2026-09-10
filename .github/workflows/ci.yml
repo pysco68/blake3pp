@@ -313,6 +313,13 @@ jobs:
           # matrices live in tools/ci-test.sh.
           - { preset: linux-ppc64le-gcc15-cxx23, image: ppc64le-gcc15 }
           - { preset: linux-s390x-gcc15-cxx23, image: s390x-gcc15 }
+          # MIPS cross, EMULATOR-ONLY in a stronger sense than the rest:
+          # the others have hardware lanes or reachable silicon, and no
+          # MSA machine is reachable at all. Every number this lane could
+          # produce would be a qemu number, so it asserts digests only.
+          # Its default qemu model has no MSA (dispatch must fall back to
+          # scalar) and Loongson-3A4000 supplies it; see tools/ci-test.sh.
+          - { preset: linux-mips64el-gcc14-cxx23, image: mips64el-gcc14 }
           # arm64 cross, emulator-in-the-loop (the SVE vector-length and
           # feature-off matrices live in tools/ci-test.sh; the aarch64
           # STATIC twin ships from the binaries job, feeding Neoverse).
@@ -480,6 +487,11 @@ jobs:
           # emulator-tested here and flagged as such in the notes.
           - { preset: linux-ppc64le-zigmusl-cxx23-static, image: zig, artifact: ppc64le }
           - { preset: linux-s390x-zigmusl-cxx23-static, image: zig, artifact: s390x }
+          # MIPS static: GCC rather than zig, because clang's MIPS backend
+          # emits no MSA from the kernel's vector code (measured: zero
+          # against GCC's 3514). Static glibc rather than musl for the same
+          # reason. No MSA silicon exists to test it on, ever.
+          - { preset: linux-mips64el-gcc14-cxx23-static, image: mips64el-gcc14, artifact: mips64el }
     container:
       image: ghcr.io/${{ github.repository }}/toolchain-${{ matrix.image }}:${{ needs.changes.outputs.tag }}
       credentials:

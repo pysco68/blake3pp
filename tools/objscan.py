@@ -62,11 +62,13 @@ import sys
 
 # ---------------------------------------------------------------- formats
 
-ELF_MACHINES = {62: "x86_64", 183: "aarch64", 243: "riscv64", 21: "ppc64", 22: "s390x"}
+ELF_MACHINES = {62: "x86_64", 183: "aarch64", 243: "riscv64", 21: "ppc64", 22: "s390x",
+                8: "mips64"}
 PE_MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64"}
 MACHO_CPUTYPES = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
 BINUTILS_PREFIX = {"aarch64": "aarch64-linux-gnu-", "riscv64": "riscv64-linux-gnu-",
-                   "ppc64": "powerpc64le-linux-gnu-", "s390x": "s390x-linux-gnu-"}
+                   "ppc64": "powerpc64le-linux-gnu-", "s390x": "s390x-linux-gnu-",
+                   "mips64": "mips64el-linux-gnuabi64-"}
 
 
 def identify(path):
@@ -344,6 +346,9 @@ VECTOR = {
     "riscv64": (r"^(th\.)?v[a-z]", None),
     "ppc64": (r"^(v[a-z]|xx|xv|xs|lxv|stxv|lvx|stvx)", None),
     "s390x": (r"^[vw][a-z]", None),
+    # MSA is the only thing on MIPS with $w registers; its mnemonics are
+    # suffixed rather than prefixed and .d/.w collide with scalar FP.
+    "mips64": (None, r"\$w\d+\b"),
 }
 # Control flow inside a function (loops) and out of it (calls).
 BRANCH = {
@@ -352,6 +357,7 @@ BRANCH = {
     "riscv64": r"^(c\.)?(b[a-z]*|j)$",
     "ppc64": r"^b(?!l$|lrl?$|ctrl?$|l[+-]$)",
     "s390x": r"^(j\w*|br|brcl?|brctg?|bc|c[lg]?[ir]?j\w*)$",
+    "mips64": r"^(b(?!al$)[a-z]*|j)$",
 }
 CALL = {
     "x86_64": r"^call",
@@ -359,6 +365,7 @@ CALL = {
     "riscv64": r"^(jalr?|call)$",
     "ppc64": r"^(bl|bctrl|bl[+-])$",
     "s390x": r"^(brasl?|basr|bas)$",
+    "mips64": r"^(jal|jalr|bal)$",
 }
 # A memory operand through the stack pointer (or the frame pointer).
 STACK = {
@@ -367,6 +374,7 @@ STACK = {
     "riscv64": r"\((sp|s0)\)",
     "ppc64": r"\(r?1\)|\(r?31\)",
     "s390x": r"\(%r1[15]\)",
+    "mips64": r"\((sp|s8|fp)\)",
 }
 
 

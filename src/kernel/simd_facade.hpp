@@ -5,6 +5,11 @@
 //
 //   BLAKE3PP_FORCE_SCALAR   width-1 plain uint32_t (the scalar kernel, and
 //                           the correctness oracle for everything else)
+//   BLAKE3PP_FORCE_VEXT     per-TU override to GNU vector extensions at a
+//                           width the build names. For ISAs no provider
+//                           covers: the std providers deduce width 1 on a
+//                           target their ISA list does not know, and xsimd
+//                           has no backend at all (MSA is the customer).
 //   BLAKE3PP_FORCE_XSIMD    per-TU override to xsimd even when a std
 //                           provider exists. The SVE kernels need it:
 //                           libstdc++'s experimental::simd SVE backend
@@ -38,6 +43,8 @@
 
 #if defined(BLAKE3PP_FORCE_SCALAR)
 #include "kernel/simd/scalar.hpp"
+#elif defined(BLAKE3PP_FORCE_VEXT)
+#include "kernel/simd/vext.hpp"
 #elif defined(BLAKE3PP_FORCE_XSIMD)
 #include "kernel/simd/xsimd.hpp"
 #elif defined(BLAKE3PP_HAS_STD_SIMD)
@@ -47,5 +54,5 @@
 #elif defined(BLAKE3PP_HAS_XSIMD)
 #include "kernel/simd/xsimd.hpp"
 #else
-#error "No simd provider: expected BLAKE3PP_FORCE_SCALAR, BLAKE3PP_HAS_STD_SIMD, BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD or BLAKE3PP_HAS_XSIMD"
+#error "No simd provider: expected BLAKE3PP_FORCE_SCALAR, BLAKE3PP_FORCE_VEXT, BLAKE3PP_HAS_STD_SIMD, BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD or BLAKE3PP_HAS_XSIMD"
 #endif

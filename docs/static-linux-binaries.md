@@ -1,7 +1,10 @@
 # The static Linux binaries
 
 Every release ships five fully static Linux archives, one per
-architecture: x86_64, aarch64, riscv64, ppc64le and s390x. Each archive
+architecture: x86_64, aarch64, riscv64, ppc64le, s390x and mips64el
+(that last one built by GCC against a static glibc rather than by zig
+against musl, equally standalone and equally free of a glibc floor, but
+emulator-tested only; see the MSA note in the README). Each archive
 carries the tools and benchmarks (`blake3ppsum`, `blake3ppgen`,
 `blake3pp_bench`, `blake3pp_bench_file`); the library itself is meant to
 be built from source. This page explains what "fully static" buys, how

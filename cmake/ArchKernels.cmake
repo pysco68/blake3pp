@@ -94,8 +94,8 @@ blake3pp_kernel_switch(VROR_ROTATE 1
   "riscv Zvbb: single-instruction vror rotate instead of the 3-op shift-or")
 
 function(blake3pp_add_kernel ns)
-  cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD"
-    "SOURCE;EXTERNAL_COMPILER" "ARCH_FLAGS")
+  cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD;FORCE_VEXT"
+    "SOURCE;EXTERNAL_COMPILER;VEXT_BYTES" "ARCH_FLAGS")
 
   # Almost every variant is an instantiation of the one kernel TU; SOURCE
   # substitutes a standalone hand-written TU for the ISAs the facade
@@ -169,6 +169,17 @@ function(blake3pp_add_kernel ns)
     # The scalar fallback must be genuinely scalar: without this, the simd
     # facade would still pick the baseline vector width (SSE2 on x86-64).
     target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_FORCE_SCALAR=1")
+  endif()
+  if(AK_FORCE_VEXT)
+    # Pin this TU to the vector-extension provider at a width the caller
+    # names (see BLAKE3PP_FORCE_VEXT in src/kernel/simd_facade.hpp). For
+    # ISAs no provider covers: the std providers deduce width 1 on a
+    # target their ISA list does not know, and xsimd has no backend.
+    if(NOT AK_VEXT_BYTES)
+      message(FATAL_ERROR "kernel ${ns}: FORCE_VEXT needs VEXT_BYTES")
+    endif()
+    target_compile_definitions(${tgt} PRIVATE
+      "BLAKE3PP_FORCE_VEXT=1" "BLAKE3PP_VEXT_BYTES=${AK_VEXT_BYTES}")
   endif()
   if(AK_FORCE_XSIMD)
     # Pin this TU to the xsimd provider regardless of the project-wide

@@ -197,6 +197,26 @@
       }
     },
     {
+      "name": "linux-mips64el-gcc14-cxx23",
+      "displayName": "MIPS cross (GCC 14, MSA via vector extensions, qemu-mips64el; EMULATOR-ONLY)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-mips64el-gcc14-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-mips64el-gcc14-cxx23/linux-mips64el-gcc14-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "linux-mips64el-gcc14-cxx23-static",
+      "displayName": "MIPS cross, static (GCC 14 + static glibc; the shipped archive; EMULATOR-ONLY)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-mips64el-gcc14-cxx23-static",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-mips64el-gcc14-cxx23-static/linux-mips64el-gcc14-cxx23-static.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "linux-ppc64le-gcc15-cxx23-coverage",
       "displayName": "POWER cross (GCC 15, VSX via xsimd, qemu-ppc64le) + gcov coverage",
       "generator": "Ninja",
@@ -341,6 +361,14 @@
     {
       "name": "linux-ppc64le-gcc15-cxx23",
       "configurePreset": "linux-ppc64le-gcc15-cxx23"
+    },
+    {
+      "name": "linux-mips64el-gcc14-cxx23",
+      "configurePreset": "linux-mips64el-gcc14-cxx23"
+    },
+    {
+      "name": "linux-mips64el-gcc14-cxx23-static",
+      "configurePreset": "linux-mips64el-gcc14-cxx23-static"
     },
     {
       "name": "linux-ppc64le-gcc15-cxx23-coverage",
@@ -505,6 +533,20 @@
     {
       "name": "linux-ppc64le-gcc15-cxx23",
       "configurePreset": "linux-ppc64le-gcc15-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-mips64el-gcc14-cxx23",
+      "configurePreset": "linux-mips64el-gcc14-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-mips64el-gcc14-cxx23-static",
+      "configurePreset": "linux-mips64el-gcc14-cxx23-static",
       "output": {
         "outputOnFailure": true
       }

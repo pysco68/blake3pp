@@ -431,6 +431,42 @@ function(_blake3pp_register_ppc64_kernels)
   endif()
 endfunction()
 
+function(_blake3pp_register_mips_kernels)
+  # MIPS MSA, 128-bit lanes, through the vector-extension provider rather
+  # than a simd library: xsimd has no MSA backend, and libstdc++ deduces a
+  # NATIVE WIDTH OF 1 here because its ABI list has never heard of the
+  # ISA, so a kernel written against either would compile to scalar code
+  # on a machine with a vector unit. Measured, GCC 14 cross to mips64el at
+  # -march=mips64r5 -mmsa: native_simd<uint32_t> 0 MSA instructions,
+  # explicit 16-byte vector 6. The compiler reaches the ISA; only the
+  # library's width guess does not.
+  #
+  # EMULATOR-ONLY. Correctness is validated byte-identical against the
+  # x86 golden vectors under qemu-mips64el; no MSA silicon has ever run
+  # this kernel, and every throughput number for it would be a qemu
+  # number. It ships with that stated, on the same terms as the POWER and
+  # IBM z variants, minus their hardware.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    return()
+  endif()
+  # -mmsa alone is not enough: MSA is an r5 extension and the distro
+  # baseline is r2, so the arch has to be raised with it. GCC predefines
+  # __mips_msa and __mips_msa_width when both land.
+  set(_blake3pp_msa_smoke [=[
+    #if !(defined(__mips_msa) && __mips_msa_width == 128)
+    #error no msa
+    #endif
+    int main() { return 0; }
+  ]=])
+  blake3pp_probe_flag_candidates(_msa_flags BLAKE3PP_COMPILER_MSA
+    SOURCE "${_blake3pp_msa_smoke}"
+    CANDIDATES "-march=mips64r5|-mmsa" "-march=mips32r5|-mmsa" "-mmsa")
+  if(_msa_flags)
+    string(REPLACE "|" ";" _msa_flags "${_msa_flags}")
+    blake3pp_add_kernel(msa FORCE_VEXT VEXT_BYTES 16 ARCH_FLAGS ${_msa_flags})
+  endif()
+endfunction()
+
 function(_blake3pp_register_s390x_kernels)
   # IBM z vector-enhancements-1 (z14) through the xsimd facade, the
   # first BIG-ENDIAN SIMD target. BLAKE3 is defined little-endian; the
@@ -508,6 +544,8 @@ function(blake3pp_register_kernels)
     _blake3pp_register_ppc64_kernels()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(s390x)$")
     _blake3pp_register_s390x_kernels()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(mips64el|mipsel|mips64|mips)$")
+    _blake3pp_register_mips_kernels()
   elseif(EMSCRIPTEN)
     _blake3pp_register_wasm_kernels()
   endif()

@@ -20,7 +20,7 @@ TAG="${BLAKE3PP_TC_TAG:-latest}"
 WORKDIR=/workspaces/blake3pp
 
 ALL_IMAGES=(gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 riscv64-gcc15 ppc64le-gcc15 s390x-gcc15
-            zig emscripten)
+            mips64el-gcc14 zig emscripten)
 
 die() { echo "tc: $*" >&2; exit 1; }
 
@@ -39,6 +39,7 @@ image_for() {
     linux-riscv64-gcc15-*) echo riscv64-gcc15 ;;
     linux-ppc64le-gcc15-*) echo ppc64le-gcc15 ;;
     linux-s390x-gcc15-*) echo s390x-gcc15 ;;
+    linux-mips64el-gcc14-*) echo mips64el-gcc14 ;;
     *zigmusl*)            echo zig ;;
     wasm32-*)             echo emscripten ;;
     windows-*)            die "windows presets are not containerized (build them natively or in CI)" ;;
