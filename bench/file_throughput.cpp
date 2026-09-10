@@ -19,9 +19,11 @@
 // volumes, where 32x16 recovered it. The sweep is
 // the stopwatch that settles it per machine.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <format>
 #include <fstream>
 #include <string>
@@ -56,9 +58,12 @@ std::string make_test_file(std::size_t mib) {
   return path;
 }
 
-// Best-effort page-cache drop (vm.drop_caches=3). Wants root; with the
-// default direct I/O the cache is bypassed anyway, so a failed drop only
-// leaves metadata/readahead state warm; reported once, not fatal.
+// Best-effort cache drop before every timed rep, so each rep reads the
+// device: vm.drop_caches=3 on Linux, purge(8) on macOS, and on Windows
+// the sequence RAMMap uses (empty the working sets, flush the modified
+// list, purge the standby list). Wants root, or an elevated token on
+// Windows. With direct I/O a failed drop only leaves metadata and
+// readahead state warm; with --no-direct it leaves the data itself warm.
 bool drop_caches() {
 #if defined(__linux__)
   ::sync();
@@ -68,9 +73,59 @@ bool drop_caches() {
   }
   f << "3" << std::flush;
   return f.good();
+#elif defined(__APPLE__)
+  return std::system("/usr/sbin/purge 2>/dev/null") == 0;
+#elif defined(_WIN32)
+#pragma comment(lib, "advapi32.lib")
+  // The memory-list calls need SeProfileSingleProcessPrivilege, and
+  // AdjustTokenPrivileges reports a token without it through
+  // ERROR_NOT_ALL_ASSIGNED rather than by failing.
+  HANDLE token = nullptr;
+  if (!::OpenProcessToken(::GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+    return false;
+  }
+  TOKEN_PRIVILEGES tp{};
+  tp.PrivilegeCount = 1;
+  tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+  const bool enabled =
+      ::LookupPrivilegeValueW(nullptr, L"SeProfileSingleProcessPrivilege",
+                              &tp.Privileges[0].Luid) &&
+      ::AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
+      ::GetLastError() == ERROR_SUCCESS;
+  ::CloseHandle(token);
+  using set_information_fn = LONG(NTAPI*)(ULONG, PVOID, ULONG);
+  const auto set_information = reinterpret_cast<set_information_fn>(
+      ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtSetSystemInformation"));
+  if (!enabled || set_information == nullptr) {
+    return false;
+  }
+  constexpr ULONG system_memory_list_information = 80;
+  // MemoryEmptyWorkingSets, MemoryFlushModifiedList, MemoryPurgeStandbyList
+  for (ULONG command : {2UL, 3UL, 4UL}) {
+    if (set_information(system_memory_list_information, &command, sizeof command) < 0) {
+      return false;
+    }
+  }
+  return true;
 #else
   return false;
 #endif
+}
+
+// best_seconds with the cache dropped before every rep, outside the
+// timed region; without the per-rep drop, a --no-direct run's first rep
+// warms the page cache and every later rep reports RAM speed.
+template <class F>
+double best_cold_seconds(int reps, bool cold, F&& fn) {
+  double best = 1e100;
+  for (int r = 0; r < reps; ++r) {
+    if (cold) {
+      drop_caches();
+    }
+    best = std::min(best, b3tool::best_seconds(1, /*warmup=*/false, fn));
+  }
+  return best;
 }
 
 // --threads resolved to a scheduler: an owned pool of exactly that size
@@ -122,9 +177,9 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
           static_cast<double>(bytes) / (1024.0 * 1024.0), reps,
           opts.direct_io ? "direct I/O" : "--no-direct",
           cold ? "active" : "unavailable",
-          cold ? "vm.drop_caches=3 before every combo"
-               : "not root; direct I/O bypasses the page cache anyway, but "
-                 "metadata/readahead state stays warm");
+          cold ? "before every rep"
+               : "needs root or elevation; direct I/O bypasses the page "
+                 "cache anyway, but metadata/readahead state stays warm");
 
   std::printf("  %10s", "window\\qd");
   for (const unsigned qd : depths) {
@@ -144,12 +199,9 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
     std::printf("  %6zu MiB", w);
     for (const unsigned qd : depths) {
       cooldown();
-      if (cold) {
-        drop_caches();
-      }
       opts.window_bytes = w * 1024 * 1024;
       opts.queue_depth = qd;
-      const double secs = b3tool::best_seconds(reps, /*warmup=*/false, [&] {
+      const double secs = best_cold_seconds(reps, cold, [&] {
         if (seq_only) {
           (void)blake3pp::hash_file(path.c_str(), opts);
         } else {
@@ -256,6 +308,15 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  const bool cold = drop_caches();
+  println(stdout, "cache: {}",
+          cold ? "dropped before every rep"
+          : opts.direct_io
+              ? "not dropped (needs root or elevation); direct I/O bypasses "
+                "it, metadata stays warm"
+              : "NOT DROPPED (needs root or elevation): with --no-direct, "
+                "every rep after the first reads RAM, not the device");
+
   // The raw-io pass below runs unconditionally and heats the machine, so
   // the first hashing measurement must cool down too.
   b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/false);
@@ -263,7 +324,7 @@ int main(int argc, char** argv) {
   // The control group: the identical pipeline delivering windows that are
   // simply released unread. This is the device ceiling as seen through
   // this backend/window/qd; every hash row below is a fraction of it.
-  const double raw_s = b3tool::best_seconds(reps, /*warmup=*/false, [&] {
+  const double raw_s = best_cold_seconds(reps, cold, [&] {
     blake3pp::detail::file_reader r(
         path.c_str(),
         {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
@@ -279,8 +340,7 @@ int main(int argc, char** argv) {
   const auto run = [&](const char* label, auto&& fn) {
     cooldown();
     blake3pp::digest d{};
-    const double best =
-        b3tool::best_seconds(reps, /*warmup=*/false, [&] { d = fn(); });
+    const double best = best_cold_seconds(reps, cold, [&] { d = fn(); });
     println(stdout, "{:<10} {}   ({}...)  [{:3.0f}% of raw]", label,
             b3tool::rate(static_cast<std::size_t>(bytes), best),
             d.to_hex().substr(0, 16), 100.0 * raw_s / best);
