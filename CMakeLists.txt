@@ -21,12 +21,22 @@ set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 option(BLAKE3PP_BUILD_TESTS "Build blake3pp tests" ${PROJECT_IS_TOP_LEVEL})
 option(BLAKE3PP_BUILD_BENCH "Build blake3pp benchmarks" ${PROJECT_IS_TOP_LEVEL})
-# The tools (CLI + benchmarks) use mimalloc by default on every supported
-# target: the parallel paths allocate on window/segment granularity, and
-# both musl's mallocng and Windows' UCRT heap serialize under threads.
-# The LIBRARY stays allocator-neutral, so consumers keep full control;
-# this only touches the executables. Off for wasm (unsupported there).
-if(EMSCRIPTEN)
+# The tools (CLI + benchmarks) use mimalloc by default where the platform
+# allocator serializes under threads: the parallel paths allocate on
+# window/segment granularity, and both musl's mallocng and Windows' UCRT
+# heap take a global lock. The LIBRARY stays allocator-neutral, so
+# consumers keep full control; this only touches the executables.
+#
+# Off for wasm (unsupported there) and off on Apple, which is neither of
+# the cases the option exists for: libmalloc caches per thread and does
+# not serialize, and measurement on an M2 puts mimalloc inside the noise
+# (1.86 GiB/s single-threaded either way, 9.4-10.0 pooled either way).
+# It is also the one platform that cannot take a real malloc override --
+# dyld honors __interpose only in dylibs and the malloc-zone swap crashes
+# at load -- so enabling it there buys nothing and costs a global operator
+# new/delete replacement whose exported symbols a plain strip(1) removes,
+# splitting the program across two allocators. Still selectable by hand.
+if(EMSCRIPTEN OR APPLE)
   set(_blake3pp_tool_mimalloc_default OFF)
 else()
   set(_blake3pp_tool_mimalloc_default ON)

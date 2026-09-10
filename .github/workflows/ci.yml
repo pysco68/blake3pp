@@ -720,6 +720,17 @@ jobs:
           python3 tools/objscan.py audit build/${{ matrix.preset }} \
             --binary build/${{ matrix.preset }}/cli/blake3ppsum \
             || echo "::warning::${{ matrix.preset }}: kernel audit findings, see the log"
+      # Tool binaries for release.yml, from the appleclang build only: the
+      # Homebrew-LLVM build rpaths its bundled libc++ under /opt/homebrew
+      # and is not portable off a brewed machine.
+      #
+      # This runs BEFORE the bench report, so everything below measures and
+      # exercises the binaries in the form they are actually shipped in. It
+      # runs AFTER the kernel audit, which reads the symbols out of
+      # blake3ppsum and needs them still there.
+      - name: Strip the tool binaries
+        if: matrix.preset == 'macos-appleclang-cxx23'
+        run: strip -x build/${{ matrix.preset }}/cli/blake3ppsum build/${{ matrix.preset }}/cli/blake3ppgen build/${{ matrix.preset }}/bench/blake3pp_bench build/${{ matrix.preset }}/bench/blake3pp_bench_file
       - name: Bench report (Apple silicon)
         run: |
           { echo "== aarch64, GitHub macos-15 runner ($(sysctl -n machdep.cpu.brand_string)), ${{ matrix.preset }} =="
@@ -732,12 +743,15 @@ jobs:
           name: bench-report-${{ matrix.preset }}
           path: bench-report.txt
           retention-days: 7
-      # Tool binaries for release.yml, from the appleclang build only: the
-      # Homebrew-LLVM build rpaths its bundled libc++ under /opt/homebrew
-      # and is not portable off a brewed machine.
-      - name: Upload tool binaries
+      # Every binary is executed, in its uploaded form, in a mode that spins 
+      # up the thread pool - which is where the allocator split aborts.
+      - name: Exercise the remaining shipped tools
         if: matrix.preset == 'macos-appleclang-cxx23'
-        run: strip build/${{ matrix.preset }}/cli/blake3ppsum build/${{ matrix.preset }}/cli/blake3ppgen build/${{ matrix.preset }}/bench/blake3pp_bench build/${{ matrix.preset }}/bench/blake3pp_bench_file
+        run: |
+          printf 'blake3pp' | build/${{ matrix.preset }}/cli/blake3ppsum
+          build/${{ matrix.preset }}/cli/blake3ppgen --seed ci --length 8M --output "${RUNNER_TEMP}/smoke.bin"
+          build/${{ matrix.preset }}/bench/blake3pp_bench_file "${RUNNER_TEMP}/smoke.bin" --reps 1 --cooldown 0 --no-direct
+          rm -f "${RUNNER_TEMP}/smoke.bin"
       - uses: actions/upload-artifact@v7
         if: matrix.preset == 'macos-appleclang-cxx23'
         with:
