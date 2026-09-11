@@ -368,6 +368,28 @@ Anyone who needs a sized or bounded pool constructs their provider's pool
 directly and passes its scheduler instead (e.g. stdexec's
 `exec::static_thread_pool pool(8); ... hash(big_buffer, pool.get_scheduler())`).
 
+The input is split into parts that the scheduler's agents pull as they
+go, and each part's 32-byte chaining value waits on the calling thread's
+stack. A `stack_budget` template argument sets how much stack that table
+may take, 32 KiB (1024 parts) by default. Where stacks are small, give it
+less and the input is split into fewer, larger parts; a budget that is not
+a multiple of 32 bytes, or holds fewer than two parts, does not compile:
+
+```cpp
+blake3pp::digest d = blake3pp::hash<blake3pp::stack_budget{1024}>(buffer, sched);   // 32 parts
+```
+
+Code that needs to check the stack usage against known configuration can check
+the budget at compile time:
+
+```cpp
+constexpr blake3pp::stack_budget budget{1024};
+static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
+```
+
+`keyed_hash`, `derive_key`, `update_file` and `hash_file` take the same
+argument, and `parallel_hasher` takes it as its second template parameter.
+
 The sender/receiver provider itself is a build-time choice
 (`-DBLAKE3PP_EXECUTION_PROVIDER=auto|std|beman|stdexec`), and
 `blake3pp::execution_provider()` reports which one a binary carries:
@@ -603,6 +625,12 @@ build-time switches make it fit:
   the primary API anyway, and a freestanding caller brings its own
   scheduler because only it knows what its execution agents should be
   (on Zephyr SMP, for instance, one per core).
+- The multi-core entry points keep one 32-byte chaining value per part
+  on the calling thread's stack, 32 KiB by default, more than a
+  microcontroller thread usually has. A `stack_budget` template argument
+  sizes that table to the thread, and a `static_assert` of the budget
+  against the RTOS's own stack size catches one that does not fit (see
+  the multi-core section above).
 
 Everything else adapts by the existing probes: 32-bit targets are
 supported, and the SIMD/execution polyfills select exactly as on

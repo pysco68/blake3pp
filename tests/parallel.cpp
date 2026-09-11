@@ -159,6 +159,43 @@ TEST_CASE("multi-core one-shots mirror the sequential spellings") {
   CHECK(blake3pp::hash(std::as_bytes(std::span{sv})) == blake3pp::hash(sv));
 }
 
+// The stack budget bounds the split through the size of the CV table on
+// the caller's stack; any budget of two parts or more, a power of two or
+// not, leaves the digest alone.
+TEST_CASE("a stack budget changes the split, not the digest") {
+  using blake3pp::stack_budget;
+  static_assert(blake3pp::default_stack_budget.parts() == 1024);
+  static_assert(stack_budget{1024}.parts() == 32);
+
+  auto sched = blake3pp::get_parallel_scheduler();
+  for (const std::size_t len :
+       {std::size_t{32 * 1024 + 1}, std::size_t{(4 * 1024 + 3) * 1024 + 17}}) {
+    CAPTURE(len);
+    const auto input = make_input(len);
+    const auto expected = blake3pp::hash(input);
+    CHECK(blake3pp::hash<stack_budget{64}>(input, sched) == expected);
+    CHECK(blake3pp::hash<stack_budget{96}>(input, sched) == expected);
+    CHECK(blake3pp::hash<stack_budget{1024}>(input, sched) == expected);
+  }
+
+  const std::string text(2 * 1024 * 1024 + 9, 'q');
+  const std::string_view sv{text};
+  std::array<std::byte, 32> key{};
+  key[3] = std::byte{42};
+  const std::span<const std::byte, 32> key_span{key};
+  CHECK(blake3pp::keyed_hash<stack_budget{256}>(key_span, sv, sched) ==
+        blake3pp::keyed_hash(key_span, sv));
+  CHECK(blake3pp::derive_key<stack_budget{256}>("ctx 2026-09", sv, sched) ==
+        blake3pp::derive_key("ctx 2026-09", sv));
+
+  // A 1 MiB window under a 128-byte budget is four parts of 256 KiB.
+  const auto input = make_input(3 * 1024 * 1024 + 5);
+  blake3pp::parallel_hasher<decltype(sched), stack_budget{128}> ph{
+      sched, {.window_bytes = 1024 * 1024}};
+  ph.update(input);
+  CHECK(ph.finalize() == blake3pp::hash(input));
+}
+
 
 // The XOF finalize family must produce the sequential hasher's stream
 // bit for bit, and stay non-destructive on the parallel side too.

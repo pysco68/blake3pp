@@ -133,28 +133,85 @@ using parallel_scheduler_t =
         // own scheduler because only it knows what its agents should be.
 
 namespace detail {
+// Deliberately not constexpr and never defined: a stack_budget constructor
+// that reaches one fails its constant evaluation, and the diagnostic names
+// the violated rule.
+void stack_budget_not_a_multiple_of_32_bytes();
+void stack_budget_below_two_parts();
+}  // namespace detail
 
-// How finely the engine splits its input. Workers pull parts from a shared
-// counter, so one that runs slow (on a shared SMT core, woken late) takes
-// fewer parts instead of holding up the join, and what is left of the
-// imbalance is the rounding, at most one part per worker. A part is at
-// least 16 chunks (16 KiB), which keeps small inputs in few tasks.
-inline constexpr std::size_t max_parts = 1024;
+/// The stack the multi-core functions may spend on their table of part
+/// chaining values, passed as their first template argument:
+///
+/// @code
+/// blake3pp::hash<blake3pp::stack_budget{1024}>(input, sched);   // 32 parts
+/// @endcode
+///
+/// The input is split into at most parts() parts, each with a 32-byte
+/// chaining value in a table on the calling thread's stack, whatever the
+/// input's size. Agents pull parts from a shared counter, so a slow agent
+/// takes fewer instead of holding up the join, and more parts balance more
+/// finely; a smaller budget splits the input into fewer, larger parts,
+/// which suits a machine with few cores.
+///
+/// A budget that is not a multiple of 32 bytes, or that holds fewer than
+/// two parts, does not compile. There is no upper limit, because the stack
+/// the calling thread has is not known where this header is compiled; the
+/// platform, the linker, the thread's creator or the application's
+/// configuration sets it. Code that knows its thread checks the budget
+/// against that at compile time, leaving room for its own frames:
+///
+/// @code
+/// constexpr blake3pp::stack_budget budget{1024};
+/// static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
+/// @endcode
+struct stack_budget {
+  /// The stack one part's chaining value takes.
+  static constexpr std::size_t bytes_per_part = 32;
+
+  /// The budget in bytes.
+  std::size_t bytes;
+
+  /// @param n  A multiple of bytes_per_part, at least two parts' worth.
+  consteval explicit stack_budget(std::size_t n) : bytes{n} {
+    if (n % bytes_per_part != 0) {
+      detail::stack_budget_not_a_multiple_of_32_bytes();
+    }
+    if (n / bytes_per_part < 2) {
+      detail::stack_budget_below_two_parts();
+    }
+  }
+
+  /// The most parts the input is split into.
+  [[nodiscard]] constexpr std::size_t parts() const noexcept {
+    return bytes / bytes_per_part;
+  }
+};
+
+/// The default budget: 32 KiB of stack, 1024 parts.
+inline constexpr stack_budget default_stack_budget{32 * 1024};
+
+namespace detail {
+
+// A part is at least 16 chunks (16 KiB), which keeps small inputs in few
+// tasks.
 inline constexpr std::size_t min_part_chunks = 16;
 
 // The part size in chunks for num_chunks: a power of two, so every part
 // starting at a multiple of it is subtree-aligned, and large enough that
-// num_chunks / part <= max_parts.
+// num_chunks / part <= Budget.parts().
+template <stack_budget Budget>
 [[nodiscard]] constexpr std::size_t part_chunks(std::size_t num_chunks) noexcept {
-  return std::bit_ceil(
-      std::max((num_chunks + max_parts - 1) / max_parts, min_part_chunks));
+  return std::bit_ceil(std::max(
+      (num_chunks + Budget.parts() - 1) / Budget.parts(), min_part_chunks));
 }
 
 // One CV slot per part, on the caller's stack. The slots are unpadded:
 // each is written once per part-sized task, so neighbours sharing a cache
-// line cost nothing measurable, and max_parts bare slots fit the same
-// 32 KiB that half as many padded ones would.
-using part_cvs = std::array<std::array<std::uint32_t, 8>, max_parts>;
+// line cost nothing measurable.
+template <stack_budget Budget>
+using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
+static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
 
 // Runs body(i) for every i in [0, n) on sched. The bulk shape only
 // provides the agents: each call pulls indices from a shared counter until
@@ -177,7 +234,7 @@ void for_each_part(Scheduler& sched, std::size_t n, Body body) {
 // The one-shot engine: partitions input into aligned subtrees, fans them
 // out over sched, and finishes inside h, whose key_words()/mode_flags()
 // drive the workers; plain, keyed and derive_key hashers all work.
-template <class Scheduler>
+template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched,
                                const kern::kernel_ops* ops) {
@@ -187,9 +244,9 @@ template <class Scheduler>
       input.size() > chunk_size ? (input.size() - 1) / chunk_size : 0;
 
   if (safe_chunks >= 2 * min_part_chunks) {
-    const std::size_t part = part_chunks(safe_chunks);
-    const std::size_t n_parts = safe_chunks / part;  // <= max_parts
-    part_cvs cvs;
+    const std::size_t part = part_chunks<Budget>(safe_chunks);
+    const std::size_t n_parts = safe_chunks / part;  // <= Budget.parts()
+    part_cvs<Budget> cvs;
     const std::byte* const base = input.data();
 
     // Starting from counter 0 in part-sized steps, every part is
@@ -221,16 +278,18 @@ template <class Scheduler>
 
 /// Expert: multi-core hash on a caller-supplied kernel table, the same
 /// seam hasher's expert constructor exposes.
+/// @tparam Budget     The stack its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param input  Any length.
 /// @param sched  Where the subtree reductions run.
 /// @param ops    The kernel table; must outlive the call.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           const kern::kernel_ops* ops) {
   hasher h{ops};
-  return detail::hash_into(h, input, std::forward<Scheduler>(sched), ops);
+  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched),
+                                   ops);
 }
 
 /// Multi-core one-shot hash: the subtree reductions of input run on sched,
@@ -238,6 +297,7 @@ template <class Scheduler>
 ///
 /// Any std::execution-style scheduler works; inputs too small for
 /// parallelism to pay for itself take the sequential path.
+/// @tparam Budget     The stack its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param input  Any length.
 /// @param sched  Where the subtree reductions run.
@@ -247,34 +307,37 @@ template <class Scheduler>
 /// auto sched = blake3pp::get_parallel_scheduler();
 /// blake3pp::digest d = blake3pp::hash(big_buffer, sched);
 /// @endcode
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           arch a = arch::auto_detect) {
-  return hash(input, std::forward<Scheduler>(sched), detail::resolve(a));
+  return hash<Budget>(input, std::forward<Scheduler>(sched),
+                      detail::resolve(a));
 }
 
 /// Multi-core one-shot hash of a string's bytes.
+/// @tparam Budget     The stack its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param input  The bytes of the string.
 /// @param sched  Where the subtree reductions run.
 /// @param a      The variant to run on.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash(std::string_view input, Scheduler&& sched,
                           arch a = arch::auto_detect) {
-  return hash(std::as_bytes(std::span{input.data(), input.size()}),
-              std::forward<Scheduler>(sched), a);
+  return hash<Budget>(std::as_bytes(std::span{input.data(), input.size()}),
+                      std::forward<Scheduler>(sched), a);
 }
 
 /// Multi-core keyed one-shot: the MAC/PRF of input under a 32-byte key,
 /// same decomposition as hash().
+/// @tparam Budget     The stack its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param key    Exactly key_size bytes, enforced by the span extent.
 /// @param input  Any length.
 /// @param sched  Where the subtree reductions run.
 /// @param a      The variant to run on.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::span<const std::byte> input,
@@ -284,33 +347,37 @@ template <class Scheduler>
   // hasher: the engine takes key material from the hasher itself.
   const kern::kernel_ops* const ops = detail::resolve(a);
   hasher h = hasher::keyed(key, ops);
-  return detail::hash_into(h, input, std::forward<Scheduler>(sched), ops);
+  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched),
+                                   ops);
 }
 
 /// Multi-core keyed one-shot of a string's bytes.
+/// @tparam Budget     The stack its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param key    Exactly key_size bytes.
 /// @param input  The bytes of the string.
 /// @param sched  Where the subtree reductions run.
 /// @param a      The variant to run on.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::string_view input, Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  return keyed_hash(key, std::as_bytes(std::span{input.data(), input.size()}),
-                    std::forward<Scheduler>(sched), a);
+  return keyed_hash<Budget>(
+      key, std::as_bytes(std::span{input.data(), input.size()}),
+      std::forward<Scheduler>(sched), a);
 }
 
 /// Multi-core key derivation, for key material large enough to matter (a
 /// file's worth of entropy, a whole seed image); see core.hpp's
 /// derive_key() for the context contract.
+/// @tparam Budget     The stack its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param context       The domain-separation string; not a secret.
 /// @param key_material  The secret to derive from.
 /// @param sched         Where the subtree reductions run.
 /// @param a             The variant to run on.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest derive_key(std::string_view context,
                                 std::span<const std::byte> key_material,
@@ -318,23 +385,24 @@ template <class Scheduler>
                                 arch a = arch::auto_detect) {
   const kern::kernel_ops* const ops = detail::resolve(a);
   hasher h = hasher::derive_key(context, ops);
-  return detail::hash_into(h, key_material, std::forward<Scheduler>(sched),
-                           ops);
+  return detail::hash_into<Budget>(
+      h, key_material, std::forward<Scheduler>(sched), ops);
 }
 
 /// Multi-core key derivation from a string's bytes.
+/// @tparam Budget     The stack its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param context       The domain-separation string; not a secret.
 /// @param key_material  The secret to derive from.
 /// @param sched         Where the subtree reductions run.
 /// @param a             The variant to run on.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest derive_key(std::string_view context,
                                 std::string_view key_material,
                                 Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  return derive_key(
+  return derive_key<Budget>(
       context,
       std::as_bytes(std::span{key_material.data(), key_material.size()}),
       std::forward<Scheduler>(sched), a);
@@ -344,19 +412,19 @@ namespace detail {
 
 // Fans one full window (num_chunks: power of two, counter-aligned) out
 // over the scheduler and absorbs the part CVs in order.
-template <class Scheduler>
+template <stack_budget Budget, class Scheduler>
 void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
                           hasher& h, const std::byte* data,
                           std::size_t num_chunks,
                           std::uint64_t chunk_counter) {
-  const std::size_t part = part_chunks(num_chunks);
+  const std::size_t part = part_chunks<Budget>(num_chunks);
   if (part >= num_chunks) {
     // Window too small to fan out; hash it inline.
     h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
     return;
   }
   const std::size_t n_parts = num_chunks / part;
-  part_cvs cvs;
+  part_cvs<Budget> cvs;
 
   for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
     compress_subtree_cv(ops, data + i * part * chunk_size, part,
@@ -393,6 +461,8 @@ struct parallel_hasher_options {
 /// non-destructive, like hasher's. Not thread-safe; the scheduler's
 /// workers are used only inside update().
 /// @tparam Scheduler  Any std::execution-style scheduler, held by value.
+/// @tparam Budget     The stack a window's part table may take; see
+///                    stack_budget.
 ///
 /// @code
 /// blake3pp::parallel_hasher ph{blake3pp::get_parallel_scheduler()};
@@ -401,7 +471,7 @@ struct parallel_hasher_options {
 /// }
 /// blake3pp::digest d = ph.finalize();   // == the sequential digest
 /// @endcode
-template <class Scheduler>
+template <class Scheduler, stack_budget Budget = default_stack_budget>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 class parallel_hasher {
  public:
@@ -513,8 +583,8 @@ class parallel_hasher {
 
   void flush_window() {
     const std::size_t chunks = window_.size() / chunk_size;
-    detail::hash_window_parallel(ops_, sched_, h_, window_.data(), chunks,
-                                 chunk_counter_);
+    detail::hash_window_parallel<Budget>(ops_, sched_, h_, window_.data(),
+                                         chunks, chunk_counter_);
     chunk_counter_ += chunks;
     filled_ = 0;
   }

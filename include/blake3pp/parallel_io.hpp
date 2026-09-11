@@ -41,6 +41,8 @@ namespace blake3pp {
 /// files whose sizes are multiples of the window. Elsewhere the window
 /// goes through h.update() instead, so the digest is the same either way
 /// and only the parallelism varies.
+/// @tparam Budget     The stack a window's part table may take; see
+///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param h      The hasher to stream into.
 /// @param path   The file to read.
@@ -48,7 +50,7 @@ namespace blake3pp {
 /// @param opts   The pipeline knobs.
 /// @throws std::system_error on I/O failure, and whatever the execution
 ///         provider raises.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const std::filesystem::path& path,
                  Scheduler&& sched, const file_io_options& opts = {}) {
@@ -61,7 +63,8 @@ void update_file(hasher& h, const std::filesystem::path& path,
     const std::uint64_t chunks = w->bytes / chunk_size;
     const std::uint64_t counter = base / chunk_size + w->offset / chunk_size;
     if (!w->last && on_chunk_boundary && counter % chunks == 0) {
-      detail::hash_window_parallel(ops, sched, h, w->data, chunks, counter);
+      detail::hash_window_parallel<Budget>(ops, sched, h, w->data, chunks,
+                                           counter);
     } else {
       h.update(std::span<const std::byte>{w->data, w->bytes});
     }
@@ -71,25 +74,29 @@ void update_file(hasher& h, const std::filesystem::path& path,
 
 /// Streams a file into a hasher over a scheduler, reporting failure
 /// through ec instead of throwing.
+/// @tparam Budget     The stack a window's part table may take; see
+///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param h      The hasher to stream into.
 /// @param path   The file to read.
 /// @param sched  Where the subtree reductions run.
 /// @param ec     Cleared on success; the error otherwise.
 /// @param opts   The pipeline knobs.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const std::filesystem::path& path,
                  Scheduler&& sched, std::error_code& ec,
                  const file_io_options& opts = {}) noexcept {
   detail::with_error_code(ec, [&] {
-    update_file(h, path, std::forward<Scheduler>(sched), opts);
+    update_file<Budget>(h, path, std::forward<Scheduler>(sched), opts);
   });
 }
 
 /// One-shot digest of a file over the full pipeline: a hasher shaped by
 /// opts (SIMD variant, optional key), the file streamed through it
 /// multi-core, finalized.
+/// @tparam Budget     The stack a window's part table may take; see
+///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
@@ -102,31 +109,33 @@ void update_file(hasher& h, const std::filesystem::path& path,
 ///                              {.window_bytes = 16 * 1024 * 1024,
 ///                               .queue_depth = 8});
 /// @endcode
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                Scheduler&& sched,
                                const hash_file_options& opts = {}) {
   hasher h = detail::make_hasher(opts, detail::resolve(opts.a));
-  update_file(h, path, std::forward<Scheduler>(sched), opts);
+  update_file<Budget>(h, path, std::forward<Scheduler>(sched), opts);
   return h.finalize();
 }
 
 /// One-shot digest of a file over the full pipeline, reporting failure
 /// through ec instead of throwing.
+/// @tparam Budget     The stack a window's part table may take; see
+///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
 /// @param ec     Cleared on success; the error otherwise.
 /// @param opts   The hasher's variant and key, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
-template <class Scheduler>
+template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                Scheduler&& sched, std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept {
   return detail::with_error_code(ec, [&] {
-    return hash_file(path, std::forward<Scheduler>(sched), opts);
+    return hash_file<Budget>(path, std::forward<Scheduler>(sched), opts);
   });
 }
 
@@ -135,12 +144,13 @@ template <class Scheduler>
 /// @param path   The file to read.
 /// @param sched  Where the subtree reductions run.
 /// @param opts   The pipeline knobs.
-template <detail::foreign_path P, class Scheduler>
+template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
+          class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const P& path, Scheduler&& sched,
                  const file_io_options& opts = {}) {
-  update_file(h, std::filesystem::path(path.native()),
-              std::forward<Scheduler>(sched), opts);
+  update_file<Budget>(h, std::filesystem::path(path.native()),
+                      std::forward<Scheduler>(sched), opts);
 }
 
 /// update_file() over a scheduler for a foreign path type, reporting
@@ -150,14 +160,15 @@ void update_file(hasher& h, const P& path, Scheduler&& sched,
 /// @param sched  Where the subtree reductions run.
 /// @param ec     Cleared on success; the error otherwise.
 /// @param opts   The pipeline knobs.
-template <detail::foreign_path P, class Scheduler>
+template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
+          class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const P& path, Scheduler&& sched,
                  std::error_code& ec, const file_io_options& opts = {}) noexcept {
   // The path conversion allocates, so it belongs inside the guard too.
   detail::with_error_code(ec, [&] {
-    update_file(h, std::filesystem::path(path.native()),
-                std::forward<Scheduler>(sched), opts);
+    update_file<Budget>(h, std::filesystem::path(path.native()),
+                        std::forward<Scheduler>(sched), opts);
   });
 }
 
@@ -165,12 +176,13 @@ void update_file(hasher& h, const P& path, Scheduler&& sched,
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
 /// @param opts   The hasher's variant and key, and the pipeline knobs.
-template <detail::foreign_path P, class Scheduler>
+template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
+          class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const P& path, Scheduler&& sched,
                                const hash_file_options& opts = {}) {
-  return hash_file(std::filesystem::path(path.native()),
-                   std::forward<Scheduler>(sched), opts);
+  return hash_file<Budget>(std::filesystem::path(path.native()),
+                           std::forward<Scheduler>(sched), opts);
 }
 
 /// hash_file() over a scheduler for a foreign path type, reporting
@@ -180,14 +192,15 @@ template <detail::foreign_path P, class Scheduler>
 /// @param ec     Cleared on success; the error otherwise.
 /// @param opts   The hasher's variant and key, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
-template <detail::foreign_path P, class Scheduler>
+template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
+          class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash_file(const P& path, Scheduler&& sched,
                                std::error_code& ec,
                                const hash_file_options& opts = {}) noexcept {
   return detail::with_error_code(ec, [&] {
-    return hash_file(std::filesystem::path(path.native()),
-                     std::forward<Scheduler>(sched), opts);
+    return hash_file<Budget>(std::filesystem::path(path.native()),
+                             std::forward<Scheduler>(sched), opts);
   });
 }
 
