@@ -273,6 +273,43 @@ void t16_sweep(int reps, double cooldown_s) {
           blake3pp::default_tune_bytes >> 20);
   blake3pp::set_transpose16(saved);
 }
+// The parallel engine's split before its agents pulled parts from a
+// counter, kept as the reference/static control row: at most 256
+// power-of-two parts in one bulk call, so a provider that hands out fixed
+// shares (stdexec's static_thread_pool does) joins on its slowest agent.
+template <class Scheduler>
+blake3pp::digest static_split_hash(std::span<const std::byte> input,
+                                   Scheduler sched,
+                                   const blake3pp::kern::kernel_ops* ops) {
+  namespace ex = blake3pp::ex;
+  constexpr std::size_t chunk = blake3pp::chunk_size;
+  constexpr std::size_t max_parts = 256;
+  blake3pp::hasher h{ops};
+  const std::size_t safe_chunks =
+      input.size() > chunk ? (input.size() - 1) / chunk : 0;
+  const std::size_t part = std::bit_floor(
+      std::max<std::size_t>((safe_chunks + max_parts - 1) / max_parts, 16));
+  const std::size_t n_parts = safe_chunks / part;
+  if (n_parts < 2) {
+    h.update(input);
+    return h.finalize();
+  }
+  std::vector<std::array<std::uint32_t, 8>> cvs(n_parts);
+  auto work = ex::schedule(sched) |
+              ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
+                blake3pp::detail::compress_subtree_cv(
+                    ops, input.data() + i * part * chunk, part,
+                    static_cast<std::uint64_t>(i) * part, h.key_words(),
+                    h.mode_flags(), cvs[i]);
+              });
+  ex::sync_wait(std::move(work));
+  for (const auto& cv : cvs) {
+    h.push_subtree_cv(cv, part);
+  }
+  h.update(input.subspan(n_parts * part * chunk));
+  return h.finalize();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -684,6 +721,15 @@ int main(int argc, char** argv) {
         [&] {
           return blake3pp::hash(std::span<const std::byte>{input}, sched,
                                 &asm_ops);
+        },
+        15);
+    // The same kernel and pool under the engine's former split, as the
+    // control for the counter-pulled parts in the row above.
+    row("reference/static",
+        std::format("{} kernel, 256 parts, fixed shares", asm_row),
+        [&] {
+          return static_split_hash(std::span<const std::byte>{input}, sched,
+                                   &asm_ops);
         },
         15);
   }

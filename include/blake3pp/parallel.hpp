@@ -6,11 +6,12 @@
 /// BLAKE3's binary Merkle tree makes the parallel decomposition exact, not
 /// heuristic: any power-of-2, position-aligned run of chunks reduces to
 /// one chaining value independently of everything else. So the engine
-/// partitions the input into equal such subtrees, bulk-schedules the
-/// (allocation-free) subtree reductions across the scheduler's execution
-/// agents, then absorbs the CVs in order through the hasher's CV-stack
-/// discipline and finishes the tail sequentially. The merge work after
-/// the parallel phase is O(parts) scalar compressions, which is noise.
+/// partitions the input into equal such subtrees, which the scheduler's
+/// execution agents pull from a shared counter until none are left (a
+/// slow agent takes fewer, rather than holding up the join), then absorbs
+/// the CVs in order through the hasher's CV-stack discipline and finishes
+/// the tail sequentially. The merge work after the parallel phase is
+/// O(parts) scalar compressions, which is noise.
 ///
 /// The provider is a build-time choice (BLAKE3PP_EXECUTION_PROVIDER):
 /// std::execution where the standard library ships it, beman.execution as
@@ -20,6 +21,7 @@
 /// and sender operation states live inside sync_wait's frame.
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <array>
 #include <cstddef>
@@ -132,6 +134,46 @@ using parallel_scheduler_t =
 
 namespace detail {
 
+// How finely the engine splits its input. Workers pull parts from a shared
+// counter, so one that runs slow (on a shared SMT core, woken late) takes
+// fewer parts instead of holding up the join, and what is left of the
+// imbalance is the rounding, at most one part per worker. A part is at
+// least 16 chunks (16 KiB), which keeps small inputs in few tasks.
+inline constexpr std::size_t max_parts = 1024;
+inline constexpr std::size_t min_part_chunks = 16;
+
+// The part size in chunks for num_chunks: a power of two, so every part
+// starting at a multiple of it is subtree-aligned, and large enough that
+// num_chunks / part <= max_parts.
+[[nodiscard]] constexpr std::size_t part_chunks(std::size_t num_chunks) noexcept {
+  return std::bit_ceil(
+      std::max((num_chunks + max_parts - 1) / max_parts, min_part_chunks));
+}
+
+// One CV slot per part, on the caller's stack. The slots are unpadded:
+// each is written once per part-sized task, so neighbours sharing a cache
+// line cost nothing measurable, and max_parts bare slots fit the same
+// 32 KiB that half as many padded ones would.
+using part_cvs = std::array<std::array<std::uint32_t, 8>, max_parts>;
+
+// Runs body(i) for every i in [0, n) on sched. The bulk shape only
+// provides the agents: each call pulls indices from a shared counter until
+// none are left, so the split follows each agent's actual speed rather
+// than the fixed shares the provider's bulk may hand out. Every index runs
+// exactly once however the implementation distributes the calls.
+template <class Scheduler, class Body>
+void for_each_part(Scheduler& sched, std::size_t n, Body body) {
+  std::atomic<std::size_t> next{0};
+  auto work = ex::schedule(sched) |
+              ex::bulk(ex::par, n, [&](std::size_t) noexcept {
+                for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                     i < n; i = next.fetch_add(1, std::memory_order_relaxed)) {
+                  body(i);
+                }
+              });
+  ex::sync_wait(std::move(work));
+}
+
 // The one-shot engine: partitions input into aligned subtrees, fans them
 // out over sched, and finishes inside h, whose key_words()/mode_flags()
 // drive the workers; plain, keyed and derive_key hashers all work.
@@ -144,40 +186,22 @@ template <class Scheduler>
   const std::size_t safe_chunks =
       input.size() > chunk_size ? (input.size() - 1) / chunk_size : 0;
 
-  constexpr std::size_t max_parts = 256;
-  constexpr std::size_t min_part_chunks = 16;  // 16 KiB per task minimum
-
   if (safe_chunks >= 2 * min_part_chunks) {
-    const std::size_t want = (safe_chunks + max_parts - 1) / max_parts;
-    const std::size_t part = std::bit_floor(std::max(want, min_part_chunks));
-    const std::size_t n_parts = safe_chunks / part;  // < 2 * max_parts
-
-    // One result slot per worker, each padded to its own cache line:
-    // adjacent workers complete at unrelated times, and a bare 32-byte CV
-    // array would put two workers' completion writes in the same line:
-    // textbook false sharing on the only memory the workers share.
-    // (std::hardware_destructive_interference_size is the standard name
-    // for this boundary; we pin its value, 64 on every target we build,
-    // because GCC warns on ABI-sensitive uses of the constant in headers.)
-    struct alignas(64) padded_cv {
-      std::array<std::uint32_t, 8> words;
-    };
-    // Starting from counter 0 in part-sized steps, every part is
-    // automatically subtree-aligned.
-    padded_cv cvs[2 * max_parts];
+    const std::size_t part = part_chunks(safe_chunks);
+    const std::size_t n_parts = safe_chunks / part;  // <= max_parts
+    part_cvs cvs;
     const std::byte* const base = input.data();
 
-    auto work = ex::schedule(sched) |
-                ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
-                  detail::compress_subtree_cv(
-                      ops, base + i * part * chunk_size, part,
-                      static_cast<std::uint64_t>(i) * part, h.key_words(),
-                      h.mode_flags(), cvs[i].words);
-                });
-    ex::sync_wait(std::move(work));
+    // Starting from counter 0 in part-sized steps, every part is
+    // automatically subtree-aligned.
+    for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
+      detail::compress_subtree_cv(ops, base + i * part * chunk_size, part,
+                                  static_cast<std::uint64_t>(i) * part,
+                                  h.key_words(), h.mode_flags(), cvs[i]);
+    });
 
     for (std::size_t i = 0; i < n_parts; ++i) {
-      h.push_subtree_cv(cvs[i].words, part);
+      h.push_subtree_cv(cvs[i], part);
     }
     h.update(input.subspan(n_parts * part * chunk_size));
     return h.finalize();
@@ -325,30 +349,22 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
                           hasher& h, const std::byte* data,
                           std::size_t num_chunks,
                           std::uint64_t chunk_counter) {
-  constexpr std::size_t max_parts = 256;
-  const std::size_t part = std::bit_floor(
-      std::max<std::size_t>(num_chunks / max_parts + 1, 16));
+  const std::size_t part = part_chunks(num_chunks);
   if (part >= num_chunks) {
     // Window too small to fan out; hash it inline.
     h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
     return;
   }
   const std::size_t n_parts = num_chunks / part;
+  part_cvs cvs;
 
-  struct alignas(64) padded_cv {
-    std::array<std::uint32_t, 8> words;
-  };
-  padded_cv cvs[2 * max_parts];
-
-  auto work = ex::schedule(sched) |
-              ex::bulk(ex::par, n_parts, [&](std::size_t i) noexcept {
-                compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                                    chunk_counter + i * part, h.key_words(),
-                                    h.mode_flags(), cvs[i].words);
-              });
-  ex::sync_wait(std::move(work));
+  for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
+    compress_subtree_cv(ops, data + i * part * chunk_size, part,
+                        chunk_counter + i * part, h.key_words(),
+                        h.mode_flags(), cvs[i]);
+  });
   for (std::size_t i = 0; i < n_parts; ++i) {
-    h.push_subtree_cv(cvs[i].words, part);
+    h.push_subtree_cv(cvs[i], part);
   }
 }
 
