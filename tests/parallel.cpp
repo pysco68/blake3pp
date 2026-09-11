@@ -30,11 +30,16 @@ TEST_SUITE("parallel") {
 TEST_CASE("parallel hash matches sequential at every size class") {
   auto sched = blake3pp::get_parallel_scheduler();
 
+  // 16 MiB and 16 MiB + 1 fill 1023 and 1024 parts of 16 KiB, 16 MiB +
+  // 1025 is the first input split into 32 KiB parts, and 32 MiB + 1023
+  // fills all 1024 again at that size.
   for (const std::size_t len :
        {std::size_t{0}, std::size_t{1}, std::size_t{1024}, std::size_t{1025},
         std::size_t{31 * 1024}, std::size_t{32 * 1024},
         std::size_t{32 * 1024 + 1}, std::size_t{1024 * 1024},
         std::size_t{(4 * 1024 + 3) * 1024 + 17},
+        std::size_t{16 * 1024 * 1024}, std::size_t{16 * 1024 * 1024 + 1},
+        std::size_t{16 * 1024 * 1024 + 1025},
         std::size_t{32 * 1024 * 1024 + 1023}}) {
     CAPTURE(len);
     const auto input = make_input(len);
@@ -61,6 +66,20 @@ TEST_CASE("parallel_hasher matches sequential across streaming patterns") {
     }
     CHECK(ph.finalize() == blake3pp::hash(input));
   }
+}
+
+TEST_CASE("parallel_hasher fills every part slot of a 16 MiB window") {
+  // A 16 MiB window is 1024 parts of 16 KiB, the engine's whole CV table;
+  // two windows and a tail cover the full fan-out, a window straddle and
+  // the sequential finish.
+  const blake3pp::parallel_hasher_options opts{.window_bytes = 16 * 1024 * 1024};
+  const auto input = make_input(2 * 16 * 1024 * 1024 + 77);
+  blake3pp::parallel_hasher ph{blake3pp::get_parallel_scheduler(), opts};
+  const std::size_t bite = 5 * 1024 * 1024 + 3;
+  for (std::size_t pos = 0; pos < input.size(); pos += bite) {
+    ph.update(std::span{input}.subspan(pos, std::min(bite, input.size() - pos)));
+  }
+  CHECK(ph.finalize() == blake3pp::hash(input));
 }
 
 TEST_CASE("parallel_hasher checkpoints and resets like hasher") {
