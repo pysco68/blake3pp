@@ -45,6 +45,7 @@ target_include_directories(blake3pp_tests PRIVATE
 target_link_libraries(blake3pp_tests PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
+  blake3pp::node_program
   doctest::doctest)
 
 list(APPEND CMAKE_MODULE_PATH

@@ -301,6 +301,21 @@ if(BLAKE3PP_TOOL_MIMALLOC)
   endif()
 endif()
 
+# Under Emscripten the tools, tests and benches are node programs, and
+# that is a property of the executable rather than of the target: real
+# host files through NODERAWFS, eight workers spawned before main() so
+# stdexec's pool never waits on the event loop to create one, and the
+# runtime torn down when main() returns (a program with live workers
+# otherwise keeps node alive). The browser module (web/) links none of
+# this and states its own embedding instead. Empty elsewhere, so the
+# link sites need no platform test.
+add_library(blake3pp_node_program INTERFACE)
+add_library(blake3pp::node_program ALIAS blake3pp_node_program)
+if(EMSCRIPTEN)
+  target_link_options(blake3pp_node_program INTERFACE
+    -sNODERAWFS=1 -sPTHREAD_POOL_SIZE=8 -sEXIT_RUNTIME=1)
+endif()
+
 # --- Command-line tooling (CLI tools + benchmarks) ---------------------------
 # Everything the executables share, so the two CLI tools and the two
 # benchmarks are one kind of program: CLI11 for argument parsing and
@@ -345,6 +360,13 @@ endif()
 
 if(BLAKE3PP_BUILD_BENCH AND BLAKE3PP_HAS_FORMAT)
   add_subdirectory(bench)
+endif()
+
+# The browser module: the library behind embind as one ES module plus its
+# .wasm, the deliverable of the wasm build that is not a node program.
+option(BLAKE3PP_BUILD_WEB "Build the browser module (Emscripten only)" ${PROJECT_IS_TOP_LEVEL})
+if(BLAKE3PP_BUILD_WEB AND EMSCRIPTEN)
+  add_subdirectory(web)
 endif()
 
 option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility" ${PROJECT_IS_TOP_LEVEL})

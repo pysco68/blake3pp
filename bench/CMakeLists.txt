@@ -10,7 +10,8 @@ target_link_libraries(blake3pp_bench PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
   blake3pp::tooling
-  blake3pp::tool_allocator)
+  blake3pp::tool_allocator
+  blake3pp::node_program)
 # For the asm-plug-in rows: the bench builds a kernel_ops table around
 # upstream's assembly, which needs the internal kernel boundary header.
 target_include_directories(blake3pp_bench PRIVATE "${PROJECT_SOURCE_DIR}/src")
@@ -22,7 +23,8 @@ if(BLAKE3PP_WITH_IO)
     blake3pp::blake3pp
     blake3pp_warnings
     blake3pp::tooling
-    blake3pp::tool_allocator)
+    blake3pp::tool_allocator
+    blake3pp::node_program)
 endif()
 
 if(BLAKE3PP_BENCH_UPSTREAM)

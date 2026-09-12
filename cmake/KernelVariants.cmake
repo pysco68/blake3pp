@@ -526,8 +526,14 @@ endfunction()
 function(_blake3pp_register_wasm_kernels)
   # WASM SIMD128 is a module-level feature (engines reject SIMD-bearing
   # modules wholesale if unsupported), so this really is a compile-time
-  # choice
-  blake3pp_add_kernel(simd128 ARCH_FLAGS -msimd128)
+  # choice: the option is what produces the scalar-only module an
+  # embedder serves to an engine without SIMD (README, "The wasm build").
+  option(BLAKE3PP_WASM_SIMD128
+    "Compile the simd128 kernel (OFF builds a module that loads on engines without wasm SIMD)"
+    ON)
+  if(BLAKE3PP_WASM_SIMD128)
+    blake3pp_add_kernel(simd128 ARCH_FLAGS -msimd128)
+  endif()
 endfunction()
 
 # Registers scalar plus every variant the target processor and compiler

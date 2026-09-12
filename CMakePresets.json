@@ -66,6 +66,17 @@
       }
     },
     {
+      "name": "wasm32-emcc-cxx23-scalar",
+      "displayName": "WebAssembly without SIMD128 (the module for engines that lack it)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/wasm32-emcc-cxx23-scalar",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/wasm32-emcc-cxx23/wasm32-emcc-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BLAKE3PP_WASM_SIMD128": "OFF"
+      }
+    },
+    {
       "name": "linux-arm64-zigmusl-cxx23-static",
       "displayName": "Static musl release (aarch64, zig + mimalloc)",
       "generator": "Ninja",
@@ -293,6 +304,10 @@
       "configurePreset": "wasm32-emcc-cxx23"
     },
     {
+      "name": "wasm32-emcc-cxx23-scalar",
+      "configurePreset": "wasm32-emcc-cxx23-scalar"
+    },
+    {
       "name": "linux-arm64-zigmusl-cxx23-static",
       "configurePreset": "linux-arm64-zigmusl-cxx23-static"
     },
@@ -422,6 +437,13 @@
     {
       "name": "wasm32-emcc-cxx23",
       "configurePreset": "wasm32-emcc-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "wasm32-emcc-cxx23-scalar",
+      "configurePreset": "wasm32-emcc-cxx23-scalar",
       "output": {
         "outputOnFailure": true
       }

@@ -384,9 +384,10 @@ jobs:
             build/${{ matrix.preset }}/coverage/coverage.lcov
             build/${{ matrix.preset }}/coverage/html/
 
-  # WebAssembly, tested in node and SHIPPED (js+wasm pairs in the
-  # release). Its own job rather than a `binaries` leg, so the Cloud-V
-  # boards never wait on an unrelated wasm build.
+  # WebAssembly, tested in node and SHIPPED (the node-runnable js+wasm
+  # pairs and the browser module, in the release). Its own job rather
+  # than a `binaries` leg, so the Cloud-V boards never wait on an
+  # unrelated wasm build.
   wasm:
     needs: [changes, images, environments]
     if: ${{ !cancelled() && needs.environments.result == 'success' }}
@@ -458,6 +459,8 @@ jobs:
             build/wasm32-emcc-cxx23/bench/blake3pp_bench.wasm
             build/wasm32-emcc-cxx23/bench/blake3pp_bench_file.js
             build/wasm32-emcc-cxx23/bench/blake3pp_bench_file.wasm
+            build/wasm32-emcc-cxx23/web/blake3pp-web-simd128.mjs
+            build/wasm32-emcc-cxx23/web/blake3pp-web-simd128.wasm
 
   # The legs whose OUTPUTS ship or meet hardware: the five static musl
   # release chains and the riscv64 gcc cross job (full RVV qemu matrix

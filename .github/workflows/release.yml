@@ -108,8 +108,9 @@ jobs:
           tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
           rm -rf "$stage"
 
-          # WebAssembly: node-runnable js+wasm pairs, SIMD128 kernel with
-          # runtime dispatch to scalar where wasm SIMD is unavailable.
+          # WebAssembly: the node-runnable js+wasm pairs and the browser
+          # module (an ES module plus its .wasm), all with the SIMD128
+          # kernel, which a wasm engine either has or refuses the module.
           src="ci-binaries/tool-binaries-wasm32"
           if [ ! -d "$src" ]; then
             echo "::error::ci run produced no wasm binaries"; exit 1
@@ -118,9 +119,10 @@ jobs:
           stage="release/${pkg}"
           mkdir -p "$stage"
           cp "$src"/cli/*.js "$src"/cli/*.wasm \
-             "$src"/bench/*.js "$src"/bench/*.wasm "$stage"/
+             "$src"/bench/*.js "$src"/bench/*.wasm \
+             "$src"/web/*.mjs "$src"/web/*.wasm "$stage"/
           cp README.md "$stage"/
-          printf 'Run with node >= 16 (SIMD on by default):\n  node blake3ppsum.js -- --help\n' > "$stage"/RUNNING.txt
+          printf 'Run with node >= 16 (SIMD on by default):\n  node blake3ppsum.js -- --help\nThe browser module (README, "The wasm build"):\n  import createBlake3pp from "./blake3pp-web-simd128.mjs"\n' > "$stage"/RUNNING.txt
           tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
           rm -rf "$stage"
 
@@ -276,7 +278,7 @@ jobs:
           | `windows-x86_64-clangcl` | Windows x64 | sse42 / avx2 / avx512 | native runner; IOCP + direct I/O |
           | `windows-arm64-clangcl` | Windows arm64 (cross-built) | neon / sve256 / sve512 / sve2_128 | windows-11-arm runner when the lane runs |
           | `macos-arm64` | macOS Apple silicon | neon; GCD + F_NOCACHE I/O | native runner |
-          | `wasm32-simd128` | node >= 16 (js+wasm pairs) | simd128 | node on the runner |
+          | `wasm32-simd128` | node >= 16 (js+wasm pairs) and browsers (the `blake3pp-web-simd128` ES module) | simd128 | node on the runner |
 
           Notes:
           - The static Linux binaries have no glibc coupling and no dynamic loader - one file per architecture, runs on any distro.

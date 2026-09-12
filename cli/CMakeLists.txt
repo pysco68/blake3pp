@@ -7,14 +7,16 @@ target_link_libraries(blake3ppsum PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
   blake3pp::tooling
-  blake3pp::tool_allocator)
+  blake3pp::tool_allocator
+  blake3pp::node_program)
 
 add_executable(blake3ppgen gen.cpp)
 target_link_libraries(blake3ppgen PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
   blake3pp::tooling
-  blake3pp::tool_allocator)
+  blake3pp::tool_allocator
+  blake3pp::node_program)
 
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell): known-answer for the empty input via stdin,

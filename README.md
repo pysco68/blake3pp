@@ -80,7 +80,7 @@ run:
 | Linux, fully static | x86_64, aarch64, riscv64, ppc64le, s390x | zig (clang + musl) |
 | Windows | x64 and arm64 | clang-cl from the VS toolset |
 | macOS | Apple silicon | Apple clang |
-| wasm | wasm32-simd128, node-runnable js+wasm pairs | Emscripten |
+| wasm | wasm32-simd128, node-runnable js+wasm pairs and the browser ES module | Emscripten |
 
 The static Linux binaries are one file per architecture that runs on
 any distro: no glibc version coupling, no dynamic loader, runtime SIMD
@@ -337,7 +337,42 @@ shipping two modules and picking one at load time on the embedder side
 (feeding `WebAssembly.validate()` a small SIMD probe module is the
 standard test). Every current mainstream engine supports SIMD128
 (node 16+ has it on by default), which is why the release ships the
-simd128 build only.
+simd128 build only; `BLAKE3PP_WASM_SIMD128=OFF` (the
+`wasm32-emcc-cxx23-scalar` preset) builds the other module.
+
+The wasm build produces two kinds of executable. The tools, tests and
+benches are node programs (`blake3pp::node_program`: host files through
+NODERAWFS, a prespawned worker pool, exit when `main` returns). The
+browser module, `web/blake3pp-web-<kernels>.mjs` plus its `.wasm`, is
+the library's types behind embind under their own names, one ES module
+usable from a page, a worker or node. Bytes are passed as (address,
+length) into the module's memory, digests come back as hex, and a
+scheduler is a `thread_pool` object the caller owns and passes, as C++
+code passes a scheduler:
+
+```js
+import createBlake3pp from './blake3pp-web-simd128.mjs';
+const b3pp = await createBlake3pp();               // spawns a worker per hardware thread
+const buf = b3pp._malloc(len);
+b3pp.HEAPU8.set(myBytes, buf);                     // bytes live in the module's memory
+b3pp.hash(buf, len, 'auto');                       // hex digest; the variant by name
+const pool = new b3pp.thread_pool(navigator.hardwareConcurrency);
+b3pp.hash(buf, len, pool, 'auto');                 // the multi-core one-shot
+const h = new b3pp.parallel_hasher(pool, 'auto');  // or new b3pp.hasher('auto')
+h.update(buf, len); h.update('text'); h.finalize(); h.reset();
+const r = new b3pp.hasher('auto').finalize_xof();  // output_reader: fill, seek, position
+h.delete(); pool.delete(); b3pp._free(buf);        // embind objects are freed explicitly
+```
+
+A pooled call blocks the thread the module was instantiated on until
+the pool is done, so a page instantiates the module in a Web Worker
+(a browser forbids waiting on its main thread) and needs
+cross-origin isolation (`Cross-Origin-Opener-Policy: same-origin`,
+`Cross-Origin-Embedder-Policy: require-corp`) for the SharedArrayBuffer
+wasm threads run on. `b3pp.version()`, `b3pp.simd_provider()`,
+`b3pp.execution_provider()`, `b3pp.compiled_arches()`,
+`b3pp.available_arches()` and `b3pp.best_available()` report what `blake3ppsum --version` prints.
+Plain mode only; keyed and derive_key modes are not bound.
 
 ### Multi-core hashing (std::execution / stdexec)
 

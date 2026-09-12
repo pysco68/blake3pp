@@ -7,10 +7,14 @@
 #                       I/O APIs and doctest need real exceptions
 #   -pthread            wasm threads (SharedArrayBuffer): stdexec's pool
 #                       runs on real workers under node
-#   NODERAWFS           direct host-filesystem access, so the CLI tools and
-#                       I/O tests operate on real files
 #   simd128             enabled per-kernel (ARCH_FLAGS), not globally: the
 #                       scalar variant stays honestly scalar
+#
+# What is NOT here: the runtime an executable is embedded in. The tools,
+# tests and benches are node programs (NODERAWFS for real files, a
+# prespawned worker pool, exit at the end of main) and the browser module
+# (web/) is none of those, so each executable states its own through
+# blake3pp::node_program or web/CMakeLists.txt.
 
 # Platform/Emscripten.cmake beside this file wraps emscripten's own; see
 # the shim for why the compiler names are set there and not here.
@@ -23,9 +27,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 string(APPEND CMAKE_CXX_FLAGS_INIT " -fwasm-exceptions -pthread")
 string(APPEND CMAKE_C_FLAGS_INIT " -pthread")
 string(APPEND CMAKE_EXE_LINKER_FLAGS_INIT
-       " -fwasm-exceptions -pthread -sPTHREAD_POOL_SIZE=8 -sNODERAWFS=1"
+       " -fwasm-exceptions -pthread"
        " -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296"
-       " -sSTACK_SIZE=1048576 -sEXIT_RUNTIME=1")
+       " -sSTACK_SIZE=1048576")
 
 # Resolved to an absolute path: ctest would find a bare "node" on PATH, but
 # a test launcher that execs its argument literally (cmake-re's
