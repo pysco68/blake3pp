@@ -414,13 +414,23 @@ a multiple of 32 bytes, or holds fewer than two parts, does not compile:
 blake3pp::digest d = blake3pp::hash<blake3pp::stack_budget{1024}>(buffer, sched);   // 32 parts
 ```
 
-Code that needs to check the stack usage against known configuration can check
-the budget at compile time:
+Code that knows its calling thread's stack can check the budget against it
+at compile time:
 
 ```cpp
 constexpr blake3pp::stack_budget budget{1024};
 static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
 ```
+
+The budget covers that table and nothing else. Each part is reduced on the
+agent that took it, by a recursion that holds one chaining-value buffer per
+level: 2 KiB per level while the build contains a 16-wide kernel, since the
+buffer is sized for the widest variant compiled rather than the one that
+runs, and as many levels as halving the part takes to reach twice the
+running variant's degree in chunks. Agent threads therefore need stack of
+their own, and the two costs pull against each other: a smaller budget
+splits the input into larger parts, which makes that recursion deeper.
+Sizing a thread from the budget alone is not enough.
 
 `keyed_hash`, `derive_key`, `update_file` and `hash_file` take the same
 argument, and `parallel_hasher` takes it as its second template parameter.
@@ -703,7 +713,11 @@ build-time switches make it fit:
   microcontroller thread usually has. A `stack_budget` template argument
   sizes that table to the thread, and a `static_assert` of the budget
   against the RTOS's own stack size catches one that does not fit (see
-  the multi-core section above).
+  the multi-core section above). The budget bounds that table only. The
+  threads behind the scheduler pay the subtree recursion described
+  there, some 2 KiB per level, so they need provisioning as well, and a
+  smaller budget deepens the recursion on them as it shrinks the table
+  on the caller.
 
 Everything else adapts by the existing probes: 32-bit targets are
 supported, and the SIMD/execution polyfills select exactly as on

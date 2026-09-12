@@ -7,10 +7,14 @@
 // one at a time (scalar), a binary tree spends ~1 scalar block per chunk on
 // interior nodes, a measured ~1.5x drag at AVX2 chunk speeds.
 //
-// Everything here is allocation-free. The recursion holds one 2*max_degree
-// CV buffer per level (1 KiB); depth is log2(subtree chunks), so even a
-// 2^54-chunk maximum-size subtree stays under ~64 KiB of stack. M3's
-// parallel engine reuses these pieces per subtree.
+// Everything here is allocation-free. The recursion holds one
+// 4*max_simd_degree CV buffer per level (2 KiB while a 16-wide kernel is
+// compiled in), sized for the widest variant compiled rather than the one
+// that runs, and it stops at twice the RUNNING variant's degree, so a
+// scalar kernel recurses deepest: a 2^54-chunk maximum-size subtree would
+// take over 100 KiB of stack. The parallel engine's stack_budget bounds its
+// own part table, not this. M3's parallel engine reuses these pieces per
+// subtree.
 
 #include <algorithm>
 #include <array>

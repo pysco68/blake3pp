@@ -180,6 +180,14 @@ void stack_budget_below_two_parts();
 /// constexpr blake3pp::stack_budget budget{1024};
 /// static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
 /// @endcode
+///
+/// The budget covers this table alone. Each part is reduced on the agent
+/// that took it, by a recursion holding one chaining-value buffer per level
+/// (2 KiB while a 16-wide kernel is compiled in: the buffer is sized for
+/// the widest compiled variant, not the running one), as deep as halving
+/// the part takes to reach twice the running variant's degree in chunks. A
+/// smaller budget makes parts larger and that recursion deeper, so agent
+/// threads need stack of their own.
 struct stack_budget {
   /// The stack one part's chaining value takes.
   static constexpr std::size_t bytes_per_part = 32;
