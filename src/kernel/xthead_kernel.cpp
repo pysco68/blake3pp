@@ -322,6 +322,10 @@ void compress_xof(const std::uint32_t cv[8],
 
 }  // namespace
 
+// As in kernel.cpp: the staging buffers this build sizes from
+// BLAKE3PP_MAX_SIMD_DEGREE must hold this variant's batches.
+static_assert(W <= max_simd_degree);
+
 extern const kernel_ops ops;
 const kernel_ops ops = {
     arch::xthead,

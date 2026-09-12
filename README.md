@@ -644,7 +644,10 @@ build-time switches make it fit:
   threads behind the scheduler pay the subtree recursion described
   there, some 2 KiB per level, so they need provisioning as well, and a
   smaller budget deepens the recursion on them as it shrinks the table
-  on the caller.
+  on the caller. Those per-level buffers are sized for the widest kernel
+  the build could contain, so a scalar-only target cuts them from 2 KiB
+  to 128 bytes with `-DBLAKE3PP_MAX_SIMD_DEGREE=1`; a kernel wider than
+  the value fails the build rather than overflowing them.
 
 Everything else adapts by the existing probes: 32-bit targets are
 supported, and the SIMD/execution polyfills select exactly as on

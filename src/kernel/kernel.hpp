@@ -39,9 +39,19 @@ inline constexpr std::uint32_t block_len = 64;
 inline constexpr std::size_t chunk_len = 1024;
 inline constexpr std::size_t out_len = 32;
 
-// Upper bound on any variant's simd_degree (AVX-512: 16 u32 lanes); sizes
-// the caller-side staging buffers for hash_many batches.
+// Upper bound on any variant's simd_degree in THIS build (AVX-512: 16 u32
+// lanes); sizes the caller-side staging buffers for hash_many batches, and
+// with them the subtree recursion's per-level buffers (core/subtree.hpp).
+// The build system defines it from BLAKE3PP_MAX_SIMD_DEGREE on
+// blake3pp::features, which the kernel objects link and the library
+// propagates, so every TU in a build agrees on the value; a target whose
+// widest kernel is narrower lowers it and pays smaller buffers, and each
+// kernel TU static_asserts its own degree against it.
+#if defined(BLAKE3PP_MAX_SIMD_DEGREE)
+inline constexpr std::size_t max_simd_degree = BLAKE3PP_MAX_SIMD_DEGREE;
+#else
 inline constexpr std::size_t max_simd_degree = 16;
+#endif
 
 // Callers hand hash_many up to TWO batches worth of inputs at once (the
 // subtree leaf granularity); bounds the batch-shaped staging buffers.
