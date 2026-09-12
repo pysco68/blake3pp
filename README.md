@@ -648,6 +648,15 @@ build-time switches make it fit:
   the build could contain, so a scalar-only target cuts them from 2 KiB
   to 128 bytes with `-DBLAKE3PP_MAX_SIMD_DEGREE=1`; a kernel wider than
   the value fails the build rather than overflowing them.
+- `-DBLAKE3PP_SUBTREE_FOLD=<levels>` goes further on such a target: the
+  subtree reduction then folds groups into a bounded chaining-value stack
+  instead of holding one buffer per level, so the agents' stack stops
+  growing with the input (720 bytes at 12 levels, against 480 bytes plus
+  272 per level). It is opt-in because it trades lane occupancy in the
+  parent compressions for that: 11% on sse42 and avx2, nothing
+  measurable on a scalar kernel, which is the only kind of target this is
+  meant for. The output is identical either way, which the test suite
+  checks on every machine it runs on.
 
 Everything else adapts by the existing probes: 32-bit targets are
 supported, and the SIMD/execution polyfills select exactly as on

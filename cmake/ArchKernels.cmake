@@ -115,6 +115,29 @@ endif()
 target_compile_definitions(blake3pp_features
   INTERFACE "BLAKE3PP_MAX_SIMD_DEGREE=${BLAKE3PP_MAX_SIMD_DEGREE}")
 
+# Opt-in: reduce a subtree by folding groups into a binary-counter stack
+# (core::compress_subtree_to_cv_folded) instead of the recursion that holds
+# one CV buffer per level. The value is the stack bound in levels, so it is
+# also the working set: 12 levels is 384 bytes, covering a subtree of
+# 2^12 groups, and ON means 54, the largest subtree BLAKE3 defines. For
+# microcontrollers: the fold trades lane occupancy in the parent
+# compressions for a working set that does not grow with the subtree's
+# depth, which costs 11% on sse42 and avx2 and nothing measurable on a
+# scalar kernel, where there are no lanes to leave idle.
+set(BLAKE3PP_SUBTREE_FOLD OFF CACHE STRING
+  "Fold subtrees through a bounded CV stack instead of per-level buffers [OFF|ON|<levels>]")
+if(BLAKE3PP_SUBTREE_FOLD)
+  set(_ak_fold_levels "${BLAKE3PP_SUBTREE_FOLD}")
+  if(BLAKE3PP_SUBTREE_FOLD STREQUAL "ON")
+    set(_ak_fold_levels 54)
+  elseif(NOT BLAKE3PP_SUBTREE_FOLD MATCHES "^[0-9]+$")
+    message(FATAL_ERROR
+      "BLAKE3PP_SUBTREE_FOLD must be OFF, ON or a number of levels, got '${BLAKE3PP_SUBTREE_FOLD}'")
+  endif()
+  target_compile_definitions(blake3pp_features
+    INTERFACE "BLAKE3PP_SUBTREE_FOLD=${_ak_fold_levels}")
+endif()
+
 function(blake3pp_add_kernel ns)
   cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD;FORCE_VEXT"
     "SOURCE;EXTERNAL_COMPILER;VEXT_BYTES" "ARCH_FLAGS")
