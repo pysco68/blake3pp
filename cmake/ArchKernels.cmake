@@ -109,6 +109,28 @@ blake3pp_kernel_switch(SHUFFLE_TREE 1
 blake3pp_kernel_switch(ROT16_PER_COMPILER 1
   "x86 clang: rot16 as the shift-or LLVM folds to one pshufb, not the byte shuffle it lowers to two")
 
+# The widest simd_degree any kernel in THIS build may have. It sizes the
+# caller-side staging buffers for hash_many batches, and with them the
+# subtree recursion's per-level buffers (4 * degree chaining values, see
+# src/core/subtree.hpp): a build whose only kernel is scalar pays 128 bytes
+# per level where an AVX-512 build needs 2 KiB, which is the difference
+# between fitting an RTOS thread stack and not. The default is the ceiling
+# of every variant the project can compile; a narrower target lowers it, and
+# each kernel TU static_asserts its own degree against it, so a value too
+# low fails the build instead of overflowing a staging buffer. Not derived
+# from the registered kernels yet: an externally compiled kernel's command
+# line is fixed when it registers, before the set is known.
+set(BLAKE3PP_MAX_SIMD_DEGREE 16 CACHE STRING
+  "Widest simd_degree any compiled kernel may have (sizes the subtree staging buffers)")
+if(NOT BLAKE3PP_MAX_SIMD_DEGREE MATCHES "^(1|2|4|8|16)$")
+  message(FATAL_ERROR
+    "BLAKE3PP_MAX_SIMD_DEGREE must be 1, 2, 4, 8 or 16, got '${BLAKE3PP_MAX_SIMD_DEGREE}'")
+endif()
+# On features, which the kernel objects link and the library propagates, so
+# every TU that includes src/kernel/kernel.hpp agrees on the value.
+target_compile_definitions(blake3pp_features
+  INTERFACE "BLAKE3PP_MAX_SIMD_DEGREE=${BLAKE3PP_MAX_SIMD_DEGREE}")
+
 function(blake3pp_add_kernel ns)
   cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD;FORCE_VEXT"
     "SOURCE;EXTERNAL_COMPILER;VEXT_BYTES" "ARCH_FLAGS")
@@ -137,6 +159,8 @@ function(blake3pp_add_kernel ns)
     foreach(d IN LISTS _ak_switches)
       list(APPEND _ak_defs "-D${d}")
     endforeach()
+    # This command line predates the features target's reach.
+    list(APPEND _ak_defs "-DBLAKE3PP_MAX_SIMD_DEGREE=${BLAKE3PP_MAX_SIMD_DEGREE}")
     # Facade kernels built externally need the xsimd headers and the
     # provider pin on the external command line too (the vxe kernel is
     # the customer: clang scalarizes xsimd's VXE ops, GCC emits real

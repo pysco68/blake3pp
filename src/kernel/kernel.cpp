@@ -24,7 +24,9 @@
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
 namespace {
 
-static_assert(u32v::width <= max_simd_degree);
+static_assert(u32v::width <= max_simd_degree,
+              "BLAKE3PP_MAX_SIMD_DEGREE is narrower than this kernel's "
+              "simd_degree: it sizes the staging buffers this kernel fills");
 
 // Little-endian load/store, spelled memcpy + byteswap rather than the
 // byte-wise shift-or idiom: GCC and Clang fold both spellings to a single
