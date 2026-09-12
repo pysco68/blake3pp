@@ -24,8 +24,8 @@ option(BLAKE3PP_BUILD_BENCH "Build blake3pp benchmarks" ${PROJECT_IS_TOP_LEVEL})
 # The tools (CLI + benchmarks) use mimalloc by default where the platform
 # allocator serializes under threads: the parallel paths allocate on
 # window/segment granularity, and both musl's mallocng and Windows' UCRT
-# heap take a global lock. The LIBRARY stays allocator-neutral, so
-# consumers keep full control; this only touches the executables.
+# heap take a global lock. The LIBRARY stays allocator-neutral, so consumers
+# keep full control; this only touches the executables.
 #
 # Off for wasm (unsupported there) and off on Apple, which is neither of
 # the cases the option exists for: libmalloc caches per thread and does

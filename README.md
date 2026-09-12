@@ -708,32 +708,66 @@ build-time switches make it fit:
   the primary API anyway, and a freestanding caller brings its own
   scheduler because only it knows what its execution agents should be
   (on Zephyr SMP, for instance, one per core).
-- The multi-core entry points keep one 32-byte chaining value per part
-  on the calling thread's stack, 32 KiB by default, more than a
-  microcontroller thread usually has. A `stack_budget` template argument
-  sizes that table to the thread, and a `static_assert` of the budget
-  against the RTOS's own stack size catches one that does not fit (see
-  the multi-core section above). The budget bounds that table only. The
-  threads behind the scheduler pay the subtree recursion described
-  there, some 2 KiB per level, so they need provisioning as well, and a
-  smaller budget deepens the recursion on them as it shrinks the table
-  on the caller. Those per-level buffers are sized for the widest kernel
-  the build could contain, so a scalar-only target cuts them from 2 KiB
-  to 128 bytes with `-DBLAKE3PP_MAX_SIMD_DEGREE=1`; a kernel wider than
-  the value fails the build rather than overflowing them.
-- `-DBLAKE3PP_SUBTREE_FOLD=<levels>` goes further on such a target: the
-  subtree reduction then folds groups into a bounded chaining-value stack
-  instead of holding one buffer per level, so the agents' stack stops
-  growing with the input (720 bytes at 12 levels, against 480 bytes plus
-  272 per level). It is opt-in because it trades lane occupancy in the
-  parent compressions for that: 11% on sse42 and avx2, nothing
-  measurable on a scalar kernel, which is the only kind of target this is
-  meant for. The output is identical either way, which the test suite
-  checks on every machine it runs on.
+- The multi-core entry points spend stack on two sides, the calling
+  thread and the scheduler's agents, and three switches size it:
+  `stack_budget`, `BLAKE3PP_MAX_SIMD_DEGREE` and
+  `BLAKE3PP_SUBTREE_FOLD`. See the next section.
 
 Everything else adapts by the existing probes: 32-bit targets are
 supported, and the SIMD/execution polyfills select exactly as on
 hosted platforms.
+
+#### Stack requirements
+
+Nothing in the compute paths allocates, so every byte a hash costs is
+stack, on two threads at once: the one that calls `hash()` and each agent
+the scheduler runs the parts on. They are provisioned separately.
+
+**The calling thread** holds the part table, one 32-byte chaining value
+per part, which is exactly what the `stack_budget` template argument
+bounds: `budget.bytes`, 32 KiB by default. Nothing else about the input
+adds to it.
+
+**Each agent** reduces one part to a chaining value, and that is where
+the rest lives. The default reduction recurses, holding one buffer per
+level; the depth is how often the part halves before reaching twice the
+running kernel's `simd_degree` in chunks:
+
+```
+part chunks = bit_ceil(max(input chunks / budget.parts(), 16))
+depth       = log2(part chunks / (2 * simd_degree))
+agent stack = entry frame + depth * per-level frame
+```
+
+The frames follow `BLAKE3PP_MAX_SIMD_DEGREE`, since the buffers are sized
+for the widest kernel the build may contain, at `128 + 144 * degree`bytes
+per level. Measured with g++ 16 at `-O2` on x86-64:
+
+| `BLAKE3PP_MAX_SIMD_DEGREE` | entry frame | per level | opt-in fold, 12 levels | fold, 54 levels |
+|---|---|---|---|---|
+| 16 (default) | 5536 | 2432 | 3120 | 4464 |
+| 8 | 2832 | 1280 | 1856 | 3200 |
+| 1 | 480 | 272 | 720 | 2064 |
+
+Two consequences worth knowing before sizing a thread. A smaller budget
+does not only shrink the table: fewer parts make each part larger, which
+makes the recursion deeper, so it moves stack from the caller to the
+agents. And `BLAKE3PP_SUBTREE_FOLD=<levels>` removes the depth term
+altogether, at 32 bytes per level of its own, which is why its figures
+above do not depend on the input.
+
+A worked case, the Zephyr port this section exists for: a scalar-only
+build (`BLAKE3PP_MAX_SIMD_DEGREE=1`) hashing 1 MiB with
+`stack_budget{1024}`, so 32 parts of 32 chunks and a depth of 4. The
+caller needs 1 KiB for the table, each agent 480 + 4 * 272 = 1568 bytes,
+or 720 bytes flat with `BLAKE3PP_SUBTREE_FOLD=12`.
+
+These are one toolchain's frames; another compiler, ABI or optimization
+level will differ. Measure yours the same way, by building the library
+with `-fstack-usage` and reading the `.su` entries for
+`compress_subtree_wide` and `compress_subtree_to_cv_recursive` (or
+`compress_subtree_to_cv_folded` with the fold on), and leave the thread
+its own headroom on top.
 
 ### Guarantees and caveats
 
