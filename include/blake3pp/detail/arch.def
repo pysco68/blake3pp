@@ -108,11 +108,16 @@ BLAKE3PP_ARCH(msa, "msa", 177)
 // length is implementation-defined (Apple fixes it at 512; the Arm and
 // Qualcomm parts are not all published), so the three lengths of the
 // shipping SVE parts are compiled and the runtime picks the matching
-// one. Each ranks below the non-streaming sve2 variant of its width (no
-// mode switches when both exist) and above the plain sve one (XAR).
+// one. All three rank BELOW neon: streaming throughput is a property of
+// the SME unit, which is shared by a cluster, not of the width. On the
+// Exynos 2600 (Cortex C1, SVL 512) sme512 measured 0.92x neon and 0.54x
+// sve2_128 on one thread, and ten threads through the streaming kernel
+// totalled the throughput of one, the arbitration of the shared unit.
+// A caller who has measured otherwise pins the variant; an engine that
+// places one streaming worker per unit is future work.
 /// AArch64 SME, streaming SVE at a streaming vector length of exactly 512 bits.
-BLAKE3PP_ARCH(sme512, "sme512", 45)
+BLAKE3PP_ARCH(sme512, "sme512", 92)
 /// AArch64 SME, streaming SVE at exactly 256 bits.
-BLAKE3PP_ARCH(sme256, "sme256", 65)
+BLAKE3PP_ARCH(sme256, "sme256", 94)
 /// AArch64 SME, streaming SVE at exactly 128 bits.
-BLAKE3PP_ARCH(sme128, "sme128", 85)
+BLAKE3PP_ARCH(sme128, "sme128", 96)
