@@ -133,6 +133,7 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
   // (Whether sri wins outside Apple cores is still unverified; the
   // SRI_ROTATE switch exists to re-measure. GCC 15 selects usra without it
   // exactly as clang does.)
+#if !defined(BLAKE3PP_KERNEL_STREAMING)  // NEON is illegal in streaming mode
   if constexpr (W == 4 && sizeof(typename u32v::impl) == 16 &&
                 std::is_trivially_copyable_v<typename u32v::impl>) {
     // Immediately-invoked generic lambda: `if constexpr` only shields
@@ -148,6 +149,7 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
           vsriq_n_u32(vshlq_n_u32(x, 32 - N), x, N))};
     }(a.v);
   }
+#endif
 #endif
   return rotr(a, N);
 }

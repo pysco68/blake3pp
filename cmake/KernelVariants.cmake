@@ -254,7 +254,7 @@ function(_blake3pp_register_aarch64_kernels)
   # through the GNU-vector currency, all of which must inline into the
   # streaming body (a callee that does not gets a mode switch around it).
   option(BLAKE3PP_SME_KERNEL
-    "Compile the sme512 kernel (streaming SVE at SVL 512) where the compiler supports SME" ON)
+    "Compile the sme128/sme256/sme512 kernels (streaming SVE, one per streaming vector length) where the compiler supports SME" ON)
   if(NOT BLAKE3PP_SME_KERNEL)
     return()
   endif()
@@ -282,16 +282,19 @@ function(_blake3pp_register_aarch64_kernels)
                "-march=armv9-a+sme -msve-vector-bits=@VLEN@")
   if(_blake3pp_sme_flag)
     _blake3pp_fetch_xsimd()
-    _blake3pp_sve_flags("${_blake3pp_sme_flag}" 512 _flags)
-    # clang warns for every always_inline helper it inlines into a
-    # streaming body, since the helpers are not annotated
-    # __arm_streaming_compatible. They are generic code (no NEON
-    # intrinsics reach a width-16 TU), and the kernel audit checks the
+    # One kernel per streaming vector length, as for SVE; the runtime
+    # exact-matches SVL. clang warns for every always_inline helper it
+    # inlines into a streaming body, since the helpers are not annotated
+    # __arm_streaming_compatible. They are generic code (the NEON escapes
+    # are compiled out of streaming TUs), and the kernel audit checks the
     # object for NEON data processing, so the warning carries no
     # information here.
-    blake3pp_add_kernel(sme512 FORCE_XSIMD
-      ARCH_FLAGS ${_flags} -DBLAKE3PP_KERNEL_STREAMING=1
-      "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-aarch64-sme-attributes>")
+    foreach(_svl IN ITEMS 512 256 128)
+      _blake3pp_sve_flags("${_blake3pp_sme_flag}" ${_svl} _flags)
+      blake3pp_add_kernel(sme${_svl} FORCE_XSIMD
+        ARCH_FLAGS ${_flags} -DBLAKE3PP_KERNEL_STREAMING=1
+        "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-aarch64-sme-attributes>")
+    endforeach()
   endif()
 endfunction()
 

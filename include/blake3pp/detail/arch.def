@@ -104,7 +104,15 @@ BLAKE3PP_ARCH(msa, "msa", 177)
 // that exist (Apple M4/M5, Exynos 2600 class) fix the streaming length at
 // 512 bits and offer no non-streaming SVE at all, so this is the only wide
 // kernel they can run; SVE2 instructions in streaming mode carry XAR.
-// Ranked below sve2_512 (no mode switches when both exist) and above
-// sve512 (XAR).
+// Each streaming length is its own variant, as with SVE. The streaming
+// length is implementation-defined (Apple fixes it at 512; the Arm and
+// Qualcomm parts are not all published), so the three lengths of the
+// shipping SVE parts are compiled and the runtime picks the matching
+// one. Each ranks below the non-streaming sve2 variant of its width (no
+// mode switches when both exist) and above the plain sve one (XAR).
 /// AArch64 SME, streaming SVE at a streaming vector length of exactly 512 bits.
 BLAKE3PP_ARCH(sme512, "sme512", 45)
+/// AArch64 SME, streaming SVE at exactly 256 bits.
+BLAKE3PP_ARCH(sme256, "sme256", 65)
+/// AArch64 SME, streaming SVE at exactly 128 bits.
+BLAKE3PP_ARCH(sme128, "sme128", 85)

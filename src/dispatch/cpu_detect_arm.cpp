@@ -178,8 +178,11 @@ bool platform_cpu_supports(arch a) noexcept {
   }
 #if defined(BLAKE3PP_AARCH64_SVE)
   const sve_state& s = sve_probe();
-  if (a == arch::sme512) {
-    return s.sme && s.svl_bytes == 64;
+  switch (a) {
+    case arch::sme128: return s.sme && s.svl_bytes == 16;
+    case arch::sme256: return s.sme && s.svl_bytes == 32;
+    case arch::sme512: return s.sme && s.svl_bytes == 64;
+    default:           break;
   }
   if (!s.sve) {
     return false;
