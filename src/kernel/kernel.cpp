@@ -21,15 +21,17 @@
 #include "kernel/simd_facade.hpp"
 #include "kernel/transpose.hpp"
 
-// Streaming-mode kernels (SME, cmake/KernelVariants.cmake): the table's
-// entry points enter streaming mode on entry and leave it on return, and
-// the helpers that stay outlined carry the streaming interface so no mode
-// switch sits between them. Everything else inlines into the entry.
+// Streaming-mode kernels (SME, cmake/KernelVariants.cmake): every function
+// in this TU carries the streaming interface, so the whole TU is code that
+// only ever runs in streaming mode, and the compiler may use SVE freely in
+// it. The mode switch itself, and the kernel_ops table, live in
+// sme_entry.cpp, a TU compiled for SME without SVE: a compiler that sees
+// SVE as available uses it in the non-streaming prologue of a locally
+// streaming function (clang 21 saves the vector granule with cntd), which
+// traps on the SME-only parts (Apple M4) this variant exists for.
 #if defined(BLAKE3PP_KERNEL_STREAMING)
-#define BLAKE3PP_KERNEL_ENTRY __arm_locally_streaming
 #define BLAKE3PP_KERNEL_STREAMING_CALLEE __arm_streaming
 #else
-#define BLAKE3PP_KERNEL_ENTRY
 #define BLAKE3PP_KERNEL_STREAMING_CALLEE
 #endif
 
@@ -354,9 +356,10 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
   out = v;
 }
 
-BLAKE3PP_KERNEL_ENTRY void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
+void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
                        std::uint32_t len, std::uint64_t counter,
-                       std::uint32_t flags) noexcept {
+                       std::uint32_t flags) noexcept
+    BLAKE3PP_KERNEL_STREAMING_CALLEE {
   std::array<std::uint32_t, 16> out;
   compress(cv, block, len, counter, flags, out);
   // A counted loop, not std::copy_n: MSVC lowers copy_n of 8 uint32_t to an
@@ -368,24 +371,16 @@ BLAKE3PP_KERNEL_ENTRY void compress_in_place(std::uint32_t cv[8], const std::uin
   }
 }
 
-void compress_xof_impl(const std::uint32_t cv[8],
-                       const std::uint8_t block[block_len], std::uint32_t len,
-                       std::uint64_t counter, std::uint32_t flags,
-                       std::uint8_t out[64]) noexcept
+void compress_xof(const std::uint32_t cv[8],
+                  const std::uint8_t block[block_len], std::uint32_t len,
+                  std::uint64_t counter, std::uint32_t flags,
+                  std::uint8_t out[64]) noexcept
     BLAKE3PP_KERNEL_STREAMING_CALLEE {
   std::array<std::uint32_t, 16> wide;
   compress(cv, block, len, counter, flags, wide);
   for (std::size_t i = 0; i < 16; ++i) {
     store32(out + 4 * i, wide[i]);
   }
-}
-
-BLAKE3PP_KERNEL_ENTRY void compress_xof(const std::uint32_t cv[8],
-                                        const std::uint8_t block[block_len],
-                                        std::uint32_t len, std::uint64_t counter,
-                                        std::uint32_t flags,
-                                        std::uint8_t out[64]) noexcept {
-  compress_xof_impl(cv, block, len, counter, flags, out);
 }
 
 // Every lane's 64-bit counter, split lane-wise into the two u32 state
@@ -448,9 +443,10 @@ void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
   store_transposed(wide, out, transpose_detail::t16_mode());
 }
 
-BLAKE3PP_KERNEL_ENTRY void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
+void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
               std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
-              std::uint8_t* out, std::size_t num_blocks) noexcept {
+              std::uint8_t* out, std::size_t num_blocks) noexcept
+    BLAKE3PP_KERNEL_STREAMING_CALLEE {
   std::size_t i = 0;
   if constexpr (u32v::width > 1) {
     for (; i + u32v::width <= num_blocks; i += u32v::width) {
@@ -458,7 +454,7 @@ BLAKE3PP_KERNEL_ENTRY void xof_many(const std::uint32_t cv[8], const std::uint8_
     }
   }
   for (; i < num_blocks; ++i) {
-    compress_xof_impl(cv, block, len, counter + i, flags, out + i * 64);
+    compress_xof(cv, block, len, counter + i, flags, out + i * 64);
   }
 }
 
@@ -527,11 +523,12 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
   }
 }
 
-BLAKE3PP_KERNEL_ENTRY void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
+void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
                std::size_t blocks, const std::uint32_t key[8],
                std::uint64_t counter, bool increment_counter,
                std::uint32_t flags, std::uint32_t flags_start,
-               std::uint32_t flags_end, std::uint8_t* out) noexcept {
+               std::uint32_t flags_end, std::uint8_t* out) noexcept
+    BLAKE3PP_KERNEL_STREAMING_CALLEE {
   std::size_t i = 0;
   if constexpr (u32v::width > 1) {
     for (; i + u32v::width <= num_inputs; i += u32v::width) {
@@ -572,6 +569,45 @@ BLAKE3PP_KERNEL_ENTRY void hash_many(const std::uint8_t* const* inputs, std::siz
 
 }  // namespace
 
+#if defined(BLAKE3PP_KERNEL_STREAMING)
+// The streaming-interface entries sme_entry.cpp's locally streaming
+// forwarders call; the table is defined there.
+namespace streaming {
+// Qualified calls: unqualified lookup would find the wrapper itself, a
+// self-recursion without side effects that the optimiser deletes.
+void compress_in_place(std::uint32_t cv[8],
+                                 const std::uint8_t block[block_len],
+                                 std::uint32_t len, std::uint64_t counter,
+                                 std::uint32_t flags) noexcept __arm_streaming {
+  ::blake3pp::kern::BLAKE3PP_ARCH_NS::compress_in_place(cv, block, len, counter, flags);
+}
+void compress_xof(const std::uint32_t cv[8],
+                            const std::uint8_t block[block_len],
+                            std::uint32_t len, std::uint64_t counter,
+                            std::uint32_t flags,
+                            std::uint8_t out[64]) noexcept __arm_streaming {
+  ::blake3pp::kern::BLAKE3PP_ARCH_NS::compress_xof(cv, block, len, counter, flags, out);
+}
+void xof_many(const std::uint32_t cv[8],
+                        const std::uint8_t block[block_len], std::uint32_t len,
+                        std::uint64_t counter, std::uint32_t flags,
+                        std::uint8_t* out,
+                        std::size_t num_blocks) noexcept __arm_streaming {
+  ::blake3pp::kern::BLAKE3PP_ARCH_NS::xof_many(cv, block, len, counter, flags, out, num_blocks);
+}
+void hash_many(const std::uint8_t* const* inputs,
+                         std::size_t num_inputs, std::size_t blocks,
+                         const std::uint32_t key[8], std::uint64_t counter,
+                         bool increment_counter, std::uint32_t flags,
+                         std::uint32_t flags_start, std::uint32_t flags_end,
+                         std::uint8_t* out) noexcept __arm_streaming {
+  ::blake3pp::kern::BLAKE3PP_ARCH_NS::hash_many(inputs, num_inputs, blocks, key, counter, increment_counter,
+            flags, flags_start, flags_end, out);
+}
+}  // namespace streaming
+static_assert(u32v::width == BLAKE3PP_KERNEL_LANES,
+              "sme_entry.cpp's table must name the kernel's lane count");
+#else
 // Namespace-scope const defaults to internal linkage; the explicit extern
 // declaration keeps `ops` exported without relying on any header having
 // declared this TU's variant namespace.
@@ -586,5 +622,6 @@ const kernel_ops ops = {
     &xof_many,
     &hash_many,
 };
+#endif
 
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS

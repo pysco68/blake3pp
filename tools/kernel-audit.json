@@ -139,6 +139,19 @@
             "operand": "\\bv\\d+\\.(16b|8b|8h|4h|4s|2s|2d)\\b"
           }
         ]
+      },
+      {
+        "match": "sme\\d+-entry",
+        "forbid": [
+          {
+            "name": "SVE outside streaming mode (the entry TU switches modes; cntd/rdvl/addvl trap on SME-only parts)",
+            "mnemonic": "^(cnt[bhwd]|addvl|addpl|rdvl)$"
+          },
+          {
+            "name": "NEON data processing",
+            "operand": "\\bv\\d+\\.(16b|8b|8h|4h|4s|2s|2d)\\b"
+          }
+        ]
       }
     ],
     "binary": [

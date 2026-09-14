@@ -604,6 +604,12 @@ def kernel_objects(build_dir):
     for obj in glob.glob(os.path.join(build_dir, "CMakeFiles", "blake3pp_kernel_*.dir", "**", "*kernel.cpp.o*"),
                          recursive=True):
         found.append((re.search(r"blake3pp_kernel_([^/\\]+)\.dir", obj).group(1), obj))
+    # A streaming (sme) variant's entry TU, the mode switch around the
+    # kernel, is audited on its own: it must hold no SVE the compiler could
+    # execute outside streaming mode.
+    for obj in glob.glob(os.path.join(build_dir, "CMakeFiles", "blake3pp_kernel_*.dir", "**", "*sme_entry.cpp.o*"),
+                         recursive=True):
+        found.append((re.search(r"blake3pp_kernel_([^/\\]+)\.dir", obj).group(1) + "-entry", obj))
     for obj in glob.glob(os.path.join(build_dir, "blake3pp_generated", "kernel_*.o*")):
         found.append((re.search(r"kernel_([^/\\]+)\.o", os.path.basename(obj)).group(1), obj))
     return sorted(found)

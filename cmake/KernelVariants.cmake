@@ -289,12 +289,39 @@ function(_blake3pp_register_aarch64_kernels)
     # are compiled out of streaming TUs), and the kernel audit checks the
     # object for NEON data processing, so the warning carries no
     # information here.
+    # The mode switch and the table live in sme_entry.cpp, compiled for SME
+    # without SVE where the compiler has that mode (clang), so that no SVE
+    # instruction can reach the non-streaming prologue (clang 21's cntd
+    # traps on SME-only parts). GCC has no SME-without-SVE mode and its
+    # prologues are clean; the entry TU takes the kernel's flags there.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      string(REPLACE "armv9-a+sme" "armv8.6-a+sme" _entry "${_blake3pp_sme_flag}")
+      string(REPLACE "generic+sme+sve2" "generic+sme" _entry "${_entry}")
+      string(REGEX REPLACE " -msve-[a-z-]*=@VLEN@" "" _entry "${_entry}")
+      separate_arguments(_entry UNIX_COMMAND "${_entry}")
+    else()
+      set(_entry "")
+    endif()
+    set_source_files_properties("${PROJECT_SOURCE_DIR}/src/kernel/sme_entry.cpp"
+      PROPERTIES
+        COMPILE_OPTIONS "$<TARGET_PROPERTY:BLAKE3PP_SME_ENTRY_FLAGS>"
+        COMPILE_DEFINITIONS "BLAKE3PP_KERNEL_LANES=$<TARGET_PROPERTY:BLAKE3PP_SME_LANES>")
     foreach(_svl IN ITEMS 512 256 128)
       _blake3pp_sve_flags("${_blake3pp_sme_flag}" ${_svl} _flags)
+      math(EXPR _lanes "${_svl} / 32")
       blake3pp_add_kernel(sme${_svl} FORCE_XSIMD
         ARCH_FLAGS ${_flags} -DBLAKE3PP_KERNEL_STREAMING=1
+        "-DBLAKE3PP_KERNEL_LANES=${_lanes}"
         "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-aarch64-sme-attributes>")
+      target_sources(blake3pp_kernel_sme${_svl} PRIVATE
+        "${PROJECT_SOURCE_DIR}/src/kernel/sme_entry.cpp")
+      set_property(TARGET blake3pp_kernel_sme${_svl} PROPERTY BLAKE3PP_SME_LANES ${_lanes})
+      set_property(TARGET blake3pp_kernel_sme${_svl} PROPERTY BLAKE3PP_SME_ENTRY_FLAGS "${_entry}")
     endforeach()
+    # One copy of the weak SME ABI fallback, compiled with the entry flags.
+    set_source_files_properties("${PROJECT_SOURCE_DIR}/src/kernel/sme_abi.cpp"
+      PROPERTIES COMPILE_OPTIONS "$<TARGET_PROPERTY:BLAKE3PP_SME_ENTRY_FLAGS>")
+    target_sources(blake3pp_kernel_sme512 PRIVATE "${PROJECT_SOURCE_DIR}/src/kernel/sme_abi.cpp")
   endif()
 endfunction()
 
