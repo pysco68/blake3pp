@@ -122,6 +122,9 @@ option(BLAKE3PP_BENCH_DISPATCH_COST
   "Build the dispatch-cost benches (one kernel compilation per variant)" OFF)
 if(BLAKE3PP_BENCH_DISPATCH_COST
    AND NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND NOT EMSCRIPTEN)
+  # The detection ladder's cost: the first call of a fresh process.
+  add_executable(blake3pp_detect_cost detect_cost.cpp)
+  target_link_libraries(blake3pp_detect_cost PRIVATE blake3pp::blake3pp blake3pp_warnings)
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
     _blake3pp_dispatch_cost(scalar)
     _blake3pp_dispatch_cost(sse42 -msse4.2)

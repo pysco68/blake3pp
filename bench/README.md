@@ -76,6 +76,17 @@ one difference to the library's kernel objects. Without the flags the
 bench reports two to four instructions per dispatch and means the
 compare, the branch and a `lea`, none of which the library executes.
 
+### The detection ladder
+
+`blake3pp_detect_cost`, built with the same option, times a fresh
+process's first library call (`best_available()`, which builds the
+availability table from auxv, hwprobe or CPUID once per compiled
+variant), the cached second call, a `hasher{}` construction, the
+opt-in `run_trap_probes()` rung, and one `is_available()` per compiled
+variant. Only a new process pays the first call, so run it several
+times. Under a hypervisor the microseconds are `cpuid` trapping to the
+host; on bare metal the whole ladder is about a microsecond.
+
 ### Other compilers and ISAs
 
 The call site is the whole question, and the disassembly answers it
