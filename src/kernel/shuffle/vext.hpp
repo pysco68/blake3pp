@@ -93,25 +93,25 @@ struct vext_backend {
 
   template <std::size_t W>
   static BLAKE3PP_FORCE_INLINE u32v to_word(reg<W> v) noexcept {
-    return u32v{std::bit_cast<typename u32v::impl>(v)};
+    return u32v{__builtin_bit_cast(typename u32v::impl, v)};
   }
 
   template <std::size_t W>
   static BLAKE3PP_FORCE_INLINE reg<W> from_word(u32v w) noexcept {
-    return std::bit_cast<reg<W>>(w.v);
+    return __builtin_bit_cast(reg<W>, w.v);
   }
 
   template <int RB, std::size_t W>
   static BLAKE3PP_FORCE_INLINE u32v rot_bytes(u32v w) noexcept {
     using B = typename bext<W>::type;
-    const B b = std::bit_cast<B>(from_word<W>(w));
+    const B b = __builtin_bit_cast(B, from_word<W>(w));
     const B r = [&]<std::size_t... I>(std::index_sequence<I...>) {
       // Little-endian: rotr by 8*RB bits moves source byte (j+RB)%4 into
       // destination byte j of each element.
       return __builtin_shufflevector(b, b,
                                      ((I / 4) * 4 + ((I % 4) + RB) % 4)...);
     }(std::make_index_sequence<4 * W>{});
-    return to_word<W>(std::bit_cast<reg<W>>(r));
+    return to_word<W>(__builtin_bit_cast(reg<W>, r));
   }
 };
 

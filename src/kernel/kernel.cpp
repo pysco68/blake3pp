@@ -21,6 +21,18 @@
 #include "kernel/simd_facade.hpp"
 #include "kernel/transpose.hpp"
 
+// Streaming-mode kernels (SME, cmake/KernelVariants.cmake): the table's
+// entry points enter streaming mode on entry and leave it on return, and
+// the helpers that stay outlined carry the streaming interface so no mode
+// switch sits between them. Everything else inlines into the entry.
+#if defined(BLAKE3PP_KERNEL_STREAMING)
+#define BLAKE3PP_KERNEL_ENTRY __arm_locally_streaming
+#define BLAKE3PP_KERNEL_STREAMING_CALLEE __arm_streaming
+#else
+#define BLAKE3PP_KERNEL_ENTRY
+#define BLAKE3PP_KERNEL_STREAMING_CALLEE
+#endif
+
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
 namespace {
 
@@ -305,7 +317,15 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
   alignas(std::uint32_t) std::uint8_t staged[block_len];
   if ((reinterpret_cast<std::uintptr_t>(src) &
        (alignof(std::uint32_t) - 1)) != 0) {
-    std::memcpy(staged, src, block_len);
+    // Eight word copies rather than one memcpy: in streaming mode (the
+    // sme kernels) a 64-byte memcpy is not expanded inline, GCC wraps a
+    // libc call in a mode switch and clang calls __arm_sc_memcpy, which
+    // musl does not provide. Word copies inline everywhere.
+    for (std::size_t i = 0; i < block_len; i += sizeof(std::uint64_t)) {
+      std::uint64_t w;
+      std::memcpy(&w, src + i, sizeof w);
+      std::memcpy(staged + i, &w, sizeof w);
+    }
     src = staged;
   }
   src = static_cast<const std::uint8_t*>(
@@ -334,7 +354,7 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
   out = v;
 }
 
-void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
+BLAKE3PP_KERNEL_ENTRY void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
                        std::uint32_t len, std::uint64_t counter,
                        std::uint32_t flags) noexcept {
   std::array<std::uint32_t, 16> out;
@@ -348,15 +368,24 @@ void compress_in_place(std::uint32_t cv[8], const std::uint8_t block[block_len],
   }
 }
 
-void compress_xof(const std::uint32_t cv[8],
-                  const std::uint8_t block[block_len], std::uint32_t len,
-                  std::uint64_t counter, std::uint32_t flags,
-                  std::uint8_t out[64]) noexcept {
+void compress_xof_impl(const std::uint32_t cv[8],
+                       const std::uint8_t block[block_len], std::uint32_t len,
+                       std::uint64_t counter, std::uint32_t flags,
+                       std::uint8_t out[64]) noexcept
+    BLAKE3PP_KERNEL_STREAMING_CALLEE {
   std::array<std::uint32_t, 16> wide;
   compress(cv, block, len, counter, flags, wide);
   for (std::size_t i = 0; i < 16; ++i) {
     store32(out + 4 * i, wide[i]);
   }
+}
+
+BLAKE3PP_KERNEL_ENTRY void compress_xof(const std::uint32_t cv[8],
+                                        const std::uint8_t block[block_len],
+                                        std::uint32_t len, std::uint64_t counter,
+                                        std::uint32_t flags,
+                                        std::uint8_t out[64]) noexcept {
+  compress_xof_impl(cv, block, len, counter, flags, out);
 }
 
 // Every lane's 64-bit counter, split lane-wise into the two u32 state
@@ -386,7 +415,8 @@ BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
 // lane-major step.
 void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
               std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
-              std::uint8_t* out) noexcept {
+              std::uint8_t* out) noexcept
+    BLAKE3PP_KERNEL_STREAMING_CALLEE {
   constexpr std::size_t W = u32v::width;
 
   u32v m[16];
@@ -418,7 +448,7 @@ void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
   store_transposed(wide, out, transpose_detail::t16_mode());
 }
 
-void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
+BLAKE3PP_KERNEL_ENTRY void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
               std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
               std::uint8_t* out, std::size_t num_blocks) noexcept {
   std::size_t i = 0;
@@ -428,7 +458,7 @@ void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
     }
   }
   for (; i < num_blocks; ++i) {
-    compress_xof(cv, block, len, counter + i, flags, out + i * 64);
+    compress_xof_impl(cv, block, len, counter + i, flags, out + i * 64);
   }
 }
 
@@ -440,7 +470,8 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
                 const std::uint32_t key[8], std::uint64_t counter,
                 bool increment_counter, std::uint32_t flags,
                 std::uint32_t flags_start, std::uint32_t flags_end,
-                std::uint8_t* out) noexcept {
+                std::uint8_t* out) noexcept
+    BLAKE3PP_KERNEL_STREAMING_CALLEE {
   constexpr std::size_t W = u32v::width;
 
   u32v cv[8];
@@ -496,7 +527,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
   }
 }
 
-void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
+BLAKE3PP_KERNEL_ENTRY void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
                std::size_t blocks, const std::uint32_t key[8],
                std::uint64_t counter, bool increment_counter,
                std::uint32_t flags, std::uint32_t flags_start,

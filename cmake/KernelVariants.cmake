@@ -244,6 +244,55 @@ function(_blake3pp_register_aarch64_kernels)
       blake3pp_add_kernel(sve2_512 FORCE_XSIMD ARCH_FLAGS ${_flags})
     endif()
   endif()
+
+  # SME: the same kernel source compiled for streaming mode. The entry
+  # points are __arm_locally_streaming (kernel.cpp, BLAKE3PP_KERNEL_STREAMING),
+  # the fixed-length SVE types are sized by the STREAMING vector length,
+  # which clang spells as a second flag and GCC folds into the one. The
+  # smoke is the streaming shape of the kernel's constructs: a locally
+  # streaming function, XAR, and the bit_cast/shufflevector round trip
+  # through the GNU-vector currency, all of which must inline into the
+  # streaming body (a callee that does not gets a mode switch around it).
+  option(BLAKE3PP_SME_KERNEL
+    "Compile the sme512 kernel (streaming SVE at SVL 512) where the compiler supports SME" ON)
+  if(NOT BLAKE3PP_SME_KERNEL)
+    return()
+  endif()
+  set(_blake3pp_sme_smoke [=[
+    #include <arm_sve.h>
+    typedef svuint32_t fixed_u32
+        __attribute__((arm_sve_vector_bits(__ARM_FEATURE_SVE_BITS)));
+    typedef unsigned gnu_vec
+        __attribute__((vector_size(sizeof(fixed_u32))));
+    __arm_locally_streaming int f(const unsigned* p) {
+      fixed_u32 z = svld1_u32(svptrue_b32(), p);
+      gnu_vec g = __builtin_bit_cast(gnu_vec, z);
+      z = svxar_n_u32(__builtin_bit_cast(fixed_u32, g), z, 7);
+      g = __builtin_shufflevector(__builtin_bit_cast(gnu_vec, z), g,
+                                  0, 16, 1, 17, 4, 20, 5, 21,
+                                  8, 24, 9, 25, 12, 28, 13, 29);
+      return (int)svcntw() + (int)g[0];
+    }
+    int main() { unsigned a[16] = {}; return f(a); }
+  ]=])
+  blake3pp_probe_flag_candidates(_blake3pp_sme_flag BLAKE3PP_COMPILER_SME_VLS
+    SOURCE "${_blake3pp_sme_smoke}" PROBE_VLEN 512
+    CANDIDATES "-march=armv9-a+sme -msve-vector-bits=@VLEN@ -msve-streaming-vector-bits=@VLEN@"
+               "-mcpu=generic+sme+sve2 -msve-vector-bits=@VLEN@ -msve-streaming-vector-bits=@VLEN@"
+               "-march=armv9-a+sme -msve-vector-bits=@VLEN@")
+  if(_blake3pp_sme_flag)
+    _blake3pp_fetch_xsimd()
+    _blake3pp_sve_flags("${_blake3pp_sme_flag}" 512 _flags)
+    # clang warns for every always_inline helper it inlines into a
+    # streaming body, since the helpers are not annotated
+    # __arm_streaming_compatible. They are generic code (no NEON
+    # intrinsics reach a width-16 TU), and the kernel audit checks the
+    # object for NEON data processing, so the warning carries no
+    # information here.
+    blake3pp_add_kernel(sme512 FORCE_XSIMD
+      ARCH_FLAGS ${_flags} -DBLAKE3PP_KERNEL_STREAMING=1
+      "$<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-aarch64-sme-attributes>")
+  endif()
 endfunction()
 
 function(_blake3pp_register_riscv64_kernels)

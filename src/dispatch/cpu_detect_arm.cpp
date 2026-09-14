@@ -18,6 +18,8 @@
 
 #include "dispatch/cpu_detect.hpp"
 
+#include <cstddef>
+
 #if defined(BLAKE3PP_CPU_DETECT_ARM)
 
 #if defined(_WIN32)
@@ -48,6 +50,22 @@
 #ifndef PR_SVE_VL_LEN_MASK
 #define PR_SVE_VL_LEN_MASK 0xffff
 #endif
+#ifndef HWCAP2_SME
+#define HWCAP2_SME (1UL << 23)
+#endif
+#ifndef PR_SME_GET_VL
+#define PR_SME_GET_VL 64
+#endif
+#ifndef PR_SME_VL_LEN_MASK
+#define PR_SME_VL_LEN_MASK 0xffff
+#endif
+#elif defined(__APPLE__)
+// Apple silicon has no SVE outside streaming mode; from the M4 on it has
+// SME with a 512-bit streaming vector length. Presence comes from sysctl,
+// the length from rdsvl, which is legal outside streaming mode.
+#define BLAKE3PP_AARCH64_SVE 1
+#define BLAKE3PP_AARCH64_APPLE_SME 1
+#include <sys/sysctl.h>
 #endif
 
 namespace blake3pp::detail {
@@ -58,6 +76,8 @@ struct sve_state {
   bool sve = false;
   bool sve2 = false;
   unsigned vl_bytes = 0;
+  bool sme = false;
+  unsigned svl_bytes = 0;  // the streaming vector length
 };
 #endif
 
@@ -76,6 +96,40 @@ const sve_state& sve_probe() noexcept {
         st.vl_bytes = static_cast<unsigned>(vl) & PR_SVE_VL_LEN_MASK;
         st.sve2 = (getauxval(AT_HWCAP2) & HWCAP2_SVE2) != 0;
       }
+    }
+    // SME is independent of SVE: a part may have either without the other.
+    if ((getauxval(AT_HWCAP2) & HWCAP2_SME) != 0) {
+      const int svl = prctl(PR_SME_GET_VL);
+      if (svl >= 0) {
+        st.sme = true;
+        st.svl_bytes = static_cast<unsigned>(svl) & PR_SME_VL_LEN_MASK;
+      }
+    }
+    return st;
+  }();
+  return s;
+}
+#elif defined(BLAKE3PP_AARCH64_APPLE_SME)
+#if defined(__GNUC__) || defined(__clang__)
+unsigned sme_svl_bytes() noexcept {
+  unsigned long long svl = 0;
+  __asm__ volatile(".arch_extension sme\n\trdsvl %0, #1\n\t.arch_extension nosme"
+                   : "=r"(svl));
+  return static_cast<unsigned>(svl);
+}
+#else
+unsigned sme_svl_bytes() noexcept { return 0; }
+#endif
+
+const sve_state& sve_probe() noexcept {
+  static const sve_state s = [] {
+    sve_state st{};
+    int v = 0;
+    std::size_t len = sizeof v;
+    if (sysctlbyname("hw.optional.arm.FEAT_SME", &v, &len, nullptr, 0) == 0 &&
+        v != 0) {
+      st.sme = true;
+      st.svl_bytes = sme_svl_bytes();
     }
     return st;
   }();
@@ -124,6 +178,9 @@ bool platform_cpu_supports(arch a) noexcept {
   }
 #if defined(BLAKE3PP_AARCH64_SVE)
   const sve_state& s = sve_probe();
+  if (a == arch::sme512) {
+    return s.sme && s.svl_bytes == 64;
+  }
   if (!s.sve) {
     return false;
   }

@@ -14,8 +14,8 @@
   ],
   "min_vector_instructions": 500,
   "quality": {
-    "hot": "::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof)\\(",
-    "allow_calls": "^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck|__asan_\\w+|__hwasan_\\w+|__ubsan_\\w+|__tsan_\\w+|__msan_\\w+|__sanitizer_\\w+|__gcov\\w*|__llvm_\\w+)$|kern::\\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\\(|std::_Atomic_storage<.*>::load\\(",
+    "hot": "::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof(_impl)?)\\(",
+    "allow_calls": "^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck|__asan_\\w+|__hwasan_\\w+|__ubsan_\\w+|__tsan_\\w+|__msan_\\w+|__sanitizer_\\w+|__gcov\\w*|__llvm_\\w+)$|kern::\\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof(_impl)?)\\(|std::_Atomic_storage<.*>::load\\(",
     "max_loops": 24,
     "min_vector": 500
   },
@@ -123,13 +123,29 @@
           "all": true,
           "min": 50
         }
+      },
+      {
+        "match": "sme\\d+",
+        "require": {
+          "name": "SVE2 in streaming mode (xar)",
+          "mnemonic": "^xar$",
+          "operand": "\\bz\\d+\\b",
+          "all": true,
+          "min": 50
+        },
+        "forbid": [
+          {
+            "name": "NEON data processing (illegal in streaming mode)",
+            "operand": "\\bv\\d+\\.(16b|8b|8h|4h|4s|2s|2d)\\b"
+          }
+        ]
       }
     ],
     "binary": [
       {
         "name": "SVE",
         "operand": "\\bz\\d+\\b|\\bp\\d+/[mz]",
-        "outside": "kern::sve"
+        "outside": "kern::(sve|sme)"
       }
     ]
   },

@@ -32,6 +32,19 @@
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
 namespace transpose_detail {
 
+// A 16-byte copy as two word copies. A memcpy of this size is a library
+// call in streaming mode (the sme kernels): GCC brackets it with a mode
+// switch, clang calls __arm_sc_memcpy, which musl does not provide. Two
+// 64-bit moves inline on every compiler and every mode.
+BLAKE3PP_FORCE_INLINE void copy16(std::uint8_t* dst,
+                                  const std::uint8_t* src) noexcept {
+  std::uint64_t lo, hi;
+  std::memcpy(&lo, src, sizeof lo);
+  std::memcpy(&hi, src + sizeof lo, sizeof hi);
+  std::memcpy(dst, &lo, sizeof lo);
+  std::memcpy(dst + sizeof lo, &hi, sizeof hi);
+}
+
 // The W==16 strategy is a RUNTIME dial (kern::transpose16_active, set via
 // blake3pp::set_transpose16 / tune_transpose16): on double-pumped AVX-512
 // (Strix Point) the register tree measured 20% slower than the scalar
@@ -62,7 +75,11 @@ BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
                                         transpose16_mode mode) noexcept {
   using V = typename B::template reg<W>;
   if constexpr (W == 16) {
+#if defined(BLAKE3PP_KERNEL_STREAMING)
+    if (mode != transpose16_mode::staging) {
+#else
     if (mode == transpose16_mode::quartered) {
+#endif
       // Quartered: 128-bit pieces land block-transposed by ADDRESSING;
       // registers only run the two in-lane stages.
       for (std::size_t q = 0; q < 4; ++q) {
@@ -70,8 +87,7 @@ BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
         for (std::size_t k = 0; k < 4; ++k) {
           std::uint8_t quad[64];
           for (std::size_t l = 0; l < 4; ++l) {
-            std::memcpy(quad + 16 * l, inputs[4 * l + k] + offset + 16 * q,
-                        16);
+            copy16(quad + 16 * l, inputs[4 * l + k] + offset + 16 * q);
           }
           r[k] = B::template load<W>(quad);
         }
@@ -83,6 +99,13 @@ BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
       }
       return true;
     }
+#if !defined(BLAKE3PP_KERNEL_STREAMING)
+    // The register tree materialises 1 KiB register arrays that both
+    // compilers copy with a memcpy call; in streaming mode (the sme
+    // kernels) that call is a mode switch (GCC) or __arm_sc_memcpy
+    // (clang; absent from musl). The tree also lost to quartered on every
+    // width-16 part measured, so the streaming kernels compile it out and
+    // the tree dial setting runs quartered there.
     if (mode == transpose16_mode::tree) {
       V r[16];
       for (std::size_t lane = 0; lane < 16; ++lane) {
@@ -95,6 +118,7 @@ BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
       }
       return true;
     }
+#endif
     return false;  // staging
   } else {
     constexpr std::size_t groups = 16 / W;
@@ -121,7 +145,11 @@ BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
                                          transpose16_mode mode) noexcept {
   using V = typename B::template reg<W>;
   if constexpr (W == 16) {
+#if defined(BLAKE3PP_KERNEL_STREAMING)
+    if (mode != transpose16_mode::staging) {
+#else
     if (mode == transpose16_mode::quartered) {
+#endif
       // Quartered mirror: two in-lane stages, then 128-bit pieces go to
       // their destinations by addressing (extract-stores).
       for (std::size_t q = 0; q < 4; ++q) {
@@ -135,12 +163,19 @@ BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
           std::uint8_t quad[64];
           B::template store<W>(quad, t[k]);
           for (std::size_t l = 0; l < 4; ++l) {
-            std::memcpy(out + (4 * l + k) * 64 + 16 * q, quad + 16 * l, 16);
+            copy16(out + (4 * l + k) * 64 + 16 * q, quad + 16 * l);
           }
         }
       }
       return true;
     }
+#if !defined(BLAKE3PP_KERNEL_STREAMING)
+    // The register tree materialises 1 KiB register arrays that both
+    // compilers copy with a memcpy call; in streaming mode (the sme
+    // kernels) that call is a mode switch (GCC) or __arm_sc_memcpy
+    // (clang; absent from musl). The tree also lost to quartered on every
+    // width-16 part measured, so the streaming kernels compile it out and
+    // the tree dial setting runs quartered there.
     if (mode == transpose16_mode::tree) {
       V r[16];
       for (std::size_t j = 0; j < 16; ++j) {
@@ -153,6 +188,7 @@ BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
       }
       return true;
     }
+#endif
     return false;  // staging
   } else {
     constexpr std::size_t groups = 16 / W;

@@ -98,3 +98,13 @@ BLAKE3PP_ARCH(vxe, "vxe", 176)
 /// EMULATOR-ONLY: validated under qemu against the golden vectors, never
 /// on MSA silicon.
 BLAKE3PP_ARCH(msa, "msa", 177)
+// SME streaming SVE. The kernel's entry points run in streaming mode
+// (__arm_locally_streaming) at the streaming vector length, exact-matched
+// like the sve* variants match the vector length. The SME implementations
+// that exist (Apple M4/M5, Exynos 2600 class) fix the streaming length at
+// 512 bits and offer no non-streaming SVE at all, so this is the only wide
+// kernel they can run; SVE2 instructions in streaming mode carry XAR.
+// Ranked below sve2_512 (no mode switches when both exist) and above
+// sve512 (XAR).
+/// AArch64 SME, streaming SVE at a streaming vector length of exactly 512 bits.
+BLAKE3PP_ARCH(sme512, "sme512", 45)

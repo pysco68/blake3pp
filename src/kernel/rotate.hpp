@@ -143,8 +143,8 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
     // parameter restores the dependency. (At SVE VL=128 the branch IS
     // taken, and validly: Z0-Z31 alias V0-V31, so the NEON sri applies.)
     return [](auto impl) BLAKE3PP_LAMBDA_FORCE_INLINE {
-      const uint32x4_t x = std::bit_cast<uint32x4_t>(impl);
-      return u32v{std::bit_cast<decltype(impl)>(
+      const uint32x4_t x = __builtin_bit_cast(uint32x4_t, impl);
+      return u32v{__builtin_bit_cast(decltype(impl),
           vsriq_n_u32(vshlq_n_u32(x, 32 - N), x, N))};
     }(a.v);
   }
@@ -181,10 +181,10 @@ BLAKE3PP_FORCE_INLINE u32v xor_rot(u32v x, u32v y) noexcept {
         const sve_fixed_u32 r = svxar_n_u32(ix.data, iy.data, N);
         return u32v{decltype(ix){r}};
       } else {
-        const sve_fixed_u32 r = svxar_n_u32(std::bit_cast<sve_fixed_u32>(ix),
-                                            std::bit_cast<sve_fixed_u32>(iy),
+        const sve_fixed_u32 r = svxar_n_u32(__builtin_bit_cast(sve_fixed_u32, ix),
+                                            __builtin_bit_cast(sve_fixed_u32, iy),
                                             N);
-        return u32v{std::bit_cast<decltype(ix)>(r)};
+        return u32v{__builtin_bit_cast(decltype(ix), r)};
       }
     }(x.v, y.v);
   }
