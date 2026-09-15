@@ -815,9 +815,11 @@ reported at configure time when it is not the default.
 | variable | default | off means |
 |----------|---------|-----------|
 | `BLAKE3PP_KERNEL_INLINE_ENFORCEMENT` | on, all targets | Drop `always_inline`/`__forceinline` from the round core. Every compiler measured then outlines it (clang the whole `all_rounds`, GCC the `index_sequence` lambda), costing 6-40% depending on compiler and variant. |
-| `BLAKE3PP_KERNEL_SRI_ROTATE` | on, aarch64 | Spell rot12/rot7 as the generic shift-or, which selects `shl`+`usra` instead of `shl`+`sri`. Worth ~6% on Apple M2 / clang 22; unverified on Neoverse. |
+| `BLAKE3PP_KERNEL_SRI_ROTATE` | on, aarch64 | Spell rot12/rot7 as the generic shift-or, which selects `shl`+`usra` instead of `shl`+`sri`. `sri` is worth ~6% on Apple M2 (clang 22), 12% on Neoverse V2 and 8% on Neoverse N1 (clang 21, static build), measured as alternating A/B pairs. |
 | `BLAKE3PP_KERNEL_STAGED_ROUNDS` | on, aarch64 | Run each round as sequential `g` calls instead of quartet-staged. A small win on Apple M2 / clang 22, and provably inert on GCC 15 (same schedule, different register names). Loses on x86, where it is off regardless. |
 | `BLAKE3PP_KERNEL_XAR_ROTATE` | on, SVE2 variants | Spell `rot(x ^ y)` as `eor` + rotate instead of one fused `XAR`. Off costs the SVE2 kernels their entire margin over NEON: measured 1.89 vs 1.61 GiB/s on Neoverse V2 (GCP Axion). |
+| `BLAKE3PP_KERNEL_SHUFFLE_TREE` | on, all SIMD targets | Stage every transpose through a scalar array and spell the byte rotates as shift-or, the code before the shuffle-tree bypass. Off costs SSE4.2 about half its throughput on clang; see the kernel section of the talk notes. |
+| `BLAKE3PP_KERNEL_ROT16_PER_COMPILER` | on, x86 clang | Spell rot16 as the byte shuffle on clang too, which LLVM lowers to `pshuflw`+`pshufhw` where the shift-or folds to one `pshufb`. The pre-split spelling, kept for the A/B. |
 | `BLAKE3PP_KERNEL_VROR_ROTATE` | on, RVV Zvbb variants | Spell the rotate as the 4-op shift-or (base RVV has no rotate) instead of `vxor`+`vror`. The XAR playbook on RISC-V; unmeasured on real Zvbb silicon so far (this switch is how it will be). |
 
 ```bash

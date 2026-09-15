@@ -97,9 +97,15 @@ typedef vuint32m1_t rvv_fixed_u32
 // occupies a register all loop long. What shortens is g's SERIAL chain, two
 // dependent shuffles down to one. Same lesson as the aarch64 sri escape:
 // on this kernel the metric is critical-path length, not instruction count.
+// BLAKE3PP_KERNEL_ROT16_PER_COMPILER (cmake/ArchKernels.cmake) off gives
+// clang the byte shuffle for 16 like every other compiler: the spelling
+// before the split, kept buildable so the pair can be re-measured.
+#ifndef BLAKE3PP_KERNEL_ROT16_PER_COMPILER
+#define BLAKE3PP_KERNEL_ROT16_PER_COMPILER 1
+#endif
 template <int N>
 constexpr bool prefer_byte_rot() noexcept {
-#if defined(__clang__) && \
+#if defined(__clang__) && BLAKE3PP_KERNEL_ROT16_PER_COMPILER && \
     (defined(__x86_64__) || defined(__i386__) || defined(_M_X64))
   return N == 8;  // N == 16 is one instruction cheaper as generic shift-or
 #else
@@ -130,9 +136,9 @@ BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
   // intrinsics reach sri directly (their PR #319 measured the same):
   // 1.61 -> 1.71 GiB/s on Apple M2 / clang 22, exactly upstream's number;
   // the two hash loops are otherwise instruction-for-instruction identical.
-  // (Whether sri wins outside Apple cores is still unverified; the
-  // SRI_ROTATE switch exists to re-measure. GCC 15 selects usra without it
-  // exactly as clang does.)
+  // (sri also wins on Neoverse V2, +12%, and N1, +8%, in alternating A/B
+  // pairs of the static clang build; the SRI_ROTATE switch exists to
+  // re-measure. GCC 15 selects usra without it exactly as clang does.)
   if constexpr (W == 4 && sizeof(typename u32v::impl) == 16 &&
                 std::is_trivially_copyable_v<typename u32v::impl>) {
     // Immediately-invoked generic lambda: `if constexpr` only shields

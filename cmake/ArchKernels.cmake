@@ -93,6 +93,22 @@ blake3pp_kernel_switch(XAR_ROTATE 1
 blake3pp_kernel_switch(VROR_ROTATE 1
   "riscv Zvbb: single-instruction vror rotate instead of the 3-op shift-or")
 
+# x86 clang: spell rot16 as the generic shift-or, which LLVM canonicalises to
+# one pshufb, where every other compiler gets that instruction from the
+# explicit byte shuffle (which LLVM lowers to pshuflw+pshufhw instead). Off
+# gives clang the byte shuffle like everyone else, the spelling before the
+# split was measured. See prefer_byte_rot in src/kernel/rotate.hpp.
+# The shuffle-tree bypass: transposes as constexpr-index shuffle networks
+# and the byte-granular rotates as byte permutes, instead of the scalar
+# staging gather and shift-or the std providers are left with (no permute
+# API in <simd>). Off restores the pre-bypass spelling for the A/B. See
+# src/kernel/shuffle.hpp.
+blake3pp_kernel_switch(SHUFFLE_TREE 1
+  "transposes and byte rotates through the constexpr shuffle networks instead of the scalar staging gather")
+
+blake3pp_kernel_switch(ROT16_PER_COMPILER 1
+  "x86 clang: rot16 as the shift-or LLVM folds to one pshufb, not the byte shuffle it lowers to two")
+
 function(blake3pp_add_kernel ns)
   cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD;FORCE_VEXT"
     "SOURCE;EXTERNAL_COMPILER;VEXT_BYTES" "ARCH_FLAGS")

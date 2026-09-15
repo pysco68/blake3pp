@@ -30,8 +30,16 @@
 
 #include "kernel/simd_facade.hpp"
 
-#if defined(BLAKE3PP_FORCE_SCALAR)
-// Width 1: nothing to transpose.
+// BLAKE3PP_KERNEL_SHUFFLE_TREE (cmake/ArchKernels.cmake) off leaves the
+// kernel without a shuffle backend: transposes go through the scalar
+// staging gather and the byte-granular rotates through shift-or, the
+// spelling before the bypass, kept buildable so the pair can be measured.
+#ifndef BLAKE3PP_KERNEL_SHUFFLE_TREE
+#define BLAKE3PP_KERNEL_SHUFFLE_TREE 1
+#endif
+
+#if defined(BLAKE3PP_FORCE_SCALAR) || !BLAKE3PP_KERNEL_SHUFFLE_TREE
+// Width 1: nothing to transpose. Or the bypass switched off.
 
 #elif (defined(__GNUC__) || defined(__clang__)) && \
     !defined(BLAKE3PP_SHUFFLE_FORCE_XSIMD)
