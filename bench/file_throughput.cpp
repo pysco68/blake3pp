@@ -246,6 +246,7 @@ int main(int argc, char** argv) {
   std::size_t make_mib = 0;
   unsigned pool_threads = b3tool::default_threads();
   bool seq_only = false;
+  bool inline_submit = false;
   bool no_direct = false;
   blake3pp::hash_file_options opts;
 
@@ -269,6 +270,9 @@ int main(int argc, char** argv) {
       ->capture_default_str();
   app.add_flag("--no-direct", no_direct,
                "keep the OS page cache (no O_DIRECT)");
+  app.add_flag("--inline-submit", inline_submit,
+               "issue each read inline in the submitting thread instead of "
+               "on io_uring's workers (IOSQE_ASYNC off)");
   app.add_option("--threads", pool_threads,
                  "parallel-engine threads (1 = a one-thread pool; default: "
                  "all); diagnostic: sweep N-1/N/N+1 to test whether the "
@@ -284,6 +288,7 @@ int main(int argc, char** argv) {
   CLI11_PARSE(app, argc, argv);
 
   opts.direct_io = !no_direct;
+  opts.offload_submit = !inline_submit;
   if (make_mib > 0) {
     path = make_test_file(make_mib);
     println(stdout, "created {} ({} MiB)", path, make_mib);
@@ -297,7 +302,8 @@ int main(int argc, char** argv) {
   {
     blake3pp::detail::file_reader probe(
         path.c_str(),
-        {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
+        {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+         opts.offload_submit});
     bytes = probe.file_size();
     println(stdout, "file: {} ({:.1f} MiB), backend: {}, window {} MiB, qd {}",
             path, static_cast<double>(bytes) / (1024.0 * 1024.0),
@@ -327,7 +333,8 @@ int main(int argc, char** argv) {
   const double raw_s = best_cold_seconds(reps, cold, [&] {
     blake3pp::detail::file_reader r(
         path.c_str(),
-        {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
+        {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+         opts.offload_submit});
     auto w = r.next();
     while (w.has_value()) {
       r.release(w.value());

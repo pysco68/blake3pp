@@ -8,7 +8,8 @@ namespace blake3pp {
 void update_file(hasher& h, const std::filesystem::path& path,
                  const file_io_options& opts) {
   detail::file_reader reader(
-      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
+      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+             opts.offload_submit});
   while (auto w = reader.next()) {
     h.update(std::span<const std::byte>{w->data, w->bytes});
     reader.release(*w);

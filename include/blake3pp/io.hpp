@@ -54,6 +54,13 @@ struct file_io_options {
   /// Bypass the page cache where the platform supports it; degrades to
   /// buffered reads where it does not.
   bool direct_io = true;
+  /// Issue each read on the kernel's I/O worker threads instead of inline
+  /// in the submitting thread (Linux: io_uring's IOSQE_ASYNC). Issuing a
+  /// large direct read costs real CPU time, and inline it is paid by the
+  /// thread that also drives the hash; kernels since 6.x issue inline
+  /// whenever they can, so this asks for the hand-off explicitly. Ignored
+  /// where the platform has no such notion.
+  bool offload_submit = true;
 };
 
 /// hash_file()'s knobs: the pipeline's, plus what shapes the hasher it
@@ -73,6 +80,8 @@ struct hash_file_options {
   unsigned queue_depth = 4;
   /// Bypass the page cache where the platform supports it.
   bool direct_io = true;
+  /// Issue reads on the kernel's I/O worker threads; see file_io_options.
+  bool offload_submit = true;
   /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
   /// derive_key and extended output have no shortcut here: build the
   /// hasher yourself and use update_file().
@@ -81,7 +90,7 @@ struct hash_file_options {
   /// The pipeline knobs alone, so one options object drives update_file()
   /// too.
   constexpr operator file_io_options() const noexcept {
-    return {window_bytes, queue_depth, direct_io};
+    return {window_bytes, queue_depth, direct_io, offload_submit};
   }
 };
 

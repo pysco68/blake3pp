@@ -472,6 +472,16 @@ buffered async -> plain synchronous reads -> stdio. Paths are
 `std::filesystem::path`; every entry point has a throwing form and a
 `std::error_code` form, mirroring the standard library.
 
+On Linux each read is issued on io_uring's worker threads
+(`IOSQE_ASYNC`), not inline in the submitting call. Issuing a large
+direct read is real CPU work (pinning the pages, splitting and queueing
+the bios: 1.5-1.9 ms per 64 MiB on a four-drive PCIe 5 stripe under
+kernel 7.0), and inline it lands on the thread that also waits for the
+window's hash; kernels since 6.x take the inline path whenever they
+can, which halved the pipeline there (22 against 41 GiB/s). The
+`offload_submit` option turns the hand-off off for callers who want the
+submit inline (`--inline-submit` in the tools).
+
 `hash_file()` is the one-shot form. `update_file()` is the primitive
 underneath it: `hasher::update()` with a file as the source. It streams
 into a hasher you own and returns, so the hasher's mode and every

@@ -36,6 +36,12 @@ struct file_reader_options {
   unsigned queue_depth = 4;  // clamped to [2, 32]
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused
   bool async = true;         // try io_uring; silently degrade if refused
+  // Issue each read on the kernel's worker threads (io_uring: IOSQE_ASYNC)
+  // rather than inline in the submit call. Issuing a large direct read is
+  // real CPU work (pinning pages, building and queueing the bios) that
+  // otherwise lands on the thread that also waits for the hash; see
+  // src/io/uring_backend.hpp. Ignored by backends without the notion.
+  bool offload_submit = true;
 };
 
 class file_reader {

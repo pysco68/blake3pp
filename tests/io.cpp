@@ -287,6 +287,22 @@ TEST_CASE("reader fallback backends deliver identical data") {
     }
     CHECK(h.finalize() == expected);
   }
+  // The async path with and without the io-wq hand-off (a no-op where the
+  // backend has no such notion) must deliver the same bytes.
+  for (const bool offload : {true, false}) {
+    CAPTURE(offload);
+    blake3pp::detail::file_reader r(
+        f.path, {.window_bytes = 64 * 1024, .queue_depth = 2,
+                 .direct_io = false, .async = true,
+                 .offload_submit = offload});
+    MESSAGE("async backend: " << r.backend());
+    blake3pp::hasher h;
+    while (auto w = r.next()) {
+      h.update(std::span<const std::byte>{w->data, w->bytes});
+      r.release(*w);
+    }
+    CHECK(h.finalize() == expected);
+  }
 }
 
 // Writes `content` through writer_engine<W>, reads it back through

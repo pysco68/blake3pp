@@ -55,7 +55,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 void update_file(hasher& h, const std::filesystem::path& path,
                  Scheduler&& sched, const file_io_options& opts = {}) {
   detail::file_reader reader(
-      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true});
+      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+             opts.offload_submit});
   const kern::kernel_ops* const ops = detail::resolve(h.selected_arch());
   const std::uint64_t base = h.count();
   const bool on_chunk_boundary = base % chunk_size == 0;

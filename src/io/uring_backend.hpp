@@ -178,12 +178,23 @@ struct uring {
 
   // Queues one READ or WRITE; the sole submitter, so sq_tail needs no CAS.
   void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
-                 unsigned len, std::uint64_t off, std::uint64_t user_data) {
+                 unsigned len, std::uint64_t off, std::uint64_t user_data,
+                 bool offload = false) {
     const unsigned tail = *sq_tail;  // we are the only writer
     const unsigned idx = tail & *sq_mask;
     io_uring_sqe& sqe = sqes[idx];
     std::memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = opcode;
+    if (offload) {
+      // Issue on io-wq rather than inline. Kernels before ~6.x bailed out
+      // of the inline attempt on a large O_DIRECT read and punted anyway;
+      // newer ones complete it inline, 1.5-1.9 ms of pinning, splitting
+      // and queueing per 64 MiB on the submitting thread (four PCIe 5
+      // drives, kernel 7.0). Serialized with the hash that thread also
+      // waits for, that halved the pipeline; asking for the hand-off
+      // restored it (22 -> 41 GiB/s).
+      sqe.flags |= IOSQE_ASYNC;
+    }
     sqe.fd = file_fd;
     sqe.addr = reinterpret_cast<std::uint64_t>(buf);
     sqe.len = len;
@@ -230,9 +241,13 @@ class uring_reader {
     }
     if (opts.async && ring_.init(2 * nslots)) {
       use_uring_ = true;
+      offload_ = opts.offload_submit;
     }
     name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
                        : (f_.direct ? "pread+direct" : "pread");
+    if (use_uring_ && !offload_) {
+      name_ += " (inline submit)";
+    }
     if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
       name_ += no_uring_suffix(ring_.setup_errno);
     }
@@ -251,7 +266,7 @@ class uring_reader {
   void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
     slots_[s] = {buf, off, 0, false};
     ring_.submit_rw(IORING_OP_READ, f_.fd, buf.data(),
-                    static_cast<unsigned>(buf.size()), off, s);
+                    static_cast<unsigned>(buf.size()), off, s, offload_);
   }
 
   // Reaps completions (issuing continuations for short reads) until slot
@@ -276,7 +291,7 @@ class uring_reader {
       if (st.filled < st.buf.size()) {
         ring_.submit_rw(IORING_OP_READ, f_.fd, st.buf.data() + st.filled,
                         static_cast<unsigned>(st.buf.size() - st.filled),
-                        st.off + st.filled, c);
+                        st.off + st.filled, c, offload_);
       } else {
         st.ready = true;
       }
@@ -300,6 +315,7 @@ class uring_reader {
   std::vector<slot> slots_;
   std::uint64_t size_ = 0;
   bool use_uring_ = false;
+  bool offload_ = false;
   std::string name_ = "pread";
 };
 
