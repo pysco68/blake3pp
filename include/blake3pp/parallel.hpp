@@ -91,11 +91,10 @@ using parallel_scheduler_t = decltype(std::execution::get_parallel_scheduler());
 using parallel_scheduler_t = beman::execution::parallel_scheduler;
 /// The process-wide parallel scheduler, in P2079's shape.
 ///
-/// Requires a parallel_scheduler backend definition in the program: the
-/// executables in this repository link blake3pp::beman_backend (stdexec's
-/// pool as the engine room until beman ships its default backend);
-/// downstream users may provide their own
-/// query_parallel_scheduler_backend() instead.
+/// Backed by beman.execution's own parallel_scheduler backend. A program
+/// may replace it by defining query_parallel_scheduler_backend() itself:
+/// P2079 replaceability, one definition per program, like a global
+/// allocator.
 [[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
   return beman::execution::get_parallel_scheduler();
 }

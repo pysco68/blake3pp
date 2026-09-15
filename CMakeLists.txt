@@ -205,18 +205,6 @@ blake3pp_register_kernels()
 
 blake3pp_target_link_kernels(blake3pp)
 
-# The beman provider needs a program-level parallel_scheduler backend
-# (P2079 replaceability: one definition per binary, like a global
-# allocator). Executables in this repo link this; downstream applications
-# may define query_parallel_scheduler_backend() themselves instead.
-if(_blake3pp_execution_provider STREQUAL "beman")
-  add_library(blake3pp_beman_backend STATIC src/execution/beman_backend.cpp)
-  add_library(blake3pp::beman_backend ALIAS blake3pp_beman_backend)
-  target_link_libraries(blake3pp_beman_backend
-    PUBLIC blake3pp::features
-    PRIVATE blake3pp_stdexec blake3pp_warnings)
-endif()
-
 # What an executable needs in order to use mimalloc as its allocator,
 # expressed as a target rather than a function: the platform answers differ
 # only in which properties they set, and when BLAKE3PP_TOOL_MIMALLOC is off

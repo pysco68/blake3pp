@@ -128,9 +128,8 @@ endif()
 #             NVIDIA stdexec otherwise (beman is never auto-selected while
 #             its upstream labels itself pre-production)
 #   std     - require the standard library's std::execution
-#   beman   - beman.execution: the conformance-first polyfill (C++23+);
-#             the executables additionally link blake3pp::beman_backend,
-#             which backs get_parallel_scheduler() with a real pool
+#   beman   - beman.execution: the conformance-first polyfill (C++23+),
+#             including its own parallel_scheduler backend
 #   stdexec - NVIDIA stdexec: the performance workhorse (C++20+)
 # Exactly one of BLAKE3PP_EXECUTION_{STD,BEMAN,STDEXEC} lands on
 # blake3pp::features; <blake3pp/parallel.hpp> switches on it.
@@ -173,9 +172,9 @@ int main() {
 }
 ]])
 
-# stdexec is needed by the stdexec provider AND by the beman bridge backend
-# (which drives beman's parallel_scheduler with stdexec's pool until beman
-# ships a default backend).
+# stdexec is needed by the stdexec provider alone: beman ships its own
+# parallel_scheduler backend as of 2026-09-12, so choosing beman no longer
+# pulls stdexec into the build.
 #
 # It is also the one INTERLOCKED (populate-only) hfc content, by policy: its
 # upstream CMake pulls rapids-cmake from the network at configure time, so
@@ -216,11 +215,11 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
       "presets cannot use it")
   endif()
   # Pinned commit: beman has no tagged releases yet. Includes P2079R10
-  # parallel_scheduler (merged 2026-07-12). Classic hermetic content:
-  # header-only, so the "build" is just the header/config install.
+  # parallel_scheduler (merged 2026-07-12) and its default backend
+  # (2026-09-12), which is what makes this provider stand alone.
   FetchContent_Declare(beman_execution
     GIT_REPOSITORY https://github.com/bemanproject/execution.git
-    GIT_TAG cc721c44496bc4b5ae63ad4ea47fe965818e52ae)
+    GIT_TAG c55d8245bea73924a6509c77f68e85008572769a)
   FetchContent_MakeHermetic(beman_execution
     HERMETIC_BUILD_SYSTEM cmake
     HERMETIC_TOOLCHAIN_EXTENSION [=[
@@ -246,7 +245,6 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
     "${HERMETIC_FETCHCONTENT_INSTALL_DIR}/beman_execution-install/include")
   target_compile_definitions(blake3pp_features INTERFACE
     BLAKE3PP_EXECUTION_BEMAN=1)
-  _blake3pp_fetch_stdexec()  # engine room for blake3pp::beman_backend
 
 else()  # stdexec
   _blake3pp_fetch_stdexec()
