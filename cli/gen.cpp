@@ -99,6 +99,8 @@ int main(int argc, char** argv) {
   bool no_direct = false;
   bool no_async = false;
   bool inline_submit = false;
+  std::size_t window_mib = 0;
+  unsigned qd = 4;
   bool verbose = false;
   unsigned threads = b3tool::default_threads();
 
@@ -124,6 +126,8 @@ int main(int argc, char** argv) {
   app.add_flag("--no-direct", no_direct, "with --output: no direct I/O (write through the page cache)")->needs(output_opt);
   app.add_flag("--no-async", no_async, "with --output: no async queue (synchronous writes)")->needs(output_opt);
   app.add_flag("--inline-submit", inline_submit, "with --output: issue writes inline in the submitting thread, not on io_uring's workers")->needs(output_opt);
+  app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 4 MiB per generator thread, so every fill fans out fully)")->needs(output_opt);
+  app.add_option("--qd", qd, "with --output: write buffers in flight (the writer clamps it to its range)")->needs(output_opt)->capture_default_str();
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
   app.add_option("--threads", threads, "generator threads (1 = sequential; default: all)")->check(b3tool::at_least_one_thread)->capture_default_str();
   CLI11_PARSE(app, argc, argv);
@@ -191,9 +195,12 @@ int main(int argc, char** argv) {
       wopts.direct_io = !no_direct;
       wopts.async = !no_async;
       wopts.offload_submit = !inline_submit;
-      if (pool.parallel()) {
+      if (window_mib > 0) {
+        wopts.buffer_bytes = window_mib * 1024 * 1024;
+      } else if (pool.parallel()) {
         wopts.buffer_bytes = threads * segment;
       }
+      wopts.queue_depth = qd;
       if (const auto total = remaining.total()) {
         wopts.preallocate_bytes = *total;
       }

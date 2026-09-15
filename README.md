@@ -578,12 +578,18 @@ so the sink is the bottleneck;
 `--output` removes even that overhead, writing through io_uring +
 O_DIRECT on Linux, IOCP + no-buffering on Windows or GCD + F_NOCACHE on
 macOS with the stream generated straight into the write buffers,
-bypassing the page cache entirely:
+bypassing the page cache entirely. The writer has the reader's pacing
+knobs: `--window` sizes each write buffer (default 4 MiB per generator
+thread, so every fill fans out over all cores), `--qd` sets how many
+are in flight (default 4), and `--inline-submit`, `--no-direct` and
+`--no-async` switch the io-wq hand-off, direct I/O and the async queue
+off for A/B measurements:
 
 ```bash
 blake3ppgen --seed run42 --length 1G > testdata.bin
 blake3ppgen --seed run42 --seek 10G --length 1M > slice.bin   # instant
 blake3ppgen --seed run42 --length 100G --output fixture.bin   # device-bound
+blake3ppgen --seed run42 --length 32G --output f.bin --window 64 --qd 8
 ```
 
 ### Consuming via CMake
