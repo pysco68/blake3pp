@@ -274,7 +274,6 @@ jobs:
           | `linux-riscv64-static` | Linux riscv64, static | rvv128-512 (+Zvbb twins), xthead (RVV 0.7.1, GCC-built object) | qemu VLEN matrix; Cloud-V boards when the lane runs |
           | `linux-ppc64le-static` | Linux POWER, static | vsx (POWER9) | qemu only - no hardware lane yet |
           | `linux-s390x-static` | Linux IBM z, static, **big-endian** | vxe (z14, GCC-built object) | qemu only - no hardware lane yet |
-          | `linux-mips64el-static` | Linux MIPS, static (glibc rather than musl; no glibc floor either way) | msa (MIPS64r5) | **qemu only, and no MSA hardware is reachable at all** |
           | `windows-x86_64-clangcl` | Windows x64 | sse42 / avx2 / avx512 | native runner; IOCP + direct I/O |
           | `windows-arm64-clangcl` | Windows arm64 (cross-built) | neon / sve256 / sve512 / sve2_128 | windows-11-arm runner when the lane runs |
           | `macos-arm64` | macOS Apple silicon | neon; GCD + F_NOCACHE I/O | native runner |

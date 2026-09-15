@@ -23,16 +23,16 @@ The MSA kernel carries an asterisk the others do not. It is validated
 against the official test vectors under qemu, byte-identical to the
 x86-64 result, and its dispatch is validated both ways: an emulated core
 without MSA falls back to scalar, one with it selects the kernel. No MSA
-silicon has ever run it, and none is reachable, so it ships with no
-throughput number and should be treated as untested on hardware. It is
+silicon has ever run it, and none is reachable, so it carries no
+throughput number and should be treated as untested on hardware. CI
+builds and tests it; no release archive contains it. It is
 built by GCC through the vector-extension provider, because no std
 provider deduces a vector width on this target and xsimd has no MSA
-backend, and clang emits no MSA from the same source at all. That is
-why the MIPS archive links a static glibc where the others link a
-static musl: it is equally standalone, with no interpreter, no dynamic
-section and no `GLIBC_` version symbol, so it carries no glibc floor.
-The one thing a static glibc gives up is NSS, which this tool never
-asks for.
+backend, and clang emits no MSA from the same source at all. Its static build
+links a static glibc where the released archives link a static musl:
+equally standalone, with no interpreter, no dynamic section and no
+`GLIBC_` version symbol, so it carries no glibc floor either. The one
+thing a static glibc gives up is NSS, which this tool never asks for.
 
 The SVE kernels are vector-length-specific: dispatch selects one only
 when the CPU's runtime vector length equals the length the kernel was
