@@ -37,6 +37,9 @@
 #include <CLI/CLI.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel_io.hpp>
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+#include <blake3pp/parallel_backend.hpp>
+#endif
 
 #include "tool_common.hpp"
 
@@ -138,17 +141,23 @@ class engine_threads {
  public:
   explicit engine_threads(unsigned threads)
       : threads_(threads != 0 ? threads : std::thread::hardware_concurrency())
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
         ,
         pool_(threads_)
 #endif
   {
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+    // The process scheduler, sized for every provider alike.
+    blake3pp::size_parallel_scheduler(threads_);
+#endif
   }
 
   [[nodiscard]] unsigned count() const noexcept { return threads_; }
 
   [[nodiscard]] blake3pp::parallel_scheduler_t scheduler() {
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+    return blake3pp::get_parallel_scheduler();
+#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
     return pool_.get_scheduler();
 #else
     return blake3pp::get_parallel_scheduler();
@@ -157,7 +166,7 @@ class engine_threads {
 
  private:
   unsigned threads_;
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
   exec::static_thread_pool pool_;
 #endif
 };

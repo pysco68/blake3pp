@@ -35,3 +35,10 @@ foreach(case version empty_stdin stdin_parallel check_roundtrip length_prefix
       "-DEMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()
+
+# The sized parallel scheduler is one definition per program; the tools
+# take it when the build offers one (see the root CMakeLists).
+if(TARGET blake3pp_parallel_backend)
+  target_link_libraries(blake3ppsum PRIVATE blake3pp::parallel_backend)
+  target_link_libraries(blake3ppgen PRIVATE blake3pp::parallel_backend)
+endif()

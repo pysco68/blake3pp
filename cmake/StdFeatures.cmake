@@ -133,6 +133,15 @@ endif()
 #   stdexec - NVIDIA stdexec: the performance workhorse (C++20+)
 # Exactly one of BLAKE3PP_EXECUTION_{STD,BEMAN,STDEXEC} lands on
 # blake3pp::features; <blake3pp/parallel.hpp> switches on it.
+# The opt-in sized parallel scheduler (<blake3pp/parallel_backend.hpp>).
+# P2079's scheduler is process-wide and takes no size; a program chooses
+# otherwise by replacing the backend, one definition per program. ON
+# builds that replacement into its own target, and under beman also builds
+# beman's own default backend out. OFF by default: a program that brings
+# its own scheduler, or wants every core, links neither.
+option(BLAKE3PP_SIZED_PARALLEL_SCHEDULER
+  "build blake3pp::parallel_backend, the sizable process-wide scheduler" OFF)
+
 set(BLAKE3PP_EXECUTION_PROVIDER "auto" CACHE STRING
   "sender/receiver provider: auto, std, beman, stdexec")
 set_property(CACHE BLAKE3PP_EXECUTION_PROVIDER
@@ -220,9 +229,7 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
   FetchContent_Declare(beman_execution
     GIT_REPOSITORY https://github.com/bemanproject/execution.git
     GIT_TAG c55d8245bea73924a6509c77f68e85008572769a)
-  FetchContent_MakeHermetic(beman_execution
-    HERMETIC_BUILD_SYSTEM cmake
-    HERMETIC_TOOLCHAIN_EXTENSION [=[
+  set(_blake3pp_beman_extension [=[
       set(BEMAN_USE_MODULES OFF CACHE BOOL "" FORCE)
       # beman gates its (large, occasionally non-compiling) test suite on
       # its own option, not BUILD_TESTING. Hermetic makes it top-level,
@@ -234,6 +241,17 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
       set(BEMAN_EXECUTION_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
       set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     ]=])
+  if(BLAKE3PP_SIZED_PARALLEL_SCHEDULER)
+    # src/execution/parallel_backend.cpp defines the replacement, so
+    # beman's own default backend is built out: the program holds one
+    # definition of query_parallel_scheduler_backend().
+    string(APPEND _blake3pp_beman_extension [=[
+      set(BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND OFF CACHE BOOL "" FORCE)
+    ]=])
+  endif()
+  FetchContent_MakeHermetic(beman_execution
+    HERMETIC_BUILD_SYSTEM cmake
+    HERMETIC_TOOLCHAIN_EXTENSION "${_blake3pp_beman_extension}")
   HermeticFetchContent_MakeAvailableAtBuildTime(beman_execution)
   target_link_libraries(blake3pp_features INTERFACE beman::execution)
   # TODO(upstream hfc): beman's install export carries its include dirs only

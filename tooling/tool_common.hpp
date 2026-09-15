@@ -16,6 +16,9 @@
 
 #include <CLI/CLI.hpp>
 #include <blake3pp/parallel.hpp>
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+#include <blake3pp/parallel_backend.hpp>
+#endif
 
 #if defined(__cpp_lib_print)
 #include <print>
@@ -187,7 +190,13 @@ inline void tool_startup() noexcept {
 class compute_pool {
  public:
   explicit compute_pool(unsigned threads) : threads_(threads) {
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+    // One sized scheduler per process, whatever the provider: the tool
+    // fixes it here, before anything can have used it.
+    if (threads > 1) {
+      blake3pp::size_parallel_scheduler(threads);
+    }
+#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
     if (threads > 1) {
       pool_.emplace(threads);
     }
@@ -197,10 +206,14 @@ class compute_pool {
   // Whether work should be offloaded at all.
   [[nodiscard]] bool parallel() const noexcept { return threads_ > 1; }
 
-  // Precondition: parallel(). Under stdexec this hands out the owned pool's
-  // scheduler, which exists exactly when parallel() is true.
+  // Precondition: parallel(). With the sized backend this is the process
+  // scheduler at the size the constructor fixed; under stdexec without it,
+  // the owned pool's, which exists exactly when parallel() is true;
+  // otherwise the provider's unsized one, which ignores --threads.
   [[nodiscard]] blake3pp::parallel_scheduler_t scheduler() {
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+    return blake3pp::get_parallel_scheduler();
+#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
     return pool_.value().get_scheduler();
 #else
     return blake3pp::get_parallel_scheduler();
@@ -209,7 +222,7 @@ class compute_pool {
 
  private:
   unsigned threads_;
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
   std::optional<exec::static_thread_pool> pool_;
 #endif
 };

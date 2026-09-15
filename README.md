@@ -437,6 +437,27 @@ The sender/receiver provider itself is a build-time choice
 
 [beman.execution]: https://github.com/bemanproject/execution
 
+`get_parallel_scheduler()` (P2079) returns one scheduler per process and
+takes no size: under the beman provider it runs on every core, whatever
+thread count a caller asks for. A program chooses otherwise by replacing
+the backend behind it, one definition per program.
+`-DBLAKE3PP_SIZED_PARALLEL_SCHEDULER=ON` builds that replacement as a
+separate target:
+
+```cpp
+#include <blake3pp/parallel_backend.hpp>   // not in the umbrella header
+
+blake3pp::size_parallel_scheduler(8);      // once, before first use
+auto d = blake3pp::hash(buf, blake3pp::get_parallel_scheduler());
+```
+
+The definition lives in `blake3pp::parallel_backend`, which an executable
+links when it wants one; `<blake3pp/parallel_backend.hpp>` is not part of
+the umbrella header. Under the beman provider the option also builds
+beman.execution with its own default backend disabled, leaving a single
+definition of `query_parallel_scheduler_backend()` in the program. The
+scheduler-taking overloads accept any scheduler and need none of this.
+
 When the data arrives in pieces, `parallel_hasher` has the exact
 interface of `hasher` (all three modes, the whole finalize family
 including `finalize_xof()`), with the multi-core fan-out and all of

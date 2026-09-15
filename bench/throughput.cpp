@@ -44,6 +44,9 @@
 #include <CLI/CLI.hpp>
 #include <blake3pp/blake3pp.hpp>
 #include <blake3pp/parallel.hpp>
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+#include <blake3pp/parallel_backend.hpp>
+#endif
 
 #include "tool_common.hpp"
 
@@ -678,11 +681,17 @@ int main(int argc, char** argv) {
   // An OWNED pool at exactly nthreads, not b3tool::compute_pool, whose
   // scheduler() has a threads>1 precondition (--threads 1 is a valid and
   // interesting measurement here: pool machinery at zero parallelism).
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+  // The process scheduler, sized here for every provider, which is what
+  // makes --threads mean the same thing in a stdexec and a beman build.
+  blake3pp::size_parallel_scheduler(nthreads);
+#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
   exec::static_thread_pool engine_pool{nthreads};
 #endif
   auto engine_sched =
-#if defined(BLAKE3PP_EXECUTION_STDEXEC)
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+      blake3pp::get_parallel_scheduler();
+#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
       engine_pool.get_scheduler();
 #else
       blake3pp::get_parallel_scheduler();

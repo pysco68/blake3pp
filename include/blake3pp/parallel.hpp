@@ -102,11 +102,27 @@ using parallel_scheduler_t = beman::execution::parallel_scheduler;
 #elif BLAKE3PP_HAS_STD_THREAD  // BLAKE3PP_EXECUTION_STDEXEC
 
 namespace detail {
+// The size process_pool() will be built with, 0 meaning every core. Only
+// <blake3pp/parallel_backend.hpp>'s size_parallel_scheduler() writes it,
+// and only before the pool exists; the flag below is how it knows.
+inline std::atomic<unsigned>& process_pool_threads() noexcept {
+  static std::atomic<unsigned> threads{0};
+  return threads;
+}
+inline std::atomic<bool>& process_pool_started() noexcept {
+  static std::atomic<bool> started{false};
+  return started;
+}
+
 // Function-local static: constructed on first use, threads joined during
 // static destruction; the same lifetime the standard's parallel scheduler
 // has.
 inline exec::static_thread_pool& process_pool() {
-  static exec::static_thread_pool pool{std::thread::hardware_concurrency()};
+  static exec::static_thread_pool pool{[] {
+    process_pool_started().store(true, std::memory_order_relaxed);
+    const unsigned n = process_pool_threads().load(std::memory_order_relaxed);
+    return n != 0 ? n : std::thread::hardware_concurrency();
+  }()};
   return pool;
 }
 }  // namespace detail

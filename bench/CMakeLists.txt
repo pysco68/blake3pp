@@ -60,6 +60,15 @@ if(BLAKE3PP_BENCH_UPSTREAM)
   target_compile_definitions(blake3pp_bench PRIVATE BLAKE3PP_BENCH_UPSTREAM=1)
 endif()
 
+# The sized parallel scheduler is one definition per program; the benches
+# take it when the build offers one (see the root CMakeLists).
+if(TARGET blake3pp_parallel_backend)
+  target_link_libraries(blake3pp_bench PRIVATE blake3pp::parallel_backend)
+  if(TARGET blake3pp_bench_file)
+    target_link_libraries(blake3pp_bench_file PRIVATE blake3pp::parallel_backend)
+  endif()
+endif()
+
 # Smoke: the benches are shipped tools, so one tiny run each proves they
 # start, find their kernels and print; it also runs the shared tooling
 # (pinning, cooldown, timing) the CLI smoke tests never reach, which the

@@ -67,6 +67,21 @@ else()
   doctest_discover_tests(blake3pp_tests)
 endif()
 
+# The sized parallel scheduler is one definition per program; the test
+# binary takes it when the build offers one (see the root CMakeLists).
+if(TARGET blake3pp_parallel_backend)
+  target_link_libraries(blake3pp_tests PRIVATE blake3pp::parallel_backend)
+
+  # Its own binary: the assertions are about process-global state in a
+  # fixed order, which a shared test binary cannot express.
+  add_executable(blake3pp_sized_scheduler_test sized_scheduler.cpp)
+  target_link_libraries(blake3pp_sized_scheduler_test
+    PRIVATE blake3pp::blake3pp blake3pp::parallel_backend doctest::doctest
+            blake3pp_warnings)
+  add_test(NAME sized_parallel_scheduler
+    COMMAND blake3pp_sized_scheduler_test)
+endif()
+
 # The riscv detection ladder against machine shapes the emulator cannot
 # present (T-Head vendor ids, kernels without hwprobe, probes that trap):
 # a second compilation of the detection TU with its test seam enabled,

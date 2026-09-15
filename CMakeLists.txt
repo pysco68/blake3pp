@@ -205,6 +205,28 @@ blake3pp_register_kernels()
 
 blake3pp_target_link_kernels(blake3pp)
 
+# The sizable process-wide parallel scheduler: one definition per program
+# (P2079 replaceability), so it is a target an executable links rather
+# than part of blake3pp itself. The executables in this repository link it
+# when it exists, which under beman they must, the option having built
+# beman's own default backend out.
+if(BLAKE3PP_SIZED_PARALLEL_SCHEDULER)
+  if(_blake3pp_execution_provider STREQUAL "std")
+    message(FATAL_ERROR "blake3pp: BLAKE3PP_SIZED_PARALLEL_SCHEDULER needs "
+      "the stdexec or beman provider; no standard library ships "
+      "std::execution yet, so there is no backend to replace")
+  endif()
+  add_library(blake3pp_parallel_backend STATIC src/execution/parallel_backend.cpp)
+  add_library(blake3pp::parallel_backend ALIAS blake3pp_parallel_backend)
+  target_link_libraries(blake3pp_parallel_backend
+    PUBLIC blake3pp::blake3pp
+    PRIVATE blake3pp_warnings)
+  # Linking it is what tells a consumer's code that --threads can be
+  # honoured whatever the provider.
+  target_compile_definitions(blake3pp_parallel_backend
+    INTERFACE BLAKE3PP_HAS_SIZED_SCHEDULER=1)
+endif()
+
 # What an executable needs in order to use mimalloc as its allocator,
 # expressed as a target rather than a function: the platform answers differ
 # only in which properties they set, and when BLAKE3PP_TOOL_MIMALLOC is off
