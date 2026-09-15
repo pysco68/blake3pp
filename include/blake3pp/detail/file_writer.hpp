@@ -40,6 +40,10 @@ struct file_writer_options {
   unsigned queue_depth = 4;  // clamped to [2, 32]
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused
   bool async = true;         // try io_uring; silently degrade if refused
+  // Issue each write on the kernel's worker threads (io_uring: IOSQE_ASYNC)
+  // rather than inline in the submit call, the reader's offload_submit for
+  // the producer side; see src/io/uring_backend.hpp.
+  bool offload_submit = true;
   // Preallocate this many bytes at construction when the total is known.
   // This matters enormously for async direct I/O: writes that EXTEND the
   // file serialize on the inode lock (each waits out journal + allocation),

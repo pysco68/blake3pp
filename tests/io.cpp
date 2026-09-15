@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -302,6 +303,34 @@ TEST_CASE("reader fallback backends deliver identical data") {
       r.release(*w);
     }
     CHECK(h.finalize() == expected);
+  }
+}
+
+// The writer's async path with and without the io-wq hand-off must land
+// the same bytes on disk.
+TEST_CASE("writer submit modes deliver identical data") {
+  const auto content = make_input(300 * 1024 + 77);
+  const auto expected = blake3pp::hash(content);
+  for (const bool offload : {true, false}) {
+    CAPTURE(offload);
+    const temp_file f({});  // placeholder path; the writer recreates it
+    {
+      blake3pp::detail::file_writer w(
+          f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2,
+                   .direct_io = false, .async = true,
+                   .offload_submit = offload});
+      MESSAGE("writer backend: " << w.backend());
+      std::size_t done = 0;
+      while (done < content.size()) {
+        auto b = w.acquire();
+        const std::size_t n = std::min(b.capacity, content.size() - done);
+        std::memcpy(b.data, content.data() + done, n);
+        w.submit(b, n);
+        done += n;
+      }
+      w.finish();
+    }
+    CHECK(blake3pp::hash_file(f.path) == expected);
   }
 }
 

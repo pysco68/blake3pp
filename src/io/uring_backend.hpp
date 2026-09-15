@@ -340,9 +340,13 @@ class uring_writer {
     }
     if (opts.async && ring_.init(2 * nslots)) {
       use_uring_ = true;
+      offload_ = opts.offload_submit;
     }
     name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
                        : (f_.direct ? "pwrite+direct" : "pwrite");
+    if (use_uring_ && !offload_) {
+      name_ += " (inline submit)";
+    }
     if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
       name_ += no_uring_suffix(ring_.setup_errno);
     }
@@ -358,7 +362,7 @@ class uring_writer {
                    std::span<const std::byte> buf) {
     slots_[s] = {buf, off, 0, true};
     ring_.submit_rw(IORING_OP_WRITE, f_.fd, buf.data(),
-                    static_cast<unsigned>(buf.size()), off, s);
+                    static_cast<unsigned>(buf.size()), off, s, offload_);
   }
 
   void wait_slot(unsigned s) {
@@ -405,7 +409,7 @@ class uring_writer {
     if (st.done < st.buf.size()) {
       ring_.submit_rw(IORING_OP_WRITE, f_.fd, st.buf.data() + st.done,
                       static_cast<unsigned>(st.buf.size() - st.done),
-                      st.off + st.done, s);
+                      st.off + st.done, s, offload_);
     } else {
       st.busy = false;
     }
@@ -416,6 +420,7 @@ class uring_writer {
   std::vector<slot> slots_;
   std::uint64_t prealloc_ = 0;
   bool use_uring_ = false;
+  bool offload_ = false;
   std::string name_ = "pwrite";
 };
 

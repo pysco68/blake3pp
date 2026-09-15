@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
   bool hex = false;
   bool no_direct = false;
   bool no_async = false;
+  bool inline_submit = false;
   bool verbose = false;
   unsigned threads = b3tool::default_threads();
 
@@ -122,6 +123,7 @@ int main(int argc, char** argv) {
 
   app.add_flag("--no-direct", no_direct, "with --output: no direct I/O (write through the page cache)")->needs(output_opt);
   app.add_flag("--no-async", no_async, "with --output: no async queue (synchronous writes)")->needs(output_opt);
+  app.add_flag("--inline-submit", inline_submit, "with --output: issue writes inline in the submitting thread, not on io_uring's workers")->needs(output_opt);
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
   app.add_option("--threads", threads, "generator threads (1 = sequential; default: all)")->check(b3tool::at_least_one_thread)->capture_default_str();
   CLI11_PARSE(app, argc, argv);
@@ -188,6 +190,7 @@ int main(int argc, char** argv) {
       blake3pp::detail::file_writer_options wopts;
       wopts.direct_io = !no_direct;
       wopts.async = !no_async;
+      wopts.offload_submit = !inline_submit;
       if (pool.parallel()) {
         wopts.buffer_bytes = threads * segment;
       }

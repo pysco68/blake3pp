@@ -480,7 +480,8 @@ kernel 7.0), and inline it lands on the thread that also waits for the
 window's hash; kernels since 6.x take the inline path whenever they
 can, which halved the pipeline there (22 against 41 GiB/s). The
 `offload_submit` option turns the hand-off off for callers who want the
-submit inline (`--inline-submit` in the tools).
+submit inline (`--inline-submit` in the tools); the writer behind
+`blake3ppgen --output` takes the same option.
 
 `hash_file()` is the one-shot form. `update_file()` is the primitive
 underneath it: `hasher::update()` with a file as the source. It streams
