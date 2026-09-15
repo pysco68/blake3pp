@@ -150,8 +150,10 @@ int main(int argc, char** argv) {
   b3tool::compute_pool pool(threads);
 
   // Each parallel task fills one segment of this size, and the sinks
-  // then buffer one segment per thread so every fill fans out fully.
+  // then buffer one segment per thread so every fill fans out fully, up
+  // to max_buffer (--window overrides both).
   constexpr std::size_t segment = 4 * 1024 * 1024;
+  constexpr std::size_t max_buffer = 64 * 1024 * 1024;
 
   // Seed ingestion: the hasher carries the mode, and a seed file streams
   // into it on the same pool that will generate the output.
@@ -198,7 +200,13 @@ int main(int argc, char** argv) {
       if (window_mib > 0) {
         wopts.buffer_bytes = window_mib * 1024 * 1024;
       } else if (pool.parallel()) {
-        wopts.buffer_bytes = threads * segment;
+        // One segment per thread so every fill fans out, but capped: past
+        // a few hundred MiB in flight (buffer x queue depth) a striped
+        // NVMe volume slows down. Measured on four PCIe 5 drives in RAID 0,
+        // 32 threads, 32 GiB written: 24.2 GiB/s at 64 MiB x 2 and 23.8 at
+        // 64 MiB x 4, against 20.7 at the uncapped 128 MiB x 4 and 14.8 at
+        // 256 MiB x 8.
+        wopts.buffer_bytes = std::min<std::size_t>(threads * segment, max_buffer);
       }
       wopts.queue_depth = qd;
       if (const auto total = remaining.total()) {

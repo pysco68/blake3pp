@@ -580,8 +580,8 @@ O_DIRECT on Linux, IOCP + no-buffering on Windows or GCD + F_NOCACHE on
 macOS with the stream generated straight into the write buffers,
 bypassing the page cache entirely. The writer has the reader's pacing
 knobs: `--window` sizes each write buffer (default 4 MiB per generator
-thread, so every fill fans out over all cores), `--qd` sets how many
-are in flight (default 4), and `--inline-submit`, `--no-direct` and
+thread, capped at 64 MiB), `--qd` sets how many are in flight
+(default 4), and `--inline-submit`, `--no-direct` and
 `--no-async` switch the io-wq hand-off, direct I/O and the async queue
 off for A/B measurements:
 
