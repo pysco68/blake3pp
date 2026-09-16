@@ -285,13 +285,64 @@ report_coverage() {
       local profdata="llvm-profdata-${cxx##*-}" cov="llvm-cov-${cxx##*-}"
       command -v "${profdata}" > /dev/null || profdata=llvm-profdata
       command -v "${cov}" > /dev/null || cov=llvm-cov
+      # Say which of the two silent emptinesses this is. Without these the
+      # lane uploads an artifact with no summary and no lcov, and the
+      # release notes carry a blank row with nothing to read anywhere.
+      local -a raw=("${coverage_dir}"/profraw/*.profraw)
+      if [ ! -e "${raw[0]}" ]; then
+        echo "::error::${preset}: no .profraw under ${coverage_dir}/profraw;" \
+             "the instrumented binaries never ran (LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE:-unset})" >&2
+        return 1
+      fi
+      echo "coverage: ${#raw[@]} profraw file(s), $((${#objects[@]})) object(s)"
+      if [ "${#objects[@]}" -eq 0 ]; then
+        echo "::error::${preset}: no instrumented binaries under ${build_dir}" >&2
+        return 1
+      fi
       "${profdata}" merge -sparse "${coverage_dir}"/profraw/*.profraw \
         -o "${coverage_dir}/merged.profdata"
+      # Name the directories to report on rather than the paths to drop.
+      # The compile-time root is not this checkout under every driver:
+      # cmake-re mirrors the repository into /usr/local/share/.tipi and
+      # builds there, so the recorded paths start with /usr/ and an
+      # -ignore-filename-regex carrying ^/usr/ (for system headers)
+      # silently filtered away the whole project, leaving a report with a
+      # total and no rows. Read the root back out of the mapping instead.
+      local root
+      root=$("${cov}" export -instr-profile "${coverage_dir}/merged.profdata" \
+             "${objects[0]}" 2> /dev/null \
+        | python3 -c 'import json,sys
+files = json.load(sys.stdin)["data"][0]["files"]
+hit = next((f["filename"] for f in files if f["filename"].endswith("/src/blake3pp.cpp")), "")
+print(hit[:-len("/src/blake3pp.cpp")] if hit else "")')
+      [ -n "${root}" ] || {
+        echo "::error::${preset}: no src/blake3pp.cpp in the coverage mapping" >&2
+        return 1
+      }
+      echo "coverage: sources rooted at ${root}"
       local -a args=(-instr-profile "${coverage_dir}/merged.profdata"
-                     -ignore-filename-regex='(/_deps/|/thirdparty/|/tests/|/bench/|^/usr/)'
                      "${objects[0]}")
       for f in "${objects[@]:1}"; do args+=(-object "${f}"); done
+      # Library, headers and tools; tests, benches and dependencies are
+      # left out by not being named.
+      args+=("${root}/src" "${root}/include" "${root}/tooling" "${root}/cli")
       "${cov}" report "${args[@]}" | tee "${coverage_dir}/summary.txt"
+      # A report with a TOTAL and no rows above it means the filter ate
+      # every file: llvm-cov matches -ignore-filename-regex against the
+      # ABSOLUTE path recorded at compile time, which is the build's
+      # working directory and not necessarily this checkout's. Print what
+      # it actually held, so the next run names the path instead of
+      # leaving a blank row in the release notes.
+      if ! grep -qE '^[^ -].*%' "${coverage_dir}/summary.txt"; then
+        echo "::error::${preset}: coverage report is empty; every file matched the ignore regex" >&2
+        echo "  source root taken from the mapping: ${root}" >&2
+        echo "  paths recorded in the coverage mapping:" >&2
+        "${cov}" export -instr-profile "${coverage_dir}/merged.profdata" \
+          "${objects[0]}" 2> /dev/null \
+          | python3 -c 'import json,sys; [print("   ", f["filename"]) for f in json.load(sys.stdin)["data"][0]["files"][:10]]' >&2 \
+          || echo "    (could not read the mapping)" >&2
+        return 1
+      fi
       "${cov}" export -format=lcov "${args[@]}" > "${coverage_dir}/coverage.lcov"
       "${cov}" show -format=html -output-dir "${coverage_dir}/html" "${args[@]}"
       ;;
