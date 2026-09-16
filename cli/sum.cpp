@@ -12,13 +12,16 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <exception>
 #include <format>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>

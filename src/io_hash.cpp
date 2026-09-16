@@ -1,7 +1,10 @@
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/io.hpp>
 
+#include <cstddef>
+#include <filesystem>
 #include <span>
+#include <system_error>
 
 namespace blake3pp {
 

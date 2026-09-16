@@ -6,6 +6,7 @@
 #include <blake3pp/dispatch.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>

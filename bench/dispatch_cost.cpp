@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ratio>
 #include <string>
 #include <vector>
 

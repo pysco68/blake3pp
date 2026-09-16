@@ -1,8 +1,15 @@
 #include <blake3pp/core.hpp>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
 
 #include "core/core.hpp"
 #include "core/subtree.hpp"

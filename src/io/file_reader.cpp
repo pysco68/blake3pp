@@ -9,6 +9,12 @@
 
 #include <blake3pp/detail/file_reader.hpp>
 
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string_view>
+
 #include "io/backend_select.hpp"
 #include "io/engine.hpp"
 

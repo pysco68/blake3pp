@@ -20,6 +20,9 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <optional>
+#include <span>
+#include <string_view>
 
 #include "dispatch/cpu_detect.hpp"
 #include "kernel/kernel.hpp"

@@ -276,6 +276,21 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "include-audit",
+      "displayName": "clang 22, every optional component on: the compile database the include audit reads",
+      "inherits": "linux-clang22-cxx26",
+      "binaryDir": "${sourceDir}/build/include-audit",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "BLAKE3PP_BUILD_TESTS": "ON",
+        "BLAKE3PP_BUILD_BENCH": "ON",
+        "BLAKE3PP_BUILD_CLI": "ON",
+        "BLAKE3PP_WITH_IO": "ON",
+        "BLAKE3PP_BENCH_UPSTREAM": "ON",
+        "BLAKE3PP_BENCH_DISPATCH_COST": "ON"
+      }
     }
   ],
   "buildPresets": [

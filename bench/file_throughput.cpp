@@ -26,6 +26,8 @@
 #include <cstdlib>
 #include <format>
 #include <fstream>
+#include <ios>
+#include <ostream>
 #include <string>
 #include <thread>
 #include <vector>

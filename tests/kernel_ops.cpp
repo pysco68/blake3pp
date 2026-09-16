@@ -3,6 +3,8 @@
 // are pinned down here as the oracle every variant must match.
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>

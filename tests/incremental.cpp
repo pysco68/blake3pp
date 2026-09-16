@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <span>
+#include <cstdint>
 #include <ostream>
+#include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 

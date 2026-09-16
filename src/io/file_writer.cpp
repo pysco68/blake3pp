@@ -6,6 +6,12 @@
 
 #include <blake3pp/detail/file_writer.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <string_view>
+
 #include "io/backend_select.hpp"
 #include "io/engine.hpp"
 

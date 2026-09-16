@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <ratio>
 
 int main() {
   using clock = std::chrono::steady_clock;

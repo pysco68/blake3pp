@@ -1,14 +1,19 @@
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
-#include <random>
-#include <string>
+#include <ios>
 #include <ostream>
+#include <random>
+#include <span>
+#include <string>
 #include <string_view>
-#include <thread>
+#include <system_error>
 #include <vector>
 
 #include <blake3pp/io.hpp>

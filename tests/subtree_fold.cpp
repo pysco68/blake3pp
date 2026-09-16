@@ -5,7 +5,10 @@
 // hand them, since the group size follows the kernel's simd_degree and the
 // interesting sizes are the ones around it.
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <ostream>
 #include <span>
 #include <string_view>
 #include <vector>
