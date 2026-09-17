@@ -2,7 +2,10 @@
 
 [← blake3pp](../README.md)
 
-## Building
+Three presets cover most of what you will want: a current GCC, a current
+clang, and the C++20 polyfill path. Everything past that is the matrix
+that proves the kernels, the remote-execution driver, and the switches
+that let you re-measure the tuning decisions on your own hardware.
 
 ```bash
 cmake --preset linux-gcc16-cxx26 && cmake --build --preset linux-gcc16-cxx26
@@ -43,13 +46,15 @@ recipes are in `docker/README.md` too. Two kernel sets are opt-in:
 
 ## Building through cmake-re
 
-Every containerized preset also builds through [tipi cmake-re], which
-runs the compile actions on a remote-execution cluster (EngFlow, through
-reclient) and serves repeats from its action cache; the tests, emulator
-matrices and artifacts are the same as with plain cmake. cmake-re ships
-in every x86_64 toolchain image (`TIPI_DISTRO_MODE=none`, so it drives
-the image's own compilers). It knows nothing about presets, so
-`tools/preset-args.py` unrolls one into plain configure arguments:
+Every containerized preset also builds through [tipi cmake-re]. It runs
+the compile actions on a remote-execution cluster, EngFlow through
+reclient, and serves repeats from its action cache. The tests, emulator
+matrices and artifacts come out the same as with plain cmake.
+
+cmake-re ships in every x86_64 toolchain image, with
+`TIPI_DISTRO_MODE=none` so that it drives the image's own compilers. It
+knows nothing about presets, so `tools/preset-args.py` unrolls one into
+plain configure arguments:
 
 ```bash
 tools/tc linux-gcc16-cxx26 -- bash -c '
@@ -66,21 +71,29 @@ credentials in `RBE_service`, `RBE_tls_client_auth_key` and
 of the checkout under `.tipi`, which is why `ctest --test-dir` is the
 spelling above.
 
-Each toolchain lives in its own folder under `cmake/toolchains/`,
-together with the `.pkr.js` and `.layers.json` that name its image at
-the content tag and the manifest digest that tag resolves to: that
-folder is the environment cmake-re copies when it is not told `--host`,
-and the cluster pulls the same image for the compile actions.
-`tools/gen-environments.py` writes these files (`--check` reports stale
-ones; the digests come from the registry or from a `--digests` map),
-and `BLAKE3PP_TC_REGISTRY` with `BLAKE3PP_TC_IMAGE_TEMPLATE` retarget
-them at a registry mirror the cluster can reach. CI does not depend on
-them being current: every run writes the tag and digests it builds with
-into them and builds on that, and when the committed files lag, a run
-of `main` opens one draft pull request (`ci/toolchain-environments`,
-updated in place while the tag keeps moving) proposing the update, and
-marking it ready for review runs CI on it; a release built on injected
-files is named and annotated as a dirty build.
+### The toolchain folders
+
+Each toolchain lives in its own folder under `cmake/toolchains/`, with
+the `.pkr.js` and `.layers.json` that name its image at the content tag
+and the manifest digest that tag resolves to. That folder is the
+environment cmake-re copies when it is not told `--host`, and the cluster
+pulls the same image for the compile actions.
+
+`tools/gen-environments.py` writes those files. `--check` reports stale
+ones, and the digests come from the registry or from a `--digests` map.
+`BLAKE3PP_TC_REGISTRY` and `BLAKE3PP_TC_IMAGE_TEMPLATE` retarget them at
+a registry mirror the cluster can reach.
+
+CI does not depend on them being current:
+
+- Every run writes the tag and digests it builds with into them, and
+  builds on that.
+- When the committed files lag, a run of `main` opens one draft pull
+  request proposing the update. It is `ci/toolchain-environments`,
+  updated in place while the tag keeps moving, and marking it ready for
+  review runs CI on it.
+- A release built on injected files is named and annotated as a dirty
+  build.
 
 In CI the repository variable `BLAKE3PP_CI_DRIVER=cmake-re` (or the
 `driver` input of a manual run) switches every Linux container lane to
