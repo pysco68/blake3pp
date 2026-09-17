@@ -14,17 +14,20 @@
 //   POSIX:  synchronous pwrite
 //   other:  buffered stdio
 //
-// The model inverts the reader's: acquire() hands out one of queue_depth
-// fixed-size buffers (allocated once at construction, the only
-// allocation), the caller fills it, submit() queues the write at the next
-// sequential offset and immediately returns so the producer can fill the
+// The model inverts the reader's. acquire() hands out one of queue_depth
+// fixed-size buffers, allocated once at construction and the only
+// allocation. The caller fills it. submit() queues the write at the next
+// sequential offset and returns immediately, so the producer can fill the
 // next buffer while the device drains this one. acquire() blocking on a
-// still-in-flight slot is the backpressure. O_DIRECT demands 4 KiB-aligned
-// lengths, so only the final submit() may be partial or unaligned; it is
-// written through a plain fd, the same trick the reader uses for its tail.
-// finish() drains all in-flight writes. Not thread-safe; drive it from one
-// producer thread (the buffers it hands out may of course be filled by
-// many).
+// still-in-flight slot is the backpressure.
+//
+// O_DIRECT demands 4 KiB-aligned lengths, so only the final submit() may
+// be partial or unaligned. That one is written through a plain fd, the
+// same trick the reader uses for its tail. finish() drains all in-flight
+// writes.
+//
+// Not thread-safe, so drive it from one producer thread. The buffers it
+// hands out may be filled by many.
 
 #include <cstddef>
 #include <string_view>

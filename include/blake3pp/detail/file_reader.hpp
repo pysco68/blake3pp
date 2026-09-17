@@ -15,11 +15,13 @@
 //   other:  buffered stdio
 //
 // The model: the file is a sequence of fixed-size windows. queue_depth
-// buffers are allocated once at construction (the only allocation);
-// windows are delivered strictly in file order while later windows stream
-// in behind them. release() recycles a buffer, which is what creates
-// backpressure: at most queue_depth windows are ever in flight or held.
-// Not thread-safe; drive it from one pipeline thread.
+// buffers are allocated once at construction, and that is the only
+// allocation. Windows are delivered strictly in file order, while later
+// ones stream in behind them.
+//
+// release() recycles a buffer, and that is what creates the backpressure:
+// at most queue_depth windows are ever in flight or held. Not
+// thread-safe, so drive it from one pipeline thread.
 
 #include <cstddef>
 #include <string_view>

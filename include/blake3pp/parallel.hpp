@@ -163,18 +163,20 @@ void stack_budget_below_two_parts();
 /// blake3pp::hash<blake3pp::stack_budget{1024}>(input, sched);   // 32 parts
 /// @endcode
 ///
-/// The input is split into at most parts() parts, each with a 32-byte
-/// chaining value in a table on the calling thread's stack, whatever the
-/// input's size. Agents pull parts from a shared counter, so a slow agent
-/// takes fewer instead of holding up the join, and more parts balance more
-/// finely; a smaller budget splits the input into fewer, larger parts,
-/// which suits a machine with few cores.
+/// The input is split into at most parts() parts, whatever its size, and
+/// each part's 32-byte chaining value sits in a table on the calling
+/// thread's stack.
+///
+/// Agents pull parts from a shared counter, so a slow agent takes fewer
+/// rather than holding up the join, and more parts balance more finely. A
+/// smaller budget splits the input into fewer, larger parts, which suits a
+/// machine with few cores.
 ///
 /// A budget that is not a multiple of 32 bytes, or that holds fewer than
-/// two parts, does not compile. There is no upper limit, because the stack
-/// the calling thread has is not known where this header is compiled; the
+/// two parts, does not compile. There is no upper limit. The stack a
+/// calling thread has is not known where this header is compiled: the
 /// platform, the linker, the thread's creator or the application's
-/// configuration sets it. Code that knows its thread checks the budget
+/// configuration sets it. Code that knows its own thread checks the budget
 /// against that at compile time, leaving room for its own frames:
 ///
 /// @code
@@ -182,13 +184,25 @@ void stack_budget_below_two_parts();
 /// static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
 /// @endcode
 ///
-/// The budget covers this table alone. Each part is reduced on the agent
+/// The budget covers the part table alone. Each part is reduced on the agent
 /// that took it, by a recursion holding one chaining-value buffer per level
 /// (2 KiB while a 16-wide kernel is compiled in: the buffer is sized for
 /// the widest compiled variant, not the running one), as deep as halving
-/// the part takes to reach twice the running variant's degree in chunks. A
-/// smaller budget makes parts larger and that recursion deeper, so agent
-/// threads need stack of their own.
+/// the part takes to reach twice the running variant's degree in chunks.
+///
+/// Three consequences follow, none of them checked at run time:
+///   - The budget moves stack, it does not save it. Lowering it shrinks
+///     the caller's table and enlarges every agent's frame, because parts
+///     get bigger and the reduction recurses deeper.
+///   - Agent threads have to be sized for that frame. The checks here are
+///     consteval and catch a malformed budget, not a thread too small to
+///     run one; overflowing an agent's stack is a crash, not an error.
+///   - A budget yielding fewer parts than the scheduler has agents leaves
+///     agents idle, so throughput can fall before stack does.
+///
+/// BLAKE3PP_SUBTREE_FOLD removes the depth term altogether, at 32 bytes per
+/// level, which makes an agent's stack independent of the input size.
+/// docs/freestanding.md gives the measured frames and a worked case.
 struct stack_budget {
   /// The stack one part's chaining value takes.
   static constexpr std::size_t bytes_per_part = 32;
@@ -308,7 +322,7 @@ template <stack_budget Budget, class Scheduler>
 // family with a scheduler added, same spellings, same string_view
 // conveniences. Every template is constrained on the scheduler concept
 // so none of them can hijack a core overload (an arch enum or a
-// string_view in the scheduler's position simply fails to match).
+// string_view in the scheduler's position fails to match).
 
 /// Expert: multi-core hash on a caller-supplied kernel table, the same
 /// seam hasher's expert constructor exposes.

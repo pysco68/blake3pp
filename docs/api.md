@@ -393,10 +393,32 @@ kernel, since the buffer is sized for the widest variant compiled rather
 than the one that runs, and as many levels as halving the part takes to
 reach twice the running variant's degree in chunks.
 
-Agent threads therefore need stack of their own, and the two costs pull
-against each other: a smaller budget splits the input into larger parts,
-which makes that recursion deeper. Sizing a thread from the budget alone
-is not enough.
+#### What turning it down actually does
+
+**It moves stack, it does not save it.** A smaller budget shrinks the
+table on the calling thread and enlarges the frame on every agent,
+because the parts get bigger and that recursion goes deeper. The total
+across the program does not fall; it relocates from one thread to
+several.
+
+**Nothing catches an undersized thread.** The checks on `stack_budget`
+are `consteval` and reject a malformed budget — not a multiple of 32
+bytes, or fewer than two parts. They cannot know how much stack your
+threads have, and where this header is compiled nobody does. Overflowing
+an agent's stack is a crash or worse, not an error you can handle, which
+is why the freestanding page gives the frames in bytes rather than
+advice.
+
+**Throughput can go before stack does.** Agents pull parts from a shared
+counter, so parts are also the unit of load balancing. A budget that
+yields fewer parts than the scheduler has agents leaves agents with
+nothing to take, and the slowest part sets the finish time.
+
+If the depth is the problem, `BLAKE3PP_SUBTREE_FOLD=<levels>` removes
+that term altogether at 32 bytes per level, which makes an agent's stack
+independent of the input size. The measured frames, the formulas and a
+worked Zephyr case are in
+[Freestanding and RTOS builds](freestanding.md#stack-requirements).
 
 `keyed_hash`, `derive_key`, `update_file` and `hash_file` take the same
 argument, and `parallel_hasher` takes it as its second template

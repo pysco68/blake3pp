@@ -50,8 +50,8 @@ void to_hex(std::span<const std::byte> bytes, std::span<char> out) noexcept;
 namespace detail {
 
 // One chunk (up to 1024 bytes) in flight. The final block of a chunk is kept
-// buffered rather than compressed eagerly: its flags (CHUNK_END, possibly
-// ROOT) are only known once we see whether more input arrives.
+// buffered rather than compressed eagerly. Its flags (CHUNK_END, possibly
+// ROOT) are known only once more input has arrived, or has not.
 struct chunk_state {
   std::array<std::uint32_t, 8> cv;
   std::uint64_t chunk_counter;
@@ -92,8 +92,8 @@ struct digest {
 
   /// Verifies a hex string against this digest in one step.
   ///
-  /// The comparison is constant-time, like operator==. Malformed hex is
-  /// simply no match.
+  /// The comparison is constant-time, like operator==. Malformed hex
+  /// counts as no match.
   /// @param hex  The hex to check, 64 characters of either case.
   /// @return true iff hex parses and denotes exactly this digest.
   [[nodiscard]] bool matches(std::string_view hex) const noexcept;

@@ -114,31 +114,34 @@ bool run_trap_probes() noexcept;
 /// The strategy for the 16-lane message transpose used by every width-16
 /// kernel (avx512, sve512/sve2_512, rvv512).
 ///
-/// The right choice depends on the execution datapath (full-width or
-/// double-pumped), which no CPUID bit reports, and on where the input
-/// lives; it moves about 10% and is not predictable from the CPU alone.
-/// Two AMD parts with identical feature flags rank the strategies in
-/// opposite order at the same input size (Strix Point: quartered 17% over
-/// staging; Strix Halo: staging 8% over quartered), and on one machine
-/// the winner changes with the input (Strix Halo: quartered for an 8 MiB
-/// input that fits in cache, staging for a 512 MiB one streaming from
-/// DRAM). All numbers are AVX-512 measurements, the only width-16
-/// hardware measured so far.
+/// Which strategy wins cannot be read off the CPU. It depends on whether
+/// the execution datapath is full-width or double-pumped, which no CPUID
+/// bit reports, and on where the input lives. The spread is about 10%.
 ///
-/// The three cost policies, none of them implicit:
-///   - Do nothing: quartered, the default, measured best on most parts
-///     tested and never worse than about 10% off.
-///   - Tune per start: tune_transpose16(bytes) races the strategies on
-///     this CPU over a working set the size of the typical input,
-///     applies the winner process-wide and returns it.
-///   - Tune once ever: persist to_string(tune_transpose16(bytes)) and on
-///     later starts restore with
+/// Two AMD parts with identical feature flags rank them in opposite order
+/// at the same input size: Strix Point puts quartered 17% over staging,
+/// Strix Halo puts staging 8% over quartered. On one machine the winner
+/// changes with the input: on Strix Halo, quartered for an 8 MiB input
+/// that fits in cache, staging for a 512 MiB one streaming from DRAM. All
+/// of these are AVX-512 measurements, the only width-16 hardware measured
+/// so far.
+///
+/// Three cost policies, none of them implicit:
+///   - Do nothing. quartered is the default. It measured best on most
+///     parts tested, and is never worse than about 10% off.
+///   - Tune per start. tune_transpose16(bytes) races the strategies on
+///     this CPU over a working set the size of the typical input, applies
+///     the winner process-wide, and returns it.
+///   - Tune once ever. Persist to_string(tune_transpose16(bytes)), and on
+///     later starts restore it with
 ///     set_transpose16(transpose16_from_string(saved).value_or(
 ///         transpose16::quartered)).
-/// Workloads at the edge measure themselves with blake3pp_bench (the
-/// t16-* rows and --t16-sweep) and pin the winner with set_transpose16().
-/// On machines without a width-16 kernel the setting is inert. Thread-safe;
-/// switching mid-hash is benign, since every strategy is correct.
+///
+/// Workloads at the edge measure themselves with blake3pp_bench, the
+/// t16-* rows and --t16-sweep, and pin the winner with set_transpose16().
+/// On machines without a width-16 kernel the setting is inert. It is
+/// thread-safe, and switching mid-hash is benign because every strategy
+/// is correct.
 enum class transpose16 : std::uint8_t {
   staging = 0,    ///< Scalar gather through a staging array.
   tree = 1,       ///< Radix-2 register shuffle network.
