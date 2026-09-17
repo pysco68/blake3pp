@@ -17,6 +17,10 @@ needing. Everything runs from the repository root.
 | `gen-test-vectors.py` | Turn the official BLAKE3 `test_vectors.json` into the C++ header the tests include. |
 | `objscan.py` | Look inside a built object or binary: instruction classes, code-generation quality, and the kernel audit. |
 | `kernel-audit.json` | The rules `objscan.py audit` enforces. |
+| `amalgamate.py` | Concatenate the library into one translation unit, for Compiler Explorer and single-file drops. |
+| `godbolt-link.py` | Shorten a source file into a Compiler Explorer link. |
+| `make-try-page.py` | Write the redirect page the README's "try it" link points at. |
+| `include-audit.py` | Cross-build `clang-include-cleaner` pass: additions from the union, removals only from the intersection. |
 
 ## objscan.py
 
@@ -95,3 +99,4 @@ with a `match` regex against the variant name (`sve\d+`, `rvv\d+_zvbb`),
 and extend the neighbouring variants' `forbid` lists if the new
 instruction class must stay out of them. The audit reports a variant
 without a rule and does not fail on it.
+

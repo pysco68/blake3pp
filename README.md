@@ -102,7 +102,10 @@ r.seek(10'000'000'000);      // byte ten billion costs what byte zero costs
 r.fill(chunk);
 ```
 
-All of it, with the edge cases, in [the API](docs/api.md).
+All of it, with the edge cases, in [the API](docs/api.md). Or
+[run it in your browser](https://pysco68.github.io/blake3pp/try/): one
+amalgamated file on Compiler Explorer, hashing on one core and on all of
+them.
 
 ## Architectures
 
