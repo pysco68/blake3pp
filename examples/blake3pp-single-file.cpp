@@ -1,4 +1,4 @@
-// blake3pp, amalgamated from f8bfdc3-dirty by tools/amalgamate.py.
+// blake3pp, amalgamated from f0960e7 by tools/amalgamate.py.
 //
 // Two kernels: the scalar fallback, and BLAKE3PP_AMALGAM_NS, built for whatever
 // this compiler was told to target. The shipped library compiles one
@@ -676,7 +676,7 @@ class hasher {
 namespace detail {
 // Reduces a power-of-2 subtree (>= 2 complete chunks) to its root CV using
 // the given kernel table, key schedule and mode flags (take them from the
-// destination hasher's key_words()/mode_flags()). Thread-safe and
+// destination hasher's key_words() and mode_flags()). Thread-safe and
 // allocation-free; the bridge the parallel engine schedules over.
 void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::size_t num_chunks, std::uint64_t chunk_counter,
@@ -5031,7 +5031,7 @@ bool operator==(const digest& lhs, const digest& rhs) noexcept {
 // the right probe: each fact is stated exactly once.
 
 
-#define BLAKE3PP_STAMPED_VERSION "f8bfdc3-dirty-amalgamated"
+#define BLAKE3PP_STAMPED_VERSION "f0960e7-amalgamated"
 
 
 #include <array>
@@ -6019,8 +6019,9 @@ void for_each_part(Scheduler& sched, std::size_t n, Body body) {
 }
 
 // The one-shot engine: partitions input into aligned subtrees, fans them
-// out over sched, and finishes inside h, whose key_words()/mode_flags()
-// drive the workers; plain, keyed and derive_key hashers all work.
+// out over sched, and finishes inside h, whose key_words() and
+// mode_flags() drive the workers. Plain, keyed and derive_key hashers all
+// work.
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched,
@@ -6235,9 +6236,9 @@ struct parallel_hasher_options {
   std::size_t window_bytes = 8 * 1024 * 1024;
 };
 
-/// The incremental counterpart of the multi-core hash(): hasher's
-/// update()/finalize()/reset() interface, with the subtree hashing fanned
-/// out over a scheduler internally.
+/// The incremental counterpart of the multi-core hash(). It offers the
+/// same `update()`, `finalize()` and `reset()` interface as hasher, and
+/// fans the subtree hashing out over a scheduler internally.
 ///
 /// Input accumulates into an aligned window; a full window is fanned out
 /// as soon as one more byte arrives, the "one byte in reserve" that keeps
