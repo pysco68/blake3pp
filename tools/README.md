@@ -21,6 +21,7 @@ root.
 | `amalgamate.py` | Concatenate the library into one translation unit, for Compiler Explorer and single-file drops. |
 | `godbolt-link.py` | Shorten a source file into a Compiler Explorer link. |
 | `build-try.py` | Write the "try it on Compiler Explorer" page for each example, minting a link when its source changed. |
+| `try-links.json` | The link cache behind that: one entry per example per version. |
 | `godbolt-check.py` | Compile and run a source file on Compiler Explorer and report, for checking a snapshot before it is published. |
 | `include-audit.py` | Cross-build `clang-include-cleaner` pass: additions from the union, removals only from the intersection. |
 | `build-site.sh` | Build the published documentation site: every release plus `main`, and the Compiler Explorer link (`--all`, `--no-link`, `--serve`). |
@@ -144,14 +145,14 @@ virtualenv on first run.
 
 Compiler Explorer's compile nodes have no network, so a link there embeds
 the source it was made from and cannot follow this repository. Each
-example therefore gets a page under `site/try/` that redirects to a link
+example therefore gets a page under the published `/try/` that redirects to a link
 built from that example, and the READMEs point at the page rather than at
 the link.
 
 `build-try.py` writes those pages. For each example it amalgamates the
 library, appends the example, and hashes the result. A link is minted
 only when that hash differs from the one recorded in
-`site/try/links.json`, so rebuilding costs no requests, and `--no-link`
+`tools/try-links.json`, so rebuilding costs no requests, and `--no-link`
 never contacts godbolt.org at all. The hash ignores the version stamp the
 amalgamation writes into itself, which otherwise changes on every commit.
 

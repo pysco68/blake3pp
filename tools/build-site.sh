@@ -45,7 +45,7 @@ offline=""
 try() {                       # try <namespace> <emitted map> [extra args...]
   local ns=$1 map=$2; shift 2
   python3 tools/build-try.py --namespace "${ns}" --emit-map "${map}" \
-    --manifest "${root}/site/try/links.json" ${offline} "$@"
+    --manifest "${root}/tools/try-links.json" ${offline} "$@"
 }
 
 # main is this checkout: it is what a contributor is previewing, and in CI
@@ -53,9 +53,7 @@ try() {                       # try <namespace> <emitted map> [extra args...]
 echo "== main"
 # main shares its links with the redirect pages at the site root, which is
 # where the README points: both describe the current tip.
-echo "-- amalgamating"
-python3 tools/amalgamate.py -o examples/blake3pp-single-file.cpp
-try "" "${maps}/main.json" --output site/try
+try "" "${maps}/main.json" --output "${out}/try"
 tools/build-docs.sh --out "${out}/main" --links "${maps}/main.json"
 versions=("main")
 
@@ -78,7 +76,7 @@ if [ "${all}" = 1 ]; then
     if ! (cd "${tree}" \
             && python3 tools/build-try.py --namespace "${tag}" \
                  --emit-map "${maps}/${tag}.json" \
-                 --manifest "${root}/site/try/links.json" ${offline} \
+                 --manifest "${root}/tools/try-links.json" ${offline} \
             && tools/build-docs.sh --out "${out}/${tag}" \
                  --links "${maps}/${tag}.json"); then
       echo "-- ${tag} does not build with today's nav; skipped" >&2
@@ -122,9 +120,6 @@ cat > "${out}/index.html" <<HTML
 <link rel="canonical" href="latest/">
 <p>Taking you to <a href="latest/">the documentation</a>.</p>
 HTML
-
-cp -r site/try "${out}/try"
-rm -f "${out}/try/links.json"
 
 echo "-- built ${out}"
 if [ "${serve}" = 1 ]; then

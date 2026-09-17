@@ -14,9 +14,9 @@ carry the real link directly. --emit-map writes the name-to-URL mapping
 that tools/build-docs.sh substitutes into each version's pages, so a
 reader of v0.1.0's documentation opens v0.1.0's code.
 
-    tools/build-try.py --output site/try
+    tools/build-try.py --output _site/try
     tools/build-try.py --namespace v0.1.0 --emit-map /tmp/links.json
-    tools/build-try.py --output site/try --no-link   # offline: reuse links
+    tools/build-try.py --output _site/try --no-link   # offline: reuse links
 """
 import argparse
 import datetime
@@ -147,7 +147,7 @@ def main():
     ap.add_argument("--emit-map", type=pathlib.Path,
                     help="write the example-to-URL mapping here")
     ap.add_argument("--manifest", type=pathlib.Path,
-                    default=REPO / "site/try/links.json",
+                    default=REPO / "tools/try-links.json",
                     help="where the link cache lives")
     ap.add_argument("--namespace", default="",
                     help="version these links belong to, for the cache")

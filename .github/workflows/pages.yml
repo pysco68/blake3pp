@@ -62,6 +62,19 @@ jobs:
       - name: Build the site
         run: tools/build-site.sh --all
 
+      # The committed single-file drop is what the README and the try pages
+      # link to on GitHub, and nothing regenerates it automatically, so say
+      # when it has fallen behind the headers.
+      - name: Check the committed amalgamation is current
+        continue-on-error: true
+        run: |
+          python3 tools/amalgamate.py -o /tmp/fresh.cpp > /dev/null
+          strip() { sed -e 's/amalgamated from .* by/amalgamated from VERSION by/' \
+                        -e 's/#define BLAKE3PP_STAMPED_VERSION ".*"/#define BLAKE3PP_STAMPED_VERSION "VERSION"/' "$1"; }
+          if ! diff -q <(strip /tmp/fresh.cpp) <(strip examples/blake3pp-single-file.cpp) > /dev/null; then
+            echo "::warning::examples/blake3pp-single-file.cpp is out of date; run tools/amalgamate.py -o examples/blake3pp-single-file.cpp"
+          fi
+
       # A link that does not build is worse than no link; the runner has a
       # new enough GCC only sometimes, so this warns rather than gates.
       - name: Compile the generated file, if this runner can
