@@ -215,6 +215,19 @@ def main():
 #else
 #define BLAKE3PP_AMALGAM_SCALAR_ONLY 1   // no <simd> here
 #endif
+
+// The multi-core half, when the reader selected beman.execution in
+// Compiler Explorer's library list. Decided here rather than beside the
+// headers it enables, because the introspection in dispatch.cpp is
+// compiled long before those and has to see the same answer.
+#if defined(__has_include) && __has_include(<beman/execution/execution.hpp>)
+#define BLAKE3PP_EXECUTION_BEMAN 1
+#define BLAKE3PP_HAS_STD_THREAD 1
+#ifndef BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND
+#define BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND 1
+#endif
+#define BLAKE3PP_AMALGAM_HAS_PARALLEL 1
+#endif
 """]
     # The public headers include each other and the arch table; paste all
     # three in dependency order and drop the includes between them.
@@ -259,13 +272,7 @@ def main():
         text = (REPO / h).read_text().replace("#pragma once", "")
         par += re.sub(r'#include [<"]blake3pp/[^>"]+[>"][^\n]*\n', "", text)
     out.append("""
-#if defined(__has_include) && __has_include(<beman/execution/execution.hpp>)
-#define BLAKE3PP_EXECUTION_BEMAN 1
-#define BLAKE3PP_HAS_STD_THREAD 1
-#ifndef BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND
-#define BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND 1
-#endif
-#define BLAKE3PP_AMALGAM_HAS_PARALLEL 1
+#ifdef BLAKE3PP_AMALGAM_HAS_PARALLEL
 """ + par + """
 #endif  // beman.execution
 """)

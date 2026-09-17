@@ -235,8 +235,10 @@ std::string_view execution_provider() noexcept {
   return "std::execution";
 #elif defined(BLAKE3PP_EXECUTION_BEMAN)
   return "beman.execution";
-#else
+#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
   return "stdexec";
+#else
+  return "none";
 #endif
 }
 

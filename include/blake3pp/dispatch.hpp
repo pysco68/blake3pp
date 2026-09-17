@@ -109,7 +109,9 @@ bool run_trap_probes() noexcept;
 /// "std::experimental::simd" or "xsimd".
 [[nodiscard]] std::string_view simd_provider() noexcept;
 /// Which sender/receiver implementation backs this build of the library:
-/// "std::execution", "beman.execution" or "stdexec".
+/// "std::execution", "beman.execution" or "stdexec", or "none" where the
+/// build carries no execution provider and the multi-core entry points do
+/// not exist.
 [[nodiscard]] std::string_view execution_provider() noexcept;
 
 /// The strategy for the 16-lane message transpose used by every width-16
