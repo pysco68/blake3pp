@@ -1,10 +1,12 @@
 // The opt-in sized parallel scheduler (<blake3pp/parallel_backend.hpp>).
 //
-// P2079's scheduler is process-wide and unsized; the only lever the design
+// P2079's scheduler is process-wide and unsized. The only lever the design
 // offers is replacing the backend behind it, once per program, which is
-// what this TU does. It is a separate target for exactly that reason: one
-// definition per program, like a global allocator, so a program that never
-// asks for it never links a thread pool.
+// what this TU does.
+//
+// It is a separate target for that reason: one definition per program, like
+// a global allocator. A program that never asks for it never links a thread
+// pool.
 //
 // Per provider:
 //   stdexec - the process pool is ours already; recording the size before

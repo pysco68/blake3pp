@@ -59,11 +59,13 @@ inline int sys_io_uring_enter(int ring_fd, unsigned to_submit,
 }
 
 // Names the reason the ring is absent, for the fallback backend name the
-// tools print. Without this, "blocked by policy" (Android's seccomp
-// filter, EPERM) and "kernel too old" (ENOSYS) are indistinguishable in
-// bench output: a fourth kind of quiet degradation the backend line
-// otherwise wouldn't confess to, in the same spirit as --version's "cpu
-// also supports X (not compiled in)".
+// tools print. Without it, "blocked by policy" (Android's seccomp filter,
+// EPERM) and "kernel too old" (ENOSYS) are indistinguishable in bench
+// output.
+//
+// That would be a fourth kind of quiet degradation the backend line does
+// not otherwise confess to, in the same spirit as --version's "cpu also
+// supports X (not compiled in)".
 inline std::string no_uring_suffix(int err) {
   switch (err) {
     case EPERM:

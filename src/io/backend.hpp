@@ -63,15 +63,21 @@ concept reader_backend =
       { cb.name() } noexcept -> std::convertible_to<std::string_view>;
       // The whole runtime-degradation ladder folded into one question the
       // engine asks per window: "may THIS (offset, length) ride your
-      // async path?" uring/IOCP answer engaged && length aligned
-      // (O_DIRECT / NO_BUFFERING reject unaligned lengths), GCD answers
-      // engaged (F_NOCACHE has no alignment contract, so the tail rides
-      // too), sync backends answer never. The engine doesn't learn why:
-      // false just routes the window to read_sync at delivery time.
-      // (Current backends ignore the offset, since engine windows start
-      // at 64 KiB multiples and it is therefore always granule-aligned,
-      // but it is part of the question because O_DIRECT constrains offset
-      // alignment too, and a future engine might not guarantee it.)
+      // async path?"
+      //
+      //   - uring and IOCP answer engaged && length aligned, because
+      //     O_DIRECT and NO_BUFFERING reject unaligned lengths.
+      //   - GCD answers engaged. F_NOCACHE has no alignment contract, so
+      //     the tail rides too.
+      //   - sync backends answer never.
+      //
+      // The engine does not learn why. false routes the window to
+      // read_sync at delivery time, and that is all it needs.
+      //
+      // Current backends ignore the offset, since engine windows start at
+      // 64 KiB multiples and it is therefore always granule-aligned. It is
+      // part of the question because O_DIRECT constrains offset alignment
+      // too, and a future engine might not guarantee that.
       { cb.wants_async(off, std::size_t{}) } noexcept -> std::same_as<bool>;
       // Begins an async read of buf at off, owned by `slot`; legal only
       // after wants_async() said yes for exactly this window.

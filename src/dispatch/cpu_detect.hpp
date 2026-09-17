@@ -7,11 +7,13 @@
 // BLAKE3PP_HAS_CPU_DETECT and dispatch.cpp answers without it.
 //
 // THE RULE every probe TU inherits: these files are compiled with the
-// library's baseline flags and must stay FLAG-NEUTRAL: no intrinsics
-// that require an -m/-march above the baseline, no
-// __builtin_cpu_supports (it drags compiler-runtime machinery into the
-// link that lld-link and musl static linking do not have). Probing is
-// syscalls, CPUID-style instructions available at baseline, and
+// library's baseline flags and must stay FLAG-NEUTRAL.
+//
+//   - No intrinsics that require an -m/-march above the baseline.
+//   - No __builtin_cpu_supports. It drags compiler-runtime machinery into
+//     the link that lld-link and musl static linking do not have.
+//
+// Probing is syscalls, CPUID-style instructions available at baseline, and
 // carefully scoped inline asm only.
 
 #include <blake3pp/dispatch.hpp>

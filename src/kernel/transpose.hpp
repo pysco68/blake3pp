@@ -3,11 +3,14 @@
 // The message transpose. (The wide word's rotate and its per-ISA escape
 // hatches live in rotate.hpp.)
 //
-// hash_batch needs the 16 message words of a block gathered ACROSS lanes
-// (word j of every input in one vector). No simd provider exposes a portable
-// permute for that (the std::simd MVP has no shuffle API at all), so the
-// naive route stages through a scalar array, and it costs ~40% of the whole
-// hash (upstream's SSE4.1 assembly matches this AVX2 kernel because of it).
+// hash_batch needs the 16 message words of a block gathered ACROSS lanes,
+// meaning word j of every input in one vector. No simd provider exposes a
+// portable permute for that, and the std::simd MVP has no shuffle API at
+// all.
+//
+// So the naive route stages through a scalar array, and that costs about
+// 40% of the whole hash. It is why upstream's SSE4.1 assembly matches this
+// AVX2 kernel.
 //
 // The bypass is a radix-2 shuffle tree whose index patterns ARE hardware
 // macro-ops; it lives in shuffle/networks.hpp, written once over whichever
@@ -33,13 +36,16 @@ namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
 namespace {
 namespace transpose_detail {
 
-// The W==16 strategy is a RUNTIME dial (kern::transpose16_active, set via
-// blake3pp::set_transpose16 / tune_transpose16): on double-pumped AVX-512
-// (Strix Point) the register tree measured 20% slower than the scalar
-// staging gather while the quartered form measured 17% faster, and no
-// CPUID bit distinguishes those microarchitectures, so the winner is
-// raced, not detected. All three paths compile into the W==16 kernel; the
-// relaxed load deciding between them amortizes over a >=16 KiB batch.
+// The W==16 strategy is a RUNTIME dial: kern::transpose16_active, set
+// through blake3pp::set_transpose16 or tune_transpose16.
+//
+// On double-pumped AVX-512, meaning Strix Point, the register tree measured
+// 20% slower than the scalar staging gather while the quartered form
+// measured 17% faster. No CPUID bit distinguishes those
+// microarchitectures, so the winner is raced rather than detected.
+//
+// All three paths compile into the W==16 kernel, and the relaxed load
+// deciding between them amortizes over a batch of 16 KiB or more.
 BLAKE3PP_FORCE_INLINE transpose16_mode t16_mode() noexcept {
   return transpose16_active.load(std::memory_order_relaxed);
 }

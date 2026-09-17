@@ -29,13 +29,14 @@ static_assert(u32v::width <= max_simd_degree,
               "BLAKE3PP_MAX_SIMD_DEGREE is narrower than this kernel's "
               "simd_degree: it sizes the staging buffers this kernel fills");
 
-// Little-endian load/store, spelled memcpy + byteswap rather than the
-// byte-wise shift-or idiom: GCC and Clang fold both spellings to a single
-// mov on LE targets, but MSVC 19.51 does not recognize the shift-or idiom
-// at all: it emitted the four movzx/shl/or per word verbatim, 10
-// instructions per message word in the scalar kernel's block loop. The
-// memcpy folds to one mov on every compiler; the byteswap arm keeps the
-// endian independence the old spelling had.
+// Little-endian load and store, spelled memcpy plus byteswap instead of
+// the byte-wise shift-or idiom. GCC and Clang fold both spellings to a
+// single mov on LE targets. MSVC 19.51 does not recognize the shift-or
+// idiom at all: it emitted the four movzx/shl/or per word verbatim, ten
+// instructions per message word in the scalar kernel's block loop.
+//
+// The memcpy folds to one mov on every compiler, and the byteswap arm
+// keeps the endian independence the old spelling had.
 //
 // std::byteswap is C++23; the C++20 presets get the shift-mask spelling,
 // which every compiler folds to a single bswap. Feature-tested rather
@@ -59,12 +60,18 @@ BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept 
 // and AArch64 perform them in hardware.
 //
 // Measured on one preprocessed source, counting loads whose base is the
-// block parameter in compress_in_place: zig 0.16 (clang 21.1.0) three,
-// Ubuntu clang 21.1.8 none, zig 0.17-dev (clang 22.1.8) none, Ubuntu
-// clang 22.1.8 none, GCC 15 none. So a 21.1.x patch release or zig's own
-// build of it is the dividing line, and the version bound below is
-// conservative on purpose: it also covers clang 21 builds that do not
-// need it, and lifts itself when the musl builds move to zig 0.17.
+// block parameter in compress_in_place:
+//
+//   zig 0.16 (clang 21.1.0)        three
+//   Ubuntu clang 21.1.8            none
+//   zig 0.17-dev (clang 22.1.8)    none
+//   Ubuntu clang 22.1.8            none
+//   GCC 15                         none
+//
+// So a 21.1.x patch release, or zig's own build of it, is the dividing
+// line. The version bound below is conservative on purpose: it also covers
+// clang 21 builds that do not need it, and lifts itself when the musl
+// builds move to zig 0.17.
 #if defined(__riscv) && defined(__riscv_v) && defined(__clang__) && __clang_major__ < 22
 #define BLAKE3PP_ALIGN_MESSAGE_BLOCK 1
 #else
@@ -135,17 +142,21 @@ constexpr auto msg_schedule = make_msg_schedule();
 
 // The quarter-round (spec section 2.2), generic over the word type.
 //
-// Scheduling note (all measured on znver3): this plain sequential-g
+// Scheduling note, all measured on znver3. This plain sequential-g
 // spelling is the best of three schedules tried. llvm-mca shows it
-// latency-bound (459 cycles/block vs a 196 port floor, IPC 2.56 where
-// upstream's hand-scheduled asm reaches 3.50), yet every attempt to
-// expose more ILP in source made things worse. Interleaving two independent
-// batches doubled live state past the 16 architectural registers (2.66 ->
-// 1.83 GiB/s); staging the four quartets' micro-steps helped narrow widths
-// but pessimized AVX2 spill placement on both compilers (ratio vs upstream
-// 0.85 -> 0.71); and staging via index arrays defeated SROA entirely
-// (Clang 0.77 GiB/s). The residual vs hand-written assembly is scheduler
-// quality, and source-level reordering cannot reliably buy it back.
+// latency-bound, at 459 cycles per block against a 196 port floor, and IPC
+// 2.56 where upstream's hand-scheduled asm reaches 3.50. Every attempt to
+// expose more ILP in source made things worse:
+//
+//   - Interleaving two independent batches doubled live state past the 16
+//     architectural registers, 2.66 -> 1.83 GiB/s.
+//   - Staging the four quartets' micro-steps helped narrow widths but
+//     pessimized AVX2 spill placement on both compilers, ratio against
+//     upstream 0.85 -> 0.71.
+//   - Staging via index arrays defeated SROA entirely, Clang 0.77 GiB/s.
+//
+// The residual against hand-written assembly is scheduler quality, and
+// source-level reordering cannot reliably buy it back.
 template <class W>
 BLAKE3PP_FORCE_INLINE void g(W v[16], std::size_t a, std::size_t b, std::size_t c,
               std::size_t d, W mx, W my) noexcept {
@@ -297,12 +308,14 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
                      const std::uint8_t block[block_len], std::uint32_t len,
                      std::uint64_t counter, std::uint32_t flags,
                      std::array<std::uint32_t, 16>& out) noexcept {
-  // See BLAKE3PP_ALIGN_MESSAGE_BLOCK: where the merged load would fault,
+  // See BLAKE3PP_ALIGN_MESSAGE_BLOCK. Where the merged load would fault,
   // an unaligned block is copied once so that the address really is
-  // aligned. Staging it unconditionally does not work, since the
-  // optimizer forwards the copy and rebuilds the loads from the original
-  // pointer; the aligned case, which is the common one, pays one
-  // predictable branch and no copy.
+  // aligned.
+  //
+  // Staging it unconditionally does not work: the optimizer forwards the
+  // copy and rebuilds the loads from the original pointer. The aligned
+  // case, which is the common one, pays one predictable branch and no
+  // copy.
   const std::uint8_t* src = block;
 #if BLAKE3PP_ALIGN_MESSAGE_BLOCK
   alignas(std::uint32_t) std::uint8_t staged[block_len];

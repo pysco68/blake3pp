@@ -67,11 +67,13 @@ struct vext_backend {
       sizeof(typename u32v::impl) == 4 * W &&
       std::is_trivially_copyable_v<typename u32v::impl>;
 
-  // Byte-granular rotate: rotr by a multiple of 8 bits is a byte
+  // Byte-granular rotate. rotr by a multiple of 8 bits is a byte
   // permutation within each 32-bit element, and the lane-local constexpr
-  // pattern is exactly vpshufb (NEON: tbl, and clang recognizes the 16-bit
-  // case as rev32): one uop instead of the three (shift, shift, or) a
-  // generic rotate costs on ISAs without a native rotate instruction.
+  // pattern is exactly vpshufb. On NEON that is tbl, and clang recognizes
+  // the 16-bit case as rev32.
+  //
+  // One uop, against the three a generic rotate costs on ISAs without a
+  // native rotate instruction: shift, shift, or.
   template <std::size_t W>
   static constexpr bool supports_byte_rot = supports<W> && (W == 4 || W == 8);
 

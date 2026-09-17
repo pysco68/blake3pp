@@ -57,12 +57,13 @@ inline bool preallocate(int fd, std::uint64_t len) noexcept {
   return ::ftruncate(fd, static_cast<off_t>(len)) == 0;
 }
 
-// The submission/completion machinery, playing the role the uring and the
-// completion port play elsewhere: submit() is fire-and-forget onto GCD's
-// global pool, workers publish per-slot completion under m and signal cv,
-// and the pipeline thread blocks on cv for the slot it needs next. The
-// group exists for teardown: in-flight workers touch the engine's buffer
-// pool, so destroy() must wait them out before the pool is freed.
+// The submission and completion machinery, playing the role the uring and
+// the completion port play elsewhere. submit() is fire-and-forget onto
+// GCD's global pool, workers publish per-slot completion under m and signal
+// cv, and the pipeline thread blocks on cv for the slot it needs next.
+//
+// The group exists for teardown. In-flight workers touch the engine's
+// buffer pool, so destroy() must wait them out before the pool is freed.
 struct gcd_pump {
   dispatch_group_t group = nullptr;
   std::mutex m;

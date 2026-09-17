@@ -77,14 +77,16 @@ class reader_engine {
   }
 
   std::optional<window> next() {
-    // A submission that fails inside release() cannot be reported there:
-    // release() is noexcept because callers pair it with next() in a tight
-    // loop, and letting it throw would call std::terminate, including
+    // A submission that fails inside release() cannot be reported there.
+    // release() is noexcept, because callers pair it with next() in a
+    // tight loop. Letting it throw would call std::terminate, including
     // from hash_file(path, ec, opts), whose whole contract is to turn I/O
-    // failures into an error_code. So the failure is latched here instead,
-    // in the function already documented as throwing. The latch is
-    // permanent: the slot whose submission failed holds a window that can
-    // never be delivered, so there is no way to continue reading.
+    // failures into an error_code.
+    //
+    // So the failure is latched here instead, in the function already
+    // documented as throwing. The latch is permanent: the slot whose
+    // submission failed holds a window that can never be delivered, so
+    // there is no way to continue reading.
     if (submit_failed_) {
       std::rethrow_exception(submit_failed_);
     }
@@ -189,13 +191,14 @@ class reader_engine {
   B backend_;
 };
 
-// The write-side slot engine, the reader's inverse: the producer fills
-// buffers ahead of the device, and acquire() blocking on a slot whose
-// write is still in flight is the entire backpressure story. The
-// unaligned tail (only the final submit may be one) always goes through
-// the backend's synchronous buffered path, because O_DIRECT and
-// NO_BUFFERING both reject unaligned lengths; the backends that don't
-// care route it the same way for uniformity.
+// The write-side slot engine, the reader's inverse. The producer fills
+// buffers ahead of the device, and acquire() blocking on a slot whose write
+// is still in flight is the entire backpressure story.
+//
+// The unaligned tail, and only the final submit may be one, always goes
+// through the backend's synchronous buffered path, because O_DIRECT and
+// NO_BUFFERING both reject unaligned lengths. The backends that do not care
+// route it the same way, for uniformity.
 template <writer_backend B>
 class writer_engine {
  public:

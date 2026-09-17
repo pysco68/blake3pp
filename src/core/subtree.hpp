@@ -1,11 +1,13 @@
 #pragma once
 
 // Wide subtree compression: reduces a chunk-aligned power-of-2 subtree to a
-// single chaining value with BOTH levels of work batched through hash_many:
-// chunks across SIMD lanes, and parent nodes across SIMD lanes too. This is
-// what closes the gap to hand-tuned implementations: with parents compressed
-// one at a time (scalar), a binary tree spends ~1 scalar block per chunk on
-// interior nodes, a measured ~1.5x drag at AVX2 chunk speeds.
+// single chaining value. Both levels of work go through hash_many, chunks
+// across SIMD lanes and parent nodes across SIMD lanes too.
+//
+// Batching the parents is what closes the gap to hand-tuned
+// implementations. Compressed one at a time, a binary tree spends about one
+// scalar block per chunk on interior nodes, a measured 1.5x drag at AVX2
+// chunk speeds.
 //
 // Everything here is allocation-free. The recursion holds one
 // 4*max_simd_degree CV buffer per level (2 KiB while a 16-wide kernel is
@@ -136,14 +138,16 @@ inline void compress_subtree_to_cv_recursive(
   }
 }
 
-// The same reduction, folding as it goes instead of holding the tree: one
-// group of 2*simd_degree chunks at a time through hash_many, reduced to one
-// CV by wide parent passes, then merged into a binary-counter stack (the
-// shape hasher::push_cv uses, src/blake3pp.cpp). Parents stay batched across
-// lanes inside a group; only the one parent that joins a group to the stack
-// is compressed alone, once per 2*simd_degree chunks. The working set is two
-// group buffers plus the stack, so it does not grow with the subtree's
-// depth, where the recursion above costs one buffer per level.
+// The same reduction, folding as it goes instead of holding the tree. One
+// group of 2*simd_degree chunks goes through hash_many at a time, is reduced
+// to one CV by wide parent passes, then merges into a binary-counter stack
+// (the shape hasher::push_cv uses, src/blake3pp.cpp).
+//
+// Parents stay batched across lanes inside a group. Only the one parent that
+// joins a group to the stack is compressed alone, once per 2*simd_degree
+// chunks. The working set is two group buffers plus the stack, so it does
+// not grow with the subtree's depth, where the recursion above costs one
+// buffer per level.
 //
 // MaxStack bounds the stack in CVs and so the subtree this can reduce:
 // log2(num_chunks / group) + 1 entries are needed, 54 covering the largest

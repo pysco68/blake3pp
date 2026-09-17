@@ -114,10 +114,11 @@ const sve_state& sve_probe() noexcept {
 
 }  // namespace
 
-// Exact-match on the runtime VL: vector-length-specific code is only
-// guaranteed on hardware whose VL equals the compiled -msve-vector-bits
-// (GCC and Arm both document exact-match only), so a 256-bit kernel on a
-// 512-bit machine is not a degraded option: it is not an option at all.
+// Exact-match on the runtime VL. Vector-length-specific code is only
+// guaranteed on hardware whose VL equals the compiled -msve-vector-bits,
+// which GCC and Arm both document as exact-match only. A 256-bit kernel on
+// a 512-bit machine is therefore not an option at all, degraded or
+// otherwise.
 bool platform_cpu_supports(arch a) noexcept {
   if (a == arch::neon) {
     return true;

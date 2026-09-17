@@ -24,22 +24,25 @@
 //    read runs under a scoped SIGILL guard: the instruction that
 //    would have crashed IS the classifier.
 //
-// The trap-guarded rungs (the vsetvli unit probe on the SG2042 shape
-// and the vlenb classifier on pre-hwprobe kernels) do NOT run during
-// default detection: swapping the SIGILL disposition, however briefly,
-// is a process-global side effect, and the library never does that as
-// a side effect of hashing. Default detection records that one of
-// those shapes is present and conservatively claims nothing (scalar).
-// blake3pp::run_trap_probes() is the explicit opt-in: it runs the
-// guarded rungs once and upgrades the detection state. The shipped
-// tools call it at startup; they own their process.
+// The trap-guarded rungs do NOT run during default detection. Those are
+// the vsetvli unit probe on the SG2042 shape and the vlenb classifier on
+// pre-hwprobe kernels. Swapping the SIGILL disposition, however briefly,
+// is a process-global side effect, and the library never does that as a
+// side effect of hashing.
 //
-// Never parse /proc/cpuinfo: old vendor kernels print a bare "v" for
+// Default detection records that one of those shapes is present and
+// conservatively claims nothing, so scalar.
+// blake3pp::run_trap_probes() is the explicit opt-in: it runs the guarded
+// rungs once and upgrades the detection state. The shipped tools call it
+// at startup, because they own their process.
+//
+// Never parse /proc/cpuinfo. Old vendor kernels print a bare "v" for
 // 0.7.1, and every fact the detection needs is available through auxv,
-// hwprobe, or the guarded read. The BLAKE3PP_ASSUME_XTHEADVECTOR=1 env
-// hook exists for emulator testing (T-Head's qemu fork predates the
-// hwprobe key, and qemu-user does not model the vlenb trap) and is
-// honored for arch::xthead only.
+// hwprobe, or the guarded read.
+//
+// The BLAKE3PP_ASSUME_XTHEADVECTOR=1 env hook exists for emulator testing,
+// because T-Head's qemu fork predates the hwprobe key and qemu-user does
+// not model the vlenb trap. It is honored for arch::xthead only.
 //
 // Zvbb has no single-letter HWCAP bit; the hwprobe IMA_EXT_0 key
 // carries it, so on pre-hwprobe kernels it reads as "absent". The
@@ -87,14 +90,16 @@
 #endif
 
 #if defined(BLAKE3PP_TEST_PROBE_SHAPES) && defined(BLAKE3PP_RISCV64_LINUX)
-// Test build only (tests/riscv_probe_shapes.cpp compiles this TU with the
-// define): the kernel's answers, HWCAP and hwprobe, come from a machine
+// Test build only: tests/riscv_probe_shapes.cpp compiles this TU with the
+// define. The kernel's answers, HWCAP and hwprobe, then come from a machine
 // description instead of the syscalls, so every rung of the ladder below
-// runs against a shape qemu-user cannot present (it reports no vendor id
-// and never lacks hwprobe). The guarded probes still execute the real
-// instructions; force_trap swaps in an illegal one so the SIGILL guard's
-// unwind runs too (qemu-user executes vector instructions whatever the
-// CPU model says). The shipped library never sees any of this.
+// runs against a shape qemu-user cannot present. qemu-user reports no
+// vendor id and never lacks hwprobe.
+//
+// The guarded probes still execute the real instructions. force_trap swaps
+// in an illegal one so the SIGILL guard's unwind runs too, since qemu-user
+// executes vector instructions whatever the CPU model says. The shipped
+// library never sees any of this.
 namespace blake3pp::detail::test {
 machine g_machine{};
 void set_machine(const machine& m) noexcept { g_machine = m; }
@@ -316,12 +321,14 @@ const vec_state& base_probe() noexcept {
       } else if (!hwcap_v &&
                  hwprobe_one(RISCV_HWPROBE_KEY_MVENDORID, &vendor) == 0 &&
                  vendor == BLAKE3PP_MVENDORID_THEAD) {
-        // Rung 2.5 SHAPE, the SG2042 6.6-pioneer: hwprobe exists but
+        // Rung 2.5 SHAPE, the SG2042 6.6-pioneer. hwprobe exists but
         // predates the vendor key, and the kernel advertises no V
-        // ANYWHERE (no hwcap bit, no IMA_V). The vendor patch may
-        // still be enabling and context-switching the T-Head vector
-        // unit; only the guarded vsetvli can settle that (it traps iff
-        // the unit is off), and that probe waits for the opt-in.
+        // ANYWHERE: no hwcap bit, no IMA_V.
+        //
+        // The vendor patch may still be enabling and context-switching
+        // the T-Head vector unit. Only the guarded vsetvli can settle
+        // that, since it traps iff the unit is off, and that probe waits
+        // for the opt-in.
         st.pending_vendor_unit = true;
       }
       // Any other contradiction: claim nothing rather than execute a

@@ -114,12 +114,14 @@ constexpr bool prefer_byte_rot() noexcept {
 #endif
 }
 
-// Compile-time-amount rotate for the wide word: a single byte shuffle for
-// the 16- and 8-bit amounts where that is the better spelling (above), then
-// the aarch64 shl+sri pair, then the generic shift-or.
-// W is a defaulted template parameter (not read directly off u32v) so the
-// discarded constexpr branches stay dependent; non-dependent constructs in
-// a discarded branch are still instantiated.
+// Compile-time-amount rotate for the wide word, in preference order: a
+// single byte shuffle for the 16- and 8-bit amounts where that is the
+// better spelling (above), then the aarch64 shl+sri pair, then the generic
+// shift-or.
+//
+// W is a defaulted template parameter rather than something read directly
+// off u32v, so that the discarded constexpr branches stay dependent.
+// Non-dependent constructs in a discarded branch are still instantiated.
 template <int N, std::size_t W = u32v::width>
 BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
   // The shift-or spelling three providers fall back to is undefined at 0

@@ -40,12 +40,14 @@ inline constexpr std::uint32_t block_len = 64;
 inline constexpr std::size_t chunk_len = 1024;
 inline constexpr std::size_t out_len = 32;
 
-// Upper bound on any variant's simd_degree in THIS build (AVX-512: 16 u32
-// lanes); sizes the caller-side staging buffers for hash_many batches, and
-// with them the subtree recursion's per-level buffers (core/subtree.hpp).
+// Upper bound on any variant's simd_degree in THIS build, 16 u32 lanes for
+// AVX-512. It sizes the caller-side staging buffers for hash_many batches,
+// and with them the subtree recursion's per-level buffers
+// (core/subtree.hpp).
+//
 // The build system defines it from BLAKE3PP_MAX_SIMD_DEGREE on
 // blake3pp::features, which the kernel objects link and the library
-// propagates, so every TU in a build agrees on the value; a target whose
+// propagates, so every TU in a build agrees on the value. A target whose
 // widest kernel is narrower lowers it and pays smaller buffers, and each
 // kernel TU static_asserts its own degree against it. Not an inline
 // variable: with internal linkage each TU owns its copy, and the code
