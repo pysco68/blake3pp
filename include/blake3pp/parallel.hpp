@@ -3,21 +3,25 @@
 /// @file
 /// Parallel BLAKE3 over the sender/receiver model.
 ///
-/// BLAKE3's binary Merkle tree makes the parallel decomposition exact, not
-/// heuristic: any power-of-2, position-aligned run of chunks reduces to
-/// one chaining value independently of everything else. So the engine
-/// partitions the input into equal such subtrees, which the scheduler's
-/// execution agents pull from a shared counter until none are left (a
-/// slow agent takes fewer, rather than holding up the join), then absorbs
-/// the CVs in order through the hasher's CV-stack discipline and finishes
-/// the tail sequentially. The merge work after the parallel phase is
-/// O(parts) scalar compressions, which is noise.
+/// BLAKE3's binary Merkle tree makes the parallel decomposition exact
+/// rather than heuristic. Any power-of-2, position-aligned run of chunks
+/// reduces to one chaining value independently of everything else, so the
+/// digest does not depend on how the work was divided.
 ///
-/// The provider is a build-time choice (BLAKE3PP_EXECUTION_PROVIDER):
+/// The engine partitions the input into equal such subtrees. The
+/// scheduler's execution agents pull them from a shared counter until none
+/// are left, which means a slow agent takes fewer instead of holding up
+/// the join. The chaining values are then absorbed in order through the
+/// hasher's CV-stack discipline, and the tail finishes sequentially. The
+/// merge work after the parallel phase is O(parts) scalar compressions,
+/// which is noise.
+///
+/// The provider is a build-time choice, BLAKE3PP_EXECUTION_PROVIDER:
 /// std::execution where the standard library ships it, beman.execution as
 /// the conformance-first polyfill, NVIDIA stdexec as the performance
-/// workhorse (same source, same story as the simd providers). No heap
-/// allocations in this header: the CV table lives on the caller's stack
+/// workhorse. Same source and same story as the simd providers.
+///
+/// Nothing here touches the heap. The CV table lives on the caller's stack
 /// and sender operation states live inside sync_wait's frame.
 
 #include <algorithm>
@@ -163,46 +167,27 @@ void stack_budget_below_two_parts();
 /// blake3pp::hash<blake3pp::stack_budget{1024}>(input, sched);   // 32 parts
 /// @endcode
 ///
-/// The input is split into at most parts() parts, whatever its size, and
-/// each part's 32-byte chaining value sits in a table on the calling
-/// thread's stack.
+/// The input is split into at most parts() parts whatever its size, and
+/// each part's 32-byte chaining value sits in that table. The default is
+/// 32 KiB, which is 1024 parts. A budget that is not a multiple of 32
+/// bytes, or that holds fewer than two parts, does not compile.
 ///
-/// Agents pull parts from a shared counter, so a slow agent takes fewer
-/// rather than holding up the join, and more parts balance more finely. A
-/// smaller budget splits the input into fewer, larger parts, which suits a
-/// machine with few cores.
-///
-/// A budget that is not a multiple of 32 bytes, or that holds fewer than
-/// two parts, does not compile. There is no upper limit. The stack a
-/// calling thread has is not known where this header is compiled: the
-/// platform, the linker, the thread's creator or the application's
-/// configuration sets it. Code that knows its own thread checks the budget
-/// against that at compile time, leaving room for its own frames:
+/// There is no upper limit, because the stack a calling thread has is not
+/// known where this header is compiled. Code that knows its own thread
+/// checks the budget against it:
 ///
 /// @code
 /// constexpr blake3pp::stack_budget budget{1024};
 /// static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
 /// @endcode
 ///
-/// The budget covers the part table alone. Each part is reduced on the agent
-/// that took it, by a recursion holding one chaining-value buffer per level
-/// (2 KiB while a 16-wide kernel is compiled in: the buffer is sized for
-/// the widest compiled variant, not the running one), as deep as halving
-/// the part takes to reach twice the running variant's degree in chunks.
+/// @warning The budget covers this table alone. Lowering it makes each part
+/// larger, which makes the per-agent reduction deeper, so it moves stack
+/// from the caller to the agents rather than saving any. Nothing checks an
+/// agent thread's stack at run time.
 ///
-/// Three consequences follow, none of them checked at run time:
-///   - The budget moves stack, it does not save it. Lowering it shrinks
-///     the caller's table and enlarges every agent's frame, because parts
-///     get bigger and the reduction recurses deeper.
-///   - Agent threads have to be sized for that frame. The checks here are
-///     consteval and catch a malformed budget, not a thread too small to
-///     run one; overflowing an agent's stack is a crash, not an error.
-///   - A budget yielding fewer parts than the scheduler has agents leaves
-///     agents idle, so throughput can fall before stack does.
-///
-/// BLAKE3PP_SUBTREE_FOLD removes the depth term altogether, at 32 bytes per
-/// level, which makes an agent's stack independent of the input size.
-/// docs/freestanding.md gives the measured frames and a worked case.
+/// @see docs/api.md for what the knob trades away, and
+/// docs/freestanding.md for the measured frames and a worked case.
 struct stack_budget {
   /// The stack one part's chaining value takes.
   static constexpr std::size_t bytes_per_part = 32;
@@ -502,14 +487,20 @@ struct parallel_hasher_options {
 /// same `update()`, `finalize()` and `reset()` interface as hasher, and
 /// fans the subtree hashing out over a scheduler internally.
 ///
-/// Input accumulates into an aligned window; a full window is fanned out
-/// as soon as one more byte arrives, the "one byte in reserve" that keeps
-/// BLAKE3's final chunk with the hasher for ROOT finalization. All
-/// alignment and final-chunk discipline lives here, not with the caller,
-/// and the digest equals the sequential one. The window buffer is the
-/// type's one allocation, made at construction. finalize() is
-/// non-destructive, like hasher's. Not thread-safe; the scheduler's
-/// workers are used only inside update().
+/// What a caller can rely on:
+///   - The digest equals the sequential one.
+///   - All alignment and final-chunk discipline lives here, not with the
+///     caller.
+///   - The window buffer is the type's one allocation, made at
+///     construction.
+///   - finalize() is non-destructive, like hasher's.
+///   - Not thread-safe. The scheduler's workers are used only inside
+///     update().
+///
+/// Input accumulates into an aligned window, and a full window is fanned
+/// out as soon as one more byte arrives. That is the "one byte in reserve"
+/// which keeps BLAKE3's final chunk with the hasher for ROOT
+/// finalization.
 /// @tparam Scheduler  Any std::execution-style scheduler, held by value.
 /// @tparam Budget     The stack a window's part table may take; see
 ///                    stack_budget.

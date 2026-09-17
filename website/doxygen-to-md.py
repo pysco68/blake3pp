@@ -206,13 +206,16 @@ def signature(m) -> str:
     if tpl is not None:
         args = ", ".join(cpp(text_of(p)) for p in tpl.findall("param"))
         prefix = f"template <{args}>\n"
-    # Doxygen keeps these out of <type>, but they are part of the contract
-    # a caller reads. `inline` is not: it is on almost every header entity.
+    typ = cpp(text_of(m.find("type")))
+    # Doxygen usually keeps these out of <type>, but they are part of the
+    # contract a caller reads, so they are added back. Usually: it does put
+    # some of them there, and then adding one spells it twice. `inline` is
+    # never added, being on almost every header entity.
+    spelled = set(typ.split())
     quals = "".join(f"{q} " for q in ("static", "explicit", "constexpr", "consteval")
-                    if m.get(q) == "yes")
+                    if m.get(q) == "yes" and q not in spelled)
     if m.get("nodiscard") == "yes":
         quals = "[[nodiscard]] " + quals
-    typ = cpp(text_of(m.find("type")))
     name = squeeze(text_of(m.find("name")))
     args = cpp(text_of(m.find("argsstring")))
     kind = m.get("kind")
