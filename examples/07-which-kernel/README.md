@@ -4,6 +4,8 @@ blake3pp is a fat binary. Every SIMD variant the target platform
 supports is compiled in, and which one runs is decided when the program
 starts.
 
+**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/07-which-kernel/)** -- it runs there, with no setup.
+
 Two questions, two different answers:
 
 ```cpp

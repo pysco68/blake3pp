@@ -3,6 +3,8 @@
 The shortest path from bytes to a digest, and what you can do with the
 digest once you have it.
 
+**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/01-hello-hash/)** -- it runs there, with no setup.
+
 ```cpp
 blake3pp::digest d = blake3pp::hash("hello world");
 std::cout << d.to_hex() << '\n';

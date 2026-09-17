@@ -8,8 +8,9 @@
 #include <vector>
 
 int main() {
-  // 256 MiB of something to hash.
-  std::vector<std::byte> buffer(256u << 20);
+  // 32 MiB of something to hash. Small enough that this runs inside a
+  // sandbox, large enough that spreading it over cores shows.
+  std::vector<std::byte> buffer(32u << 20);
   for (std::size_t i = 0; i < buffer.size(); ++i) {
     buffer[i] = static_cast<std::byte>(i);
   }
@@ -51,7 +52,7 @@ int main() {
   for (int i = 0; i < 4; ++i) {
     ph.update(buffer);
   }
-  std::cout << "\n1 GiB through parallel_hasher\n  " << ph.finalize().to_hex()
+  std::cout << "\n128 MiB through parallel_hasher\n  " << ph.finalize().to_hex()
             << '\n';
 
   // Each part's 32-byte chaining value waits on the calling thread's

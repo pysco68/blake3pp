@@ -1,0 +1,34 @@
+{
+  "01-hello-hash": {
+    "sha": "7526041ce1c87f881d4344ae524f72b8ad87f28d081b6cb42ef82639464d2c59",
+    "url": "https://godbolt.org/z/Mc5GcKKzM"
+  },
+  "02-incremental": {
+    "sha": "4fb1d37654273feb46ccd28e2bcb71d504eb80075ca71c5c3005c8ddda589dad",
+    "url": "https://godbolt.org/z/7c85cdqEY"
+  },
+  "03-keyed-and-derive-key": {
+    "sha": "f5e15033ef2edaa2145f124762f59dad186f1edbd1b18ddf5d30cd0e5d59ae65",
+    "url": "https://godbolt.org/z/8MfvKqPv5"
+  },
+  "04-extended-output": {
+    "sha": "172d08ecff46fa2711320fc902dcbdd6f58cdc861dd146079ae6cf8b8fb328c7",
+    "url": "https://godbolt.org/z/58v8roMvz"
+  },
+  "05-hash-a-file": {
+    "sha": "d40d3de025437d198df6d83142ba61d5e439fcb60bf617472a8a97428ce3951e",
+    "url": "https://godbolt.org/z/vYxTjnTzE"
+  },
+  "06-multi-core": {
+    "sha": "c7451f92b657a4aec1b3692b319cfd5666b755195809ab63ed0c76c5e09a632e",
+    "url": "https://godbolt.org/z/bcser5vfE"
+  },
+  "07-which-kernel": {
+    "sha": "aae70460b95a12c92bae5a6258e1fa5c3c9f204b54a38ae496c4d808ff6dbcc6",
+    "url": "https://godbolt.org/z/heWvnj4ac"
+  },
+  "root": {
+    "sha": "276d6013711f29631dc324d4ebe5f2f1db8b8959bf1d69eff2578c82aca4def1",
+    "url": "https://godbolt.org/z/6jcbKohTq"
+  }
+}

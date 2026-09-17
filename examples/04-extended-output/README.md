@@ -4,6 +4,8 @@ BLAKE3 is natively an extendable-output function. The 32-byte digest is
 the first 32 bytes of an unbounded stream, and the rest of it costs no
 more to reach.
 
+**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/04-extended-output/)** -- it runs there, with no setup.
+
 ## Asking for a width
 
 ```cpp

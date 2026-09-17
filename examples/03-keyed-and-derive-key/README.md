@@ -2,6 +2,8 @@
 
 BLAKE3 has two secret-key modes built into the same function.
 
+**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/03-keyed-and-derive-key/)** -- it runs there, with no setup.
+
 ## Keyed hashing: the MAC
 
 ```cpp

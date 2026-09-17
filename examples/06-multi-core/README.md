@@ -5,6 +5,8 @@ auto sched = blake3pp::get_parallel_scheduler();
 blake3pp::digest d = blake3pp::hash(big_buffer, sched);
 ```
 
+**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/06-multi-core/)** -- it runs there, with no setup.
+
 Adding cores means adding a scheduler argument. Nothing else about the
 call changes, and the digest does not change either.
 
@@ -65,7 +67,7 @@ cmake --build build --target blake3pp_example_06_multi_core
 ./build/examples/blake3pp_example_06_multi_core
 ```
 
-It hashes 256 MiB both ways and prints the rate of each, so the output
+It hashes 32 MiB both ways and prints the rate of each, so the output
 depends on the machine.
 
 ## Next

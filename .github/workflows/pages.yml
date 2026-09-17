@@ -22,7 +22,7 @@ on:
       - 'tools/build-site.sh'
       - 'tools/doxygen-to-md.py'
       - 'tools/Doxyfile'
-      - 'tools/make-try-page.py'
+      - 'tools/build-try.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 

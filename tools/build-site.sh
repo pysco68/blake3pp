@@ -98,31 +98,21 @@ cat > "${out}/index.html" <<HTML
 <p>Taking you to <a href="latest/">the documentation</a>.</p>
 HTML
 
-# The Compiler Explorer link. It embeds the source it was made from and
-# their compile nodes have no network, so it is regenerated from this
-# checkout and lives at the site root: one link, always the newest.
-tmp=$(mktemp -d)
+# The Compiler Explorer pages: one per example, plus the demo at the root
+# that the README has pointed at since before the examples existed. Each
+# embeds its own snapshot, because Compiler Explorer's compile nodes have
+# no network and cannot fetch this repository.
 echo "-- amalgamating"
 python3 tools/amalgamate.py -o examples/blake3pp-single-file.cpp
-python3 tools/amalgamate.py --no-demo -o "${tmp}/lib.cpp" > /dev/null
-cat "${tmp}/lib.cpp" examples/parallel-demo.cpp > "${tmp}/full.cpp"
 
+echo "-- Compiler Explorer pages"
 if [ "${link}" = 1 ]; then
-  echo "-- shortening on godbolt.org"
-  url=$(python3 tools/godbolt-link.py "${tmp}/full.cpp" --lib beman_execution:trunk)
+  python3 tools/build-try.py --output site/try
 else
-  # Offline preview: keep whatever the checked-in page already points at.
-  url=$(sed -n 's/.*rel="canonical" href="\([^"]*\)".*/\1/p' site/try/index.html 2>/dev/null || true)
-  url=${url:-https://godbolt.org/}
-  echo "-- offline: keeping ${url}"
+  python3 tools/build-try.py --output site/try --no-link
 fi
-rm -rf "${tmp}"
-
-python3 tools/make-try-page.py --url "${url}" \
-  --commit "$(git -C "${root}" rev-parse --short HEAD 2>/dev/null || echo unknown)" \
-  --output site/try/index.html
-mkdir -p "${out}/try"
-cp site/try/index.html "${out}/try/index.html"
+cp -r site/try "${out}/try"
+rm -f "${out}/try/links.json"
 
 echo "-- built ${out}"
 if [ "${serve}" = 1 ]; then
