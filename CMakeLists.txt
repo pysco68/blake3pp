@@ -372,6 +372,13 @@ if(BLAKE3PP_BUILD_BENCH AND BLAKE3PP_HAS_FORMAT)
   add_subdirectory(bench)
 endif()
 
+# One directory per example, each with a main() and a README. They also
+# run as tests, which keeps them honest about the API they show.
+option(BLAKE3PP_BUILD_EXAMPLES "Build the examples in examples/" ${PROJECT_IS_TOP_LEVEL})
+if(BLAKE3PP_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
+
 # The browser module: the library behind embind as one ES module plus its
 # .wasm, the deliverable of the wasm build that is not a node program.
 option(BLAKE3PP_BUILD_WEB "Build the browser module (Emscripten only)" ${PROJECT_IS_TOP_LEVEL})
