@@ -15,9 +15,10 @@ namespace {
 
 // doctest stringifies a `const char*` as its ADDRESS, not its text, so
 // arch names must reach CAPTURE/MESSAGE as a string_view to be readable.
-// blake3pp::to_string(arch) deliberately returns const char*: generic code
-// (CLI11's default-value printer, found by ADL) needs implicit conversion
-// to std::string, which std::string_view does not provide.
+//
+// blake3pp::to_string(arch) returns const char* on purpose. Generic code,
+// such as CLI11's default-value printer found by ADL, needs implicit
+// conversion to std::string, which std::string_view does not provide.
 [[nodiscard]] std::string_view arch_name(blake3pp::arch a) noexcept {
   return blake3pp::to_string(a);
 }
@@ -98,8 +99,9 @@ TEST_CASE("all modes match the full 131-byte vectors on every available arch") {
   }
 }
 
-// The official vectors carry 131 bytes of extended output per case; with
-// XOF we can verify every byte of every mode, not just the 32-byte prefix.
+// The official vectors carry 131 bytes of extended output per case, so XOF
+// lets these tests check every byte of every mode rather than the 32-byte
+// prefix alone.
 TEST_CASE("extended output matches the full 131-byte vectors, all modes") {
   constexpr std::string_view key_str = blake3pp::testvec::key;
   const auto key =

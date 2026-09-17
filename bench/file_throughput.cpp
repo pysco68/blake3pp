@@ -135,11 +135,12 @@ double best_cold_seconds(int reps, bool cold, F&& fn) {
 }
 
 // --threads resolved to a scheduler: an owned pool of exactly that size
-// under stdexec, the process-wide scheduler elsewhere. The option exists
-// as a DIAGNOSTIC for the sync-tier oversubscription question (the pread
-// fallback's reader is an implicit extra thread the pool doesn't know
-// about, i.e. 11 runnable threads on a 10-core phone): sweep N-1/N/N+1 to
-// separate reader starvation from other shortfalls.
+// under stdexec, the process-wide scheduler elsewhere.
+//
+// The option exists as a DIAGNOSTIC for the sync-tier oversubscription
+// question. The pread fallback's reader is an implicit extra thread the
+// pool does not know about, so 11 runnable threads on a 10-core phone.
+// Sweep N-1/N/N+1 to separate reader starvation from other shortfalls.
 class engine_threads {
  public:
   explicit engine_threads(unsigned threads)
@@ -340,8 +341,8 @@ int main(int argc, char** argv) {
   b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/false);
 
   // The control group: the identical pipeline delivering windows that are
-  // simply released unread. This is the device ceiling as seen through
-  // this backend/window/qd; every hash row below is a fraction of it.
+  // released unread. This is the device ceiling as seen through this
+  // backend, window and qd, and every hash row below is a fraction of it.
   const double raw_s = best_cold_seconds(reps, cold, [&] {
     blake3pp::detail::file_reader r(
         path.c_str(),

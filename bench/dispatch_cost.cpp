@@ -15,14 +15,18 @@
 // loop into something else (see bench/CMakeLists.txt): guessing the
 // indirect call's target, and cloning the entry for constant arguments.
 //
-// Measured on messages of one block (one call per 64 bytes, the worst
-// case), one chunk (hash_many over 2 x simd_degree chunks per call, the
-// library's leaf batch) and 64 chunks per call, pinned to one core,
-// with hardware counters where Linux offers them: cycles, instructions,
-// branches and branch-misses per message, next to the wall clock. The
-// instruction delta between dispatched and direct is the exact size of
-// the dispatch mechanism; the branch-miss column shows whether the
-// indirect call is predicted.
+// Measured on three message sizes, pinned to one core:
+//
+//   - One block, so one call per 64 bytes, the worst case.
+//   - One chunk, so hash_many over 2 x simd_degree chunks per call, which
+//     is the library's leaf batch.
+//   - 64 chunks per call.
+//
+// Hardware counters are reported where Linux offers them: cycles,
+// instructions, branches and branch-misses per message, next to the wall
+// clock. The instruction delta between dispatched and direct is the exact
+// size of the dispatch mechanism, and the branch-miss column shows whether
+// the indirect call is predicted.
 #include <algorithm>
 #include <array>
 #include <atomic>

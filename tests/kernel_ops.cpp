@@ -22,9 +22,10 @@ namespace {
 
 // doctest stringifies a `const char*` as its ADDRESS, not its text, so
 // arch names must reach CAPTURE/MESSAGE as a string_view to be readable.
-// blake3pp::to_string(arch) deliberately returns const char*: generic code
-// (CLI11's default-value printer, found by ADL) needs implicit conversion
-// to std::string, which std::string_view does not provide.
+//
+// blake3pp::to_string(arch) returns const char* on purpose. Generic code,
+// such as CLI11's default-value printer found by ADL, needs implicit
+// conversion to std::string, which std::string_view does not provide.
 [[nodiscard]] std::string_view arch_name(blake3pp::arch a) noexcept {
   return blake3pp::to_string(a);
 }
@@ -258,11 +259,13 @@ TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
   }
   CHECK(blake3pp::transpose16_from_string("bogus") == std::nullopt);
   blake3pp::set_transpose16(saved);
-  // The tuner applies and reports a strategy (a no-op fallback without a
-  // width-16 kernel); either way its result must be the active one after.
-  // Tuned for a deliberately tiny input: the postcondition is what is
-  // under test, and the no-argument overload would race a 128 MiB working
-  // set on every AVX-512 machine in the matrix to prove the same thing.
+  // The tuner applies and reports a strategy, falling back to a no-op
+  // without a width-16 kernel. Either way its result must be the active
+  // one afterwards.
+  //
+  // The input is tiny on purpose. The postcondition is what is under test,
+  // and the no-argument overload would race a 128 MiB working set on every
+  // AVX-512 machine in the matrix to prove the same thing.
   const auto picked = blake3pp::tune_transpose16(64u << 10);
   CHECK(blake3pp::active_transpose16() == picked);
   blake3pp::set_transpose16(saved);

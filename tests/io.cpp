@@ -312,8 +312,9 @@ TEST_CASE("io_uring destroy reaps in-flight reads before the ring goes") {
 #endif
 
 // The degradation ladder below io_uring: synchronous backends must produce
-// identical windows. These run rarely in the wild (no-io_uring kernels,
-// seccomp sandboxes), so exercise them deliberately.
+// identical windows. They run rarely in the wild, on kernels without
+// io_uring and in seccomp sandboxes, which is why these tests reach for
+// them explicitly.
 TEST_CASE("reader fallback backends deliver identical data") {
   const auto content = make_input(300 * 1024 + 77);
   const temp_file f(content);

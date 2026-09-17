@@ -1,8 +1,10 @@
-// What the detection ladder costs: the first library call in a fresh
-// process builds the availability table (auxv, hwprobe or CPUID reads,
-// once per compiled variant), later calls read it. This prints those
-// times for the process it runs in; the bundle's dispatch-cost.sh runs
-// it several times, since only a new process pays the first call.
+// What the detection ladder costs. The first library call in a fresh
+// process builds the availability table, reading auxv, hwprobe or CPUID
+// once per compiled variant. Later calls read the table.
+//
+// This prints those times for the process it runs in. The bundle's
+// dispatch-cost.sh runs it several times, since only a new process pays
+// the first call.
 #include <blake3pp/core.hpp>
 #include <blake3pp/dispatch.hpp>
 

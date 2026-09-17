@@ -11,16 +11,20 @@
 // framework-free: pair it with hyperfine when process-level statistics are
 // wanted.
 //
-// The single-thread rows run INTERLEAVED (pass = one rep of every row,
-// start row rotated per pass) rather than row-by-row, and each row prints
-// the CPUs it ran on. Both are scar tissue from the same incident: on a
-// heterogeneous phone (Exynos 2600) the row-by-row order let EAS upmigrate
-// the run onto the prime core over time, so whichever rows ran LAST won a
-// core class, not a comparison: a 21% phantom that looked exactly like a
-// microarchitecture finding. Interleaving makes placement and thermal
-// history symmetric across rows; --pin removes the variable entirely; the
-// per-row CPU report is how a reader of someone else's output can tell
-// which regime they are looking at.
+// The single-thread rows run INTERLEAVED instead of row-by-row: a pass is
+// one rep of every row, with the start row rotated per pass. Each row also
+// prints the CPUs it ran on.
+//
+// Both are scar tissue from one incident. On a heterogeneous phone, an
+// Exynos 2600, the row-by-row order let EAS upmigrate the run onto the
+// prime core over time. Whichever rows ran LAST won a core class, not a
+// comparison, which produced a 21% phantom that looked exactly like a
+// microarchitecture finding.
+//
+// Interleaving makes placement and thermal history symmetric across rows.
+// --pin removes the variable entirely. The per-row CPU report is how a
+// reader of someone else's output can tell which regime they are looking
+// at.
 
 #include <algorithm>
 #include <chrono>
@@ -60,16 +64,19 @@
 #include "kernel/kernel.hpp"
 
 // The reference implementation's kernels, already present in the linked
-// baseline library, wrapped as kernel_ops tables: that plugs them into the
-// blake3pp pipeline (subtree batching, CV stack, parallel engine) through
-// the same seam every portable variant uses, so each reference row differs
-// from its same-ISA blake3pp twin ONLY in the hash_many kernel. Only the
-// flag argument widths differ (the reference narrows them to uint8_t). The
-// comparison rows come from this: the portable C kernel (the scalar row's
-// direct counterpart) and every hand-tuned wide kernel: hand-scheduled
-// AVX2 and AVX-512 assembly on x86-64 (GAS-built under gcc/clang/clang-cl,
-// MASM under MSVC), NEON intrinsics on aarch64 (the reference ships no ARM
-// assembly).
+// baseline library, wrapped as kernel_ops tables. That plugs them into the
+// blake3pp pipeline, meaning subtree batching, the CV stack and the
+// parallel engine, through the same seam every portable variant uses. Each
+// reference row therefore differs from its same-ISA blake3pp twin ONLY in
+// the hash_many kernel. Only the flag argument widths differ, since the
+// reference narrows them to uint8_t.
+//
+// The comparison rows come from this:
+//
+//   - The portable C kernel, the scalar row's direct counterpart.
+//   - Hand-scheduled AVX2 and AVX-512 assembly on x86-64, GAS-built under
+//     gcc/clang/clang-cl and MASM under MSVC.
+//   - NEON intrinsics on aarch64. The reference ships no ARM assembly.
 extern "C" void blake3_hash_many_portable(
     const std::uint8_t* const* inputs, std::size_t num_inputs,
     std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
@@ -141,9 +148,9 @@ void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
 }
 
 // Everything that varies by host architecture, decided once: which wide
-// kernels exist, which of our variants each pairs with, and how the rows
-// read. Narrowest first, so the widest AVAILABLE entry (the ISA the
-// reference's own dispatcher would pick) is the last match, and the one
+// kernels exist, which blake3pp variant each pairs with, and how the rows
+// read. Narrowest first, so the widest AVAILABLE entry is the last match.
+// That is the ISA the reference's own dispatcher would pick, and the one
 // the parallel row below reuses.
 struct asm_kernel {
   blake3pp::arch variant;
@@ -193,8 +200,8 @@ bool stderr_is_tty() {
 // is calibrated for the wrong one.
 //
 // This sweeps the SAME comparison across working-set sizes, and runs each
-// size in both strategy orders: a ranking that flips with size is a regime
-// mismatch, a ranking that flips with ORDER is thermal/frequency drift
+// size in both strategy orders. A ranking that flips with size is a regime
+// mismatch. A ranking that flips with ORDER is thermal or frequency drift
 // contaminating the measurement instead.
 // The width-16 kernel this machine would dispatch to (avx512 on x86,
 // sve512/sve2_512 elsewhere), if any: the t16 dial rows and the sweep race
@@ -494,13 +501,14 @@ int main(int argc, char** argv) {
   }
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
-  // The reference kernels behind the blake3pp kernel_ops seam: identical
+  // The reference kernels behind the blake3pp kernel_ops seam. Identical
   // pipeline, only hash_many swapped, so any difference to the section
-  // above is pure kernel codegen. Row labels match the blake3pp rows they
-  // pair with (portable <-> scalar, neon <-> neon, avx2 <-> avx2, avx512
-  // <-> avx512); always compare a reference row against its same-ISA twin,
-  // never against the end-to-end `reference` row, which picks its own
-  // best ISA.
+  // above is pure kernel codegen.
+  //
+  // Row labels match the blake3pp rows they pair with: portable <->
+  // scalar, neon <-> neon, avx2 <-> avx2, avx512 <-> avx512. Always
+  // compare a reference row against its same-ISA twin, never against the
+  // end-to-end `reference` row, which picks its own best ISA.
   add_section(
       std::format("reference impl. kernels in the blake3pp pipeline "
                   "(single thread, BLAKE3 {})",
@@ -551,11 +559,12 @@ int main(int argc, char** argv) {
   });
 #endif
 
-  // Our own full pipeline, single thread: the discriminator between
-  // "the pool scales badly" and "our pipeline (subtree/CV machinery)
-  // costs more than the raw kernel loop at this width". The reference
-  // e2e row above has had this mirror all along; ours was the blind
-  // spot while chasing the width-16 pool anomaly.
+  // The blake3pp full pipeline on a single thread. It discriminates
+  // between "the pool scales badly" and "the subtree and CV machinery
+  // costs more than the raw kernel loop at this width".
+  //
+  // The reference end-to-end row above has had this mirror all along.
+  // This row was the blind spot while chasing the width-16 pool anomaly.
   add_section("blake3pp end-to-end (single thread)");
   add_row("blake3pp", "", [&] {
     return blake3pp::hash(std::span<const std::byte>{input});

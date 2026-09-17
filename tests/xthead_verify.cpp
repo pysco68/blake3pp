@@ -1,13 +1,14 @@
 // Freestanding correctness harness for the XTheadVector kernel, run under
 // T-Head's Xuantie qemu fork on the c906fdv CPU model.
 //
-// Why freestanding: the fork's th-capable CPU models (c906fdv/c910v/c920)
-// predate the RVA23-flavored scalar ISA that Ubuntu resolute's glibc uses
-// unconditionally, so ANY glibc-linked binary (static or dynamic) dies
-// of SIGILL in libc startup on those models; and the fork's generic
-// xtheadvector=on property path is broken for userland outright. No libc,
-// no problem: _start, two raw syscalls (write, exit), a local memcpy, and
-// the two kernel object files.
+// Why freestanding. The fork's th-capable CPU models, c906fdv, c910v and
+// c920, predate the RVA23-flavored scalar ISA that Ubuntu resolute's glibc
+// uses unconditionally, so ANY glibc-linked binary dies of SIGILL in libc
+// startup on those models, static or dynamic. The fork's generic
+// xtheadvector=on property path is broken for userland outright.
+//
+// No libc, no problem: _start, two raw syscalls (write and exit), a local
+// memcpy, and the two kernel object files.
 //
 // Build (see docker/riscv64-gcc15.Dockerfile for the image; all three TUs
 // with -fno-exceptions -fno-rtti -fno-stack-protector):
@@ -37,9 +38,9 @@
 namespace kern = blake3pp::kern;
 
 namespace blake3pp::kern {
-// Normally defined in dispatch.cpp, which this harness deliberately does
-// not link (it would drag in hosted-libc surface). The scalar kernel reads
-// it once per batch; any valid value works for width 1.
+// Normally defined in dispatch.cpp, which this harness does not link,
+// because that would drag in hosted-libc surface. The scalar kernel reads
+// it once per batch, and any valid value works for width 1.
 std::atomic<transpose16_mode> transpose16_active{transpose16_mode::staging};
 namespace xthead {
 extern const kernel_ops ops;
