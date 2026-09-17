@@ -21,7 +21,7 @@ xsimd is not needed (std::simd is the provider) and neither is stdexec:
 the scheduler comes from beman.execution, which Compiler Explorer already
 installs, and only the caller's own TU includes it.
 
-    tools/amalgamate.py --variant avx2 -o examples/blake3pp-single-file.cpp
+    tools/amalgamate.py -o /tmp/blake3pp-single-file.cpp
 """
 import argparse
 import pathlib
@@ -80,6 +80,64 @@ def inline(rel, seen, variant):
     return INCLUDE.sub(paste, text).replace("BLAKE3PP_ARCH_NS", variant)
 
 
+def strip_comments(text: str) -> str:
+    """Drop C and C++ comments, leaving string literals alone.
+
+    The pasted library is nine thousand lines of a reader's screen, and
+    its comments document a build this file is not: the shipped library
+    has a translation unit per kernel, and this has one. The banner at
+    the top says so, and says it once.
+
+    A block comment becomes as many newlines as it spanned, so a macro
+    continuation cannot swallow the line after it.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        two = text[i:i + 2]
+        if two == "//":
+            j = text.find("\n", i)
+            i = n if j < 0 else j            # the newline itself is kept
+        elif two == "/*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("\n" * text.count("\n", i, j))
+            i = j
+        elif c in "\"'":
+            # A raw string ends at its own delimiter, and anything at all
+            # may appear inside it.
+            if c == '"' and text[max(0, i - 1):i] == "R":
+                k = text.find("(", i)
+                delim = text[i + 1:k]
+                close = ")" + delim + '"'
+                j = text.find(close, k)
+                j = n if j < 0 else j + len(close)
+            else:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] == c:
+                        j += 1
+                        break
+                    j += 1
+            out.append(text[i:j])
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    # Comments leave holes; close them up rather than shipping the gaps.
+    lines = [line.rstrip() for line in "".join(out).split("\n")]
+    tidy, blanks = [], 0
+    for line in lines:
+        blanks = blanks + 1 if not line else 0
+        if blanks < 2:
+            tidy.append(line)
+    return "\n".join(tidy)
+
+
 def version():
     try:
         return subprocess.run(["git", "-C", str(REPO), "describe", "--always", "--dirty"],
@@ -93,10 +151,30 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("--no-demo", action="store_true", help="omit main()")
+    ap.add_argument("--demo-name", default="",
+                    help="what the program at the end of the file is called")
+    ap.add_argument("--keep-comments", action="store_true",
+                    help="leave the library's own comments in place")
     args = ap.parse_args()
 
+    # Whatever ends up at the bottom, the reader has to be told it is
+    # there: everything above it is nine thousand lines of library.
+    demo = args.demo_name or ("" if args.no_demo else "the demo")
+    notice = ""
+    if demo:
+        notice = f"""
+//
+// {'=' * 70}
+//
+//     >>>>>>>>>>   S C R O L L   T O   T H E   B O T T O M   <<<<<<<<<<
+//
+//     The code of {demo} is in main(), at the END of this file.
+//     Everything between here and there is the library, inlined.
+//
+// {'=' * 70}"""
+
     arch_def = (REPO / "include/blake3pp/detail/arch.def").read_text()
-    out = [f"""// blake3pp, amalgamated from {version()} by tools/amalgamate.py.
+    out = [f"""// blake3pp, amalgamated from {version()} by tools/amalgamate.py.{notice}
 //
 // Two kernels: the scalar fallback, and {"BLAKE3PP_AMALGAM_NS"}, built for whatever
 // this compiler was told to target. The shipped library compiles one
@@ -189,9 +267,15 @@ def main():
 #endif  // beman.execution
 """)
 
+    # The banner is the one comment block that survives, and a program
+    # appended at the end keeps its own: it is the part being read.
+    banner, body = out[0], "\n".join(out[1:])
+    if not args.keep_comments:
+        body = strip_comments(body)
+    text = banner + "\n" + body
     if not args.no_demo:
-        out.append((REPO / "tools/amalgam-demo.inc").read_text())
-    pathlib.Path(args.output).write_text("\n".join(out))
+        text += "\n" + (REPO / "tools/amalgam-demo.inc").read_text()
+    pathlib.Path(args.output).write_text(text)
     print(f"{args.output}: {len(pathlib.Path(args.output).read_text().splitlines())} lines")
 
 

@@ -18,7 +18,7 @@ root.
 | `gen-test-vectors.py` | Turn the official BLAKE3 `test_vectors.json` into the C++ header the tests include. |
 | `objscan.py` | Look inside a built object or binary: instruction classes, code-generation quality, and the kernel audit. |
 | `kernel-audit.json` | The rules `objscan.py audit` enforces. |
-| `amalgamate.py` | Concatenate the library into one translation unit, for Compiler Explorer and single-file drops. |
+| `amalgamate.py` | Concatenate the library into one translation unit, for Compiler Explorer and single-file drops. Its comments are stripped; the banner it writes is the one that stays. |
 | `godbolt-link.py` | Shorten a source file into a Compiler Explorer link. |
 | `build-try.py` | Write the "try it on Compiler Explorer" page for each example, minting a link when its source changed. |
 | `try-links.json` | The link cache behind that: one entry per example per version. |
@@ -150,7 +150,10 @@ built from that example, and the READMEs point at the page rather than at
 the link.
 
 `build-try.py` writes those pages. For each example it amalgamates the
-library, appends the example, and hashes the result. A link is minted
+library, appends the example, and hashes the result. The library goes in
+with its comments stripped, because they describe a build this file is
+not: the banner at the top says so once, and tells the reader to scroll
+past the library to the program at the end, which keeps its own comments. A link is minted
 only when that hash differs from the one recorded in
 `tools/try-links.json`, so rebuilding costs no requests, and `--no-link`
 never contacts godbolt.org at all. The hash ignores the version stamp the

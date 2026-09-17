@@ -36,6 +36,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 # README has pointed there since before the examples existed.
 ROOT = {
     "slug": "",
+    "demo": "parallel-demo",
     "title": "blake3pp, in your browser",
     "source": "examples/parallel-demo.cpp",
     "libs": ["beman_execution:trunk"],
@@ -132,6 +133,7 @@ def targets():
         title, blurb = summarise(readme.read_text(), d.name)
         out.append({
             "slug": d.name,
+            "demo": d.name,
             "title": title,
             "source": str(main.relative_to(REPO)),
             "libs": ["beman_execution:trunk"] if d.name == NEEDS_EXECUTION else [],
@@ -168,22 +170,23 @@ def main():
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text())
 
-    # The library half is the same for every example; build it once.
     scratch = pathlib.Path(tempfile.mkdtemp())
-    lib = scratch / "lib.cpp"
-    subprocess.run([sys.executable, str(REPO / "tools/amalgamate.py"),
-                    "--no-demo", "-o", str(lib)],
-                   check=True, capture_output=True)
-    library = lib.read_text()
-
     stamp, today = commit(), datetime.date.today().isoformat()
     urls = {}
     for t in targets():
         # The example's own includes of the library are dropped: it is
         # already above them in the file.
+        # The banner tells the reader to scroll past the library to the
+        # program at the end, and names it, so the library is generated
+        # once per example rather than shared between them.
+        lib = scratch / "lib.cpp"
+        subprocess.run([sys.executable, str(REPO / "tools/amalgamate.py"),
+                        "--no-demo", "--demo-name", t["demo"], "-o", str(lib)],
+                       check=True, capture_output=True)
+
         body = (REPO / t["source"]).read_text()
         body = re.sub(r"^#include <blake3pp/[^>]+>\n", "", body, flags=re.M)
-        source = library + "\n" + body
+        source = lib.read_text() + "\n" + body
         sha = fingerprint(source)
 
         key = "/".join(filter(None, (a.namespace, t["slug"] or "root")))
