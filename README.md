@@ -137,7 +137,7 @@ All of this, rendered and searchable, with a version for every release:
 | | |
 |---|---|
 | [Examples](examples/) | seven standalone programs, one per aspect of the library |
-| [The API](docs/api.md) | the whole public surface with its examples: hashing, keyed and derive-key, extended output, files, cores, variants |
+| [The API](docs/api.md) | the guide across the library: what you compute, how you feed it, what runs it, what it costs |
 | [Architectures and kernels](docs/architectures.md) | details about every kernel a build carries and why the WASM build is an edge case |
 | [Command-line tools](docs/tools.md) | `blake3ppsum` and `blake3ppgen` |
 | [Integration](docs/integration.md) | vendoring, installing, and `find_package` |

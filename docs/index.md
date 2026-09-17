@@ -87,8 +87,8 @@ BLAKE3 is more than a 32-byte digest, and all of it is available:
 | | |
 |---|---|
 | [Examples](examples/index.md) | seven standalone programs, one per subject. Start here if you learn by reading code |
-| [The API](api.md) | the guided tour of the whole public surface, with examples |
-| [Reference](reference/index.md) | every declaration, generated from the headers' own doc comments |
+| [The API](api.md) | the guide across the library: what you compute, how you feed it, what runs it, what it costs |
+| [Reference](reference/index.md) | every declaration on its own terms, generated from the headers' doc comments |
 | [Architectures and kernels](architectures.md) | which SIMD variants a build carries, and how dispatch picks one |
 | [Command-line tools](tools.md) | `blake3ppsum` and `blake3ppgen` |
 | [Building](building.md) | presets, toolchain images, and the kernel switches |
