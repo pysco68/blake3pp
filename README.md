@@ -34,12 +34,15 @@ That call opens the file with direct I/O, keeps several windows in flight,
 hashes with the widest kernel the processor turns out to have and spreads
 the work over all cores the system has.
 
-The whole specification is here, not just the digest: plain hashing,
-keyed hashing for a MAC or PRF, and `derive_key` for context-separated
-subkeys; 32 bytes of output or an extended stream of any length, seekable
-in constant time; one shot or incremental; sequential or over a
-scheduler. Files are a first-class input rather than a loop the caller
-writes.
+The whole specification is here, not just the digest:
+
+- **Three modes.** Plain hashing, keyed hashing for a MAC or PRF, and
+  `derive_key` for context-separated subkeys.
+- **Output of any length.** 32 bytes, or an extended stream seekable in
+  constant time.
+- **One shot or incremental**, and **sequential or over a scheduler**.
+
+Files are a first-class input, not a loop you write.
 
 The binary release contains two [command-line tools](docs/tools.md) built on the library: `blake3ppsum` and `blake3ppgen`.
 
