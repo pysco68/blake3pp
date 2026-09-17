@@ -50,10 +50,10 @@ XML_OUTPUT = ${PWD}/build/doxygen/xml
 DOXY
 python3 tools/doxygen-to-md.py --xml build/doxygen/xml --out "${src}/reference"
 
-# The README is the landing page: one source of truth. On GitHub its links
-# reach down into docs/ and the documents' links reach back up to it; on
-# the site both live in one directory.
-echo "-- landing page from README.md"
+# docs/index.md is the site's landing page and the README is not published:
+# the two have different jobs. The documents' back-links to the README are
+# repointed at that landing page.
+echo "-- staging the documents"
 python3 - "${src}" <<'PY'
 import pathlib
 import re
@@ -62,15 +62,11 @@ import sys
 src = pathlib.Path(sys.argv[1])
 BLOB = "https://github.com/pysco68/blake3pp/blob/main/"
 
-readme = pathlib.Path("README.md").read_text().replace("](docs/", "](")
-# Whatever is still relative is a repository path, not a page here.
-readme = re.sub(r"\]\((?!https?:|#|\w[\w.-]*\.md)([^)]+)\)", rf"]({BLOB}\1)", readme)
-(src / "index.md").write_text(readme)
-
 for page in src.glob("*.md"):
-    if page.name == "index.md":
-        continue
     text = page.read_text().replace("(../README.md", "(index.md")
+    # Whatever is still relative is a repository path, not a page here.
+    text = re.sub(r"\]\((?!https?:|#|\w[\w.-]*\.md|\w[\w.-]*/)([^)]+)\)",
+                  rf"]({BLOB}\1)", text)
     page.write_text(text)
 
 # The examples become pages of their own, each README followed by the
