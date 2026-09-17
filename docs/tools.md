@@ -29,7 +29,7 @@ built on extended output: the same seed (`--seed`, or the bytes of a
 `--seed-file` streamed through the file pipeline) always yields the same
 infinite stream, and `--seek` is O(1), so materializing a slice at
 offset 10 GB costs the same as offset 0. Generation runs lanes-parallel
-in the kernel and `--threads` fans segments across cores via the O(1) seek, 
+in the kernel and `--threads` fans segments across cores via the O(1) seek,
 so the sink is the bottleneck;
 `--output` removes even that overhead, writing through io_uring +
 O_DIRECT on Linux, IOCP + no-buffering on Windows or GCD + F_NOCACHE on
@@ -50,7 +50,7 @@ blake3ppgen --seed run42 --length 32G --output f.bin --window 64 --qd 8
 
 ## The allocator
 
-For the **tools** (blake3ppsum, blake3ppgen, benchmarks), [mimalloc](https://github.com/microsoft/mimalloc/) 
+For the **tools** (blake3ppsum, blake3ppgen, benchmarks), [mimalloc](https://github.com/microsoft/mimalloc/)
 is the default allocator on every  supported target (`BLAKE3PP_TOOL_MIMALLOC`, off only for wasm and macos).
 
 The library itself stays allocator-neutral.

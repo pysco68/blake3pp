@@ -265,8 +265,9 @@ void for_each_part(Scheduler& sched, std::size_t n, Body body) {
 }
 
 // The one-shot engine: partitions input into aligned subtrees, fans them
-// out over sched, and finishes inside h, whose key_words()/mode_flags()
-// drive the workers; plain, keyed and derive_key hashers all work.
+// out over sched, and finishes inside h, whose key_words() and
+// mode_flags() drive the workers. Plain, keyed and derive_key hashers all
+// work.
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched,
@@ -483,9 +484,9 @@ struct parallel_hasher_options {
   std::size_t window_bytes = 8 * 1024 * 1024;
 };
 
-/// The incremental counterpart of the multi-core hash(): hasher's
-/// update()/finalize()/reset() interface, with the subtree hashing fanned
-/// out over a scheduler internally.
+/// The incremental counterpart of the multi-core hash(). It offers the
+/// same `update()`, `finalize()` and `reset()` interface as hasher, and
+/// fans the subtree hashing out over a scheduler internally.
 ///
 /// Input accumulates into an aligned window; a full window is fanned out
 /// as soon as one more byte arrives, the "one byte in reserve" that keeps

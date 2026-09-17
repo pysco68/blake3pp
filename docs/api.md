@@ -106,10 +106,10 @@ auto storage_key =
     blake3pp::derive_key("example.com 2026-08 disk encryption", master_secret);
 ```
 
-Both modes compose with everything else: `hasher::keyed`/
-`hasher::derive_key` give incremental hashing, `keyed_hash(key, data, sched)` 
-and the keyed and derive_key `parallel_hasher` constructors go multi-core, 
-and a keyed or derive_key hasher takes file input through `update_file()`. 
+Both modes compose with everything else: `hasher::keyed` and
+`hasher::derive_key` give incremental hashing, `keyed_hash(key, data, sched)`
+and the keyed and derive_key `parallel_hasher` constructors go multi-core,
+and a keyed or derive_key hasher takes file input through `update_file()`.
 Authenticated file manifests at full pipeline speed are one line either way:
 
 ```cpp
@@ -143,8 +143,9 @@ r.fill(deep_chunk);                         // byte 10 GB costs same as byte 0
 ```
 
 O(1) seek also makes the stream embarrassingly parallel: with a
-scheduler (`<blake3pp/parallel.hpp>`), `blake3pp::fill(r, big_buffer,
-sched)` splits the request into segments that fill on every core, each
+scheduler (`<blake3pp/parallel.hpp>`),
+`blake3pp::fill(r, big_buffer, sched)` splits the request into segments
+that fill on every core, each
 straight into its slice of the buffer, and leaves `r` positioned exactly
 as `blake3pp::fill(r, big_buffer)` (the free spelling of `r.fill()`)
 would have. That is what `blake3ppgen --threads` runs on.

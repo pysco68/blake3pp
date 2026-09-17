@@ -28,9 +28,9 @@ FetchContent_MakeAvailable(blake3pp)
 target_link_libraries(your_app PRIVATE blake3pp::blake3pp)
 ```
 
-That call opens the file with direct I/O, keeps several windows in flight, 
-hashes with the widest kernel the processor turns out to have and spreads 
-the work over core the system has. 
+That call opens the file with direct I/O, keeps several windows in flight,
+hashes with the widest kernel the processor turns out to have and spreads
+the work over core the system has.
 
 The whole specification is here, not just the digest: plain hashing,
 keyed hashing for a MAC or PRF, and `derive_key` for context-separated
@@ -41,10 +41,10 @@ writes.
 
 The binary release contains two [command-line tools](docs/tools.md) built on the library: `blake3ppsum` and `blake3ppgen`.
 
-`blake3ppsum` is a core-tool style hashing tool you can use just like `sha256sum` but 
+`blake3ppsum` is a core-tool style hashing tool you can use just like `sha256sum` but
 exposes all the cool BLAKE3 modes with keyed hashing, XOF, etc.
 
-`blake3ppgen` uses BLAKE3's extended output mode to generate deterministic arbitrary 
+`blake3ppgen` uses BLAKE3's extended output mode to generate deterministic arbitrary
 length, seekable streams of data which is perfect for test data generation.
 
 <details>
@@ -109,7 +109,7 @@ them.
 
 ## Architectures
 
-This project's CI ships: 
+This project's CI ships:
 
 |Platform | SIMD kernels|
 |---|---|
@@ -142,7 +142,7 @@ All of this, rendered and searchable, with a version for every release:
 
 ## Using the library
 
-blake3pp is normally consumed **from source**: the FetchContent block above, or a 
+blake3pp is normally consumed **from source**: the FetchContent block above, or a
 submodule plus `add_subdirectory`. Tests, benchmarks and tools stay out of consuming
 builds by default.
 

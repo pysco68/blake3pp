@@ -89,9 +89,10 @@ The split follows one rule. Members are the sequential primitives of the
 value types (`update`, `finalize`, `finalize_xof`, `fill`, `take`,
 `seek`). Free functions are the entry points that bring in a resource
 the type does not own, a scheduler or a file, and each comes as a pair
-so call sites read alike with and without cores: `hash(data)` /
-`hash(data, sched)`, `update_file(h, path)` / `update_file(h, path, sched)`,
- `fill(r, out)` / `fill(r, out, sched)`. The scheduler-taking
+so call sites read alike with and without cores:
+`hash(data)` and `hash(data, sched)`,
+`update_file(h, path)` and `update_file(h, path, sched)`,
+`fill(r, out)` and `fill(r, out, sched)`. The scheduler-taking
 half of each pair lives in the header that owns the dependency.
 The two I/O headers exist only when the library is built with
 `BLAKE3PP_WITH_IO=ON` (the default); see

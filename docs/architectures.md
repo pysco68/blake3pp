@@ -16,8 +16,8 @@
 
 Every build also carries a scalar kernel as a fallback.
 
-The SVE kernels are vector-length-specific: dispatch selects one only when the CPU's runtime 
-vector length equals the length the kernel was compiled for, since that is the only case the 
+The SVE kernels are vector-length-specific: dispatch selects one only when the CPU's runtime
+vector length equals the length the kernel was compiled for, since that is the only case the
 ABI guarantees. That length comes from `prctl` on Linux and from `rdvl` on Windows, which
 reports whether SVE is present but not how wide it is. Compiling them
 needs a compiler that accepts a fixed vector length: `clang-cl` does, in

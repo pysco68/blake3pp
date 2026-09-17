@@ -344,7 +344,7 @@ class hasher {
 namespace detail {
 // Reduces a power-of-2 subtree (>= 2 complete chunks) to its root CV using
 // the given kernel table, key schedule and mode flags (take them from the
-// destination hasher's key_words()/mode_flags()). Thread-safe and
+// destination hasher's key_words() and mode_flags()). Thread-safe and
 // allocation-free; the bridge the parallel engine schedules over.
 void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::size_t num_chunks, std::uint64_t chunk_counter,
