@@ -142,7 +142,7 @@ struct win_file {
 
   // NO_BUFFERING and OVERLAPPED are per-open flags: engage by reopening,
   // keeping the plain handle for unaligned lengths. Best-effort: a
-  // refused reopen, or a port that will not attach, simply leaves the
+  // refused reopen, or a port that will not attach, leaves the
   // plain handle in charge with direct/use_iocp still false.
   void engage(const wchar_t* path, DWORD access, DWORD share,
               bool want_direct, bool want_async) noexcept {

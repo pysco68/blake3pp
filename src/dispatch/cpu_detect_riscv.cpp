@@ -35,14 +35,14 @@
 // tools call it at startup; they own their process.
 //
 // Never parse /proc/cpuinfo: old vendor kernels print a bare "v" for
-// 0.7.1, and every fact this file needs is available through auxv,
+// 0.7.1, and every fact the detection needs is available through auxv,
 // hwprobe, or the guarded read. The BLAKE3PP_ASSUME_XTHEADVECTOR=1 env
 // hook exists for emulator testing (T-Head's qemu fork predates the
 // hwprobe key, and qemu-user does not model the vlenb trap) and is
 // honored for arch::xthead only.
 //
 // Zvbb has no single-letter HWCAP bit; the hwprobe IMA_EXT_0 key
-// carries it, so on pre-hwprobe kernels it is simply "absent". The
+// carries it, so on pre-hwprobe kernels it reads as "absent". The
 // hwprobe syscall is raw (glibc grew a wrapper only recently and musl
 // has none); ENOSYS degrades to "not detectable".
 

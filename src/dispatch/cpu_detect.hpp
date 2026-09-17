@@ -3,7 +3,7 @@
 // The seam between generic dispatch and per-platform CPU capability
 // probing. Exactly one cpu_detect_<platform>.cpp defines
 // platform_cpu_supports() per target (the others compile empty); targets
-// with no probe file at all (wasm) simply never define
+// with no probe file at all (wasm) never define
 // BLAKE3PP_HAS_CPU_DETECT and dispatch.cpp answers without it.
 //
 // THE RULE every probe TU inherits: these files are compiled with the

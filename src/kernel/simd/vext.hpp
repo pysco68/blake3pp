@@ -40,7 +40,7 @@ struct u32v {
   static BLAKE3PP_FORCE_INLINE u32v broadcast(std::uint32_t x) noexcept {
     return {impl{} + x};
   }
-  // memcpy rather than a cast: the callers' buffers carry no vector
+  // A memcpy, not a cast. The callers' buffers carry no vector
   // alignment, and every compiler folds a sizeof-register memcpy into
   // the target's unaligned load.
   static BLAKE3PP_FORCE_INLINE u32v load(const std::uint32_t* p) noexcept {

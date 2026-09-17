@@ -1,7 +1,7 @@
 // The width-16 transpose dial and its stopwatch tuner: runtime TUNING
-// policy, deliberately separate from dispatch (which only ever answers
-// "can this CPU run that kernel"; this file answers "which of three
-// correct strategies is fastest HERE", a question no feature bit can).
+// policy, kept separate from dispatch. Dispatch answers only "can this
+// CPU run that kernel". The question here is "which of three correct
+// strategies is fastest HERE", which no feature bit can answer.
 
 #include <blake3pp/dispatch.hpp>
 
@@ -130,7 +130,7 @@ transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
 
   // Heap, not stack: the point is a working set that does not fit in
   // cache. Tuning must not fail the program, so an allocation failure
-  // simply leaves the current setting alone.
+  // leaves the current setting alone.
   auto* data = static_cast<std::uint8_t*>(std::malloc(bytes));
   if (data == nullptr) {
     return active_transpose16();

@@ -7,7 +7,7 @@
 // (word j of every input in one vector). No simd provider exposes a portable
 // permute for that (the std::simd MVP has no shuffle API at all), so the
 // naive route stages through a scalar array, and it costs ~40% of the whole
-// hash (upstream's SSE4.1 assembly matches our AVX2 because of it).
+// hash (upstream's SSE4.1 assembly matches this AVX2 kernel because of it).
 //
 // The bypass is a radix-2 shuffle tree whose index patterns ARE hardware
 // macro-ops; it lives in shuffle/networks.hpp, written once over whichever

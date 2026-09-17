@@ -20,7 +20,7 @@ namespace blake3pp::core {
 
 // A node whose chaining value has not been computed yet. Keeping the inputs
 // around (rather than eagerly compressing) is what makes the ROOT flag
-// possible: the last node's compression must wait until we know it is last.
+// possible: the last node's compression waits until it is known to be last.
 struct output {
   std::array<std::uint32_t, 8> input_cv;
   std::array<std::uint8_t, kern::block_len> block;

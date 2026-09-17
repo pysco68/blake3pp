@@ -82,7 +82,7 @@ static_assert(ranks_unique(), "arch.def ranks must be unique");
 
 // Every enumerator sorted by rank: auto_detect first (rank 0), then
 // best-first. This is all_arches() verbatim, and the dispatch preference
-// order is simply its tail. One list, two roles.
+// order is its tail. One list, two roles.
 constexpr std::array<arch, num_arches> all_enumerators = [] {
   std::array<arch, num_arches> out{};
   std::size_t n = 0;

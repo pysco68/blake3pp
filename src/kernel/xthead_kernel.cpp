@@ -3,7 +3,7 @@
 // -DBLAKE3PP_XTHEAD_KERNEL=ON; compiled with -march=rv64gc_xtheadvector
 // through blake3pp_add_kernel's SOURCE argument.
 //
-// This is deliberately NOT an instantiation of kernel.cpp: XTheadVector
+// This is not an instantiation of kernel.cpp. XTheadVector
 // types are sizeless in GCC's model (no fixed-vlen attribute exists for
 // them, unlike RVV 1.0's riscv_rvv_vector_bits), so they cannot back the
 // facade's u32v struct member, cannot form arrays, and cannot cross any

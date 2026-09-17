@@ -163,7 +163,7 @@ struct signal_job final : job {
 };
 
 // Chunks are pulled from a shared counter rather than dealt out in fixed
-// shares, so a worker that runs slower simply takes fewer: the same split
+// shares, so a worker that runs slower takes fewer: the same split
 // the hashing engine uses one layer up.
 struct bulk_job final : job {
   repl::bulk_item_receiver_proxy& proxy;

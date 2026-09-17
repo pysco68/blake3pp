@@ -21,8 +21,8 @@
 
 namespace blake3pp::kern {
 
-// Strategy for the width-16 (AVX-512) message transpose. A process-wide
-// runtime dial rather than a compile-time one: CPUID cannot express
+// Strategy for the width-16 (AVX-512) message transpose. The dial is
+// process-wide and set at runtime, because CPUID cannot express
 // "double-pumped datapath" (Strix Point and full-width Zen 5 report
 // identical AVX-512 feature bits), so the right strategy is a property
 // you MEASURE, not detect; see blake3pp::tune_transpose16(). Kernels
@@ -98,7 +98,7 @@ static_assert(std::is_same_v<std::uint8_t, unsigned char>,
 }
 
 struct kernel_ops {
-  // Which variant this table implements; the identity behind
+  // Which variant the table implements: the identity behind
   // hasher::selected_arch() and friends.
   arch variant;
 

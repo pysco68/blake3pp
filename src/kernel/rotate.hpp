@@ -45,8 +45,8 @@
 
 // The tuning switches, set by cmake/ArchKernels.cmake from
 // -DBLAKE3PP_KERNEL_*_ROTATE=auto|on|off; each fallback repeats that
-// default (the headers are also parsed by tooling that does not pass our
-// flags). Off restores the generic spelling for re-measurement.
+// default (the headers are also parsed by tooling that passes none of
+// these flags). Off restores the generic spelling for re-measurement.
 #ifndef BLAKE3PP_KERNEL_SRI_ROTATE
 #define BLAKE3PP_KERNEL_SRI_ROTATE 1
 #endif
@@ -80,7 +80,7 @@ typedef vuint32m1_t rvv_fixed_u32
 //                       N=8:  1x pshufb          1x pshufb
 //
 // Mirror images: LLVM canonicalizes the shift-or rotate idiom straight to
-// pshufb, but lowers OUR byte-shuffle to the 16-bit-lane pair for N==16
+// pshufb, but lowers the byte-shuffle spelling to the 16-bit-lane pair for N==16
 // (both are legal; its cost model dislikes materializing the mask, even
 // though upstream's asm hoists exactly that mask out of the loop). GCC
 // never forms a shuffle from shift-or and needs the byte spelling. Neither
@@ -177,7 +177,7 @@ BLAKE3PP_FORCE_INLINE u32v xor_rot(u32v x, u32v y) noexcept {
     // Same dependent-lambda shield as rot's sri escape above: keeps the
     // bit_casts out of TUs whose impl is not the fixed-length SVE size.
     return [](auto ix, auto iy) BLAKE3PP_LAMBDA_FORCE_INLINE {
-      // The provider's register itself where it exposes one, rather than
+      // The provider's register itself where it exposes one, in place of
       // a reinterpret of the object holding it. Both spellings name the
       // same fixed-length SVE type, but clang under the MSVC ABI
       // declines to inline a reinterpret of the batch CLASS even with

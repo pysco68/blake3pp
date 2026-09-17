@@ -63,7 +63,7 @@ BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept 
 // Ubuntu clang 21.1.8 none, zig 0.17-dev (clang 22.1.8) none, Ubuntu
 // clang 22.1.8 none, GCC 15 none. So a 21.1.x patch release or zig's own
 // build of it is the dividing line, and the version bound below is
-// deliberately conservative: it also covers clang 21 builds that do not
+// conservative on purpose: it also covers clang 21 builds that do not
 // need it, and lifts itself when the musl builds move to zig 0.17.
 #if defined(__riscv) && defined(__riscv_v) && defined(__clang__) && __clang_major__ < 22
 #define BLAKE3PP_ALIGN_MESSAGE_BLOCK 1
@@ -102,7 +102,7 @@ BLAKE3PP_FORCE_INLINE std::uint32_t xor_rot(std::uint32_t x,
 }
 
 // The spec's 64-bit block counter enters the state as two u32 words
-// (v[12]/v[13], t0/t1): this pair is the one place the kernel deliberately
+// (v[12]/v[13], t0/t1): this pair is the one place the kernel knowingly
 // truncates.
 BLAKE3PP_FORCE_INLINE std::uint32_t counter_lo(std::uint64_t c) noexcept {
   return static_cast<std::uint32_t>(c);

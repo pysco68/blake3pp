@@ -155,9 +155,9 @@ inline void compress_subtree_to_cv_recursive(
 // over 319 hash_many calls instead of 67 on avx2, none of them at full lane
 // occupancy, which costs 11% on sse42 and avx2. On a scalar kernel there is
 // no occupancy to lose and throughput is unchanged, which is why this is
-// opt-in for narrow targets (BLAKE3PP_SUBTREE_FOLD) rather than a default:
-// there it replaces one buffer per level with a fixed working set, 720 bytes
-// at 12 levels against 480 + 272 per level.
+// opt-in for narrow targets through BLAKE3PP_SUBTREE_FOLD. There it
+// replaces one buffer per level with a fixed working set, 720 bytes at 12
+// levels against 480 + 272 per level.
 template <std::size_t MaxStack = 54, std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_subtree_to_cv_folded(
     const kern::kernel_ops& k, const std::uint8_t* input,

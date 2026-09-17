@@ -27,7 +27,7 @@
 
 // Set by cmake/ArchKernels.cmake from -DBLAKE3PP_KERNEL_INLINE_ENFORCEMENT=
 // auto|on|off; the fallback below repeats that default for tooling and for
-// consumers building these sources outside our CMake. Turning it off
+// consumers building these sources outside this CMake. Turning it off
 // restores the pre-enforcement spelling so one tree can be built both ways
 // and the numbers above re-measured on other hardware.
 #ifndef BLAKE3PP_KERNEL_INLINE_ENFORCEMENT

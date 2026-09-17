@@ -91,8 +91,8 @@ class stdio_reader {
     if (std::fread(buf.data(), 1, buf.size(), stream_) != buf.size()) {
       // Distinguish a real read error from a short read at EOF; the engine
       // never asks for more than the file holds, so EOF here means the file
-      // was truncated underneath us. errno is taken before ferror(), which
-      // is not required to preserve it.
+      // was truncated while it was open. errno is taken before ferror(),
+      // which is not required to preserve it.
       const int err = errno;
       throw std::system_error(std::ferror(stream_) != 0 ? err : EIO,
                               std::generic_category(), "fread");
