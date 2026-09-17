@@ -36,9 +36,14 @@ int main(int argc, char** argv) {
   } else {
     scratch = std::filesystem::temp_directory_path() / "blake3pp-example-09";
     std::filesystem::create_directories(scratch);
-    path = write_demo_file(scratch, 32u << 20);
+    path = write_demo_file(scratch, 12u << 20);
   }
   const auto bytes = std::filesystem::file_size(path);
+
+  // One untimed pass first. The first read of a freshly written file pays
+  // for metadata and for opening the direct-I/O path, which at these sizes
+  // is larger than the difference being measured.
+  (void)blake3pp::hash_file(path);
 
   const auto timed = [&](auto&& run) {
     const auto start = std::chrono::steady_clock::now();
@@ -64,14 +69,16 @@ int main(int argc, char** argv) {
   std::cout << "\nsame digest: " << std::boolalpha << (one == many) << '\n';
   std::cout << "speedup: " << (many_rate / one_rate) << " x\n";
 
-  // Past a point the device is the limit rather than the hashing, and a
-  // bigger window with more reads in flight is what moves that limit.
+  // Past a point the device is the limit rather than the hashing, and the
+  // window size and queue depth are what move it. The window has to divide
+  // the file into more than one piece for any of this to matter, which is
+  // why a small file wants a small window.
   const auto [tuned, tuned_rate] = timed([&] {
     return blake3pp::hash_file(path, sched,
-                               {.window_bytes = 16 * 1024 * 1024,
+                               {.window_bytes = 4 * 1024 * 1024,
                                 .queue_depth = 8});
   });
-  std::cout << "\nwith a 16 MiB window, 8 deep\n  " << tuned_rate
+  std::cout << "\nwith a 4 MiB window, 8 deep\n  " << tuned_rate
             << " GiB/s, digest unchanged: " << (tuned == one) << '\n';
 
   if (!scratch.empty()) {

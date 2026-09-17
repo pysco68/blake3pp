@@ -69,8 +69,8 @@ cmake --build build --target blake3pp_example_06_multi_core
 
 It hashes 32 MiB both ways and prints the rate of each, so the output
 depends on the machine. On Compiler Explorer expect a speedup near 1.2x
-where a laptop shows 5x: it is a shared sandbox with few cores. The
-digests are identical everywhere, which is the part worth checking.
+where a laptop shows 5x, because the sandbox offers two cores. The digests
+are identical everywhere, which is the part worth checking.
 
 ## Next
 

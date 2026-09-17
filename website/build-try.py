@@ -51,10 +51,11 @@ ROOT = {
     "blurb": "It hashes on one core and on all of them, and prints both rates.",
 }
 
-# Compiler Explorer runs programs in a sandbox with a file-size limit and
-# a handful of cores. An example whose subject is storage throughput has
-# nothing to show there, and dies on the limit rather than reporting it.
-NO_SANDBOX = {"09-one-file-two-ways"}
+# Compiler Explorer's sandbox allows files up to 16 MiB (RLIMIT_FSIZE) and
+# offers two cores, so an example that writes its own corpus has to stay
+# under that. Nothing is excluded today; the set is here because an example
+# that cannot run there should say so rather than die on a limit.
+NO_SANDBOX: set[str] = set()
 
 PAGE = """<!doctype html>
 <meta charset="utf-8">
