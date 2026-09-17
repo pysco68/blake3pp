@@ -67,7 +67,7 @@ struct chunk_state {
 ///
 /// The digest is the first 32 bytes of the hash's extended output stream.
 /// It formats with std::format ("{}" prints the lowercase hex) where the
-/// standard library provides <format>.
+/// standard library provides `<format>`.
 struct digest {
   /// The digest bytes.
   std::array<std::byte, digest_size> bytes;

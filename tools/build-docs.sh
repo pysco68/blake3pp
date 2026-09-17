@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Build one version of the documentation site.
+#
+# Three inputs become one directory: the markdown in docs/, the README as
+# the landing page, and the `///` comments in the public headers by way of
+# Doxygen's XML. tools/build-site.sh calls this once per published version.
+#
+# Nothing is generated into the source tree: the three are staged into
+# build/site-src, where the links can be rewritten for a site whose root
+# is docs/ without breaking the same links when read on GitHub.
+#
+#   tools/build-docs.sh --out _site/main
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out) out=$2; shift 2 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "build-docs: unknown option '$1'" >&2; exit 2 ;;
+  esac
+done
+[ -n "${out}" ] || { echo "build-docs: --out is required" >&2; exit 2; }
+case "${out}" in /*) ;; *) out="${PWD}/${out}" ;; esac
+
+# mkdocs is a Python application, not a system package; keep it in a venv
+# beside the checkout so a contributor needs no global installs.
+venv=${BLAKE3PP_DOCS_VENV:-${PWD}/.venv-docs}
+if [ ! -x "${venv}/bin/mkdocs" ]; then
+  echo "-- creating ${venv}"
+  python3 -m venv "${venv}"
+  "${venv}/bin/pip" install -q -r docs/requirements.txt
+fi
+
+command -v doxygen > /dev/null || {
+  echo "build-docs: doxygen is not installed (apt install doxygen)" >&2; exit 1; }
+
+src=build/site-src
+rm -rf "${src}" build/doxygen
+mkdir -p "${src}" build/doxygen
+cp docs/*.md "${src}/"
+
+# The reference pages, straight from the headers. Doxygen writes XML only;
+# none of its HTML is published.
+echo "-- extracting the header documentation"
+doxygen - > /dev/null <<DOXY
+$(cat tools/Doxyfile)
+XML_OUTPUT = ${PWD}/build/doxygen/xml
+DOXY
+python3 tools/doxygen-to-md.py --xml build/doxygen/xml --out "${src}/reference"
+
+# The README is the landing page: one source of truth. On GitHub its links
+# reach down into docs/ and the documents' links reach back up to it; on
+# the site both live in one directory.
+echo "-- landing page from README.md"
+python3 - "${src}" <<'PY'
+import pathlib
+import re
+import sys
+
+src = pathlib.Path(sys.argv[1])
+BLOB = "https://github.com/pysco68/blake3pp/blob/main/"
+
+readme = pathlib.Path("README.md").read_text().replace("](docs/", "](")
+# Whatever is still relative is a repository path, not a page here.
+readme = re.sub(r"\]\((?!https?:|#|\w[\w.-]*\.md)([^)]+)\)", rf"]({BLOB}\1)", readme)
+(src / "index.md").write_text(readme)
+
+for page in src.glob("*.md"):
+    if page.name == "index.md":
+        continue
+    text = page.read_text().replace("(../README.md", "(index.md")
+    page.write_text(text)
+PY
+
+# --strict, and the status is propagated: a version that does not build
+# must not be published half-rendered. The filter drops mkdocs' own INFO
+# chatter and the upstream banner about a future MkDocs 2.0, neither of
+# which says anything about this build.
+echo "-- mkdocs build -> ${out}"
+log=$(mktemp); trap 'rm -f "${log}"' EXIT
+status=0
+"${venv}/bin/mkdocs" build --strict --site-dir "${out}" > "${log}" 2>&1 || status=$?
+grep -vE "^INFO|^[[:space:]]*$|Material for MkDocs team|MkDocs 2\.0|plugin system|theming system|migration path|contribution model|Currently unlicensed|squidfunk\.github\.io|full analysis|^.\[3[0-9]m" "${log}" >&2 || true
+exit ${status}

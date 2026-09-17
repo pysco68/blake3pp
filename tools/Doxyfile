@@ -1,0 +1,34 @@
+# Doxygen runs headless here: it parses the public headers and writes XML,
+# which tools/doxygen-to-md.py turns into the site's reference pages. No
+# Doxygen HTML is ever published, so nothing in here is about presentation.
+PROJECT_NAME           = blake3pp
+INPUT                  = include/blake3pp
+FILE_PATTERNS          = *.hpp
+RECURSIVE              = NO
+EXCLUDE_PATTERNS       = */detail/*
+
+GENERATE_HTML          = NO
+GENERATE_LATEX         = NO
+GENERATE_XML           = YES
+XML_PROGRAMLISTING     = NO
+
+# Everything public is listed, documented or not, so the reference is a
+# complete API listing rather than only the parts that got a comment.
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_FRIEND_COMPOUNDS  = NO
+
+# The first sentence becomes the brief, which is what the header table on
+# the reference index shows.
+JAVADOC_AUTOBRIEF      = YES
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = BLAKE3PP_FORCE_INLINE= \
+                         BLAKE3PP_DOXYGEN=1
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO

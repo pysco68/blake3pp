@@ -1,0 +1,77 @@
+# The documentation site. One version of it: tools/build-site.sh builds
+# this once per published version and assembles them under one dropdown.
+site_name: blake3pp
+site_description: BLAKE3 for C++20 and later, with every SIMD kernel in one binary
+site_url: https://pysco68.github.io/blake3pp/
+repo_url: https://github.com/pysco68/blake3pp
+repo_name: pysco68/blake3pp
+edit_uri: edit/main/docs/
+copyright: Apache-2.0
+
+# Staged by tools/build-docs.sh: docs/, the README, and the generated
+# reference, with their cross-links rewritten for this layout.
+docs_dir: build/site-src
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+    - toc.follow
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep orange
+      accent: deep orange
+      toggle: { icon: material/weather-night, name: Switch to dark mode }
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep orange
+      accent: deep orange
+      toggle: { icon: material/weather-sunny, name: Switch to light mode }
+
+extra:
+  # Reads versions.json beside the site root; tools/build-site.sh writes it.
+  version:
+    provider: mike
+    default: latest
+
+markdown_extensions:
+  - attr_list          # the reference pages carry their own heading anchors
+  - def_list
+  - tables
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Guide:
+      - The API: api.md
+      - Architectures and kernels: architectures.md
+      - Command-line tools: tools.md
+  - Reference:
+      - Overview: reference/index.md
+      - blake3pp.hpp: reference/blake3pp.md
+      - core.hpp: reference/core.md
+      - io.hpp: reference/io.md
+      - parallel.hpp: reference/parallel.md
+      - parallel_io.hpp: reference/parallel_io.md
+      - parallel_backend.hpp: reference/parallel_backend.md
+      - dispatch.hpp: reference/dispatch.md
+  - Building:
+      - Building: building.md
+      - Integration: integration.md
+      - Freestanding and RTOS builds: freestanding.md
+      - Static Linux binaries: static-linux-binaries.md

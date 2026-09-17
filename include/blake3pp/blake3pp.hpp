@@ -3,20 +3,24 @@
 /// @file
 /// The umbrella header: one include, the whole library.
 ///
-///   #include <blake3pp/blake3pp.hpp>
+/// @code
+/// #include <blake3pp/blake3pp.hpp>
+/// @endcode
 ///
 /// Compile-cost-sensitive translation units can include just what they
 /// use:
 ///
-///   <blake3pp/core.hpp>      digest, hasher, one-shot hash()
-///   <blake3pp/dispatch.hpp>  arch enum, introspection (pulled in by core)
-///   <blake3pp/parallel.hpp>  multi-core hash(), parallel_hasher, XOF fill()
+/// @code{.unparsed}
+/// <blake3pp/core.hpp>        digest, hasher, one-shot hash()
+/// <blake3pp/dispatch.hpp>    arch enum, introspection (pulled in by core)
+/// <blake3pp/parallel.hpp>    multi-core hash(), parallel_hasher, XOF fill()
 ///                            (brings in the sender/receiver machinery)
-///   <blake3pp/io.hpp>        update_file(), hash_file() and the direct-I/O
+/// <blake3pp/io.hpp>          update_file(), hash_file() and the direct-I/O
 ///                            pipeline (brings in <filesystem>; standard
 ///                            library only)
-///   <blake3pp/parallel_io.hpp> the same over a scheduler (io.hpp +
+/// <blake3pp/parallel_io.hpp> the same over a scheduler (io.hpp +
 ///                            parallel.hpp)
+/// @endcode
 ///
 /// The I/O headers follow the BLAKE3PP_WITH_IO build option: a
 /// freestanding build has no filesystem to offer them.

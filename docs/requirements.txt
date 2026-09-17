@@ -1,0 +1,2 @@
+# The documentation site. Doxygen is the other half and is a system package.
+mkdocs-material==9.7.7

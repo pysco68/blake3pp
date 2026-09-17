@@ -1,0 +1,81 @@
+# The documentation site: every release plus main, under one dropdown.
+#
+# A Compiler Explorer link embeds the source it was made from; their
+# compile nodes have no network, so no link can follow this repository.
+# So the README points at a page here, and this workflow repoints that
+# page at a freshly generated link whenever the library changes.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'include/**'
+      - 'src/**'
+      - 'docs/**'
+      - 'README.md'
+      - 'mkdocs.yml'
+      - 'examples/parallel-demo.cpp'
+      - 'tools/amalgamate.py'
+      - 'tools/build-docs.sh'
+      - 'tools/build-site.sh'
+      - 'tools/doxygen-to-md.py'
+      - 'tools/Doxyfile'
+      - 'tools/make-try-page.py'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time; a queued run supersedes a waiting one.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      # Every tag is built, so the whole history has to be here.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install doxygen
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends doxygen
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+
+      # The same script a contributor runs locally, so the preview and the
+      # published site cannot drift: tools/build-site.sh --all --serve.
+      - name: Build the site
+        run: tools/build-site.sh --all
+
+      # A link that does not build is worse than no link; the runner has a
+      # new enough GCC only sometimes, so this warns rather than gates.
+      - name: Compile the generated file, if this runner can
+        continue-on-error: true
+        run: |
+          if g++-16 --version > /dev/null 2>&1; then
+            g++-16 -std=c++26 -O2 -msse4.2 -fsyntax-only examples/blake3pp-single-file.cpp
+          else
+            echo "::warning::no g++-16 on this runner; published unverified"
+          fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

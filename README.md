@@ -126,6 +126,9 @@ More details can be found in [Architectures and kernels](docs/architectures.md).
 
 ## Documentation
 
+All of this, rendered and searchable, with a version for every release:
+**[pysco68.github.io/blake3pp](https://pysco68.github.io/blake3pp/)**.
+
 | | |
 |---|---|
 | [The API](docs/api.md) | the whole public surface with its examples: hashing, keyed and derive-key, extended output, files, cores, variants |
@@ -135,6 +138,7 @@ More details can be found in [Architectures and kernels](docs/architectures.md).
 | [Building](docs/building.md) | presets, the toolchain images, cmake-re, and the kernel switches |
 | [Freestanding and RTOS builds](docs/freestanding.md) | no OS, no allocator and how to use `blake3pp` with only a few hundred bytes of stack |
 | [Static Linux binaries](docs/static-linux-binaries.md) | it should just run on any distro, really |
+| [Reference](https://pysco68.github.io/blake3pp/latest/reference/) | every declaration in the public headers, generated from their own doc comments |
 
 ## Using the library
 

@@ -1,8 +1,9 @@
 # tools/
 
 Scripts around the build: the toolchain matrix, the CI entry point, the
-release packaging, and the binary inspection the fat-binary design keeps
-needing. Everything runs from the repository root.
+release packaging, the documentation site, and the binary inspection the
+fat-binary design keeps needing. Everything runs from the repository
+root.
 
 | Script | Purpose |
 | --- | --- |
@@ -21,6 +22,10 @@ needing. Everything runs from the repository root.
 | `godbolt-link.py` | Shorten a source file into a Compiler Explorer link. |
 | `make-try-page.py` | Write the redirect page the README's "try it" link points at. |
 | `include-audit.py` | Cross-build `clang-include-cleaner` pass: additions from the union, removals only from the intersection. |
+| `build-site.sh` | Build the published documentation site: every release plus `main`, and the Compiler Explorer link (`--all`, `--no-link`, `--serve`). |
+| `build-docs.sh` | Build one version of that site into a directory. |
+| `doxygen-to-md.py` | Turn Doxygen's XML into the site's reference pages. |
+| `Doxyfile` | The Doxygen configuration, XML only: no Doxygen HTML is published. |
 
 ## objscan.py
 
@@ -100,3 +105,29 @@ and extend the neighbouring variants' `forbid` lists if the new
 instruction class must stay out of them. The audit reports a variant
 without a rule and does not fail on it.
 
+## The documentation site
+
+`build-site.sh` produces what `pysco68.github.io/blake3pp` serves, and CI
+runs the same script, so a local preview cannot drift from the published
+site:
+
+    tools/build-site.sh --no-link --serve      # localhost:8000
+
+`--no-link` keeps the Compiler Explorer link the repository already holds
+instead of minting a new one, which is what an offline preview wants;
+drop it to regenerate the link. `--all` additionally builds every `v*`
+tag into its own directory and writes the `versions.json` behind the
+version dropdown. Each version is rendered with the tooling from the
+current checkout, not from the tag, so there is only ever one renderer to
+maintain; a tag whose documents predate the current navigation is skipped
+rather than published half-built.
+
+One version comes from `build-docs.sh`, which stages three inputs into
+`build/site-src` and runs MkDocs over them: the markdown in `docs/`, the
+README as the landing page, and the public headers' `///` comments by way
+of Doxygen's XML and `doxygen-to-md.py`. Nothing is generated into the
+source tree, and the cross-links between README and `docs/` are rewritten
+for the site's flat layout so the same links keep working on GitHub.
+
+MkDocs lives in a `.venv-docs` virtualenv the script creates on first
+run; Doxygen is a system package (`apt install doxygen`).
