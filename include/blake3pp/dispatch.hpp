@@ -58,7 +58,7 @@ enum class arch : std::uint8_t {
 [[nodiscard]] std::span<const arch> compiled_arches() noexcept;
 
 /// The compiled variants this CPU can run, best-first; never empty, and
-/// available_arches().front() == best_available().
+/// `available_arches().front() == best_available()`.
 [[nodiscard]] std::span<const arch> available_arches() noexcept;
 
 /// Runs the deferred, trap-guarded detection probes once and upgrades the

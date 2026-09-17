@@ -40,11 +40,11 @@ inline constexpr std::size_t key_size = 32;
 ///
 /// Neither allocates nor NUL-terminates.
 /// @param bytes  The bytes to encode (extended output, a key, a digest).
-/// @param out    Receives 2 * bytes.size() characters; must be that large.
+/// @param out    Receives 2 * `bytes.size()` characters; must be that large.
 void to_hex(std::span<const std::byte> bytes, std::span<char> out) noexcept;
 /// Returns the lowercase hex of any byte sequence as a string.
 /// @param bytes  The bytes to encode.
-/// @return 2 * bytes.size() lowercase hex characters.
+/// @return 2 * `bytes.size()` lowercase hex characters.
 [[nodiscard]] std::string to_hex(std::span<const std::byte> bytes);
 
 namespace detail {
@@ -108,7 +108,7 @@ struct digest {
 /// 32-byte digest is exactly the stream's first 32 bytes.
 class output_reader {
  public:
-  /// Writes the next out.size() bytes of the output stream and advances
+  /// Writes the next `out.size()` bytes of the output stream and advances
   /// past them.
   /// @param out  Any length; the stream is unbounded.
   void fill(std::span<std::byte> out) noexcept;
@@ -155,7 +155,7 @@ class output_reader {
 /// the scheduler-taking form (<blake3pp/parallel.hpp>) read alike:
 /// fill(r, out) and fill(r, out, sched).
 /// @param r    The reader to advance.
-/// @param out  Receives the next out.size() bytes of r's stream.
+/// @param out  Receives the next `out.size()` bytes of r's stream.
 inline void fill(output_reader& r, std::span<std::byte> out) noexcept {
   r.fill(out);
 }
@@ -230,7 +230,7 @@ class hasher {
   /// The digest of everything absorbed so far; the hasher stays usable.
   [[nodiscard]] digest finalize() const noexcept;
 
-  /// Extended output: fills out with the first out.size() bytes of the
+  /// Extended output: fills out with the first `out.size()` bytes of the
   /// output stream, of which the digest is the first 32.
   /// @param out  Any length.
   void finalize(std::span<std::byte> out) const noexcept;

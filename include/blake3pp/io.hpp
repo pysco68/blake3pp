@@ -11,12 +11,12 @@
 /// mechanism, so the pipeline never allocates past setup, and never lets
 /// the device idle waiting for compute or the other way round.
 ///
-/// The primitive is update_file(), which is hasher::update() with a file
+/// The primitive is `update_file()`, which is `hasher::update()` with a file
 /// as the source. It streams into a caller-owned hasher and returns.
 /// Because the hasher belongs to the caller, its mode (plain, keyed,
 /// derive_key) and every finalize form (digest, extended output, the
 /// seekable reader) compose with file input without this header knowing
-/// about them. hash_file() is the one-shot convenience on top: construct,
+/// about them. `hash_file()` is the one-shot convenience on top: construct,
 /// update_file, finalize.
 ///
 /// This header is free of any execution-provider dependency: core.hpp,
@@ -132,7 +132,7 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
 
 }  // namespace detail
 
-/// Streams a file's bytes into a hasher, as h.update() would, and returns
+/// Streams a file's bytes into a hasher, as `h.update()` would, and returns
 /// with h open for more input or any finalize form.
 ///
 /// Files hash in sequence: after update_file(h, a); update_file(h, b);
@@ -195,7 +195,7 @@ concept foreign_path =
 }  // namespace detail
 
 /// update_file() for a path type from another filesystem library (e.g.
-/// boost::filesystem::path): anything with a native() the standard path
+/// boost::filesystem::path): anything with a `native()` the standard path
 /// accepts, bridged without transcoding.
 /// @param h     The hasher to stream into.
 /// @param path  The file to read.

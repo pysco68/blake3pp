@@ -494,7 +494,7 @@ struct parallel_hasher_options {
   arch a = arch::auto_detect;
   /// Bytes accumulated before a window is fanned out; rounded down to a
   /// power-of-2 multiple of chunk_size, minimum 64 KiB. Buffered input
-  /// below one window hashes sequentially at finalize().
+  /// below one window hashes sequentially at `finalize()`.
   std::size_t window_bytes = 8 * 1024 * 1024;
 };
 
@@ -590,7 +590,7 @@ class parallel_hasher {
   /// The digest of everything absorbed so far; the hasher stays usable.
   [[nodiscard]] digest finalize() const { return drained().finalize(); }
 
-  /// Extended output: fills out with the first out.size() bytes of the
+  /// Extended output: fills out with the first `out.size()` bytes of the
   /// output stream.
   /// @param out  Any length.
   void finalize(std::span<std::byte> out) const { drained().finalize(out); }
@@ -656,7 +656,7 @@ class parallel_hasher {
 /// segment or less take the sequential path.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param r              The reader to advance.
-/// @param out            Receives the next out.size() bytes of r's stream.
+/// @param out            Receives the next `out.size()` bytes of r's stream.
 /// @param sched          Where the segments are filled.
 /// @param segment_bytes  Bytes per task; rounded down to a multiple of
 ///                       block_size so every task starts on the wide path.

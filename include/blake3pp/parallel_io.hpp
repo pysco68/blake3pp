@@ -16,7 +16,7 @@
 /// window (which may be partial and contains the message end) goes
 /// through hasher::update to keep ROOT finalization correct.
 ///
-/// Same shape as io.hpp: update_file() is the primitive, hash_file() the
+/// Same shape as io.hpp: `update_file()` is the primitive, `hash_file()` the
 /// one-shot convenience, each with a throwing and a std::error_code form.
 
 #include <cstdint>
@@ -41,7 +41,7 @@ namespace blake3pp {
 /// sequence. A window is offloaded as a subtree only when h sits on a
 /// boundary aligned to it: always the case for a fresh hasher, and after
 /// files whose sizes are multiples of the window. Elsewhere the window
-/// goes through h.update() instead, so the digest is the same either way
+/// goes through `h.update()` instead, so the digest is the same either way
 /// and only the parallelism varies.
 /// @tparam Budget     The stack a window's part table may take; see
 ///                    stack_budget.
