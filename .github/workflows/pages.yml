@@ -62,26 +62,16 @@ jobs:
       - name: Build the site
         run: tools/build-site.sh --all
 
-      # The committed single-file drop is what the README and the try pages
-      # link to on GitHub, and nothing regenerates it automatically, so say
-      # when it has fallen behind the headers.
-      - name: Check the committed amalgamation is current
+      # The amalgamation is what the try links run, and it is generated
+      # rather than kept in the repository, so this is where it gets
+      # compiled. The runner has a new enough GCC only sometimes, so it
+      # warns rather than gates.
+      - name: Compile the amalgamation, if this runner can
         continue-on-error: true
         run: |
-          python3 tools/amalgamate.py -o /tmp/fresh.cpp > /dev/null
-          strip() { sed -e 's/amalgamated from .* by/amalgamated from VERSION by/' \
-                        -e 's/#define BLAKE3PP_STAMPED_VERSION ".*"/#define BLAKE3PP_STAMPED_VERSION "VERSION"/' "$1"; }
-          if ! diff -q <(strip /tmp/fresh.cpp) <(strip examples/blake3pp-single-file.cpp) > /dev/null; then
-            echo "::warning::examples/blake3pp-single-file.cpp is out of date; run tools/amalgamate.py -o examples/blake3pp-single-file.cpp"
-          fi
-
-      # A link that does not build is worse than no link; the runner has a
-      # new enough GCC only sometimes, so this warns rather than gates.
-      - name: Compile the generated file, if this runner can
-        continue-on-error: true
-        run: |
+          python3 tools/amalgamate.py -o "${RUNNER_TEMP}/single-file.cpp"
           if g++-16 --version > /dev/null 2>&1; then
-            g++-16 -std=c++26 -O2 -msse4.2 -fsyntax-only examples/blake3pp-single-file.cpp
+            g++-16 -std=c++26 -O2 -msse4.2 -fsyntax-only "${RUNNER_TEMP}/single-file.cpp"
           else
             echo "::warning::no g++-16 on this runner; published unverified"
           fi

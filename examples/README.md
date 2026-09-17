@@ -30,10 +30,10 @@ Each one is also a test, so `ctest` running them is what keeps them
 describing the library as it currently is. To leave them out of a build,
 configure with `-DBLAKE3PP_BUILD_EXAMPLES=OFF`.
 
-## Two files that are not in this list
+## One file that is not in this list
 
-`blake3pp-single-file.cpp` is the whole library concatenated into one
-translation unit by `tools/amalgamate.py`, and `parallel-demo.cpp` is the
-program appended to it. Together they are what the
-["try it" link](https://pysco68.github.io/blake3pp/try/) opens on
-Compiler Explorer, where a single file is the only thing that can be run.
+`parallel-demo.cpp` is the program behind the
+["try it" link](https://pysco68.github.io/blake3pp/try/). Compiler
+Explorer can only run a single translation unit, so `tools/amalgamate.py`
+concatenates the library into one file and appends a program to it. That
+file is generated when the site is built and is not kept here.
