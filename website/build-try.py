@@ -39,7 +39,7 @@ ROOT = {
     "slug": "",
     "demo": "parallel-demo",
     "title": "blake3pp, in your browser",
-    "source": "examples/parallel-demo.cpp",
+    "source": "website/parallel-demo.cpp",
     "libs": ["beman_execution:trunk"],
     "blurb": "It hashes on one core and on all of them, and prints both rates.",
 }

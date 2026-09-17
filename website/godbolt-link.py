@@ -5,7 +5,7 @@ Posts the editor state to godbolt.org's shortener and prints the URL, so
 the README can link a live, runnable example rather than describing one.
 
     website/amalgamate.py --no-demo -o /tmp/lib.cpp
-    cat /tmp/lib.cpp examples/parallel-demo.cpp > /tmp/full.cpp
+    cat /tmp/lib.cpp website/parallel-demo.cpp > /tmp/full.cpp
     website/godbolt-link.py /tmp/full.cpp --lib beman_execution:trunk
 """
 import argparse
