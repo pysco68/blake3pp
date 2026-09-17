@@ -200,13 +200,19 @@ def main():
         elif a.no_link:
             url = known.get("url", "https://godbolt.org/")
             note = "stale, offline" if known else "no link yet, offline"
+            # The fingerprint is deliberately not recorded here. Writing it
+            # would pair the new source with the old link, and the next run
+            # with a network would see nothing to do.
+            key = None
         else:
             tmp = scratch / "full.cpp"
             tmp.write_text(source)
             url = shorten(tmp, t["libs"])
             built, when = stamp, today
             note = "new link"
-        manifest[key] = {"url": url, "sha": sha, "commit": built, "date": when}
+        if key is not None:
+            manifest[key] = {"url": url, "sha": sha,
+                             "commit": built, "date": when}
 
         urls[t["slug"] or "root"] = url
 
