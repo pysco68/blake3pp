@@ -19,6 +19,8 @@ int main(int, char** argv) {
 }
 ```
 
+[![try it on Compiler Explorer](https://img.shields.io/badge/try%20it-Compiler%20Explorer-67c52a?logo=compilerexplorer&logoColor=white)](https://pysco68.github.io/blake3pp/try/)
+
 ```cmake
 include(FetchContent)
 FetchContent_Declare(blake3pp
