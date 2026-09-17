@@ -5,7 +5,7 @@
 [![standard](https://img.shields.io/badge/C%2B%2B-20%20%7C%2023%20%7C%2026-blue)](docs/building.md)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-An attempt at the *fastest possible* (`std::execution` + `std::simd` + direct I/O) **clean** (no assembly / intrinsics if avoidable) C++26* BLAKE3 implementation that hashes from memory and files.
+An attempt at the *fastest possible* (`std::execution` + `std::simd` + direct I/O) **clean** (no assembly / intrinsics if avoidable) C++26&ast; BLAKE3 implementation that hashes from memory and files.
 
 (*) Shipping all of that today by using polyfills that make it *just work* with most C++20 & up toolchains.
 
@@ -30,7 +30,7 @@ target_link_libraries(your_app PRIVATE blake3pp::blake3pp)
 
 That call opens the file with direct I/O, keeps several windows in flight,
 hashes with the widest kernel the processor turns out to have and spreads
-the work over core the system has.
+the work over all cores the system has.
 
 The whole specification is here, not just the digest: plain hashing,
 keyed hashing for a MAC or PRF, and `derive_key` for context-separated
