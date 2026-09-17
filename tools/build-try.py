@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -90,6 +91,37 @@ def fingerprint(source: str) -> str:
     return hashlib.sha256(source.encode()).hexdigest()
 
 
+# The published manifest is the cache that survives between CI runs: a
+# runner starts from a fresh checkout, but the site it deployed last time
+# is still there to be read. Anything that arrives this way is data from
+# the network, so its shape is checked before it is believed.
+LINK = re.compile(r"^https://godbolt\.org/z/[A-Za-z0-9]+$")
+
+
+def published(url: str, timeout: int = 30) -> dict:
+    """The manifest from the last deployment, or nothing at all."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            raw = json.load(r)
+    except Exception as e:                    # 404 on the first ever run
+        print(f"  (no published manifest at {url}: {e})")
+        return {}
+    if not isinstance(raw, dict):
+        print(f"  (published manifest is not an object; ignored)")
+        return {}
+    good = {}
+    for key, entry in raw.items():
+        if (isinstance(key, str) and isinstance(entry, dict)
+                and isinstance(entry.get("url"), str)
+                and isinstance(entry.get("sha"), str)
+                and LINK.match(entry["url"])):
+            good[key] = entry
+    dropped = len(raw) - len(good)
+    print(f"  (read {len(good)} published links"
+          + (f", dropped {dropped} malformed" if dropped else "") + ")")
+    return good
+
+
 def commit() -> str:
     try:
         return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
@@ -149,8 +181,10 @@ def main():
     ap.add_argument("--emit-map", type=pathlib.Path,
                     help="write the example-to-URL mapping here")
     ap.add_argument("--manifest", type=pathlib.Path,
-                    default=REPO / "tools/try-links.json",
-                    help="where the link cache lives")
+                    default=REPO / "build/try-links.json",
+                    help="where the local copy of the link cache lives")
+    ap.add_argument("--manifest-url", default="",
+                    help="the published manifest to seed the cache from")
     ap.add_argument("--namespace", default="",
                     help="version these links belong to, for the cache")
     ap.add_argument("--no-link", action="store_true",
@@ -166,9 +200,17 @@ def main():
 
     manifest_path = a.manifest
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = {}
+    local = {}
     if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text())
+        try:
+            local = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError:
+            print(f"  ({manifest_path} is not readable JSON; starting fresh)")
+    # A local entry is at least as new as a published one and its link is
+    # just as real, so it wins; either is only used if its fingerprint
+    # still matches the source.
+    remote = published(a.manifest_url) if a.manifest_url and not a.no_link else {}
+    manifest = {**remote, **local}
 
     scratch = pathlib.Path(tempfile.mkdtemp())
     stamp, today = commit(), datetime.date.today().isoformat()

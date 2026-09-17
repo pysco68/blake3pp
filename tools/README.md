@@ -21,7 +21,6 @@ root.
 | `amalgamate.py` | Concatenate the library into one translation unit, for Compiler Explorer and single-file drops. Its comments are stripped; the banner it writes is the one that stays. |
 | `godbolt-link.py` | Shorten a source file into a Compiler Explorer link. |
 | `build-try.py` | Write the "try it on Compiler Explorer" page for each example, minting a link when its source changed. |
-| `try-links.json` | The link cache behind that: one entry per example per version. |
 | `godbolt-check.py` | Compile and run a source file on Compiler Explorer and report, for checking a snapshot before it is published. |
 | `include-audit.py` | Cross-build `clang-include-cleaner` pass: additions from the union, removals only from the intersection. |
 | `build-site.sh` | Build the published documentation site: every release plus `main`, and the Compiler Explorer link (`--all`, `--no-link`, `--serve`). |
@@ -154,10 +153,21 @@ library, appends the example, and hashes the result. The library goes in
 with its comments stripped, because they describe a build this file is
 not: the banner at the top says so once, and tells the reader to scroll
 past the library to the program at the end, which keeps its own comments. A link is minted
-only when that hash differs from the one recorded in
-`tools/try-links.json`, so rebuilding costs no requests, and `--no-link`
-never contacts godbolt.org at all. The hash ignores the version stamp the
-amalgamation writes into itself, which otherwise changes on every commit.
+only when that hash differs from the one recorded in the link manifest,
+so rebuilding costs no requests, and `--no-link` never contacts
+godbolt.org at all. The hash ignores the version stamp the amalgamation
+writes into itself, which otherwise changes on every commit.
+
+That manifest is published with the site, at `/try/links.json`, and the
+next build reads it back from there (`--manifest-url`). A CI runner
+starts from a fresh checkout but the site it deployed last time is still
+standing, so the cache survives without being committed and without CI
+needing write access to the repository. A local copy under `build/` is
+the fallback, and `BLAKE3PP_SITE_URL` points the lookup at a fork's own
+site. Three things can go wrong and none of them is fatal: the manifest
+may not exist yet, which is the first run; the site may be unreachable,
+which falls back to the local copy; and what comes back is checked entry
+by entry, since it arrives over the network.
 
 The documentation site does not use those pages. It is rebuilt from
 scratch for every published version, so it can carry the real link, and

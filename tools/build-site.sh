@@ -40,12 +40,17 @@ trap 'rm -rf "${maps}"' EXIT
 offline=""
 [ "${link}" = 1 ] || offline="--no-link"
 
-# The link cache lives in the checkout and is keyed by version, so a tag's
-# links are minted once and then never again: its sources cannot change.
+# The link cache is published with the site and read back from there, so
+# it survives between CI runs without being committed. It is keyed by
+# version, and a tag's sources cannot change, so a tag's links are minted
+# once and then read from the manifest forever.
+site_url=${BLAKE3PP_SITE_URL:-https://pysco68.github.io/blake3pp}
+manifest=${root}/build/try-links.json
 try() {                       # try <namespace> <emitted map> [extra args...]
   local ns=$1 map=$2; shift 2
   python3 tools/build-try.py --namespace "${ns}" --emit-map "${map}" \
-    --manifest "${root}/tools/try-links.json" ${offline} "$@"
+    --manifest "${manifest}" --manifest-url "${site_url}/try/links.json" \
+    ${offline} "$@"
 }
 
 # main is this checkout: it is what a contributor is previewing, and in CI
@@ -76,7 +81,8 @@ if [ "${all}" = 1 ]; then
     if ! (cd "${tree}" \
             && python3 tools/build-try.py --namespace "${tag}" \
                  --emit-map "${maps}/${tag}.json" \
-                 --manifest "${root}/tools/try-links.json" ${offline} \
+                 --manifest "${manifest}" \
+                 --manifest-url "${site_url}/try/links.json" ${offline} \
             && tools/build-docs.sh --out "${out}/${tag}" \
                  --links "${maps}/${tag}.json"); then
       echo "-- ${tag} does not build with today's nav; skipped" >&2
@@ -86,6 +92,10 @@ if [ "${all}" = 1 ]; then
     versions+=("${tag}")
   done
 fi
+
+# Published beside the pages it describes, which is where the next build
+# reads it from.
+cp "${manifest}" "${out}/try/links.json"
 
 # The newest release is what an arriving reader should land on; with no
 # release yet, that is main.
