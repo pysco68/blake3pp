@@ -33,6 +33,13 @@ import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
+# Every link carries beman.execution, which Compiler Explorer installs.
+# The multi-core examples need it for the scheduler; the rest get it so
+# that the introspection reports a real execution provider instead of
+# "none", and so that editing any example to add a scheduler just works.
+# It is header-only, so an example that ignores it pays only compile time.
+LIBS = ["beman_execution:trunk"]
+
 # The example that opens from the site root, kept at /try/ because the
 # README has pointed there since before the examples existed.
 ROOT = {
@@ -40,13 +47,9 @@ ROOT = {
     "demo": "parallel-demo",
     "title": "blake3pp, in your browser",
     "source": "website/parallel-demo.cpp",
-    "libs": ["beman_execution:trunk"],
+    "libs": LIBS,
     "blurb": "It hashes on one core and on all of them, and prints both rates.",
 }
-
-# The multi-core examples need a library: the scheduler comes from
-# beman.execution, which Compiler Explorer installs.
-NEEDS_EXECUTION = {"06-multi-core", "09-one-file-two-ways"}
 
 # Compiler Explorer runs programs in a sandbox with a file-size limit and
 # a handful of cores. An example whose subject is storage throughput has
@@ -90,10 +93,12 @@ STAMPS = [
 ]
 
 
-def fingerprint(source: str) -> str:
+def fingerprint(source: str, libs: list) -> str:
+    """What a link is made of: the source, and the libraries selected with it."""
     for pattern, replacement in STAMPS:
         source = pattern.sub(replacement, source)
-    return hashlib.sha256(source.encode()).hexdigest()
+    material = source + "\n// libs: " + ",".join(sorted(libs))
+    return hashlib.sha256(material.encode()).hexdigest()
 
 
 # The published manifest is the cache that survives between CI runs: a
@@ -175,7 +180,7 @@ def targets():
             "demo": d.name,
             "title": title,
             "source": str(main.relative_to(REPO)),
-            "libs": ["beman_execution:trunk"] if d.name in NEEDS_EXECUTION else [],
+            "libs": LIBS,
             "blurb": blurb,
         })
     return out
@@ -236,7 +241,7 @@ def main():
         body = (REPO / t["source"]).read_text()
         body = re.sub(r"^#include <blake3pp/[^>]+>\n", "", body, flags=re.M)
         source = lib.read_text() + "\n" + body
-        sha = fingerprint(source)
+        sha = fingerprint(source, t["libs"])
 
         key = "/".join(filter(None, (a.namespace, t["slug"] or "root")))
         known = manifest.get(key, {})
