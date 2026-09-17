@@ -186,7 +186,10 @@ def main():
 // no <simd>; the file detects that and carries the scalar kernel only)
 //   -std=c++26 -O2 -msse4.2        on x86
 //   -std=c++26 -O2                 on aarch64, where NEON is mandatory
-// and, for the multi-core example only, the beman.execution library.
+// plus the beman.execution library, which Compiler Explorer installs and
+// which is the easy way to get an execution provider there. Select it and
+// the multi-core entry points exist; leave it out and they do not, and
+// execution_provider() answers "none".
 //
 // Which vector kernel this carries is decided by those flags, not by the
 // generator. Choose them for the machine that will RUN it: one file means

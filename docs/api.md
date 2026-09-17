@@ -265,6 +265,12 @@ The sender/receiver provider is a build-time choice
 
 [beman.execution]: https://github.com/bemanproject/execution
 
+The examples you can [run in a browser](https://pysco68.github.io/blake3pp/try/)
+are built on beman.execution, because it is the one Compiler Explorer
+installs. Selecting it there is a checkbox; stdexec would be a build.
+That is a convenience of the venue. A real build should take
+`std::execution` where the standard library ships it.
+
 Under the beman provider `get_parallel_scheduler()` runs on every core,
 whatever thread count a caller asks for. A program chooses otherwise by
 replacing the backend behind it, one definition per program.

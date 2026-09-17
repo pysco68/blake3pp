@@ -101,3 +101,19 @@ In the READMEs it stays an ordinary link, which is what GitHub renders.
 `godbolt-check.py` compiles and runs a file on Compiler Explorer and
 reports what happened, which is how a snapshot gets verified before its
 link is published.
+
+### Why beman.execution
+
+Every link selects it, whether or not the example hashes across cores.
+The library needs a sender/receiver implementation for its multi-core
+half, and of the three it supports, beman.execution is the one Compiler
+Explorer already installs: selecting it there is a checkbox, where
+stdexec would be a build. It is header-only, so an example that never
+touches a scheduler pays compile time and nothing else, and one that does
+gets `get_parallel_scheduler()` without the reader working out what to
+add.
+
+Leaving it out is a supported configuration. The amalgamation detects the
+header; without it the multi-core entry points are not declared, and
+`execution_provider()` answers `none`. That is what `07-which-kernel`
+prints if you clear the library list.
