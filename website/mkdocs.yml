@@ -71,6 +71,9 @@ nav:
       - Hashing a file: examples/05-hash-a-file.md
       - Multi-core hashing: examples/06-multi-core.md
       - Which kernel is running: examples/07-which-kernel.md
+      - Keyed hashing and extended output: examples/08-keyed-and-extended-output.md
+      - One file, two ways: examples/09-one-file-two-ways.md
+      - An authenticated manifest: examples/10-authenticated-manifest.md
   - Reference:
       - Overview: reference/index.md
       - blake3pp.hpp: reference/blake3pp.md

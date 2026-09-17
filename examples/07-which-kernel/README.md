@@ -53,5 +53,7 @@ The output depends on both the build and the machine.
 
 ## Next
 
+- [08-keyed-and-extended-output](../08-keyed-and-extended-output/) is the
+  first of three examples that combine these choices.
 - [Architectures and kernels](../../docs/architectures.md) lists every
   variant and how dispatch decides.

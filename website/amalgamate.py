@@ -253,8 +253,11 @@ def main():
     # The multi-core half, when the reader selected beman.execution in
     # Compiler Explorer's library list. Header-only, so it only has to be
     # reachable; nothing else in this file depends on it.
-    par = (REPO / "include/blake3pp/parallel.hpp").read_text().replace("#pragma once", "")
-    par = re.sub(r'#include [<"]blake3pp/[^>"]+[>"][^\n]*\n', "", par)
+    # parallel.hpp, then the file overloads that need both it and io.hpp.
+    par = ""
+    for h in ("include/blake3pp/parallel.hpp", "include/blake3pp/parallel_io.hpp"):
+        text = (REPO / h).read_text().replace("#pragma once", "")
+        par += re.sub(r'#include [<"]blake3pp/[^>"]+[>"][^\n]*\n', "", text)
     out.append("""
 #if defined(__has_include) && __has_include(<beman/execution/execution.hpp>)
 #define BLAKE3PP_EXECUTION_BEMAN 1

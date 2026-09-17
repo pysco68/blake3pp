@@ -44,9 +44,14 @@ ROOT = {
     "blurb": "It hashes on one core and on all of them, and prints both rates.",
 }
 
-# The multi-core example is the only one needing a library: the scheduler
-# comes from beman.execution, which Compiler Explorer installs.
-NEEDS_EXECUTION = "06-multi-core"
+# The multi-core examples need a library: the scheduler comes from
+# beman.execution, which Compiler Explorer installs.
+NEEDS_EXECUTION = {"06-multi-core", "09-one-file-two-ways"}
+
+# Compiler Explorer runs programs in a sandbox with a file-size limit and
+# a handful of cores. An example whose subject is storage throughput has
+# nothing to show there, and dies on the limit rather than reporting it.
+NO_SANDBOX = {"09-one-file-two-ways"}
 
 PAGE = """<!doctype html>
 <meta charset="utf-8">
@@ -162,13 +167,15 @@ def targets():
         readme, main = d / "README.md", d / "main.cpp"
         if not (d.is_dir() and readme.is_file() and main.is_file()):
             continue
+        if d.name in NO_SANDBOX:
+            continue
         title, blurb = summarise(readme.read_text(), d.name)
         out.append({
             "slug": d.name,
             "demo": d.name,
             "title": title,
             "source": str(main.relative_to(REPO)),
-            "libs": ["beman_execution:trunk"] if d.name == NEEDS_EXECUTION else [],
+            "libs": ["beman_execution:trunk"] if d.name in NEEDS_EXECUTION else [],
             "blurb": blurb,
         })
     return out

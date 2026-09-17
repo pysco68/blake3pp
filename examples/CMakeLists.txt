@@ -9,10 +9,12 @@ set(_examples
   04-extended-output
   06-multi-core
   07-which-kernel
+  08-keyed-and-extended-output
 )
 
 if(BLAKE3PP_WITH_IO)
-  list(APPEND _examples 05-hash-a-file)
+  list(APPEND _examples 05-hash-a-file 09-one-file-two-ways
+       10-authenticated-manifest)
 endif()
 
 list(SORT _examples)

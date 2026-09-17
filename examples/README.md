@@ -13,6 +13,14 @@ their own, and each has a README explaining what it shows.
 | [06-multi-core](06-multi-core/) | a scheduler, and why the digest does not change | [try it](https://pysco68.github.io/blake3pp/try/06-multi-core/) |
 | [07-which-kernel](07-which-kernel/) | what the binary carries, what the CPU can run | [try it](https://pysco68.github.io/blake3pp/try/07-which-kernel/) |
 
+The last three combine those choices, which is where the design shows:
+
+| | | |
+|---|---|---|
+| [08-keyed-and-extended-output](08-keyed-and-extended-output/) | a MAC of any width, and an authenticated keystream | [try it](https://pysco68.github.io/blake3pp/try/08-keyed-and-extended-output/) |
+| [09-one-file-two-ways](09-one-file-two-ways/) | the same file sequentially and across cores | needs a real disk |
+| [10-authenticated-manifest](10-authenticated-manifest/) | keyed hashing, files and verification together | [try it](https://pysco68.github.io/blake3pp/try/10-authenticated-manifest/) |
+
 Read them in order for a tour of the library, or jump to the one that
 matches the problem in front of you.
 
