@@ -76,21 +76,28 @@ BLOB = "https://github.com/pysco68/blake3pp/blob/main/"
 # button.
 TRY = re.compile(r"\]\(https://pysco68\.github\.io/blake3pp/try/([\w.-]*)/?\)")
 ALONE = re.compile(r"^\s*\[[^\]]+\]\(https://pysco68\.github\.io/blake3pp/try/[\w.-]*/?\)\s*$")
-BUTTON = "{ .md-button .md-button--primary }"
+# Compiler Explorer opens in a tab of its own: following one of these is
+# trying the example, not leaving the documentation behind.
+NEW_TAB = "target=_blank rel=noopener"
+BUTTON = "{ .md-button .md-button--primary " + NEW_TAB + " }"
+INLINE = "{ " + NEW_TAB + " }"
 links = json.loads(pathlib.Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 \
     and sys.argv[2] else {}
 
 
 def retarget(text: str) -> str:
-    if not links:
-        return text
     out = []
     for line in text.split("\n"):
+        if not TRY.search(line):
+            out.append(line)
+            continue
         button = bool(ALONE.match(line))
 
-        def swap(m):
+        def swap(m, button=button):
             url = links.get(m.group(1) or "root")
-            return m.group(0) if url is None else f"]({url})"
+            link = m.group(0) if url is None else f"]({url})"
+            # A button carries the attributes for the whole line instead.
+            return link if button else link + INLINE
 
         line = TRY.sub(swap, line)
         if button and not line.rstrip().endswith("}"):
