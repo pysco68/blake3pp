@@ -1,12 +1,14 @@
 #pragma once
 
 /// @file
-/// File hashing driven by a scheduler: the intersection of io.hpp (which
-/// windows a file at storage speed) and parallel.hpp (which hashes
-/// subtrees across threads). It is its own header because that
-/// intersection is the only part of the file API that needs an execution
-/// provider: io.hpp on its own compiles against the standard library
-/// alone, and parallel.hpp on its own knows nothing about files.
+/// File hashing driven by a scheduler: the intersection of io.hpp, which
+/// windows a file at storage speed, and parallel.hpp, which hashes
+/// subtrees across threads.
+///
+/// It is its own header because that intersection is the only part of the
+/// file API needing an execution provider. io.hpp on its own compiles
+/// against the standard library alone, and parallel.hpp on its own knows
+/// nothing about files.
 ///
 /// Every full window is a power-of-2, subtree-aligned run of chunks, so
 /// its chaining values drop into the hasher through the same

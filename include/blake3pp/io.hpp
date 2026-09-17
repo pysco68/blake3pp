@@ -2,19 +2,22 @@
 
 /// @file
 /// File hashing at storage speed: the windowed pipeline that joins the
-/// file_reader (io_uring + O_DIRECT, IOCP + NO_BUFFERING, or GCD +
-/// F_NOCACHE, whatever the platform allows) to the compute engine. While
-/// window i is being hashed, windows i+1..i+depth-1 are already streaming
-/// in; the queue-depth buffer ring is the backpressure mechanism, so the
-/// pipeline never allocates past setup and never lets the device idle
-/// waiting for compute (or vice versa).
+/// file_reader to the compute engine. The reader uses io_uring +
+/// O_DIRECT, IOCP + NO_BUFFERING, or GCD + F_NOCACHE, whatever the
+/// platform allows.
 ///
-/// The primitive is update_file(): hasher::update() with a file as the
-/// source. It streams into a caller-owned hasher and returns, so the
-/// hasher's mode (plain, keyed, derive_key) and every finalize form
-/// (digest, extended output, the seekable reader) compose with file input
-/// without this header knowing about them. hash_file() is the one-shot
-/// convenience on top: construct, update_file, finalize.
+/// While window i is being hashed, windows i+1..i+depth-1 are already
+/// streaming in. The queue-depth buffer ring is the backpressure
+/// mechanism, so the pipeline never allocates past setup, and never lets
+/// the device idle waiting for compute or the other way round.
+///
+/// The primitive is update_file(), which is hasher::update() with a file
+/// as the source. It streams into a caller-owned hasher and returns.
+/// Because the hasher belongs to the caller, its mode (plain, keyed,
+/// derive_key) and every finalize form (digest, extended output, the
+/// seekable reader) compose with file input without this header knowing
+/// about them. hash_file() is the one-shot convenience on top: construct,
+/// update_file, finalize.
 ///
 /// This header is free of any execution-provider dependency: core.hpp,
 /// dispatch.hpp and io.hpp compile against the standard library alone.

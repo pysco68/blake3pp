@@ -19,13 +19,14 @@ struct kernel_ops;
 
 /// The instruction-set variants a binary may carry.
 ///
-/// Which ones a binary actually carries is a build-time property
-/// (compiled_arches(), cmake/ArchKernels.cmake); which ones are usable is
-/// a runtime property of the CPU (available_arches()). auto_detect
-/// resolves to the best usable variant. The enumerators, their canonical
-/// names and the dispatch preference are generated from one list,
-/// detail/arch.def, which documents each entry; its line order is the
-/// ABI order and append-only.
+/// Which ones a binary carries is a build-time property, reported by
+/// compiled_arches() and decided in cmake/ArchKernels.cmake. Which ones
+/// are usable is a runtime property of the CPU, reported by
+/// available_arches(). auto_detect resolves to the best usable variant.
+///
+/// The enumerators, their canonical names and the dispatch preference are
+/// generated from one list, detail/arch.def, which documents each entry.
+/// Its line order is the ABI order, and append-only.
 enum class arch : std::uint8_t {
 #define BLAKE3PP_ARCH(enumerator, name, rank) enumerator,
 #include <blake3pp/detail/arch.def>
