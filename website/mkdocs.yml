@@ -1,4 +1,4 @@
-# The documentation site. One version of it: tools/build-site.sh builds
+# The documentation site. One version of it: website/build.sh builds
 # this once per published version and assembles them under one dropdown.
 site_name: blake3pp
 site_description: BLAKE3 for C++20 and later, with every SIMD kernel in one binary
@@ -8,9 +8,10 @@ repo_name: pysco68/blake3pp
 edit_uri: edit/main/docs/
 copyright: Apache-2.0
 
-# Staged by tools/build-docs.sh: docs/, the README, and the generated
-# reference, with their cross-links rewritten for this layout.
-docs_dir: build/site-src
+# Staged by website/build-docs.sh into the repository's build directory:
+# docs/, the README, and the generated reference, with their cross-links
+# rewritten for this layout. The path is relative to this file.
+docs_dir: ../build/site-src
 
 theme:
   name: material
@@ -38,7 +39,7 @@ theme:
       toggle: { icon: material/weather-sunny, name: Switch to light mode }
 
 extra:
-  # Reads versions.json beside the site root; tools/build-site.sh writes it.
+  # Reads versions.json beside the site root; website/build.sh writes it.
   version:
     provider: mike
     default: latest

@@ -3,14 +3,14 @@
 #
 # Three inputs become one directory: the markdown in docs/, the README as
 # the landing page, and the `///` comments in the public headers by way of
-# Doxygen's XML. tools/build-site.sh calls this once per published version.
+# Doxygen's XML. website/build.sh calls this once per published version.
 #
 # Nothing is generated into the source tree: the three are staged into
 # build/site-src, where the links can be rewritten for a site whose root
 # is docs/ without breaking the same links when read on GitHub.
 #
-#   tools/build-docs.sh --out _site/main
-#   tools/build-docs.sh --out _site/v0.1.0 --links /tmp/links.json
+#   website/build-docs.sh --out _site/main
+#   website/build-docs.sh --out _site/v0.1.0 --links /tmp/links.json
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -36,7 +36,7 @@ venv=${BLAKE3PP_DOCS_VENV:-${PWD}/.venv-docs}
 if [ ! -x "${venv}/bin/mkdocs" ]; then
   echo "-- creating ${venv}"
   python3 -m venv "${venv}"
-  "${venv}/bin/pip" install -q -r docs/requirements.txt
+  "${venv}/bin/pip" install -q -r website/requirements.txt
 fi
 
 command -v doxygen > /dev/null || {
@@ -51,10 +51,10 @@ cp docs/*.md "${src}/"
 # none of its HTML is published.
 echo "-- extracting the header documentation"
 doxygen - > /dev/null <<DOXY
-$(cat tools/Doxyfile)
+$(cat website/Doxyfile)
 XML_OUTPUT = ${PWD}/build/doxygen/xml
 DOXY
-python3 tools/doxygen-to-md.py --xml build/doxygen/xml --out "${src}/reference"
+python3 website/doxygen-to-md.py --xml build/doxygen/xml --out "${src}/reference"
 
 # docs/index.md is the site's landing page and the README is not published:
 # the two have different jobs. The documents' back-links to the README are
@@ -141,6 +141,6 @@ PY
 echo "-- mkdocs build -> ${out}"
 log=$(mktemp); trap 'rm -f "${log}"' EXIT
 status=0
-"${venv}/bin/mkdocs" build --strict --site-dir "${out}" > "${log}" 2>&1 || status=$?
+"${venv}/bin/mkdocs" build -f website/mkdocs.yml --strict --site-dir "${out}" > "${log}" 2>&1 || status=$?
 grep -vE "^INFO|^[[:space:]]*$|Material for MkDocs team|MkDocs 2\.0|plugin system|theming system|migration path|contribution model|Currently unlicensed|squidfunk\.github\.io|full analysis|^.\[3[0-9]m" "${log}" >&2 || true
 exit ${status}

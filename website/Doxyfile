@@ -1,5 +1,5 @@
 # Doxygen runs headless here: it parses the public headers and writes XML,
-# which tools/doxygen-to-md.py turns into the site's reference pages. No
+# which website/doxygen-to-md.py turns into the site's reference pages. No
 # Doxygen HTML is ever published, so nothing in here is about presentation.
 PROJECT_NAME           = blake3pp
 INPUT                  = include/blake3pp

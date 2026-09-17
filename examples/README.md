@@ -34,6 +34,6 @@ configure with `-DBLAKE3PP_BUILD_EXAMPLES=OFF`.
 
 `parallel-demo.cpp` is the program behind the
 ["try it" link](https://pysco68.github.io/blake3pp/try/). Compiler
-Explorer can only run a single translation unit, so `tools/amalgamate.py`
+Explorer can only run a single translation unit, so `website/amalgamate.py`
 concatenates the library into one file and appends a program to it. That
 file is generated when the site is built and is not kept here.

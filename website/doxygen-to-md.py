@@ -6,7 +6,7 @@ the same text as one markdown page per header, so the reference and the
 tooltips can never disagree. It reads only what Doxygen extracted, adds
 nothing, and links entities to each other by Doxygen's own refids.
 
-    tools/doxygen-to-md.py --xml build/doxygen/xml --out docs/reference
+    website/doxygen-to-md.py --xml build/doxygen/xml --out docs/reference
 """
 import argparse
 import html

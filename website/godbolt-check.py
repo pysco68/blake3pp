@@ -5,7 +5,7 @@ A "try it" link is only worth publishing if the snapshot behind it still
 builds and runs on the machines that will serve it. This asks Compiler
 Explorer to do both and exits non-zero when either fails.
 
-    tools/godbolt-check.py /tmp/full.cpp --lib beman_execution:trunk
+    website/godbolt-check.py /tmp/full.cpp --lib beman_execution:trunk
 """
 import argparse
 import json

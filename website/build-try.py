@@ -11,12 +11,12 @@ for: redirect pages at a fixed address, repointed whenever the source
 behind them changes. The documentation site needs something else, because
 it is rebuilt from scratch for every published version and can therefore
 carry the real link directly. --emit-map writes the name-to-URL mapping
-that tools/build-docs.sh substitutes into each version's pages, so a
+that website/build-docs.sh substitutes into each version's pages, so a
 reader of v0.1.0's documentation opens v0.1.0's code.
 
-    tools/build-try.py --output _site/try
-    tools/build-try.py --namespace v0.1.0 --emit-map /tmp/links.json
-    tools/build-try.py --output _site/try --no-link   # offline: reuse links
+    website/build-try.py --output _site/try
+    website/build-try.py --namespace v0.1.0 --emit-map /tmp/links.json
+    website/build-try.py --output _site/try --no-link   # offline: reuse links
 """
 import argparse
 import datetime
@@ -131,7 +131,7 @@ def commit() -> str:
 
 
 def shorten(source: pathlib.Path, libs: list) -> str:
-    cmd = [sys.executable, str(REPO / "tools/godbolt-link.py"), str(source)]
+    cmd = [sys.executable, str(REPO / "website/godbolt-link.py"), str(source)]
     for lib in libs:
         cmd += ["--lib", lib]
     return subprocess.run(cmd, capture_output=True, text=True,
@@ -222,7 +222,7 @@ def main():
         # program at the end, and names it, so the library is generated
         # once per example rather than shared between them.
         lib = scratch / "lib.cpp"
-        subprocess.run([sys.executable, str(REPO / "tools/amalgamate.py"),
+        subprocess.run([sys.executable, str(REPO / "website/amalgamate.py"),
                         "--no-demo", "--demo-name", t["demo"], "-o", str(lib)],
                        check=True, capture_output=True)
 

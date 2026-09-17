@@ -4,10 +4,10 @@
 #
 # CI runs exactly this, so what you preview locally is what gets published.
 #
-#   tools/build-site.sh                 # this checkout only, as "main"
-#   tools/build-site.sh --all           # main and every v* tag
-#   tools/build-site.sh --no-link       # offline: keep the current CE link
-#   tools/build-site.sh --serve         # ...and serve it on :8000
+#   website/build.sh                 # this checkout only, as "main"
+#   website/build.sh --all           # main and every v* tag
+#   website/build.sh --no-link       # offline: keep the current CE link
+#   website/build.sh --serve         # ...and serve it on :8000
 #
 # Every version is built with the tooling from this checkout, not from the
 # tag: a release documents its own headers, but how they are rendered is
@@ -48,7 +48,7 @@ site_url=${BLAKE3PP_SITE_URL:-https://pysco68.github.io/blake3pp}
 manifest=${root}/build/try-links.json
 try() {                       # try <namespace> <emitted map> [extra args...]
   local ns=$1 map=$2; shift 2
-  python3 tools/build-try.py --namespace "${ns}" --emit-map "${map}" \
+  python3 website/build-try.py --namespace "${ns}" --emit-map "${map}" \
     --manifest "${manifest}" --manifest-url "${site_url}/try/links.json" \
     ${offline} "$@"
 }
@@ -59,7 +59,7 @@ echo "== main"
 # main shares its links with the redirect pages at the site root, which is
 # where the README points: both describe the current tip.
 try "" "${maps}/main.json" --output "${out}/try"
-tools/build-docs.sh --out "${out}/main" --links "${maps}/main.json"
+website/build-docs.sh --out "${out}/main" --links "${maps}/main.json"
 versions=("main")
 
 if [ "${all}" = 1 ]; then
@@ -70,20 +70,16 @@ if [ "${all}" = 1 ]; then
     tree=${work}/${tag}
     git -C "${root}" worktree add --detach --quiet "${tree}" "${tag}"
     # The generator travels; the documented sources stay at the tag.
-    cp "${root}/mkdocs.yml" "${tree}/mkdocs.yml"
-    mkdir -p "${tree}/tools" "${tree}/docs"
-    cp "${root}/tools/Doxyfile" "${root}/tools/doxygen-to-md.py" \
-       "${root}/tools/build-docs.sh" "${root}/tools/build-try.py" \
-       "${root}/tools/godbolt-link.py" "${tree}/tools/"
-    cp "${root}/docs/requirements.txt" "${tree}/docs/"
+    rm -rf "${tree}/website"
+    cp -r "${root}/website" "${tree}/website"
     # A tag that predates a document the nav lists cannot build strictly;
     # it is skipped rather than failing the whole site.
     if ! (cd "${tree}" \
-            && python3 tools/build-try.py --namespace "${tag}" \
+            && python3 website/build-try.py --namespace "${tag}" \
                  --emit-map "${maps}/${tag}.json" \
                  --manifest "${manifest}" \
                  --manifest-url "${site_url}/try/links.json" ${offline} \
-            && tools/build-docs.sh --out "${out}/${tag}" \
+            && website/build-docs.sh --out "${out}/${tag}" \
                  --links "${maps}/${tag}.json"); then
       echo "-- ${tag} does not build with today's nav; skipped" >&2
       rm -rf "${out:?}/${tag}"

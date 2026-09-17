@@ -21,7 +21,7 @@ xsimd is not needed (std::simd is the provider) and neither is stdexec:
 the scheduler comes from beman.execution, which Compiler Explorer already
 installs, and only the caller's own TU includes it.
 
-    tools/amalgamate.py -o /tmp/blake3pp-single-file.cpp
+    website/amalgamate.py -o /tmp/blake3pp-single-file.cpp
 """
 import argparse
 import pathlib
@@ -174,7 +174,7 @@ def main():
 // {'=' * 70}"""
 
     arch_def = (REPO / "include/blake3pp/detail/arch.def").read_text()
-    out = [f"""// blake3pp, amalgamated from {version()} by tools/amalgamate.py.{notice}
+    out = [f"""// blake3pp, amalgamated from {version()} by website/amalgamate.py.{notice}
 //
 // Two kernels: the scalar fallback, and {"BLAKE3PP_AMALGAM_NS"}, built for whatever
 // this compiler was told to target. The shipped library compiles one
@@ -274,7 +274,7 @@ def main():
         body = strip_comments(body)
     text = banner + "\n" + body
     if not args.no_demo:
-        text += "\n" + (REPO / "tools/amalgam-demo.inc").read_text()
+        text += "\n" + (REPO / "website/amalgam-demo.inc").read_text()
     pathlib.Path(args.output).write_text(text)
     print(f"{args.output}: {len(pathlib.Path(args.output).read_text().splitlines())} lines")
 
