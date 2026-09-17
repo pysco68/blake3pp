@@ -306,7 +306,7 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
   const std::uint8_t* src = block;
 #if BLAKE3PP_ALIGN_MESSAGE_BLOCK
   alignas(std::uint32_t) std::uint8_t staged[block_len];
-  if ((reinterpret_cast<std::uintptr_t>(src) &
+  if ((std::bit_cast<std::uintptr_t>(src) &
        (alignof(std::uint32_t) - 1)) != 0) {
     std::memcpy(staged, src, block_len);
     src = staged;

@@ -16,6 +16,7 @@
 
 #include <emscripten/bind.h>
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -30,10 +31,10 @@ namespace {
 using namespace blake3pp;
 
 std::span<const std::byte> in(std::uintptr_t ptr, std::size_t len) {
-  return {reinterpret_cast<const std::byte*>(ptr), len};
+  return {std::bit_cast<const std::byte*>(ptr), len};
 }
 std::span<std::byte> out(std::uintptr_t ptr, std::size_t len) {
-  return {reinterpret_cast<std::byte*>(ptr), len};
+  return {std::bit_cast<std::byte*>(ptr), len};
 }
 arch arch_named(const std::string& name) {
   return arch_from_string(name).value_or(arch::auto_detect);

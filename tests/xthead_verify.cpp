@@ -28,6 +28,7 @@
 // xof_many over inputs that exercise the wide path, the serial remainder,
 // and multi-block chaining.
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 
@@ -51,7 +52,7 @@ namespace {
 
 void sys_write(const char* s, std::size_t n) noexcept {
   register std::intptr_t a0 asm("a0") = 1;  // stdout
-  register std::intptr_t a1 asm("a1") = reinterpret_cast<std::intptr_t>(s);
+  register std::intptr_t a1 asm("a1") = std::bit_cast<std::intptr_t>(s);
   register std::intptr_t a2 asm("a2") = static_cast<std::intptr_t>(n);
   register std::intptr_t a7 asm("a7") = 64;  // __NR_write
   asm volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");

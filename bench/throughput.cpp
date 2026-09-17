@@ -539,7 +539,7 @@ int main(int argc, char** argv) {
     blake3_hasher_init(&h);
     blake3_hasher_update(&h, input.data(), input.size());
     blake3pp::digest d{};
-    blake3_hasher_finalize(&h, reinterpret_cast<std::uint8_t*>(d.bytes.data()),
+    blake3_hasher_finalize(&h, blake3pp::kern::kernel_bytes(d.bytes.data()),
                            BLAKE3_OUT_LEN);
 #if defined(__has_feature)
 #if __has_feature(memory_sanitizer)

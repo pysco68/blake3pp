@@ -136,7 +136,7 @@ void hasher::close_full_chunk() noexcept {
 }
 
 void hasher::update(std::span<const std::byte> input) noexcept {
-  const auto* p = reinterpret_cast<const std::uint8_t*>(input.data());
+  const auto* p = kern::kernel_bytes(input.data());
   std::size_t len = input.size();
 
   while (len > 0) {
@@ -229,7 +229,7 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
       const std::size_t nblocks = (out.size() - done) / kern::block_len;
       ops_->xof_many(input_cv_.data(), block_.data(), block_len_,
                      block_index, flags_,
-                     reinterpret_cast<std::uint8_t*>(out.data() + done),
+                     kern::kernel_bytes(out.data() + done),
                      nblocks);
       done += nblocks * kern::block_len;
       position_ += nblocks * kern::block_len;
@@ -239,7 +239,7 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
       // uint8_t view of the byte cache at the flat kernel ABI boundary.
       ops_->compress_xof(input_cv_.data(), block_.data(), block_len_,
                          block_index, flags_,
-                         reinterpret_cast<std::uint8_t*>(cache_.data()));
+                         kern::kernel_bytes(cache_.data()));
       cached_block_ = block_index;
       cache_valid_ = true;
     }
@@ -268,7 +268,7 @@ void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::uint32_t base_flags,
                          std::span<std::uint32_t, 8> out_cv) noexcept {
   core::compress_subtree_to_cv(*ops,
-                               reinterpret_cast<const std::uint8_t*>(data),
+                               kern::kernel_bytes(data),
                                num_chunks, chunk_counter, key, base_flags,
                                out_cv);
 }

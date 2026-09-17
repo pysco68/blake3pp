@@ -14,12 +14,15 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
+#include <bit>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <new>
 #include <span>
 #include <string>
 #include <system_error>
@@ -72,6 +75,34 @@ inline std::string no_uring_suffix(int err) {
   }
 }
 
+// The ring is memory the kernel mapped and writes into, so no C++ object
+// was ever created in it, while the accesses below want a T there: an
+// unsigned for std::atomic_ref, which operates on an object in place.
+//
+// Two spellings say so, and both are defined behaviour. start_lifetime_as
+// is the one that means it and copies nothing, and is C++23.
+// Placement-new creates the object the standard requires, and seeding it
+// from the bytes already in the storage is what keeps the value the kernel
+// put there; the byte read is legal, and the write puts back what it read.
+// Nothing else in the ring is named as an object at all: the descriptors
+// and completions are copied in and out, because memcpy creates whatever
+// it writes and a local is a real object to read into.
+template <class T>
+[[nodiscard]] inline T* ring_at(unsigned char* base, std::uint32_t off) noexcept {
+#ifdef __cpp_lib_start_lifetime_as
+  return std::start_lifetime_as<T>(base + off);
+#else
+  T seed{};
+  std::memcpy(&seed, base + off, sizeof seed);
+  return ::new (static_cast<void*>(base + off)) T(seed);
+#endif
+}
+
+// atomic_ref needs the referenced object to be lock-free to be usable from
+// another address space; nothing here would work otherwise.
+static_assert(std::atomic_ref<unsigned>::is_always_lock_free,
+              "the io_uring head/tail contract needs lock-free 32-bit atomics");
+
 // The mapped rings, reduced to what this pipeline needs. Kernel-shared
 // integers are accessed through atomic_ref with acquire/release, per the
 // io_uring memory-ordering contract.
@@ -88,15 +119,15 @@ struct uring {
   std::size_t sq_ring_sz = 0;
   void* cq_ring = nullptr;
   std::size_t cq_ring_sz = 0;
-  io_uring_sqe* sqes = nullptr;
+  unsigned char* sqes = nullptr;
   std::size_t sqes_sz = 0;
   unsigned* sq_tail = nullptr;
   unsigned* sq_mask = nullptr;
-  unsigned* sq_array = nullptr;
+  unsigned char* sq_array = nullptr;
   unsigned* cq_head = nullptr;
   unsigned* cq_tail = nullptr;
   unsigned* cq_mask = nullptr;
-  io_uring_cqe* cqes = nullptr;
+  unsigned char* cqes = nullptr;
 
   uring() = default;
   uring(const uring&) = delete;
@@ -133,7 +164,7 @@ struct uring {
       return fail();
     }
     sqes_sz = p.sq_entries * sizeof(io_uring_sqe);
-    sqes = static_cast<io_uring_sqe*>(
+    sqes = static_cast<unsigned char*>(
         ::mmap(nullptr, sqes_sz, PROT_READ | PROT_WRITE,
                MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES));
     if (sqes == MAP_FAILED) {
@@ -142,13 +173,13 @@ struct uring {
     }
     auto* sqb = static_cast<unsigned char*>(sq_ring);
     auto* cqb = static_cast<unsigned char*>(cq_ring);
-    sq_tail = reinterpret_cast<unsigned*>(sqb + p.sq_off.tail);
-    sq_mask = reinterpret_cast<unsigned*>(sqb + p.sq_off.ring_mask);
-    sq_array = reinterpret_cast<unsigned*>(sqb + p.sq_off.array);
-    cq_head = reinterpret_cast<unsigned*>(cqb + p.cq_off.head);
-    cq_tail = reinterpret_cast<unsigned*>(cqb + p.cq_off.tail);
-    cq_mask = reinterpret_cast<unsigned*>(cqb + p.cq_off.ring_mask);
-    cqes = reinterpret_cast<io_uring_cqe*>(cqb + p.cq_off.cqes);
+    sq_tail = ring_at<unsigned>(sqb, p.sq_off.tail);
+    sq_mask = ring_at<unsigned>(sqb, p.sq_off.ring_mask);
+    sq_array = sqb + p.sq_off.array;
+    cq_head = ring_at<unsigned>(cqb, p.cq_off.head);
+    cq_tail = ring_at<unsigned>(cqb, p.cq_off.tail);
+    cq_mask = ring_at<unsigned>(cqb, p.cq_off.ring_mask);
+    cqes = cqb + p.cq_off.cqes;
     return true;
   }
 
@@ -182,7 +213,7 @@ struct uring {
                  bool offload = false) {
     const unsigned tail = *sq_tail;  // we are the only writer
     const unsigned idx = tail & *sq_mask;
-    io_uring_sqe& sqe = sqes[idx];
+    io_uring_sqe sqe{};
     std::memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = opcode;
     if (offload) {
@@ -196,11 +227,12 @@ struct uring {
       sqe.flags |= IOSQE_ASYNC;
     }
     sqe.fd = file_fd;
-    sqe.addr = reinterpret_cast<std::uint64_t>(buf);
+    sqe.addr = static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(buf));
     sqe.len = len;
     sqe.off = off;
     sqe.user_data = user_data;
-    sq_array[idx] = idx;
+    std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
+    std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
     std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
                                               std::memory_order_release);
     if (sys_io_uring_enter(fd, 1, 0, 0) < 0) {
@@ -215,7 +247,9 @@ struct uring {
       const unsigned tail =
           std::atomic_ref<unsigned>(*cq_tail).load(std::memory_order_acquire);
       if (head != tail) {
-        const io_uring_cqe& cqe = cqes[head & *cq_mask];
+        io_uring_cqe cqe{};
+        std::memcpy(&cqe, cqes + (head & *cq_mask) * sizeof(io_uring_cqe),
+                    sizeof(cqe));
         const std::pair<std::uint64_t, int> out{cqe.user_data, cqe.res};
         std::atomic_ref<unsigned>(*cq_head).store(head + 1,
                                                   std::memory_order_release);

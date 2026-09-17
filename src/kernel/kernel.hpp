@@ -76,6 +76,18 @@ inline constexpr std::uint32_t flag_derive_key_material = 1u << 6;
 // no heap, no vtable, no dynamic registration. One predicted indirect call
 // per >=1 KiB of work; everything behind it inlines under the variant's own
 // flags.
+// The kernel ABI is flat, std::uint8_t* as a C interface would be, while
+// the library's own surface is std::byte. Both are byte types, so these
+// hand back a view of the same object rather than punning its type; the
+// hop through void* is what keeps them out of reinterpret_cast.
+[[nodiscard]] inline const std::uint8_t* kernel_bytes(
+    const std::byte* p) noexcept {
+  return static_cast<const std::uint8_t*>(static_cast<const void*>(p));
+}
+[[nodiscard]] inline std::uint8_t* kernel_bytes(std::byte* p) noexcept {
+  return static_cast<std::uint8_t*>(static_cast<void*>(p));
+}
+
 struct kernel_ops {
   // Which variant this table implements; the identity behind
   // hasher::selected_arch() and friends.

@@ -20,6 +20,7 @@
 // the stopwatch that settles it per machine.
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -100,7 +101,7 @@ bool drop_caches() {
       ::GetLastError() == ERROR_SUCCESS;
   ::CloseHandle(token);
   using set_information_fn = LONG(NTAPI*)(ULONG, PVOID, ULONG);
-  const auto set_information = reinterpret_cast<set_information_fn>(
+  const auto set_information = std::bit_cast<set_information_fn>(
       ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtSetSystemInformation"));
   if (!enabled || set_information == nullptr) {
     return false;

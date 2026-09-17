@@ -50,9 +50,13 @@ struct temp_file {
     path = fs::temp_directory_path() /
            ("blake3pp_io_test_" + std::to_string(run_id) + "_" +
             std::to_string(counter++));
+    // ostream::write wants char, so the bytes are converted rather than
+    // reinterpreted: one transform and one bulk write.
+    std::string chars(content.size(), '\0');
+    std::ranges::transform(content, chars.begin(),
+                           [](std::byte b) { return static_cast<char>(b); });
     std::ofstream out(path, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(content.data()),
-              static_cast<std::streamsize>(content.size()));
+    out.write(chars.data(), static_cast<std::streamsize>(chars.size()));
   }
   ~temp_file() {
     std::error_code ec;
