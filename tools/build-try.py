@@ -66,6 +66,22 @@ PAGE = """<!doctype html>
 """
 
 
+# The amalgamation stamps itself with `git describe`, so its bytes change
+# on every commit while the code in it does not. Hashing the stamped-out
+# form is what keeps a link alive until the library actually changes.
+STAMPS = [
+    (re.compile(r"amalgamated from \S+ by"), "amalgamated from VERSION by"),
+    (re.compile(r'#define BLAKE3PP_STAMPED_VERSION "[^"]*"'),
+     '#define BLAKE3PP_STAMPED_VERSION "VERSION"'),
+]
+
+
+def fingerprint(source: str) -> str:
+    for pattern, replacement in STAMPS:
+        source = pattern.sub(replacement, source)
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
 def commit() -> str:
     try:
         return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
@@ -147,9 +163,13 @@ def main():
         body = (REPO / t["source"]).read_text()
         body = re.sub(r"^#include <blake3pp/[^>]+>\n", "", body, flags=re.M)
         source = library + "\n" + body
-        sha = hashlib.sha256(source.encode()).hexdigest()
+        sha = fingerprint(source)
 
-        known = manifest.get(t["slug"] or "root", {})
+        key = t["slug"] or "root"
+        known = manifest.get(key, {})
+        # The stamp on the page names the commit the LINK was built from,
+        # so it stays put until a new link is minted.
+        built, when = known.get("commit", stamp), known.get("date", today)
         if known.get("sha") == sha and not a.force:
             url = known["url"]
             note = "unchanged"
@@ -161,8 +181,9 @@ def main():
             tmp.write_text(source)
             url = shorten(tmp, t["libs"])
             tmp.unlink()
+            built, when = stamp, today
             note = "new link"
-        manifest[t["slug"] or "root"] = {"url": url, "sha": sha}
+        manifest[key] = {"url": url, "sha": sha, "commit": built, "date": when}
 
         page = a.output / t["slug"] / "index.html" if t["slug"] \
             else a.output / "index.html"
@@ -172,7 +193,7 @@ def main():
             title=html.escape(t["title"]),
             url=html.escape(url, quote=True),
             blurb=html.escape(t["blurb"]),
-            commit=html.escape(stamp), date=today,
+            commit=html.escape(built), date=when,
             repo=html.escape(repo_url, quote=True)))
         print(f"  {t['slug'] or '/':<24} {note:<16} {url}")
 

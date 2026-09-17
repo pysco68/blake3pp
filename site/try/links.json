@@ -1,34 +1,50 @@
 {
   "01-hello-hash": {
-    "sha": "7526041ce1c87f881d4344ae524f72b8ad87f28d081b6cb42ef82639464d2c59",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "40c112d4d1fd7a4e88455f0982f72cfaa15d9b61ea02a627318cf46caf4dd0a1",
     "url": "https://godbolt.org/z/Mc5GcKKzM"
   },
   "02-incremental": {
-    "sha": "4fb1d37654273feb46ccd28e2bcb71d504eb80075ca71c5c3005c8ddda589dad",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "46c294244a1b3cd7bb637f8de07bb8b400d0f24b5a37b092b21137d42c92f9c4",
     "url": "https://godbolt.org/z/7c85cdqEY"
   },
   "03-keyed-and-derive-key": {
-    "sha": "f5e15033ef2edaa2145f124762f59dad186f1edbd1b18ddf5d30cd0e5d59ae65",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "036ca2a53838c34941d37ae8c8b6dfda7aa861701bb7bcd496880e5e62020f08",
     "url": "https://godbolt.org/z/8MfvKqPv5"
   },
   "04-extended-output": {
-    "sha": "172d08ecff46fa2711320fc902dcbdd6f58cdc861dd146079ae6cf8b8fb328c7",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "bd3195d93e8f70c2c11701c8748e40be7f75d71cc38d2ecccc1a5e9a3a9737cb",
     "url": "https://godbolt.org/z/58v8roMvz"
   },
   "05-hash-a-file": {
-    "sha": "d40d3de025437d198df6d83142ba61d5e439fcb60bf617472a8a97428ce3951e",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "2f3584e1e4a45e58ccf047894a9800d464ca496a6ee788f3ba50844189247fef",
     "url": "https://godbolt.org/z/vYxTjnTzE"
   },
   "06-multi-core": {
-    "sha": "c7451f92b657a4aec1b3692b319cfd5666b755195809ab63ed0c76c5e09a632e",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "f0b4ac851a5a2d2c9ec956aeeed5626141e4f4a81794449c88ab2e60a5ee5ead",
     "url": "https://godbolt.org/z/bcser5vfE"
   },
   "07-which-kernel": {
-    "sha": "aae70460b95a12c92bae5a6258e1fa5c3c9f204b54a38ae496c4d808ff6dbcc6",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "be48c9da483c79487709500ae638c658492ddf3c6ee60a17ddef99babdaf5301",
     "url": "https://godbolt.org/z/heWvnj4ac"
   },
   "root": {
-    "sha": "276d6013711f29631dc324d4ebe5f2f1db8b8959bf1d69eff2578c82aca4def1",
+    "commit": "564f139",
+    "date": "2026-09-17",
+    "sha": "1f782725a742bf5dc618bc6db0d90d2882344db424fd3a595cf9a752ae6efcfb",
     "url": "https://godbolt.org/z/6jcbKohTq"
   }
 }
