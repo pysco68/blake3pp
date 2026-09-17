@@ -1,4 +1,4 @@
-// blake3pp, amalgamated from f0960e7 by tools/amalgamate.py.
+// blake3pp, amalgamated from 9c43def-dirty by tools/amalgamate.py.
 //
 // Two kernels: the scalar fallback, and BLAKE3PP_AMALGAM_NS, built for whatever
 // this compiler was told to target. The shipped library compiles one
@@ -697,6 +697,442 @@ struct std::formatter<blake3pp::digest> : std::formatter<std::string_view> {
   }
 };
 #endif
+
+
+
+// The portable boundary over OS-native file reading. One interface, the
+// fastest backend the platform and filesystem allow, decided at runtime:
+//
+//   Linux:  io_uring + O_DIRECT (async, page-cache-bypassing) with graceful
+//           per-feature fallback (no O_DIRECT support -> buffered io_uring;
+//           no io_uring -> synchronous pread)
+//   Windows: IOCP + FILE_FLAG_NO_BUFFERING (async, page-cache-bypassing)
+//           with the same per-feature fallback (no port -> sync ReadFile)
+//   macOS:  GCD (libdispatch pool) + F_NOCACHE (async, page-cache-
+//           bypassing for uncached data; already-cached pages still come
+//           from RAM) with the same fallback (no async -> sync pread)
+//   POSIX:  synchronous pread
+//   other:  buffered stdio
+//
+// The model: the file is a sequence of fixed-size windows. queue_depth
+// buffers are allocated once at construction (the only allocation);
+// windows are delivered strictly in file order while later windows stream
+// in behind them. release() recycles a buffer, which is what creates
+// backpressure: at most queue_depth windows are ever in flight or held.
+// Not thread-safe; drive it from one pipeline thread.
+
+#include <cstddef>
+#include <string_view>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+
+namespace blake3pp::detail {
+
+struct file_reader_options {
+  // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB.
+  std::size_t window_bytes = 8 * 1024 * 1024;
+  unsigned queue_depth = 4;  // clamped to [2, 32]
+  bool direct_io = true;     // try O_DIRECT; silently degrade if refused
+  bool async = true;         // try io_uring; silently degrade if refused
+  // Issue each read on the kernel's worker threads (io_uring: IOSQE_ASYNC)
+  // rather than inline in the submit call. Issuing a large direct read is
+  // real CPU work (pinning pages, building and queueing the bios) that
+  // otherwise lands on the thread that also waits for the hash; see
+  // src/io/uring_backend.hpp. Ignored by backends without the notion.
+  bool offload_submit = true;
+};
+
+class file_reader {
+ public:
+  // Throws std::system_error if the file cannot be opened or statted.
+  // std::filesystem::path is the canonical currency: it carries the
+  // platform's native encoding, which is what makes the Windows backend
+  // implementable without an API break.
+  file_reader(const std::filesystem::path& path,
+              const file_reader_options& opts);
+  ~file_reader();
+  file_reader(const file_reader&) = delete;
+  file_reader& operator=(const file_reader&) = delete;
+
+  struct window {
+    const std::byte* data;
+    std::size_t bytes;     // == window_bytes for all but possibly the last
+    std::uint64_t offset;  // byte offset within the file
+    bool last;             // reaches end of file
+    unsigned slot;         // buffer slot; hand back via release()
+  };
+
+  [[nodiscard]] std::uint64_t file_size() const noexcept;
+
+  // Next window in file order; blocks until its read completes. Empty at
+  // EOF. Throws std::system_error on read failure. The data stays valid
+  // until release() of this window (or destruction).
+  std::optional<window> next();
+
+  // Recycles the buffer slot, allowing the next pending window's read to
+  // be issued into it.
+  void release(const window& w) noexcept;
+
+  // Which mechanism was actually engaged, e.g. "io_uring+direct",
+  // "iocp+direct", "gcd+nocache", "pread", "readfile", "stdio".
+  [[nodiscard]] std::string_view backend() const noexcept;
+
+ private:
+  struct impl;
+  // unique_ptr over an incomplete type: legal because the destructor is
+  // only DECLARED here and defined in the TU where impl is complete. That
+  // also keeps this class non-movable by default, which is deliberate:
+  // outstanding windows/buffers hold the slot indices this object owns.
+  std::unique_ptr<impl> impl_;
+};
+
+}  // namespace blake3pp::detail
+
+
+
+// The write-side mirror of file_reader: sequential file output through the
+// fastest mechanism the platform allows, decided at runtime:
+//
+//   Linux:  io_uring + O_DIRECT (async, page-cache-bypassing) with graceful
+//           per-feature fallback (no O_DIRECT -> buffered io_uring;
+//           no io_uring -> synchronous pwrite)
+//   Windows: IOCP + FILE_FLAG_NO_BUFFERING, preallocation via
+//           SetEndOfFile + best-effort SetFileValidData (waives NTFS's
+//           synchronous zero-fill to the valid-data length)
+//   macOS:  GCD (libdispatch pool) + F_NOCACHE, preallocation via
+//           F_PREALLOCATE + ftruncate
+//   POSIX:  synchronous pwrite
+//   other:  buffered stdio
+//
+// The model inverts the reader's: acquire() hands out one of queue_depth
+// fixed-size buffers (allocated once at construction, the only
+// allocation), the caller fills it, submit() queues the write at the next
+// sequential offset and immediately returns so the producer can fill the
+// next buffer while the device drains this one. acquire() blocking on a
+// still-in-flight slot is the backpressure. O_DIRECT demands 4 KiB-aligned
+// lengths, so only the final submit() may be partial or unaligned; it is
+// written through a plain fd, the same trick the reader uses for its tail.
+// finish() drains all in-flight writes. Not thread-safe; drive it from one
+// producer thread (the buffers it hands out may of course be filled by
+// many).
+
+#include <cstddef>
+#include <string_view>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+
+namespace blake3pp::detail {
+
+struct file_writer_options {
+  // Rounded up to a multiple of 4 KiB, min 64 KiB.
+  std::size_t buffer_bytes = 8 * 1024 * 1024;
+  unsigned queue_depth = 4;  // clamped to [2, 32]
+  bool direct_io = true;     // try O_DIRECT; silently degrade if refused
+  bool async = true;         // try io_uring; silently degrade if refused
+  // Issue each write on the kernel's worker threads (io_uring: IOSQE_ASYNC)
+  // rather than inline in the submit call, the reader's offload_submit for
+  // the producer side; see src/io/uring_backend.hpp.
+  bool offload_submit = true;
+  // Preallocate this many bytes at construction when the total is known.
+  // This matters enormously for async direct I/O: writes that EXTEND the
+  // file serialize on the inode lock (each waits out journal + allocation),
+  // while writes into preallocated extents overlap freely. On Windows the
+  // same role is played by SetEndOfFile plus SetFileValidData (privilege
+  // permitting). finish() trims the file back to the bytes actually
+  // written.
+  std::uint64_t preallocate_bytes = 0;
+};
+
+class file_writer {
+ public:
+  // Creates or truncates the file. Throws std::system_error on failure.
+  file_writer(const std::filesystem::path& path,
+              const file_writer_options& opts);
+  ~file_writer();
+  file_writer(const file_writer&) = delete;
+  file_writer& operator=(const file_writer&) = delete;
+
+  struct buffer {
+    std::byte* data;
+    std::size_t capacity;  // == buffer_bytes (rounded)
+    unsigned slot;
+  };
+
+  // Next free buffer; blocks until the slot's previous write completes.
+  // Throws std::system_error if that write failed.
+  buffer acquire();
+
+  // Queues `bytes` from the buffer at the next sequential file offset and
+  // returns without waiting. `bytes` must be a multiple of 4 KiB except on
+  // the final submit before finish(). Throws std::system_error on
+  // submission failure.
+  void submit(const buffer& b, std::size_t bytes);
+
+  // Blocks until every queued write has hit the file; surfaces any
+  // deferred write error. Implicit in the destructor, but only finish()
+  // can report failure, so call it.
+  void finish();
+
+  [[nodiscard]] std::uint64_t bytes_written() const noexcept;
+
+  // Which mechanism was actually engaged, e.g. "io_uring+direct",
+  // "iocp+direct+vdl", "gcd+nocache", "pwrite", "writefile", "stdio".
+  [[nodiscard]] std::string_view backend() const noexcept;
+
+ private:
+  struct impl;
+  // unique_ptr over an incomplete type: legal because the destructor is
+  // only DECLARED here and defined in the TU where impl is complete. That
+  // also keeps this class non-movable by default, which is deliberate:
+  // outstanding windows/buffers hold the slot indices this object owns.
+  std::unique_ptr<impl> impl_;
+};
+
+}  // namespace blake3pp::detail
+
+
+
+/// @file
+/// File hashing at storage speed: the windowed pipeline that joins the
+/// file_reader (io_uring + O_DIRECT, IOCP + NO_BUFFERING, or GCD +
+/// F_NOCACHE, whatever the platform allows) to the compute engine. While
+/// window i is being hashed, windows i+1..i+depth-1 are already streaming
+/// in; the queue-depth buffer ring is the backpressure mechanism, so the
+/// pipeline never allocates past setup and never lets the device idle
+/// waiting for compute (or vice versa).
+///
+/// The primitive is update_file(): hasher::update() with a file as the
+/// source. It streams into a caller-owned hasher and returns, so the
+/// hasher's mode (plain, keyed, derive_key) and every finalize form
+/// (digest, extended output, the seekable reader) compose with file input
+/// without this header knowing about them. hash_file() is the one-shot
+/// convenience on top: construct, update_file, finalize.
+///
+/// This header is free of any execution-provider dependency: core.hpp,
+/// dispatch.hpp and io.hpp compile against the standard library alone.
+/// Reads still overlap hashing here (the reader is asynchronous); what is
+/// sequential is the compute. The scheduler-taking overloads, which fan
+/// each window out over cores, live in parallel_io.hpp, the one public
+/// header that needs stdexec/beman/std::execution.
+///
+/// std::filesystem::path is the path currency throughout (string literals
+/// and std::string convert implicitly). Each entry point follows the
+/// standard library's dual-overload idiom: the plain form throws
+/// std::system_error on I/O failure, the std::error_code& form reports
+/// through ec instead.
+
+#include <array>
+#include <concepts>
+#include <cstddef>
+#include <filesystem>
+#include <optional>
+#include <span>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+
+
+namespace blake3pp {
+
+/// The pipeline's knobs: what update_file() takes. The hasher it streams
+/// into already carries the SIMD variant and the mode.
+struct file_io_options {
+  /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
+  /// minimum 64 KiB.
+  std::size_t window_bytes = 8 * 1024 * 1024;
+  /// Windows in flight at once; clamped to [2, 32].
+  unsigned queue_depth = 4;
+  /// Bypass the page cache where the platform supports it; degrades to
+  /// buffered reads where it does not.
+  bool direct_io = true;
+  /// Issue each read on the kernel's I/O worker threads instead of inline
+  /// in the submitting thread (Linux: io_uring's IOSQE_ASYNC). Issuing a
+  /// large direct read costs real CPU time, and inline it is paid by the
+  /// thread that also drives the hash; kernels since 6.x issue inline
+  /// whenever they can, so this asks for the hand-off explicitly. Ignored
+  /// where the platform has no such notion.
+  bool offload_submit = true;
+};
+
+/// hash_file()'s knobs: the pipeline's, plus what shapes the hasher it
+/// constructs internally.
+///
+/// Both structs spell the shared fields the same way so designated
+/// initializers read alike, and this one converts to file_io_options so a
+/// single options object can drive both entry points (a tool's
+/// --window/--qd/--no-direct flags land in one place).
+struct hash_file_options {
+  /// The SIMD variant of the hasher.
+  arch a = arch::auto_detect;
+  /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
+  /// minimum 64 KiB.
+  std::size_t window_bytes = 8 * 1024 * 1024;
+  /// Windows in flight at once; clamped to [2, 32].
+  unsigned queue_depth = 4;
+  /// Bypass the page cache where the platform supports it.
+  bool direct_io = true;
+  /// Issue reads on the kernel's I/O worker threads; see file_io_options.
+  bool offload_submit = true;
+  /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
+  /// derive_key and extended output have no shortcut here: build the
+  /// hasher yourself and use update_file().
+  std::optional<std::array<std::byte, key_size>> key = std::nullopt;
+
+  /// The pipeline knobs alone, so one options object drives update_file()
+  /// too.
+  constexpr operator file_io_options() const noexcept {
+    return {window_bytes, queue_depth, direct_io, offload_submit};
+  }
+};
+
+namespace detail {
+
+inline hasher make_hasher(const hash_file_options& opts,
+                          const kern::kernel_ops* ops) noexcept {
+  if (opts.key.has_value()) {
+    return hasher::keyed(std::span<const std::byte, key_size>{opts.key.value()},
+                         ops);
+  }
+  return hasher{ops};
+}
+
+// The body of every std::error_code overload: ec is cleared, then set
+// from the std::system_error the throwing form raises. Anything else
+// escaping the pipeline is an allocation failure at setup (the buffer
+// ring, the queue), reported as not_enough_memory. Value-returning
+// callers get a default-constructed result on failure.
+template <class F>
+auto with_error_code(std::error_code& ec, F&& fn) noexcept
+    -> std::invoke_result_t<F> {
+  using result = std::invoke_result_t<F>;
+  try {
+    ec.clear();
+    return std::forward<F>(fn)();
+  } catch (const std::system_error& e) {
+    ec = e.code();
+  } catch (...) {
+    ec = std::make_error_code(std::errc::not_enough_memory);
+  }
+  if constexpr (!std::is_void_v<result>) {
+    return result{};
+  }
+}
+
+}  // namespace detail
+
+/// Streams a file's bytes into a hasher, as h.update() would, and returns
+/// with h open for more input or any finalize form.
+///
+/// Files hash in sequence: after update_file(h, a); update_file(h, b);
+/// h holds the hash of a's bytes followed by b's. The hasher's mode
+/// (plain, keyed, derive_key) applies unchanged.
+/// @param h     The hasher to stream into.
+/// @param path  The file to read.
+/// @param opts  The pipeline knobs.
+/// @throws std::system_error on I/O failure; h is then in an unspecified
+///         but valid state (reset() or discard it).
+///
+/// @code
+/// blake3pp::hasher h = blake3pp::hasher::derive_key("fixture v3 2026-09");
+/// blake3pp::update_file(h, "seed.bin");
+/// auto stream = h.finalize_xof();
+/// @endcode
+void update_file(hasher& h, const std::filesystem::path& path,
+                 const file_io_options& opts = {});
+/// Streams a file's bytes into a hasher, reporting failure through ec
+/// instead of throwing.
+/// @param h     The hasher to stream into.
+/// @param path  The file to read.
+/// @param ec    Cleared on success; the I/O error otherwise (allocation
+///              failure at setup reads as not_enough_memory).
+/// @param opts  The pipeline knobs.
+void update_file(hasher& h, const std::filesystem::path& path,
+                 std::error_code& ec,
+                 const file_io_options& opts = {}) noexcept;
+
+/// One-shot digest of a file: a hasher shaped by opts (SIMD variant,
+/// optional key), the file streamed through it, finalized.
+/// @param path  The file to hash.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @throws std::system_error on I/O failure.
+[[nodiscard]] digest hash_file(const std::filesystem::path& path,
+                               const hash_file_options& opts = {});
+/// One-shot digest of a file, reporting failure through ec instead of
+/// throwing.
+/// @param path  The file to hash.
+/// @param ec    Cleared on success; the I/O error otherwise.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @return The digest, or an all-zero digest when ec is set.
+[[nodiscard]] digest hash_file(const std::filesystem::path& path,
+                               std::error_code& ec,
+                               const hash_file_options& opts = {}) noexcept;
+
+namespace detail {
+
+// Path types from other filesystem libraries (boost::filesystem::path is
+// the motivating case): anything exposing a native() character sequence
+// that std::filesystem::path accepts as a Source. Bridging through
+// native() preserves the platform encoding exactly (no lossy transcoding,
+// unlike .string() on Windows). Structural, so no third-party dependency
+// or naming enters this library.
+template <class P>
+concept foreign_path =
+    !std::same_as<std::remove_cvref_t<P>, std::filesystem::path> &&
+    requires(const P& p) { std::filesystem::path(p.native()); };
+
+}  // namespace detail
+
+/// update_file() for a path type from another filesystem library (e.g.
+/// boost::filesystem::path): anything with a native() the standard path
+/// accepts, bridged without transcoding.
+/// @param h     The hasher to stream into.
+/// @param path  The file to read.
+/// @param opts  The pipeline knobs.
+template <detail::foreign_path P>
+void update_file(hasher& h, const P& path, const file_io_options& opts = {}) {
+  update_file(h, std::filesystem::path(path.native()), opts);
+}
+
+/// update_file() for a foreign path type, reporting through ec.
+/// @param h     The hasher to stream into.
+/// @param path  The file to read.
+/// @param ec    Cleared on success; the error otherwise.
+/// @param opts  The pipeline knobs.
+template <detail::foreign_path P>
+void update_file(hasher& h, const P& path, std::error_code& ec,
+                 const file_io_options& opts = {}) noexcept {
+  // The path conversion allocates, so it belongs inside the guard too.
+  detail::with_error_code(ec, [&] {
+    update_file(h, std::filesystem::path(path.native()), opts);
+  });
+}
+
+/// hash_file() for a foreign path type.
+/// @param path  The file to hash.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
+template <detail::foreign_path P>
+[[nodiscard]] digest hash_file(const P& path,
+                               const hash_file_options& opts = {}) {
+  return hash_file(std::filesystem::path(path.native()), opts);
+}
+
+/// hash_file() for a foreign path type, reporting through ec.
+/// @param path  The file to hash.
+/// @param ec    Cleared on success; the error otherwise.
+/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @return The digest, or an all-zero digest when ec is set.
+template <detail::foreign_path P>
+[[nodiscard]] digest hash_file(const P& path, std::error_code& ec,
+                               const hash_file_options& opts = {}) noexcept {
+  return detail::with_error_code(ec, [&] {
+    return hash_file(std::filesystem::path(path.native()), opts);
+  });
+}
+
+}  // namespace blake3pp
 
 
 
@@ -5031,7 +5467,7 @@ bool operator==(const digest& lhs, const digest& rhs) noexcept {
 // the right probe: each fact is stated exactly once.
 
 
-#define BLAKE3PP_STAMPED_VERSION "f0960e7-amalgamated"
+#define BLAKE3PP_STAMPED_VERSION "9c43def-dirty-amalgamated"
 
 
 #include <array>
@@ -5754,6 +6190,2219 @@ bool platform_run_trap_probes() noexcept { return false; }
 }  // namespace blake3pp::detail
 
 #endif  // BLAKE3PP_CPU_DETECT_X86
+
+// file_reader implementation: a pimpl shell around the portable engine.
+// This TU contains no platform code and no engine logic: reader_engine
+// (io/engine.hpp) is the window/slot machine, written once against the
+// reader_backend concept, and io/backend_select.hpp decides which OS
+// backend it is instantiated with here: io_uring (Linux), IOCP
+// (Windows), GCD (macOS), plain pread (other POSIX), stdio (everything
+// else). Runtime degradation (O_DIRECT refused -> buffered, async engine
+// refused -> sync) happens inside the backends.
+
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string_view>
+
+
+
+// The one platform decision left in the I/O layer. Each branch names the
+// backend pair the OS gets; everything else (the engines and the backends
+// themselves) is straight-line C++. The engine TUs static_assert the
+// concepts (io/backend.hpp) against these aliases, so a backend drifting
+// from the contract fails loudly at this seam, not somewhere inside the
+// engine. Internal to src/io/, never installed.
+
+#if defined(__linux__)
+
+
+// The Linux backend: io_uring driven through raw syscalls (three of them:
+// setup, enter, and mmap for the rings), with no liburing dependency, so
+// every moving part is visible. Degrades per-feature at RUNTIME inside
+// this class: O_DIRECT refused by the filesystem -> buffered io_uring;
+// io_uring refused (seccomp, old kernel) -> synchronous pread. Internal
+// to src/io/, never installed.
+
+#if defined(__linux__)
+
+#include <linux/io_uring.h>
+#include <string_view>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+
+
+// The portable contract between the file_reader/file_writer engines and
+// the per-OS I/O backends. 
+//
+// Two contract rules that span every operation, so they live here rather
+// than on any one requirement below:
+//  - Slot exclusivity: start()/start_write() may only be called for a
+//    slot the backend claimed via wants_async(...), and only while
+//    nothing else is outstanding on that slot.
+//  - Teardown drain: a backend's destructor drains every in-flight
+//    operation. The engines declare their buffer pool member BEFORE the
+//    backend member precisely so the drain runs before the pool is
+//    freed.
+// Internal to src/io/, never installed.
+
+#include <cerrno>
+#include <string_view>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <new>
+#include <span>
+#include <system_error>
+
+
+namespace blake3pp::detail::io_impl {
+
+[[noreturn]] inline void throw_errno(const char* what) {
+  throw std::system_error(errno, std::generic_category(), what);
+}
+
+// The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule.
+constexpr std::size_t direct_align = 4096;
+
+// The engines' buffer arena: one direct-I/O-aligned allocation, RAII so
+// member declaration order alone sequences teardown against the backend.
+struct aligned_pool {
+  std::byte* data = nullptr;
+
+  explicit aligned_pool(std::size_t bytes)
+      : data(static_cast<std::byte*>(
+            ::operator new(bytes, std::align_val_t{direct_align}))) {}
+  ~aligned_pool() { ::operator delete(data, std::align_val_t{direct_align}); }
+  aligned_pool(const aligned_pool&) = delete;
+  aligned_pool& operator=(const aligned_pool&) = delete;
+};
+
+template <class B>
+concept reader_backend =
+    // Opens the file and decides (at runtime, per feature) how much of
+    // the requested fast path (direct I/O, async engine) it can actually
+    // deliver. The unsigned is the engine's queue depth: the most slots
+    // that can ever be outstanding at once.
+    std::constructible_from<B, const std::filesystem::path&,
+                            const file_reader_options&, unsigned> &&
+    requires(B b, const B cb, unsigned slot, std::uint64_t off,
+             std::span<std::byte> buf) {
+      { cb.size() } noexcept -> std::same_as<std::uint64_t>;
+      { cb.name() } noexcept -> std::convertible_to<std::string_view>;
+      // The whole runtime-degradation ladder folded into one question the
+      // engine asks per window: "may THIS (offset, length) ride your
+      // async path?" uring/IOCP answer engaged && length aligned
+      // (O_DIRECT / NO_BUFFERING reject unaligned lengths), GCD answers
+      // engaged (F_NOCACHE has no alignment contract, so the tail rides
+      // too), sync backends answer never. The engine doesn't learn why:
+      // false just routes the window to read_sync at delivery time.
+      // (Current backends ignore the offset, since engine windows start
+      // at 64 KiB multiples and it is therefore always granule-aligned,
+      // but it is part of the question because O_DIRECT constrains offset
+      // alignment too, and a future engine might not guarantee it.)
+      { cb.wants_async(off, std::size_t{}) } noexcept -> std::same_as<bool>;
+      // Begins an async read of buf at off, owned by `slot`; legal only
+      // after wants_async() said yes for exactly this window.
+      { b.start(slot, off, buf) };
+      // Blocks until `slot`'s read fully completes, reissuing short
+      // reads and absorbing OTHER slots' completions when the OS delivers
+      // them out of order. Throws std::system_error on failure, including
+      // failures a worker thread captured earlier.
+      { b.wait(slot) };
+      // Positional synchronous read: completes fully or throws. Picks the
+      // right handle internally (direct vs buffered) for the length's
+      // alignment; the unaligned-tail dance is backend business.
+      { b.read_sync(off, buf) };
+    };
+
+template <class B>
+concept writer_backend =
+    // Creates/truncates the file, preallocates if asked (fallocate /
+    // SetEndOfFile+VDL / F_PREALLOCATE), and engages what it can of the
+    // fast path. The unsigned is the engine's queue depth.
+    std::constructible_from<B, const std::filesystem::path&,
+                            const file_writer_options&, unsigned> &&
+    requires(B b, const B cb, unsigned slot, std::uint64_t off,
+             std::span<const std::byte> buf, std::uint64_t written) {
+      { cb.name() } noexcept -> std::convertible_to<std::string_view>;
+      // The reader's degradation question, minus the offset: the engine
+      // writes strictly sequentially and only the final submit may be
+      // unaligned, so the length alone decides. False routes the buffer
+      // to write_sync.
+      { cb.wants_async(std::size_t{}) } noexcept -> std::same_as<bool>;
+      // Begins an async write of buf at off, owned by `slot`; legal only
+      // after wants_async() said yes for this length. Returns without
+      // waiting: the device drains while the producer fills the next
+      // buffer.
+      { b.start_write(slot, off, buf) };
+      // Blocks until `slot` is idle (trivially so on sync backends).
+      // This is the engine's backpressure point: acquire() calls it
+      // before recycling the slot's buffer. Throws the slot's deferred
+      // write error as std::system_error.
+      { b.wait_slot(slot) };
+      // Positional synchronous write: completes fully or throws. Handle
+      // choice (direct vs buffered) for the length's alignment is
+      // backend business, same as read_sync.
+      { b.write_sync(off, buf) };
+      // End of stream: drain every in-flight write, trim the
+      // preallocation back to `written` bytes, flush what needs
+      // flushing. May be called more than once; the destructor is the
+      // error-swallowing fallback for what finish() didn't get to.
+      { b.finish(written) };
+    };
+
+}  // namespace blake3pp::detail::io_impl
+
+
+
+// Shared POSIX file plumbing for the I/O backends: the buffered fd that
+// always exists, the optional O_DIRECT reopen next to it (a per-open flag,
+// hence a second fd; Darwin's F_NOCACHE backend instead flips `direct` on
+// the one fd), and the EINTR-looping positional read/write primitives.
+// Internal to src/io/, never installed.
+
+#if defined(__unix__) || defined(__APPLE__)
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <system_error>
+
+
+
+namespace blake3pp::detail::io_impl {
+
+struct posix_file {
+  int fd_plain = -1;  // always-buffered fd (unaligned tails, fallback)
+  int fd = -1;        // == fd_plain unless the O_DIRECT reopen engaged
+  bool direct = false;
+
+  posix_file() = default;
+  posix_file(const posix_file&) = delete;
+  posix_file& operator=(const posix_file&) = delete;
+  ~posix_file() {
+    if (fd != fd_plain && fd >= 0) {
+      ::close(fd);
+    }
+    if (fd_plain >= 0) {
+      ::close(fd_plain);
+    }
+  }
+
+  void open(const char* path, int flags, ::mode_t mode = 0) {
+    fd_plain = ::open(path, flags, mode);
+    if (fd_plain < 0) {
+      throw_errno("open");
+    }
+    fd = fd_plain;
+  }
+
+  [[nodiscard]] std::uint64_t stat_size() const {
+    struct stat st;
+    if (::fstat(fd_plain, &st) != 0) {
+      throw_errno("fstat");
+    }
+    return static_cast<std::uint64_t>(st.st_size);
+  }
+
+  // O_DIRECT is a per-open flag: engage by reopening, keeping the plain fd
+  // for unaligned lengths. Silently declines where the platform (Darwin)
+  // lacks the flag or the filesystem refuses it.
+  void try_odirect(const char* path, int flags) noexcept {
+#if defined(O_DIRECT)
+    const int dfd = ::open(path, flags | O_DIRECT);
+    if (dfd >= 0) {
+      fd = dfd;
+      direct = true;
+    }
+#else
+    (void)path;
+    (void)flags;
+#endif
+  }
+
+  // Picks the fd for a synchronous positional transfer: direct only when
+  // engaged AND the length keeps O_DIRECT's alignment contract.
+  [[nodiscard]] int sync_fd(std::size_t len) const noexcept {
+    return direct && len % direct_align == 0 ? fd : fd_plain;
+  }
+
+  void pread_all(int use_fd, std::byte* dst, std::size_t len,
+                 std::uint64_t off) const {
+    std::size_t got = 0;
+    while (got < len) {
+      const ssize_t n = ::pread(use_fd, dst + got, len - got,
+                                static_cast<off_t>(off + got));
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw_errno("pread");
+      }
+      if (n == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "unexpected EOF");
+      }
+      got += static_cast<std::size_t>(n);
+    }
+  }
+
+  void pwrite_all(int use_fd, const std::byte* src, std::size_t len,
+                  std::uint64_t off) const {
+    std::size_t put = 0;
+    while (put < len) {
+      const ssize_t n = ::pwrite(use_fd, src + put, len - put,
+                                 static_cast<off_t>(off + put));
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        throw_errno("pwrite");
+      }
+      put += static_cast<std::size_t>(n);
+    }
+  }
+};
+
+}  // namespace blake3pp::detail::io_impl
+
+#endif  // __unix__ || __APPLE__
+
+
+// MemorySanitizer cannot see io_uring completions: the kernel fills read
+// buffers without any libc call MSan intercepts, so the bytes stay
+// "uninitialized" in its shadow. Read completions therefore unpoison the
+// range they filled, stating a fact MSan has no other way to learn.
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#define BLAKE3PP_MSAN_UNPOISON(ptr, len) __msan_unpoison(ptr, len)
+#endif
+#endif
+#if !defined(BLAKE3PP_MSAN_UNPOISON)
+#define BLAKE3PP_MSAN_UNPOISON(ptr, len) ((void)0)
+#endif
+
+namespace blake3pp::detail::io_impl {
+
+inline int sys_io_uring_setup(unsigned entries, io_uring_params* p) noexcept {
+  return static_cast<int>(::syscall(__NR_io_uring_setup, entries, p));
+}
+
+inline int sys_io_uring_enter(int ring_fd, unsigned to_submit,
+                              unsigned min_complete, unsigned flags) noexcept {
+  return static_cast<int>(::syscall(__NR_io_uring_enter, ring_fd, to_submit,
+                                    min_complete, flags, nullptr, 0));
+}
+
+// Names the reason the ring is absent, for the fallback backend name the
+// tools print. Without this, "blocked by policy" (Android's seccomp
+// filter, EPERM) and "kernel too old" (ENOSYS) are indistinguishable in
+// bench output: a fourth kind of quiet degradation the backend line
+// otherwise wouldn't confess to, in the same spirit as --version's "cpu
+// also supports X (not compiled in)".
+inline std::string no_uring_suffix(int err) {
+  switch (err) {
+    case EPERM:
+      return " [io_uring: EPERM, blocked by policy]";
+    case ENOSYS:
+      return " [io_uring: ENOSYS, kernel too old]";
+    default:
+      return " [io_uring: errno " + std::to_string(err) + "]";
+  }
+}
+
+// The mapped rings, reduced to what this pipeline needs. Kernel-shared
+// integers are accessed through atomic_ref with acquire/release, per the
+// io_uring memory-ordering contract.
+struct uring {
+  int fd = -1;
+  // errno from a failed io_uring_setup. EPERM (a seccomp policy forbids
+  // the syscall; Android does) and ENOSYS (kernel predates io_uring) are
+  // the same observable with entirely different causes, so the fallback
+  // name below reports which one fired.
+  int setup_errno = 0;
+  unsigned sq_entries = 0;
+  unsigned cq_entries = 0;
+  void* sq_ring = nullptr;
+  std::size_t sq_ring_sz = 0;
+  void* cq_ring = nullptr;
+  std::size_t cq_ring_sz = 0;
+  io_uring_sqe* sqes = nullptr;
+  std::size_t sqes_sz = 0;
+  unsigned* sq_tail = nullptr;
+  unsigned* sq_mask = nullptr;
+  unsigned* sq_array = nullptr;
+  unsigned* cq_head = nullptr;
+  unsigned* cq_tail = nullptr;
+  unsigned* cq_mask = nullptr;
+  io_uring_cqe* cqes = nullptr;
+
+  uring() = default;
+  uring(const uring&) = delete;
+  uring& operator=(const uring&) = delete;
+  ~uring() { destroy(); }
+
+  bool init(unsigned entries) noexcept {
+    io_uring_params p;
+    std::memset(&p, 0, sizeof(p));
+    fd = sys_io_uring_setup(entries, &p);
+    if (fd < 0) {
+      setup_errno = errno;
+      return false;
+    }
+    sq_entries = p.sq_entries;
+    cq_entries = p.cq_entries;
+    sq_ring_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+    cq_ring_sz = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {
+      sq_ring_sz = cq_ring_sz = std::max(sq_ring_sz, cq_ring_sz);
+    }
+    sq_ring = ::mmap(nullptr, sq_ring_sz, PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+    if (sq_ring == MAP_FAILED) {
+      sq_ring = nullptr;  // destroy() tests for null, and MAP_FAILED is -1
+      return fail();
+    }
+    cq_ring = (p.features & IORING_FEAT_SINGLE_MMAP)
+                  ? sq_ring
+                  : ::mmap(nullptr, cq_ring_sz, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+    if (cq_ring == MAP_FAILED) {
+      cq_ring = nullptr;
+      return fail();
+    }
+    sqes_sz = p.sq_entries * sizeof(io_uring_sqe);
+    sqes = static_cast<io_uring_sqe*>(
+        ::mmap(nullptr, sqes_sz, PROT_READ | PROT_WRITE,
+               MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES));
+    if (sqes == MAP_FAILED) {
+      sqes = nullptr;
+      return fail();
+    }
+    auto* sqb = static_cast<unsigned char*>(sq_ring);
+    auto* cqb = static_cast<unsigned char*>(cq_ring);
+    sq_tail = reinterpret_cast<unsigned*>(sqb + p.sq_off.tail);
+    sq_mask = reinterpret_cast<unsigned*>(sqb + p.sq_off.ring_mask);
+    sq_array = reinterpret_cast<unsigned*>(sqb + p.sq_off.array);
+    cq_head = reinterpret_cast<unsigned*>(cqb + p.cq_off.head);
+    cq_tail = reinterpret_cast<unsigned*>(cqb + p.cq_off.tail);
+    cq_mask = reinterpret_cast<unsigned*>(cqb + p.cq_off.ring_mask);
+    cqes = reinterpret_cast<io_uring_cqe*>(cqb + p.cq_off.cqes);
+    return true;
+  }
+
+  bool fail() noexcept {
+    destroy();
+    return false;
+  }
+
+  void destroy() noexcept {
+    if (sqes != nullptr) {
+      ::munmap(sqes, sqes_sz);
+      sqes = nullptr;
+    }
+    if (cq_ring != nullptr && cq_ring != sq_ring) {
+      ::munmap(cq_ring, cq_ring_sz);
+    }
+    cq_ring = nullptr;
+    if (sq_ring != nullptr) {
+      ::munmap(sq_ring, sq_ring_sz);
+      sq_ring = nullptr;
+    }
+    if (fd >= 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+
+  // Queues one READ or WRITE; the sole submitter, so sq_tail needs no CAS.
+  void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
+                 unsigned len, std::uint64_t off, std::uint64_t user_data,
+                 bool offload = false) {
+    const unsigned tail = *sq_tail;  // we are the only writer
+    const unsigned idx = tail & *sq_mask;
+    io_uring_sqe& sqe = sqes[idx];
+    std::memset(&sqe, 0, sizeof(sqe));
+    sqe.opcode = opcode;
+    if (offload) {
+      // Issue on io-wq rather than inline. Kernels before ~6.x bailed out
+      // of the inline attempt on a large O_DIRECT read and punted anyway;
+      // newer ones complete it inline, 1.5-1.9 ms of pinning, splitting
+      // and queueing per 64 MiB on the submitting thread (four PCIe 5
+      // drives, kernel 7.0). Serialized with the hash that thread also
+      // waits for, that halved the pipeline; asking for the hand-off
+      // restored it (22 -> 41 GiB/s).
+      sqe.flags |= IOSQE_ASYNC;
+    }
+    sqe.fd = file_fd;
+    sqe.addr = reinterpret_cast<std::uint64_t>(buf);
+    sqe.len = len;
+    sqe.off = off;
+    sqe.user_data = user_data;
+    sq_array[idx] = idx;
+    std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
+                                              std::memory_order_release);
+    if (sys_io_uring_enter(fd, 1, 0, 0) < 0) {
+      throw_errno("io_uring_enter(submit)");
+    }
+  }
+
+  // Blocks for one completion and returns (user_data, result).
+  std::pair<std::uint64_t, int> wait_one() {
+    for (;;) {
+      const unsigned head = *cq_head;  // we are the only consumer
+      const unsigned tail =
+          std::atomic_ref<unsigned>(*cq_tail).load(std::memory_order_acquire);
+      if (head != tail) {
+        const io_uring_cqe& cqe = cqes[head & *cq_mask];
+        const std::pair<std::uint64_t, int> out{cqe.user_data, cqe.res};
+        std::atomic_ref<unsigned>(*cq_head).store(head + 1,
+                                                  std::memory_order_release);
+        return out;
+      }
+      if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
+          errno != EINTR) {
+        throw_errno("io_uring_enter(wait)");
+      }
+    }
+  }
+};
+
+class uring_reader {
+ public:
+  uring_reader(const std::filesystem::path& path,
+               const file_reader_options& opts, unsigned nslots)
+      : slots_(nslots) {
+    f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    size_ = f_.stat_size();
+    if (opts.direct_io) {
+      f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
+    }
+    if (opts.async && ring_.init(2 * nslots)) {
+      use_uring_ = true;
+      offload_ = opts.offload_submit;
+    }
+    name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
+                       : (f_.direct ? "pread+direct" : "pread");
+    if (use_uring_ && !offload_) {
+      name_ += " (inline submit)";
+    }
+    if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
+      name_ += no_uring_suffix(ring_.setup_errno);
+    }
+  }
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+  // Only fully-aligned windows may ride the io_uring path (O_DIRECT
+  // rejects unaligned lengths); the tail goes through read_sync.
+  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t len) const
+      noexcept {
+    return use_uring_ && len % direct_align == 0;
+  }
+
+  void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
+    slots_[s] = {buf, off, 0, false};
+    ring_.submit_rw(IORING_OP_READ, f_.fd, buf.data(),
+                    static_cast<unsigned>(buf.size()), off, s, offload_);
+  }
+
+  // Reaps completions (issuing continuations for short reads) until slot
+  // `s` is fully read; completions for other slots are absorbed into
+  // their state along the way.
+  void wait(unsigned s) {
+    while (!slots_[s].ready) {
+      const auto [ud, res] = ring_.wait_one();
+      const unsigned c = static_cast<unsigned>(ud);
+      slot& st = slots_[c];
+      if (res < 0) {
+        throw std::system_error(-res, std::generic_category(),
+                                "io_uring read");
+      }
+      if (res == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "unexpected EOF (io_uring)");
+      }
+      BLAKE3PP_MSAN_UNPOISON(st.buf.data() + st.filled,
+                             static_cast<std::size_t>(res));
+      st.filled += static_cast<std::size_t>(res);
+      if (st.filled < st.buf.size()) {
+        ring_.submit_rw(IORING_OP_READ, f_.fd, st.buf.data() + st.filled,
+                        static_cast<unsigned>(st.buf.size() - st.filled),
+                        st.off + st.filled, c, offload_);
+      } else {
+        st.ready = true;
+      }
+    }
+  }
+
+  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
+    f_.pread_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+  }
+
+ private:
+  struct slot {
+    std::span<std::byte> buf{};
+    std::uint64_t off = 0;
+    std::size_t filled = 0;
+    bool ready = false;
+  };
+
+  posix_file f_;
+  uring ring_;
+  std::vector<slot> slots_;
+  std::uint64_t size_ = 0;
+  bool use_uring_ = false;
+  bool offload_ = false;
+  std::string name_ = "pread";
+};
+
+class uring_writer {
+ public:
+  uring_writer(const std::filesystem::path& path,
+               const file_writer_options& opts, unsigned nslots)
+      : slots_(nslots) {
+    f_.open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    // Preallocating turns every write into an overwrite of existing
+    // extents. Extending writes serialize on the inode lock; with async
+    // direct I/O that collapses the whole queue to one stalled write at a
+    // time.
+    if (opts.preallocate_bytes > 0 &&
+        ::fallocate(f_.fd_plain, 0, 0,
+                    static_cast<off_t>(opts.preallocate_bytes)) == 0) {
+      prealloc_ = opts.preallocate_bytes;
+    }
+    if (opts.direct_io) {
+      // Reopen (not TRUNC, already truncated) so the tail keeps a plain fd.
+      f_.try_odirect(path.c_str(), O_WRONLY | O_CLOEXEC);
+    }
+    if (opts.async && ring_.init(2 * nslots)) {
+      use_uring_ = true;
+      offload_ = opts.offload_submit;
+    }
+    name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
+                       : (f_.direct ? "pwrite+direct" : "pwrite");
+    if (use_uring_ && !offload_) {
+      name_ += " (inline submit)";
+    }
+    if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
+      name_ += no_uring_suffix(ring_.setup_errno);
+    }
+  }
+
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+  [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
+    return use_uring_ && len % direct_align == 0;
+  }
+
+  void start_write(unsigned s, std::uint64_t off,
+                   std::span<const std::byte> buf) {
+    slots_[s] = {buf, off, 0, true};
+    ring_.submit_rw(IORING_OP_WRITE, f_.fd, buf.data(),
+                    static_cast<unsigned>(buf.size()), off, s, offload_);
+  }
+
+  void wait_slot(unsigned s) {
+    while (slots_[s].busy) {
+      reap_one();
+    }
+  }
+
+  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
+    f_.pwrite_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+  }
+
+  void finish(std::uint64_t written) {
+    for (unsigned s = 0; s < slots_.size(); ++s) {
+      wait_slot(s);
+    }
+    // fallocate set the file size up front; trim if less was written.
+    if (prealloc_ > written &&
+        ::ftruncate(f_.fd_plain, static_cast<off_t>(written)) != 0) {
+      throw_errno("ftruncate");
+    }
+    prealloc_ = 0;
+  }
+
+ private:
+  struct slot {
+    std::span<const std::byte> buf{};
+    std::uint64_t off = 0;
+    std::size_t done = 0;
+    bool busy = false;
+  };
+
+  // Reaps one completion, issuing a continuation on a short write. The
+  // device may complete slots in any order; each carries its slot index.
+  void reap_one() {
+    const auto [ud, res] = ring_.wait_one();
+    const unsigned s = static_cast<unsigned>(ud);
+    slot& st = slots_[s];
+    if (res <= 0) {
+      throw std::system_error(res < 0 ? -res : EIO, std::generic_category(),
+                              "io_uring write");
+    }
+    st.done += static_cast<std::size_t>(res);
+    if (st.done < st.buf.size()) {
+      ring_.submit_rw(IORING_OP_WRITE, f_.fd, st.buf.data() + st.done,
+                      static_cast<unsigned>(st.buf.size() - st.done),
+                      st.off + st.done, s, offload_);
+    } else {
+      st.busy = false;
+    }
+  }
+
+  posix_file f_;
+  uring ring_;
+  std::vector<slot> slots_;
+  std::uint64_t prealloc_ = 0;
+  bool use_uring_ = false;
+  bool offload_ = false;
+  std::string name_ = "pwrite";
+};
+
+// Definition-site conformance check. Concepts only verify use-sites, so
+// without this a drifting backend wouldn't be diagnosed until an engine
+// instantiation in some other TU; this makes the header self-checking.
+static_assert(reader_backend<uring_reader>);
+static_assert(writer_backend<uring_writer>);
+
+}  // namespace blake3pp::detail::io_impl
+
+#endif  // __linux__
+
+namespace blake3pp::detail::io_impl {
+using native_reader = uring_reader;
+using native_writer = uring_writer;
+}  // namespace blake3pp::detail::io_impl
+#elif defined(_WIN32)
+
+
+// The Windows backend: CreateFileW handles (std::filesystem::path's native
+// wide string is the whole reason the public API trades in paths), an I/O
+// completion port as the completion queue, and the SeManageVolumePrivilege
+// dance for SetFileValidData. The mapping to the io_uring backend is
+// nearly 1:1: one OVERLAPPED per buffer slot plays the SQE,
+// GetQueuedCompletionStatus plays wait_one, and FILE_FLAG_NO_BUFFERING is
+// O_DIRECT (same sector-alignment demands, same buffered-handle escape
+// hatch for the unaligned tail). Degrades per-feature at RUNTIME: no port
+// -> sync ReadFile/WriteFile, NO_BUFFERING refused -> buffered. Internal
+// to src/io/, never installed.
+
+#if defined(_WIN32)
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <string_view>
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+
+
+namespace blake3pp::detail::io_impl {
+
+[[noreturn]] inline void throw_winerr(const char* what) {
+  throw std::system_error(static_cast<int>(::GetLastError()),
+                          std::system_category(), what);
+}
+
+// Writes that land beyond the file's valid data length force NTFS to
+// zero-fill the gap synchronously, the Windows twin of ext4's
+// extending-write serialization. SetFileValidData waives the zero-fill,
+// but only for callers holding SeManageVolumePrivilege (admins, usually,
+// and only if the privilege is enabled in the token). Best-effort by
+// design: returns whether it actually took.
+inline bool try_set_valid_data(HANDLE file, std::int64_t size) noexcept {
+  HANDLE token = nullptr;
+  if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES,
+                         &token) == 0) {
+    return false;
+  }
+  TOKEN_PRIVILEGES tp{};
+  tp.PrivilegeCount = 1;
+  tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+  bool ok = ::LookupPrivilegeValueW(nullptr, L"SeManageVolumePrivilege",
+                                    &tp.Privileges[0].Luid) != 0;
+  ok = ok &&
+       ::AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) != 0 &&
+       ::GetLastError() == ERROR_SUCCESS;
+  ::CloseHandle(token);
+  if (!ok) {
+    return false;
+  }
+  LARGE_INTEGER n;
+  n.QuadPart = size;
+  return ::SetFileValidData(file, n.QuadPart) != 0;
+}
+
+// Owns one Win32 HANDLE and closes it exactly once. Win32 spells "no
+// handle" two ways (CreateFileW yields INVALID_HANDLE_VALUE, the IOCP
+// calls yield nullptr), so both count as empty here and neither is ever
+// handed to CloseHandle. Move-only, so a handle can never be owned twice.
+class unique_handle {
+ public:
+  unique_handle() = default;
+  explicit unique_handle(HANDLE h) noexcept : h_(h) {}
+  unique_handle(const unique_handle&) = delete;
+  unique_handle& operator=(const unique_handle&) = delete;
+  unique_handle(unique_handle&& other) noexcept
+      : h_(std::exchange(other.h_, INVALID_HANDLE_VALUE)) {}
+  unique_handle& operator=(unique_handle&& other) noexcept {
+    if (this != &other) {
+      reset(std::exchange(other.h_, INVALID_HANDLE_VALUE));
+    }
+    return *this;
+  }
+  ~unique_handle() { reset(); }
+
+  [[nodiscard]] HANDLE get() const noexcept { return h_; }
+  explicit operator bool() const noexcept {
+    return h_ != nullptr && h_ != INVALID_HANDLE_VALUE;
+  }
+  void reset(HANDLE h = INVALID_HANDLE_VALUE) noexcept {
+    if (*this) {
+      ::CloseHandle(h_);
+    }
+    h_ = h;
+  }
+
+ private:
+  HANDLE h_ = INVALID_HANDLE_VALUE;
+};
+
+// Shared Windows file plumbing, the twin of posix_file: the buffered
+// handle that always exists, the optional NO_BUFFERING/OVERLAPPED reopen
+// next to it (both are per-open flags, hence a second handle), and the
+// completion port when async engages. Every handle lives in a
+// unique_handle, which makes the type non-copyable by construction and
+// unwinds the whole set when a constructor throws part-way through.
+//
+// `fast` is held ONLY when the reopen genuinely engaged, so it never
+// aliases `plain` and no destructor has to test for that.
+// Shared verbatim between reader and writer; only access/creation differ.
+struct win_file {
+  unique_handle plain;  // always-buffered+sync: unaligned tails, fallback
+  unique_handle fast;   // the reopened handle, when one engaged
+  unique_handle port;   // IOCP, when async engaged
+  bool direct = false;
+  bool use_iocp = false;
+
+  // The handle the fast path should use: the reopened one when it
+  // engaged, else the plain one. Borrowed: the caller never closes it.
+  [[nodiscard]] HANDLE h() const noexcept {
+    return fast ? fast.get() : plain.get();
+  }
+
+  void open(const wchar_t* path, DWORD access, DWORD share, DWORD creation,
+            DWORD flags) {
+    plain.reset(::CreateFileW(path, access, share, nullptr, creation, flags,
+                              nullptr));
+    if (!plain) {
+      throw_winerr("CreateFileW");
+    }
+  }
+
+  [[nodiscard]] std::uint64_t stat_size() const {
+    LARGE_INTEGER sz;
+    if (::GetFileSizeEx(plain.get(), &sz) == 0) {
+      throw_winerr("GetFileSizeEx");
+    }
+    return static_cast<std::uint64_t>(sz.QuadPart);
+  }
+
+  // NO_BUFFERING and OVERLAPPED are per-open flags: engage by reopening,
+  // keeping the plain handle for unaligned lengths. Best-effort: a
+  // refused reopen, or a port that will not attach, simply leaves the
+  // plain handle in charge with direct/use_iocp still false.
+  void engage(const wchar_t* path, DWORD access, DWORD share,
+              bool want_direct, bool want_async) noexcept {
+    if (!want_direct && !want_async) {
+      return;
+    }
+    DWORD flags = FILE_ATTRIBUTE_NORMAL;
+    if (want_direct) {
+      flags |= FILE_FLAG_NO_BUFFERING;
+    }
+    if (want_async) {
+      flags |= FILE_FLAG_OVERLAPPED;
+    }
+    unique_handle cand(::CreateFileW(path, access, share, nullptr,
+                                     OPEN_EXISTING, flags, nullptr));
+    if (!cand) {
+      return;
+    }
+    if (want_async) {
+      unique_handle p(
+          ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1));
+      // An unattachable port takes the fast handle down with it: a
+      // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path.
+      // Both candidates close on the way out of this branch.
+      if (!p ||
+          ::CreateIoCompletionPort(cand.get(), p.get(), 0, 0) == nullptr) {
+        return;
+      }
+      port = std::move(p);
+      use_iocp = true;
+    }
+    fast = std::move(cand);
+    direct = want_direct;
+  }
+};
+
+class iocp_reader {
+ public:
+  iocp_reader(const std::filesystem::path& path,
+              const file_reader_options& opts, unsigned nslots)
+      : slots_(nslots), ovs_(nslots) {
+    file_.open(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
+    size_ = file_.stat_size();
+    file_.engage(path.c_str(), GENERIC_READ, FILE_SHARE_READ, opts.direct_io,
+                 opts.async);
+    name_ = file_.use_iocp ? (file_.direct ? "iocp+direct" : "iocp")
+            : file_.direct ? "readfile+direct"
+                           : "readfile";
+  }
+
+
+  // Cancels every in-flight request and waits for ALL of them to report.
+  // The wait is INFINITE on purpose. These requests target the engine's
+  // buffer pool, which is declared before this backend and therefore freed
+  // AFTER it, so returning while one is still pending hands the kernel a
+  // window to write into freed memory. CancelIoEx makes that wait bounded
+  // in practice: once it returns, every outstanding request is guaranteed
+  // to complete, successfully or with ERROR_OPERATION_ABORTED. A null
+  // OVERLAPPED here therefore means the port itself has failed, not that a
+  // request is merely slow: no completion can ever arrive, so breaking is
+  // the only option left.
+  void drain_cancelled() noexcept {
+    ::CancelIoEx(file_.h(), nullptr);
+    while (outstanding_ > 0) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key, &pov,
+                                  INFINITE);
+      if (pov == nullptr) {
+        break;  // port unusable: no completion will ever arrive
+      }
+      --outstanding_;
+    }
+  }
+
+  // Only the drain is hand-written now: every handle belongs to file_,
+  // whose destructor runs after this body, that is, after the last
+  // request has reported, which is the ordering the drain exists for.
+  ~iocp_reader() {
+    if (file_.use_iocp && outstanding_ > 0) {
+      drain_cancelled();
+    }
+  }
+  iocp_reader(const iocp_reader&) = delete;
+  iocp_reader& operator=(const iocp_reader&) = delete;
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+  // Only fully-aligned windows may ride the IOCP path (NO_BUFFERING
+  // rejects unaligned lengths); the tail goes through read_sync.
+  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t len) const
+      noexcept {
+    return file_.use_iocp && len % direct_align == 0;
+  }
+
+  void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
+    slots_[s] = {buf.data(), buf.size(), off, 0, false};
+    submit_read(s, 0);
+  }
+
+  // Reaps completions (issuing continuations for short reads) until slot
+  // `s` is fully read. GetQueuedCompletionStatus is wait_one: the
+  // OVERLAPPED pointer identifies the slot.
+  void wait(unsigned s) {
+    while (!slots_[s].ready) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      const BOOL ok = ::GetQueuedCompletionStatus(file_.port.get(), &bytes,
+                                                  &key, &pov, INFINITE);
+      if (pov == nullptr) {
+        throw_winerr("GetQueuedCompletionStatus");
+      }
+      --outstanding_;
+      const unsigned c = static_cast<unsigned>(pov - ovs_.data());
+      slot& st = slots_[c];
+      if (ok == 0) {
+        throw_winerr("iocp read");
+      }
+      if (bytes == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "unexpected EOF (iocp)");
+      }
+      st.filled += bytes;
+      if (st.filled < st.len) {
+        submit_read(c, st.filled);
+      } else {
+        st.ready = true;
+      }
+    }
+  }
+
+  // Positional synchronous read: a non-OVERLAPPED handle plus an
+  // OVERLAPPED offset blocks until complete. In iocp mode only unaligned
+  // tails reach this path; the !use_iocp guard makes it structural that
+  // the overlapped handle is never used synchronously.
+  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
+    const HANDLE use_h = file_.direct && !file_.use_iocp &&
+                                 buf.size() % direct_align == 0
+                             ? file_.h()
+                             : file_.plain.get();
+    std::size_t got = 0;
+    while (got < buf.size()) {
+      OVERLAPPED ov{};
+      const std::uint64_t o = off + got;
+      ov.Offset = static_cast<DWORD>(o);
+      ov.OffsetHigh = static_cast<DWORD>(o >> 32);
+      DWORD n = 0;
+      if (::ReadFile(use_h, buf.data() + got,
+                     static_cast<DWORD>(buf.size() - got), &n, &ov) == 0) {
+        throw_winerr("ReadFile");
+      }
+      if (n == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "unexpected EOF");
+      }
+      got += n;
+    }
+  }
+
+ private:
+  struct slot {
+    std::byte* dst = nullptr;
+    std::size_t len = 0;
+    std::uint64_t off = 0;
+    std::size_t filled = 0;
+    bool ready = false;
+  };
+
+  // Queues one async read (or a short-read continuation from `from`).
+  void submit_read(unsigned s, std::size_t from) {
+    slot& st = slots_[s];
+    OVERLAPPED& ov = ovs_[s];
+    std::memset(&ov, 0, sizeof(ov));
+    const std::uint64_t off = st.off + from;
+    ov.Offset = static_cast<DWORD>(off);
+    ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+    if (::ReadFile(file_.h(), st.dst + from,
+                   static_cast<DWORD>(st.len - from), nullptr, &ov) == 0 &&
+        ::GetLastError() != ERROR_IO_PENDING) {
+      throw_winerr("ReadFile(async)");
+    }
+    ++outstanding_;
+  }
+
+  std::vector<slot> slots_;
+  std::vector<OVERLAPPED> ovs_;  // one per slot; the SQE equivalent
+  std::uint64_t size_ = 0;
+  unsigned outstanding_ = 0;  // async reads in flight
+  std::string_view name_ = "readfile";
+  // Declared LAST so it is destroyed FIRST: the handles must close before
+  // ovs_ goes away. drain_cancelled() normally guarantees nothing is in
+  // flight by then, but it gives up early if the port itself has failed,
+  // and closing the handles is what cancels any request still holding an
+  // OVERLAPPED in that path.
+  win_file file_;  // plain (tail, fallback) + fast reopen + IOCP port
+};
+
+class iocp_writer {
+ public:
+  iocp_writer(const std::filesystem::path& path,
+              const file_writer_options& opts, unsigned nslots)
+      : slots_(nslots), ovs_(nslots) {
+    // Two opens of one file need explicit sharing on Windows.
+    constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    file_.open(path.c_str(), GENERIC_WRITE, share, CREATE_ALWAYS,
+               FILE_ATTRIBUTE_NORMAL);
+    bool vdl = false;
+    if (opts.preallocate_bytes > 0) {
+      // SetEndOfFile is the fallocate twin: writes become overwrites of an
+      // existing region. NTFS adds a second lock beyond ext4's, the valid
+      // data length: any write landing past VDL zero-fills the gap
+      // synchronously. SetFileValidData waives that, privilege permitting.
+      LARGE_INTEGER target;
+      target.QuadPart = static_cast<std::int64_t>(opts.preallocate_bytes);
+      if (::SetFilePointerEx(file_.plain.get(), target, nullptr,
+                             FILE_BEGIN) != 0 &&
+          ::SetEndOfFile(file_.plain.get()) != 0) {
+        prealloc_ = opts.preallocate_bytes;
+        vdl = try_set_valid_data(file_.plain.get(), target.QuadPart);
+      }
+      LARGE_INTEGER zero{};
+      ::SetFilePointerEx(file_.plain.get(), zero, nullptr, FILE_BEGIN);
+    }
+    file_.engage(path.c_str(), GENERIC_WRITE, share, opts.direct_io,
+                 opts.async);
+    name_ = file_.use_iocp
+                ? (file_.direct ? (vdl ? "iocp+direct+vdl" : "iocp+direct")
+                                : "iocp")
+                : file_.direct
+                    ? (vdl ? "writefile+direct+vdl" : "writefile+direct")
+                    : "writefile";
+  }
+
+
+  // Cancels every in-flight request and waits for ALL of them to report.
+  // The wait is INFINITE on purpose. These requests target the engine's
+  // buffer pool, which is declared before this backend and therefore freed
+  // AFTER it, so returning while one is still pending hands the kernel a
+  // window to write into freed memory. CancelIoEx makes that wait bounded
+  // in practice: once it returns, every outstanding request is guaranteed
+  // to complete, successfully or with ERROR_OPERATION_ABORTED. A null
+  // OVERLAPPED here therefore means the port itself has failed, not that a
+  // request is merely slow: no completion can ever arrive, so breaking is
+  // the only option left.
+  void drain_cancelled() noexcept {
+    ::CancelIoEx(file_.h(), nullptr);
+    while (outstanding_ > 0) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key, &pov,
+                                  INFINITE);
+      if (pov == nullptr) {
+        break;  // port unusable: no completion will ever arrive
+      }
+      --outstanding_;
+    }
+  }
+
+  // Only the drain is hand-written now: every handle belongs to file_,
+  // whose destructor runs after this body, that is, after the last
+  // request has reported, which is the ordering the drain exists for.
+  ~iocp_writer() {
+    // finish() may have thrown or been skipped, leaving writes in flight.
+    if (file_.use_iocp && outstanding_ > 0) {
+      drain_cancelled();
+    }
+  }
+  iocp_writer(const iocp_writer&) = delete;
+  iocp_writer& operator=(const iocp_writer&) = delete;
+
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+  [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
+    return file_.use_iocp && len % direct_align == 0;
+  }
+
+  void start_write(unsigned s, std::uint64_t off,
+                   std::span<const std::byte> buf) {
+    slots_[s] = {buf.data(), buf.size(), off, 0, true};
+    submit_async(s, 0);
+  }
+
+  void wait_slot(unsigned s) {
+    while (slots_[s].busy) {
+      reap_one();
+    }
+  }
+
+  // Positional synchronous write on a non-OVERLAPPED handle; the
+  // unaligned tail always takes the buffered handle (NO_BUFFERING rejects
+  // unaligned lengths, same story as O_DIRECT).
+  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
+    const HANDLE use_h = file_.direct && !file_.use_iocp &&
+                                 buf.size() % direct_align == 0
+                             ? file_.h()
+                             : file_.plain.get();
+    std::size_t put = 0;
+    while (put < buf.size()) {
+      OVERLAPPED ov{};
+      const std::uint64_t o = off + put;
+      ov.Offset = static_cast<DWORD>(o);
+      ov.OffsetHigh = static_cast<DWORD>(o >> 32);
+      DWORD n = 0;
+      if (::WriteFile(use_h, buf.data() + put,
+                      static_cast<DWORD>(buf.size() - put), &n, &ov) == 0) {
+        throw_winerr("WriteFile");
+      }
+      put += n;
+    }
+  }
+
+  void finish(std::uint64_t written) {
+    for (unsigned s = 0; s < slots_.size(); ++s) {
+      wait_slot(s);
+    }
+    // SetEndOfFile set the size up front; trim back if less was written.
+    if (prealloc_ > written) {
+      LARGE_INTEGER n;
+      n.QuadPart = static_cast<std::int64_t>(written);
+      if (::SetFilePointerEx(file_.plain.get(), n, nullptr, FILE_BEGIN) == 0 ||
+          ::SetEndOfFile(file_.plain.get()) == 0) {
+        throw_winerr("SetEndOfFile(trim)");
+      }
+    }
+    prealloc_ = 0;
+  }
+
+ private:
+  struct slot {
+    const std::byte* src = nullptr;
+    std::size_t len = 0;
+    std::uint64_t off = 0;
+    std::size_t done = 0;
+    bool busy = false;
+  };
+
+  void submit_async(unsigned s, std::size_t from) {
+    slot& st = slots_[s];
+    OVERLAPPED& ov = ovs_[s];
+    std::memset(&ov, 0, sizeof(ov));
+    const std::uint64_t o = st.off + from;
+    ov.Offset = static_cast<DWORD>(o);
+    ov.OffsetHigh = static_cast<DWORD>(o >> 32);
+    if (::WriteFile(file_.h(), st.src + from,
+                    static_cast<DWORD>(st.len - from), nullptr, &ov) == 0 &&
+        ::GetLastError() != ERROR_IO_PENDING) {
+      throw_winerr("WriteFile(async)");
+    }
+    ++outstanding_;
+  }
+
+  void reap_one() {
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* pov = nullptr;
+    const BOOL ok = ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key,
+                                                &pov, INFINITE);
+    if (pov == nullptr) {
+      throw_winerr("GetQueuedCompletionStatus");
+    }
+    --outstanding_;
+    const unsigned s = static_cast<unsigned>(pov - ovs_.data());
+    slot& st = slots_[s];
+    if (ok == 0 || bytes == 0) {
+      throw_winerr("iocp write");
+    }
+    st.done += bytes;
+    if (st.done < st.len) {
+      submit_async(s, st.done);
+    } else {
+      st.busy = false;
+    }
+  }
+
+  std::vector<slot> slots_;
+  std::vector<OVERLAPPED> ovs_;  // one per slot
+  std::uint64_t prealloc_ = 0;
+  unsigned outstanding_ = 0;
+  std::string_view name_ = "writefile";
+  // Declared LAST so it is destroyed FIRST: the handles must close before
+  // ovs_ goes away. drain_cancelled() normally guarantees nothing is in
+  // flight by then, but it gives up early if the port itself has failed,
+  // and closing the handles is what cancels any request still holding an
+  // OVERLAPPED in that path.
+  win_file file_;  // plain (tail, trim) + fast reopen + IOCP port
+};
+
+// Definition-site conformance check (see uring_backend.hpp): fails here,
+// with the missed requirement named, the first time MSVC compiles this
+// header, before any engine instantiation exists.
+static_assert(reader_backend<iocp_reader>);
+static_assert(writer_backend<iocp_writer>);
+
+}  // namespace blake3pp::detail::io_impl
+
+#endif  // _WIN32
+
+namespace blake3pp::detail::io_impl {
+using native_reader = iocp_reader;
+using native_writer = iocp_writer;
+}  // namespace blake3pp::detail::io_impl
+#elif defined(__APPLE__)
+
+
+// The Darwin backend. macOS has no io_uring; the platform's async story IS
+// libdispatch (GCD), and its page-cache bypass is fcntl(F_NOCACHE),
+// per-fd rather than per-open, with no alignment contract: unaligned edges
+// are silently served through the cache instead of being rejected, so the
+// dual-fd tail trick the O_DIRECT and NO_BUFFERING backends need
+// disappears here. The backend runs positional pread/pwrite loops on GCD's
+// global concurrent pool, straight into the engine's buffer ring
+// (dispatch_io was considered and rejected: it delivers dispatch_data_t
+// chunks it allocated itself, an extra copy the zero-copy pipeline exists
+// to avoid). A dispatch_group is the teardown drain and a mutex/condvar
+// pair the completion queue. Internal to src/io/, never installed.
+
+#if defined(__APPLE__)
+
+#include <dispatch/dispatch.h>
+#include <string_view>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <span>
+#include <system_error>
+#include <vector>
+
+
+
+
+namespace blake3pp::detail::io_impl {
+
+// Turns the page cache off for this fd: Darwin's O_DIRECT analogue.
+inline bool set_nocache(int fd) noexcept {
+  return ::fcntl(fd, F_NOCACHE, 1) != -1;
+}
+
+// fallocate's Darwin twin: reserve the extents (contiguous if the volume
+// can, scattered otherwise), then give the file its final logical size,
+// so queued writes land as overwrites instead of size-extending appends.
+inline bool preallocate(int fd, std::uint64_t len) noexcept {
+  fstore_t st{};
+  st.fst_flags = F_ALLOCATECONTIG;
+  st.fst_posmode = F_PEOFPOSMODE;
+  st.fst_offset = 0;
+  st.fst_length = static_cast<off_t>(len);
+  if (::fcntl(fd, F_PREALLOCATE, &st) == -1) {
+    st.fst_flags = F_ALLOCATEALL;
+    if (::fcntl(fd, F_PREALLOCATE, &st) == -1) {
+      return false;
+    }
+  }
+  return ::ftruncate(fd, static_cast<off_t>(len)) == 0;
+}
+
+// The submission/completion machinery, playing the role the uring and the
+// completion port play elsewhere: submit() is fire-and-forget onto GCD's
+// global pool, workers publish per-slot completion under m and signal cv,
+// and the pipeline thread blocks on cv for the slot it needs next. The
+// group exists for teardown: in-flight workers touch the engine's buffer
+// pool, so destroy() must wait them out before the pool is freed.
+struct gcd_pump {
+  dispatch_group_t group = nullptr;
+  std::mutex m;
+  std::condition_variable cv;
+
+  bool init() noexcept {
+    group = dispatch_group_create();
+    return group != nullptr;
+  }
+
+  // Owning the group means owning its release. The backends below also
+  // call destroy() explicitly (it is idempotent), but they can only do so
+  // once their constructor has COMPLETED: both allocate slot vectors after
+  // init() succeeds, and a throw there destroys members without ever
+  // running the backend destructor. This is the net under that window.
+  ~gcd_pump() { destroy(); }
+  gcd_pump() = default;
+  gcd_pump(const gcd_pump&) = delete;
+  gcd_pump& operator=(const gcd_pump&) = delete;
+
+  void destroy() noexcept {
+    if (group != nullptr) {
+      dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+      dispatch_release(group);
+      group = nullptr;
+    }
+  }
+
+  void submit(void (*fn)(void*), void* ctx) noexcept {
+    dispatch_group_async_f(
+        group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ctx,
+        fn);
+  }
+};
+
+class gcd_reader {
+ public:
+  gcd_reader(const std::filesystem::path& path,
+             const file_reader_options& opts, unsigned nslots) {
+    f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    size_ = f_.stat_size();
+    // Darwin's cache bypass is per-fd, not per-open, and tolerates any
+    // alignment, so one fd serves every window, tail included.
+    if (opts.direct_io && set_nocache(f_.fd_plain)) {
+      f_.direct = true;
+    }
+    name_ = f_.direct ? "pread+nocache" : "pread";
+    if (opts.async && pump_.init()) {
+      use_gcd_ = true;
+      slots_.resize(nslots);
+      tasks_.resize(nslots);
+      for (unsigned s = 0; s < nslots; ++s) {
+        tasks_[s] = {this, s};
+      }
+      name_ = f_.direct ? "gcd+nocache" : "gcd";
+    }
+  }
+
+  // In-flight workers write into the engine's buffer pool: wait them out
+  // here, before the pool member (declared before this backend in the
+  // engine) is freed. This is the GCD flavor of the IOCP cancel-and-drain
+  // rule.
+  ~gcd_reader() { pump_.destroy(); }
+  gcd_reader(const gcd_reader&) = delete;
+  gcd_reader& operator=(const gcd_reader&) = delete;
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+  // Every window, the unaligned tail included, takes the async path:
+  // F_NOCACHE has no alignment contract, the kernel just serves unaligned
+  // edges through the cache.
+  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t) const noexcept {
+    return use_gcd_;
+  }
+
+  void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
+    slot& st = slots_[s];
+    st.dst = buf.data();
+    st.len = buf.size();
+    st.off = off;
+    st.filled = 0;
+    st.error = 0;
+    st.ready = false;
+    pump_.submit(&gcd_reader::run_read, &tasks_[s]);
+  }
+
+  // Blocks until slot s completes; throws the worker's deferred errno.
+  // ready/error are written under the pump lock, so even the "is it done
+  // already" check lives here; an unlocked peek would be a data race.
+  void wait(unsigned s) {
+    slot& st = slots_[s];
+    std::unique_lock<std::mutex> lk(pump_.m);
+    pump_.cv.wait(lk, [&] { return st.ready; });
+    if (st.error != 0) {
+      throw std::system_error(st.error, std::generic_category(),
+                              "gcd pread");
+    }
+  }
+
+  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
+    f_.pread_all(f_.fd_plain, buf.data(), buf.size(), off);
+  }
+
+ private:
+  struct slot {
+    std::byte* dst = nullptr;
+    std::size_t len = 0;
+    std::uint64_t off = 0;
+    std::size_t filled = 0;
+    int error = 0;  // errno captured by the worker; thrown at wait()
+    bool ready = false;
+  };
+  struct task {
+    gcd_reader* self = nullptr;
+    unsigned s = 0;
+  };
+
+  // Runs on a GCD worker: fills the slot's buffer with one positional
+  // read loop, then publishes completion under the pump lock. noexcept:
+  // errors travel through slot::error to the waiting thread.
+  static void run_read(void* ctx) noexcept {
+    const task t = *static_cast<task*>(ctx);
+    gcd_reader& r = *t.self;
+    slot& st = r.slots_[t.s];
+    int err = 0;
+    std::size_t got = 0;
+    while (got < st.len) {
+      const ssize_t n = ::pread(r.f_.fd_plain, st.dst + got, st.len - got,
+                                static_cast<off_t>(st.off + got));
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        err = errno;
+        break;
+      }
+      if (n == 0) {
+        err = EIO;  // unexpected EOF
+        break;
+      }
+      got += static_cast<std::size_t>(n);
+    }
+    {
+      const std::lock_guard<std::mutex> lk(r.pump_.m);
+      st.filled = got;
+      st.error = err;
+      st.ready = true;
+    }
+    r.pump_.cv.notify_all();
+  }
+
+  posix_file f_;
+  gcd_pump pump_;
+  std::vector<slot> slots_;
+  std::vector<task> tasks_;
+  std::uint64_t size_ = 0;
+  bool use_gcd_ = false;
+  std::string_view name_ = "pread";
+};
+
+class gcd_writer {
+ public:
+  gcd_writer(const std::filesystem::path& path,
+             const file_writer_options& opts, unsigned nslots) {
+    f_.open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    // Same story as Linux's fallocate, via Darwin's spelling: queued
+    // writes should land as overwrites, not size-extending appends.
+    if (opts.preallocate_bytes > 0 &&
+        preallocate(f_.fd_plain, opts.preallocate_bytes)) {
+      prealloc_ = opts.preallocate_bytes;
+    }
+    if (opts.direct_io && set_nocache(f_.fd_plain)) {
+      f_.direct = true;
+    }
+    name_ = f_.direct ? "pwrite+nocache" : "pwrite";
+    if (opts.async && pump_.init()) {
+      use_gcd_ = true;
+      slots_.resize(nslots);
+      tasks_.resize(nslots);
+      for (unsigned s = 0; s < nslots; ++s) {
+        tasks_[s] = {this, s};
+      }
+      name_ = f_.direct ? "gcd+nocache" : "gcd";
+    }
+  }
+
+  // If finish() threw (or was skipped), workers may still be writing from
+  // the engine's pool: wait them all out before it is freed.
+  ~gcd_writer() { pump_.destroy(); }
+  gcd_writer(const gcd_writer&) = delete;
+  gcd_writer& operator=(const gcd_writer&) = delete;
+
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+  [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
+    return use_gcd_ && len % direct_align == 0;
+  }
+
+  void start_write(unsigned s, std::uint64_t off,
+                   std::span<const std::byte> buf) {
+    slot& st = slots_[s];
+    st.src = buf.data();
+    st.len = buf.size();
+    st.off = off;
+    st.done = 0;
+    st.busy = true;
+    pump_.submit(&gcd_writer::run_write, &tasks_[s]);
+  }
+
+  // Blocks until slot s is idle; surfaces its deferred write error once
+  // (cleared after the throw so the slot stays reusable).
+  void wait_slot(unsigned s) {
+    if (!use_gcd_) {
+      return;
+    }
+    slot& st = slots_[s];
+    std::unique_lock<std::mutex> lk(pump_.m);
+    pump_.cv.wait(lk, [&] { return !st.busy; });
+    if (st.error != 0) {
+      const int e = st.error;
+      st.error = 0;
+      throw std::system_error(e, std::generic_category(), "gcd pwrite");
+    }
+  }
+
+  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
+    f_.pwrite_all(f_.fd_plain, buf.data(), buf.size(), off);
+  }
+
+  void finish(std::uint64_t written) {
+    if (use_gcd_) {
+      for (unsigned s = 0; s < slots_.size(); ++s) {
+        wait_slot(s);
+      }
+    }
+    // F_PREALLOCATE/ftruncate set the size up front; trim if less was
+    // written.
+    if (prealloc_ > written &&
+        ::ftruncate(f_.fd_plain, static_cast<off_t>(written)) != 0) {
+      throw_errno("ftruncate");
+    }
+    prealloc_ = 0;
+  }
+
+ private:
+  struct slot {
+    const std::byte* src = nullptr;
+    std::size_t len = 0;
+    std::uint64_t off = 0;
+    std::size_t done = 0;
+    int error = 0;  // errno captured by the worker; thrown at wait_slot()
+    bool busy = false;
+  };
+  struct task {
+    gcd_writer* self = nullptr;
+    unsigned s = 0;
+  };
+
+  // Runs on a GCD worker: drains the slot's buffer with one positional
+  // write loop, then publishes completion under the pump lock.
+  static void run_write(void* ctx) noexcept {
+    const task t = *static_cast<task*>(ctx);
+    gcd_writer& w = *t.self;
+    slot& st = w.slots_[t.s];
+    int err = 0;
+    std::size_t put = 0;
+    while (put < st.len) {
+      const ssize_t n = ::pwrite(w.f_.fd_plain, st.src + put, st.len - put,
+                                 static_cast<off_t>(st.off + put));
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        err = errno;
+        break;
+      }
+      put += static_cast<std::size_t>(n);
+    }
+    {
+      const std::lock_guard<std::mutex> lk(w.pump_.m);
+      st.done = put;
+      st.error = err;
+      st.busy = false;
+    }
+    w.pump_.cv.notify_all();
+  }
+
+  posix_file f_;
+  gcd_pump pump_;
+  std::vector<slot> slots_;
+  std::vector<task> tasks_;
+  std::uint64_t prealloc_ = 0;
+  bool use_gcd_ = false;
+  std::string_view name_ = "pwrite";
+};
+
+// Definition-site conformance check (see uring_backend.hpp).
+static_assert(reader_backend<gcd_reader>);
+static_assert(writer_backend<gcd_writer>);
+
+}  // namespace blake3pp::detail::io_impl
+
+#endif  // __APPLE__
+
+namespace blake3pp::detail::io_impl {
+using native_reader = gcd_reader;
+using native_writer = gcd_writer;
+}  // namespace blake3pp::detail::io_impl
+#elif defined(__unix__)
+
+
+// The synchronous POSIX backend: plain positional pread/pwrite, with the
+// O_DIRECT reopen where the platform offers it. This is the compile-time
+// choice for POSIX systems with neither io_uring nor GCD; the equivalent
+// RUNTIME floor on Linux lives inside uring_backend.hpp. Internal to
+// src/io/, never installed.
+
+#if defined(__unix__) || defined(__APPLE__)
+
+#include <cassert>
+#include <string_view>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+
+
+
+namespace blake3pp::detail::io_impl {
+
+class pread_reader {
+ public:
+  pread_reader(const std::filesystem::path& path,
+               const file_reader_options& opts, unsigned) {
+    f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    size_ = f_.stat_size();
+    if (opts.direct_io) {
+      f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
+    }
+  }
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+  [[nodiscard]] std::string_view name() const noexcept {
+    return f_.direct ? "pread+direct" : "pread";
+  }
+  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t) const noexcept {
+    return false;
+  }
+
+  void start(unsigned, std::uint64_t, std::span<std::byte>) {
+    assert(false && "pread backend has no async path");
+  }
+  void wait(unsigned) { assert(false && "pread backend has no async path"); }
+
+  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
+    f_.pread_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+  }
+
+ private:
+  posix_file f_;
+  std::uint64_t size_ = 0;
+};
+
+class pread_writer {
+ public:
+  pread_writer(const std::filesystem::path& path,
+               const file_writer_options& opts, unsigned) {
+    f_.open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    // No preallocation here: fallocate is Linux, F_PREALLOCATE is Darwin,
+    // and each lives in its platform's backend. Synchronous writes don't
+    // suffer the extending-write serialization anyway.
+    (void)opts;
+    if (opts.direct_io) {
+      f_.try_odirect(path.c_str(), O_WRONLY | O_CLOEXEC);
+    }
+  }
+
+  [[nodiscard]] std::string_view name() const noexcept {
+    return f_.direct ? "pwrite+direct" : "pwrite";
+  }
+  [[nodiscard]] bool wants_async(std::size_t) const noexcept { return false; }
+
+  void start_write(unsigned, std::uint64_t, std::span<const std::byte>) {
+    assert(false && "pread backend has no async path");
+  }
+  void wait_slot(unsigned) {}  // nothing is ever in flight
+
+  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
+    f_.pwrite_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+  }
+
+  void finish(std::uint64_t) {}  // no queue to drain, no preallocation
+
+ private:
+  posix_file f_;
+};
+
+// Definition-site conformance check (see uring_backend.hpp).
+static_assert(reader_backend<pread_reader>);
+static_assert(writer_backend<pread_writer>);
+
+}  // namespace blake3pp::detail::io_impl
+
+#endif  // __unix__ || __APPLE__
+
+namespace blake3pp::detail::io_impl {
+using native_reader = pread_reader;
+using native_writer = pread_writer;
+}  // namespace blake3pp::detail::io_impl
+#else
+
+
+// The portable floor: buffered, fully synchronous stdio, for platforms
+// with none of the native backends (e.g. wasm). Internal to src/io/,
+// never installed.
+
+#include <cassert>
+#include <cerrno>
+#include <string_view>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <span>
+#include <system_error>
+
+
+
+namespace blake3pp::detail::io_impl {
+
+// std::fseek/std::ftell take and return `long`, which is 32 bits on
+// Windows (LLP64) and on wasm32, precisely the platforms this fallback
+// exists to serve. Truncating a file offset there does not fail: it seeks
+// somewhere else and returns the wrong bytes, which for a hash function
+// means a silently wrong digest. These wrappers keep the full 64-bit range
+// where the platform offers it, and where it does not they REFUSE the
+// offset rather than truncate it.
+inline int seek64(std::FILE* f, std::uint64_t off) noexcept {
+#if defined(_MSC_VER)
+  return _fseeki64(f, static_cast<__int64>(off), SEEK_SET);
+#elif defined(_WIN32)
+  return fseeko64(f, static_cast<off64_t>(off), SEEK_SET);
+#else
+  // POSIX, including macOS and Emscripten (musl's off_t is always 64-bit).
+  return ::fseeko(f, static_cast<::off_t>(off), SEEK_SET);
+#endif
+}
+
+inline std::int64_t tell64(std::FILE* f) noexcept {
+#if defined(_MSC_VER)
+  return _ftelli64(f);
+#elif defined(_WIN32)
+  return ftello64(f);
+#else
+  return ::ftello(f);
+#endif
+}
+
+class stdio_reader {
+ public:
+  stdio_reader(const std::filesystem::path& path, const file_reader_options&,
+               unsigned) {
+    stream_ = std::fopen(path.string().c_str(), "rb");
+    if (stream_ == nullptr) {
+      throw_errno("fopen");
+    }
+    // Unchecked, these silently produce a nonsense size: a failed seek
+    // leaves ftell returning -1, which as an unsigned size is ~18 EiB, and
+    // the engine then computes a huge window count that fails obscurely.
+    if (std::fseek(stream_, 0, SEEK_END) != 0) {
+      throw_errno("fseek(end)");
+    }
+    const std::int64_t end = tell64(stream_);
+    if (end < 0) {
+      throw_errno("ftell");
+    }
+    size_ = static_cast<std::uint64_t>(end);
+  }
+  ~stdio_reader() {
+    if (stream_ != nullptr) {
+      std::fclose(stream_);
+    }
+  }
+  stdio_reader(const stdio_reader&) = delete;
+  stdio_reader& operator=(const stdio_reader&) = delete;
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+  [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
+  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t) const noexcept {
+    return false;
+  }
+
+  void start(unsigned, std::uint64_t, std::span<std::byte>) {
+    assert(false && "stdio backend has no async path");
+  }
+  void wait(unsigned) { assert(false && "stdio backend has no async path"); }
+
+  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
+    if (seek64(stream_, off) != 0) {
+      throw_errno("fseek");
+    }
+    if (std::fread(buf.data(), 1, buf.size(), stream_) != buf.size()) {
+      // Distinguish a real read error from a short read at EOF; the engine
+      // never asks for more than the file holds, so EOF here means the file
+      // was truncated underneath us.
+      throw std::system_error(std::ferror(stream_) != 0 ? errno : EIO,
+                              std::generic_category(), "fread");
+    }
+  }
+
+ private:
+  std::FILE* stream_ = nullptr;
+  std::uint64_t size_ = 0;
+};
+
+class stdio_writer {
+ public:
+  stdio_writer(const std::filesystem::path& path, const file_writer_options&,
+               unsigned) {
+    stream_ = std::fopen(path.string().c_str(), "wb");
+    if (stream_ == nullptr) {
+      throw_errno("fopen");
+    }
+  }
+  ~stdio_writer() {
+    if (stream_ != nullptr) {
+      std::fclose(stream_);
+    }
+  }
+  stdio_writer(const stdio_writer&) = delete;
+  stdio_writer& operator=(const stdio_writer&) = delete;
+
+  [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
+  [[nodiscard]] bool wants_async(std::size_t) const noexcept { return false; }
+
+  void start_write(unsigned, std::uint64_t, std::span<const std::byte>) {
+    assert(false && "stdio backend has no async path");
+  }
+  void wait_slot(unsigned) {}  // nothing is ever in flight
+
+  // Writes are strictly sequential (the engine's offset only grows), so
+  // the stream position is already `off` and no seek is needed.
+  void write_sync(std::uint64_t, std::span<const std::byte> buf) {
+    if (std::fwrite(buf.data(), 1, buf.size(), stream_) != buf.size()) {
+      throw std::system_error(EIO, std::generic_category(), "fwrite");
+    }
+  }
+
+  void finish(std::uint64_t) {
+    if (std::fflush(stream_) != 0) {
+      throw_errno("fflush");
+    }
+  }
+
+ private:
+  std::FILE* stream_ = nullptr;
+};
+
+// Definition-site conformance check (see uring_backend.hpp).
+static_assert(reader_backend<stdio_reader>);
+static_assert(writer_backend<stdio_writer>);
+
+}  // namespace blake3pp::detail::io_impl
+
+namespace blake3pp::detail::io_impl {
+using native_reader = stdio_reader;
+using native_writer = stdio_writer;
+}  // namespace blake3pp::detail::io_impl
+#endif
+
+
+
+// The two portable I/O engines, written exactly once as class templates
+// constrained by the backend concepts (io/backend.hpp). The public
+// file_reader/file_writer TUs instantiate them with the platform backend
+// backend_select.hpp picks; the tests instantiate them again with the
+// off-platform POSIX/stdio backends, so those stay compiled AND executed
+// on every platform even though the selector never chooses them there.
+// The constraint is the contract: an engine can only speak the concept's
+// vocabulary, and a backend drifting from it fails at the instantiation
+// with a diagnostic naming the missed requirement. Internal to src/io/,
+// never installed.
+
+#include <algorithm>
+#include <string_view>
+#include <bit>
+#include <cassert>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <optional>
+#include <span>
+#include <system_error>
+#include <vector>
+
+
+
+
+namespace blake3pp::detail::io_impl {
+
+// The read-side window/slot engine: windows are delivered strictly in
+// file order while later windows stream in behind them; release()
+// recycles a buffer slot, which is what creates backpressure. Every
+// window is just "async in flight" (wait) or "read lazily at delivery"
+// (read_sync); the backend decided which via wants_async().
+template <reader_backend B>
+class reader_engine {
+ public:
+  using window = file_reader::window;
+
+  reader_engine(const std::filesystem::path& path,
+                const file_reader_options& opts)
+      // Window: power-of-2 multiple of the chunk size so every full window
+      // is a subtree-aligned unit; >= 64 KiB keeps O_DIRECT alignment
+      // trivial.
+      : window_(std::bit_floor(
+            std::max<std::size_t>(opts.window_bytes, 64 * 1024))),
+        qd_(std::min(32u, std::max(2u, opts.queue_depth))),
+        slots_(qd_),
+        pool_(std::size_t{qd_} * window_),
+        backend_(path, opts, qd_) {
+    num_windows_ = (backend_.size() + window_ - 1) / window_;
+    const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
+    for (unsigned s = 0; s < initial; ++s) {
+      assign(s);
+    }
+  }
+
+  [[nodiscard]] std::uint64_t file_size() const noexcept {
+    return backend_.size();
+  }
+  [[nodiscard]] std::string_view backend_name() const noexcept {
+    return backend_.name();
+  }
+
+  std::optional<window> next() {
+    // A submission that fails inside release() cannot be reported there:
+    // release() is noexcept because callers pair it with next() in a tight
+    // loop, and letting it throw would call std::terminate, including
+    // from hash_file(path, ec, opts), whose whole contract is to turn I/O
+    // failures into an error_code. So the failure is latched here instead,
+    // in the function already documented as throwing. The latch is
+    // permanent: the slot whose submission failed holds a window that can
+    // never be delivered, so there is no way to continue reading.
+    if (submit_failed_) {
+      std::rethrow_exception(submit_failed_);
+    }
+    if (next_deliver_ >= num_windows_) {
+      return std::nullopt;
+    }
+    const std::uint64_t want = next_deliver_;
+    unsigned s = 0;
+    for (; s < qd_; ++s) {
+      if (slots_[s].assigned && slots_[s].win == want) {
+        break;
+      }
+    }
+    assert(s < qd_);  // release() reassigns eagerly, so `want` has a slot
+    slot_state& st = slots_[s];
+    if (st.started) {
+      backend_.wait(s);
+    } else {
+      backend_.read_sync(want * window_, {buf(s), st.target});
+    }
+    st.held = true;
+    next_deliver_++;
+    return window{buf(s), st.target, want * window_,
+                  want + 1 == num_windows_, s};
+  }
+
+  void release(const window& w) noexcept {
+    slot_state& st = slots_[w.slot];
+    st.assigned = false;
+    st.held = false;
+    if (next_submit_ < num_windows_ && !submit_failed_) {
+      // assign() submits real I/O (io_uring_enter / ReadFile), which can
+      // fail. Latch it for next() to rethrow; see the note there.
+      try {
+        assign(w.slot);
+      } catch (...) {
+        submit_failed_ = std::current_exception();
+      }
+    }
+  }
+
+ private:
+  struct slot_state {
+    std::uint64_t win = 0;   // window index assigned to this slot
+    std::size_t target = 0;  // bytes this window must read
+    bool assigned = false;
+    bool started = false;  // async read in flight (wait) vs lazy (read_sync)
+    bool held = false;     // delivered, not yet released
+  };
+
+  std::size_t window_len(std::uint64_t w) const noexcept {
+    const std::uint64_t off = w * window_;
+    const std::uint64_t rest = backend_.size() - off;
+    return rest < window_ ? static_cast<std::size_t>(rest) : window_;
+  }
+
+  std::byte* buf(unsigned slot) const noexcept {
+    return pool_.data + static_cast<std::size_t>(slot) * window_;
+  }
+
+  void assign(unsigned s) {
+    slot_state& st = slots_[s];
+    st.win = next_submit_++;
+    st.target = window_len(st.win);
+    st.assigned = true;
+    st.held = false;
+    st.started = backend_.wants_async(st.win * window_, st.target);
+    if (st.started) {
+      backend_.start(s, st.win * window_, {buf(s), st.target});
+    }
+    // Slots the backend declined are read synchronously at delivery time.
+  }
+
+  std::size_t window_;
+  unsigned qd_;
+  std::uint64_t num_windows_ = 0;
+  std::uint64_t next_submit_ = 0;   // next window index to assign to a slot
+  std::uint64_t next_deliver_ = 0;  // next window index to hand out
+  std::exception_ptr submit_failed_;  // latched by release(), thrown by next()
+  std::vector<slot_state> slots_;
+
+  // Declaration order is the teardown contract: the backend destructs
+  // FIRST, draining any in-flight reads that target the pool, and the
+  // pool is freed after. Do not reorder these two members.
+  aligned_pool pool_;
+  B backend_;
+};
+
+// The write-side slot engine, the reader's inverse: the producer fills
+// buffers ahead of the device, and acquire() blocking on a slot whose
+// write is still in flight is the entire backpressure story. The
+// unaligned tail (only the final submit may be one) always goes through
+// the backend's synchronous buffered path, because O_DIRECT and
+// NO_BUFFERING both reject unaligned lengths; the backends that don't
+// care route it the same way for uniformity.
+template <writer_backend B>
+class writer_engine {
+ public:
+  using buffer = file_writer::buffer;
+
+  writer_engine(const std::filesystem::path& path,
+                const file_writer_options& opts)
+      : buffer_(rounded_buffer(opts.buffer_bytes)),
+        qd_(std::min(32u, std::max(2u, opts.queue_depth))),
+        pool_(std::size_t{qd_} * buffer_),
+        backend_(path, opts, qd_) {}
+
+  [[nodiscard]] std::uint64_t bytes_written() const noexcept {
+    return written_;
+  }
+  [[nodiscard]] std::string_view backend_name() const noexcept {
+    return backend_.name();
+  }
+
+  buffer acquire() {
+    const unsigned s = next_slot_;
+    backend_.wait_slot(s);
+    return buffer{buf(s), buffer_, s};
+  }
+
+  void submit(const buffer& b, std::size_t bytes) {
+    if (bytes == 0) {
+      return;
+    }
+    if (tail_submitted_) {
+      throw std::system_error(EINVAL, std::generic_category(),
+                              "submit after partial write");
+    }
+    if (bytes % direct_align != 0) {
+      tail_submitted_ = true;
+    }
+    const std::span<const std::byte> data{b.data, bytes};
+    if (backend_.wants_async(bytes)) {
+      backend_.start_write(b.slot, offset_, data);
+    } else {
+      backend_.write_sync(offset_, data);
+    }
+    offset_ += bytes;
+    written_ += bytes;
+    next_slot_ = (b.slot + 1) % qd_;
+  }
+
+  void finish() { backend_.finish(written_); }
+
+ private:
+  // Round up to the O_DIRECT length granule; >= 64 KiB so queued writes
+  // are worth their submission cost.
+  static std::size_t rounded_buffer(std::size_t bytes) noexcept {
+    bytes = std::max<std::size_t>(bytes, 64 * 1024);
+    return (bytes + direct_align - 1) / direct_align * direct_align;
+  }
+
+  std::byte* buf(unsigned slot) const noexcept {
+    return pool_.data + static_cast<std::size_t>(slot) * buffer_;
+  }
+
+  std::size_t buffer_;
+  unsigned qd_;
+  unsigned next_slot_ = 0;       // round-robin acquire order
+  std::uint64_t offset_ = 0;     // next sequential file offset
+  std::uint64_t written_ = 0;    // total bytes accepted via submit()
+  bool tail_submitted_ = false;  // a partial submit closes the stream
+
+  // Declaration order is the teardown contract: the backend destructs
+  // FIRST, draining any in-flight writes that read from the pool, and the
+  // pool is freed after. Do not reorder these two members.
+  aligned_pool pool_;
+  B backend_;
+};
+
+}  // namespace blake3pp::detail::io_impl
+
+
+namespace blake3pp::detail {
+
+// Conformance is checked in the backend headers themselves (each ends
+// with definition-site static_asserts) and again by the reader_engine
+// constraint at this instantiation.
+struct file_reader::impl : io_impl::reader_engine<io_impl::native_reader> {
+  using reader_engine::reader_engine;
+};
+
+file_reader::file_reader(const std::filesystem::path& path,
+                         const file_reader_options& opts)
+    : impl_(std::make_unique<impl>(path, opts)) {}
+
+file_reader::~file_reader() = default;
+
+std::uint64_t file_reader::file_size() const noexcept {
+  return impl_->file_size();
+}
+
+std::string_view file_reader::backend() const noexcept {
+  return impl_->backend_name();
+}
+
+std::optional<file_reader::window> file_reader::next() {
+  return impl_->next();
+}
+
+void file_reader::release(const window& w) noexcept { impl_->release(w); }
+
+}  // namespace blake3pp::detail
+
+
+#include <cstddef>
+#include <filesystem>
+#include <span>
+#include <system_error>
+
+namespace blake3pp {
+
+void update_file(hasher& h, const std::filesystem::path& path,
+                 const file_io_options& opts) {
+  detail::file_reader reader(
+      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+             opts.offload_submit});
+  while (auto w = reader.next()) {
+    h.update(std::span<const std::byte>{w->data, w->bytes});
+    reader.release(*w);
+  }
+}
+
+void update_file(hasher& h, const std::filesystem::path& path,
+                 std::error_code& ec, const file_io_options& opts) noexcept {
+  detail::with_error_code(ec, [&] { update_file(h, path, opts); });
+}
+
+digest hash_file(const std::filesystem::path& path,
+                 const hash_file_options& opts) {
+  hasher h = detail::make_hasher(opts, detail::resolve(opts.a));
+  update_file(h, path, opts);
+  return h.finalize();
+}
+
+digest hash_file(const std::filesystem::path& path, std::error_code& ec,
+                 const hash_file_options& opts) noexcept {
+  return detail::with_error_code(ec, [&] { return hash_file(path, opts); });
+}
+
+}  // namespace blake3pp
 
 
 #if defined(__has_include) && __has_include(<beman/execution/execution.hpp>)
