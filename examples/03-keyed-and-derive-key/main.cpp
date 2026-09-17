@@ -11,8 +11,8 @@
 namespace {
 
 // A stand-in for a key that would really come from a key store. Keys are
-// exactly 32 bytes; the span extent in the signatures makes a wrong-sized
-// key a compile error rather than a runtime surprise.
+// exactly 32 bytes, and the span extent in the signatures turns a
+// wrong-sized key into a compile error.
 std::array<std::byte, blake3pp::key_size> demo_key(std::byte seed) {
   std::array<std::byte, blake3pp::key_size> key{};
   for (std::size_t i = 0; i < key.size(); ++i) {

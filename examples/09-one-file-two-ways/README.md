@@ -24,8 +24,8 @@ reading.
 
 The speedup is bounded by whichever of the two runs out first, the cores
 or the device. On a fast NVMe stripe the hashing stops being the limit
-and the rates converge; on a slower disk they converge sooner. That is
-the point of the pipeline rather than a shortcoming of it.
+and the rates converge. On a slower disk they converge sooner. Reaching
+the device's ceiling is what the pipeline is for.
 
 When the device is the limit, the window size and queue depth are the
 knobs that move it, in either direction:

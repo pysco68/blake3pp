@@ -12,7 +12,7 @@ blake3pp::digest tag = blake3pp::keyed_hash(key, message);
 
 This is BLAKE3's message authentication code, and it replaces HMAC
 directly. There is no nested construction and no separate key schedule:
-the key simply replaces the initialization vector.
+the key replaces the initialization vector.
 
 Keys are exactly 32 bytes. The signatures take
 `std::span<const std::byte, 32>`, so a wrong-sized key fails to compile

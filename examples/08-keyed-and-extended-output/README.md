@@ -17,7 +17,7 @@ auto keystream = mac.finalize_xof();  // ...or all of it, seekable
 
 A keyed hasher is a hasher. Every finalize form in
 [04-extended-output](../04-extended-output/) applies to it unchanged, so
-the 32-byte tag is simply the first 32 bytes of an authenticated stream.
+the 32-byte tag is the first 32 bytes of an authenticated stream.
 
 Keying changes the whole stream, not a prefix of it. The unkeyed hash of
 the same message shares no bytes with the keyed one at any offset.

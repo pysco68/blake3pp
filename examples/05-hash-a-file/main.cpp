@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
             << '\n';
 
   // The same file through a keyed hasher gives an authenticated manifest
-  // entry rather than a plain checksum.
+  // entry: one that needs the key to produce, not only to check.
   const std::array<std::byte, blake3pp::key_size> key{};
   blake3pp::hasher mac = blake3pp::hasher::keyed(key);
   blake3pp::update_file(mac, a);
