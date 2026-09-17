@@ -50,8 +50,7 @@ workarounds) in place.
 The usual casualty of full static linking is runtime CPU dispatch,
 because the common mechanism for it is GNU ifunc: a resolver function
 that the dynamic loader runs while binding symbols. With no loader in
-the picture, ifunc is at best fragile and at worst simply does not
-work.
+the picture, ifunc is fragile at best and broken at worst.
 
 blake3pp never uses ifunc. Dispatch is a plain CPU probe plus a
 function-pointer table selected at first use: ordinary C++ that behaves
@@ -80,17 +79,19 @@ zig's clang cannot produce two of the kernels the fat binary wants:
 | riscv64 | `xthead` (draft RVV 0.7.1) | LLVM never merged the XTheadVector extension | `riscv64-linux-gnu-g++` |
 | s390x   | `vxe` (z14 vector) | LLVM's SystemZ backend compiles the code but scalarizes the vector ops: about 10 vector instructions in the whole binary versus GCC's thousands, including the single-instruction `verllf` rotate | `s390x-linux-gnu-g++` |
 
-The s390x case is the treacherous one: the clang-built kernel is
-correct, passes every test, and reports itself as a vector variant
-while performing like the scalar one. A compile probe cannot detect
-that, so the build policy is explicit: under a non-GNU primary compiler
-the vxe kernel comes from GCC or is not registered at all.
+The s390x case is the treacherous one. The clang-built kernel is
+correct. It passes every test and reports itself as a vector variant,
+while performing like the scalar one. No compile probe detects that, so
+the build policy is explicit: under a non-GNU primary compiler, the vxe
+kernel comes from GCC, or it is not registered at all.
 
 For these two kernels the build uses the `EXTERNAL_COMPILER` mode of
-`cmake/ArchKernels.cmake`: the one translation unit is compiled by the
-distro GCC cross compiler (present in the zig toolchain image for
-exactly this purpose) and its object file is linked into the same fat
-binary zig produces. Here's why this can work in these special circumstances:
+`cmake/ArchKernels.cmake`. One translation unit is compiled by the distro
+GCC cross compiler, which is in the zig toolchain image for exactly this
+purpose, and its object file is linked into the same fat binary zig
+produces.
+
+Mixing two compilers' output is safe here for three reasons:
 
 - the external object is compiled with `-fno-exceptions -fno-rtti`
   `-fno-stack-protector`, so it needs no compiler runtime support

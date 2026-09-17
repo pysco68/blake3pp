@@ -2,12 +2,11 @@
 
 [← blake3pp](../README.md)
 
-## Freestanding and RTOS builds
+The library core runs on targets with no filesystem and no OS threads.
+What drove it was a Zephyr SMP port running blake3pp on the RP2350 in
+both of its personalities, Cortex-M33 and Hazard3 RISC-V.
 
-The library core runs on targets with no filesystem and no OS threads;
-what drove this was a Zephyr SMP port running blake3pp on the RP2350
-in both of its personalities (Cortex-M33 and Hazard3 RISC-V). Two
-build-time switches make it fit:
+Two build-time switches make it fit:
 
 - `-DBLAKE3PP_WITH_IO=OFF` drops the file-I/O layer entirely. It needs
   a filesystem, 64-bit seeks and OS-specific async I/O, none of which
@@ -19,7 +18,7 @@ build-time switches make it fit:
 - Toolchains without OS threads are detected, not fought: where
   `<thread>`/`<mutex>` are empty (the Zephyr SDK's libstdc++ is built
   without gthreads), the `BLAKE3PP_HAS_STD_THREAD` probe comes back
-  negative and `get_parallel_scheduler()` simply does not exist.
+  negative and `get_parallel_scheduler()` does not exist.
   Nothing else is lost: the scheduler-taking `hash()` overloads are
   the primary API anyway, and a freestanding caller brings its own
   scheduler because only it knows what its execution agents should be

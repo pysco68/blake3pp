@@ -9,11 +9,7 @@ lives in `namespace blake3pp`, and `#include <blake3pp/blake3pp.hpp>`
 brings in all of it; the granular headers are in
 [Integration](integration.md#header-layout).
 
-This page runs across those decisions. The
-[reference](reference/index.md) runs down each header, declaration by
-declaration, generated from the doc comments in them — which is the one
-thing it cannot show you, because no single entity can see how it
-combines with the others.
+This page runs across those decisions. The [reference](reference/index.md) runs down each header.
 
 ## The choices, and how they compose
 
