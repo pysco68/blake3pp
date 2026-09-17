@@ -11,7 +11,8 @@
 #
 # Every version is built with the tooling from this checkout, not from the
 # tag: a release documents its own headers, but how they are rendered is
-# only ever one implementation.
+# only ever one implementation. Its Compiler Explorer links do come from
+# the tag, so a reader of v0.1.0's documentation opens v0.1.0's code.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,10 +35,28 @@ rm -rf "${out}"
 mkdir -p "${out}"
 export BLAKE3PP_DOCS_VENV=${root}/.venv-docs
 
+maps=$(mktemp -d)
+trap 'rm -rf "${maps}"' EXIT
+offline=""
+[ "${link}" = 1 ] || offline="--no-link"
+
+# The link cache lives in the checkout and is keyed by version, so a tag's
+# links are minted once and then never again: its sources cannot change.
+try() {                       # try <namespace> <emitted map> [extra args...]
+  local ns=$1 map=$2; shift 2
+  python3 tools/build-try.py --namespace "${ns}" --emit-map "${map}" \
+    --manifest "${root}/site/try/links.json" ${offline} "$@"
+}
+
 # main is this checkout: it is what a contributor is previewing, and in CI
 # it is the commit being published.
 echo "== main"
-tools/build-docs.sh --out "${out}/main"
+# main shares its links with the redirect pages at the site root, which is
+# where the README points: both describe the current tip.
+echo "-- amalgamating"
+python3 tools/amalgamate.py -o examples/blake3pp-single-file.cpp
+try "" "${maps}/main.json" --output site/try
+tools/build-docs.sh --out "${out}/main" --links "${maps}/main.json"
 versions=("main")
 
 if [ "${all}" = 1 ]; then
@@ -51,11 +70,17 @@ if [ "${all}" = 1 ]; then
     cp "${root}/mkdocs.yml" "${tree}/mkdocs.yml"
     mkdir -p "${tree}/tools" "${tree}/docs"
     cp "${root}/tools/Doxyfile" "${root}/tools/doxygen-to-md.py" \
-       "${root}/tools/build-docs.sh" "${tree}/tools/"
+       "${root}/tools/build-docs.sh" "${root}/tools/build-try.py" \
+       "${root}/tools/godbolt-link.py" "${tree}/tools/"
     cp "${root}/docs/requirements.txt" "${tree}/docs/"
     # A tag that predates a document the nav lists cannot build strictly;
     # it is skipped rather than failing the whole site.
-    if ! (cd "${tree}" && tools/build-docs.sh --out "${out}/${tag}"); then
+    if ! (cd "${tree}" \
+            && python3 tools/build-try.py --namespace "${tag}" \
+                 --emit-map "${maps}/${tag}.json" \
+                 --manifest "${root}/site/try/links.json" ${offline} \
+            && tools/build-docs.sh --out "${out}/${tag}" \
+                 --links "${maps}/${tag}.json"); then
       echo "-- ${tag} does not build with today's nav; skipped" >&2
       rm -rf "${out:?}/${tag}"
       continue
@@ -98,19 +123,6 @@ cat > "${out}/index.html" <<HTML
 <p>Taking you to <a href="latest/">the documentation</a>.</p>
 HTML
 
-# The Compiler Explorer pages: one per example, plus the demo at the root
-# that the README has pointed at since before the examples existed. Each
-# embeds its own snapshot, because Compiler Explorer's compile nodes have
-# no network and cannot fetch this repository.
-echo "-- amalgamating"
-python3 tools/amalgamate.py -o examples/blake3pp-single-file.cpp
-
-echo "-- Compiler Explorer pages"
-if [ "${link}" = 1 ]; then
-  python3 tools/build-try.py --output site/try
-else
-  python3 tools/build-try.py --output site/try --no-link
-fi
 cp -r site/try "${out}/try"
 rm -f "${out}/try/links.json"
 

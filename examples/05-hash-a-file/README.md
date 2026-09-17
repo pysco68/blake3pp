@@ -4,7 +4,7 @@
 blake3pp::digest d = blake3pp::hash_file("dataset.parquet");
 ```
 
-**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/05-hash-a-file/)** -- it runs there, with no setup.
+[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/05-hash-a-file/)
 
 That call opens the file with the fastest mechanism the platform offers,
 keeps several reads in flight, and hashes each window as it lands.

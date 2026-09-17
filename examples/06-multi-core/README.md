@@ -5,7 +5,7 @@ auto sched = blake3pp::get_parallel_scheduler();
 blake3pp::digest d = blake3pp::hash(big_buffer, sched);
 ```
 
-**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/06-multi-core/)** -- it runs there, with no setup.
+[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/06-multi-core/)
 
 Adding cores means adding a scheduler argument. Nothing else about the
 call changes, and the digest does not change either.

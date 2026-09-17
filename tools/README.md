@@ -152,7 +152,20 @@ the link.
 library, appends the example, and hashes the result. A link is minted
 only when that hash differs from the one recorded in
 `site/try/links.json`, so rebuilding costs no requests, and `--no-link`
-never contacts godbolt.org at all.
+never contacts godbolt.org at all. The hash ignores the version stamp the
+amalgamation writes into itself, which otherwise changes on every commit.
+
+The documentation site does not use those pages. It is rebuilt from
+scratch for every published version, so it can carry the real link, and
+each version carries its own: `build-try.py --namespace <version>
+--emit-map` writes the example-to-URL mapping, and `build-docs.sh
+--links` substitutes it into that version's pages while staging. A reader
+of `v0.1.0`'s documentation therefore opens `v0.1.0`'s code. Cache
+entries are keyed by version, and a tag's sources cannot change, so its
+links are minted once and then read from the manifest forever.
+
+A try link standing alone in its paragraph becomes a button on the site.
+In the READMEs it stays an ordinary link, which is what GitHub renders.
 
 `godbolt-check.py` compiles and runs a file on Compiler Explorer and
 reports what happened, which is how a snapshot gets verified before its

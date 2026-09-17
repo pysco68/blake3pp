@@ -2,7 +2,7 @@
 
 Data that does not arrive all at once still hashes in one pass.
 
-**[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/02-incremental/)** -- it runs there, with no setup.
+[Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/02-incremental/)
 
 ```cpp
 blake3pp::hasher h;

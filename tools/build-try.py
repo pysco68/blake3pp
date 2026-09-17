@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Write the "try it on Compiler Explorer" pages, one per example.
+"""Compiler Explorer links for the examples, and the pages that hold them.
 
-A Compiler Explorer link embeds the source it was made from, because
-their compile nodes have no network and cannot fetch this repository. The
-pages written here are the indirection that fixes that: the READMEs point
-at a page, and this repoints the page at a freshly generated link when the
-source behind it changes.
+A Compiler Explorer link embeds the source it was made from, because their
+compile nodes have no network and cannot fetch this repository. So one
+link is minted per example, from the amalgamated library with that example
+appended, and what opens there is the example as it is committed.
 
-Each page's source is the amalgamated library with one example appended,
-so what opens on Compiler Explorer is the example as it is committed.
+The README needs a link that cannot go stale, which is what --output is
+for: redirect pages at a fixed address, repointed whenever the source
+behind them changes. The documentation site needs something else, because
+it is rebuilt from scratch for every published version and can therefore
+carry the real link directly. --emit-map writes the name-to-URL mapping
+that tools/build-docs.sh substitutes into each version's pages, so a
+reader of v0.1.0's documentation opens v0.1.0's code.
 
     tools/build-try.py --output site/try
+    tools/build-try.py --namespace v0.1.0 --emit-map /tmp/links.json
     tools/build-try.py --output site/try --no-link   # offline: reuse links
 """
 import argparse
@@ -20,8 +25,10 @@ import html
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -135,28 +142,42 @@ def targets():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--output", type=pathlib.Path, required=True)
+    ap.add_argument("--output", type=pathlib.Path,
+                    help="write redirect pages here")
+    ap.add_argument("--emit-map", type=pathlib.Path,
+                    help="write the example-to-URL mapping here")
+    ap.add_argument("--manifest", type=pathlib.Path,
+                    default=REPO / "site/try/links.json",
+                    help="where the link cache lives")
+    ap.add_argument("--namespace", default="",
+                    help="version these links belong to, for the cache")
     ap.add_argument("--no-link", action="store_true",
                     help="never contact godbolt.org; reuse the known links")
     ap.add_argument("--force", action="store_true",
                     help="mint a new link even when the source is unchanged")
     a = ap.parse_args()
 
-    a.output.mkdir(parents=True, exist_ok=True)
-    manifest_path = a.output / "links.json"
+    if not a.output and not a.emit_map:
+        ap.error("nothing to do: pass --output, --emit-map, or both")
+    if a.output:
+        a.output.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = a.manifest
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest = {}
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text())
 
     # The library half is the same for every example; build it once.
-    lib = a.output / ".lib.cpp"
+    scratch = pathlib.Path(tempfile.mkdtemp())
+    lib = scratch / "lib.cpp"
     subprocess.run([sys.executable, str(REPO / "tools/amalgamate.py"),
                     "--no-demo", "-o", str(lib)],
                    check=True, capture_output=True)
     library = lib.read_text()
-    lib.unlink()
 
     stamp, today = commit(), datetime.date.today().isoformat()
+    urls = {}
     for t in targets():
         # The example's own includes of the library are dropped: it is
         # already above them in the file.
@@ -165,7 +186,7 @@ def main():
         source = library + "\n" + body
         sha = fingerprint(source)
 
-        key = t["slug"] or "root"
+        key = "/".join(filter(None, (a.namespace, t["slug"] or "root")))
         known = manifest.get(key, {})
         # The stamp on the page names the commit the LINK was built from,
         # so it stays put until a new link is minted.
@@ -177,27 +198,33 @@ def main():
             url = known.get("url", "https://godbolt.org/")
             note = "stale, offline" if known else "no link yet, offline"
         else:
-            tmp = a.output / ".full.cpp"
+            tmp = scratch / "full.cpp"
             tmp.write_text(source)
             url = shorten(tmp, t["libs"])
-            tmp.unlink()
             built, when = stamp, today
             note = "new link"
         manifest[key] = {"url": url, "sha": sha, "commit": built, "date": when}
 
-        page = a.output / t["slug"] / "index.html" if t["slug"] \
-            else a.output / "index.html"
-        page.parent.mkdir(parents=True, exist_ok=True)
-        repo_url = ("https://github.com/pysco68/blake3pp/blob/main/" + t["source"])
-        page.write_text(PAGE.format(
-            title=html.escape(t["title"]),
-            url=html.escape(url, quote=True),
-            blurb=html.escape(t["blurb"]),
-            commit=html.escape(built), date=when,
-            repo=html.escape(repo_url, quote=True)))
+        urls[t["slug"] or "root"] = url
+
+        if a.output:
+            page = a.output / t["slug"] / "index.html" if t["slug"] \
+                else a.output / "index.html"
+            page.parent.mkdir(parents=True, exist_ok=True)
+            repo_url = "https://github.com/pysco68/blake3pp/blob/main/" + t["source"]
+            page.write_text(PAGE.format(
+                title=html.escape(t["title"]),
+                url=html.escape(url, quote=True),
+                blurb=html.escape(t["blurb"]),
+                commit=html.escape(built), date=when,
+                repo=html.escape(repo_url, quote=True)))
         print(f"  {t['slug'] or '/':<24} {note:<16} {url}")
 
+    shutil.rmtree(scratch, ignore_errors=True)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    if a.emit_map:
+        a.emit_map.parent.mkdir(parents=True, exist_ok=True)
+        a.emit_map.write_text(json.dumps(urls, indent=2, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ int main() {
 d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24
 ```
 
+[Run this on Compiler Explorer](https://pysco68.github.io/blake3pp/try/01-hello-hash/)
+
 `hash()` takes a string or anything span-like, and hands back a
 `digest`: a value type you can compare, copy, and print as hex.
 

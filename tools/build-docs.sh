@@ -10,19 +10,25 @@
 # is docs/ without breaking the same links when read on GitHub.
 #
 #   tools/build-docs.sh --out _site/main
+#   tools/build-docs.sh --out _site/v0.1.0 --links /tmp/links.json
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 out=""
+links=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --out) out=$2; shift 2 ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --out)   out=$2; shift 2 ;;
+    --links) links=$2; shift 2 ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "build-docs: unknown option '$1'" >&2; exit 2 ;;
   esac
 done
 [ -n "${out}" ] || { echo "build-docs: --out is required" >&2; exit 2; }
 case "${out}" in /*) ;; *) out="${PWD}/${out}" ;; esac
+if [ -n "${links}" ]; then
+  case "${links}" in /*) ;; *) links="${PWD}/${links}" ;; esac
+fi
 
 # mkdocs is a Python application, not a system package; keep it in a venv
 # beside the checkout so a contributor needs no global installs.
@@ -54,7 +60,8 @@ python3 tools/doxygen-to-md.py --xml build/doxygen/xml --out "${src}/reference"
 # the two have different jobs. The documents' back-links to the README are
 # repointed at that landing page.
 echo "-- staging the documents"
-python3 - "${src}" <<'PY'
+python3 - "${src}" "${links}" <<'PY'
+import json
 import pathlib
 import re
 import sys
@@ -62,12 +69,41 @@ import sys
 src = pathlib.Path(sys.argv[1])
 BLOB = "https://github.com/pysco68/blake3pp/blob/main/"
 
+# The READMEs point at the redirect pages at the site root, which is what
+# a link committed to git has to do. This site is rebuilt for every
+# published version, so it carries each version's own Compiler Explorer
+# link instead, and a link standing alone in its paragraph becomes a
+# button.
+TRY = re.compile(r"\]\(https://pysco68\.github\.io/blake3pp/try/([\w.-]*)/?\)")
+ALONE = re.compile(r"^\s*\[[^\]]+\]\(https://pysco68\.github\.io/blake3pp/try/[\w.-]*/?\)\s*$")
+BUTTON = "{ .md-button .md-button--primary }"
+links = json.loads(pathlib.Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 \
+    and sys.argv[2] else {}
+
+
+def retarget(text: str) -> str:
+    if not links:
+        return text
+    out = []
+    for line in text.split("\n"):
+        button = bool(ALONE.match(line))
+
+        def swap(m):
+            url = links.get(m.group(1) or "root")
+            return m.group(0) if url is None else f"]({url})"
+
+        line = TRY.sub(swap, line)
+        if button and not line.rstrip().endswith("}"):
+            line = line.rstrip() + BUTTON
+        out.append(line)
+    return "\n".join(out)
+
 for page in src.glob("*.md"):
     text = page.read_text().replace("(../README.md", "(index.md")
     # Whatever is still relative is a repository path, not a page here.
     text = re.sub(r"\]\((?!https?:|#|\w[\w.-]*\.md|\w[\w.-]*/)([^)]+)\)",
                   rf"]({BLOB}\1)", text)
-    page.write_text(text)
+    page.write_text(retarget(text))
 
 # The examples become pages of their own, each README followed by the
 # program it describes, so the site carries the code and not only a
@@ -83,12 +119,12 @@ for d in sorted(pathlib.Path("examples").iterdir()):
     # Sibling examples are pages here, and docs/ is one level up.
     text = re.sub(r"\]\(\.\./(\d[\w-]+)/\)", r"](\1.md)", text)
     text = text.replace("](../../docs/", "](../")
-    (examples / (d.name + ".md")).write_text(text)
+    (examples / (d.name + ".md")).write_text(retarget(text))
 
 listing = pathlib.Path("examples/README.md")
 if listing.is_file():
     text = re.sub(r"\]\((\d[\w-]+)/\)", r"](\1.md)", listing.read_text())
-    (examples / "index.md").write_text(text)
+    (examples / "index.md").write_text(retarget(text))
 PY
 
 # --strict, and the status is propagated: a version that does not build
