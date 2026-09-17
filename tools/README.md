@@ -30,12 +30,13 @@ leave a call soup, does anything outside the kernels use an instruction
 the dispatch verdict does not gate, whose address is that in the
 emulator's trace. `objscan.py` answers them from the disassembly.
 
-It reads ELF, Mach-O and PE/COFF (objects and linked binaries) and picks
-the disassembler for the target: the prefixed GNU binutils in the cross
-images, llvm-objdump elsewhere (Xcode's `objdump`, the LLVM install on
-the Windows runners; `--objdump` names one explicitly). Function names
-are the disassembler's demangled ones; patterns match on
-`kern::<variant>::` rather than on whole names, since Mach-O keeps a
+It reads ELF, Mach-O and PE/COFF, objects and linked binaries alike, and
+picks the disassembler for the target: the prefixed GNU binutils in the
+cross images, llvm-objdump elsewhere (Xcode's `objdump`, or the LLVM
+install on the Windows runners). `--objdump` names one explicitly.
+
+Function names are the disassembler's demangled ones. Patterns match on
+`kern::<variant>::` rather than on whole names, because Mach-O keeps a
 leading underscore and the MSVC demangler spells the anonymous namespace
 its own way.
 
@@ -63,14 +64,17 @@ tools/objscan.py diff bench-arch13 bench-z13
 tools/objscan.py resolve build/linux-riscv64-gcc15-cxx23/cli/blake3ppsum 0x5555556a0b2c --bias 0x555555554000
 ```
 
-`quality` is the check that catches the two classic failures: a compiler
-that gave up inlining the SIMD facade (calls into `xsimd::` or
-`std::simd` helpers in `hash_many`; MSVC's default inlining budget did
-exactly that on the sse42 kernel until `/Ob3`), and rounds that were not
-unrolled (a rolled kernel has a tenth of the vector instructions and one
-more loop). The stack-vector column counts vector loads and stores
-through the stack pointer; the transposed message blocks legitimately
-live there, so read it as a trend across compilers, not as an assertion.
+`quality` catches the two classic failures:
+
+- **A compiler that gave up inlining the SIMD facade**, leaving calls
+  into `xsimd::` or `std::simd` helpers in `hash_many`. MSVC's default
+  inlining budget did exactly that on the sse42 kernel until `/Ob3`.
+- **Rounds that were not unrolled.** A rolled kernel has a tenth of the
+  vector instructions and one more loop.
+
+The stack-vector column counts vector loads and stores through the stack
+pointer. The transposed message blocks legitimately live there, so read
+that column as a trend across compilers rather than as an assertion.
 
 ### The audit
 
@@ -78,16 +82,22 @@ live there, so read it as a trend across compilers, not as an assertion.
 tools/objscan.py audit build/<preset> [--binary build/<preset>/cli/blake3ppsum]
 ```
 
-`kernel-audit.json` states, per architecture and kernel variant, the
-instruction class the variant must contain, the classes it must not
-(the dispatch verdict does not gate them: no AVX-512 in the avx2 kernel,
-no SVE in the neon kernel, no Zvbb in the plain rvv kernels, no z14/z15
-vector instruction outside the vxe kernel), the quality thresholds for
-the hot functions (no call outside the allow-list, a loop budget, a
-minimum vector count in the widest function), and the classes that must
-not appear in the linked binary outside the kernels that own them. A
-rule matches an instruction by mnemonic or by operand text; `all: true`
-asks for both.
+`kernel-audit.json` states four things per architecture and kernel
+variant:
+
+- The instruction class the variant must contain.
+- The classes it must not, because the dispatch verdict does not gate
+  them: no AVX-512 in the avx2 kernel, no SVE in the neon kernel, no
+  Zvbb in the plain rvv kernels, no z14/z15 vector instruction outside
+  the vxe kernel.
+- The quality thresholds for the hot functions: no call outside the
+  allow-list, a loop budget, and a minimum vector count in the widest
+  function.
+- The classes that must not appear in the linked binary outside the
+  kernels that own them.
+
+A rule matches an instruction by mnemonic or by operand text, and
+`all: true` asks for both.
 
 `ci-test.sh` runs the audit on every Linux preset after the build (the
 wasm presets excepted: a wasm module has no objdump), the Windows and
