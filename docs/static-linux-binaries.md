@@ -8,9 +8,7 @@ and equally free of a glibc floor, but emulator-tested only (see the
 MSA note in the README). Each released archive
 carries the tools and benchmarks (`blake3ppsum`, `blake3ppgen`,
 `blake3pp_bench`, `blake3pp_bench_file`); the library itself is meant to
-be built from source. This page explains what "fully static" buys, how
-the build produces it, why runtime SIMD dispatch survives it, and why
-two of the archives are the work of two compilers at once.
+be built from source.
 
 ## What "fully static" means here
 

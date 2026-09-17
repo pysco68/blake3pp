@@ -395,10 +395,10 @@ def main():
         written.append((header, page, brief))
 
     index = ["# Reference\n",
-             "Every declaration in the public headers, generated from the `///` "
-             "comments in them, so this page says exactly what your editor says.\n",
-             "For the guided version, with the examples that go with it, read "
-             "[The API](../api.md) instead.\n",
+             "Every declaration in the public headers, generated from their "
+             "`///` doc comments.\n",
+             "[The API](../api.md) covers the same surface as a guide, with "
+             "examples.\n",
              "| Header | |", "| --- | --- |"]
     index += [f"| [`<blake3pp/{h}>`]({p}) | {b} |" for h, p, b in written]
     (a.out / "index.md").write_text("\n".join(index) + "\n")

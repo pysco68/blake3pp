@@ -107,27 +107,34 @@ without a rule and does not fail on it.
 
 ## The documentation site
 
-`build-site.sh` produces what `pysco68.github.io/blake3pp` serves, and CI
-runs the same script, so a local preview cannot drift from the published
-site:
+`build-site.sh` builds what `pysco68.github.io/blake3pp` serves. CI runs
+the same script.
 
     tools/build-site.sh --no-link --serve      # localhost:8000
 
-`--no-link` keeps the Compiler Explorer link the repository already holds
-instead of minting a new one, which is what an offline preview wants;
-drop it to regenerate the link. `--all` additionally builds every `v*`
-tag into its own directory and writes the `versions.json` behind the
-version dropdown. Each version is rendered with the tooling from the
-current checkout, not from the tag, so there is only ever one renderer to
-maintain; a tag whose documents predate the current navigation is skipped
-rather than published half-built.
+| Option | Effect |
+| --- | --- |
+| `--all` | Build every `v*` tag as well as `main`, and write the `versions.json` behind the version dropdown. |
+| `--no-link` | Keep the Compiler Explorer link the repository already holds instead of generating a new one. An offline preview needs this. |
+| `--serve` | Serve the result on port 8000. |
 
-One version comes from `build-docs.sh`, which stages three inputs into
-`build/site-src` and runs MkDocs over them: the markdown in `docs/`, the
-README as the landing page, and the public headers' `///` comments by way
-of Doxygen's XML and `doxygen-to-md.py`. Nothing is generated into the
-source tree, and the cross-links between README and `docs/` are rewritten
-for the site's flat layout so the same links keep working on GitHub.
+Every version is rendered with the tooling from the current checkout, not
+with the tooling from the tag. A tag whose documents predate the current
+navigation is skipped and does not appear in the dropdown.
 
-MkDocs lives in a `.venv-docs` virtualenv the script creates on first
-run; Doxygen is a system package (`apt install doxygen`).
+`build-docs.sh` builds a single version. It stages three inputs into
+`build/site-src` and runs MkDocs over them:
+
+- the markdown documents in `docs/`;
+- `README.md`, as the landing page;
+- one reference page per public header, rendered by `doxygen-to-md.py`
+  from the XML that Doxygen extracts from the `///` comments.
+
+Staging keeps generated files out of the source tree. The links between
+`README.md` and `docs/` are rewritten during staging for the site's flat
+layout, and the originals keep working when the same files are read on
+GitHub.
+
+Two requirements: Doxygen as a system package (`apt install doxygen`),
+and MkDocs, which `build-docs.sh` installs into a `.venv-docs`
+virtualenv on first run.

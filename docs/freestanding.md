@@ -65,14 +65,14 @@ per level. Measured with g++ 16 at `-O2` on x86-64:
 | 8 | 2832 | 1280 | 1856 | 3200 |
 | 1 | 480 | 272 | 720 | 2064 |
 
-Two consequences worth knowing before sizing a thread. A smaller budget
+Two consequences follow when sizing a thread. A smaller budget
 does not only shrink the table: fewer parts make each part larger, which
 makes the recursion deeper, so it moves stack from the caller to the
 agents. And `BLAKE3PP_SUBTREE_FOLD=<levels>` removes the depth term
 altogether, at 32 bytes per level of its own, which is why its figures
 above do not depend on the input.
 
-A worked case, the Zephyr port this section exists for: a scalar-only
+A worked case, a Zephyr port: a scalar-only
 build (`BLAKE3PP_MAX_SIMD_DEGREE=1`) hashing 1 MiB with
 `stack_budget{1024}`, so 32 parts of 32 chunks and a depth of 4. The
 caller needs 1 KiB for the table, each agent 480 + 4 * 272 = 1568 bytes,
