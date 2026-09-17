@@ -61,6 +61,15 @@ nav:
       - The API: api.md
       - Architectures and kernels: architectures.md
       - Command-line tools: tools.md
+  - Examples:
+      - Overview: examples/index.md
+      - One-shot hashing: examples/01-hello-hash.md
+      - Incremental hashing: examples/02-incremental.md
+      - Keyed hashing and key derivation: examples/03-keyed-and-derive-key.md
+      - Extended output: examples/04-extended-output.md
+      - Hashing a file: examples/05-hash-a-file.md
+      - Multi-core hashing: examples/06-multi-core.md
+      - Which kernel is running: examples/07-which-kernel.md
   - Reference:
       - Overview: reference/index.md
       - blake3pp.hpp: reference/blake3pp.md

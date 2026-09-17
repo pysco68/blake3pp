@@ -72,6 +72,27 @@ for page in src.glob("*.md"):
         continue
     text = page.read_text().replace("(../README.md", "(index.md")
     page.write_text(text)
+
+# The examples become pages of their own, each README followed by the
+# program it describes, so the site carries the code and not only a
+# pointer to it.
+examples = src / "examples"
+examples.mkdir(exist_ok=True)
+for d in sorted(pathlib.Path("examples").iterdir()):
+    readme, main = d / "README.md", d / "main.cpp"
+    if not (d.is_dir() and readme.is_file() and main.is_file()):
+        continue
+    text = readme.read_text()
+    text += "\n## The whole program\n\n```cpp\n" + main.read_text().strip() + "\n```\n"
+    # Sibling examples are pages here, and docs/ is one level up.
+    text = re.sub(r"\]\(\.\./(\d[\w-]+)/\)", r"](\1.md)", text)
+    text = text.replace("](../../docs/", "](../")
+    (examples / (d.name + ".md")).write_text(text)
+
+listing = pathlib.Path("examples/README.md")
+if listing.is_file():
+    text = re.sub(r"\]\((\d[\w-]+)/\)", r"](\1.md)", listing.read_text())
+    (examples / "index.md").write_text(text)
 PY
 
 # --strict, and the status is propagated: a version that does not build
