@@ -10,6 +10,8 @@
 #include <blake3pp/parallel.hpp>
 #include <doctest/doctest.h>
 
+#include <system_error>
+
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
 #include <exec/libdispatch_queue.hpp>
 #endif
@@ -320,3 +322,76 @@ TEST_CASE("GCD (libdispatch) scheduler drives the engine unchanged") {
 }  // TEST_SUITE
 
 }  // namespace
+
+// A scheduler that never runs anything: its schedule sender completes
+// stopped, the shape of a pool that received a stop request or is shutting
+// down. The engine has to notice rather than read the part table it never
+// filled. Spelled in the vocabulary all three providers share.
+namespace {
+
+struct stopping_scheduler {
+  template <class Receiver>
+  struct opstate {
+    using operation_state_concept = blake3pp::ex::operation_state_t;
+    void start() noexcept { blake3pp::ex::set_stopped(std::move(rcvr)); }
+    Receiver rcvr;
+  };
+  struct attrs {
+    template <class Tag>
+    auto query(blake3pp::ex::get_completion_scheduler_t<Tag>) const noexcept {
+      return stopping_scheduler{};
+    }
+  };
+  struct sender {
+    using sender_concept = blake3pp::ex::sender_t;
+    // Declares the value completion a real pool's sender has too (sync_wait
+    // requires one) and only ever delivers the stopped one. Both spellings:
+    // the static function is the standard's, the typedef the older one
+    // some providers still read.
+    using completion_signatures =
+        blake3pp::ex::completion_signatures<blake3pp::ex::set_value_t(),
+                                            blake3pp::ex::set_stopped_t()>;
+    template <class Self, class... Env>
+    static consteval auto get_completion_signatures() noexcept {
+      return completion_signatures{};
+    }
+    template <class Receiver>
+    static auto connect(Receiver rcvr) noexcept -> opstate<Receiver> {
+      return {std::move(rcvr)};
+    }
+    static auto get_env() noexcept -> attrs { return {}; }
+  };
+  using scheduler_concept = blake3pp::ex::scheduler_t;
+  static auto schedule() noexcept -> sender { return {}; }
+  // The standard's scheduler concept asks for this; a scheduler that runs
+  // nothing promises the least.
+  auto query(blake3pp::ex::get_forward_progress_guarantee_t) const noexcept {
+    return blake3pp::ex::forward_progress_guarantee::weakly_parallel;
+  }
+  bool operator==(const stopping_scheduler&) const noexcept = default;
+};
+static_assert(blake3pp::ex::scheduler<stopping_scheduler>);
+
+}  // namespace
+
+TEST_CASE("a scheduler that completes stopped is reported, not read") {
+  const std::vector<std::byte> input(4 * 1024 * 1024, std::byte{0x5a});
+  stopping_scheduler sched;
+  CHECK_THROWS_AS(blake3pp::hash(input, sched), std::system_error);
+  try {
+    (void)blake3pp::hash(input, sched);
+  } catch (const std::system_error& e) {
+    CHECK(e.code() == std::errc::operation_canceled);
+  }
+  // Small inputs never reach the scheduler and hash sequentially.
+  const std::vector<std::byte> small(1024, std::byte{0x5a});
+  CHECK(blake3pp::hash(small, sched) == blake3pp::hash(small));
+
+  // The parallel fill leaves the reader where it was.
+  blake3pp::hasher h;
+  h.update(small);
+  auto r = h.finalize_xof();
+  std::vector<std::byte> out(16 * 1024 * 1024);
+  CHECK_THROWS_AS(blake3pp::fill(r, out, sched), std::system_error);
+  CHECK(r.position() == 0);
+}

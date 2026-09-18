@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <system_error>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -241,6 +242,12 @@ static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_pa
 // none are left, so the split follows each agent's actual speed rather
 // than the fixed shares the provider's bulk may hand out. Every index runs
 // exactly once however the implementation distributes the calls.
+//
+// A scheduler may complete the work stopped instead of running it (a
+// stop request on the pool, a pool already shutting down); sync_wait then
+// returns an empty optional and nothing was computed, so the caller must
+// not read its results. That is reported as operation_canceled rather
+// than finished sequentially: the caller asked for the work to stop.
 template <class Scheduler, class Body>
 void for_each_part(Scheduler& sched, std::size_t n, Body body) {
   std::atomic<std::size_t> next{0};
@@ -251,7 +258,10 @@ void for_each_part(Scheduler& sched, std::size_t n, Body body) {
                   body(i);
                 }
               });
-  ex::sync_wait(std::move(work));
+  if (!ex::sync_wait(std::move(work))) {
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled),
+                            "the scheduler stopped the parallel hash");
+  }
 }
 
 // The one-shot engine: partitions input into aligned subtrees, fans them
@@ -325,6 +335,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 /// @param input  Any length.
 /// @param sched  Where the subtree reductions run.
 /// @param a      The variant to run on.
+/// @throws std::system_error with errc::operation_canceled if sched
+///         completes the work stopped instead of running it.
 ///
 /// @code
 /// auto sched = blake3pp::get_parallel_scheduler();
@@ -635,6 +647,8 @@ class parallel_hasher {
 ///                       block_size so every task starts on the wide path.
 ///                       The default matches a generator's natural write
 ///                       granularity.
+/// @throws std::system_error with errc::operation_canceled if sched
+///         completes the work stopped; r is then left where it was.
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void fill(output_reader& r, std::span<std::byte> out, Scheduler&& sched,
@@ -654,7 +668,10 @@ void fill(output_reader& r, std::span<std::byte> out, Scheduler&& sched,
                 part.seek(base + off);
                 part.fill(out.subspan(off, std::min(segment, out.size() - off)));
               });
-  ex::sync_wait(std::move(work));
+  if (!ex::sync_wait(std::move(work))) {
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled),
+                            "the scheduler stopped the parallel fill");
+  }
   r.seek(base + out.size());
 }
 
