@@ -74,9 +74,15 @@ enum class arch : std::uint8_t {
 /// and idempotent, it upgrades cpu_supports(), available_arches() and
 /// auto-dispatch. Call it where the application is not concurrently
 /// manipulating SIGILL handling; the shipped CLI tools call it at
-/// startup, since a standalone binary owns its process. The
-/// BLAKE3PP_ASSUME_XTHEADVECTOR environment hook is independent of this
-/// and needs no probe.
+/// startup, since a standalone binary owns its process.
+///
+/// The BLAKE3PP_ASSUME_XTHEADVECTOR environment variable bypasses the
+/// question instead of answering it: =0 vetoes the XTheadVector kernel
+/// whatever detection says, and =1 asserts the CPU has it without any
+/// check, which is the one way this library runs a kernel the CPU may
+/// lack (SIGILL on the first hash if the assertion is wrong). It exists
+/// for boards whose kernel hides the answer and whose owner knows it;
+/// nothing else should set it.
 /// @return true if anything new was learned.
 bool run_trap_probes() noexcept;
 
