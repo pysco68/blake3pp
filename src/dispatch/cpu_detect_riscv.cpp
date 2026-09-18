@@ -161,9 +161,23 @@ constexpr bool test_force_trap() noexcept { return false; }
 // platform_run_trap_probes() below, whose magic static guarantees
 // exactly one thread runs the guarded probes, exactly once; the SIGILL
 // handler is scoped to the probed instruction and restored immediately.
-sigjmp_buf g_probe_jmp;
+// A signal disposition is process-wide, so a SIGILL raised on another
+// thread inside that window reaches this handler too. The jump buffer
+// is per thread and the flag says whether this thread is probing; a
+// foreign fault gets the previous disposition back and returns, so the
+// faulting instruction re-executes under it and takes the path it
+// would have taken anyway, instead of a siglongjmp into a frame that
+// is not on its stack.
+thread_local sigjmp_buf g_probe_jmp;
+thread_local volatile std::sig_atomic_t g_probing = 0;
+struct sigaction g_probe_old {};
 
-void probe_sigill(int) { siglongjmp(g_probe_jmp, 1); }
+void probe_sigill(int) {
+  if (g_probing) {
+    siglongjmp(g_probe_jmp, 1);
+  }
+  sigaction(SIGILL, &g_probe_old, nullptr);
+}
 
 // Run one probe under a scoped SIGILL guard. Only ever called from
 // platform_run_trap_probes() (single thread via its magic static);
@@ -174,18 +188,19 @@ void probe_sigill(int) { siglongjmp(g_probe_jmp, 1); }
 template <class F>
 bool guarded(F&& body) noexcept {
   struct sigaction sa {};
-  struct sigaction old {};
   sa.sa_handler = &probe_sigill;
   sigemptyset(&sa.sa_mask);
-  if (sigaction(SIGILL, &sa, &old) != 0) {
+  if (sigaction(SIGILL, &sa, &g_probe_old) != 0) {
     return false;  // cannot make the probe safe -> claim nothing
   }
   bool ok = false;
+  g_probing = 1;
   if (sigsetjmp(g_probe_jmp, 1) == 0) {
     body();
     ok = true;
   }
-  sigaction(SIGILL, &old, nullptr);
+  g_probing = 0;
+  sigaction(SIGILL, &g_probe_old, nullptr);
   return ok;
 }
 
@@ -335,7 +350,7 @@ bool xthead_supported() noexcept {
   static const int assume = [] {
     const char* v = std::getenv("BLAKE3PP_ASSUME_XTHEADVECTOR");
     if (v != nullptr && v[0] == '1') {
-      return 1;
+      return 1;  // an unchecked assertion: the caller vouches for the CPU
     }
     if (v != nullptr && v[0] == '0') {
       return 0;  // explicit opt-out: the ladder's emergency brake
