@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <string_view>
 #include <bit>
-#include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -88,7 +87,12 @@ class reader_engine {
         break;
       }
     }
-    assert(s < qd_);  // release() reassigns eagerly, so `want` has a slot
+    // release() reassigns eagerly, so `want` has a slot unless the caller
+    // holds every one of them: the documented queue_depth limit.
+    if (s == qd_) {
+      throw std::system_error(EINVAL, std::generic_category(),
+                              "next() with every window slot still held");
+    }
     slot_state& st = slots_[s];
     if (st.started) {
       backend_.wait(s);
@@ -102,6 +106,17 @@ class reader_engine {
   }
 
   void release(const window& w) noexcept {
+    // A slot this reader never handed out, or one released twice, cannot
+    // be reported here (noexcept); it is latched like a failed submission
+    // and surfaces at the next next().
+    if (w.slot >= qd_ || !slots_[w.slot].held) {
+      if (!submit_failed_) {
+        submit_failed_ = std::make_exception_ptr(std::system_error(
+            EINVAL, std::generic_category(),
+            "release() of a window this reader did not hand out"));
+      }
+      return;
+    }
     slot_state& st = slots_[w.slot];
     st.assigned = false;
     st.held = false;
@@ -198,6 +213,11 @@ class writer_engine {
   void submit(const buffer& b, std::size_t bytes) {
     if (bytes == 0) {
       return;
+    }
+    if (b.slot >= qd_ || bytes > buffer_) {
+      throw std::system_error(EINVAL, std::generic_category(),
+                              "submit() of a buffer this writer did not "
+                              "hand out, or of more bytes than it holds");
     }
     if (tail_submitted_) {
       throw std::system_error(EINVAL, std::generic_category(),

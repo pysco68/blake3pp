@@ -350,6 +350,72 @@ TEST_CASE("reader fallback backends deliver identical data") {
   }
 }
 
+// At most queue_depth windows may be held at once. Asking for one more
+// is refused rather than indexing past the slot table, and the reader
+// carries on once a window comes back.
+TEST_CASE("reader refuses a window beyond queue_depth and recovers") {
+  const auto content = make_input(256 * 1024 + 5);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+  blake3pp::detail::file_reader r(
+      f.path, {.window_bytes = 64 * 1024, .queue_depth = 2});
+  auto w0 = r.next();
+  auto w1 = r.next();
+  REQUIRE(w0);
+  REQUIRE(w1);
+  CHECK_THROWS_AS(r.next(), std::system_error);
+  blake3pp::hasher h;
+  h.update(std::span<const std::byte>{w0->data, w0->bytes});
+  r.release(*w0);
+  h.update(std::span<const std::byte>{w1->data, w1->bytes});
+  r.release(*w1);
+  while (auto w = r.next()) {
+    h.update(std::span<const std::byte>{w->data, w->bytes});
+    r.release(*w);
+  }
+  CHECK(h.finalize() == expected);
+}
+
+// release() is noexcept, so a window the reader never handed out (or one
+// handed back twice) is latched and reported by the next next().
+TEST_CASE("reader latches a release it did not hand out") {
+  const auto content = make_input(256 * 1024);
+  const temp_file f(content);
+  SUBCASE("foreign slot") {
+    blake3pp::detail::file_reader r(
+        f.path, {.window_bytes = 64 * 1024, .queue_depth = 2});
+    auto w = r.next();
+    REQUIRE(w);
+    auto bogus = *w;
+    bogus.slot = 7;
+    r.release(bogus);
+    CHECK_THROWS_AS(r.next(), std::system_error);
+  }
+  SUBCASE("released twice") {
+    blake3pp::detail::file_reader r(
+        f.path, {.window_bytes = 64 * 1024, .queue_depth = 2});
+    auto w = r.next();
+    REQUIRE(w);
+    r.release(*w);
+    r.release(*w);
+    CHECK_THROWS_AS(r.next(), std::system_error);
+  }
+}
+
+// A submit larger than the buffer it names would hand the kernel a span
+// running into the next slot; it is refused instead.
+TEST_CASE("writer refuses a submit larger than its buffer") {
+  const temp_file f({});
+  blake3pp::detail::file_writer w(
+      f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
+  auto b = w.acquire();
+  CHECK_THROWS_AS(w.submit(b, b.capacity + 1), std::system_error);
+  auto foreign = b;
+  foreign.slot = 9;
+  CHECK_THROWS_AS(w.submit(foreign, 4096), std::system_error);
+  w.finish();
+}
+
 // The writer's async path with and without the io-wq hand-off must land
 // the same bytes on disk.
 TEST_CASE("writer submit modes deliver identical data") {
