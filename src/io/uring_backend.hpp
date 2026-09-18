@@ -121,6 +121,7 @@ struct uring {
   std::size_t cq_ring_sz = 0;
   unsigned char* sqes = nullptr;
   std::size_t sqes_sz = 0;
+  unsigned* sq_head = nullptr;
   unsigned* sq_tail = nullptr;
   unsigned* sq_mask = nullptr;
   unsigned char* sq_array = nullptr;
@@ -128,6 +129,12 @@ struct uring {
   unsigned* cq_tail = nullptr;
   unsigned* cq_mask = nullptr;
   unsigned char* cqes = nullptr;
+  // Submissions the kernel has accepted and not yet completed. destroy()
+  // reaps them before the ring goes: close() on the ring fd does not
+  // wait (ring exit runs on a kernel workqueue), and a read already
+  // issued to the device completes into the pages it pinned, which by
+  // then belong to whatever the caller allocated next.
+  unsigned outstanding = 0;
 
   uring() = default;
   uring(const uring&) = delete;
@@ -173,6 +180,7 @@ struct uring {
     }
     auto* sqb = static_cast<unsigned char*>(sq_ring);
     auto* cqb = static_cast<unsigned char*>(cq_ring);
+    sq_head = ring_at<unsigned>(sqb, p.sq_off.head);
     sq_tail = ring_at<unsigned>(sqb, p.sq_off.tail);
     sq_mask = ring_at<unsigned>(sqb, p.sq_off.ring_mask);
     sq_array = sqb + p.sq_off.array;
@@ -188,7 +196,29 @@ struct uring {
     return false;
   }
 
+  // Reaps every completion still owed. A failure of the wait itself
+  // (not EINTR) ends the loop: nothing more can be learned from that
+  // ring, and the caller's buffers are the only thing left to protect.
+  void drain() noexcept {
+    while (outstanding > 0 && cq_head != nullptr) {
+      const unsigned head = *cq_head;
+      const unsigned tail =
+          std::atomic_ref<unsigned>(*cq_tail).load(std::memory_order_acquire);
+      if (head != tail) {
+        std::atomic_ref<unsigned>(*cq_head).store(tail,
+                                                  std::memory_order_release);
+        outstanding -= std::min(tail - head, outstanding);
+        continue;
+      }
+      if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
+          errno != EINTR) {
+        break;
+      }
+    }
+  }
+
   void destroy() noexcept {
+    drain();
     if (sqes != nullptr) {
       ::munmap(sqes, sqes_sz);
       sqes = nullptr;
@@ -235,8 +265,21 @@ struct uring {
     std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
     std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
                                               std::memory_order_release);
-    if (sys_io_uring_enter(fd, 1, 0, 0) < 0) {
-      throw_errno("io_uring_enter(submit)");
+    // Submit everything between the kernel's head and the new tail, not
+    // one entry: a failed enter leaves its entry published, and a fixed
+    // count of one would then submit that stale entry and leave this one
+    // behind, shifting every later completion by a slot.
+    for (;;) {
+      const unsigned head =
+          std::atomic_ref<unsigned>(*sq_head).load(std::memory_order_acquire);
+      const int n = sys_io_uring_enter(fd, tail + 1 - head, 0, 0);
+      if (n >= 0) {
+        outstanding += static_cast<unsigned>(n);
+        return;
+      }
+      if (errno != EINTR) {
+        throw_errno("io_uring_enter(submit)");
+      }
     }
   }
 
@@ -253,6 +296,7 @@ struct uring {
         const std::pair<std::uint64_t, int> out{cqe.user_data, cqe.res};
         std::atomic_ref<unsigned>(*cq_head).store(head + 1,
                                                   std::memory_order_release);
+        outstanding -= std::min(1u, outstanding);
         return out;
       }
       if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&

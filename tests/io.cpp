@@ -30,6 +30,11 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include "io/pread_backend.hpp"
 #endif
+#if defined(__linux__)
+#include <fcntl.h>
+#include "io/backend.hpp"
+#include "io/uring_backend.hpp"
+#endif
 
 namespace {
 
@@ -275,6 +280,36 @@ TEST_CASE("reader reports a backend") {
   MESSAGE("file_reader backend: " << r.backend());
   CHECK(!r.backend().empty());
 }
+
+#if defined(__linux__)
+// Closing the ring fd does not wait for the reads it still owes, so a
+// ring torn down with a read in flight lets the kernel complete into
+// memory its owner has already freed. destroy() has to reap them first:
+// after it returns, the buffer holds the file. The read is large enough
+// that it cannot have finished in the microseconds destroy() itself
+// takes, so a missing drain fails here rather than by luck.
+TEST_CASE("io_uring destroy reaps in-flight reads before the ring goes") {
+  using namespace blake3pp::detail::io_impl;
+  const auto content = make_input(32 * 1024 * 1024);
+  const temp_file f(content);
+  uring ring;
+  if (!ring.init(4)) {
+    MESSAGE("io_uring unavailable (" << no_uring_suffix(ring.setup_errno)
+                                     << "): skipped");
+    return;
+  }
+  posix_file file;
+  file.open(f.path.c_str(), O_RDONLY | O_CLOEXEC);
+  file.try_odirect(f.path.c_str(), O_RDONLY | O_CLOEXEC);
+  aligned_pool buf(content.size());
+  std::memset(buf.data, 0, content.size());
+  ring.submit_rw(IORING_OP_READ, file.fd, buf.data,
+                 static_cast<unsigned>(content.size()), 0, 0, true);
+  ring.destroy();
+  CHECK(ring.outstanding == 0);
+  CHECK(std::equal(content.begin(), content.end(), buf.data));
+}
+#endif
 
 // The degradation ladder below io_uring: synchronous backends must produce
 // identical windows. These run rarely in the wild (no-io_uring kernels,
