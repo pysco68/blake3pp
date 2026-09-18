@@ -35,7 +35,7 @@
 namespace blake3pp::detail {
 
 struct file_writer_options {
-  // Rounded up to a multiple of 4 KiB, min 64 KiB.
+  // Rounded up to a multiple of 4 KiB, min 64 KiB, max 1 GiB.
   std::size_t buffer_bytes = 8 * 1024 * 1024;
   unsigned queue_depth = 4;  // clamped to [2, 32]
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused

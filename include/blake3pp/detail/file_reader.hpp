@@ -31,7 +31,8 @@
 namespace blake3pp::detail {
 
 struct file_reader_options {
-  // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB.
+  // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB,
+  // max 1 GiB.
   std::size_t window_bytes = 8 * 1024 * 1024;
   unsigned queue_depth = 4;  // clamped to [2, 32]
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused

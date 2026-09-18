@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <span>
 #include <system_error>
@@ -29,6 +30,16 @@
 #include "io/backend.hpp"
 
 namespace blake3pp::detail::io_impl {
+
+constexpr unsigned max_queue_depth = 32;
+
+// The largest window or buffer either engine accepts: 1 GiB, or less
+// where max_queue_depth of them would not fit in size_t. Keeps the pool
+// size from wrapping and every transfer below the 32-bit length the
+// backends hand the kernel (io_uring's sqe.len, WriteFile's DWORD).
+constexpr std::size_t max_window_bytes =
+    std::min<std::size_t>(std::size_t{1} << 30,
+                          std::numeric_limits<std::size_t>::max() / max_queue_depth);
 
 // The read-side window/slot engine: windows are delivered strictly in
 // file order while later windows stream in behind them; release()
@@ -45,9 +56,9 @@ class reader_engine {
       // Window: power-of-2 multiple of the chunk size so every full window
       // is a subtree-aligned unit; >= 64 KiB keeps O_DIRECT alignment
       // trivial.
-      : window_(std::bit_floor(
-            std::max<std::size_t>(opts.window_bytes, 64 * 1024))),
-        qd_(std::min(32u, std::max(2u, opts.queue_depth))),
+      : window_(std::bit_floor(std::clamp<std::size_t>(
+            opts.window_bytes, 64 * 1024, max_window_bytes))),
+        qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
         slots_(qd_),
         pool_(std::size_t{qd_} * window_),
         backend_(path, opts, qd_) {
@@ -193,7 +204,7 @@ class writer_engine {
   writer_engine(const std::filesystem::path& path,
                 const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
-        qd_(std::min(32u, std::max(2u, opts.queue_depth))),
+        qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
         pool_(std::size_t{qd_} * buffer_),
         backend_(path, opts, qd_) {}
 
@@ -243,7 +254,9 @@ class writer_engine {
   // Round up to the O_DIRECT length granule; >= 64 KiB so queued writes
   // are worth their submission cost.
   static std::size_t rounded_buffer(std::size_t bytes) noexcept {
-    bytes = std::max<std::size_t>(bytes, 64 * 1024);
+    bytes = std::clamp<std::size_t>(bytes, 64 * 1024,
+                                    max_window_bytes / direct_align *
+                                        direct_align);
     return (bytes + direct_align - 1) / direct_align * direct_align;
   }
 
