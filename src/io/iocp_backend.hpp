@@ -455,6 +455,10 @@ class iocp_writer {
                       static_cast<DWORD>(buf.size() - put), &n, &ov) == 0) {
         throw_winerr("WriteFile");
       }
+      if (n == 0) {
+        throw std::system_error(EIO, std::generic_category(),
+                                "WriteFile wrote nothing");
+      }
       put += n;
     }
   }
