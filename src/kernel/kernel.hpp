@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include <blake3pp/dispatch.hpp>  // arch: each table names its variant
 
@@ -79,7 +80,11 @@ inline constexpr std::uint32_t flag_derive_key_material = 1u << 6;
 // The kernel ABI is flat, std::uint8_t* as a C interface would be, while
 // the library's own surface is std::byte. Both are byte types, so these
 // hand back a view of the same object rather than punning its type; the
-// hop through void* is what keeps them out of reinterpret_cast.
+// hop through void* is what keeps them out of reinterpret_cast. That
+// holds only while std::uint8_t is unsigned char, which the aliasing
+// rules exempt; an implementation could make it a distinct type.
+static_assert(std::is_same_v<std::uint8_t, unsigned char>,
+              "the kernel ABI reads std::byte storage through std::uint8_t");
 [[nodiscard]] inline const std::uint8_t* kernel_bytes(
     const std::byte* p) noexcept {
   return static_cast<const std::uint8_t*>(static_cast<const void*>(p));

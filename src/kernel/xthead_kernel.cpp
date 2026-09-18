@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <bit>
 
 namespace blake3pp::kern::xthead {
 namespace {
@@ -33,10 +34,15 @@ namespace {
 constexpr std::size_t W = 4;       // VLEN=128, u32 m1
 constexpr std::size_t vl = W;
 
+// No byte swap: RISC-V is little-endian, and big-endian RV has no 0.7.1
+// parts. The main kernel swaps on big-endian; this one refuses to build.
+static_assert(std::endian::native == std::endian::little,
+              "the XTheadVector kernel loads message words little-endian");
+
 inline std::uint32_t load32(const std::uint8_t* p) noexcept {
   std::uint32_t v;
   std::memcpy(&v, p, sizeof v);
-  return v;  // RISC-V is little-endian; big-endian RV has no 0.7.1 parts
+  return v;
 }
 
 inline void store32(std::uint8_t* p, std::uint32_t v) noexcept {

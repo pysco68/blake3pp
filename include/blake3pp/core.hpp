@@ -265,13 +265,17 @@ class hasher {
   /// engine and the I/O pipeline: absorbs the root chaining value of a
   /// subtree covering subtree_chunks complete chunks.
   ///
-  /// @pre subtree_chunks is a power of two.
+  /// @pre subtree_chunks is a power of two, at least 1.
   /// @pre The hasher sits on a chunk boundary: count() is a multiple of
   ///      chunk_size. A full chunk still open from update() is closed out
   ///      here, since the subtree proves it is not the last.
   /// @pre The current chunk position is subtree_chunks-aligned.
   /// @pre At least one byte of the message follows the subtree; it must
   ///      not contain the final chunk.
+  /// @pre The message stays within BLAKE3's 2^64 bytes: at most 2^54
+  ///      chunks in total, which is what the chaining-value stack holds.
+  /// These preconditions are checked by assert() only; violating them in
+  /// a release build corrupts the hasher.
   /// The subtree must have been hashed under this hasher's key_words() and
   /// mode_flags() so keyed and derive_key modes propagate.
   /// @param cv              The subtree's root chaining value.

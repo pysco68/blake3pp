@@ -68,6 +68,10 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
                                          std::span<const std::uint32_t, 8> key,
                                          std::uint32_t base_flags,
                                          std::uint8_t* out_cvs) noexcept {
+  // A power of two splits into equal halves all the way down, so
+  // compress_parents_wide never sees an odd child count and its output
+  // fits the max_batch_inputs CVs the callers provide.
+  assert(std::has_single_bit(num_chunks));
   if (num_chunks <= 2 * k.simd_degree) {
     const std::uint8_t* chunks[kern::max_batch_inputs];
     for (std::size_t i = 0; i < num_chunks; ++i) {
@@ -202,6 +206,7 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
                                    std::span<const std::uint32_t, 8> key,
                                    std::uint32_t base_flags,
                                    std::span<std::uint32_t, 8> out_cv) noexcept {
+  assert(num_chunks > 0 && std::has_single_bit(num_chunks));
 #if defined(BLAKE3PP_SUBTREE_FOLD)
   // The macro's value is the stack bound in levels; see ArchKernels.cmake.
   compress_subtree_to_cv_folded<BLAKE3PP_SUBTREE_FOLD>(

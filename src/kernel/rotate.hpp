@@ -121,6 +121,9 @@ constexpr bool prefer_byte_rot() noexcept {
 // a discarded branch are still instantiated.
 template <int N, std::size_t W = u32v::width>
 BLAKE3PP_FORCE_INLINE u32v rot(u32v a) noexcept {
+  // The shift-or spelling three providers fall back to is undefined at 0
+  // and 32; BLAKE3 only ever rotates by 16, 12, 8 and 7.
+  static_assert(N > 0 && N < 32, "rotate amount must be in (0, 32)");
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
   if constexpr (prefer_byte_rot<N>() && shuffle_backend::supports_byte_rot<W>) {
     return shuffle_backend::rot_bytes<N / 8, W>(a);
