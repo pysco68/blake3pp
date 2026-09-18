@@ -40,6 +40,7 @@ TEST_CASE("arch introspection invariants") {
   const auto avail = blake3pp::available_arches();
   REQUIRE(!avail.empty());
   CHECK(avail.front() == blake3pp::best_available());
+  CHECK(blake3pp::is_available(blake3pp::arch::auto_detect));
 
   for (const auto a : avail) {
     CAPTURE(arch_name(a));

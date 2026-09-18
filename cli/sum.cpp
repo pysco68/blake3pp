@@ -287,7 +287,7 @@ int main(int argc, char** argv) {
 
   o.io.direct_io = !no_direct;
   o.io.offload_submit = !inline_submit;
-  if (o.io.a != blake3pp::arch::auto_detect && !blake3pp::is_available(o.io.a)) {
+  if (!blake3pp::is_available(o.io.a)) {
     println(stderr, "blake3ppsum: arch '{}' not available on this machine (auto -> {})", blake3pp::to_string(o.io.a), blake3pp::to_string(blake3pp::best_available()));
     return b3tool::exit_usage;
   }

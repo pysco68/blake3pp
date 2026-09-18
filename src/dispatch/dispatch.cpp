@@ -185,7 +185,9 @@ std::span<const arch> available_impl() noexcept {
 }  // namespace
 
 bool is_available(arch a) noexcept {
-  return compiled_in(a) && cpu_supports_impl(a);
+  // auto_detect names whatever best_available() resolves to, which always
+  // exists: scalar is compiled into every build.
+  return a == arch::auto_detect || (compiled_in(a) && cpu_supports_impl(a));
 }
 
 bool run_trap_probes() noexcept {
