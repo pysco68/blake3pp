@@ -46,6 +46,8 @@
 
 namespace blake3pp {
 
+class trace_buffer;
+
 /// The pipeline's knobs: what update_file() takes. The hasher it streams
 /// into already carries the SIMD variant and the mode.
 struct file_io_options {
@@ -64,6 +66,9 @@ struct file_io_options {
   /// whenever they can, so this asks for the hand-off explicitly. Ignored
   /// where the platform has no such notion.
   bool offload_submit = true;
+  /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
+  /// records nothing, at the cost of one branch per window.
+  trace_buffer* trace = nullptr;
 };
 
 /// hash_file()'s knobs: the pipeline's, plus what shapes the hasher it
@@ -89,11 +94,14 @@ struct hash_file_options {
   /// derive_key and extended output have no shortcut here: build the
   /// hasher yourself and use update_file().
   std::optional<std::array<std::byte, key_size>> key = std::nullopt;
+  /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
+  /// records nothing.
+  trace_buffer* trace = nullptr;
 
   /// The pipeline knobs alone, so one options object drives update_file()
   /// too.
   constexpr operator file_io_options() const noexcept {
-    return {window_bytes, queue_depth, direct_io, offload_submit};
+    return {window_bytes, queue_depth, direct_io, offload_submit, trace};
   }
 };
 

@@ -31,17 +31,6 @@
 
 namespace blake3pp::detail::io_impl {
 
-constexpr unsigned max_queue_depth = 32;
-
-// The largest window or buffer either engine accepts, 1 GiB, or less
-// where max_queue_depth of them would not fit in size_t. The cap keeps
-// the pool size from wrapping and every transfer below the 32-bit
-// length the backends hand the kernel (io_uring's sqe.len, WriteFile's
-// DWORD).
-constexpr std::size_t max_window_bytes =
-    std::min<std::size_t>(std::size_t{1} << 30,
-                          std::numeric_limits<std::size_t>::max() / max_queue_depth);
-
 // The read-side window/slot engine: windows are delivered strictly in
 // file order while later windows stream in behind them; release()
 // recycles a buffer slot, which is what creates backpressure. Every
@@ -54,11 +43,7 @@ class reader_engine {
 
   reader_engine(const std::filesystem::path& path,
                 const file_reader_options& opts)
-      // Window: power-of-2 multiple of the chunk size so every full window
-      // is a subtree-aligned unit; >= 64 KiB keeps O_DIRECT alignment
-      // trivial.
-      : window_(std::bit_floor(std::clamp<std::size_t>(
-            opts.window_bytes, 64 * 1024, max_window_bytes))),
+      : window_(rounded_window_bytes(opts.window_bytes)),
         qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
         slots_(qd_),
         pool_(std::size_t{qd_} * window_),

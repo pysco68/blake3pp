@@ -175,6 +175,7 @@ consumers can pick granular headers instead:
 | `<blake3pp/io.hpp>`          | `update_file()` and `hash_file()`, the async direct-I/O pipeline | no |
 | `<blake3pp/parallel.hpp>`    | multi-core `hash()`, `parallel_hasher`, multi-core XOF `fill()` | yes |
 | `<blake3pp/parallel_io.hpp>` | `update_file()` and `hash_file()` over a scheduler (the two combined) | yes |
+| `<blake3pp/trace.hpp>`       | `trace_buffer`: per-window timing records for `update_file()` | no |
 
 The last column is the one that matters when you install blake3pp rather
 than build it: only the scheduler-taking headers include an execution

@@ -30,6 +30,7 @@
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
+#include <blake3pp/trace.hpp>
 
 namespace blake3pp {
 
@@ -62,16 +63,40 @@ void update_file(hasher& h, const std::filesystem::path& path,
   const kern::kernel_ops* const ops = detail::resolve(h.selected_arch());
   const std::uint64_t base = h.count();
   const bool on_chunk_boundary = base % chunk_size == 0;
-  while (auto w = reader.next()) {
+  trace_buffer* const trace = opts.trace;
+  std::uint64_t index = 0;
+  for (;;) {
+    // The wait is timed before the record is claimed: the last next()
+    // returns nothing, and that iteration gets no record.
+    const std::int64_t t_wait_begin = trace ? trace->now() : 0;
+    auto w = reader.next();
+    if (!w) {
+      break;
+    }
+    window_record* const rec = trace ? trace->claim_window() : nullptr;
+    if (rec) {
+      rec->index = index;
+      rec->bytes = w->bytes;
+      rec->flags = w->last ? window_record::flag_last : 0;
+      rec->t_wait_begin = t_wait_begin;
+      rec->t_ready = trace->now();
+    }
     const std::uint64_t chunks = w->bytes / chunk_size;
     const std::uint64_t counter = base / chunk_size + w->offset / chunk_size;
     if (!w->last && on_chunk_boundary && counter % chunks == 0) {
       detail::hash_window_parallel<Budget>(ops, sched, h, w->data, chunks,
-                                           counter);
+                                           counter, trace, rec);
     } else {
       h.update(std::span<const std::byte>{w->data, w->bytes});
+      if (rec) {
+        rec->t_joined = rec->t_absorbed = trace->now();
+      }
     }
     reader.release(*w);
+    if (rec) {
+      rec->t_released = trace->now();
+    }
+    ++index;
   }
 }
 

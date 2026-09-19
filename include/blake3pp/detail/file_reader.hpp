@@ -23,14 +23,37 @@
 // at most queue_depth windows are ever in flight or held. Not
 // thread-safe, so drive it from one pipeline thread.
 
+#include <algorithm>
+#include <bit>
 #include <cstddef>
-#include <string_view>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 namespace blake3pp::detail {
+
+constexpr unsigned max_queue_depth = 32;
+
+// The largest window or buffer the engines accept, 1 GiB, or less where
+// max_queue_depth of them would not fit in size_t. The cap keeps the pool
+// size from wrapping and every transfer below the 32-bit length the
+// backends hand the kernel (io_uring's sqe.len, WriteFile's DWORD).
+constexpr std::size_t max_window_bytes =
+    std::min<std::size_t>(std::size_t{1} << 30,
+                          std::numeric_limits<std::size_t>::max() / max_queue_depth);
+
+// The window the reader actually uses for a requested size: a power of
+// two (so every full window is a subtree-aligned unit) between 64 KiB
+// (which keeps O_DIRECT alignment trivial) and max_window_bytes. Anything
+// that sizes storage per window must use the same rounding.
+[[nodiscard]] constexpr std::size_t rounded_window_bytes(
+    std::size_t requested) noexcept {
+  return std::bit_floor(
+      std::clamp<std::size_t>(requested, 64 * 1024, max_window_bytes));
+}
 
 struct file_reader_options {
   // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB,
