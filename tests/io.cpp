@@ -2,6 +2,7 @@
 #include <array>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -19,6 +20,7 @@
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
 #include <blake3pp/parallel_io.hpp>
+#include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
 // The portable engines and the backends the platform selector never
@@ -264,6 +266,229 @@ TEST_CASE("hash_file_options drives update_file") {
   blake3pp::hasher h;
   blake3pp::update_file(h, f.path, opts);
   CHECK(h.finalize() == blake3pp::hash_file(f.path, opts));
+}
+
+// Tracing: a trace_buffer in the options records one window_record per
+// window (and, with agent storage, one agent_record per bulk invocation
+// that took parts) without touching the digest.
+
+// The window count the reader will produce for len bytes at window_bytes
+// (a power of two here, so no rounding).
+std::size_t window_count(std::size_t len, std::size_t window_bytes) {
+  return (len + window_bytes - 1) / window_bytes;
+}
+
+TEST_CASE("tracing leaves the digest unchanged") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  const std::size_t len = 3 * 1024 * 1024 + 17;  // not a window multiple
+  const auto content = make_input(len);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+
+  for (const std::size_t window : {std::size_t{64 * 1024},
+                                   std::size_t{1024 * 1024}}) {
+    CAPTURE(window);
+    std::vector<blake3pp::window_record> windows(window_count(len, window));
+    std::vector<blake3pp::agent_record> agents(windows.size() * 64);
+    for (const bool with_agents : {false, true}) {
+      CAPTURE(with_agents);
+      blake3pp::trace_buffer trace(
+          windows, with_agents ? std::span{agents}
+                               : std::span<blake3pp::agent_record>{});
+      const blake3pp::file_io_options opts{.window_bytes = window,
+                                           .trace = &trace};
+
+      blake3pp::hasher seq;
+      blake3pp::update_file(seq, f.path, opts);
+      CHECK(seq.finalize() == expected);
+      CHECK(trace.windows().size() == windows.size());
+
+      trace.clear();
+      blake3pp::hasher par;
+      blake3pp::update_file(par, f.path, sched, opts);
+      CHECK(par.finalize() == expected);
+      CHECK(trace.windows().size() == windows.size());
+
+      // hash_file_options forwards the buffer too.
+      trace.clear();
+      CHECK(blake3pp::hash_file(f.path, sched,
+                                {.window_bytes = window, .trace = &trace}) ==
+            expected);
+      CHECK(trace.windows().size() == windows.size());
+    }
+  }
+}
+
+TEST_CASE("window records are complete, in order and consistent") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t window = 64 * 1024;
+  const std::size_t len = 5 * window + 4097;
+  const auto content = make_input(len);
+  const temp_file f(content);
+  const std::size_t n = window_count(len, window);
+  std::vector<blake3pp::window_record> windows(n);
+  blake3pp::trace_buffer trace(windows);
+  const blake3pp::file_io_options opts{.window_bytes = window,
+                                       .trace = &trace};
+
+  for (const bool parallel : {false, true}) {
+    CAPTURE(parallel);
+    trace.clear();
+    blake3pp::hasher h;
+    if (parallel) {
+      blake3pp::update_file(h, f.path, sched, opts);
+    } else {
+      blake3pp::update_file(h, f.path, opts);
+    }
+    CHECK(h.finalize() == blake3pp::hash(content));
+
+    const auto recs = trace.windows();
+    REQUIRE(recs.size() == n);
+    CHECK(trace.dropped_windows() == 0);
+    std::size_t last_flags = 0;
+    std::uint64_t bytes = 0;
+    for (std::size_t i = 0; i < recs.size(); ++i) {
+      const auto& r = recs[i];
+      CAPTURE(i);
+      CHECK(r.index == i);
+      bytes += r.bytes;
+      // Ordering holds within a record; nothing is asserted between
+      // records, which a driver with several windows in flight may
+      // complete in any order.
+      CHECK(r.t_wait_begin <= r.t_ready);
+      CHECK(r.t_ready <= r.t_joined);
+      CHECK(r.t_joined <= r.t_absorbed);
+      CHECK(r.t_absorbed <= r.t_released);
+      if (r.flags & blake3pp::window_record::flag_last) {
+        ++last_flags;
+        CHECK(i == recs.size() - 1);
+      }
+      if (parallel && !(r.flags & blake3pp::window_record::flag_last)) {
+        // 64 chunks in 16-chunk parts: fanned out over the scheduler.
+        CHECK((r.flags & blake3pp::window_record::flag_parallel) != 0);
+        CHECK(r.agents_active >= 1);
+        CHECK(r.agent_busy_ns > 0);
+      } else {
+        CHECK((r.flags & blake3pp::window_record::flag_parallel) == 0);
+        CHECK(r.agents_active == 0);
+        CHECK(r.agent_busy_ns == 0);
+        CHECK(r.t_joined == r.t_absorbed);
+      }
+    }
+    CHECK(last_flags == 1);
+    CHECK(bytes == len);
+  }
+}
+
+TEST_CASE("agent records account for every part of their window") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t window = 256 * 1024;  // 256 chunks, 16 parts
+  const std::size_t len = 4 * window + 1;
+  const auto content = make_input(len);
+  const temp_file f(content);
+  const std::size_t n = window_count(len, window);
+  std::vector<blake3pp::window_record> windows(n);
+  std::vector<blake3pp::agent_record> agents(n * 64);
+  blake3pp::trace_buffer trace(windows, agents);
+  CHECK(trace.wants_agents());
+
+  blake3pp::hasher h;
+  blake3pp::update_file(h, f.path, sched,
+                        {.window_bytes = window, .trace = &trace});
+  CHECK(h.finalize() == blake3pp::hash(content));
+  CHECK(trace.dropped_agents() == 0);
+
+  const auto recs = trace.windows();
+  REQUIRE(recs.size() == n);
+  for (const auto& w : recs) {
+    CAPTURE(w.index);
+    std::uint64_t parts = 0;
+    std::uint64_t busy = 0;
+    std::uint32_t active = 0;
+    for (const auto& a : trace.agents()) {
+      if (a.window != w.index) {
+        continue;
+      }
+      ++active;
+      parts += a.parts;
+      busy += a.busy_ns;
+      CHECK(a.parts >= 1);
+      CHECK(a.part_chunks == 16);
+      CHECK(a.min_part_ns <= a.max_part_ns);
+      const std::uint64_t floor_ns = a.min_part_ns * a.parts;
+      CHECK(floor_ns <= a.busy_ns);
+      CHECK(a.t_begin >= w.t_ready);
+      CHECK(a.t_begin + static_cast<std::int64_t>(a.busy_ns) <= w.t_joined);
+    }
+    if (w.flags & blake3pp::window_record::flag_parallel) {
+      CHECK(parts == w.bytes / blake3pp::chunk_size / 16);
+      CHECK(busy == w.agent_busy_ns);
+      CHECK(active == w.agents_active);
+    } else {
+      CHECK(active == 0);
+    }
+  }
+}
+
+TEST_CASE("full trace storage drops records, never bytes") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t window = 64 * 1024;
+  const std::size_t len = 6 * window + 100;
+  const auto content = make_input(len);
+  const temp_file f(content);
+  const std::size_t n = window_count(len, window);
+  REQUIRE(n >= 5);
+  const auto expected = blake3pp::hash(content);
+
+  std::vector<blake3pp::window_record> windows(2);
+  std::vector<blake3pp::agent_record> agents(1);
+  blake3pp::trace_buffer trace(windows, agents);
+  const blake3pp::hash_file_options opts{.window_bytes = window,
+                                       .trace = &trace};
+
+  CHECK(blake3pp::hash_file(f.path, opts) == expected);
+  CHECK(trace.windows().size() == 2);
+  CHECK(trace.dropped_windows() == n - 2);
+  CHECK(trace.agents().empty());  // sequential: no agents
+  CHECK(trace.dropped_agents() == 0);
+
+  trace.clear();
+  CHECK(blake3pp::hash_file(f.path, sched, opts) == expected);
+  CHECK(trace.windows().size() == 2);
+  CHECK(trace.dropped_windows() == n - 2);
+  CHECK(trace.agents().size() == 1);
+  CHECK(trace.dropped_agents() > 0);
+  CHECK(trace.agents()[0].parts >= 1);
+}
+
+TEST_CASE("trace_buffer::clear keeps the epoch") {
+  constexpr std::size_t window = 64 * 1024;
+  const auto content = make_input(3 * window);
+  const temp_file f(content);
+  std::vector<blake3pp::window_record> windows(3);
+  std::vector<blake3pp::agent_record> agents(8);
+  blake3pp::trace_buffer trace(windows, agents);
+  const blake3pp::hash_file_options opts{.window_bytes = window,
+                                       .trace = &trace};
+  CHECK(trace.epoch_ns() > 0);
+  CHECK(trace.now() >= 0);
+
+  (void)blake3pp::hash_file(f.path, opts);
+  (void)blake3pp::hash_file(f.path, opts);  // a second call overflows
+  REQUIRE(trace.windows().size() == 3);
+  CHECK(trace.dropped_windows() == 3);
+  const std::int64_t before = trace.windows().back().t_released;
+
+  trace.clear();
+  CHECK(trace.windows().empty());
+  CHECK(trace.agents().empty());
+  CHECK(trace.dropped_windows() == 0);
+  CHECK(trace.dropped_agents() == 0);
+
+  (void)blake3pp::hash_file(f.path, opts);
+  REQUIRE(trace.windows().size() == 3);
+  // Same epoch: the new records come after the old ones on the same axis.
+  CHECK(trace.windows().front().t_wait_begin >= before);
 }
 
 TEST_CASE("missing file throws system_error") {
