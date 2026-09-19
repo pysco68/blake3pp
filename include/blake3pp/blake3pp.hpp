@@ -20,6 +20,8 @@
 ///                            library only)
 /// <blake3pp/parallel_io.hpp> the same over a scheduler (io.hpp +
 ///                            parallel.hpp)
+/// <blake3pp/trace.hpp>       per-window timing records for update_file()
+///                            (standard library only)
 /// @endcode
 ///
 /// The I/O headers follow the BLAKE3PP_WITH_IO build option: a
@@ -31,4 +33,5 @@
 #if BLAKE3PP_WITH_IO
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel_io.hpp>
+#include <blake3pp/trace.hpp>
 #endif
