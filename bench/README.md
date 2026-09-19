@@ -9,6 +9,64 @@ with `BLAKE3PP_BUILD_BENCH` and are documented by their `--help`.
 The third, `blake3pp_dispatch_cost_<variant>`, answers one question and
 is off by default (`-DBLAKE3PP_BENCH_DISPATCH_COST=ON`).
 
+## file_throughput: where a window's time goes (`--trace`)
+
+`blake3pp_bench_file FILE --trace PATH` hands the pipeline a
+`blake3pp::trace_buffer` (`<blake3pp/trace.hpp>`) sized for the file:
+one `window_record` per I/O window, and with `--trace-agents` one
+`agent_record` per pool thread per window. Every rep starts from an
+empty buffer; the last rep of each row (`seq`, `parallel`) is what the
+summary below the row describes and what lands in PATH as Chrome trace
+JSON (with both rows, `PATH` becomes `<stem>.seq.<ext>` and
+`<stem>.parallel.<ext>`). Open it in Perfetto or `chrome://tracing`.
+
+A window record holds five timestamps, nanoseconds on the steady clock
+from the buffer's construction: before the reader was asked for the
+window (`t_wait_begin`), the reader handing it out (`t_ready`), the
+compute done (`t_joined`), the chaining values in the hasher
+(`t_absorbed`, equal to `t_joined` for a window hashed inline) and the
+buffer back with the reader (`t_released`). The JSON puts the four
+intervals on `tid` 1 as `wait`, `hash`, `absorb` and `release`, one
+`"X"` event each with the window index in `args`. The summary prints
+their shares of the row's wall time (last release minus first wait),
+and for the parallel row the pool's busy fraction (the agents' summed
+compress time over threads × wall) and how many agents took part per
+window.
+
+An agent record is one bulk invocation that compressed at least one
+part (a part is 16 or more chunks; nothing below a part is timed): when
+it started, its busy time, the parts it took, the shortest and longest
+part, and the CPU it ran on. The JSON gives each CPU its own track
+(`tid` 100 + cpu; 99 when unknown) with one `compress` event per
+record, so the pipeline row sits above the cores. The summary aggregates
+per CPU into an effective rate (bytes compressed over busy time), then
+prints the run's min, median and max of that rate and the worst
+`max_part / min_part` ratio seen on one agent. A slow core is a low
+rate; preemption is a large ratio on an otherwise normal core; cores
+that arrive after the counter is drained are missing altogether. The
+per-window overhead of `--trace` alone is a few clock reads on the
+driving thread; `--trace-agents` adds one clock read per part on the
+agents.
+
+On Linux the summary also reports `io-wq cpu`, the CPU time of the
+kernel's io_uring worker threads (`iou-wrk-*` under `/proc/self/task`)
+over the rep's wall time, in cores. Workers come and go with the load,
+so the figure only credits workers alive at both ends of the rep.
+
+### Pairing with perf
+
+The records and `perf` share `CLOCK_MONOTONIC`; the JSON's top-level
+`epoch_ns` is the records' zero on that clock:
+
+    perf record -k CLOCK_MONOTONIC -e cycles --call-graph lbr -- \
+        blake3pp_bench_file FILE --trace t.json --trace-agents
+    perf script -F time,cpu,ip,sym
+
+A sample at time `T` seconds belongs to the window whose interval
+covers `T * 1e9 - epoch_ns`, and to the agent record with the same
+`cpu` whose `[t_begin, t_begin + busy_ns)` covers it. No probes or
+markers are involved; the join is by time and CPU alone.
+
 ## dispatch_cost: what the fat binary pays at the call boundary
 
 Every hashing call in the library goes through a pointer to the running
