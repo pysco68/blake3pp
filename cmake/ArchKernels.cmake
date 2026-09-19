@@ -207,7 +207,7 @@ function(blake3pp_add_kernel ns)
            "-I${_ak_xsimd_inc}")
     endif()
     add_custom_command(OUTPUT "${_ak_obj}"
-      COMMAND "${AK_EXTERNAL_COMPILER}" -std=c++23 -O3
+      COMMAND "${AK_EXTERNAL_COMPILER}" -std=c++23 -O3 -fPIC
               -fno-exceptions -fno-rtti -fno-stack-protector
               ${AK_ARCH_FLAGS} ${_ak_defs} "-DBLAKE3PP_ARCH_NS=${ns}"
               "-I${PROJECT_SOURCE_DIR}/src" "-I${PROJECT_SOURCE_DIR}/include"
