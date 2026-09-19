@@ -22,7 +22,17 @@ namespace {
 
 void x86_cpuid(unsigned leaf, unsigned subleaf, unsigned out[4]) noexcept {
 #if defined(_MSC_VER)
+  // A leaf above the CPU's maximum basic leaf returns the highest leaf's
+  // data on Intel and zeros on AMD; zero it here so feature tests read a
+  // definite absence, as the GNU path below does.
   int r[4];
+  __cpuid(r, 0);
+  if (leaf > static_cast<unsigned>(r[0])) {
+    for (int i = 0; i < 4; ++i) {
+      out[i] = 0;
+    }
+    return;
+  }
   __cpuidex(r, static_cast<int>(leaf), static_cast<int>(subleaf));
   for (int i = 0; i < 4; ++i) {
     out[i] = static_cast<unsigned>(r[i]);
