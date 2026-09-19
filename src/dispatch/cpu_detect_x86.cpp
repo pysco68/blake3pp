@@ -61,12 +61,37 @@ unsigned x86_xgetbv0() noexcept {
 #endif
 }
 
+// The three reads every query needs, taken once: cpuid traps under a
+// hypervisor (1.3-2.2 us per query when read on every call, 2-4 us on
+// WSL2), and the answer cannot change while the process runs. The Arm
+// probe keeps its auxv reads in a static the same way.
+struct x86_state {
+  unsigned ecx1 = 0;  // cpuid(1).ecx: SSE4.2, OSXSAVE
+  unsigned xcr0 = 0;  // XCR0, valid only when OSXSAVE is set
+  unsigned ebx7 = 0;  // cpuid(7,0).ebx: AVX2, AVX-512 F/DQ/CD/BW/VL
+};
+
+const x86_state& x86_probe() noexcept {
+  static const x86_state s = [] {
+    x86_state st;
+    unsigned r[4];
+    x86_cpuid(1, 0, r);
+    st.ecx1 = r[2];
+    if ((st.ecx1 >> 27) & 1u) {  // OSXSAVE: XGETBV is legal
+      st.xcr0 = x86_xgetbv0();
+      x86_cpuid(7, 0, r);
+      st.ebx7 = r[1];
+    }
+    return st;
+  }();
+  return s;
+}
+
 }  // namespace
 
 bool platform_cpu_supports(arch a) noexcept {
-  unsigned r[4];
-  x86_cpuid(1, 0, r);
-  const unsigned ecx1 = r[2];
+  const x86_state& st = x86_probe();
+  const unsigned ecx1 = st.ecx1;
   if (a == arch::sse42) {
     return (ecx1 >> 20) & 1u;  // SSE4.2; XMM state is OS baseline
   }
@@ -74,9 +99,8 @@ bool platform_cpu_supports(arch a) noexcept {
   if (!osxsave) {
     return false;
   }
-  const unsigned xcr0 = x86_xgetbv0();
-  x86_cpuid(7, 0, r);
-  const unsigned ebx7 = r[1];
+  const unsigned xcr0 = st.xcr0;
+  const unsigned ebx7 = st.ebx7;
   if (a == arch::avx2) {
     return (xcr0 & 0x6u) == 0x6u &&  // XMM + YMM saved
            ((ebx7 >> 5) & 1u);
