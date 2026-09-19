@@ -1,6 +1,6 @@
 # The official BLAKE3 C library (with its hand-written assembly kernels) is
 # built alongside the bench as the performance baseline, so every run shows
-# our variants against the hand-tuned ceiling on the same machine. Its
+# blake3pp's variants against the hand-tuned ceiling on the same machine. Its
 # c/CMakeLists.txt is a proper subproject; SOURCE_SUBDIR points there.
 option(BLAKE3PP_BENCH_UPSTREAM
   "Include the upstream BLAKE3 C library as a baseline in the benchmark" ON)
@@ -70,7 +70,7 @@ if(TARGET blake3pp_parallel_backend)
 endif()
 
 # Smoke: the benches are shipped tools, so one tiny run each proves they
-# start, find their kernels and print; it also runs the shared tooling
+# start, find their kernels and print. It also runs the shared tooling
 # (pinning, cooldown, timing) the CLI smoke tests never reach, which the
 # coverage lanes would otherwise report as dead.
 add_test(NAME bench_smoke
@@ -116,8 +116,8 @@ function(_blake3pp_dispatch_cost ns)
   target_link_libraries(${tgt} PRIVATE blake3pp::features)
   set_target_properties(${tgt} PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 endfunction()
-# Off by default: four extra kernel compilations that only the dispatch
-# question needs.
+# Off by default: up to four extra kernel compilations that only the
+# dispatch question needs.
 option(BLAKE3PP_BENCH_DISPATCH_COST
   "Build the dispatch-cost benches (one kernel compilation per variant)" OFF)
 if(BLAKE3PP_BENCH_DISPATCH_COST

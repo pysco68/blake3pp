@@ -120,7 +120,7 @@ bool drop_caches() {
 }
 
 // best_seconds with the cache dropped before every rep, outside the
-// timed region; without the per-rep drop, a --no-direct run's first rep
+// timed region. Without the per-rep drop, a --no-direct run's first rep
 // warms the page cache and every later rep reports RAM speed.
 template <class F>
 double best_cold_seconds(int reps, bool cold, F&& fn) {
