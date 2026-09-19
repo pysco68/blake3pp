@@ -377,7 +377,7 @@ static_assert(blake3pp::ex::scheduler<stopping_scheduler>);
 TEST_CASE("a scheduler that completes stopped is reported, not read") {
   const std::vector<std::byte> input(4 * 1024 * 1024, std::byte{0x5a});
   stopping_scheduler sched;
-  CHECK_THROWS_AS(blake3pp::hash(input, sched), std::system_error);
+  CHECK_THROWS_AS((void)blake3pp::hash(input, sched), std::system_error);
   try {
     (void)blake3pp::hash(input, sched);
   } catch (const std::system_error& e) {
