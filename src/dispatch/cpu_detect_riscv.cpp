@@ -130,7 +130,7 @@ long hwprobe_one(std::int64_t key, std::uint64_t* value) noexcept {
     std::uint64_t value;
   } pair = {key, 0};
   const long rc =
-      syscall(BLAKE3PP_NR_riscv_hwprobe, &pair, 1UL, 0UL, nullptr, 0U);
+      syscall(BLAKE3PP_NR_riscv_hwprobe, &pair, 1UL, 0UL, 0UL, 0UL);
   // An unknown key comes back as key=-1 with value=0, an old kernel as
   // ENOSYS; both mean "not detectable" and therefore "absent".
   if (rc != 0 || pair.key != key) {
@@ -298,7 +298,7 @@ const vec_state& base_probe() noexcept {
       if ((ima & RISCV_HWPROBE_IMA_V) != 0) {
         // Kernel vouches for ratified V: vector CSRs are safe to read.
         unsigned long vlenb = 0;
-        asm(".option push\n\t"
+        asm volatile(".option push\n\t"
             ".option arch, +v\n\t"
             "csrr %0, vlenb\n\t"
             ".option pop"
