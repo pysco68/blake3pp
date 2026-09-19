@@ -284,8 +284,8 @@ TEST_CASE("reader reports a backend") {
 #if defined(__linux__)
 // Closing the ring fd does not wait for the reads it still owes, so a
 // ring torn down with a read in flight lets the kernel complete into
-// memory its owner has already freed. destroy() has to reap them first:
-// after it returns, the buffer holds the file. The read is large enough
+// memory its owner has already freed. destroy() has to reap them first,
+// so after it returns the buffer holds the file. The read is large enough
 // that it cannot have finished in the microseconds destroy() itself
 // takes, so a missing drain fails here rather than by luck.
 TEST_CASE("io_uring destroy reaps in-flight reads before the ring goes") {
@@ -404,7 +404,7 @@ TEST_CASE("reader latches a release it did not hand out") {
 }
 
 // A submit larger than the buffer it names would hand the kernel a span
-// running into the next slot; it is refused instead.
+// running into the next slot. It is refused instead.
 TEST_CASE("writer refuses a submit larger than its buffer") {
   const temp_file f({});
   blake3pp::detail::file_writer w(

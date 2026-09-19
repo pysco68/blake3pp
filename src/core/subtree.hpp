@@ -33,7 +33,7 @@ namespace blake3pp::core {
 // The staging buffers below are sized by MaxDegree, the widest kernel the
 // build may contain, and the fold level is a build choice too. Both come
 // from the build system as macros, and both are template parameters here
-// rather than constants read inside the function bodies: a template
+// rather than constants read inside the function bodies. A template
 // argument is part of the mangled name, so two translation units that
 // disagree on either value instantiate two different functions instead of
 // two definitions of one, which the linker would merge without a word.

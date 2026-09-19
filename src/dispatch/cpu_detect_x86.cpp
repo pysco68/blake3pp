@@ -23,7 +23,7 @@ namespace {
 void x86_cpuid(unsigned leaf, unsigned subleaf, unsigned out[4]) noexcept {
 #if defined(_MSC_VER)
   // A leaf above the CPU's maximum basic leaf returns the highest leaf's
-  // data on Intel and zeros on AMD; zero it here so feature tests read a
+  // data on Intel and zeros on AMD. Zero it here so feature tests read a
   // definite absence, as the GNU path below does.
   int r[4];
   __cpuid(r, 0);
@@ -61,9 +61,9 @@ unsigned x86_xgetbv0() noexcept {
 #endif
 }
 
-// The three reads every query needs, taken once: cpuid traps under a
-// hypervisor (1.3-2.2 us per query when read on every call, 2-4 us on
-// WSL2), and the answer cannot change while the process runs. The Arm
+// The three reads every query needs, taken once. cpuid traps under a
+// hypervisor, 1.3-2.2 us per query when read on every call and 2-4 us
+// on WSL2, and the answer cannot change while the process runs. The Arm
 // probe keeps its auxv reads in a static the same way.
 struct x86_state {
   unsigned ecx1 = 0;  // cpuid(1).ecx: SSE4.2, OSXSAVE

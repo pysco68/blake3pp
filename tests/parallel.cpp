@@ -323,7 +323,7 @@ TEST_CASE("GCD (libdispatch) scheduler drives the engine unchanged") {
 
 }  // namespace
 
-// A scheduler that never runs anything: its schedule sender completes
+// A scheduler that never runs anything. Its schedule sender completes
 // stopped, the shape of a pool that received a stop request or is shutting
 // down. The engine has to notice rather than read the part table it never
 // filled. Spelled in the vocabulary all three providers share.
@@ -344,10 +344,10 @@ struct stopping_scheduler {
   };
   struct sender {
     using sender_concept = blake3pp::ex::sender_t;
-    // Declares the value completion a real pool's sender has too (sync_wait
-    // requires one) and only ever delivers the stopped one. Both spellings:
-    // the static function is the standard's, the typedef the older one
-    // some providers still read.
+    // Declares the value completion a real pool's sender has too, which
+    // sync_wait requires, and only ever delivers the stopped one. Both
+    // spellings are given. The static function is the standard's, the
+    // typedef the older one some providers still read.
     using completion_signatures =
         blake3pp::ex::completion_signatures<blake3pp::ex::set_value_t(),
                                             blake3pp::ex::set_stopped_t()>;
@@ -363,7 +363,7 @@ struct stopping_scheduler {
   };
   using scheduler_concept = blake3pp::ex::scheduler_t;
   static auto schedule() noexcept -> sender { return {}; }
-  // The standard's scheduler concept asks for this; a scheduler that runs
+  // The standard's scheduler concept asks for this. A scheduler that runs
   // nothing promises the least.
   auto query(blake3pp::ex::get_forward_progress_guarantee_t) const noexcept {
     return blake3pp::ex::forward_progress_guarantee::weakly_parallel;

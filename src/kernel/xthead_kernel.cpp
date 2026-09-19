@@ -34,8 +34,9 @@ namespace {
 constexpr std::size_t W = 4;       // VLEN=128, u32 m1
 constexpr std::size_t vl = W;
 
-// No byte swap: RISC-V is little-endian, and big-endian RV has no 0.7.1
-// parts. The main kernel swaps on big-endian; this one refuses to build.
+// No byte swap, since RISC-V is little-endian and big-endian RV has no
+// 0.7.1 parts. The main kernel swaps on big-endian. This one refuses to
+// build there.
 static_assert(std::endian::native == std::endian::little,
               "the XTheadVector kernel loads message words little-endian");
 

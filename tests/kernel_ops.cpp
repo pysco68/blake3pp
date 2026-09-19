@@ -270,7 +270,7 @@ TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
   CHECK(blake3pp::active_transpose16() == picked);
   blake3pp::set_transpose16(saved);
 
-  // Two tuners at once serialize: each returns a strategy, and the one
+  // Two tuners at once serialize. Each returns a strategy, and the one
   // in effect afterwards is the winner of whichever finished last.
   blake3pp::transpose16 a{};
   blake3pp::transpose16 b{};

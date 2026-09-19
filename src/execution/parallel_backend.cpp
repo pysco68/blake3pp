@@ -47,9 +47,9 @@ namespace {
 // mutex rather than made atomic, because "fix it, but only once, and only
 // before anything used it" is a two-field decision.
 std::mutex g_mutex;
-// Written under g_mutex (the check-and-set in size_parallel_scheduler is
-// what the lock is for); read without it, so the noexcept reader cannot
-// hit a lock failure and terminate.
+// Written under g_mutex, whose purpose is the check-and-set in
+// size_parallel_scheduler, and read without it, so the noexcept reader
+// cannot hit a lock failure and terminate.
 std::atomic<unsigned> g_threads{0};
 
 // Whether the scheduler exists yet. Under stdexec the pool itself records

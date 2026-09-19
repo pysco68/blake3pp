@@ -49,11 +49,12 @@ inline constexpr std::size_t out_len = 32;
 // blake3pp::features, which the kernel objects link and the library
 // propagates, so every TU in a build agrees on the value. A target whose
 // widest kernel is narrower lowers it and pays smaller buffers, and each
-// kernel TU static_asserts its own degree against it. Not an inline
-// variable: with internal linkage each TU owns its copy, and the code
-// whose layout depends on it (core/subtree.hpp) takes it as a template
-// argument, so a TU compiled with another value gets other functions,
-// not another definition of the same ones.
+// kernel TU static_asserts its own degree against it.
+//
+// Not an inline variable. With internal linkage each TU owns its copy,
+// and the code whose layout depends on it (core/subtree.hpp) takes it as
+// a template argument, so a TU compiled with another value gets other
+// functions, not another definition of the same ones.
 #if defined(BLAKE3PP_MAX_SIMD_DEGREE)
 constexpr std::size_t max_simd_degree = BLAKE3PP_MAX_SIMD_DEGREE;
 #else
@@ -88,7 +89,7 @@ inline constexpr std::uint32_t flag_derive_key_material = 1u << 6;
 // hand back a view of the same object rather than punning its type; the
 // hop through void* is what keeps them out of reinterpret_cast. That
 // holds only while std::uint8_t is unsigned char, which the aliasing
-// rules exempt; an implementation could make it a distinct type.
+// rules exempt. An implementation could make it a distinct type.
 static_assert(std::is_same_v<std::uint8_t, unsigned char>,
               "the kernel ABI reads std::byte storage through std::uint8_t");
 [[nodiscard]] inline const std::uint8_t* kernel_bytes(

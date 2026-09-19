@@ -242,11 +242,12 @@ static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_pa
 // than the fixed shares the provider's bulk may hand out. Every index runs
 // exactly once however the implementation distributes the calls.
 //
-// A scheduler may complete the work stopped instead of running it (a
-// stop request on the pool, a pool already shutting down); sync_wait then
+// A scheduler may complete the work stopped instead of running it, on a
+// stop request or with a pool already shutting down. sync_wait then
 // returns an empty optional and nothing was computed, so the caller must
 // not read its results. That is reported as operation_canceled rather
-// than finished sequentially: the caller asked for the work to stop.
+// than finished sequentially, because the caller asked for the work to
+// stop.
 template <class Scheduler, class Body>
 void for_each_part(Scheduler& sched, std::size_t n, Body body) {
   std::atomic<std::size_t> next{0};

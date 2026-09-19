@@ -33,10 +33,11 @@ namespace blake3pp::detail::io_impl {
 
 constexpr unsigned max_queue_depth = 32;
 
-// The largest window or buffer either engine accepts: 1 GiB, or less
-// where max_queue_depth of them would not fit in size_t. Keeps the pool
-// size from wrapping and every transfer below the 32-bit length the
-// backends hand the kernel (io_uring's sqe.len, WriteFile's DWORD).
+// The largest window or buffer either engine accepts, 1 GiB, or less
+// where max_queue_depth of them would not fit in size_t. The cap keeps
+// the pool size from wrapping and every transfer below the 32-bit
+// length the backends hand the kernel (io_uring's sqe.len, WriteFile's
+// DWORD).
 constexpr std::size_t max_window_bytes =
     std::min<std::size_t>(std::size_t{1} << 30,
                           std::numeric_limits<std::size_t>::max() / max_queue_depth);
@@ -101,7 +102,7 @@ class reader_engine {
       }
     }
     // release() reassigns eagerly, so `want` has a slot unless the caller
-    // holds every one of them: the documented queue_depth limit.
+    // holds every one of them, which is the documented queue_depth limit.
     if (s == qd_) {
       throw std::system_error(EINVAL, std::generic_category(),
                               "next() with every window slot still held");

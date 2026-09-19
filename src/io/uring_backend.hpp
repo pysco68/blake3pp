@@ -132,10 +132,10 @@ struct uring {
   unsigned* cq_mask = nullptr;
   unsigned char* cqes = nullptr;
   // Submissions the kernel has accepted and not yet completed. destroy()
-  // reaps them before the ring goes: close() on the ring fd does not
-  // wait (ring exit runs on a kernel workqueue), and a read already
-  // issued to the device completes into the pages it pinned, which by
-  // then belong to whatever the caller allocated next.
+  // reaps them before the ring goes. Closing the ring fd does not wait,
+  // since ring exit runs on a kernel workqueue, and a read already issued
+  // to the device completes into the pages it pinned. By then those pages
+  // belong to whatever the caller allocated next.
   unsigned outstanding = 0;
 
   uring() = default;
@@ -198,9 +198,10 @@ struct uring {
     return false;
   }
 
-  // Reaps every completion still owed. A failure of the wait itself
-  // (not EINTR) ends the loop: nothing more can be learned from that
-  // ring, and the caller's buffers are the only thing left to protect.
+  // Reaps every completion still owed. A failure of the wait itself,
+  // other than EINTR, ends the loop. Nothing more can be learned from
+  // that ring, and the caller's buffers are the only thing left to
+  // protect.
   void drain() noexcept {
     while (outstanding > 0 && cq_head != nullptr) {
       const unsigned head = *cq_head;
@@ -268,7 +269,7 @@ struct uring {
     std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
                                               std::memory_order_release);
     // Submit everything between the kernel's head and the new tail, not
-    // one entry: a failed enter leaves its entry published, and a fixed
+    // one entry. A failed enter leaves its entry published, and a fixed
     // count of one would then submit that stale entry and leave this one
     // behind, shifting every later completion by a slot.
     for (;;) {

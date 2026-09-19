@@ -78,12 +78,12 @@ enum class arch : std::uint8_t {
 /// startup, since a standalone binary owns its process.
 ///
 /// The BLAKE3PP_ASSUME_XTHEADVECTOR environment variable bypasses the
-/// question instead of answering it: =0 vetoes the XTheadVector kernel
-/// whatever detection says, and =1 asserts the CPU has it without any
-/// check, which is the one way this library runs a kernel the CPU may
-/// lack (SIGILL on the first hash if the assertion is wrong). It exists
-/// for boards whose kernel hides the answer and whose owner knows it;
-/// nothing else should set it.
+/// question instead of answering it. =0 vetoes the XTheadVector kernel
+/// whatever detection says. =1 asserts the CPU has it without any check,
+/// which is the one way this library runs a kernel the CPU may lack, and
+/// a wrong assertion is a SIGILL on the first hash. It exists for boards
+/// whose kernel hides the answer and whose owner knows it. Nothing else
+/// should set it.
 /// @return true if anything new was learned.
 bool run_trap_probes() noexcept;
 
@@ -163,7 +163,7 @@ void set_transpose16(transpose16 strategy) noexcept;
 inline constexpr std::size_t default_tune_bytes = 128u << 20;
 /// Races the transpose strategies on this CPU and applies the winner
 /// process-wide. Concurrent calls run one after the other, each racing
-/// on its own; the winner of the last to finish is the one in effect.
+/// on its own, and the winner of the last to finish is the one in effect.
 ///
 /// Never called implicitly. Costs one streaming pass per strategy (tens of
 /// milliseconds for small inputs, a few hundred at the 256 MiB cap) and

@@ -75,11 +75,11 @@ std::string_view to_string(transpose16 strategy) noexcept {
 // while it is not doing the caller's real work. Callers who need the last
 // few percent should measure with blake3pp_bench and pin the result with
 // set_transpose16().
-// One race at a time: the tuner sets the process-wide dial per strategy
+// One race at a time. The tuner sets the process-wide dial per strategy
 // as it times each one, so two races at once would each time the other's
 // setting and crown a bogus winner. Serialized on an atomic with wait and
-// notify rather than a mutex, which has no place in a noexcept function;
-// the second caller re-races after the first and its winner stands.
+// notify rather than a mutex, which has no place in a noexcept function.
+// The second caller re-races after the first, and its winner stands.
 std::atomic<bool> g_tuning{false};
 
 struct tune_guard {

@@ -164,11 +164,12 @@ constexpr bool test_force_trap() noexcept { return false; }
 
 // The trap-rung classifier state. Only ever touched from
 // platform_run_trap_probes() below, whose magic static guarantees
-// exactly one thread runs the guarded probes, exactly once; the SIGILL
+// exactly one thread runs the guarded probes, exactly once. The SIGILL
 // handler is scoped to the probed instruction and restored immediately.
+//
 // A signal disposition is process-wide, so a SIGILL raised on another
 // thread inside that window reaches this handler too. The jump buffer
-// is per thread and the flag says whether this thread is probing; a
+// is per thread and the flag says whether this thread is probing. A
 // foreign fault gets the previous disposition back and returns, so the
 // faulting instruction re-executes under it and takes the path it
 // would have taken anyway, instead of a siglongjmp into a frame that

@@ -272,9 +272,9 @@ class hasher {
   /// @pre The current chunk position is subtree_chunks-aligned.
   /// @pre At least one byte of the message follows the subtree; it must
   ///      not contain the final chunk.
-  /// @pre The message stays within BLAKE3's 2^64 bytes: at most 2^54
+  /// @pre The message stays within BLAKE3's 2^64 bytes, at most 2^54
   ///      chunks in total, which is what the chaining-value stack holds.
-  /// These preconditions are checked by assert() only; violating them in
+  /// These preconditions are checked by assert() only. Violating them in
   /// a release build corrupts the hasher.
   /// The subtree must have been hashed under this hasher's key_words() and
   /// mode_flags() so keyed and derive_key modes propagate.
