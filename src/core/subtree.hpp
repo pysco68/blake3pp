@@ -24,6 +24,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 #include "kernel/kernel.hpp"
@@ -42,6 +43,46 @@ constexpr std::size_t subtree_fold_levels = BLAKE3PP_SUBTREE_FOLD;
 #else
 constexpr std::size_t subtree_fold_levels = 0;  // the recursion
 #endif
+
+// The kernels carry chaining values as little-endian bytes while the
+// library's seams pass them as words. Both directions are spelled out
+// rather than punned: the word form is host-endian, so a cast would be a
+// different value on a big-endian target.
+//
+// Where the host is little-endian the word array's object representation
+// already is that byte string, and the move is what costs: the shift-or
+// form compiles to word-at-a-time moves, which is half the cost of a
+// generation of the parallel engine's window fold. memcpy of the whole
+// 32 bytes is the same bytes in two vector moves. The portable form stays
+// for the other byte order, where it is the only correct one.
+inline void store_cv_le(std::span<const std::uint32_t, 8> cv,
+                        std::uint8_t* out) noexcept {
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(out, cv.data(), 8 * sizeof(std::uint32_t));
+  } else {
+    for (std::size_t w = 0; w < 8; ++w) {
+      out[4 * w + 0] = static_cast<std::uint8_t>(cv[w]);
+      out[4 * w + 1] = static_cast<std::uint8_t>(cv[w] >> 8);
+      out[4 * w + 2] = static_cast<std::uint8_t>(cv[w] >> 16);
+      out[4 * w + 3] = static_cast<std::uint8_t>(cv[w] >> 24);
+    }
+  }
+}
+
+inline void load_cv_le(const std::uint8_t* in,
+                       std::span<std::uint32_t, 8> cv) noexcept {
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(cv.data(), in, 8 * sizeof(std::uint32_t));
+  } else {
+    for (std::size_t w = 0; w < 8; ++w) {
+      const std::uint8_t* b = in + 4 * w;
+      cv[w] = static_cast<std::uint32_t>(b[0]) |
+              (static_cast<std::uint32_t>(b[1]) << 8) |
+              (static_cast<std::uint32_t>(b[2]) << 16) |
+              (static_cast<std::uint32_t>(b[3]) << 24);
+    }
+  }
+}
 
 // One generation of parents: pairs of child CVs (contiguous, LE bytes)
 // become one-block parent nodes, hashed lanes-wide. An odd trailing child
@@ -236,6 +277,57 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
   } else {
     compress_subtree_to_cv_recursive<MaxDegree>(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
+  }
+}
+
+// Reduces sibling CVs of equal-sized adjacent subtrees, left to right, to
+// the CV of their common ancestor: one generation at a time, lanes-wide.
+// cvs is the working array and is clobbered, each generation writing its
+// parents to the front of it.
+//
+// The batch is 2 * MaxDegree parents per hash_many call, which is
+// kern::max_batch_inputs for a build's widest kernel and exactly what
+// compress_parents_wide stages pointers for. hash_many itself takes any
+// number of inputs, hashing full lanes and then the remainder one at a
+// time, so the pointer array is the only ceiling. The two staging buffers
+// are that batch's children and parents, 3 KiB where 16 lanes are
+// compiled in, and neither grows with cvs.size().
+//
+// The number of CVs is a power of two, so no generation has an odd child
+// to pass through, and the caller's tree stays the one the hasher would
+// have built out of the same subtrees.
+template <std::size_t MaxDegree = kern::max_simd_degree>
+inline void fold_sibling_cvs_wide(const kern::kernel_ops& k,
+                                  std::span<std::array<std::uint32_t, 8>> cvs,
+                                  std::span<const std::uint32_t, 8> key,
+                                  std::uint32_t base_flags,
+                                  std::span<std::uint32_t, 8> out_cv) noexcept {
+  assert(cvs.size() >= 2 && std::has_single_bit(cvs.size()));
+  constexpr std::size_t batch_parents = 2 * MaxDegree;
+  std::uint8_t children[2 * batch_parents * kern::out_len];
+  std::uint8_t parents[batch_parents * kern::out_len];
+
+  for (std::size_t n = cvs.size(); n > 1;) {
+    std::size_t written = 0;
+    for (std::size_t i = 0; i < n; i += 2 * batch_parents) {
+      const std::size_t take = std::min(2 * batch_parents, n - i);
+      // The whole batch is serialised before any of its parents is
+      // written back, and a parent's index is never past the children it
+      // came from, so the generation reduces cvs in place.
+      for (std::size_t j = 0; j < take; ++j) {
+        store_cv_le(cvs[i + j], children + j * kern::out_len);
+      }
+      compress_parents_wide<MaxDegree>(k, children, take, key, base_flags,
+                                       parents);
+      for (std::size_t j = 0; j < take / 2; ++j) {
+        load_cv_le(parents + j * kern::out_len, cvs[written + j]);
+      }
+      written += take / 2;
+    }
+    n = written;
+  }
+  for (std::size_t w = 0; w < 8; ++w) {
+    out_cv[w] = cvs[0][w];
   }
 }
 

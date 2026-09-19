@@ -272,6 +272,14 @@ void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                                num_chunks, chunk_counter, key, base_flags,
                                out_cv);
 }
+
+void fold_sibling_cvs(const kern::kernel_ops* ops,
+                      std::span<std::array<std::uint32_t, 8>> cvs,
+                      std::span<const std::uint32_t, 8> key,
+                      std::uint32_t base_flags,
+                      std::span<std::uint32_t, 8> out_cv) noexcept {
+  core::fold_sibling_cvs_wide<>(*ops, cvs, key, base_flags, out_cv);
+}
 }  // namespace detail
 
 digest hash(std::span<const std::byte> input) noexcept {

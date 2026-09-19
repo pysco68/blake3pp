@@ -130,6 +130,26 @@ TEST_CASE("parallel hash_file matches, across window boundaries") {
   }
 }
 
+// The stack budget decides how many parts a window is split into, and so
+// how many chaining values the window fold joins. 64 bytes is two parts,
+// the fewest the fold can take; the default is 512 for an 8 MiB window.
+// The window here is the default 8 MiB and the file is not a multiple of
+// it, so the last window takes the sequential path.
+TEST_CASE("a stack budget changes a window's split, not the digest") {
+  using blake3pp::stack_budget;
+  auto sched = blake3pp::get_parallel_scheduler();
+  const auto content = make_input(9 * 1024 * 1024 + 12345);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+  CHECK(blake3pp::hash_file<stack_budget{64}>(f.path, sched) == expected);
+  CHECK(blake3pp::hash_file<stack_budget{1024}>(f.path, sched) == expected);
+  CHECK(blake3pp::hash_file(f.path, sched) == expected);
+
+  blake3pp::hasher h;
+  blake3pp::update_file<stack_budget{64}>(h, f.path, sched);
+  CHECK(h.finalize() == expected);
+}
+
 TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
   std::array<std::byte, 32> key{};
   for (std::size_t i = 0; i < key.size(); ++i) {

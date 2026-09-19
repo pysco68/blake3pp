@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -224,6 +225,14 @@ namespace detail {
 // A part is at least 16 chunks (16 KiB), which keeps small inputs in few
 // tasks.
 inline constexpr std::size_t min_part_chunks = 16;
+
+// The same floor for a window of the file pipeline, where the trade is a
+// different one: a window is absorbed as one subtree, so fewer and larger
+// parts shrink the fold and the bulk's shape, while lengthening the
+// straggler tail that the window's join waits for. The engine cannot ask
+// a generic scheduler how many agents it has, so the floor is the only
+// lever on that balance.
+inline constexpr std::size_t window_min_part_chunks = min_part_chunks;
 
 // The part size in chunks for num_chunks: a power of two, so every part
 // starting at a multiple of it is subtree-aligned, and large enough that
@@ -556,7 +565,8 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
                           std::uint64_t chunk_counter,
                           trace_buffer* buf = nullptr,
                           window_record* rec = nullptr) {
-  const std::size_t part = part_chunks<Budget>(num_chunks);
+  const std::size_t part =
+      std::max(part_chunks<Budget>(num_chunks), window_min_part_chunks);
   if (part >= num_chunks) {
     // Window too small to fan out; hash it inline.
     h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
@@ -583,9 +593,16 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
   } else {
     for_each_part(sched, n_parts, body);
   }
-  for (std::size_t i = 0; i < n_parts; ++i) {
-    h.push_subtree_cv(cvs[i], part);
-  }
+  // Every part pairs with a sibling all the way up: both callers hand in
+  // a power-of-two window (parallel_hasher rounds its buffer down to one,
+  // and update_file fans out only a full non-last window, which the
+  // reader has sized as a power-of-two multiple of the chunk size) and
+  // part is a power of two, so n_parts is one too.
+  assert(std::has_single_bit(n_parts));
+  std::array<std::uint32_t, 8> window_cv;
+  fold_sibling_cvs(ops, std::span{cvs}.first(n_parts), h.key_words(),
+                   h.mode_flags(), window_cv);
+  h.push_subtree_cv(window_cv, num_chunks);
   if (rec) {
     rec->t_absorbed = buf->now();
   }
