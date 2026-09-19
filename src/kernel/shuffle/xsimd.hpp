@@ -22,6 +22,7 @@
 #include "kernel/simd_facade.hpp"
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS::shuffle_detail {
+namespace {
 
 // Byte-rotate mask: dest byte i of each 32-bit element takes source byte
 // ((i%4)+RB)%4, a little-endian rotr by 8*RB bits, the same pattern the
@@ -107,4 +108,5 @@ struct xsimd_backend {
   }
 };
 
+}  // namespace
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS::shuffle_detail

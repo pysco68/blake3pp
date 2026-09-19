@@ -46,7 +46,9 @@
 #define BLAKE3PP_HAVE_SHUFFLE 1
 #include "kernel/shuffle/vext.hpp"
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
+namespace {
 using shuffle_backend = shuffle_detail::vext_backend;
+}  // namespace
 }
 
 #elif defined(BLAKE3PP_HAS_XSIMD) && !(defined(_M_ARM64) && !defined(__clang__))
@@ -59,7 +61,9 @@ using shuffle_backend = shuffle_detail::vext_backend;
 #define BLAKE3PP_HAVE_SHUFFLE 1
 #include "kernel/shuffle/xsimd.hpp"
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
+namespace {
 using shuffle_backend = shuffle_detail::xsimd_backend;
+}  // namespace
 }
 #endif
 

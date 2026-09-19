@@ -58,6 +58,7 @@
 #endif
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
+namespace {
 
 #if defined(BLAKE3PP_HAVE_SVE2_XAR)
 typedef svuint32_t sve_fixed_u32
@@ -216,4 +217,5 @@ BLAKE3PP_FORCE_INLINE u32v xor_rot(u32v x, u32v y) noexcept {
   return rot<N>(x ^ y);
 }
 
+}  // namespace
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS

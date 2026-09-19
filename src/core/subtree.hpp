@@ -28,9 +28,23 @@
 
 namespace blake3pp::core {
 
+// The staging buffers below are sized by MaxDegree, the widest kernel the
+// build may contain, and the fold level is a build choice too. Both come
+// from the build system as macros, and both are template parameters here
+// rather than constants read inside the function bodies: a template
+// argument is part of the mangled name, so two translation units that
+// disagree on either value instantiate two different functions instead of
+// two definitions of one, which the linker would merge without a word.
+#if defined(BLAKE3PP_SUBTREE_FOLD)
+constexpr std::size_t subtree_fold_levels = BLAKE3PP_SUBTREE_FOLD;
+#else
+constexpr std::size_t subtree_fold_levels = 0;  // the recursion
+#endif
+
 // One generation of parents: pairs of child CVs (contiguous, LE bytes)
 // become one-block parent nodes, hashed lanes-wide. An odd trailing child
 // passes through unchanged (spec 2.4). Returns the new generation's count.
+template <std::size_t MaxDegree = kern::max_simd_degree>
 inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
                                          const std::uint8_t* child_cvs,
                                          std::size_t num_children,
@@ -38,7 +52,7 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
                                          std::uint32_t base_flags,
                                          std::uint8_t* out) noexcept {
   const std::size_t num_parents = num_children / 2;
-  const std::uint8_t* parent_blocks[kern::max_batch_inputs];
+  const std::uint8_t* parent_blocks[2 * MaxDegree];
   for (std::size_t i = 0; i < num_parents; ++i) {
     parent_blocks[i] = child_cvs + 2 * i * kern::out_len;
   }
@@ -61,6 +75,7 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
 // num_chunks is a power of two; input holds num_chunks complete chunks.
 // Returns min(num_chunks, 2 * simd_degree) CVs in out_cvs. The leaf spans
 // TWO SIMD batches so hash_many can run its dual-batch interleaved path.
+template <std::size_t MaxDegree = kern::max_simd_degree>
 inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
                                          const std::uint8_t* input,
                                          std::size_t num_chunks,
@@ -73,7 +88,7 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
   // fits the max_batch_inputs CVs the callers provide.
   assert(std::has_single_bit(num_chunks));
   if (num_chunks <= 2 * k.simd_degree) {
-    const std::uint8_t* chunks[kern::max_batch_inputs];
+    const std::uint8_t* chunks[2 * MaxDegree];
     for (std::size_t i = 0; i < num_chunks; ++i) {
       chunks[i] = input + i * kern::chunk_len;
     }
@@ -85,30 +100,31 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
   }
 
   const std::size_t half = num_chunks / 2;
-  std::uint8_t child_cvs[2 * kern::max_batch_inputs * kern::out_len];
-  const std::size_t nl = compress_subtree_wide(k, input, half, chunk_counter,
-                                               key, base_flags, child_cvs);
-  const std::size_t nr = compress_subtree_wide(
+  std::uint8_t child_cvs[4 * MaxDegree * kern::out_len];
+  const std::size_t nl = compress_subtree_wide<MaxDegree>(
+      k, input, half, chunk_counter, key, base_flags, child_cvs);
+  const std::size_t nr = compress_subtree_wide<MaxDegree>(
       k, input + half * kern::chunk_len, half, chunk_counter + half, key,
       base_flags, child_cvs + nl * kern::out_len);
-  return compress_parents_wide(k, child_cvs, nl + nr, key, base_flags,
-                               out_cvs);
+  return compress_parents_wide<MaxDegree>(k, child_cvs, nl + nr, key,
+                                          base_flags, out_cvs);
 }
 
 // Full reduction of a power-of-2 subtree (>= 2 chunks) to one CV. The final
 // log2(degree) generations run below full lane occupancy, but that tail is
 // O(log degree) blocks per subtree and amortizes to noise.
+template <std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_subtree_to_cv_recursive(
     const kern::kernel_ops& k, const std::uint8_t* input,
     std::size_t num_chunks, std::uint64_t chunk_counter,
     std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
     std::span<std::uint32_t, 8> out_cv) noexcept {
-  std::uint8_t cvs[kern::max_batch_inputs * kern::out_len];
-  std::uint8_t next[kern::max_batch_inputs * kern::out_len];
-  std::size_t n = compress_subtree_wide(k, input, num_chunks, chunk_counter,
-                                        key, base_flags, cvs);
+  std::uint8_t cvs[2 * MaxDegree * kern::out_len];
+  std::uint8_t next[2 * MaxDegree * kern::out_len];
+  std::size_t n = compress_subtree_wide<MaxDegree>(
+      k, input, num_chunks, chunk_counter, key, base_flags, cvs);
   while (n > 1) {
-    n = compress_parents_wide(k, cvs, n, key, base_flags, next);
+    n = compress_parents_wide<MaxDegree>(k, cvs, n, key, base_flags, next);
     std::copy_n(next, n * kern::out_len, cvs);
   }
   for (std::size_t w = 0; w < 8; ++w) {
@@ -142,14 +158,14 @@ inline void compress_subtree_to_cv_recursive(
 // opt-in for narrow targets (BLAKE3PP_SUBTREE_FOLD) rather than a default:
 // there it replaces one buffer per level with a fixed working set, 720 bytes
 // at 12 levels against 480 + 272 per level.
-template <std::size_t MaxStack = 54>
+template <std::size_t MaxStack = 54, std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_subtree_to_cv_folded(
     const kern::kernel_ops& k, const std::uint8_t* input,
     std::size_t num_chunks, std::uint64_t chunk_counter,
     std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
     std::span<std::uint32_t, 8> out_cv) noexcept {
-  std::uint8_t cvs[kern::max_batch_inputs * kern::out_len];
-  std::uint8_t next[kern::max_batch_inputs * kern::out_len];
+  std::uint8_t cvs[2 * MaxDegree * kern::out_len];
+  std::uint8_t next[2 * MaxDegree * kern::out_len];
   std::uint8_t stack[MaxStack * kern::out_len];
   std::size_t depth = 0;
 
@@ -159,7 +175,7 @@ inline void compress_subtree_to_cv_folded(
   std::uint64_t groups = 0;
   for (std::size_t done = 0; done < num_chunks; done += group) {
     const std::size_t n = std::min(group, num_chunks - done);
-    const std::uint8_t* chunks[kern::max_batch_inputs];
+    const std::uint8_t* chunks[2 * MaxDegree];
     for (std::size_t i = 0; i < n; ++i) {
       chunks[i] = input + (done + i) * kern::chunk_len;
     }
@@ -168,7 +184,7 @@ inline void compress_subtree_to_cv_folded(
                 kern::flag_chunk_start, kern::flag_chunk_end, cvs);
     // The group's own parents, lanes-wide, down to its single root CV.
     for (std::size_t m = n; m > 1;) {
-      m = compress_parents_wide(k, cvs, m, key, base_flags, next);
+      m = compress_parents_wide<MaxDegree>(k, cvs, m, key, base_flags, next);
       std::copy_n(next, m * kern::out_len, cvs);
     }
     assert(depth < MaxStack);
@@ -180,8 +196,8 @@ inline void compress_subtree_to_cv_folded(
     for (int carries = std::countr_zero(groups); carries > 0; --carries) {
       assert(depth >= 2);
       depth -= 2;
-      compress_parents_wide(k, stack + depth * kern::out_len, 2, key,
-                            base_flags, next);
+      compress_parents_wide<MaxDegree>(k, stack + depth * kern::out_len, 2,
+                                       key, base_flags, next);
       std::copy_n(next, kern::out_len, stack + depth * kern::out_len);
       depth++;
     }
@@ -197,8 +213,11 @@ inline void compress_subtree_to_cv_folded(
 }
 
 // Which of the two the library uses: the recursion unless a build opts into
-// the fold, which only narrow targets should. Both stay compiled so the
-// tests can compare them on every machine.
+// the fold, which only narrow targets should (Fold is then the stack bound
+// in levels; see ArchKernels.cmake). Both stay compiled so the tests can
+// compare them on every machine.
+template <std::size_t Fold = subtree_fold_levels,
+          std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_subtree_to_cv(const kern::kernel_ops& k,
                                    const std::uint8_t* input,
                                    std::size_t num_chunks,
@@ -207,14 +226,13 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
                                    std::uint32_t base_flags,
                                    std::span<std::uint32_t, 8> out_cv) noexcept {
   assert(num_chunks > 0 && std::has_single_bit(num_chunks));
-#if defined(BLAKE3PP_SUBTREE_FOLD)
-  // The macro's value is the stack bound in levels; see ArchKernels.cmake.
-  compress_subtree_to_cv_folded<BLAKE3PP_SUBTREE_FOLD>(
-      k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
-#else
-  compress_subtree_to_cv_recursive(k, input, num_chunks, chunk_counter, key,
-                                   base_flags, out_cv);
-#endif
+  if constexpr (Fold > 0) {
+    compress_subtree_to_cv_folded<Fold, MaxDegree>(
+        k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
+  } else {
+    compress_subtree_to_cv_recursive<MaxDegree>(
+        k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
+  }
 }
 
 }  // namespace blake3pp::core

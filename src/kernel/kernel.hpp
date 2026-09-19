@@ -47,16 +47,20 @@ inline constexpr std::size_t out_len = 32;
 // blake3pp::features, which the kernel objects link and the library
 // propagates, so every TU in a build agrees on the value; a target whose
 // widest kernel is narrower lowers it and pays smaller buffers, and each
-// kernel TU static_asserts its own degree against it.
+// kernel TU static_asserts its own degree against it. Not an inline
+// variable: with internal linkage each TU owns its copy, and the code
+// whose layout depends on it (core/subtree.hpp) takes it as a template
+// argument, so a TU compiled with another value gets other functions,
+// not another definition of the same ones.
 #if defined(BLAKE3PP_MAX_SIMD_DEGREE)
-inline constexpr std::size_t max_simd_degree = BLAKE3PP_MAX_SIMD_DEGREE;
+constexpr std::size_t max_simd_degree = BLAKE3PP_MAX_SIMD_DEGREE;
 #else
-inline constexpr std::size_t max_simd_degree = 16;
+constexpr std::size_t max_simd_degree = 16;
 #endif
 
 // Callers hand hash_many up to TWO batches worth of inputs at once (the
 // subtree leaf granularity); bounds the batch-shaped staging buffers.
-inline constexpr std::size_t max_batch_inputs = 2 * max_simd_degree;
+constexpr std::size_t max_batch_inputs = 2 * max_simd_degree;
 
 // BLAKE3 IV (identical to BLAKE2s / SHA-256's first eight constants).
 inline constexpr std::array<std::uint32_t, 8> iv = {

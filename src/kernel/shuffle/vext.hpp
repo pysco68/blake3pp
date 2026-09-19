@@ -20,6 +20,7 @@
 #include "kernel/simd_facade.hpp"
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS::shuffle_detail {
+namespace {
 
 // GCC raises -Wpsabi for vector types wider than the TU's -m flags allow
 // natively. These types never appear in any cross-TU signature (that is the
@@ -117,4 +118,5 @@ struct vext_backend {
 
 #pragma GCC diagnostic pop
 
+}  // namespace
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS::shuffle_detail

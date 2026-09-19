@@ -20,6 +20,7 @@
 #include "kernel/force_inline.hpp"
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS::shuffle_detail {
+namespace {
 
 // 4x4: two radix-2 stages (32-bit unpacks, then 64-bit unpacks).
 template <class Op, class V>
@@ -120,4 +121,5 @@ BLAKE3PP_FORCE_INLINE void inlane_4x4(const V (&r)[4], V (&t)[4]) noexcept {
   t[3] = Op::template shuf<2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31>(a1, a3);
 }
 
+}  // namespace
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS::shuffle_detail

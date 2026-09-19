@@ -30,6 +30,7 @@
 #endif
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
+namespace {
 namespace transpose_detail {
 
 // The W==16 strategy is a RUNTIME dial (kern::transpose16_active, set via
@@ -228,4 +229,5 @@ BLAKE3PP_FORCE_INLINE void store_transposed(const u32v (&w)[16],
   }
 }
 
+}  // namespace
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS

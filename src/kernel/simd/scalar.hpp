@@ -11,6 +11,7 @@
 #include "kernel/force_inline.hpp"
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
+namespace {
 
 struct u32v {
   using impl = std::uint32_t;
@@ -38,4 +39,5 @@ struct u32v {
   }
 };
 
+}  // namespace
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS
