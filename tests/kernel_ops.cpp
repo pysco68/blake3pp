@@ -10,6 +10,7 @@
 #include <optional>
 #include <ostream>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <blake3pp/core.hpp>
@@ -264,6 +265,18 @@ TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
   // set on every AVX-512 machine in the matrix to prove the same thing.
   const auto picked = blake3pp::tune_transpose16(64u << 10);
   CHECK(blake3pp::active_transpose16() == picked);
+  blake3pp::set_transpose16(saved);
+
+  // Two tuners at once serialize: each returns a strategy, and the one
+  // in effect afterwards is the winner of whichever finished last.
+  blake3pp::transpose16 a{};
+  blake3pp::transpose16 b{};
+  std::thread ta([&] { a = blake3pp::tune_transpose16(64u << 10); });
+  std::thread tb([&] { b = blake3pp::tune_transpose16(64u << 10); });
+  ta.join();
+  tb.join();
+  const auto after = blake3pp::active_transpose16();
+  CHECK((after == a || after == b));
   blake3pp::set_transpose16(saved);
 }
 

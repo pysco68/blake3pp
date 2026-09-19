@@ -156,7 +156,8 @@ void set_transpose16(transpose16 strategy) noexcept;
 /// Callers who hash something smaller should say so.
 inline constexpr std::size_t default_tune_bytes = 128u << 20;
 /// Races the transpose strategies on this CPU and applies the winner
-/// process-wide.
+/// process-wide. Concurrent calls run one after the other, each racing
+/// on its own; the winner of the last to finish is the one in effect.
 ///
 /// Never called implicitly. Costs one streaming pass per strategy (tens of
 /// milliseconds for small inputs, a few hundred at the 256 MiB cap) and
