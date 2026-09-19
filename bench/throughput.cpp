@@ -3,7 +3,8 @@
 // pipeline, the reference implementation end-to-end, and the parallel
 // engine under different schedulers/kernels.
 //
-//   blake3pp_bench [--size MiB] [--reps N] [--cooldown S] [--pin CPU] [ARCH...]
+//   blake3pp_bench [--size MiB] [--reps N] [--cooldown S] [--pin CPU]
+//                  [--threads N] [ARCH...]
 //
 // With no ARCH arguments, measures every variant available on this machine.
 // Reports the best of N repetitions, the interesting number for a

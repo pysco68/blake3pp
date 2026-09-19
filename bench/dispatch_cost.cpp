@@ -24,9 +24,10 @@
 //
 // Hardware counters are reported where Linux offers them: cycles,
 // instructions, branches and branch-misses per message, next to the wall
-// clock. The instruction delta between dispatched and direct is the exact
-// size of the dispatch mechanism, and the branch-miss column shows whether
-// the indirect call is predicted.
+// clock. The instruction delta between dispatched and inlined is the
+// size of the dispatch mechanism (direct carries its wrapper's own
+// instructions), and the branch-miss column shows whether the indirect
+// call is predicted.
 #include <algorithm>
 #include <array>
 #include <atomic>

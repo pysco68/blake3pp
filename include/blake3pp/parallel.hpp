@@ -38,6 +38,11 @@
 #include <vector>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/trace.hpp>
+
+#if defined(__linux__)
+#include <sched.h>  // sched_getcpu() for agent_record::cpu
+#endif
 
 #if defined(BLAKE3PP_EXECUTION_STD)
 #include <execution>
@@ -236,21 +241,115 @@ template <stack_budget Budget>
 using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
 static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
 
-// Runs body(i) for every i in [0, n) on sched. The bulk shape only
-// provides the agents: each call pulls indices from a shared counter until
-// none are left, so the split follows each agent's actual speed rather
-// than the fixed shares the provider's bulk may hand out. Every index runs
-// exactly once however the implementation distributes the calls.
-//
+// What one for_each_part() call records when tracing: the agents' summed
+// compress time and their count, each one atomic add per bulk invocation,
+// and through buf one agent_record per invocation when the buffer wants
+// them. window is the id the caller gives the records; for_each_part()
+// does not know what it is running over.
+struct part_trace {
+  trace_buffer* buf;
+  std::uint64_t window;
+  std::uint32_t part_chunks;
+  std::atomic<std::uint64_t> busy_ns{0};
+  std::atomic<std::uint32_t> active{0};
+};
+
 // A scheduler may complete the work stopped instead of running it, on a
 // stop request or with a pool already shutting down. sync_wait then
 // returns an empty optional and nothing was computed, so the caller must
 // not read its results. That is reported as operation_canceled rather
 // than finished sequentially, because the caller asked for the work to
 // stop.
+template <class Work>
+void wait_for_parts(Work&& work) {
+  if (!ex::sync_wait(std::forward<Work>(work))) {
+    throw std::system_error(std::make_error_code(std::errc::operation_canceled),
+                            "the scheduler stopped the parallel hash");
+  }
+}
+
+// The traced form of for_each_part()'s bulk body: the same pull loop with
+// the clock read once before the first part and, when agent records are
+// wanted, once after every part (the end of one is the start of the
+// next). Per bulk invocation, not per part: two atomic adds on pt and at
+// most one record claim. An invocation that finds the counter exhausted
+// records nothing and is not an active agent.
 template <class Scheduler, class Body>
-void for_each_part(Scheduler& sched, std::size_t n, Body body) {
+void for_each_part_traced(Scheduler& sched, std::size_t n, Body& body,
+                          std::atomic<std::size_t>& next, part_trace& pt) {
+  auto work =
+      ex::schedule(sched) |
+      ex::bulk(ex::par, n, [&](std::size_t) noexcept {
+        std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= n) {
+          return;
+        }
+        trace_buffer& buf = *pt.buf;
+        const bool per_agent = buf.wants_agents();
+        const std::int64_t t_begin = buf.now();
+        std::int64_t t = t_begin;
+        std::uint32_t parts = 0;
+        std::uint64_t min_ns = ~std::uint64_t{0};
+        std::uint64_t max_ns = 0;
+        std::uint32_t cpu = ~std::uint32_t{0};
+        if (per_agent) {
+#if defined(__linux__)
+          const int c = ::sched_getcpu();
+          cpu = c < 0 ? ~std::uint32_t{0} : static_cast<std::uint32_t>(c);
+#endif
+          do {
+            body(i);
+            const std::int64_t t_end = buf.now();
+            const auto d = static_cast<std::uint64_t>(t_end - t);
+            min_ns = std::min(min_ns, d);
+            max_ns = std::max(max_ns, d);
+            t = t_end;
+            ++parts;
+            i = next.fetch_add(1, std::memory_order_relaxed);
+          } while (i < n);
+        } else {
+          do {
+            body(i);
+            ++parts;
+            i = next.fetch_add(1, std::memory_order_relaxed);
+          } while (i < n);
+          t = buf.now();
+        }
+        const auto busy = static_cast<std::uint64_t>(t - t_begin);
+        pt.busy_ns.fetch_add(busy, std::memory_order_relaxed);
+        pt.active.fetch_add(1, std::memory_order_relaxed);
+        if (per_agent) {
+          if (agent_record* const r = buf.claim_agent()) {
+            r->window = pt.window;
+            r->t_begin = t_begin;
+            r->busy_ns = busy;
+            r->min_part_ns = min_ns;
+            r->max_part_ns = max_ns;
+            r->parts = parts;
+            r->part_chunks = pt.part_chunks;
+            r->cpu = cpu;
+          }
+        }
+      });
+  wait_for_parts(std::move(work));
+}
+
+// Runs body(i) for every i in [0, n) on sched. The bulk shape only
+// provides the agents: each call pulls indices from a shared counter until
+// none are left, so the split follows each agent's actual speed rather
+// than the fixed shares the provider's bulk may hand out. Every index runs
+// exactly once however the implementation distributes the calls.
+//
+// With pt set the traced body runs instead (see for_each_part_traced);
+// the choice is made once here, so the untraced bulk body is untouched.
+template <class Scheduler, class Body>
+void for_each_part(Scheduler& sched, std::size_t n, Body body,
+                   part_trace* pt = nullptr) {
   std::atomic<std::size_t> next{0};
+  if (pt != nullptr) {
+    for_each_part_traced(sched, n, body, next, *pt);
+    return;
+  }
   auto work = ex::schedule(sched) |
               ex::bulk(ex::par, n, [&](std::size_t) noexcept {
                 for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
@@ -258,10 +357,7 @@ void for_each_part(Scheduler& sched, std::size_t n, Body body) {
                   body(i);
                 }
               });
-  if (!ex::sync_wait(std::move(work))) {
-    throw std::system_error(std::make_error_code(std::errc::operation_canceled),
-                            "the scheduler stopped the parallel hash");
-  }
+  wait_for_parts(std::move(work));
 }
 
 // The one-shot engine: partitions input into aligned subtrees, fans them
@@ -448,27 +544,50 @@ namespace detail {
 
 // Fans one full window (num_chunks: power of two, counter-aligned) out
 // over the scheduler and absorbs the part CVs in order.
+//
+// With rec set (and buf with it), the window's compute is recorded: the
+// join and absorb times, the agents' summed busy time and count, and
+// flag_parallel when the window was fanned out. The inline fallback has
+// no absorb step, so its two stamps are one clock read.
 template <stack_budget Budget, class Scheduler>
 void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
                           hasher& h, const std::byte* data,
                           std::size_t num_chunks,
-                          std::uint64_t chunk_counter) {
+                          std::uint64_t chunk_counter,
+                          trace_buffer* buf = nullptr,
+                          window_record* rec = nullptr) {
   const std::size_t part = part_chunks<Budget>(num_chunks);
   if (part >= num_chunks) {
     // Window too small to fan out; hash it inline.
     h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
+    if (rec) {
+      rec->t_joined = rec->t_absorbed = buf->now();
+    }
     return;
   }
   const std::size_t n_parts = num_chunks / part;
   part_cvs<Budget> cvs;
 
-  for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
+  const auto body = [&](std::size_t i) noexcept {
     compress_subtree_cv(ops, data + i * part * chunk_size, part,
                         chunk_counter + i * part, h.key_words(),
                         h.mode_flags(), cvs[i]);
-  });
+  };
+  if (rec) {
+    part_trace pt{buf, rec->index, static_cast<std::uint32_t>(part)};
+    for_each_part(sched, n_parts, body, &pt);
+    rec->t_joined = buf->now();
+    rec->agent_busy_ns = pt.busy_ns.load(std::memory_order_relaxed);
+    rec->agents_active = pt.active.load(std::memory_order_relaxed);
+    rec->flags |= window_record::flag_parallel;
+  } else {
+    for_each_part(sched, n_parts, body);
+  }
   for (std::size_t i = 0; i < n_parts; ++i) {
     h.push_subtree_cv(cvs[i], part);
+  }
+  if (rec) {
+    rec->t_absorbed = buf->now();
   }
 }
 
