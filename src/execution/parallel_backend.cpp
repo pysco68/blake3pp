@@ -45,7 +45,10 @@ namespace {
 // mutex rather than made atomic, because "fix it, but only once, and only
 // before anything used it" is a two-field decision.
 std::mutex g_mutex;
-unsigned g_threads = 0;
+// Written under g_mutex (the check-and-set in size_parallel_scheduler is
+// what the lock is for); read without it, so the noexcept reader cannot
+// hit a lock failure and terminate.
+std::atomic<unsigned> g_threads{0};
 
 // Whether the scheduler exists yet. Under stdexec the pool itself records
 // it (parallel.hpp); under beman the backend below is the moment.
@@ -292,18 +295,18 @@ void size_parallel_scheduler(unsigned threads) {
   if (scheduler_started()) {
     already("the parallel scheduler is already running");
   }
-  if (g_threads != 0 && g_threads != threads) {
-    already("already sized to " + std::to_string(g_threads));
+  const unsigned sized = g_threads.load(std::memory_order_relaxed);
+  if (sized != 0 && sized != threads) {
+    already("already sized to " + std::to_string(sized));
   }
-  g_threads = threads;
+  g_threads.store(threads, std::memory_order_relaxed);
 #if defined(BLAKE3PP_EXECUTION_STDEXEC)
   detail::process_pool_threads().store(threads, std::memory_order_relaxed);
 #endif
 }
 
 unsigned parallel_scheduler_threads() noexcept {
-  const std::lock_guard lock{g_mutex};
-  return g_threads;
+  return g_threads.load(std::memory_order_relaxed);
 }
 
 }  // namespace blake3pp
