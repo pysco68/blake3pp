@@ -18,12 +18,10 @@
 namespace blake3pp::detail::io_impl {
 
 // std::fseek/std::ftell take and return `long`, which is 32 bits on
-// Windows (LLP64) and on wasm32, precisely the platforms this fallback
-// exists to serve. Truncating a file offset there does not fail: it seeks
-// somewhere else and returns the wrong bytes, which for a hash function
-// means a silently wrong digest. These wrappers keep the full 64-bit range
-// where the platform offers it, and where it does not they REFUSE the
-// offset rather than truncate it.
+// Windows (LLP64) and on wasm32. Truncating a file offset there does not
+// fail: it seeks somewhere else and returns the wrong bytes, which for a
+// hash function means a silently wrong digest. These wrappers use the
+// 64-bit call each platform offers.
 inline int seek64(std::FILE* f, std::uint64_t off) noexcept {
 #if defined(_MSC_VER)
   return _fseeki64(f, static_cast<__int64>(off), SEEK_SET);

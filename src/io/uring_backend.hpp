@@ -81,14 +81,15 @@ inline std::string no_uring_suffix(int err) {
 // was ever created in it, while the accesses below want a T there: an
 // unsigned for std::atomic_ref, which operates on an object in place.
 //
-// Two spellings say so, and both are defined behaviour. start_lifetime_as
-// is the one that means it and copies nothing, and is C++23.
-// Placement-new creates the object the standard requires, and seeding it
-// from the bytes already in the storage is what keeps the value the kernel
-// put there; the byte read is legal, and the write puts back what it read.
-// Nothing else in the ring is named as an object at all: the descriptors
-// and completions are copied in and out, because memcpy creates whatever
-// it writes and a local is a real object to read into.
+// Two spellings say so, and both are defined behaviour.
+//  - start_lifetime_as (C++23) starts the object's lifetime and copies
+//    nothing.
+//  - Placement-new creates the object, seeded from the bytes already in
+//    the storage so it keeps the value the kernel put there. The byte
+//    read is legal, and the write puts back what it read.
+// Nothing else in the ring is named as an object. The descriptors and
+// completions are copied in and out with memcpy, which creates whatever
+// it writes, into and out of locals.
 template <class T>
 [[nodiscard]] inline T* ring_at(unsigned char* base, std::uint32_t off) noexcept {
 #ifdef __cpp_lib_start_lifetime_as
@@ -250,13 +251,12 @@ struct uring {
     std::memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = opcode;
     if (offload) {
-      // Issue on io-wq rather than inline. Kernels before ~6.x bailed out
-      // of the inline attempt on a large O_DIRECT read and punted anyway;
-      // newer ones complete it inline, 1.5-1.9 ms of pinning, splitting
-      // and queueing per 64 MiB on the submitting thread (four PCIe 5
-      // drives, kernel 7.0). Serialized with the hash that thread also
-      // waits for, that halved the pipeline; asking for the hand-off
-      // restored it (22 -> 41 GiB/s).
+      // Issue on io-wq. Kernel 7.0 issues a large O_DIRECT read inline:
+      // 1.5-1.9 ms of pinning, splitting and queueing per 64 MiB on the
+      // submitting thread (four PCIe 5 drives), against 0.02 ms on 5.15,
+      // which handed it to io-wq. That thread also waits for the hash, so
+      // the two serialized; with the hand-off the pipeline went from 22.3
+      // to 41.4 GiB/s at 64 MiB x 8.
       sqe.flags |= IOSQE_ASYNC;
     }
     sqe.fd = file_fd;
