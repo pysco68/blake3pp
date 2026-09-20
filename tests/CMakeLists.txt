@@ -38,7 +38,7 @@ add_executable(blake3pp_tests
 # The io suite tests hash_file and the backend engines; without the
 # file-I/O layer there is nothing for it to link against.
 if(BLAKE3PP_WITH_IO)
-  target_sources(blake3pp_tests PRIVATE io.cpp)
+  target_sources(blake3pp_tests PRIVATE io.cpp io_context.cpp)
 endif()
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"

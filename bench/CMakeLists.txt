@@ -19,6 +19,9 @@ target_include_directories(blake3pp_bench PRIVATE "${PROJECT_SOURCE_DIR}/src")
 # The file bench measures the I/O pipeline; it has no subject without it.
 if(BLAKE3PP_WITH_IO)
   add_executable(blake3pp_bench_file file_throughput.cpp)
+  # The null source builds the reader engine directly (io/engine.hpp),
+  # which is internal to src/.
+  target_include_directories(blake3pp_bench_file PRIVATE "${PROJECT_SOURCE_DIR}/src")
   target_link_libraries(blake3pp_bench_file PRIVATE
     blake3pp::blake3pp
     blake3pp_warnings
