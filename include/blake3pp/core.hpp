@@ -364,6 +364,19 @@ void fold_sibling_cvs(const kern::kernel_ops* ops,
                       std::span<const std::uint32_t, 8> key,
                       std::uint32_t base_flags,
                       std::span<std::uint32_t, 8> out_cv) noexcept;
+
+// One parent node: the chaining value of the subtree whose children have
+// these CVs. Never the root, so no ROOT flag. Same key and flags contract
+// as compress_subtree_cv (take them from the destination hasher's
+// key_words() and mode_flags()); thread-safe and allocation-free.
+// out_cv may alias left or right: both children are copied into the parent
+// block before anything is written back.
+void parent_cv(const kern::kernel_ops* ops,
+               std::span<const std::uint32_t, 8> left,
+               std::span<const std::uint32_t, 8> right,
+               std::span<const std::uint32_t, 8> key,
+               std::uint32_t base_flags,
+               std::span<std::uint32_t, 8> out_cv) noexcept;
 }  // namespace detail
 
 }  // namespace blake3pp
