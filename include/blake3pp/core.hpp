@@ -351,6 +351,19 @@ void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::span<const std::uint32_t, 8> key,
                          std::uint32_t base_flags,
                          std::span<std::uint32_t, 8> out_cv) noexcept;
+
+// Reduces cvs.size() chaining values of equal-sized, adjacent subtrees
+// (left to right) to the CV of their common ancestor, one generation at a
+// time, lanes-wide. Never the root, so no ROOT flag. cvs is scratch and is
+// clobbered. Same key and flags contract as compress_subtree_cv; take them
+// from the destination hasher's key_words() and mode_flags(). Thread-safe
+// and allocation-free.
+// @pre cvs.size() is a power of two, at least 2.
+void fold_sibling_cvs(const kern::kernel_ops* ops,
+                      std::span<std::array<std::uint32_t, 8>> cvs,
+                      std::span<const std::uint32_t, 8> key,
+                      std::uint32_t base_flags,
+                      std::span<std::uint32_t, 8> out_cv) noexcept;
 }  // namespace detail
 
 }  // namespace blake3pp
