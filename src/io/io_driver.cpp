@@ -8,6 +8,7 @@
 
 #include <blake3pp/detail/io_driver.hpp>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 #include "io/backend.hpp"
@@ -37,6 +39,17 @@ static_assert(sizeof(native_op) <= io_read_op::storage_size,
 static_assert(alignof(native_op) <= io_read_op::storage_align,
               "io_read_op::storage_align is weaker than this platform's "
               "reader_context::read_op requires");
+
+// One io_read_op is reused for read after read -- the window cells hold
+// theirs for the pipeline's lifetime -- and each submit constructs a new
+// backend op over the previous one's bytes without destroying it. That is
+// only sound while destruction is a no-op. A backend whose op acquires
+// anything has to be released in trampoline() before the callback runs,
+// which no backend needs today.
+static_assert(std::is_trivially_destructible_v<native_op>,
+              "this platform's reader_context::read_op has a non-trivial "
+              "destructor; io_read_op::storage is reused per read, so the "
+              "op must be destroyed in trampoline() before the callback");
 
 // The backend completes its own op; this carries that across to the
 // caller's, which is the only one the pipeline knows about.
@@ -67,6 +80,13 @@ struct io_driver::impl {
   // reorder.
   arena buffers;
   context ctx;
+#ifndef NDEBUG
+  // A file holds a reference to the context that opened it. One that
+  // outlives its driver is a use-after-free the backend would only report
+  // as a crash somewhere else, so debug builds count them and name the
+  // mistake in the driver's destructor.
+  unsigned live_files = 0;
+#endif
 
   impl(const io_driver_options& opts, unsigned max_inflight)
       : ctx(io_impl::reader_context_options{opts.async, opts.offload_submit},
@@ -75,18 +95,46 @@ struct io_driver::impl {
 
 struct io_driver::file::impl {
   context::file f;
-  impl(context& ctx, const std::filesystem::path& path, bool direct_io)
-      : f(ctx, path, direct_io) {}
+#ifndef NDEBUG
+  io_driver::impl* drv = nullptr;
+#endif
+
+  impl(io_driver::impl& d, const std::filesystem::path& path, bool direct_io)
+      : f(d.ctx, path, direct_io) {
+#ifndef NDEBUG
+    drv = &d;
+    ++d.live_files;
+#endif
+  }
+
+  ~impl() {
+#ifndef NDEBUG
+    --drv->live_files;
+#endif
+  }
+
+  impl(const impl&) = delete;
+  impl& operator=(const impl&) = delete;
 };
+
+io_read_op_layout native_read_op_layout() noexcept {
+  return {sizeof(native_op), alignof(native_op)};
+}
 
 io_driver::io_driver(const io_driver_options& opts, unsigned max_inflight)
     : impl_(std::make_unique<impl>(opts, max_inflight)) {}
 
-io_driver::~io_driver() = default;
+io_driver::~io_driver() {
+#ifndef NDEBUG
+  assert(impl_->live_files == 0 &&
+         "an io_driver::file outlived its io_driver: every file must be "
+         "destroyed before the driver it was opened on");
+#endif
+}
 
 io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
                       bool direct_io)
-    : impl_(std::make_unique<impl>(drv.impl_->ctx, path, direct_io)) {}
+    : impl_(std::make_unique<impl>(*drv.impl_, path, direct_io)) {}
 
 io_driver::file::~file() = default;
 

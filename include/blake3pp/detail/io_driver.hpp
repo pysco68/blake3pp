@@ -39,7 +39,10 @@ struct io_driver_options {
 // The backend's own operation lives in `storage`: sized and aligned here
 // for the widest backend, checked against the real type by a
 // static_assert in io_driver.cpp, so a backend that outgrows it fails the
-// build rather than corrupting the neighbouring bytes.
+// build rather than corrupting the neighbouring bytes. One io_read_op
+// serves read after read, each submit constructing a fresh backend op
+// over the last one's bytes, which is why that type has to be trivially
+// destructible -- also checked there.
 struct io_read_op {
   void (*done)(io_read_op*, std::error_code) noexcept = nullptr;
   void* owner = nullptr;
@@ -48,6 +51,17 @@ struct io_read_op {
   static constexpr std::size_t storage_align = 16;
   alignas(storage_align) std::byte storage[storage_size];
 };
+
+// Size and alignment of the platform backend's own read operation: what
+// io_read_op::storage has to hold. The static_assert in io_driver.cpp is
+// the one that sees the real type, so this reports the margin on
+// platforms whose backend nobody here can compile.
+struct io_read_op_layout {
+  std::size_t size;
+  std::size_t align;
+};
+
+[[nodiscard]] io_read_op_layout native_read_op_layout() noexcept;
 
 class io_driver {
  public:
