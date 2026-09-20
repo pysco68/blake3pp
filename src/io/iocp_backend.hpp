@@ -281,17 +281,22 @@ class iocp_context {
     op.owner_file = &f;
     // NO_BUFFERING rejects an unaligned length, so only whole granules
     // ride the port; the tail is read synchronously inside poll().
-    const bool on_port = f.f_.use_iocp && buf.size() % direct_align == 0;
-    if (on_port) {
-      // ReadFile can fail outright and issue() throws when it does. The
-      // counters go up only once the port owes a completion: counting a
-      // read nobody will complete leaves in_flight() above zero for
-      // good, and a driver that blocks on it never wakes.
-      issue(op);
+    bool queued = f.f_.use_iocp && buf.size() % direct_align == 0;
+    if (queued) {
+      try {
+        issue(op);
+      } catch (const std::system_error&) {
+        // ReadFile refused it outright, so the port owes no completion
+        // and nothing will ever take this read off in_flight(). It goes
+        // down the ladder an unalignable read already takes: read
+        // synchronously inside poll(), where a second failure reaches
+        // the caller as every other read error does.
+        queued = false;
+      }
     }
     in_flight_++;
     f.inflight_++;
-    if (!on_port) {
+    if (!queued) {
       deferred_.push(op);
     }
   }
@@ -379,11 +384,25 @@ class iocp_context {
       } else {
         op.filled += bytes;
         if (op.filled < op.len) {
-          issue(op);
+          (void)reissue(op);
         } else {
           complete(op, {});
         }
       }
+    }
+  }
+
+  // Queues the rest of a short read. False means ReadFile refused it and
+  // the op was completed with that error instead. Both callers are
+  // inside poll(), which is where a read's error is allowed to reach its
+  // callback; what cannot happen is leaving it counted and unissued.
+  [[nodiscard]] bool reissue(read_op& op) noexcept {
+    try {
+      issue(op);
+      return true;
+    } catch (const std::system_error& e) {
+      complete(op, e.code());
+      return false;
     }
   }
 
@@ -449,7 +468,9 @@ class iocp_context {
       }
       op.filled += bytes;
       if (op.filled < op.len) {
-        issue(op);
+        if (!reissue(op)) {
+          ran++;  // it ended here, with the error ReadFile gave
+        }
         continue;
       }
       complete(op, {});

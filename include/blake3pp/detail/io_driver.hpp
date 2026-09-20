@@ -95,8 +95,10 @@ class io_driver {
   // synchronously inside poll(), as it is in the backends.
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    io_read_op& op);
-  // Pushes everything queued to the OS in one call.
-  void flush();
+  // Pushes everything queued to the OS in one call. A read the OS
+  // refuses is not lost: it is read synchronously inside poll(), which
+  // is why nothing here reports a submit failure.
+  void flush() noexcept;
   // Reaps completions, reissues short reads, performs at most one
   // deferred synchronous read, and runs the callbacks of every op that
   // finished. Flushes first. With block, sleeps until at least one
@@ -129,7 +131,7 @@ concept file_driver =
       { f.size() } noexcept -> std::same_as<std::uint64_t>;
       { f.name() } noexcept -> std::same_as<std::string_view>;
       { d.submit_read(f, off, buf, op) };
-      { d.flush() };
+      { d.flush() } noexcept;
       { d.poll(block) } -> std::same_as<std::size_t>;
       { d.wake() } noexcept;
       { cd.in_flight() } noexcept -> std::same_as<std::size_t>;
