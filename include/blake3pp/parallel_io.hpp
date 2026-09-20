@@ -19,6 +19,7 @@
 /// Same shape as io.hpp: `update_file()` is the primitive, `hash_file()` the
 /// one-shot convenience, each with a throwing and a std::error_code form.
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -27,6 +28,7 @@
 #include <utility>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
@@ -112,6 +114,21 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const std::filesystem::path& path,
                  Scheduler&& sched, const file_io_options& opts = {}) {
+  // The pipeline drives the reads itself, from this thread, and absorbs
+  // windows in whatever order they finish. It can only do that where
+  // every full window is a subtree of the final tree; where it is not,
+  // the sequential window loop still is the answer.
+  if (detail::pipeline_can_take<Budget>(
+          h, detail::rounded_window_bytes(opts.window_bytes))) {
+    detail::io_driver drv(
+        {/*async=*/true, opts.offload_submit},
+        std::clamp<unsigned>(opts.queue_depth, 2, detail::max_queue_depth));
+    detail::io_driver::file file(drv, path, opts.direct_io);
+    detail::run_window_pipeline<Budget>(
+        h, drv, file, std::forward<Scheduler>(sched),
+        {opts.window_bytes, opts.queue_depth, opts.trace, 0});
+    return;
+  }
   detail::file_reader reader(
       path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
              opts.offload_submit});
