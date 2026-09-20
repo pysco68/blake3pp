@@ -19,6 +19,7 @@
 
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/tree_reducer.hpp>
+#include <blake3pp/dispatch.hpp>
 #include <doctest/doctest.h>
 
 namespace {
@@ -483,6 +484,88 @@ TEST_CASE("clear() returns the reducer to empty") {
   p.tail = 5000;
   p.clear_first = true;
   static_cast<void>(run_case(p, rng, storage));
+}
+
+// fold_aligned_runs has one job: produce exactly the nodes the reducer
+// would have produced from the same parts, so that a window folded on a
+// pool thread is indistinguishable from one inserted part by part.
+TEST_CASE("fold_aligned_runs matches inserting every part") {
+  using blake3pp::detail::fold_aligned_runs;
+  const auto* ops = blake3pp::detail::resolve(blake3pp::arch::auto_detect);
+  hasher h;
+  std::mt19937_64 rng(seed);
+
+  std::array<tree_reducer::node, 2 * 54> folded_storage{};
+  std::vector<tree_reducer::node> nodes_a(256);
+  std::vector<tree_reducer::node> nodes_b(256);
+
+  for (int round = 0; round < 400; ++round) {
+    // A part size that is a power of two, a base that is a multiple of
+    // it, and any sub-run of the parts.
+    const std::uint64_t part_chunks = std::uint64_t{1} << (rng() % 6);
+    const std::size_t parts = 1 + rng() % 40;
+    const std::uint64_t base_part = rng() % 1000;
+    const std::uint64_t base_chunk = base_part * part_chunks;
+    const std::size_t i0 = rng() % parts;
+    const std::size_t i1 = i0 + 1 + rng() % (parts - i0);
+    CAPTURE(part_chunks);
+    CAPTURE(base_chunk);
+    CAPTURE(i0);
+    CAPTURE(i1);
+
+    std::vector<tree_reducer::cv_type> cvs(parts);
+    for (auto& cv : cvs) {
+      for (auto& word : cv) {
+        word = static_cast<std::uint32_t>(rng());
+      }
+    }
+    const std::vector<tree_reducer::cv_type> original = cvs;
+
+    // What the helper produces, inserted as nodes.
+    tree_reducer a(ops, h.key_words(), h.mode_flags(), nodes_a);
+    const std::size_t n = fold_aligned_runs(
+        ops, h.key_words(), h.mode_flags(), std::span(cvs), i0, i1, base_chunk,
+        part_chunks, std::span(folded_storage));
+    REQUIRE(n > 0);
+    REQUIRE(n <= folded_storage.size());
+    for (std::size_t k = 0; k < n; ++k) {
+      REQUIRE(a.insert(folded_storage[k].first_chunk,
+                       folded_storage[k].chunks, folded_storage[k].cv));
+    }
+
+    // What the reducer produces from the same parts, one at a time.
+    tree_reducer b(ops, h.key_words(), h.mode_flags(), nodes_b);
+    for (std::size_t i = i0; i < i1; ++i) {
+      REQUIRE(b.insert(base_chunk + i * part_chunks, part_chunks, original[i]));
+    }
+
+    const auto left = a.sorted();
+    const auto right = b.sorted();
+    REQUIRE(left.size() == right.size());
+    for (std::size_t k = 0; k < left.size(); ++k) {
+      CAPTURE(k);
+      CHECK(left[k].first_chunk == right[k].first_chunk);
+      CHECK(left[k].chunks == right[k].chunks);
+      // The CVs are the claim: the grouped route folds with
+      // fold_sibling_cvs, lanes-wide, and the per-part route merges with
+      // the reducer's own scalar parent_cv. Equal positions would pass
+      // with two different trees behind them.
+      CHECK(left[k].cv == right[k].cv);
+    }
+    // The canonical decomposition is at most one node per level twice
+    // over, which is what bounds the helper's output storage.
+    CHECK(n <= 2 * 54);
+  }
+}
+
+TEST_CASE("fold_aligned_runs leaves an empty run alone") {
+  using blake3pp::detail::fold_aligned_runs;
+  const auto* ops = blake3pp::detail::resolve(blake3pp::arch::auto_detect);
+  hasher h;
+  std::vector<tree_reducer::cv_type> cvs(4);
+  std::array<tree_reducer::node, 2 * 54> out{};
+  CHECK(fold_aligned_runs(ops, h.key_words(), h.mode_flags(), std::span(cvs), 2,
+                          2, 0, 16, std::span(out)) == 0);
 }
 
 }  // TEST_SUITE
