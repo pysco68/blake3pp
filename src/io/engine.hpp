@@ -60,7 +60,7 @@ class polled_reader_engine {
       : window_(rounded_window_bytes(opts.window_bytes)),
         qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
         slots_(qd_),
-        pool_(std::size_t{qd_} * window_),
+        pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
         file_(ctx_, path, opts.direct_io) {
     num_windows_ = (file_.size() + window_ - 1) / window_;
@@ -82,7 +82,7 @@ class polled_reader_engine {
       : window_(rounded_window_bytes(opts.window_bytes)),
         qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
         slots_(qd_),
-        pool_(std::size_t{qd_} * window_),
+        pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
         file_(ctx_, size) {
     num_windows_ = (file_.size() + window_ - 1) / window_;
@@ -103,7 +103,7 @@ class polled_reader_engine {
   // The buffer arena, for callers that must fill it before the first read
   // (the null source hands back whatever is already there).
   [[nodiscard]] std::span<std::byte> pool() noexcept {
-    return {pool_.data, std::size_t{qd_} * window_};
+    return {pool_.get(), std::size_t{qd_} * window_};
   }
 
   std::optional<window> next() {
@@ -188,7 +188,7 @@ class polled_reader_engine {
   }
 
   std::byte* buf(unsigned slot) const noexcept {
-    return pool_.data + static_cast<std::size_t>(slot) * window_;
+    return pool_.get() + static_cast<std::size_t>(slot) * window_;
   }
 
   void assign(unsigned s) {
@@ -216,7 +216,7 @@ class polled_reader_engine {
   // old engine's: the file closes first, then the context drains every
   // read still owed (running no callback), and only then is the pool it
   // was reading into freed. Do not reorder these three members.
-  aligned_pool pool_;
+  aligned_buffer pool_;
   C ctx_;
   typename C::file file_;
 };
@@ -238,7 +238,7 @@ class writer_engine {
                 const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
         qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
-        pool_(std::size_t{qd_} * buffer_),
+        pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
         backend_(path, opts, qd_) {}
 
   [[nodiscard]] std::uint64_t bytes_written() const noexcept {
@@ -294,7 +294,7 @@ class writer_engine {
   }
 
   std::byte* buf(unsigned slot) const noexcept {
-    return pool_.data + static_cast<std::size_t>(slot) * buffer_;
+    return pool_.get() + static_cast<std::size_t>(slot) * buffer_;
   }
 
   std::size_t buffer_;
@@ -307,7 +307,7 @@ class writer_engine {
   // Declaration order is the teardown contract: the backend destructs
   // FIRST, draining any in-flight writes that read from the pool, and the
   // pool is freed after. Do not reorder these two members.
-  aligned_pool pool_;
+  aligned_buffer pool_;
   B backend_;
 };
 
