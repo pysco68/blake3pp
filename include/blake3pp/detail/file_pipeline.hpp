@@ -20,12 +20,15 @@
 // a pool thread cannot touch the driver, so it parks a node on the run
 // queue and nudges the driver awake instead.
 //
-// Two rules hold the shape together, and both are about where a
-// completion may run:
+// Three rules hold the shape together, and all of them are about where a
+// completion may run and who may touch what afterwards:
 //
 //   * callbacks run only inside poll(), which is the I/O contract from
 //     Phase 2a (src/io/backend.hpp);
-//   * nothing completes inside a start(), which is this header's.
+//   * nothing completes inside a start(), which is this header's;
+//   * once a node is on the run queue, the thread that put it there
+//     touches neither the node nor the operation state it lives in ever
+//     again.
 //
 // The second follows from the first plus who calls start(). The scope
 // starts the next window from inside its own receiver, so a sender that
@@ -35,6 +38,14 @@
 // windows happen to be ready. A read that cannot even be queued
 // therefore parks its failure on the run queue and is completed from
 // the loop, like every other completion.
+//
+// The third is what a publishing thread owes the driver. The push is the
+// hand-off, and from that instant the driver may run the continuation,
+// re-emplace the operation cell the node lived in, finish the file and
+// return to a caller that destroys everything. Only the loop itself may
+// be touched after a push -- its publisher count and its driver's wake
+// -- and the loop is what waits those threads out before run_until
+// returns. ThreadSanitizer is the only thing that catches a violation.
 //
 // A template over file_driver: io_driver for a real device, the bench's
 // driver over null_context for a pipeline measured with no device under
@@ -55,6 +66,7 @@
 #include <optional>
 #include <span>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -87,6 +99,13 @@ class run_queue {
 
   // Any thread. The release on the exchange publishes whatever the node
   // was filled with to the drain's acquire.
+  //
+  // The node is written only before the exchange that publishes it: a
+  // failed compare_exchange has published nothing, and a successful one
+  // hands the node to the driver, which may run it and re-emplace the
+  // operation cell it lives in before this call has even returned.
+  // Nothing here touches n afterwards, and nothing anywhere else may
+  // either.
   void push(run_node* n) noexcept {
     run_node* head = head_.load(std::memory_order_relaxed);
     do {
@@ -144,14 +163,11 @@ class schedule_op : public run_node {
   schedule_op& operator=(const schedule_op&) = delete;
 
   // Runs on whichever thread finished the work before it, which for the
-  // window chain is a pool thread. The push and the wake are the entire
-  // hand-off back to the driver; the wake is one write to the driver's
-  // wake primitive per window, and it is what stops a parked poll from
-  // sleeping through a ready window.
-  void start() & noexcept {
-    loop_->queue().push(this);
-    loop_->driver().wake();
-  }
+  // window chain is a pool thread. Handing the node to the loop is the
+  // entire hand-off back to the driver, and it is the last thing this
+  // operation state does: publishing it is what allows the driver to
+  // finish the run and destroy it.
+  void start() & noexcept { loop_->publish(this); }
 
  private:
   Receiver rcvr_;
@@ -254,8 +270,7 @@ class read_op_state : public run_node {
   // completion.
   void fail(std::error_code ec) noexcept {
     ec_ = ec;
-    loop_->queue().push(this);
-    loop_->driver().wake();
+    loop_->publish(this);
   }
 
   static void deliver_submit_failure(run_node* n) noexcept {
@@ -344,6 +359,22 @@ class driver_loop {
   [[nodiscard]] D& driver() noexcept { return *drv_; }
   [[nodiscard]] run_queue& queue() noexcept { return queue_; }
 
+  // Hands one node to the driver, from any thread.
+  //
+  // Everything after the push touches this loop and nothing else: the
+  // node is the driver's from that instant, and so is the operation
+  // state it lives in, which may already have been destroyed and
+  // re-emplaced for the next window. The driver's wake is reached
+  // through the loop for the same reason, and the publisher count is
+  // what keeps the loop and the driver alive long enough to reach it --
+  // run_until does not return while a thread is between the two.
+  void publish(run_node* n) noexcept {
+    publishers_.fetch_add(1, std::memory_order_relaxed);
+    queue_.push(n);
+    drv_->wake();
+    publishers_.fetch_sub(1, std::memory_order_release);
+  }
+
   // Drives everything until the pipeline says it is done, which happens
   // inside a completion this loop itself ran. Blocks only when there is
   // nothing to run, so the thread sleeps in the kernel rather than
@@ -354,6 +385,10 @@ class driver_loop {
   // windows reaches the OS in one call rather than one each.
   template <class BeforeFlush>
   void run_until(const loop_status& status, BeforeFlush&& before_flush) {
+    // Also on the way out of a throwing poll(): the caller's next act is
+    // to destroy the operation cells, and a thread inside publish() is
+    // still reading this loop.
+    const publisher_guard guard{this};
     for (;;) {
       drain();
       before_flush();
@@ -376,6 +411,20 @@ class driver_loop {
     run_until(status, [] {});
   }
 
+  // Waits out the threads that are inside publish(). One eventfd write
+  // each, so this spins for as long as a syscall and only where the run
+  // is already over.
+  struct publisher_guard {
+    driver_loop* loop;
+    ~publisher_guard() { loop->settle_publishers(); }
+  };
+
+  void settle_publishers() noexcept {
+    while (publishers_.load(std::memory_order_acquire) != 0) {
+      std::this_thread::yield();
+    }
+  }
+
   // Runs everything parked on the queue, once. A node may be pushed
   // again by its own completion, so the successor is read before the
   // node runs.
@@ -393,6 +442,7 @@ class driver_loop {
  private:
   D* drv_;
   run_queue queue_;
+  std::atomic<unsigned> publishers_{0};
 };
 
 // --------------------------------------------------------------------
