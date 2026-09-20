@@ -651,6 +651,7 @@ class window_scope {
 
     if (trace_ != nullptr) {
       trace_->driver().admission_stalls = admission_stalls_;
+      trace_->driver().max_pending = max_pending_;
     }
     if (eptr_) {
       std::rethrow_exception(eptr_);
@@ -822,6 +823,7 @@ class window_scope {
     // Admission reserved this node before the window started.
     assert(inserted && "the reducer refused a window admission had room for");
     (void)inserted;
+    max_pending_ = std::max(max_pending_, reducer_.pending());
     if (w.rec != nullptr) {
       w.rec->t_absorbed = trace_->now();
     }
@@ -925,6 +927,7 @@ class window_scope {
   std::uint64_t index_ = 0;
   unsigned in_flight_ = 0;
   std::uint64_t admission_stalls_ = 0;
+  std::size_t max_pending_ = 0;
   bool stop_ = false;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
