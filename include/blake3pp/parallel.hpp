@@ -39,6 +39,7 @@
 #include <vector>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/tree_reducer.hpp>
 #include <blake3pp/trace.hpp>
 
 #if defined(__linux__)
@@ -637,6 +638,31 @@ struct window_compress {
     return true;
   }
 
+  // An edge window: the caller says how big a part is and how many of
+  // them belong to the tree, because the rest of the window is the
+  // hasher's own. counter is the absolute chunk of part 0.
+  void prepare_edge(const kern::kernel_ops* o, const std::byte* d,
+                    std::size_t part_chunks, std::size_t parts,
+                    std::uint64_t counter,
+                    std::span<const std::uint32_t, 8> k, std::uint32_t f,
+                    trace_buffer* buf, std::uint64_t window_id) noexcept {
+    assert(parts <= Budget.parts());
+    ops = o;
+    data = d;
+    chunk_counter = counter;
+    num_chunks = parts * part_chunks;
+    part = part_chunks;
+    n_parts = parts;
+    std::ranges::copy(k, key.begin());
+    flags = f;
+    next.store(0, std::memory_order_relaxed);
+    pt.buf = buf;
+    pt.window = window_id;
+    pt.part_chunks = static_cast<std::uint32_t>(part_chunks);
+    pt.busy_ns.store(0, std::memory_order_relaxed);
+    pt.active.store(0, std::memory_order_relaxed);
+  }
+
   void operator()(std::size_t i) noexcept {
     compress_subtree_cv(ops, data + i * part * chunk_size, part,
                         chunk_counter + i * part, key, flags, cvs[i]);
@@ -677,6 +703,30 @@ template <bool Traced, stack_budget Budget, class Scheduler>
            fold_sibling_cvs(w.ops, std::span{w.cvs}.first(w.n_parts), w.key,
                             w.flags, w.cv);
            return w.cv;
+         });
+}
+
+// An edge window's compress stage: the same bulk over a run of parts the
+// caller chose, and then, instead of one fold to one CV, the canonical
+// decomposition of that run into reducer nodes.
+//
+// An edge window is one whose bytes cannot all become a subtree -- the
+// last window carries the message's final chunk, the first may start
+// part-way through a part -- so only the middle of it goes to the pool,
+// and what comes back is a handful of nodes rather than a single
+// chaining value. Value: how many nodes were written to `out`.
+//
+// The fold runs on the agent that finished the bulk, like the full
+// window's; `out` is the caller's and must outlive the sender.
+template <bool Traced, stack_budget Budget, class Scheduler>
+[[nodiscard]] auto compress_edge_on(Scheduler& sched,
+                                    window_compress<Budget>& w,
+                                    std::span<tree_reducer::node> out) {
+  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt) |
+         ex::then([&w, out]() noexcept {
+           return fold_aligned_runs(w.ops, w.key, w.flags,
+                                    std::span(w.cvs).first(w.n_parts), 0,
+                                    w.n_parts, w.chunk_counter, w.part, out);
          });
 }
 
