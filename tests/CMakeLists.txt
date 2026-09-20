@@ -67,7 +67,14 @@ elseif(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   # aggregate; it becomes runnable on real hardware.
   add_test(NAME blake3pp_tests COMMAND blake3pp_tests --no-colors)
 else()
-  doctest_discover_tests(blake3pp_tests)
+  # Without a per-case limit a stall in the pipeline or a backend holds
+  # the run until the CI job's own limit, with nothing to say which case
+  # was stuck. A deadlock is unbounded, so any finite limit catches it,
+  # and the number is set by the slowest case doing real work: the
+  # reducer's property cases under GCC with address+undefined, which hash
+  # a couple of gigabytes each and take about four minutes there against
+  # under a second on the plain lanes.
+  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 900)
 endif()
 
 # The sized parallel scheduler is one definition per program; the test
