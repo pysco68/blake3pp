@@ -19,13 +19,14 @@
 
 namespace blake3pp::detail::io_impl {
 
-class pread_reader {
+// The source half of the synchronous contract (sync_context in
+// backend.hpp supplies the deferred list, the poll loop and the wake).
+class pread_source {
  public:
-  pread_reader(const std::filesystem::path& path,
-               const file_reader_options& opts, unsigned) {
+  pread_source(const std::filesystem::path& path, bool direct_io) {
     f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
     size_ = f_.stat_size();
-    if (opts.direct_io) {
+    if (direct_io) {
       f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
     }
   }
@@ -34,16 +35,8 @@ class pread_reader {
   [[nodiscard]] std::string_view name() const noexcept {
     return f_.direct ? "pread+direct" : "pread";
   }
-  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t) const noexcept {
-    return false;
-  }
 
-  void start(unsigned, std::uint64_t, std::span<std::byte>) {
-    assert(false && "pread backend has no async path");
-  }
-  void wait(unsigned) { assert(false && "pread backend has no async path"); }
-
-  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
+  void read_at(std::uint64_t off, std::span<std::byte> buf) {
     f_.pread_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
   }
 
@@ -51,6 +44,8 @@ class pread_reader {
   posix_file f_;
   std::uint64_t size_ = 0;
 };
+
+using pread_context = sync_context<pread_source>;
 
 class pread_writer {
  public:
@@ -87,7 +82,7 @@ class pread_writer {
 };
 
 // Definition-site conformance check (see uring_backend.hpp).
-static_assert(reader_backend<pread_reader>);
+static_assert(reader_context<pread_context>);
 static_assert(writer_backend<pread_writer>);
 
 }  // namespace blake3pp::detail::io_impl

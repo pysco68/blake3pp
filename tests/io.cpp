@@ -526,13 +526,13 @@ TEST_CASE("io_uring destroy reaps in-flight reads before the ring goes") {
   posix_file file;
   file.open(f.path.c_str(), O_RDONLY | O_CLOEXEC);
   file.try_odirect(f.path.c_str(), O_RDONLY | O_CLOEXEC);
-  aligned_pool buf(content.size());
-  std::memset(buf.data, 0, content.size());
-  ring.submit_rw(IORING_OP_READ, file.fd, buf.data,
+  const aligned_buffer buf = make_aligned_buffer(content.size());
+  std::memset(buf.get(), 0, content.size());
+  ring.submit_rw(IORING_OP_READ, file.fd, buf.get(),
                  static_cast<unsigned>(content.size()), 0, 0, true);
   ring.destroy();
   CHECK(ring.outstanding == 0);
-  CHECK(std::equal(content.begin(), content.end(), buf.data));
+  CHECK(std::equal(content.begin(), content.end(), buf.get()));
 }
 #endif
 
@@ -671,10 +671,10 @@ TEST_CASE("writer submit modes deliver identical data") {
 }
 
 // Writes `content` through writer_engine<W>, reads it back through
-// reader_engine<R>, and checks byte identity. Small buffers and low queue
-// depth force slot recycling; the odd length forces an unaligned tail
-// through the sync path.
-template <class R, class W>
+// polled_reader_engine<C>, and checks byte identity. Small buffers and low
+// queue depth force slot recycling; the odd length forces an unaligned
+// tail through the deferred path.
+template <class C, class W>
 void roundtrip_engines(std::string_view tag) {
   namespace io_impl = blake3pp::detail::io_impl;
   const auto content = make_input(300 * 1024 + 77);
@@ -697,8 +697,8 @@ void roundtrip_engines(std::string_view tag) {
     CHECK(w.bytes_written() == content.size());
   }
 
-  io_impl::reader_engine<R> r(f.path,
-                              {.window_bytes = 64 * 1024, .queue_depth = 2});
+  io_impl::polled_reader_engine<C> r(
+      f.path, {.window_bytes = 64 * 1024, .queue_depth = 2});
   MESSAGE(tag << " reader backend: " << r.backend_name());
   CHECK(r.file_size() == content.size());
   std::vector<std::byte> out;
@@ -716,9 +716,9 @@ void roundtrip_engines(std::string_view tag) {
 // everywhere, not just where the selector picks them.
 TEST_CASE("engine templates drive the off-platform backends") {
   namespace io_impl = blake3pp::detail::io_impl;
-  roundtrip_engines<io_impl::stdio_reader, io_impl::stdio_writer>("stdio");
+  roundtrip_engines<io_impl::stdio_context, io_impl::stdio_writer>("stdio");
 #if defined(__unix__) || defined(__APPLE__)
-  roundtrip_engines<io_impl::pread_reader, io_impl::pread_writer>("pread");
+  roundtrip_engines<io_impl::pread_context, io_impl::pread_writer>("pread");
 #endif
 }
 

@@ -34,32 +34,19 @@
 
 namespace blake3pp {
 
-/// Streams a file into a hasher with every complete window fanned out
-/// over a scheduler; the final window is absorbed by h itself.
-///
-/// Same contract as io.hpp's update_file(): h keeps its mode, stays open
-/// for more input and for every finalize form, and files hash in
-/// sequence. A window is offloaded as a subtree only when h sits on a
-/// boundary aligned to it: always the case for a fresh hasher, and after
-/// files whose sizes are multiples of the window. Elsewhere the window
-/// goes through `h.update()` instead, so the digest is the same either way
-/// and only the parallelism varies.
-/// @tparam Budget     The stack a window's part table may take; see
-///                    stack_budget.
-/// @tparam Scheduler  Any std::execution-style scheduler.
-/// @param h      The hasher to stream into.
-/// @param path   The file to read.
-/// @param sched  Where the subtree reductions run.
-/// @param opts   The pipeline knobs.
-/// @throws std::system_error on I/O failure, and whatever the execution
-///         provider raises.
-template <stack_budget Budget = default_stack_budget, class Scheduler>
-  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
-void update_file(hasher& h, const std::filesystem::path& path,
-                 Scheduler&& sched, const file_io_options& opts = {}) {
-  detail::file_reader reader(
-      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-             opts.offload_submit});
+namespace detail {
+
+// The window loop, over anything shaped like file_reader: next() hands
+// windows out in file order, release() recycles them, and that is the
+// whole vocabulary it needs. update_file() drives it with a real
+// file_reader; the bench drives it with a source that performs no I/O,
+// which is how the pipeline's hash-bound ceiling is measured with no
+// device in the way. The tracing lives here, so both see the same
+// records.
+template <stack_budget Budget = default_stack_budget, class Reader,
+          class Scheduler>
+void update_from_reader(hasher& h, Reader& reader, Scheduler&& sched,
+                        const file_io_options& opts) {
   const kern::kernel_ops* const ops = detail::resolve(h.selected_arch());
   const std::uint64_t base = h.count();
   const bool on_chunk_boundary = base % chunk_size == 0;
@@ -98,6 +85,38 @@ void update_file(hasher& h, const std::filesystem::path& path,
     }
     ++index;
   }
+}
+
+}  // namespace detail
+
+/// Streams a file into a hasher with every complete window fanned out
+/// over a scheduler; the final window is absorbed by h itself.
+///
+/// Same contract as io.hpp's update_file(): h keeps its mode, stays open
+/// for more input and for every finalize form, and files hash in
+/// sequence. A window is offloaded as a subtree only when h sits on a
+/// boundary aligned to it: always the case for a fresh hasher, and after
+/// files whose sizes are multiples of the window. Elsewhere the window
+/// goes through `h.update()` instead, so the digest is the same either way
+/// and only the parallelism varies.
+/// @tparam Budget     The stack a window's part table may take; see
+///                    stack_budget.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param h      The hasher to stream into.
+/// @param path   The file to read.
+/// @param sched  Where the subtree reductions run.
+/// @param opts   The pipeline knobs.
+/// @throws std::system_error on I/O failure, and whatever the execution
+///         provider raises.
+template <stack_budget Budget = default_stack_budget, class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void update_file(hasher& h, const std::filesystem::path& path,
+                 Scheduler&& sched, const file_io_options& opts = {}) {
+  detail::file_reader reader(
+      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+             opts.offload_submit});
+  detail::update_from_reader<Budget>(h, reader, std::forward<Scheduler>(sched),
+                                     opts);
 }
 
 /// Streams a file into a hasher over a scheduler, reporting failure

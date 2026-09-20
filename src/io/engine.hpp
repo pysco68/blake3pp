@@ -1,10 +1,11 @@
 #pragma once
 
 // The two portable I/O engines, written exactly once as class templates
-// constrained by the backend concepts (io/backend.hpp). The public
-// file_reader/file_writer TUs instantiate them with the platform backend
+// constrained by the concepts in io/backend.hpp: the reader over
+// reader_context, the writer over writer_backend. The public
+// file_reader/file_writer TUs instantiate them with what
 // backend_select.hpp picks; the tests instantiate them again with the
-// off-platform POSIX/stdio backends, so those stay compiled AND executed
+// off-platform contexts and backends, so those stay compiled AND executed
 // on every platform even though the selector never chooses them there.
 // The constraint is the contract: an engine can only speak the concept's
 // vocabulary, and a backend drifting from it fails at the instantiation
@@ -12,6 +13,7 @@
 // never installed.
 
 #include <algorithm>
+#include <concepts>
 #include <string_view>
 #include <bit>
 #include <cerrno>
@@ -21,6 +23,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -31,48 +34,81 @@
 
 namespace blake3pp::detail::io_impl {
 
-// The read-side window/slot engine: windows are delivered strictly in
-// file order while later windows stream in behind them; release()
-// recycles a buffer slot, which is what creates backpressure. Every
-// window is just "async in flight" (wait) or "read lazily at delivery"
-// (read_sync); the backend decided which via wants_async().
-template <reader_backend B>
-class reader_engine {
+// The read-side window/slot engine on the completion-callback contract
+// (reader_context in io/backend.hpp). Observably identical to
+// reader_engine above: windows are delivered strictly in file order,
+// release() recycles a slot and that recycling is the backpressure, and a
+// submission that fails inside the noexcept release() is latched for the
+// next next() to throw.
+//
+// What changed is where a read finishes. The context reports completion
+// by calling back, only from inside poll(), so a slot is "ready" when its
+// callback said so rather than when a blocking wait(slot) returned. next()
+// therefore drives poll() until the window it wants is the one that
+// arrived, absorbing the others on the way -- the same reordering the old
+// wait() absorbed, moved to where a later phase can share one poll across
+// several windows and, after that, several files.
+template <reader_context C>
+class polled_reader_engine {
  public:
   using window = file_reader::window;
 
-  reader_engine(const std::filesystem::path& path,
-                const file_reader_options& opts)
+  polled_reader_engine(const std::filesystem::path& path,
+                       const file_reader_options& opts)
+    requires std::constructible_from<typename C::file, C&,
+                                     const std::filesystem::path&, bool>
       : window_(rounded_window_bytes(opts.window_bytes)),
         qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
         slots_(qd_),
-        pool_(std::size_t{qd_} * window_),
-        backend_(path, opts, qd_) {
-    num_windows_ = (backend_.size() + window_ - 1) / window_;
+        pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
+        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
+        file_(ctx_, path, opts.direct_io) {
+    num_windows_ = (file_.size() + window_ - 1) / window_;
     const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
     for (unsigned s = 0; s < initial; ++s) {
       assign(s);
     }
+    // One flush for the whole initial batch: the contract separates
+    // queueing from submitting precisely so this is one io_uring_enter
+    // rather than queue_depth of them.
+    ctx_.flush();
+  }
+
+  // A source with no path: the null source is constructed from the size
+  // it should pretend to have. Everything downstream -- window count,
+  // slots, delivery order -- is the same machine.
+  polled_reader_engine(std::uint64_t size, const file_reader_options& opts)
+    requires std::constructible_from<typename C::file, C&, std::uint64_t>
+      : window_(rounded_window_bytes(opts.window_bytes)),
+        qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
+        slots_(qd_),
+        pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
+        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
+        file_(ctx_, size) {
+    num_windows_ = (file_.size() + window_ - 1) / window_;
+    const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
+    for (unsigned s = 0; s < initial; ++s) {
+      assign(s);
+    }
+    ctx_.flush();
   }
 
   [[nodiscard]] std::uint64_t file_size() const noexcept {
-    return backend_.size();
+    return file_.size();
   }
   [[nodiscard]] std::string_view backend_name() const noexcept {
-    return backend_.name();
+    return file_.name();
+  }
+
+  // The buffer arena, for callers that must fill it before the first read
+  // (the null source hands back whatever is already there).
+  [[nodiscard]] std::span<std::byte> pool() noexcept {
+    return {pool_.get(), std::size_t{qd_} * window_};
   }
 
   std::optional<window> next() {
-    // A submission that fails inside release() cannot be reported there.
-    // release() is noexcept, because callers pair it with next() in a
-    // tight loop. Letting it throw would call std::terminate, including
-    // from hash_file(path, ec, opts), whose whole contract is to turn I/O
-    // failures into an error_code.
-    //
-    // So the failure is latched here instead, in the function already
-    // documented as throwing. The latch is permanent: the slot whose
-    // submission failed holds a window that can never be delivered, so
-    // there is no way to continue reading.
+    // See reader_engine::next(): release() is noexcept, so a failed
+    // submission is latched there and thrown here.
     if (submit_failed_) {
       std::rethrow_exception(submit_failed_);
     }
@@ -86,17 +122,16 @@ class reader_engine {
         break;
       }
     }
-    // release() reassigns eagerly, so `want` has a slot unless the caller
-    // holds every one of them, which is the documented queue_depth limit.
     if (s == qd_) {
       throw std::system_error(EINVAL, std::generic_category(),
                               "next() with every window slot still held");
     }
     slot_state& st = slots_[s];
-    if (st.started) {
-      backend_.wait(s);
-    } else {
-      backend_.read_sync(want * window_, {buf(s), st.target});
+    while (!st.ready) {
+      ctx_.poll(true);
+    }
+    if (st.ec) {
+      throw std::system_error(st.ec, "read");
     }
     st.held = true;
     next_deliver_++;
@@ -105,9 +140,6 @@ class reader_engine {
   }
 
   void release(const window& w) noexcept {
-    // A slot this reader never handed out, or one released twice, cannot
-    // be reported here (noexcept); it is latched like a failed submission
-    // and surfaces at the next next().
     if (w.slot >= qd_ || !slots_[w.slot].held) {
       if (!submit_failed_) {
         submit_failed_ = std::make_exception_ptr(std::system_error(
@@ -120,10 +152,9 @@ class reader_engine {
     st.assigned = false;
     st.held = false;
     if (next_submit_ < num_windows_ && !submit_failed_) {
-      // assign() submits real I/O (io_uring_enter / ReadFile), which can
-      // fail. Latch it for next() to rethrow; see the note there.
       try {
         assign(w.slot);
+        ctx_.flush();
       } catch (...) {
         submit_failed_ = std::current_exception();
       }
@@ -132,21 +163,32 @@ class reader_engine {
 
  private:
   struct slot_state {
-    std::uint64_t win = 0;   // window index assigned to this slot
-    std::size_t target = 0;  // bytes this window must read
+    typename C::read_op op{};
+    std::uint64_t win = 0;
+    std::size_t target = 0;
+    std::error_code ec{};
     bool assigned = false;
-    bool started = false;  // async read in flight (wait) vs lazy (read_sync)
-    bool held = false;     // delivered, not yet released
+    bool ready = false;  // the callback has run for this window
+    bool held = false;   // delivered, not yet released
   };
+
+  // The one place a context hands control back. Marking the slot is all
+  // it may do: the engine is not reentrant, and the contract's promise is
+  // that this runs on the thread inside poll().
+  static void on_done(read_op_base* base, std::error_code ec) noexcept {
+    auto* const st = static_cast<slot_state*>(base->owner);
+    st->ec = ec;
+    st->ready = true;
+  }
 
   std::size_t window_len(std::uint64_t w) const noexcept {
     const std::uint64_t off = w * window_;
-    const std::uint64_t rest = backend_.size() - off;
+    const std::uint64_t rest = file_.size() - off;
     return rest < window_ ? static_cast<std::size_t>(rest) : window_;
   }
 
   std::byte* buf(unsigned slot) const noexcept {
-    return pool_.data + static_cast<std::size_t>(slot) * window_;
+    return pool_.get() + static_cast<std::size_t>(slot) * window_;
   }
 
   void assign(unsigned s) {
@@ -155,26 +197,28 @@ class reader_engine {
     st.target = window_len(st.win);
     st.assigned = true;
     st.held = false;
-    st.started = backend_.wants_async(st.win * window_, st.target);
-    if (st.started) {
-      backend_.start(s, st.win * window_, {buf(s), st.target});
-    }
-    // Slots the backend declined are read synchronously at delivery time.
+    st.ready = false;
+    st.ec = {};
+    st.op.done = &on_done;
+    st.op.owner = &st;
+    ctx_.submit_read(file_, st.win * window_, {buf(s), st.target}, st.op);
   }
 
   std::size_t window_;
   unsigned qd_;
   std::uint64_t num_windows_ = 0;
-  std::uint64_t next_submit_ = 0;   // next window index to assign to a slot
-  std::uint64_t next_deliver_ = 0;  // next window index to hand out
-  std::exception_ptr submit_failed_;  // latched by release(), thrown by next()
+  std::uint64_t next_submit_ = 0;
+  std::uint64_t next_deliver_ = 0;
+  std::exception_ptr submit_failed_;
   std::vector<slot_state> slots_;
 
-  // Declaration order is the teardown contract: the backend destructs
-  // FIRST, draining any in-flight reads that target the pool, and the
-  // pool is freed after. Do not reorder these two members.
-  aligned_pool pool_;
-  B backend_;
+  // Declaration order is the teardown contract, one link longer than the
+  // old engine's: the file closes first, then the context drains every
+  // read still owed (running no callback), and only then is the pool it
+  // was reading into freed. Do not reorder these three members.
+  aligned_buffer pool_;
+  C ctx_;
+  typename C::file file_;
 };
 
 // The write-side slot engine, the reader's inverse. The producer fills
@@ -194,7 +238,7 @@ class writer_engine {
                 const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
         qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
-        pool_(std::size_t{qd_} * buffer_),
+        pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
         backend_(path, opts, qd_) {}
 
   [[nodiscard]] std::uint64_t bytes_written() const noexcept {
@@ -250,7 +294,7 @@ class writer_engine {
   }
 
   std::byte* buf(unsigned slot) const noexcept {
-    return pool_.data + static_cast<std::size_t>(slot) * buffer_;
+    return pool_.get() + static_cast<std::size_t>(slot) * buffer_;
   }
 
   std::size_t buffer_;
@@ -263,7 +307,7 @@ class writer_engine {
   // Declaration order is the teardown contract: the backend destructs
   // FIRST, draining any in-flight writes that read from the pool, and the
   // pool is freed after. Do not reorder these two members.
-  aligned_pool pool_;
+  aligned_buffer pool_;
   B backend_;
 };
 

@@ -10,13 +10,16 @@
 #if defined(__linux__)
 
 #include <linux/io_uring.h>
+#include <poll.h>
 #include <string_view>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
 #include <bit>
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -81,14 +84,15 @@ inline std::string no_uring_suffix(int err) {
 // was ever created in it, while the accesses below want a T there: an
 // unsigned for std::atomic_ref, which operates on an object in place.
 //
-// Two spellings say so, and both are defined behaviour. start_lifetime_as
-// is the one that means it and copies nothing, and is C++23.
-// Placement-new creates the object the standard requires, and seeding it
-// from the bytes already in the storage is what keeps the value the kernel
-// put there; the byte read is legal, and the write puts back what it read.
-// Nothing else in the ring is named as an object at all: the descriptors
-// and completions are copied in and out, because memcpy creates whatever
-// it writes and a local is a real object to read into.
+// Two spellings say so, and both are defined behaviour.
+//  - start_lifetime_as (C++23) starts the object's lifetime and copies
+//    nothing.
+//  - Placement-new creates the object, seeded from the bytes already in
+//    the storage so it keeps the value the kernel put there. The byte
+//    read is legal, and the write puts back what it read.
+// Nothing else in the ring is named as an object. The descriptors and
+// completions are copied in and out with memcpy, which creates whatever
+// it writes, into and out of locals.
 template <class T>
 [[nodiscard]] inline T* ring_at(unsigned char* base, std::uint32_t off) noexcept {
 #ifdef __cpp_lib_start_lifetime_as
@@ -240,23 +244,23 @@ struct uring {
     }
   }
 
-  // Queues one READ or WRITE; the sole submitter, so sq_tail needs no CAS.
-  void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
-                 unsigned len, std::uint64_t off, std::uint64_t user_data,
-                 bool offload = false) {
+  // Queues one READ or WRITE without entering the kernel; the sole
+  // submitter, so sq_tail needs no CAS. flush() is what hands it over.
+  void fill_rw(std::uint8_t opcode, int file_fd, const void* buf,
+               unsigned len, std::uint64_t off, std::uint64_t user_data,
+               bool offload = false) noexcept {
     const unsigned tail = *sq_tail;  // we are the only writer
     const unsigned idx = tail & *sq_mask;
     io_uring_sqe sqe{};
     std::memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = opcode;
     if (offload) {
-      // Issue on io-wq rather than inline. Kernels before ~6.x bailed out
-      // of the inline attempt on a large O_DIRECT read and punted anyway;
-      // newer ones complete it inline, 1.5-1.9 ms of pinning, splitting
-      // and queueing per 64 MiB on the submitting thread (four PCIe 5
-      // drives, kernel 7.0). Serialized with the hash that thread also
-      // waits for, that halved the pipeline; asking for the hand-off
-      // restored it (22 -> 41 GiB/s).
+      // Issue on io-wq. Kernel 7.0 issues a large O_DIRECT read inline:
+      // 1.5-1.9 ms of pinning, splitting and queueing per 64 MiB on the
+      // submitting thread (four PCIe 5 drives), against 0.02 ms on 5.15,
+      // which handed it to io-wq. That thread also waits for the hash, so
+      // the two serialized; with the hand-off the pipeline went from 22.3
+      // to 41.4 GiB/s at 64 MiB x 8.
       sqe.flags |= IOSQE_ASYNC;
     }
     sqe.fd = file_fd;
@@ -268,14 +272,37 @@ struct uring {
     std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
     std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
                                               std::memory_order_release);
-    // Submit everything between the kernel's head and the new tail, not
-    // one entry. A failed enter leaves its entry published, and a fixed
-    // count of one would then submit that stale entry and leave this one
-    // behind, shifting every later completion by a slot.
+  }
+
+  // Queues a one-shot poll on `poll_fd`, the wake path's arming step.
+  void fill_poll_add(int poll_fd, std::uint64_t user_data) noexcept {
+    const unsigned tail = *sq_tail;
+    const unsigned idx = tail & *sq_mask;
+    io_uring_sqe sqe{};
+    std::memset(&sqe, 0, sizeof(sqe));
+    sqe.opcode = IORING_OP_POLL_ADD;
+    sqe.fd = poll_fd;
+    sqe.poll_events = POLLIN;
+    sqe.user_data = user_data;
+    std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
+    std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
+    std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
+                                              std::memory_order_release);
+  }
+
+  // Hands the kernel everything queued since it last looked, in one
+  // enter. It submits the whole head-to-tail span, so a failed enter is
+  // recoverable: its entries stay published, and the next flush picks them
+  // up in order.
+  void flush() {
     for (;;) {
+      const unsigned tail = *sq_tail;
       const unsigned head =
           std::atomic_ref<unsigned>(*sq_head).load(std::memory_order_acquire);
-      const int n = sys_io_uring_enter(fd, tail + 1 - head, 0, 0);
+      if (tail == head) {
+        return;
+      }
+      const int n = sys_io_uring_enter(fd, tail - head, 0, 0);
       if (n >= 0) {
         outstanding += static_cast<unsigned>(n);
         return;
@@ -283,6 +310,61 @@ struct uring {
       if (errno != EINTR) {
         throw_errno("io_uring_enter(submit)");
       }
+    }
+  }
+
+  // Takes back every entry the kernel has not accepted, oldest first,
+  // and leaves the queue empty. A caller that cannot submit needs to
+  // know which reads it is still holding, and a submit the kernel
+  // refused will not do better on the next try.
+  template <class Fn>
+  void take_unsubmitted(Fn&& fn) noexcept {
+    const unsigned tail = *sq_tail;  // we are the only writer
+    const unsigned head =
+        std::atomic_ref<unsigned>(*sq_head).load(std::memory_order_acquire);
+    for (unsigned i = head; i != tail; ++i) {
+      io_uring_sqe sqe{};
+      std::memcpy(&sqe, sqes + (i & *sq_mask) * sizeof(io_uring_sqe),
+                  sizeof(sqe));
+      fn(sqe.user_data);
+    }
+    std::atomic_ref<unsigned>(*sq_tail).store(head, std::memory_order_release);
+  }
+
+  // Queues one READ or WRITE and submits immediately: the writer engine's
+  // one-at-a-time shape, unchanged.
+  void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
+                 unsigned len, std::uint64_t off, std::uint64_t user_data,
+                 bool offload = false) {
+    fill_rw(opcode, file_fd, buf, len, off, user_data, offload);
+    flush();
+  }
+
+  // Takes one completion if the ring has one. False leaves the ring
+  // untouched.
+  [[nodiscard]] bool reap(std::uint64_t& user_data, int& res) noexcept {
+    const unsigned head = *cq_head;  // we are the only consumer
+    const unsigned tail =
+        std::atomic_ref<unsigned>(*cq_tail).load(std::memory_order_acquire);
+    if (head == tail) {
+      return false;
+    }
+    io_uring_cqe cqe{};
+    std::memcpy(&cqe, cqes + (head & *cq_mask) * sizeof(io_uring_cqe),
+                sizeof(cqe));
+    user_data = cqe.user_data;
+    res = cqe.res;
+    std::atomic_ref<unsigned>(*cq_head).store(head + 1,
+                                              std::memory_order_release);
+    outstanding -= std::min(1u, outstanding);
+    return true;
+  }
+
+  // Sleeps until the ring has at least one completion.
+  void wait_cq() {
+    if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
+        errno != EINTR) {
+      throw_errno("io_uring_enter(wait)");
     }
   }
 
@@ -310,94 +392,312 @@ struct uring {
   }
 };
 
-class uring_reader {
+// The io_uring reader context: one ring, any number of files, reads named
+// by the caller's read_op, completions delivered as callbacks out of
+// poll(). Degrades per feature at runtime, as the whole layer does:
+// O_DIRECT refused by the filesystem -> buffered, io_uring refused ->
+// every read served synchronously from the deferred list.
+class uring_context {
  public:
-  uring_reader(const std::filesystem::path& path,
-               const file_reader_options& opts, unsigned nslots)
-      : slots_(nslots) {
-    f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    size_ = f_.stat_size();
-    if (opts.direct_io) {
-      f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
-    }
-    if (opts.async && ring_.init(2 * nslots)) {
-      use_uring_ = true;
-      offload_ = opts.offload_submit;
-    }
-    name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
-                       : (f_.direct ? "pread+direct" : "pread");
-    if (use_uring_ && !offload_) {
-      name_ += " (inline submit)";
-    }
-    if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
-      name_ += no_uring_suffix(ring_.setup_errno);
-    }
-  }
-
-  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
-  // Only fully-aligned windows may ride the io_uring path (O_DIRECT
-  // rejects unaligned lengths); the tail goes through read_sync.
-  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t len) const
-      noexcept {
-    return use_uring_ && len % direct_align == 0;
-  }
-
-  void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
-    slots_[s] = {buf, off, 0, false};
-    ring_.submit_rw(IORING_OP_READ, f_.fd, buf.data(),
-                    static_cast<unsigned>(buf.size()), off, s, offload_);
-  }
-
-  // Reaps completions (issuing continuations for short reads) until slot
-  // `s` is fully read; completions for other slots are absorbed into
-  // their state along the way.
-  void wait(unsigned s) {
-    while (!slots_[s].ready) {
-      const auto [ud, res] = ring_.wait_one();
-      const unsigned c = static_cast<unsigned>(ud);
-      slot& st = slots_[c];
-      if (res < 0) {
-        throw std::system_error(-res, std::generic_category(),
-                                "io_uring read");
-      }
-      if (res == 0) {
-        throw std::system_error(EIO, std::generic_category(),
-                                "unexpected EOF (io_uring)");
-      }
-      BLAKE3PP_MSAN_UNPOISON(st.buf.data() + st.filled,
-                             static_cast<std::size_t>(res));
-      st.filled += static_cast<std::size_t>(res);
-      if (st.filled < st.buf.size()) {
-        ring_.submit_rw(IORING_OP_READ, f_.fd, st.buf.data() + st.filled,
-                        static_cast<unsigned>(st.buf.size() - st.filled),
-                        st.off + st.filled, c, offload_);
-      } else {
-        st.ready = true;
-      }
-    }
-  }
-
-  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
-    f_.pread_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
-  }
-
- private:
-  struct slot {
+  struct read_op : read_op_base {
     std::span<std::byte> buf{};
     std::uint64_t off = 0;
     std::size_t filled = 0;
-    bool ready = false;
+    int fd = -1;                      // the fd this read rides
+    posix_file* sync_file = nullptr;  // the deferred path needs the pair
+    read_op* next_deferred = nullptr;
   };
 
-  posix_file f_;
+  // An open file bound to a context. Every file must be destroyed before
+  // the context it was opened on, which keeps these descriptors open
+  // while the context's drain waits out the transfers on them.
+  class file {
+   public:
+    file(uring_context& ctx, const std::filesystem::path& path,
+         bool direct_io) {
+      f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      size_ = f_.stat_size();
+      if (direct_io) {
+        f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
+      }
+      name_ = ctx.name_for(f_.direct);
+    }
+
+    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+   private:
+    friend class uring_context;
+    posix_file f_;
+    std::uint64_t size_ = 0;
+    std::string name_;
+  };
+
+  uring_context(const reader_context_options& opts, unsigned max_inflight)
+      : async_requested_(opts.async) {
+    // Two entries beyond the reads: the armed wake poll, and one spare so
+    // a short read's continuation always finds a free entry even with
+    // every slot in flight.
+    if (opts.async && ring_.init(2 * max_inflight + 2)) {
+      use_uring_ = true;
+      offload_ = opts.offload_submit;
+      arm_wake();
+      ring_.flush();
+    }
+  }
+
+  uring_context(const uring_context&) = delete;
+  uring_context& operator=(const uring_context&) = delete;
+
+  ~uring_context() {
+    // The armed poll completes only when the eventfd becomes readable,
+    // and ~uring drains everything outstanding before it unmaps: without
+    // this nudge that drain waits forever. Runs before any member is
+    // destroyed, and the eventfd itself outlives the ring by declaration
+    // order, so the nudge lands on an open descriptor and the drain
+    // reaps the poll it completes.
+    if (wake_armed_) {
+      waiter_.wake();
+    }
+    // ~uring drains the rest. No callback runs from here, by contract.
+  }
+
+  void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
+                   read_op& op) {
+    op.buf = buf;
+    op.off = off;
+    op.filled = 0;
+    op.fd = f.f_.fd;
+    op.sync_file = &f.f_;
+    op.next_deferred = nullptr;
+    in_flight_++;
+    // O_DIRECT rejects an unaligned length, so only whole granules may
+    // ride the ring; the tail is read synchronously inside poll(). This
+    // is the whole runtime-degradation question, asked in one place.
+    if (use_uring_ && buf.size() % direct_align == 0) {
+      ring_.fill_rw(IORING_OP_READ, op.fd, buf.data(),
+                    static_cast<unsigned>(buf.size()), off, op_ud(&op),
+                    offload_);
+    } else {
+      deferred_.push(op);
+    }
+  }
+
+  // A refused submit is not an error the caller can do anything with:
+  // the reads are already counted in in_flight(), and an exception here
+  // would leave them counted and uncompleted. They take the ladder this
+  // backend already has for a read it cannot put on the ring instead.
+  void flush() noexcept {
+    if (!use_uring_) {
+      return;
+    }
+    try {
+      ring_.flush();
+    } catch (const std::system_error&) {
+      defer_unsubmitted();
+    }
+  }
+
+  std::size_t poll(bool block) {
+    flush();
+    std::size_t ran = reap_ready() + run_one_deferred();
+    if (ran > 0 || !block) {
+      return ran;
+    }
+    for (;;) {
+      if (take_wake()) {
+        return ran;
+      }
+      sleep_once();
+      ran += reap_ready() + run_one_deferred();
+      if (ran > 0 || take_wake()) {
+        return ran;
+      }
+    }
+  }
+
+  // The one member another thread may call.
+  void wake() noexcept { waiter_.wake(); }
+
+  [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+
+  // Every entry the kernel refused to take names a read that in_flight()
+  // counts and the ring will never complete. Moving them to the deferred
+  // list is what keeps the contract's promise that a counted read
+  // reaches its callback: poll() reads each one synchronously and
+  // reports whatever happens then. The wake's one-shot poll comes back
+  // with them; take_wake() re-arms it.
+  //
+  // Called by flush() on a refused submit, and directly by the test that
+  // covers this path, since a working kernel cannot be asked to refuse.
+  void defer_unsubmitted() noexcept {
+    // A context that never got a ring has nothing published to take
+    // back, and its ring pointers are null: every read it was handed is
+    // already on the deferred list. Callers reach this from flush(),
+    // which knows, and from a test, which does not.
+    if (!use_uring_) {
+      return;
+    }
+    ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
+      if (ud == wake_ud()) {
+        wake_armed_ = false;
+        return;
+      }
+      read_op& op = *op_from(ud);
+      op.next_deferred = nullptr;
+      deferred_.push(op);
+    });
+  }
+
+ private:
+  // Which rung of the ladder this context reached, for a file that did or
+  // did not get O_DIRECT. file_reader::backend() reports it verbatim and
+  // tools print it, so the spellings, their order and the suffixes are
+  // observable API.
+  [[nodiscard]] std::string name_for(bool direct) const {
+    std::string n = use_uring_ ? (direct ? "io_uring+direct" : "io_uring")
+                               : (direct ? "pread+direct" : "pread");
+    if (use_uring_ && !offload_) {
+      n += " (inline submit)";
+    }
+    if (async_requested_ && !use_uring_ && ring_.setup_errno != 0) {
+      n += no_uring_suffix(ring_.setup_errno);
+    }
+    return n;
+  }
+
+  [[nodiscard]] std::uint64_t op_ud(read_op* op) const noexcept {
+    return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(op));
+  }
+  [[nodiscard]] read_op* op_from(std::uint64_t ud) const noexcept {
+    return std::bit_cast<read_op*>(static_cast<std::uintptr_t>(ud));
+  }
+  // The wake completion needs a user_data no read_op can wear; its own
+  // op's address is one, and costs nothing.
+  [[nodiscard]] std::uint64_t wake_ud() const noexcept {
+    return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(&wake_op_));
+  }
+
+  void arm_wake() noexcept {
+    ring_.fill_poll_add(waiter_.fd(), wake_ud());
+    wake_armed_ = true;
+  }
+
+  void complete(read_op& op, std::error_code ec) noexcept {
+    in_flight_--;
+    op.done(&op, ec);
+  }
+
+  // Consumes every completion the ring has without blocking, reissuing
+  // short reads. Returns the number of callbacks run.
+  std::size_t reap_ready() {
+    if (!use_uring_) {
+      return 0;
+    }
+    std::size_t ran = 0;
+    bool requeued = false;
+    std::uint64_t ud = 0;
+    int res = 0;
+    while (ring_.reap(ud, res)) {
+      if (ud == wake_ud()) {
+        wake_armed_ = false;  // one-shot; take_wake() re-arms
+        continue;
+      }
+      read_op& op = *op_from(ud);
+      if (res < 0) {
+        complete(op, std::error_code(-res, std::generic_category()));
+        ran++;
+        continue;
+      }
+      if (res == 0) {
+        // Short of the length with nothing left to give: the file ended
+        // where the engine was told it would not.
+        complete(op, std::error_code(EIO, std::generic_category()));
+        ran++;
+        continue;
+      }
+      BLAKE3PP_MSAN_UNPOISON(op.buf.data() + op.filled,
+                             static_cast<std::size_t>(res));
+      op.filled += static_cast<std::size_t>(res);
+      if (op.filled < op.buf.size()) {
+        ring_.fill_rw(IORING_OP_READ, op.fd, op.buf.data() + op.filled,
+                      static_cast<unsigned>(op.buf.size() - op.filled),
+                      op.off + op.filled, ud, offload_);
+        requeued = true;
+        continue;
+      }
+      complete(op, {});
+      ran++;
+    }
+    if (requeued) {
+      // The continuation of a short read is the same kind of entry as
+      // the read itself, and the same refusal leaves it owed.
+      try {
+        ring_.flush();
+      } catch (const std::system_error&) {
+        defer_unsubmitted();
+      }
+    }
+    return ran;
+  }
+
+  // At most one per poll(): a synchronous read holds the calling thread
+  // for the whole window, and the caller asked to be given control back.
+  std::size_t run_one_deferred() noexcept {
+    read_op* const next = deferred_.take();
+    if (next == nullptr) {
+      return 0;
+    }
+    read_op& op = *next;
+    std::error_code ec;
+    try {
+      op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
+                              op.buf.data(), op.buf.size(), op.off);
+      op.filled = op.buf.size();
+    } catch (const std::system_error& e) {
+      ec = e.code();
+    }
+    complete(op, ec);
+    return 1;
+  }
+
+  // Drains the eventfd counter, re-arming the ring's one-shot poll. True
+  // means a wake() had been issued.
+  bool take_wake() noexcept {
+    const bool woken = waiter_.take();
+    if (use_uring_ && !wake_armed_) {
+      arm_wake();
+      try {
+        ring_.flush();
+      } catch (const std::system_error&) {
+        // The arm will go out with the next read's flush; a wake in the
+        // meantime still breaks the sleep through the eventfd itself.
+      }
+    }
+    return woken;
+  }
+
+  void sleep_once() {
+    if (use_uring_) {
+      ring_.wait_cq();
+      return;
+    }
+    waiter_.sleep();
+  }
+
+  // Declaration order is the teardown contract: the ring drains, and
+  // with it the one-shot poll armed on the eventfd, before the eventfd
+  // is closed and before the op whose address that poll wears goes.
+  // Do not move ring_ above these two.
+  poll_waiter waiter_;
+  read_op wake_op_{};  // address only: the wake completion's user_data
   uring ring_;
-  std::vector<slot> slots_;
-  std::uint64_t size_ = 0;
+  deferred_ops<read_op> deferred_;
+  std::size_t in_flight_ = 0;
+  bool async_requested_ = true;
   bool use_uring_ = false;
   bool offload_ = false;
-  std::string name_ = "pread";
+  bool wake_armed_ = false;
 };
 
 class uring_writer {
@@ -441,6 +741,11 @@ class uring_writer {
 
   void start_write(unsigned s, std::uint64_t off,
                    std::span<const std::byte> buf) {
+    // The engine asks wants_async() first, which is false without a
+    // ring; reaching here degraded would submit through null ring
+    // pointers. The synchronous writers state the same invariant with
+    // the same assert.
+    assert(use_uring_ && "the uring writer has no async path without a ring");
     slots_[s] = {buf, off, 0, true};
     ring_.submit_rw(IORING_OP_WRITE, f_.fd, buf.data(),
                     static_cast<unsigned>(buf.size()), off, s, offload_);
@@ -508,7 +813,7 @@ class uring_writer {
 // Definition-site conformance check. Concepts only verify use-sites, so
 // without this a drifting backend wouldn't be diagnosed until an engine
 // instantiation in some other TU; this makes the header self-checking.
-static_assert(reader_backend<uring_reader>);
+static_assert(reader_context<uring_context>);
 static_assert(writer_backend<uring_writer>);
 
 }  // namespace blake3pp::detail::io_impl
