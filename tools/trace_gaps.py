@@ -24,7 +24,6 @@ pool is invisible and only the wall split is printed.
 """
 import argparse
 import json
-import statistics
 import sys
 
 # A gap shorter than this is what a scheduler does between two runnable
@@ -138,7 +137,7 @@ class Trace:
         idle_ramp = max(0.0, (ramp_end - self.begin) * self.threads - busy_ramp)
         idle_tail = max(0.0, (self.end - tail_begin) * self.threads - busy_tail)
         gaps = self.steady_gaps(ramp_end, tail_begin)
-        idle_between = sum(sum(g) for g in gaps.values())
+        idle_between = sum(h["dur"] for holes in gaps.values() for h in holes)
         residual = max(0.0, capacity - busy - idle_ramp - idle_tail - idle_between)
         return {
             "wall_us": wall,
@@ -155,7 +154,12 @@ class Trace:
         }
 
     def steady_gaps(self, ramp_end, tail_begin):
-        """Per cpu, the holes between its own agent records in steady state."""
+        """Per cpu, the holes between its own agent records in steady state.
+
+        Each hole carries the record that ended it, which is what says
+        whether the thread was waiting for a window to exist or merely
+        arriving late to one already being compressed elsewhere.
+        """
         by_cpu = {}
         for a in self.agents:
             by_cpu.setdefault(a["tid"], []).append(a)
@@ -167,9 +171,56 @@ class Trace:
                 g0 = max(prev["ts"] + prev["dur"], ramp_end)
                 g1 = min(cur["ts"], tail_begin)
                 if g1 > g0:
-                    holes.append(g1 - g0)
+                    holes.append(
+                        {
+                            "tid": tid,
+                            "begin": g0,
+                            "dur": g1 - g0,
+                            # The record that ends it, unless the gap was
+                            # cut short by the tail rather than by work.
+                            "ends_with": cur if cur["ts"] <= tail_begin else None,
+                        }
+                    )
             out[tid] = holes
         return out
+
+    def first_agent_per_window(self):
+        """When each window's bulk first started on any cpu."""
+        first = {}
+        for a in self.agents:
+            w = a["args"]["window"]
+            first[w] = min(first.get(w, a["ts"]), a["ts"])
+        return first
+
+    def classify_long_gaps(self, gaps):
+        """What ended each gap longer than the noise threshold.
+
+        A gap that ends with the first record of a window nobody had
+        started yet is a thread with nothing to do: the window had not
+        been issued, or had been issued and not yet fanned out. A gap
+        that ends with a record of a window already being compressed
+        elsewhere is a thread arriving late to work that existed.
+        """
+        first = self.first_agent_per_window()
+        classes = {
+            "waiting for a window": {"count": 0, "us": 0.0},
+            "joining a window late": {"count": 0, "us": 0.0},
+            "other": {"count": 0, "us": 0.0},
+        }
+        for holes in gaps.values():
+            for hole in holes:
+                if hole["dur"] <= NOISE_GAP_US:
+                    continue
+                cur = hole["ends_with"]
+                if cur is None:
+                    name = "other"
+                elif first.get(cur["args"]["window"], 0.0) >= hole["begin"]:
+                    name = "waiting for a window"
+                else:
+                    name = "joining a window late"
+                classes[name]["count"] += 1
+                classes[name]["us"] += hole["dur"]
+        return classes
 
     # -- per window ------------------------------------------------------
 
@@ -179,10 +230,15 @@ class Trace:
         for a in self.agents:
             agents_by_window.setdefault(a["args"]["window"], []).append(a)
         read_to_agent, agent_to_cv, cv_to_reduced, release_to_submit = [], [], [], []
+        first_to_last_agent = []
         for w in self.windows:
             found = agents_by_window.get(w["index"])
             if found and not w["last"]:
-                read_to_agent.append(min(a["ts"] for a in found) - w["t_ready"])
+                first_start = min(a["ts"] for a in found)
+                read_to_agent.append(first_start - w["t_ready"])
+                # How long the window took to gather its agents: the
+                # spread between the first and the last one starting.
+                first_to_last_agent.append(max(a["ts"] for a in found) - first_start)
                 agent_to_cv.append(
                     w["t_joined"] - max(a["ts"] + a["dur"] for a in found)
                 )
@@ -197,6 +253,7 @@ class Trace:
                 release_to_submit.append(cur["t_wait_begin"] - prev["t_released"])
         return {
             "read_to_agent": read_to_agent,
+            "first_to_last_agent": first_to_last_agent,
             "agent_to_cv": agent_to_cv,
             "cv_to_reduced": cv_to_reduced,
             "release_to_submit": release_to_submit,
@@ -222,6 +279,16 @@ def report(trace, out_json=None):
             f"    {name:<8} {split[key] / 1000:9.2f} ms  {100.0 * split[key] / wall:5.1f}%"
         )
 
+    if not trace.agents:
+        # Without agent records the pool leaves no trace at all, and every
+        # number below would be an artefact of that absence rather than a
+        # measurement. Say so instead of printing zeros.
+        print(
+            "\n  no agent records in this trace: rerun the bench with "
+            "--trace-agents for the pool split"
+        )
+        return
+
     print(f"\n  pool time (share of {trace.threads} x {wall / 1000:.1f} ms)")
     rows = (
         ("compressing", "compressing_us"),
@@ -236,11 +303,11 @@ def report(trace, out_json=None):
         )
 
     gaps = trace.steady_gaps(trace.ramp_end(), trace.tail_begin())
-    flat = [g for holes in gaps.values() for g in holes]
+    flat = [h["dur"] for holes in gaps.values() for h in holes]
     print("\n  steady-state idle gaps per cpu")
     print(f"    {'cpu':>5} {'count':>7} {'p50 us':>9} {'p90 us':>9} {'max us':>9}")
     for tid in sorted(gaps):
-        holes = gaps[tid]
+        holes = [h["dur"] for h in gaps[tid]]
         if not holes:
             continue
         print(
@@ -248,23 +315,37 @@ def report(trace, out_json=None):
             f"{len(holes):>7} {percentile(holes, 0.5):>9.1f} "
             f"{percentile(holes, 0.9):>9.1f} {max(holes):>9.1f}"
         )
+    classes = trace.classify_long_gaps(gaps)
     if flat:
-        short = [g for g in flat if g < NOISE_GAP_US]
+        short = [g for g in flat if g <= NOISE_GAP_US]
         short_time = sum(short)
+        total = sum(flat)
         print(
-            f"    all: {len(flat)} gaps, {len(short)} under {NOISE_GAP_US:.0f} us "
+            f"    all: {len(flat)} gaps, {len(short)} at or under "
+            f"{NOISE_GAP_US:.0f} us "
             f"({100.0 * len(short) / len(flat):.1f}% of gaps, "
-            f"{100.0 * short_time / sum(flat):.1f}% of the idle time)"
+            f"{100.0 * short_time / total:.1f}% of the idle time)"
         )
+        # What ended the long ones, which is what says whether the thread
+        # had nothing to do or merely arrived late to something.
+        print(f"    gaps over {NOISE_GAP_US:.0f} us, by what ended them:")
+        for name, c in classes.items():
+            if c["count"] == 0:
+                continue
+            print(
+                f"      {name:<24} {c['count']:>6} gaps  {c['us'] / 1000:8.2f} ms"
+                f"  {100.0 * c['us'] / total:5.1f}% of gap time"
+            )
 
     lat = trace.window_latencies()
     print("\n  per-window latencies (us)")
     print(f"    {'':<18} {'p50':>10} {'p90':>10}")
     for name, key in (
-        ("read -> agent", "read_to_agent"),
-        ("agent -> cv", "agent_to_cv"),
+        ("read -> first agent", "read_to_agent"),
+        ("first -> last agent", "first_to_last_agent"),
+        ("last agent -> cv", "agent_to_cv"),
         ("cv -> reduced", "cv_to_reduced"),
-        ("release -> submit", "release_to_submit"),
+        ("released -> submit", "release_to_submit"),
     ):
         values = lat[key]
         print(
@@ -289,8 +370,10 @@ def report(trace, out_json=None):
         payload = dict(split)
         payload["path"] = trace.path
         payload["gaps"] = {
-            trace.names.get(tid, str(tid)): holes for tid, holes in gaps.items()
+            trace.names.get(tid, str(tid)): [h["dur"] for h in holes]
+            for tid, holes in gaps.items()
         }
+        payload["long_gap_classes"] = classes
         payload["latencies"] = lat
         payload["verdict"] = {"largest_idle": worst, "share": idle[worst] / cap}
         with open(out_json, "w") as fh:
