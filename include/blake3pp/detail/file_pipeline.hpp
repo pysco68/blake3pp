@@ -389,10 +389,21 @@ class driver_loop {
     // to destroy the operation cells, and a thread inside publish() is
     // still reading this loop.
     const publisher_guard guard{this};
+    // The driver's own split of busy against parked, which is what says
+    // whether this thread is the bottleneck once the stage shares of a
+    // window no longer sum to the wall clock. One clock read per poll,
+    // and none at all without a trace buffer.
+    std::int64_t t = stats_ != nullptr ? trace_->now() : 0;
     for (;;) {
       drain();
       before_flush();
+      if (stats_ != nullptr) {
+        ++stats_->iterations;
+      }
       if (status.done) {
+        if (stats_ != nullptr) {
+          stats_->busy_ns += static_cast<std::uint64_t>(trace_->now() - t);
+        }
         return;
       }
       drv_->flush();
@@ -403,7 +414,21 @@ class driver_loop {
       assert((!block || drv_->in_flight() > 0 || status.outstanding > 0) &&
              "the driver is about to block with no read in flight, an empty "
              "run queue and no chain outstanding: nothing can wake it");
+      if (stats_ == nullptr) {
+        drv_->poll(block);
+        continue;
+      }
+      const std::int64_t t_poll = trace_->now();
+      stats_->busy_ns += static_cast<std::uint64_t>(t_poll - t);
       drv_->poll(block);
+      t = trace_->now();
+      ++stats_->polls;
+      if (block) {
+        ++stats_->blocking_polls;
+        stats_->parked_ns += static_cast<std::uint64_t>(t - t_poll);
+      } else {
+        stats_->busy_ns += static_cast<std::uint64_t>(t - t_poll);
+      }
     }
   }
 
@@ -436,13 +461,25 @@ class driver_loop {
       ++ran;
       n = next;
     }
+    if (stats_ != nullptr) {
+      stats_->queue_runs += ran;
+    }
     return ran;
+  }
+
+  // Where to record what this thread spends its time on; null records
+  // nothing, which is the default and costs one branch per poll.
+  void record_into(trace_buffer* trace) noexcept {
+    trace_ = trace;
+    stats_ = trace != nullptr ? &trace->driver() : nullptr;
   }
 
  private:
   D* drv_;
   run_queue queue_;
   std::atomic<unsigned> publishers_{0};
+  trace_buffer* trace_ = nullptr;
+  driver_stats* stats_ = nullptr;
 };
 
 // --------------------------------------------------------------------
@@ -525,6 +562,7 @@ class window_scope {
     // that it outlives every read the teardown has to drain.
     const std::span<std::byte> pool =
         drv.allocate(window_bytes_ * static_cast<std::size_t>(count_));
+    loop_.record_into(trace_);
     for (unsigned i = count_; i > 0; --i) {
       window& w = windows_[i - 1];
       w.buffer = pool.subspan(static_cast<std::size_t>(i - 1) * window_bytes_,
@@ -611,6 +649,9 @@ class window_scope {
              "window can start and nothing is in flight");
     });
 
+    if (trace_ != nullptr) {
+      trace_->driver().admission_stalls = admission_stalls_;
+    }
     if (eptr_) {
       std::rethrow_exception(eptr_);
     }
@@ -844,6 +885,7 @@ class window_scope {
       w.rec->index = w.index;
       w.rec->bytes = w.bytes;
       w.rec->flags = w.last ? window_record::flag_last : 0;
+      w.rec->slot = w.slot;
       w.rec->t_wait_begin = trace_->now();
     }
   }
