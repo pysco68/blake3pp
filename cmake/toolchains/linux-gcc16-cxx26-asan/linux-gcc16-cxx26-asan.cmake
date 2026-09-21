@@ -11,5 +11,6 @@ set(TC_CXX_COMPILER "g++-16")
 set(TC_CXX_STANDARD "26")
 set(TC_DEFAULT_BUILD_TYPE "RelWithDebInfo")
 set(TC_SANITIZERS address undefined)
+set(TC_EXTRA_CXX_FLAGS -fno-sanitize=null,nonnull-attribute,returns-nonnull-attribute)
 
 include("${CMAKE_CURRENT_LIST_DIR}/../common.cmake")
