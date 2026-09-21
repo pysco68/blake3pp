@@ -1162,6 +1162,24 @@ TEST_CASE("a read error at one window surfaces once") {
     }
     CHECK(thrown == 1);
     CHECK(seen == std::make_error_code(std::errc::io_error));
+
+    // The same failure with tracing on: a traced run is a separate
+    // instantiation of the whole scope, so its error path is separate
+    // code and would otherwise never run.
+    std::vector<blake3pp::window_record> records(16);
+    blake3pp::trace_buffer trace(records);
+    blake3pp::hasher traced;
+    int traced_thrown = 0;
+    try {
+      fake_driver drv(content, win, {.fail_at_window = k});
+      fake_driver::file f(drv);
+      blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+          traced, drv, f, sched,
+          {.window_bytes = win, .queue_depth = 8, .trace = &trace});
+    } catch (const std::system_error&) {
+      ++traced_thrown;
+    }
+    CHECK(traced_thrown == 1);
     // The hasher is left usable, which is the contract update_file
     // already has for a failed read.
     h.update(std::span<const std::byte>(content).first(64));

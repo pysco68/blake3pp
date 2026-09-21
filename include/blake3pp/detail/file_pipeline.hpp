@@ -357,7 +357,13 @@ class driver_loop {
   }
 
   [[nodiscard]] D& driver() noexcept { return *drv_; }
-  [[nodiscard]] run_queue& queue() noexcept { return queue_; }
+
+  // Where to record what this thread spends its time on; null records
+  // nothing, which is the default and costs one branch per poll.
+  void record_into(trace_buffer* trace) noexcept {
+    trace_ = trace;
+    stats_ = trace != nullptr ? &trace->driver() : nullptr;
+  }
 
   // Hands one node to the driver, from any thread.
   //
@@ -450,6 +456,7 @@ class driver_loop {
     }
   }
 
+ private:
   // Runs everything parked on the queue, once. A node may be pushed
   // again by its own completion, so the successor is read before the
   // node runs.
@@ -467,14 +474,7 @@ class driver_loop {
     return ran;
   }
 
-  // Where to record what this thread spends its time on; null records
-  // nothing, which is the default and costs one branch per poll.
-  void record_into(trace_buffer* trace) noexcept {
-    trace_ = trace;
-    stats_ = trace != nullptr ? &trace->driver() : nullptr;
-  }
 
- private:
   D* drv_;
   run_queue queue_;
   std::atomic<unsigned> publishers_{0};
