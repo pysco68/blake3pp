@@ -28,6 +28,7 @@
 #include <vector>
 
 #include <blake3pp/detail/ex_compat.hpp>
+#include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/parallel.hpp>
 #include <doctest/doctest.h>
@@ -219,6 +220,58 @@ void check_adaptors(MakeReceiver make) {
   }
 }
 
+// What the pipeline's own receivers will be: a handle, copyable, with a
+// real constructor. This one records the completion and takes the chain
+// off the loop's outstanding count, which is what ends the run.
+struct chain_result {
+  bool completed = false;
+  std::size_t bytes = 0;
+  std::uint64_t sum = 0;
+  std::error_code ec{};
+};
+
+struct chain_receiver {
+  using receiver_concept = compat::receiver_tag;
+  chain_receiver(chain_result* r, blake3pp::detail::loop_status* s) noexcept
+      : out(r), status(s) {}
+  chain_result* out;
+  blake3pp::detail::loop_status* status;
+
+  void finish() const noexcept {
+    out->completed = true;
+    if (status->outstanding > 0) {
+      --status->outstanding;
+    }
+    status->done = status->outstanding == 0;
+  }
+  void set_value() && noexcept { finish(); }
+  void set_value(std::span<const std::byte> w) && noexcept {
+    out->bytes = w.size();
+    finish();
+  }
+  void set_value(std::uint64_t v) && noexcept {
+    out->sum = v;
+    finish();
+  }
+  void set_error(std::error_code e) && noexcept {
+    out->ec = e;
+    finish();
+  }
+  void set_error(std::exception_ptr) && noexcept {
+    out->ec = std::make_error_code(std::errc::state_not_recoverable);
+    finish();
+  }
+  void set_stopped() && noexcept { finish(); }
+};
+
+[[nodiscard]] std::uint64_t byte_sum(std::span<const std::byte> w) noexcept {
+  std::uint64_t s = 0;
+  for (const std::byte b : w) {
+    s += static_cast<std::uint64_t>(b);
+  }
+  return s;
+}
+
 namespace fs = std::filesystem;
 
 std::vector<std::byte> pattern(std::size_t len, std::uint32_t seed) {
@@ -384,6 +437,179 @@ TEST_CASE("the io driver wakes a blocked poll from another thread") {
   drv.wake();
   driver.join();
   CHECK(ran == 0);
+}
+
+// --------------------------------------------------------------------
+// Section 3: the read as a sender, the driver as a scheduler, and the
+// loop that drives both.
+
+TEST_CASE("a window read is a sender the driver loop completes") {
+  using blake3pp::detail::driver_loop;
+  using blake3pp::detail::io_driver;
+  constexpr std::size_t len = 128 * 1024;
+  const auto content = pattern(len, 21);
+  const temp_file f(content);
+
+  io_driver drv({}, 4);
+  driver_loop<io_driver> io(drv);
+  io_driver::file file(drv, f.path, /*direct_io=*/false);
+  const auto pool = drv.allocate(len);
+
+  chain_result r;
+  blake3pp::detail::loop_status st{false, 1};
+  auto op = ex::connect(io.read(file, 0, pool), chain_receiver{&r, &st});
+  // start() queues the read and nothing else: no flush, no callback.
+  ex::start(op);
+  CHECK(!r.completed);
+  CHECK(drv.in_flight() == 1);
+
+  io.run_until(st);
+  CHECK(r.completed);
+  CHECK(!r.ec);
+  CHECK(r.bytes == len);
+  CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
+}
+
+TEST_CASE("a read that fails reports through the error channel") {
+  using blake3pp::detail::driver_loop;
+  using blake3pp::detail::io_driver;
+  constexpr std::size_t len = 64 * 1024;
+  const auto content = pattern(len, 5);
+  const temp_file f(content);
+
+  io_driver drv({}, 4);
+  driver_loop<io_driver> io(drv);
+  io_driver::file file(drv, f.path, /*direct_io=*/false);
+  const auto pool = drv.allocate(len);
+
+  // Past the end of the file: the backend reports the unexpected EOF as
+  // an error, and the chain sees it as std::error_code, not a value.
+  chain_result r;
+  blake3pp::detail::loop_status st{false, 1};
+  auto op = ex::connect(io.read(file, len, pool), chain_receiver{&r, &st});
+  ex::start(op);
+  io.run_until(st);
+  CHECK(r.completed);
+  CHECK(r.ec);
+  CHECK(r.bytes == 0);
+}
+
+TEST_CASE("the driver scheduler runs work on the loop's own thread") {
+  using blake3pp::detail::driver_loop;
+  using blake3pp::detail::io_driver;
+  io_driver drv({}, 4);
+  driver_loop<io_driver> io(drv);
+
+  const auto here = std::this_thread::get_id();
+  std::thread::id ran_on{};
+  chain_result r;
+  blake3pp::detail::loop_status st{false, 1};
+  auto op = ex::connect(
+      ex::then(ex::schedule(io.scheduler()),
+               [&] { ran_on = std::this_thread::get_id(); }),
+      chain_receiver{&r, &st});
+  // Parked on the run queue: nothing happens until the loop drains it.
+  ex::start(op);
+  CHECK(!r.completed);
+  io.run_until(st);
+  CHECK(r.completed);
+  CHECK(ran_on == here);
+}
+
+TEST_CASE("work parked from another thread wakes a blocked driver") {
+  using blake3pp::detail::driver_loop;
+  using blake3pp::detail::io_driver;
+  constexpr std::size_t len = 64 * 1024;
+  const auto content = pattern(len, 9);
+  const temp_file f(content);
+
+  io_driver drv({}, 4);
+  driver_loop<io_driver> io(drv);
+  io_driver::file file(drv, f.path, /*direct_io=*/false);
+  const auto pool = drv.allocate(len);
+
+  // Two chains, so the loop runs until both are in: the read is what
+  // makes blocking legitimate, and the other thread's schedule is what
+  // has to get through to a driver already asleep.
+  blake3pp::detail::loop_status st{false, 2};
+  chain_result read_done;
+  auto read_op =
+      ex::connect(io.read(file, 0, pool), chain_receiver{&read_done, &st});
+  chain_result parked;
+  auto sched_op =
+      ex::connect(ex::schedule(io.scheduler()), chain_receiver{&parked, &st});
+
+  std::atomic<bool> go{false};
+  std::thread other([&] {
+    while (!go.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    ex::start(sched_op);  // push and wake, from off the driver thread
+  });
+
+  ex::start(read_op);
+  go.store(true, std::memory_order_release);
+  io.run_until(st);
+  other.join();
+
+  CHECK(read_done.completed);
+  CHECK(parked.completed);
+  CHECK(!read_done.ec);
+  CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
+}
+
+TEST_CASE("the four-line window chain composes on this provider") {
+  using blake3pp::detail::driver_loop;
+  using blake3pp::detail::io_driver;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 77);
+  const temp_file f(content);
+
+  io_driver drv({}, 4);
+  driver_loop<io_driver> io(drv);
+  io_driver::file file(drv, f.path, /*direct_io=*/false);
+  const auto pool = drv.allocate(len);
+
+  // The shape of the real window chain, with a stand-in for the compress
+  // stage: read on the driver, work on the pool, back on the driver.
+  // Phase 4 replaces only the middle line, so this is the case that says
+  // whether the shape itself holds on this provider.
+  auto sched = blake3pp::get_parallel_scheduler();
+  const auto here = std::this_thread::get_id();
+  std::atomic<bool> summed_elsewhere{false};
+  std::thread::id returned_on{};
+
+  chain_result r;
+  blake3pp::detail::loop_status st{false, 1};
+  auto op = ex::connect(
+      ex::then(
+          ex::continues_on(
+              ex::let_value(io.read(file, 0, pool),
+                            [&, sched](std::span<const std::byte> w) {
+                              return ex::then(ex::schedule(sched), [&, w] {
+                                summed_elsewhere.store(
+                                    std::this_thread::get_id() != here,
+                                    std::memory_order_relaxed);
+                                return byte_sum(w);
+                              });
+                            }),
+              io.scheduler()),
+          [&](std::uint64_t v) {
+            returned_on = std::this_thread::get_id();
+            return v;
+          }),
+      chain_receiver{&r, &st});
+  ex::start(op);
+  io.run_until(st);
+
+  CHECK(r.completed);
+  CHECK(!r.ec);
+  CHECK(r.sum == byte_sum(std::span<const std::byte>(content)));
+  // Whatever thread the pool picked, continues_on brought the result
+  // back to this one: that is what lets the reducer stay single-threaded.
+  CHECK(returned_on == here);
+  MESSAGE("compress stage left the driver thread: "
+          << summed_elsewhere.load(std::memory_order_relaxed));
 }
 
 }  // TEST_SUITE
