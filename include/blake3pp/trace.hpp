@@ -120,6 +120,9 @@ struct driver_stats {
   std::uint64_t queue_runs;
   /// Windows the scope held back because the reducer had no node free.
   std::uint64_t admission_stalls;
+  /// The most subtrees the reducer held at once: how far ahead of the
+  /// tree the reads ran, and what the node storage has to cover.
+  std::uint64_t max_pending;
 };
 
 static_assert(std::is_trivially_copyable_v<window_record>);

@@ -439,10 +439,11 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     const double driver_ns = static_cast<double>(d.busy_ns + d.parked_ns);
     println(stdout,
             "    driver busy {:5.1f}% of its own {:.3f} s, {} iterations, {} "
-            "polls ({} blocking), {} completions, {} admission stalls",
+            "polls ({} blocking), {} completions, {} admission stalls, "
+            "reducer held at most {}",
             100.0 * static_cast<double>(d.busy_ns) / driver_ns,
             driver_ns / 1e9, d.iterations, d.polls, d.blocking_polls,
-            d.queue_runs, d.admission_stalls);
+            d.queue_runs, d.admission_stalls, d.max_pending);
   }
 
   // Per-window latencies, as medians: with windows overlapping, an
