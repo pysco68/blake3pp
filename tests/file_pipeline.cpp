@@ -312,6 +312,21 @@ TEST_CASE("std::execution senders are not silently untested") {
 #endif
 }
 
+// io_read_op::storage is sized for the widest backend, but only the
+// platform being built sees its own. Reporting the margin here is how a
+// backend that grows towards the limit becomes visible before the
+// static_assert in io_driver.cpp stops the build.
+TEST_CASE("the backend's read operation fits the driver's op storage") {
+  using blake3pp::detail::io_read_op;
+  const auto layout = blake3pp::detail::native_read_op_layout();
+  MESSAGE("backend read_op: " << layout.size << " bytes, align "
+                              << layout.align << " (storage "
+                              << io_read_op::storage_size << " / "
+                              << io_read_op::storage_align << ")");
+  CHECK(layout.size <= io_read_op::storage_size);
+  CHECK(layout.align <= io_read_op::storage_align);
+}
+
 // The compiled seam: the same contract the backends keep, from behind a
 // pimpl, plus the arena whose lifetime the drain depends on.
 TEST_CASE("the io driver reads a file and keeps the callback discipline") {
