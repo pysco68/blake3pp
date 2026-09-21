@@ -55,6 +55,7 @@
 #include <optional>
 #include <span>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -144,14 +145,11 @@ class schedule_op : public run_node {
   schedule_op& operator=(const schedule_op&) = delete;
 
   // Runs on whichever thread finished the work before it, which for the
-  // window chain is a pool thread. The push and the wake are the entire
-  // hand-off back to the driver; the wake is one write to the driver's
-  // wake primitive per window, and it is what stops a parked poll from
-  // sleeping through a ready window.
-  void start() & noexcept {
-    loop_->queue().push(this);
-    loop_->driver().wake();
-  }
+  // window chain is a pool thread. Handing the node to the loop is the
+  // entire hand-off back to the driver, and it is the last thing this
+  // operation state does: publishing it is what allows the driver to
+  // finish the run and destroy it.
+  void start() & noexcept { loop_->publish(this); }
 
  private:
   Receiver rcvr_;
@@ -254,8 +252,7 @@ class read_op_state : public run_node {
   // completion.
   void fail(std::error_code ec) noexcept {
     ec_ = ec;
-    loop_->queue().push(this);
-    loop_->driver().wake();
+    loop_->publish(this);
   }
 
   static void deliver_submit_failure(run_node* n) noexcept {
@@ -344,6 +341,21 @@ class driver_loop {
   [[nodiscard]] D& driver() noexcept { return *drv_; }
   [[nodiscard]] run_queue& queue() noexcept { return queue_; }
 
+  // Hands one node to the driver, from any thread.
+  //
+  // The push publishes the node, and from that instant the driver may
+  // run it, finish the run and let its caller destroy the driver, this
+  // loop and the operation state the node sits in. The wake that follows
+  // therefore touches objects that are already being torn down, which is
+  // what the publisher count is for: run_until does not return while a
+  // thread is between the two.
+  void publish(run_node* n) noexcept {
+    publishers_.fetch_add(1, std::memory_order_relaxed);
+    queue_.push(n);
+    drv_->wake();
+    publishers_.fetch_sub(1, std::memory_order_release);
+  }
+
   // Drives everything until the pipeline says it is done, which happens
   // inside a completion this loop itself ran. Blocks only when there is
   // nothing to run, so the thread sleeps in the kernel rather than
@@ -358,6 +370,7 @@ class driver_loop {
       drain();
       before_flush();
       if (status.done) {
+        settle_publishers();
         return;
       }
       drv_->flush();
@@ -374,6 +387,15 @@ class driver_loop {
 
   void run_until(const loop_status& status) {
     run_until(status, [] {});
+  }
+
+  // Waits out the threads that are inside publish(). One eventfd write
+  // each, so this spins for as long as a syscall and only where the run
+  // is already over.
+  void settle_publishers() noexcept {
+    while (publishers_.load(std::memory_order_acquire) != 0) {
+      std::this_thread::yield();
+    }
   }
 
   // Runs everything parked on the queue, once. A node may be pushed
@@ -393,6 +415,7 @@ class driver_loop {
  private:
   D* drv_;
   run_queue queue_;
+  std::atomic<unsigned> publishers_{0};
 };
 
 // --------------------------------------------------------------------
