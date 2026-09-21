@@ -33,10 +33,12 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -64,6 +66,9 @@
 #if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
 #include <blake3pp/parallel_backend.hpp>
 #endif
+
+#include "io/engine.hpp"
+#include "io/null_backend.hpp"
 
 #include "tool_common.hpp"
 
@@ -386,6 +391,21 @@ std::string trace_file_name(const std::string& path, const char* label,
       .string();
 }
 
+// The pipeline with nothing behind it: the reader hands back buffers that
+// were filled once and never touched again, so what is left in the
+// measurement is the engine, the window fan-out and the fold. This is the
+// hash-bound ceiling the device rows are read against, and the only
+// configuration in which the tracer's own cost is visible.
+//
+// The filler is one byte repeated, because nothing here depends on what
+// the bytes are: BLAKE3's rate is data-independent, and every slot holds
+// the same window anyway, so a pseudo-random pattern would detect no more
+// than a constant does. Not zero, though -- a buffer the engine never
+// filled would then hash the same as one it did, and the digest check
+// below is the only thing proving the loop absorbed what it claims to
+// have read.
+constexpr std::byte null_filler{0xa5};
+
 // --threads resolved to a scheduler: an owned pool of exactly that size
 // under stdexec, the process-wide scheduler elsewhere.
 //
@@ -511,6 +531,7 @@ int main(int argc, char** argv) {
   std::size_t make_mib = 0;
   unsigned pool_threads = b3tool::default_threads();
   bool seq_only = false;
+  double null_gib = 0;
   bool inline_submit = false;
   bool no_direct = false;
   blake3pp::hash_file_options opts;
@@ -545,6 +566,10 @@ int main(int argc, char** argv) {
       ->check(b3tool::at_least_one_thread)
       ->capture_default_str();
   app.add_flag("--seq-only", seq_only, "skip the parallel measurement");
+  app.add_option("--null-source", null_gib,
+                 "hash this many GiB from a source that performs no I/O: the "
+                 "pipeline's hash-bound ceiling, with no file and no device")
+      ->check(CLI::PositiveNumber);
   bool sweep = false;
   auto* sweep_opt =
       app.add_flag("--io-sweep", sweep,
@@ -566,6 +591,83 @@ int main(int argc, char** argv) {
 
   opts.direct_io = !no_direct;
   opts.offload_submit = !inline_submit;
+  if (null_gib > 0) {
+    namespace io_impl = blake3pp::detail::io_impl;
+    const auto total =
+        static_cast<std::uint64_t>(null_gib * 1024.0 * 1024.0 * 1024.0);
+    const std::size_t win =
+        blake3pp::detail::rounded_window_bytes(opts.window_bytes);
+    const unsigned threads =
+        pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
+    std::vector<blake3pp::window_record> window_records;
+    std::vector<blake3pp::agent_record> agent_records;
+    std::optional<blake3pp::trace_buffer> trace;
+    blake3pp::file_io_options io_opts{opts.window_bytes, opts.queue_depth,
+                                      opts.direct_io, opts.offload_submit};
+    if (!trace_path.empty()) {
+      const std::size_t n = static_cast<std::size_t>((total + win - 1) / win) + 1;
+      window_records.resize(n);
+      if (trace_agents) {
+        agent_records.resize(n * threads);
+      }
+      trace.emplace(std::span{window_records}, std::span{agent_records});
+      io_opts.trace = &*trace;
+    }
+    const std::vector<std::byte> pattern(win, null_filler);
+    println(stdout,
+            "null source: {:.2f} GiB, window {} MiB, qd {}, {} threads",
+            null_gib, win >> 20, opts.queue_depth, threads);
+
+    // The digest this must produce: the same bytes, hashed in memory.
+    blake3pp::hasher expect;
+    for (std::uint64_t done = 0; done < total;) {
+      const auto n = static_cast<std::size_t>(
+          std::min<std::uint64_t>(win, total - done));
+      expect.update(std::span<const std::byte>{pattern.data(), n});
+      done += n;
+    }
+    const blake3pp::digest want = expect.finalize();
+
+    engine_threads engine(threads);
+    auto sched = engine.scheduler();
+    b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
+    double best = 1e30;
+    blake3pp::digest got{};
+    for (int r = 0; r < reps; ++r) {
+      cooldown();
+      if (trace) {
+        trace->clear();
+      }
+      io_impl::polled_reader_engine<io_impl::null_context> reader(
+          total, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+                  opts.offload_submit});
+      const auto pool = reader.pool();
+      for (std::size_t off = 0; off < pool.size(); off += win) {
+        std::memcpy(pool.data() + off, pattern.data(),
+                    std::min(win, pool.size() - off));
+      }
+      blake3pp::hasher h;
+      const auto t0 = std::chrono::steady_clock::now();
+      blake3pp::detail::update_from_reader(h, reader, sched, io_opts);
+      got = h.finalize();
+      const auto t1 = std::chrono::steady_clock::now();
+      best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
+    }
+    println(stdout, "{:<10} {}   ({}...)  [{}]", "null",
+            b3tool::rate(static_cast<std::size_t>(total), best),
+            got.to_hex().substr(0, 16),
+            got == want ? "digest matches the in-memory hash"
+                        : "DIGEST MISMATCH");
+    if (trace) {
+      print_trace_summary(*trace, threads, 0.0);
+      const std::string file = trace_file_name(trace_path, "null", false);
+      if (write_chrome_trace(file, *trace, "blake3pp_bench_file null")) {
+        println(stdout, "    trace written to {}", file);
+      }
+    }
+    return got == want ? 0 : 1;
+  }
+
   if (make_mib > 0) {
     path = make_test_file(make_mib);
     println(stdout, "created {} ({} MiB)", path, make_mib);
