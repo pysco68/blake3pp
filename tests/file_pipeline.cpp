@@ -865,17 +865,18 @@ TEST_CASE("sibling windows the reducer cannot hold still finish") {
   fake_driver::file f(drv);
   auto sched = blake3pp::get_parallel_scheduler();
   blake3pp::hasher h;
-  // Four nodes is the smallest capacity this file may legally run with:
-  // a contiguous run of k of its eight windows holds popcount(k) nodes,
-  // three at k = 7, and the rule needs one more than that. At two the
-  // scope stalls by construction, which is what the assert in the start
-  // hook says.
+  // Eight nodes is the smallest capacity this file may legally run with.
+  // A contiguous run of k of its eight windows holds popcount(k) nodes,
+  // three at k = 7, and the last window is an edge window that reserves
+  // the decomposition of its own three parts, four more. Below the sum
+  // the scope stalls by construction, which is what the assert in the
+  // start hook says.
   scope_type scope(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 8,
                     .trace = nullptr,
                     .in_flight_cap = 0,
-                    .reducer_capacity = 4});
+                    .reducer_capacity = 8});
   run_scope(scope);
   CHECK(h.finalize() == blake3pp::hash(content));
 }
@@ -887,8 +888,9 @@ TEST_CASE("admission throttles starts instead of refusing an insert") {
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   // Eight windows: a contiguous run of k of them holds popcount(k)
-  // nodes, three at most, so four is just above what this file needs and
-  // far below the eight windows that would otherwise start at once.
+  // nodes, three at most, and the last window reserves four for its own
+  // parts. Eight is just above that sum and far below what eight windows
+  // starting at once would want.
   const std::size_t len = 8 * win;
   const auto content = pattern(len, 62);
 
@@ -901,7 +903,7 @@ TEST_CASE("admission throttles starts instead of refusing an insert") {
                     .queue_depth = 8,
                     .trace = nullptr,
                     .in_flight_cap = 0,
-                    .reducer_capacity = 4});
+                    .reducer_capacity = 8});
   run_scope(scope);
   CHECK(h.finalize() == blake3pp::hash(content));
   // The whole point: the scope held windows back rather than letting the
@@ -1322,6 +1324,114 @@ TEST_CASE("a file truncated under the pipeline fails once with EIO") {
     // consistent records; the run just stops early.
     CHECK(trace.windows().size() <= 8);
   }
+}
+
+// The last window is where the tree stops and the hasher takes over, so
+// every length that moves that boundary is its own case: the part that
+// holds the final chunk stays with the hasher, and everything before it
+// has to reach the tree unchanged.
+TEST_CASE("every last-window length hashes like the sequential path") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  // The part size this window count produces, so the lengths either side
+  // of a part boundary can be named.
+  constexpr std::size_t part = 16 * blake3pp::chunk_size;
+  const std::size_t tails[] = {
+      1,             // a single byte
+      1024,          // one chunk
+      part - 1,      // just under a part
+      part,          // exactly a part
+      part + 1,      // just over
+      2 * part,      // two parts: the smallest fan-out
+      win - 1,       // a window all but a byte
+      win,           // an exact window multiple
+  };
+  for (const std::size_t leading : {std::size_t{0}, std::size_t{3}}) {
+    for (const std::size_t tail : tails) {
+      const std::size_t len = leading * win + tail;
+      CAPTURE(leading);
+      CAPTURE(tail);
+      const auto content = pattern(len, static_cast<std::uint32_t>(tail));
+      const auto expected = blake3pp::hash(content);
+
+      blake3pp::hasher fake;
+      fake_run(fake, content, win, sched, 4, {.order = {2, 0, 3}});
+      CHECK(fake.finalize() == expected);
+
+      // The same through the real driver, which sizes its windows from
+      // the file's own length rather than from a span.
+      const temp_file f(content);
+      CHECK(pipeline_digest(f.path, win, 4, 0) == expected);
+      CHECK(pipeline_digest(f.path, win, 4, 1) == expected);
+    }
+  }
+}
+
+TEST_CASE("the last window fans out in every hasher mode") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  // Three windows and a last one big enough to have parts of its own.
+  const std::size_t len = 3 * win + 48 * 1024;
+  const auto content = pattern(len, 101);
+  std::array<std::byte, blake3pp::key_size> key{};
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<std::byte>(i * 3 + 5);
+  }
+
+  SUBCASE("plain") {
+    blake3pp::hasher h;
+    fake_run(h, content, win, sched);
+    CHECK(h.finalize() == blake3pp::hash(content));
+  }
+  SUBCASE("keyed") {
+    blake3pp::hasher h = blake3pp::hasher::keyed(key);
+    fake_run(h, content, win, sched);
+    CHECK(h.finalize() == blake3pp::keyed_hash(key, content));
+  }
+  SUBCASE("derive_key") {
+    blake3pp::hasher h = blake3pp::hasher::derive_key("blake3pp last window");
+    fake_run(h, content, win, sched);
+    CHECK(h.finalize() == blake3pp::derive_key("blake3pp last window", content));
+  }
+}
+
+TEST_CASE("an 8 MiB last window fans out too") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 8 * 1024 * 1024;
+  // A last window of six sevenths of a window: plenty of parts before
+  // the one holding the final chunk.
+  const std::size_t len = win + (win * 6) / 7;
+  const auto content = pattern(len, 102);
+  blake3pp::hasher h;
+  fake_run(h, content, win, sched, 4, {.order = {1, 0}});
+  CHECK(h.finalize() == blake3pp::hash(content));
+}
+
+TEST_CASE("a last window with many parts never refuses an insert") {
+  using blake3pp::default_stack_budget;
+  using scope_type =
+      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+                                     blake3pp::parallel_scheduler_t>;
+  constexpr std::size_t win = 64 * 1024;
+  // Four windows, the last one all but a byte short of full: its parts
+  // decompose into several nodes at once, which is what the reservation
+  // has to cover.
+  const std::size_t len = 3 * win + win - 1;
+  const auto content = pattern(len, 103);
+  fake_driver drv(content, win, {.order = {3, 1, 0, 2}});
+  fake_driver::file f(drv);
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  // Just above what this file needs: three nodes for a run of three
+  // windows, plus the last window's own reservation.
+  scope_type scope(h, drv, f, sched,
+                   {.window_bytes = win,
+                    .queue_depth = 4,
+                    .trace = nullptr,
+                    .in_flight_cap = 0,
+                    .reducer_capacity = 12});
+  scope.run();
+  CHECK(h.finalize() == blake3pp::hash(content));
 }
 
 }  // TEST_SUITE

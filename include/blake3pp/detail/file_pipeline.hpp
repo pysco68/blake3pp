@@ -57,6 +57,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
@@ -518,9 +519,10 @@ struct pipeline_options {
 // next window needs, or the scope could reach a state where no window
 // may start; see admit_more().
 inline constexpr std::size_t reducer_nodes = 256;
-static_assert(reducer_nodes > 2 * 54 + 1,
+static_assert(reducer_nodes > 2 * 54 + 2 * 54,
               "the reducer must hold the decomposition of any contiguous "
-              "run of windows plus one, or admission can stall");
+              "run of windows plus the largest reservation one edge window "
+              "can make, or admission can stall");
 
 // Several window chains in flight over one file, all on the caller's
 // thread.
@@ -595,8 +597,12 @@ class window_scope {
         decltype(std::declval<window_scope&>().window_chain(
             std::declval<window&>())),
         scope_receiver>;
-    using last_op = ex::connect_result_t<
-        decltype(std::declval<window_scope&>().last_window_chain(
+    using read_only_op = ex::connect_result_t<
+        decltype(std::declval<window_scope&>().read_only_chain(
+            std::declval<window&>())),
+        scope_receiver>;
+    using edge_op = ex::connect_result_t<
+        decltype(std::declval<window_scope&>().edge_chain(
             std::declval<window&>())),
         scope_receiver>;
 
@@ -607,41 +613,65 @@ class window_scope {
         return ex::connect(scope->window_chain(*w), scope_receiver{scope, w});
       }
     };
-    struct connect_last {
+    struct connect_read {
       window_scope* scope;
       window* w;
-      operator last_op() const {
-        return ex::connect(scope->last_window_chain(*w),
+      operator read_only_op() const {
+        return ex::connect(scope->read_only_chain(*w),
                            scope_receiver{scope, w});
+      }
+    };
+    struct connect_edge {
+      window_scope* scope;
+      window* w;
+      operator edge_op() const {
+        return ex::connect(scope->edge_chain(*w), scope_receiver{scope, w});
       }
     };
 
     auto cells = std::make_unique<std::optional<full_op>[]>(count_);
-    std::optional<last_op> last_cell;
+    // One cell of each shape per edge window: the first and the last can
+    // be in flight together on a file of three windows, and either may
+    // turn out to have no parts worth fanning out.
+    std::optional<edge_op> last_edge_cell;
+    std::optional<read_only_op> last_read_cell;
 
     loop_.run_until(status_, [&] {
       // Every window that can start, started before the one flush this
       // round: the reads of a whole batch reach the OS in one call.
       while (!stop_ && in_flight_ < in_flight_cap_ && free_ != nullptr) {
-        if (!admit_more()) {
+        if (next_offset_ >= file_bytes_) {
+          break;
+        }
+        // An edge window reserves room for a whole decomposition rather
+        // than for one node, so what it costs has to be known before it
+        // is admitted.
+        // The cost is the window's own, not a worst case: plan it
+        // before admitting it, since an edge window reserves a whole
+        // decomposition.
+        const std::size_t cost = this->next_window_cost();
+        if (!admit_more(cost)) {
           break;
         }
         window* const w = free_;
-        if (!take_next(*w)) {
-          break;
-        }
+        take_next(*w);
         free_ = w->next_free;
         claim_record(*w);
         ++in_flight_;
+        in_flight_nodes_ += w->node_cost;
         status_.outstanding = in_flight_;
-        if (w->last) {
-          last_window_ = w;
-          last_cell.emplace(connect_last{this, w});
-          ex::start(*last_cell);
-        } else {
+        if (!w->last) {
           prepare_compress(*w);
           cells[w->slot].emplace(connect_full{this, w});
           ex::start(*cells[w->slot]);
+        } else if (w->parts >= 2) {
+          last_window_ = w;
+          last_edge_cell.emplace(connect_edge{this, w});
+          ex::start(*last_edge_cell);
+        } else {
+          last_window_ = w;
+          last_read_cell.emplace(connect_read{this, w});
+          ex::start(*last_read_cell);
         }
       }
       // Nothing running, work left, a buffer free, and still nothing
@@ -670,7 +700,9 @@ class window_scope {
     reducer_.drain_into(h_);
     if (last_window_ != nullptr) {
       window& w = *last_window_;
-      h_.update(std::span<const std::byte>(w.buffer.data(), w.bytes));
+      // Only the tail: the parts before it are already in the tree.
+      h_.update(std::span<const std::byte>(
+          w.buffer.data() + (w.bytes - w.tail_bytes), w.tail_bytes));
       if (w.rec != nullptr) {
         // The last window is never folded, so its join and its absorb
         // are the same instant: the hasher took it whole.
@@ -700,7 +732,32 @@ class window_scope {
     window* next_free = nullptr;
     unsigned slot = 0;
     bool last = false;
+    // An edge window is split three ways. `head` is absorbed by the
+    // hasher on the driver the moment the read lands, `parts` full parts
+    // go to the pool and come back as nodes, and `tail` waits for the
+    // reducer to drain. A full window is all parts and no ends.
+    std::size_t head_bytes = 0;
+    std::size_t tail_bytes = 0;
+    std::size_t parts = 0;
+    std::size_t part_chunks = 0;
+    std::size_t nodes = 0;       // nodes the fold produced
+    unsigned edge_slot = 0;      // which node buffer this window uses
+    std::size_t node_cost = 1;   // reducer slots admission reserved
   };
+
+  // The most nodes a run of `parts` parts can decompose into: one
+  // ascending chain and one descending one, at most one node per level
+  // of the run. Reserving this rather than the worst case over any run
+  // is what keeps a small reducer usable -- a blanket 2 * 54 would make
+  // an edge window unadmittable below that capacity, and hang.
+  [[nodiscard]] static constexpr std::size_t nodes_for(
+      std::size_t parts) noexcept {
+    return 2 * static_cast<std::size_t>(std::bit_width(parts));
+  }
+
+  // What the node buffers hold: the worst case over any run, which is
+  // what fold_aligned_runs asserts against.
+  static constexpr std::size_t edge_node_cap = 2 * 54;
 
   // The scope's receiver is a handle: the scope and the window it speaks
   // for, nothing else. It must stay copy-constructible, because beman's
@@ -741,14 +798,69 @@ class window_scope {
         [this, &w](const cv_type& cv) noexcept { reduce_into_tree(w, cv); });
   }
 
-  // The last window is never a subtree of anything: its read is issued
-  // like the others and its buffer is held until the run ends, where the
-  // hasher takes it after the reducer has drained.
-  [[nodiscard]] auto last_window_chain(window& w) {
+  // An edge window with nothing worth fanning out: read it, hold it, and
+  // let the hasher take the whole thing at the end. Small last windows
+  // land here, and so does a file below one window.
+  [[nodiscard]] auto read_only_chain(window& w) {
     return ex::then(loop_.read(file_, w.offset, w.buffer.first(w.bytes)),
                     [this, &w](std::span<const std::byte>) noexcept {
                       stamp_ready(w);
+                      stamp_joined(w);
                     });
+  }
+
+  // An edge window that has full parts in the middle: the parts go to
+  // the pool like any other window's, but what comes back is the
+  // canonical decomposition of that run rather than one chaining value,
+  // because the window's ends belong to the hasher.
+  //
+  // Same three stages as the full window's chain and the same rules; it
+  // exists separately because its value type is a node count, and
+  // generalising the full window's chain to carry either would put a
+  // branch on the path every window takes.
+  [[nodiscard]] auto edge_chain(window& w) {
+    return ex::then(
+        ex::continues_on(
+            ex::let_value(loop_.read(file_, w.offset, w.buffer.first(w.bytes)),
+                          [this, &w](std::span<const std::byte>) {
+                            return edge_compress_stage(w);
+                          }),
+            loop_.scheduler()),
+        [this, &w](std::size_t nodes) noexcept { insert_edge_nodes(w, nodes); });
+  }
+
+  [[nodiscard]] auto edge_compress_stage(window& w) {
+    stamp_ready(w);
+    w.compress.prepare_edge(ops_, w.buffer.data() + w.head_bytes, w.part_chunks,
+                            w.parts,
+                            w.first_chunk + w.head_bytes / chunk_size,
+                            h_.key_words(), h_.mode_flags(), trace_, w.index);
+    const std::span<tree_reducer::node> out(edge_nodes_[w.edge_slot]);
+    if constexpr (Traced) {
+      return ex::then(compress_edge_on<true>(sched_, w.compress, out),
+                      [this, &w](std::size_t nodes) noexcept {
+                        stamp_agents(w);
+                        return nodes;
+                      });
+    } else {
+      return compress_edge_on<false>(sched_, w.compress, out);
+    }
+  }
+
+  // On the driver, like every other insert.
+  void insert_edge_nodes(window& w, std::size_t nodes) noexcept {
+    w.nodes = nodes;
+    for (std::size_t i = 0; i < nodes; ++i) {
+      const tree_reducer::node& n = edge_nodes_[w.edge_slot][i];
+      const bool inserted = reducer_.insert(n.first_chunk, n.chunks, n.cv);
+      // Admission reserved a whole decomposition for this window.
+      assert(inserted && "the reducer refused an edge window's node");
+      (void)inserted;
+    }
+    max_pending_ = std::max(max_pending_, reducer_.pending());
+    if (w.rec != nullptr) {
+      w.rec->t_absorbed = trace_->now();
+    }
   }
 
   [[nodiscard]] auto compress_stage(window& w) {
@@ -781,26 +893,63 @@ class window_scope {
   // storage is full and no merge happened, and this rule leaves room for
   // each chain before it starts.
   //
+  // A full window inserts one node when it finishes and reserves one. An
+  // edge window inserts the decomposition of its run of parts instead,
+  // up to 2 * 54 nodes, and reserves that many from the moment it
+  // starts: reserving one and inserting a hundred is how the refusal
+  // this rule exists to prevent would come back.
+  //
   // The rule cannot stall the pipeline. Reads start in file order, so
   // when nothing is in flight the windows that have finished are a
   // contiguous run from the beginning, and a contiguous run of aligned
   // subtrees decomposes into at most one ascending and one descending
   // chain of nodes, one per level: 2 * 54 at BLAKE3's 2^64-byte limit.
-  // The capacity is above that, so with nothing in flight there is
-  // always a free node and always a window that may start.
-  [[nodiscard]] bool admit_more() noexcept {
-    if (reducer_.pending() + in_flight_ < reducer_capacity_) {
+  // The capacity is above that plus what one edge window reserves, so
+  // with nothing in flight there is always a window that may start.
+  [[nodiscard]] bool admit_more(std::size_t cost) noexcept {
+    if (reducer_.pending() + in_flight_nodes_ + cost <= reducer_capacity_) {
       return true;
     }
     ++admission_stalls_;
     return false;
   }
 
-  // Takes the next window's geometry, or false at end of file.
-  [[nodiscard]] bool take_next(window& w) noexcept {
-    if (next_offset_ >= file_bytes_) {
-      return false;
+  // Whether the window that would start next is an edge one, which the
+  // admission rule has to know before the window is taken.
+  [[nodiscard]] bool next_is_edge() const noexcept {
+    const std::uint64_t bytes =
+        std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_);
+    return next_offset_ + bytes >= file_bytes_;
+  }
+
+  // What the next window would reserve in the reducer, decided from the
+  // same plan the window will get.
+  [[nodiscard]] std::size_t next_window_cost() const noexcept {
+    if (!next_is_edge()) {
+      return 1;
     }
+    const std::size_t bytes = static_cast<std::size_t>(
+        std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_));
+    const std::size_t parts = last_window_parts(bytes);
+    return parts >= 2 ? nodes_for(parts) : 1;
+  }
+
+  // How many whole parts of a last window of `bytes` sit entirely before
+  // its final chunk; below two there is nothing worth fanning out.
+  [[nodiscard]] std::size_t last_window_parts(std::size_t bytes) const noexcept {
+    const std::uint64_t chunks_with_tail =
+        (static_cast<std::uint64_t>(bytes) + chunk_size - 1) / chunk_size;
+    if (chunks_with_tail < 2) {
+      return 0;
+    }
+    const std::size_t p =
+        window_part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
+    const std::uint64_t k = (chunks_with_tail - 1) / p;
+    return k < 2 ? 0 : static_cast<std::size_t>(k);
+  }
+
+  // Takes the next window's geometry and decides its three parts.
+  void take_next(window& w) noexcept {
     w.offset = next_offset_;
     w.bytes = static_cast<std::size_t>(
         std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_));
@@ -808,8 +957,44 @@ class window_scope {
     w.chunks = w.bytes / chunk_size;
     w.first_chunk = base_chunk_ + w.offset / chunk_size;
     w.index = index_++;
+    w.head_bytes = 0;
+    w.tail_bytes = 0;
+    w.parts = 0;
+    w.part_chunks = 0;
+    w.nodes = 0;
+    w.node_cost = 1;
     next_offset_ += w.bytes;
-    return true;
+    if (w.last) {
+      plan_last(w);
+    }
+  }
+
+  // The last window carries the message's final chunk, and a merged
+  // range must never contain it -- so the part that holds it, and
+  // everything after, stays with the hasher. Everything before that is
+  // ordinary full parts and goes to the pool like any other window's.
+  //
+  // k is how many whole parts sit entirely before the final chunk. Below
+  // two of them there is nothing worth a round trip through the pool and
+  // the window is all tail, which is also the shape of a file that fits
+  // inside one window. The hasher's share is then up to two parts rather
+  // than the one the driver rule allows elsewhere: the final part is its
+  // by definition, and the one before it is not worth splitting out
+  // alone.
+  void plan_last(window& w) noexcept {
+    const std::size_t parts = last_window_parts(w.bytes);
+    if (parts == 0) {
+      w.tail_bytes = w.bytes;
+      return;
+    }
+    const std::uint64_t chunks_with_tail =
+        (static_cast<std::uint64_t>(w.bytes) + chunk_size - 1) / chunk_size;
+    w.part_chunks =
+        window_part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
+    w.parts = parts;
+    w.tail_bytes = w.bytes - parts * w.part_chunks * chunk_size;
+    w.node_cost = nodes_for(parts);
+    w.edge_slot = 1;
   }
 
   void prepare_compress(window& w) noexcept {
@@ -836,6 +1021,9 @@ class window_scope {
 
   void on_done(window& w) noexcept {
     --in_flight_;
+    // Whatever this window reserved in the reducer is now either in it
+    // or never coming.
+    in_flight_nodes_ -= w.node_cost;
     if (&w != last_window_) {
       release(w);
     }
@@ -848,6 +1036,7 @@ class window_scope {
     }
     stop_ = true;
     --in_flight_;
+    in_flight_nodes_ -= w.node_cost;
     if (&w != last_window_) {
       release(w);
     }
@@ -860,6 +1049,7 @@ class window_scope {
     }
     stop_ = true;
     --in_flight_;
+    in_flight_nodes_ -= w.node_cost;
     if (&w != last_window_) {
       release(w);
     }
@@ -903,6 +1093,25 @@ class window_scope {
     }
   }
 
+  // A window that never reaches the pool has no separate join: its
+  // compute is the hasher's, at the end.
+  void stamp_joined(window& w) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_joined = trace_->now();
+    }
+  }
+
+  void stamp_agents(window& w) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_joined = trace_->now();
+      w.rec->agent_busy_ns =
+          w.compress.pt.busy_ns.load(std::memory_order_relaxed);
+      w.rec->agents_active =
+          w.compress.pt.active.load(std::memory_order_relaxed);
+      w.rec->flags |= window_record::flag_parallel;
+    }
+  }
+
   void stamp_released(window& w) noexcept {
     if (w.rec != nullptr) {
       w.rec->t_released = trace_->now();
@@ -924,6 +1133,10 @@ class window_scope {
   std::unique_ptr<window[]> windows_;
   std::unique_ptr<tree_reducer::node[]> nodes_;
   tree_reducer reducer_;
+  // Where an edge window's fold leaves its nodes: one buffer for the
+  // first window and one for the last, since a three-window file has
+  // both in flight at once.
+  std::array<std::array<tree_reducer::node, edge_node_cap>, 2> edge_nodes_{};
 
   loop_status status_{};
   window* free_ = nullptr;
@@ -931,6 +1144,7 @@ class window_scope {
   std::uint64_t next_offset_ = 0;
   std::uint64_t index_ = 0;
   unsigned in_flight_ = 0;
+  std::size_t in_flight_nodes_ = 0;
   std::uint64_t admission_stalls_ = 0;
   std::size_t max_pending_ = 0;
   bool stop_ = false;
