@@ -7,7 +7,10 @@
 #include <string_view>
 #include <vector>
 
+#include <blake3pp/core.hpp>
+#include <blake3pp/dispatch.hpp>
 #include <blake3pp/parallel.hpp>
+#include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
 #include <system_error>
@@ -373,6 +376,69 @@ struct stopping_scheduler {
 static_assert(blake3pp::ex::scheduler<stopping_scheduler>);
 
 }  // namespace
+
+// The compress stage the file pipeline starts per window: the same bulk
+// and the same fold hash_window_parallel runs, but as a sender whose
+// state lives in the window object rather than on the calling frame.
+// What it produces has to be the window's chaining value, or every
+// digest downstream of it is wrong.
+TEST_CASE("the window compress stage produces the window's chaining value") {
+  using namespace blake3pp;
+  namespace ex = blake3pp::ex;
+  auto sched = get_parallel_scheduler();
+  const auto* ops = detail::resolve(arch::auto_detect);
+
+  // A window of 512 chunks, with a tail after it so the window is not
+  // the root: the CV only means anything in that position.
+  constexpr std::size_t window_chunks = 512;
+  constexpr std::size_t window_bytes = window_chunks * chunk_size;
+  const auto input = make_input(window_bytes + 1024);
+
+  hasher via_stage;
+  detail::window_compress<default_stack_budget> w;
+  REQUIRE(w.prepare(ops, input.data(), window_chunks, 0, via_stage.key_words(),
+                    via_stage.mode_flags(), nullptr, 0));
+  CHECK(w.n_parts > 1);
+  auto result = ex::sync_wait(detail::compress_on<false>(sched, w));
+  REQUIRE(result.has_value());
+  const auto cv = std::get<0>(*result);
+
+  via_stage.push_subtree_cv(cv, window_chunks);
+  via_stage.update(std::span(input).subspan(window_bytes));
+
+  hasher sequential;
+  sequential.update(input);
+  CHECK(via_stage.finalize() == sequential.finalize());
+}
+
+// Tracing must not change what the stage computes, only what it records.
+TEST_CASE("the traced compress stage computes the same chaining value") {
+  using namespace blake3pp;
+  namespace ex = blake3pp::ex;
+  auto sched = get_parallel_scheduler();
+  const auto* ops = detail::resolve(arch::auto_detect);
+  constexpr std::size_t window_chunks = 256;
+  const auto input = make_input(window_chunks * chunk_size);
+
+  hasher h;
+  std::array<window_record, 4> window_records{};
+  std::array<agent_record, 16> agent_records{};
+  trace_buffer buf(window_records, agent_records);
+  detail::window_compress<default_stack_budget> plain;
+  detail::window_compress<default_stack_budget> traced;
+  REQUIRE(plain.prepare(ops, input.data(), window_chunks, 0, h.key_words(),
+                        h.mode_flags(), nullptr, 0));
+  REQUIRE(traced.prepare(ops, input.data(), window_chunks, 0, h.key_words(),
+                         h.mode_flags(), &buf, 7));
+
+  auto a = ex::sync_wait(detail::compress_on<false>(sched, plain));
+  auto b = ex::sync_wait(detail::compress_on<true>(sched, traced));
+  REQUIRE(a.has_value());
+  REQUIRE(b.has_value());
+  CHECK(std::get<0>(*a) == std::get<0>(*b));
+  CHECK(traced.pt.active.load() > 0);
+  CHECK(traced.pt.busy_ns.load() > 0);
+}
 
 TEST_CASE("a scheduler that completes stopped is reported, not read") {
   const std::vector<std::byte> input(4 * 1024 * 1024, std::byte{0x5a});

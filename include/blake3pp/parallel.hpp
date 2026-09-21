@@ -277,96 +277,112 @@ void wait_for_parts(Work&& work) {
   }
 }
 
-// The traced form of for_each_part()'s bulk body: the same pull loop with
-// the clock read once before the first part and, when agent records are
-// wanted, once after every part (the end of one is the start of the
-// next). Per bulk invocation, not per part: two atomic adds on pt and at
-// most one record claim. An invocation that finds the counter exhausted
-// records nothing and is not an active agent.
-template <class Scheduler, class Body>
-void for_each_part_traced(Scheduler& sched, std::size_t n, Body& body,
-                          std::atomic<std::size_t>& next, part_trace& pt) {
-  auto work =
-      ex::schedule(sched) |
-      ex::bulk(ex::par, n, [&](std::size_t) noexcept {
-        std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-        if (i >= n) {
-          return;
-        }
-        trace_buffer& buf = *pt.buf;
-        const bool per_agent = buf.wants_agents();
-        const std::int64_t t_begin = buf.now();
-        std::int64_t t = t_begin;
-        std::uint32_t parts = 0;
-        std::uint64_t min_ns = ~std::uint64_t{0};
-        std::uint64_t max_ns = 0;
-        std::uint32_t cpu = ~std::uint32_t{0};
-        if (per_agent) {
+// The schedule-and-bulk sender that runs body(i) for every i in [0, n).
+// for_each_part() waits on it; the file pipeline starts one per window
+// and lets the driver loop carry on.
+//
+// The bulk shape only provides the agents: each call pulls indices from
+// `next` until none are left, so the split follows each agent's actual
+// speed rather than the fixed shares the provider's bulk may hand out.
+// Every index runs exactly once however the implementation distributes
+// the calls.
+//
+// `body` and `next` are the caller's and must outlive the sender --
+// for_each_part keeps them in its own frame, the pipeline in the window
+// object.
+//
+// Traced is a template parameter and not a null check inside the body
+// for two reasons: the untraced body is the hot one and stays exactly as
+// it was, and a pipeline that connects one sender per window needs the
+// type settled before the run starts.
+//
+// The traced body reads the clock once before its first part and, when
+// agent records are wanted, once after every part (the end of one is the
+// start of the next). Per bulk invocation, not per part: two atomic adds
+// on pt and at most one record claim. An invocation that finds the
+// counter exhausted records nothing and is not an active agent.
+template <bool Traced, class Scheduler, class Body>
+[[nodiscard]] auto part_bulk_sender(Scheduler& sched, std::size_t n,
+                                    Body& body, std::atomic<std::size_t>& next,
+                                    part_trace* pt) {
+  if constexpr (Traced) {
+    return ex::schedule(sched) |
+           ex::bulk(ex::par, n, [n, &body, &next, pt](std::size_t) noexcept {
+             std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+             if (i >= n) {
+               return;
+             }
+             trace_buffer& buf = *pt->buf;
+             const bool per_agent = buf.wants_agents();
+             const std::int64_t t_begin = buf.now();
+             std::int64_t t = t_begin;
+             std::uint32_t parts = 0;
+             std::uint64_t min_ns = ~std::uint64_t{0};
+             std::uint64_t max_ns = 0;
+             std::uint32_t cpu = ~std::uint32_t{0};
+             if (per_agent) {
 #if defined(__linux__)
-          const int c = ::sched_getcpu();
-          cpu = c < 0 ? ~std::uint32_t{0} : static_cast<std::uint32_t>(c);
+               const int c = ::sched_getcpu();
+               cpu = c < 0 ? ~std::uint32_t{0} : static_cast<std::uint32_t>(c);
 #endif
-          do {
-            body(i);
-            const std::int64_t t_end = buf.now();
-            const auto d = static_cast<std::uint64_t>(t_end - t);
-            min_ns = std::min(min_ns, d);
-            max_ns = std::max(max_ns, d);
-            t = t_end;
-            ++parts;
-            i = next.fetch_add(1, std::memory_order_relaxed);
-          } while (i < n);
-        } else {
-          do {
-            body(i);
-            ++parts;
-            i = next.fetch_add(1, std::memory_order_relaxed);
-          } while (i < n);
-          t = buf.now();
-        }
-        const auto busy = static_cast<std::uint64_t>(t - t_begin);
-        pt.busy_ns.fetch_add(busy, std::memory_order_relaxed);
-        pt.active.fetch_add(1, std::memory_order_relaxed);
-        if (per_agent) {
-          if (agent_record* const r = buf.claim_agent()) {
-            r->window = pt.window;
-            r->t_begin = t_begin;
-            r->busy_ns = busy;
-            r->min_part_ns = min_ns;
-            r->max_part_ns = max_ns;
-            r->parts = parts;
-            r->part_chunks = pt.part_chunks;
-            r->cpu = cpu;
-          }
-        }
-      });
-  wait_for_parts(std::move(work));
+               do {
+                 body(i);
+                 const std::int64_t t_end = buf.now();
+                 const auto d = static_cast<std::uint64_t>(t_end - t);
+                 min_ns = std::min(min_ns, d);
+                 max_ns = std::max(max_ns, d);
+                 t = t_end;
+                 ++parts;
+                 i = next.fetch_add(1, std::memory_order_relaxed);
+               } while (i < n);
+             } else {
+               do {
+                 body(i);
+                 ++parts;
+                 i = next.fetch_add(1, std::memory_order_relaxed);
+               } while (i < n);
+               t = buf.now();
+             }
+             const auto busy = static_cast<std::uint64_t>(t - t_begin);
+             pt->busy_ns.fetch_add(busy, std::memory_order_relaxed);
+             pt->active.fetch_add(1, std::memory_order_relaxed);
+             if (per_agent) {
+               if (agent_record* const r = buf.claim_agent()) {
+                 r->window = pt->window;
+                 r->t_begin = t_begin;
+                 r->busy_ns = busy;
+                 r->min_part_ns = min_ns;
+                 r->max_part_ns = max_ns;
+                 r->parts = parts;
+                 r->part_chunks = pt->part_chunks;
+                 r->cpu = cpu;
+               }
+             }
+           });
+  } else {
+    return ex::schedule(sched) |
+           ex::bulk(ex::par, n, [n, &body, &next](std::size_t) noexcept {
+             for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                  i < n; i = next.fetch_add(1, std::memory_order_relaxed)) {
+               body(i);
+             }
+           });
+  }
 }
 
-// Runs body(i) for every i in [0, n) on sched. The bulk shape only
-// provides the agents: each call pulls indices from a shared counter until
-// none are left, so the split follows each agent's actual speed rather
-// than the fixed shares the provider's bulk may hand out. Every index runs
-// exactly once however the implementation distributes the calls.
+// Runs body(i) for every i in [0, n) on sched and waits for all of them.
 //
-// With pt set the traced body runs instead (see for_each_part_traced);
-// the choice is made once here, so the untraced bulk body is untouched.
+// With pt set the traced body runs instead; the choice is made once
+// here, so the untraced bulk body is untouched.
 template <class Scheduler, class Body>
 void for_each_part(Scheduler& sched, std::size_t n, Body body,
                    part_trace* pt = nullptr) {
   std::atomic<std::size_t> next{0};
   if (pt != nullptr) {
-    for_each_part_traced(sched, n, body, next, *pt);
+    wait_for_parts(part_bulk_sender<true>(sched, n, body, next, pt));
     return;
   }
-  auto work = ex::schedule(sched) |
-              ex::bulk(ex::par, n, [&](std::size_t) noexcept {
-                for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                     i < n; i = next.fetch_add(1, std::memory_order_relaxed)) {
-                  body(i);
-                }
-              });
-  wait_for_parts(std::move(work));
+  wait_for_parts(part_bulk_sender<false>(sched, n, body, next, nullptr));
 }
 
 // The one-shot engine: partitions input into aligned subtrees, fans them
@@ -551,6 +567,103 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 
 namespace detail {
 
+// The part size of a full window: the same arithmetic wherever a window
+// is compressed, so a window folds identically whichever path ran it.
+// A result at or above num_chunks means the window is too small to fan
+// out at all.
+template <stack_budget Budget>
+[[nodiscard]] constexpr std::size_t window_part_chunks(
+    std::size_t num_chunks) noexcept {
+  return std::max(part_chunks<Budget>(num_chunks), window_min_part_chunks);
+}
+
+// One window's compress stage, and everything it touches.
+//
+// hash_window_parallel keeps the part table and the pull counter in its
+// own frame because it waits for them there. The pipeline cannot: its
+// compress stage is a sender that outlives the call which built it, and
+// several are in flight at once. So the state moves into an object the
+// window owns, allocated once with the window and reused for every
+// window that passes through it.
+//
+// Also the bulk body: an agent calls operator()(i) for one part, and
+// concurrent calls write disjoint slots of cvs.
+template <stack_budget Budget>
+struct window_compress {
+  const kern::kernel_ops* ops = nullptr;
+  const std::byte* data = nullptr;
+  std::uint64_t chunk_counter = 0;
+  std::size_t num_chunks = 0;
+  std::size_t part = 0;
+  std::size_t n_parts = 0;
+  std::array<std::uint32_t, 8> key{};
+  std::uint32_t flags = 0;
+
+  part_cvs<Budget> cvs;               // one CV per part
+  std::atomic<std::size_t> next{0};   // the agents pull their parts from here
+  std::array<std::uint32_t, 8> cv{};  // where the fold leaves the window's CV
+  part_trace pt{nullptr, 0, 0};
+
+  window_compress() = default;
+  window_compress(const window_compress&) = delete;
+  window_compress& operator=(const window_compress&) = delete;
+
+  // Takes a full, counter-aligned window. False means it is too small to
+  // fan out and belongs on the sequential path, the same verdict
+  // hash_window_parallel reaches.
+  [[nodiscard]] bool prepare(const kern::kernel_ops* o, const std::byte* d,
+                             std::size_t chunks, std::uint64_t counter,
+                             std::span<const std::uint32_t, 8> k,
+                             std::uint32_t f, trace_buffer* buf,
+                             std::uint64_t window_id) noexcept {
+    const std::size_t p = window_part_chunks<Budget>(chunks);
+    if (p >= chunks) {
+      return false;
+    }
+    ops = o;
+    data = d;
+    chunk_counter = counter;
+    num_chunks = chunks;
+    part = p;
+    n_parts = chunks / p;
+    std::ranges::copy(k, key.begin());
+    flags = f;
+    next.store(0, std::memory_order_relaxed);
+    pt.buf = buf;
+    pt.window = window_id;
+    pt.part_chunks = static_cast<std::uint32_t>(p);
+    pt.busy_ns.store(0, std::memory_order_relaxed);
+    pt.active.store(0, std::memory_order_relaxed);
+    return true;
+  }
+
+  void operator()(std::size_t i) noexcept {
+    compress_subtree_cv(ops, data + i * part * chunk_size, part,
+                        chunk_counter + i * part, key, flags, cvs[i]);
+  }
+};
+
+// One window's compress stage as a sender: the provider's bulk over the
+// parts, then the fold that turns their CVs into the window's own. Value:
+// the window CV.
+//
+// The fold runs on whichever agent finished the bulk, so the driver
+// thread never touches it. This is the one line Phase 4 exists to
+// replace; the window chain around it does not know what is inside.
+template <bool Traced, stack_budget Budget, class Scheduler>
+[[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w) {
+  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt) |
+         ex::then([&w]() noexcept {
+           // Every part pairs with a sibling all the way up: the window
+           // is a power-of-two number of chunks and part is a power of
+           // two, so n_parts is one too.
+           assert(std::has_single_bit(w.n_parts));
+           fold_sibling_cvs(w.ops, std::span{w.cvs}.first(w.n_parts), w.key,
+                            w.flags, w.cv);
+           return w.cv;
+         });
+}
+
 // Fans one full window (num_chunks: power of two, counter-aligned) out
 // over the scheduler and absorbs the part CVs in order.
 //
@@ -565,8 +678,7 @@ void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
                           std::uint64_t chunk_counter,
                           trace_buffer* buf = nullptr,
                           window_record* rec = nullptr) {
-  const std::size_t part =
-      std::max(part_chunks<Budget>(num_chunks), window_min_part_chunks);
+  const std::size_t part = window_part_chunks<Budget>(num_chunks);
   if (part >= num_chunks) {
     // Window too small to fan out; hash it inline.
     h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
