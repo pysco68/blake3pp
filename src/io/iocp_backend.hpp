@@ -144,8 +144,13 @@ struct win_file {
   // keeping the plain handle for unaligned lengths. Best-effort: a
   // refused reopen, or a port that will not attach, leaves the
   // plain handle in charge with direct/use_iocp still false.
+  // shared_port, when given, is a port this file does not own: the reader
+  // context keeps one port for every file it opens, while the writer still
+  // creates its own here. Ownership is the only difference; association
+  // and the failure handling are the same either way.
   void engage(const wchar_t* path, DWORD access, DWORD share,
-              bool want_direct, bool want_async) noexcept {
+              bool want_direct, bool want_async,
+              HANDLE shared_port = nullptr) noexcept {
     if (!want_direct && !want_async) {
       return;
     }
@@ -162,16 +167,23 @@ struct win_file {
       return;
     }
     if (want_async) {
-      unique_handle p(
-          ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1));
-      // An unattachable port takes the fast handle down with it: a
-      // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path.
-      // Both candidates close on the way out of this branch.
-      if (!p ||
-          ::CreateIoCompletionPort(cand.get(), p.get(), 0, 0) == nullptr) {
-        return;
+      if (shared_port != nullptr) {
+        // An unattachable port takes the fast handle down with it: a
+        // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path,
+        // so the candidate closes on the way out.
+        if (::CreateIoCompletionPort(cand.get(), shared_port, 0, 0) ==
+            nullptr) {
+          return;
+        }
+      } else {
+        unique_handle p(
+            ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1));
+        if (!p ||
+            ::CreateIoCompletionPort(cand.get(), p.get(), 0, 0) == nullptr) {
+          return;
+        }
+        port = std::move(p);
       }
-      port = std::move(p);
       use_iocp = true;
     }
     fast = std::move(cand);
@@ -179,114 +191,292 @@ struct win_file {
   }
 };
 
-class iocp_reader {
+// The IOCP reader context: one completion port, any number of files,
+// reads named by the caller's read_op, completions delivered as callbacks
+// out of poll(). The port is the context's; each file associates its
+// overlapped handle with it at construction.
+//
+// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is deliberately NOT set. With it, a
+// read that completes synchronously returns without posting, and its
+// callback would have to run inside submit_read() -- exactly what the
+// contract forbids. Leaving it unset costs a post per fast completion and
+// buys one path: every read, fast or slow, reports from poll().
+class iocp_context {
  public:
-  iocp_reader(const std::filesystem::path& path,
-              const file_reader_options& opts, unsigned nslots)
-      : slots_(nslots), ovs_(nslots) {
-    file_.open(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
-               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
-    size_ = file_.stat_size();
-    file_.engage(path.c_str(), GENERIC_READ, FILE_SHARE_READ, opts.direct_io,
-                 opts.async);
-    name_ = file_.use_iocp ? (file_.direct ? "iocp+direct" : "iocp")
-            : file_.direct ? "readfile+direct"
-                           : "readfile";
-  }
+  struct read_op : read_op_base {
+    OVERLAPPED ov{};
+    std::byte* dst = nullptr;
+    std::size_t len = 0;
+    std::uint64_t off = 0;
+    std::size_t filled = 0;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    win_file* sync_file = nullptr;  // the deferred path needs the handles
+    void* owner_file = nullptr;     // which file's drain owes this op
+    read_op* next_deferred = nullptr;
+  };
 
+  class file {
+   public:
+    file(iocp_context& ctx, const std::filesystem::path& path,
+         bool direct_io) {
+      f_.open(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
+      size_ = f_.stat_size();
+      f_.engage(path.c_str(), GENERIC_READ, FILE_SHARE_READ, direct_io,
+                ctx.port_wanted(), ctx.port());
+      name_ = f_.use_iocp ? (f_.direct ? "iocp+direct" : "iocp")
+              : f_.direct ? "readfile+direct"
+                          : "readfile";
+      ctx.adopt(*this);
+    }
 
-  // Cancels every in-flight request and waits for ALL of them to report.
-  // The wait is INFINITE on purpose. These requests target the engine's
-  // buffer pool, which is declared before this backend and therefore freed
-  // AFTER it, so returning while one is still pending hands the kernel a
-  // window to write into freed memory. CancelIoEx makes that wait bounded
-  // in practice: once it returns, every outstanding request is guaranteed
-  // to complete, successfully or with ERROR_OPERATION_ABORTED. A null
-  // OVERLAPPED here therefore means the port itself has failed, not that a
-  // request is merely slow: no completion can ever arrive, so breaking is
-  // the only option left.
-  void drain_cancelled() noexcept {
-    ::CancelIoEx(file_.h(), nullptr);
-    while (outstanding_ > 0) {
-      DWORD bytes = 0;
-      ULONG_PTR key = 0;
-      OVERLAPPED* pov = nullptr;
-      ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key, &pov,
-                                  INFINITE);
-      if (pov == nullptr) {
-        break;  // port unusable: no completion will ever arrive
+    ~file() {
+      if (ctx_ != nullptr) {
+        ctx_->forget(*this);
       }
-      --outstanding_;
+    }
+    file(const file&) = delete;
+    file& operator=(const file&) = delete;
+
+    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+   private:
+    friend class iocp_context;
+    win_file f_;
+    std::uint64_t size_ = 0;
+    std::string_view name_ = "readfile";
+    iocp_context* ctx_ = nullptr;
+    std::size_t inflight_ = 0;  // this file's share of the context's
+  };
+
+  // The port exists whether or not files engage the async path: it is
+  // also the wake primitive, so a context whose reads all go through the
+  // deferred list still has exactly one thing a blocked poll sleeps on.
+  iocp_context(const reader_context_options& opts, unsigned)
+      : async_requested_(opts.async),
+        port_(::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1)) {
+    if (!port_) {
+      throw_winerr("CreateIoCompletionPort");
+    }
+  }
+  iocp_context(const iocp_context&) = delete;
+  iocp_context& operator=(const iocp_context&) = delete;
+
+  // Every file is gone by now (they must outlive nothing and be destroyed
+  // first), so their handles are closed and the requests they owned have
+  // reported. What can remain is a wake nobody consumed, which the port
+  // drops with itself.
+  ~iocp_context() = default;
+
+  void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
+                   read_op& op) {
+    op.dst = buf.data();
+    op.len = buf.size();
+    op.off = off;
+    op.filled = 0;
+    op.h = f.f_.h();
+    op.sync_file = &f.f_;
+    op.next_deferred = nullptr;
+    op.owner_file = &f;
+    in_flight_++;
+    f.inflight_++;
+    // NO_BUFFERING rejects an unaligned length, so only whole granules
+    // ride the port; the tail is read synchronously inside poll().
+    if (f.f_.use_iocp && buf.size() % direct_align == 0) {
+      issue(op);
+    } else {
+      deferred_.push(op);
     }
   }
 
-  // Only the drain is hand-written now: every handle belongs to file_,
-  // whose destructor runs after this body, that is, after the last
-  // request has reported, which is the ordering the drain exists for.
-  ~iocp_reader() {
-    if (file_.use_iocp && outstanding_ > 0) {
-      drain_cancelled();
+  // ReadFile queues the request itself, so there is nothing batched to
+  // push. The contract keeps the call because io_uring has.
+  void flush() noexcept {}
+
+  std::size_t poll(bool block) {
+    std::size_t ran = reap_ready(false) + run_one_deferred();
+    if (ran > 0 || !block) {
+      return ran;
+    }
+    for (;;) {
+      if (std::exchange(woken_, false)) {
+        return ran;
+      }
+      ran += reap_ready(true) + run_one_deferred();
+      if (ran > 0 || std::exchange(woken_, false)) {
+        return ran;
+      }
     }
   }
-  iocp_reader(const iocp_reader&) = delete;
-  iocp_reader& operator=(const iocp_reader&) = delete;
 
-  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
-  // Only fully-aligned windows may ride the IOCP path (NO_BUFFERING
-  // rejects unaligned lengths); the tail goes through read_sync.
-  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t len) const
-      noexcept {
-    return file_.use_iocp && len % direct_align == 0;
+  // Posts a sentinel the port hands back with a null OVERLAPPED, which is
+  // how a blocked GetQueuedCompletionStatus is ended from another thread.
+  void wake() noexcept {
+    ::PostQueuedCompletionStatus(port_.get(), 0, wake_key, nullptr);
   }
 
-  void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
-    slots_[s] = {buf.data(), buf.size(), off, 0, false};
-    submit_read(s, 0);
+  [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+
+ private:
+  static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
+
+  [[nodiscard]] bool port_wanted() const noexcept { return async_requested_; }
+  [[nodiscard]] HANDLE port() const noexcept {
+    return port_ ? port_.get() : nullptr;
   }
 
-  // Reaps completions (issuing continuations for short reads) until slot
-  // `s` is fully read. GetQueuedCompletionStatus is wait_one: the
-  // OVERLAPPED pointer identifies the slot.
-  void wait(unsigned s) {
-    while (!slots_[s].ready) {
+  void adopt(file& f) noexcept { f.ctx_ = this; }
+
+  // A file about to close cancels what it still owes and waits it out: the
+  // requests target the engine's pool, which is freed just after, and a
+  // request still pending would write into it afterwards. Nothing of this
+  // file's is reported, which is the contract's teardown drain.
+  //
+  // One sharp edge, since the port is shared: a completion belonging to
+  // ANOTHER file can surface while this one drains, and it is reported
+  // normally rather than dropped -- losing it would strand an op that can
+  // never complete. So destroying one file of a multi-file context while
+  // a sibling has reads in flight can run that sibling's callback from a
+  // destructor. The engine never does it (one file per context), and a
+  // multi-file driver should idle a file before closing it.
+  void forget(file& f) noexcept {
+    if (!f.f_.use_iocp || f.inflight_ == 0) {
+      return;
+    }
+    ::CancelIoEx(f.f_.h(), nullptr);
+    while (f.inflight_ > 0) {
       DWORD bytes = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
-      const BOOL ok = ::GetQueuedCompletionStatus(file_.port.get(), &bytes,
-                                                  &key, &pov, INFINITE);
+      const BOOL ok =
+          ::GetQueuedCompletionStatus(port_.get(), &bytes, &key, &pov,
+                                      INFINITE);
       if (pov == nullptr) {
+        if (key == wake_key) {
+          woken_ = true;  // remember it; a later poll() still owes it
+          continue;
+        }
+        break;  // the port is unusable; no completion can arrive
+      }
+      read_op& op = *op_of(pov);
+      if (op.owner_file == &f) {
+        in_flight_--;
+        f.inflight_--;  // reaped, and deliberately not reported
+        continue;
+      }
+      if (ok == 0) {
+        complete(op, std::error_code(static_cast<int>(::GetLastError()),
+                                     std::system_category()));
+      } else if (bytes == 0) {
+        complete(op, std::error_code(EIO, std::generic_category()));
+      } else {
+        op.filled += bytes;
+        if (op.filled < op.len) {
+          issue(op);
+        } else {
+          complete(op, {});
+        }
+      }
+    }
+  }
+
+  void issue(read_op& op) {
+    std::memset(&op.ov, 0, sizeof(op.ov));
+    const std::uint64_t off = op.off + op.filled;
+    op.ov.Offset = static_cast<DWORD>(off);
+    op.ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+    if (::ReadFile(op.h, op.dst + op.filled,
+                   static_cast<DWORD>(op.len - op.filled), nullptr,
+                   &op.ov) == 0 &&
+        ::GetLastError() != ERROR_IO_PENDING) {
+      throw_winerr("ReadFile(async)");
+    }
+  }
+
+  void complete(read_op& op, std::error_code ec) noexcept {
+    in_flight_--;
+    if (op.owner_file != nullptr) {
+      static_cast<file*>(op.owner_file)->inflight_--;
+    }
+    op.done(&op, ec);
+  }
+
+  // The op is the record its OVERLAPPED is a member of. The caller keeps
+  // it at a fixed address from submit until its callback has run, which
+  // is what makes the walk back valid; it is the documented IOCP idiom
+  // and the reason read_op is the caller's type rather than the
+  // context's.
+  [[nodiscard]] static read_op* op_of(OVERLAPPED* pov) noexcept {
+    return CONTAINING_RECORD(pov, read_op, ov);
+  }
+
+  std::size_t reap_ready(bool block) {
+    std::size_t ran = 0;
+    for (;;) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      const BOOL ok = ::GetQueuedCompletionStatus(
+          port_.get(), &bytes, &key, &pov, block && ran == 0 ? INFINITE : 0);
+      if (pov == nullptr) {
+        if (ok == 0 && ::GetLastError() == WAIT_TIMEOUT) {
+          return ran;  // nothing more queued
+        }
+        if (key == wake_key) {
+          woken_ = true;
+          return ran;
+        }
         throw_winerr("GetQueuedCompletionStatus");
       }
-      --outstanding_;
-      const unsigned c = static_cast<unsigned>(pov - ovs_.data());
-      slot& st = slots_[c];
+      read_op& op = *op_of(pov);
       if (ok == 0) {
-        throw_winerr("iocp read");
+        complete(op, std::error_code(static_cast<int>(::GetLastError()),
+                                     std::system_category()));
+        ran++;
+        continue;
       }
       if (bytes == 0) {
-        throw std::system_error(EIO, std::generic_category(),
-                                "unexpected EOF (iocp)");
+        complete(op, std::error_code(EIO, std::generic_category()));
+        ran++;
+        continue;
       }
-      st.filled += bytes;
-      if (st.filled < st.len) {
-        submit_read(c, st.filled);
-      } else {
-        st.ready = true;
+      op.filled += bytes;
+      if (op.filled < op.len) {
+        issue(op);
+        continue;
       }
+      complete(op, {});
+      ran++;
     }
   }
 
-  // Positional synchronous read: a non-OVERLAPPED handle plus an
-  // OVERLAPPED offset blocks until complete. In iocp mode only unaligned
-  // tails reach this path; the !use_iocp guard makes it structural that
-  // the overlapped handle is never used synchronously.
-  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
-    const HANDLE use_h = file_.direct && !file_.use_iocp &&
-                                 buf.size() % direct_align == 0
-                             ? file_.h()
-                             : file_.plain.get();
+  std::size_t run_one_deferred() noexcept {
+    read_op* const next = deferred_.take();
+    if (next == nullptr) {
+      return 0;
+    }
+    read_op& op = *next;
+    std::error_code ec;
+    try {
+      read_sync(*op.sync_file, op.off, {op.dst, op.len});
+      op.filled = op.len;
+    } catch (const std::system_error& e) {
+      ec = e.code();
+    }
+    complete(op, ec);
+    return 1;
+  }
+
+  // A non-OVERLAPPED handle plus an OVERLAPPED offset blocks until
+  // complete. The use_iocp guard makes it structural that the overlapped
+  // handle is never used synchronously.
+  static void read_sync(win_file& f, std::uint64_t off,
+                        std::span<std::byte> buf) {
+    const HANDLE use_h =
+        f.direct && !f.use_iocp && buf.size() % direct_align == 0
+            ? f.h()
+            : f.plain.get();
     std::size_t got = 0;
     while (got < buf.size()) {
       OVERLAPPED ov{};
@@ -306,42 +496,11 @@ class iocp_reader {
     }
   }
 
- private:
-  struct slot {
-    std::byte* dst = nullptr;
-    std::size_t len = 0;
-    std::uint64_t off = 0;
-    std::size_t filled = 0;
-    bool ready = false;
-  };
-
-  // Queues one async read (or a short-read continuation from `from`).
-  void submit_read(unsigned s, std::size_t from) {
-    slot& st = slots_[s];
-    OVERLAPPED& ov = ovs_[s];
-    std::memset(&ov, 0, sizeof(ov));
-    const std::uint64_t off = st.off + from;
-    ov.Offset = static_cast<DWORD>(off);
-    ov.OffsetHigh = static_cast<DWORD>(off >> 32);
-    if (::ReadFile(file_.h(), st.dst + from,
-                   static_cast<DWORD>(st.len - from), nullptr, &ov) == 0 &&
-        ::GetLastError() != ERROR_IO_PENDING) {
-      throw_winerr("ReadFile(async)");
-    }
-    ++outstanding_;
-  }
-
-  std::vector<slot> slots_;
-  std::vector<OVERLAPPED> ovs_;  // one per slot; the SQE equivalent
-  std::uint64_t size_ = 0;
-  unsigned outstanding_ = 0;  // async reads in flight
-  std::string_view name_ = "readfile";
-  // Declared LAST so it is destroyed FIRST: the handles must close before
-  // ovs_ goes away. drain_cancelled() normally guarantees nothing is in
-  // flight by then, but it gives up early if the port itself has failed,
-  // and closing the handles is what cancels any request still holding an
-  // OVERLAPPED in that path.
-  win_file file_;  // plain (tail, fallback) + fast reopen + IOCP port
+  bool async_requested_ = true;
+  unique_handle port_;
+  deferred_ops<read_op> deferred_;
+  std::size_t in_flight_ = 0;
+  bool woken_ = false;
 };
 
 class iocp_writer {
@@ -542,7 +701,7 @@ class iocp_writer {
 // Definition-site conformance check (see uring_backend.hpp): fails here,
 // with the missed requirement named, the first time MSVC compiles this
 // header, before any engine instantiation exists.
-static_assert(reader_backend<iocp_reader>);
+static_assert(reader_context<iocp_context>);
 static_assert(writer_backend<iocp_writer>);
 
 }  // namespace blake3pp::detail::io_impl

@@ -89,65 +89,6 @@ class stdio_source {
 
 using stdio_context = sync_context<stdio_source>;
 
-class stdio_reader {
- public:
-  stdio_reader(const std::filesystem::path& path, const file_reader_options&,
-               unsigned) {
-    stream_ = std::fopen(path.string().c_str(), "rb");
-    if (stream_ == nullptr) {
-      throw_errno("fopen");
-    }
-    // Unchecked, these silently produce a nonsense size: a failed seek
-    // leaves ftell returning -1, which as an unsigned size is ~18 EiB, and
-    // the engine then computes a huge window count that fails obscurely.
-    if (std::fseek(stream_, 0, SEEK_END) != 0) {
-      throw_errno("fseek(end)");
-    }
-    const std::int64_t end = tell64(stream_);
-    if (end < 0) {
-      throw_errno("ftell");
-    }
-    size_ = static_cast<std::uint64_t>(end);
-  }
-  ~stdio_reader() {
-    if (stream_ != nullptr) {
-      std::fclose(stream_);
-    }
-  }
-  stdio_reader(const stdio_reader&) = delete;
-  stdio_reader& operator=(const stdio_reader&) = delete;
-
-  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
-  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t) const noexcept {
-    return false;
-  }
-
-  void start(unsigned, std::uint64_t, std::span<std::byte>) {
-    assert(false && "stdio backend has no async path");
-  }
-  void wait(unsigned) { assert(false && "stdio backend has no async path"); }
-
-  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
-    if (seek64(stream_, off) != 0) {
-      throw_errno("fseek");
-    }
-    if (std::fread(buf.data(), 1, buf.size(), stream_) != buf.size()) {
-      // Distinguish a real read error from a short read at EOF; the engine
-      // never asks for more than the file holds, so EOF here means the file
-      // was truncated while it was open. errno is taken before ferror(),
-      // which is not required to preserve it.
-      const int err = errno;
-      throw std::system_error(std::ferror(stream_) != 0 ? err : EIO,
-                              std::generic_category(), "fread");
-    }
-  }
-
- private:
-  std::FILE* stream_ = nullptr;
-  std::uint64_t size_ = 0;
-};
-
 class stdio_writer {
  public:
   stdio_writer(const std::filesystem::path& path, const file_writer_options&,
@@ -193,7 +134,6 @@ class stdio_writer {
 
 // Definition-site conformance check (see uring_backend.hpp).
 static_assert(reader_context<stdio_context>);
-static_assert(reader_backend<stdio_reader>);
 static_assert(writer_backend<stdio_writer>);
 
 }  // namespace blake3pp::detail::io_impl

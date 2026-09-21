@@ -7,11 +7,11 @@
 // aliases, so a backend drifting from the contract fails loudly at this
 // seam, not somewhere inside the engine.
 //
-// The reader side names a whole engine rather than a backend because the
-// two contracts coexist while the platforms migrate: Linux and the POSIX
-// and stdio fallbacks run polled_reader_engine over a reader_context,
-// Windows and macOS still run reader_engine over the slot-based
-// reader_backend. Internal to src/io/, never installed.
+// The reader side names a whole engine rather than a backend, which is
+// what lets a platform bring its own: every one of them now runs
+// polled_reader_engine over a reader_context, and the alias is the seam
+// where a future engine could differ again. Internal to src/io/, never
+// installed.
 
 #include "io/engine.hpp"
 
@@ -24,13 +24,13 @@ using native_writer = uring_writer;
 #elif defined(_WIN32)
 #include "io/iocp_backend.hpp"
 namespace blake3pp::detail::io_impl {
-using native_reader_engine = reader_engine<iocp_reader>;
+using native_reader_engine = polled_reader_engine<iocp_context>;
 using native_writer = iocp_writer;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__APPLE__)
 #include "io/gcd_backend.hpp"
 namespace blake3pp::detail::io_impl {
-using native_reader_engine = reader_engine<gcd_reader>;
+using native_reader_engine = polled_reader_engine<gcd_context>;
 using native_writer = gcd_writer;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__unix__)

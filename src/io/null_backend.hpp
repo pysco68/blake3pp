@@ -14,7 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <string>
+#include <string_view>
 
 #include "io/backend.hpp"
 
@@ -31,6 +31,7 @@ class null_context {
     file(null_context&, std::uint64_t size) noexcept : size_(size) {}
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return "null"; }
 
    private:
     std::uint64_t size_ = 0;
@@ -42,12 +43,6 @@ class null_context {
   // Queued reads simply never complete if the context dies first, which
   // is the contract's "drain without running callbacks" for a source
   // that has nothing in flight in the first place.
-
-  // True: the engine's async path is what this measures. Nothing is
-  // deferred, so no window takes the synchronous route.
-  [[nodiscard]] bool async() const noexcept { return true; }
-
-  [[nodiscard]] std::string describe(const file&) const { return "null"; }
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
                    read_op& op) noexcept {

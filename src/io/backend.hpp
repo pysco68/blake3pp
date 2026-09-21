@@ -3,29 +3,27 @@
 // The portable contract between the file_reader/file_writer engines and
 // the per-OS I/O backends. 
 //
-// Two contract rules that span every operation, so they live here rather
+// The two sides have different shapes. A WRITER backend is per file and
+// owns its slots: start_write() names a buffer by slot and wait_slot()
+// blocks for it. A READER runs on reader_context, where the completion
+// mechanism is separate from the file, a read is named by a caller-owned
+// operation, and completions arrive as callbacks.
+//
+// Three contract rules span every operation, so they live here rather
 // than on any one requirement below:
-//  - Slot exclusivity: start()/start_write() may only be called for a
+//  - Slot exclusivity (writers): start_write() may only be called for a
 //    slot the backend claimed via wants_async(...), and only while
 //    nothing else is outstanding on that slot.
-//  - Teardown drain: a backend's destructor drains every in-flight
-//    operation. The engines declare their buffer pool member BEFORE the
-//    backend member precisely so the drain runs before the pool is
-//    freed.
-//
-// The reader side is mid-migration. reader_backend below is the original
-// contract: one backend per file, reads named by slot, completed inside a
-// blocking wait(slot). reader_context is its replacement: the completion
-// mechanism is separate from the file, a read is named by a caller-owned
-// operation, and completions are reported through callbacks that run in
-// poll(). Windows and macOS still use the first; everything else uses the
-// second. A third rule governs it:
-//  - Callback discipline: a read's callback runs ONLY inside poll(), on
-//    the thread that called poll(). Never from submit_read(), flush(),
-//    wake() or a destructor. Everything a later phase wants to build on
-//    this -- several windows, then several files, driven as senders from
-//    one thread -- depends on there being exactly one place where caller
-//    code regains control.
+//  - Teardown drain: a backend's or context's destructor drains every
+//    in-flight operation, running no callback. The engines declare their
+//    buffer pool member BEFORE it precisely so the drain runs before the
+//    pool is freed.
+//  - Callback discipline (readers): a read's callback runs ONLY inside
+//    poll(), on the thread that called poll(). Never from submit_read(),
+//    flush(), wake() or a destructor. Everything a later phase wants to
+//    build on this -- several windows, then several files, driven as
+//    senders from one thread -- depends on there being exactly one place
+//    where caller code regains control.
 // Internal to src/io/, never installed.
 
 #include <cerrno>
@@ -176,9 +174,13 @@ struct read_op_base {
 // A context owns the completion mechanism (a ring, a port, a queue) and
 // nothing about any particular file. C::file is an open file bound to a
 // context: constructed from (C&, const std::filesystem::path&, bool
-// direct_io) and exposing size(). A source that has no path constructs
-// its file differently -- null_context::file takes a size -- which is why
-// construction is described here rather than required below.
+// direct_io) and exposing size() and name(). A source that has no path
+// constructs its file differently -- null_context::file takes a size --
+// which is why construction is described here rather than required below.
+//
+// name() is where the degradation ladder becomes visible: it is settled
+// when the file is opened, against the context that opened it, and
+// file_reader::backend() reports it verbatim.
 //
 // Lifetime: every C::file must be destroyed before its context, and the
 // context's destructor drains every in-flight read WITHOUT running
@@ -196,11 +198,9 @@ concept reader_context = requires(C c, const C cc, typename C::file& f,
   typename C::read_op;
   requires std::derived_from<typename C::read_op, read_op_base>;
   requires std::default_initializable<typename C::read_op>;
-  // Is the context's async engine running at all? False means every read
-  // is served synchronously inside poll().
-  { cc.async() } noexcept -> std::same_as<bool>;
-  // The file_reader::backend() string for this file on this context.
-  { cc.describe(f) } -> std::convertible_to<std::string>;
+  // The file_reader::backend() string, computed when the file was opened
+  // and owned by it: the engine hands it straight to file_reader.
+  { f.name() } noexcept -> std::same_as<std::string_view>;
   // Queues one read of exactly buf.size() bytes at off. No syscall, no
   // callback. A window the file cannot take asynchronously (an unaligned
   // length under O_DIRECT, or no ring at all) goes on the context's
@@ -218,6 +218,46 @@ concept reader_context = requires(C c, const C cc, typename C::file& f,
   // return. Idempotent; a wake with no blocked poll is remembered.
   { c.wake() } noexcept;
   { cc.in_flight() } noexcept -> std::same_as<std::size_t>;
+};
+
+// The queue of reads a context could not hand to its async engine --
+// an unaligned length under O_DIRECT or NO_BUFFERING, or no engine at
+// all. Written once: every context that has both paths would otherwise
+// carry its own copy of the same four pointers, and the rule that only
+// ONE of these runs per poll() is the part that must not drift, since it
+// is what bounds how long a caller waits to get control back.
+template <class Op>
+class deferred_ops {
+ public:
+  void push(Op& op) noexcept {
+    op.next_deferred = nullptr;
+    if (tail_ == nullptr) {
+      head_ = tail_ = &op;
+    } else {
+      tail_->next_deferred = &op;
+      tail_ = &op;
+    }
+  }
+
+  // The next one to serve, or null. Removed from the queue by the act of
+  // taking it: the caller owes its callback either way.
+  [[nodiscard]] Op* take() noexcept {
+    Op* const op = head_;
+    if (op == nullptr) {
+      return nullptr;
+    }
+    head_ = op->next_deferred;
+    if (head_ == nullptr) {
+      tail_ = nullptr;
+    }
+    return op;
+  }
+
+  [[nodiscard]] bool empty() const noexcept { return head_ == nullptr; }
+
+ private:
+  Op* head_ = nullptr;
+  Op* tail_ = nullptr;
 };
 
 // Every synchronous source has the same shape under the contract:
@@ -243,6 +283,9 @@ class sync_context {
         : src_(path, direct_io) {}
 
     [[nodiscard]] std::uint64_t size() const noexcept { return src_.size(); }
+    [[nodiscard]] std::string_view name() const noexcept {
+      return src_.name();
+    }
 
    private:
     friend class sync_context;
@@ -255,31 +298,20 @@ class sync_context {
   // Nothing is in flight by construction, so there is nothing to drain
   // and no callback to suppress: the queued ops simply never complete.
 
-  [[nodiscard]] bool async() const noexcept { return false; }
-
-  [[nodiscard]] std::string describe(const file& f) const {
-    return std::string(f.src_.name());
-  }
-
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
     op.buf = buf;
     op.off = off;
     op.src = &f.src_;
-    op.next_deferred = nullptr;
-    if (tail_ == nullptr) {
-      head_ = tail_ = &op;
-    } else {
-      tail_->next_deferred = &op;
-      tail_ = &op;
-    }
+    queue_.push(op);
     queued_++;
   }
 
   void flush() noexcept {}
 
   std::size_t poll(bool block) {
-    if (head_ == nullptr) {
+    read_op* const next = queue_.take();
+    if (next == nullptr) {
       // Nothing to do: a blocking poll here is the driver waiting for
       // another thread, which is what wake() is for.
       if (block) {
@@ -289,11 +321,7 @@ class sync_context {
       }
       return 0;
     }
-    read_op& op = *head_;
-    head_ = op.next_deferred;
-    if (head_ == nullptr) {
-      tail_ = nullptr;
-    }
+    read_op& op = *next;
     queued_--;
     std::error_code ec;
     try {
@@ -310,55 +338,10 @@ class sync_context {
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
 
  private:
-  read_op* head_ = nullptr;
-  read_op* tail_ = nullptr;
+  deferred_ops<read_op> queue_;
   std::size_t queued_ = 0;
   poll_waiter waiter_;
 };
-
-template <class B>
-concept reader_backend =
-    // Opens the file and decides (at runtime, per feature) how much of
-    // the requested fast path (direct I/O, async engine) it can actually
-    // deliver. The unsigned is the engine's queue depth: the most slots
-    // that can ever be outstanding at once.
-    std::constructible_from<B, const std::filesystem::path&,
-                            const file_reader_options&, unsigned> &&
-    requires(B b, const B cb, unsigned slot, std::uint64_t off,
-             std::span<std::byte> buf) {
-      { cb.size() } noexcept -> std::same_as<std::uint64_t>;
-      { cb.name() } noexcept -> std::convertible_to<std::string_view>;
-      // The whole runtime-degradation ladder folded into one question the
-      // engine asks per window: "may THIS (offset, length) ride your
-      // async path?"
-      //
-      //   - uring and IOCP answer engaged && length aligned, because
-      //     O_DIRECT and NO_BUFFERING reject unaligned lengths.
-      //   - GCD answers engaged. F_NOCACHE has no alignment contract, so
-      //     the tail rides too.
-      //   - sync backends answer never.
-      //
-      // The engine does not learn why. false routes the window to
-      // read_sync at delivery time, and that is all it needs.
-      //
-      // Current backends ignore the offset, since engine windows start at
-      // 64 KiB multiples and it is therefore always granule-aligned. It is
-      // part of the question because O_DIRECT constrains offset alignment
-      // too, and a future engine might not guarantee that.
-      { cb.wants_async(off, std::size_t{}) } noexcept -> std::same_as<bool>;
-      // Begins an async read of buf at off, owned by `slot`; legal only
-      // after wants_async() said yes for exactly this window.
-      { b.start(slot, off, buf) };
-      // Blocks until `slot`'s read fully completes, reissuing short
-      // reads and absorbing OTHER slots' completions when the OS delivers
-      // them out of order. Throws std::system_error on failure, including
-      // failures a worker thread captured earlier.
-      { b.wait(slot) };
-      // Positional synchronous read: completes fully or throws. Picks the
-      // right handle internally (direct vs buffered) for the length's
-      // alignment; the unaligned-tail dance is backend business.
-      { b.read_sync(off, buf) };
-    };
 
 template <class B>
 concept writer_backend =

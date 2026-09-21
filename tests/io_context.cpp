@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <memory>
 #include <optional>
 #include <ostream>
 #include <random>
@@ -42,6 +43,12 @@
 #endif
 #if defined(__linux__)
 #include "io/uring_backend.hpp"
+#endif
+#if defined(_WIN32)
+#include "io/iocp_backend.hpp"
+#endif
+#if defined(__APPLE__)
+#include "io/gcd_backend.hpp"
 #endif
 
 namespace {
@@ -80,15 +87,21 @@ struct temp_file {
 };
 
 // One counted completion. `owner` points here, which is the only thing
-// the contract says that field is for.
+// the contract says that field is for. The thread id is recorded because
+// "callbacks run inside poll()" means on the caller's thread: a backend
+// whose completions arrive on its own workers (GCD) has to hand them over
+// rather than call from there, and nothing else in the suite would
+// notice if it did not.
 struct probe {
   int calls = 0;
   std::error_code ec{};
+  std::thread::id ran_on{};
   static void on_done(io_impl::read_op_base* base,
                       std::error_code e) noexcept {
     auto* const p = static_cast<probe*>(base->owner);
     p->calls++;
     p->ec = e;
+    p->ran_on = std::this_thread::get_id();
   }
 };
 
@@ -110,6 +123,7 @@ class fake_context {
    public:
     file(fake_context&, std::uint64_t size) noexcept : size_(size) {}
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return "fake"; }
 
    private:
     std::uint64_t size_ = 0;
@@ -118,7 +132,6 @@ class fake_context {
   fake_context(const io_impl::reader_context_options&, unsigned) noexcept {}
 
   [[nodiscard]] bool async() const noexcept { return true; }
-  [[nodiscard]] std::string describe(const file&) const { return "fake"; }
 
   void submit_read(file&, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
@@ -212,6 +225,10 @@ void check_callback_discipline(std::string_view tag, MakeFile make_file) {
   CHECK(!pa.ec);
   CHECK(!pb.ec);
   CHECK(ctx.in_flight() == 0);
+  // On the thread that called poll(), not on whatever thread the backend
+  // happens to complete on.
+  CHECK(pa.ran_on == std::this_thread::get_id());
+  CHECK(pb.ran_on == std::this_thread::get_id());
 }
 
 }  // namespace
@@ -231,6 +248,18 @@ TEST_CASE("callbacks run only inside poll") {
   check_callback_discipline<io_impl::pread_context>(
       "pread", [&](io_impl::pread_context& c) {
         return io_impl::pread_context::file(c, f.path, /*direct_io=*/false);
+      });
+#endif
+#if defined(_WIN32)
+  check_callback_discipline<io_impl::iocp_context>(
+      "iocp", [&](io_impl::iocp_context& c) {
+        return io_impl::iocp_context::file(c, f.path, /*direct_io=*/false);
+      });
+#endif
+#if defined(__APPLE__)
+  check_callback_discipline<io_impl::gcd_context>(
+      "gcd", [&](io_impl::gcd_context& c) {
+        return io_impl::gcd_context::file(c, f.path, /*direct_io=*/false);
       });
 #endif
   check_callback_discipline<io_impl::stdio_context>(
@@ -328,6 +357,18 @@ TEST_CASE("two files share one context") {
     run(ctx);
   }
 #endif
+#if defined(_WIN32)
+  {
+    io_impl::iocp_context ctx({}, 4);
+    run(ctx);
+  }
+#endif
+#if defined(__APPLE__)
+  {
+    io_impl::gcd_context ctx({}, 4);
+    run(ctx);
+  }
+#endif
 }
 
 TEST_CASE("wake() releases a blocked poll from another thread") {
@@ -361,26 +402,45 @@ TEST_CASE("wake() releases a blocked poll from another thread") {
     check(ctx);
   }
 #endif
+#if defined(_WIN32)
+  {
+    io_impl::iocp_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(__APPLE__)
+  {
+    io_impl::gcd_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
   {
     io_impl::null_context ctx({}, 4);
     check(ctx);
   }
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
 // The destructor drains without completing anything into the caller's
 // hands: the pool outlives the context here, so a callback running from
 // teardown would be visible, and so would a kernel write into freed
 // memory (which is what ASan is watching for).
 TEST_CASE("a context destroyed with reads in flight runs no callback") {
+#if defined(__linux__)
+  using ctx_type = io_impl::uring_context;
+#elif defined(_WIN32)
+  using ctx_type = io_impl::iocp_context;
+#else
+  using ctx_type = io_impl::gcd_context;
+#endif
   const auto content = pattern(8 * 1024 * 1024, 3);
   const temp_file f(content);
   std::vector<std::byte> buf(content.size());
   probe p;
   {
-    io_impl::uring_context ctx({}, 4);
-    io_impl::uring_context::file file(ctx, f.path, false);
-    io_impl::uring_context::read_op op{};
+    ctx_type ctx({}, 4);
+    ctx_type::file file(ctx, f.path, false);
+    ctx_type::read_op op{};
     op.done = &probe::on_done;
     op.owner = &p;
     ctx.submit_read(file, 0, std::span{buf}, op);
@@ -391,6 +451,45 @@ TEST_CASE("a context destroyed with reads in flight runs no callback") {
   CHECK(p.calls == 0);
 }
 #endif
+
+// A wake nobody consumed is still queued when the context dies: an
+// eventfd counter, a sentinel in the completion port, a signalled
+// condition variable. Destruction must not wait for it and must not turn
+// it into a callback.
+TEST_CASE("a context destroyed with a wake pending tears down cleanly") {
+  const auto check = [](auto&& make) {
+    {
+      auto ctx = make();
+      ctx->wake();
+    }
+    // Twice, so a wake consumed by the destructor of one context cannot
+    // hide a second that was never armed.
+    {
+      auto ctx = make();
+      ctx->wake();
+      ctx->wake();
+    }
+    CHECK(true);  // reaching here without a hang or a crash is the check
+  };
+#if defined(__linux__)
+  check([] { return std::make_unique<io_impl::uring_context>(
+                 io_impl::reader_context_options{}, 4u); });
+#endif
+#if defined(__unix__) || defined(__APPLE__)
+  check([] { return std::make_unique<io_impl::pread_context>(
+                 io_impl::reader_context_options{}, 4u); });
+#endif
+#if defined(_WIN32)
+  check([] { return std::make_unique<io_impl::iocp_context>(
+                 io_impl::reader_context_options{}, 4u); });
+#endif
+#if defined(__APPLE__)
+  check([] { return std::make_unique<io_impl::gcd_context>(
+                 io_impl::reader_context_options{}, 4u); });
+#endif
+  check([] { return std::make_unique<io_impl::null_context>(
+                 io_impl::reader_context_options{}, 4u); });
+}
 
 TEST_CASE("the null source hashes the pattern it was filled with") {
   // A size that is not a window multiple: the last window is short, which
@@ -461,6 +560,20 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
             {false, true, true, "pread" + why},
             {false, false, true, "pread"}};
   }
+#elif defined(__APPLE__)
+  // F_NOCACHE is per-fd and tolerates any alignment, so there is no
+  // unaligned-tail rung: the ladder is GCD or not, cache or not.
+  rows = {{true, true, true, "gcd+nocache"},
+          {false, true, true, "gcd"},
+          {true, false, true, "pread+nocache"},
+          {false, false, true, "pread"}};
+#elif defined(_WIN32)
+  // NO_BUFFERING and the port are per-open flags, so the ladder is the
+  // same shape: what engaged, and what it fell back to.
+  rows = {{true, true, true, "iocp+direct"},
+          {false, true, true, "iocp"},
+          {true, false, true, "readfile+direct"},
+          {false, false, true, "readfile"}};
 #else
   rows = {{false, false, true, ""}};
 #endif
@@ -484,6 +597,61 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
     }
     CHECK(out == content);
   }
+}
+
+// The callback must run on whichever thread called poll(), not on the
+// one that submitted and not on a backend worker. Driving poll() from a
+// second thread is what tells those three apart.
+TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
+  const auto content = pattern(64 * 1024, 41);
+  const temp_file f(content);
+  const auto check = [&](auto& ctx, auto&& make_file) {
+    auto file = make_file(ctx);
+    std::vector<std::byte> buf(content.size());
+    typename std::remove_reference_t<decltype(ctx)>::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, std::span{buf}, op);
+    ctx.flush();
+    std::thread::id driver_id{};
+    std::thread driver([&] {
+      driver_id = std::this_thread::get_id();
+      while (p.calls == 0) {
+        ctx.poll(true);
+      }
+    });
+    driver.join();
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    CHECK(p.ran_on == driver_id);
+    CHECK(p.ran_on != std::this_thread::get_id());
+    CHECK(buf == content);
+  };
+#if defined(__linux__)
+  {
+    io_impl::uring_context ctx({}, 4);
+    check(ctx, [&](io_impl::uring_context& c) {
+      return io_impl::uring_context::file(c, f.path, false);
+    });
+  }
+#endif
+#if defined(__APPLE__)
+  {
+    io_impl::gcd_context ctx({}, 4);
+    check(ctx, [&](io_impl::gcd_context& c) {
+      return io_impl::gcd_context::file(c, f.path, false);
+    });
+  }
+#endif
+#if defined(_WIN32)
+  {
+    io_impl::iocp_context ctx({}, 4);
+    check(ctx, [&](io_impl::iocp_context& c) {
+      return io_impl::iocp_context::file(c, f.path, false);
+    });
+  }
+#endif
 }
 
 }  // TEST_SUITE

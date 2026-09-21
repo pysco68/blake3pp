@@ -1,10 +1,11 @@
 #pragma once
 
 // The two portable I/O engines, written exactly once as class templates
-// constrained by the backend concepts (io/backend.hpp). The public
-// file_reader/file_writer TUs instantiate them with the platform backend
+// constrained by the concepts in io/backend.hpp: the reader over
+// reader_context, the writer over writer_backend. The public
+// file_reader/file_writer TUs instantiate them with what
 // backend_select.hpp picks; the tests instantiate them again with the
-// off-platform POSIX/stdio backends, so those stay compiled AND executed
+// off-platform contexts and backends, so those stay compiled AND executed
 // on every platform even though the selector never chooses them there.
 // The constraint is the contract: an engine can only speak the concept's
 // vocabulary, and a backend drifting from it fails at the instantiation
@@ -32,152 +33,6 @@
 #include "io/backend.hpp"
 
 namespace blake3pp::detail::io_impl {
-
-// The read-side window/slot engine: windows are delivered strictly in
-// file order while later windows stream in behind them; release()
-// recycles a buffer slot, which is what creates backpressure. Every
-// window is just "async in flight" (wait) or "read lazily at delivery"
-// (read_sync); the backend decided which via wants_async().
-template <reader_backend B>
-class reader_engine {
- public:
-  using window = file_reader::window;
-
-  reader_engine(const std::filesystem::path& path,
-                const file_reader_options& opts)
-      : window_(rounded_window_bytes(opts.window_bytes)),
-        qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
-        slots_(qd_),
-        pool_(std::size_t{qd_} * window_),
-        backend_(path, opts, qd_) {
-    num_windows_ = (backend_.size() + window_ - 1) / window_;
-    const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
-    for (unsigned s = 0; s < initial; ++s) {
-      assign(s);
-    }
-  }
-
-  [[nodiscard]] std::uint64_t file_size() const noexcept {
-    return backend_.size();
-  }
-  [[nodiscard]] std::string_view backend_name() const noexcept {
-    return backend_.name();
-  }
-
-  std::optional<window> next() {
-    // A submission that fails inside release() cannot be reported there.
-    // release() is noexcept, because callers pair it with next() in a
-    // tight loop. Letting it throw would call std::terminate, including
-    // from hash_file(path, ec, opts), whose whole contract is to turn I/O
-    // failures into an error_code.
-    //
-    // So the failure is latched here instead, in the function already
-    // documented as throwing. The latch is permanent: the slot whose
-    // submission failed holds a window that can never be delivered, so
-    // there is no way to continue reading.
-    if (submit_failed_) {
-      std::rethrow_exception(submit_failed_);
-    }
-    if (next_deliver_ >= num_windows_) {
-      return std::nullopt;
-    }
-    const std::uint64_t want = next_deliver_;
-    unsigned s = 0;
-    for (; s < qd_; ++s) {
-      if (slots_[s].assigned && slots_[s].win == want) {
-        break;
-      }
-    }
-    // release() reassigns eagerly, so `want` has a slot unless the caller
-    // holds every one of them, which is the documented queue_depth limit.
-    if (s == qd_) {
-      throw std::system_error(EINVAL, std::generic_category(),
-                              "next() with every window slot still held");
-    }
-    slot_state& st = slots_[s];
-    if (st.started) {
-      backend_.wait(s);
-    } else {
-      backend_.read_sync(want * window_, {buf(s), st.target});
-    }
-    st.held = true;
-    next_deliver_++;
-    return window{buf(s), st.target, want * window_,
-                  want + 1 == num_windows_, s};
-  }
-
-  void release(const window& w) noexcept {
-    // A slot this reader never handed out, or one released twice, cannot
-    // be reported here (noexcept); it is latched like a failed submission
-    // and surfaces at the next next().
-    if (w.slot >= qd_ || !slots_[w.slot].held) {
-      if (!submit_failed_) {
-        submit_failed_ = std::make_exception_ptr(std::system_error(
-            EINVAL, std::generic_category(),
-            "release() of a window this reader did not hand out"));
-      }
-      return;
-    }
-    slot_state& st = slots_[w.slot];
-    st.assigned = false;
-    st.held = false;
-    if (next_submit_ < num_windows_ && !submit_failed_) {
-      // assign() submits real I/O (io_uring_enter / ReadFile), which can
-      // fail. Latch it for next() to rethrow; see the note there.
-      try {
-        assign(w.slot);
-      } catch (...) {
-        submit_failed_ = std::current_exception();
-      }
-    }
-  }
-
- private:
-  struct slot_state {
-    std::uint64_t win = 0;   // window index assigned to this slot
-    std::size_t target = 0;  // bytes this window must read
-    bool assigned = false;
-    bool started = false;  // async read in flight (wait) vs lazy (read_sync)
-    bool held = false;     // delivered, not yet released
-  };
-
-  std::size_t window_len(std::uint64_t w) const noexcept {
-    const std::uint64_t off = w * window_;
-    const std::uint64_t rest = backend_.size() - off;
-    return rest < window_ ? static_cast<std::size_t>(rest) : window_;
-  }
-
-  std::byte* buf(unsigned slot) const noexcept {
-    return pool_.data + static_cast<std::size_t>(slot) * window_;
-  }
-
-  void assign(unsigned s) {
-    slot_state& st = slots_[s];
-    st.win = next_submit_++;
-    st.target = window_len(st.win);
-    st.assigned = true;
-    st.held = false;
-    st.started = backend_.wants_async(st.win * window_, st.target);
-    if (st.started) {
-      backend_.start(s, st.win * window_, {buf(s), st.target});
-    }
-    // Slots the backend declined are read synchronously at delivery time.
-  }
-
-  std::size_t window_;
-  unsigned qd_;
-  std::uint64_t num_windows_ = 0;
-  std::uint64_t next_submit_ = 0;   // next window index to assign to a slot
-  std::uint64_t next_deliver_ = 0;  // next window index to hand out
-  std::exception_ptr submit_failed_;  // latched by release(), thrown by next()
-  std::vector<slot_state> slots_;
-
-  // Declaration order is the teardown contract: the backend destructs
-  // FIRST, draining any in-flight reads that target the pool, and the
-  // pool is freed after. Do not reorder these two members.
-  aligned_pool pool_;
-  B backend_;
-};
 
 // The read-side window/slot engine on the completion-callback contract
 // (reader_context in io/backend.hpp). Observably identical to
@@ -208,7 +63,6 @@ class polled_reader_engine {
         pool_(std::size_t{qd_} * window_),
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
         file_(ctx_, path, opts.direct_io) {
-    name_ = ctx_.describe(file_);
     num_windows_ = (file_.size() + window_ - 1) / window_;
     const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
     for (unsigned s = 0; s < initial; ++s) {
@@ -231,7 +85,6 @@ class polled_reader_engine {
         pool_(std::size_t{qd_} * window_),
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
         file_(ctx_, size) {
-    name_ = ctx_.describe(file_);
     num_windows_ = (file_.size() + window_ - 1) / window_;
     const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
     for (unsigned s = 0; s < initial; ++s) {
@@ -244,7 +97,7 @@ class polled_reader_engine {
     return file_.size();
   }
   [[nodiscard]] std::string_view backend_name() const noexcept {
-    return name_;
+    return file_.name();
   }
 
   // The buffer arena, for callers that must fill it before the first read
@@ -357,7 +210,6 @@ class polled_reader_engine {
   std::uint64_t next_submit_ = 0;
   std::uint64_t next_deliver_ = 0;
   std::exception_ptr submit_failed_;
-  std::string name_;
   std::vector<slot_state> slots_;
 
   // Declaration order is the teardown contract, one link longer than the

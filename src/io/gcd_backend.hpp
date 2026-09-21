@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <mutex>
 #include <span>
+#include <utility>
 #include <system_error>
 #include <vector>
 
@@ -99,101 +100,128 @@ struct gcd_pump {
   }
 };
 
-class gcd_reader {
+// The Darwin reader context: one dispatch group, any number of files,
+// reads named by the caller's read_op.
+//
+// Completions arrive on GCD worker threads, which must NOT run the
+// callback: a worker pushes the finished op onto an internal list and
+// signals, and poll() drains that list on the thread that called it. The
+// signal is the contract's poll_waiter, the same primitive wake() uses,
+// so a blocked poll has exactly one thing to wait on whether the news is
+// "a read finished" or "another thread wants you back".
+class gcd_context {
  public:
-  gcd_reader(const std::filesystem::path& path,
-             const file_reader_options& opts, unsigned nslots) {
-    f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    size_ = f_.stat_size();
-    // Darwin's cache bypass is per-fd, not per-open, and tolerates any
-    // alignment, so one fd serves every window, tail included.
-    if (opts.direct_io && set_nocache(f_.fd_plain)) {
-      f_.direct = true;
-    }
-    name_ = f_.direct ? "pread+nocache" : "pread";
-    if (opts.async && pump_.init()) {
-      use_gcd_ = true;
-      slots_.resize(nslots);
-      tasks_.resize(nslots);
-      for (unsigned s = 0; s < nslots; ++s) {
-        tasks_[s] = {this, s};
-      }
-      name_ = f_.direct ? "gcd+nocache" : "gcd";
-    }
-  }
-
-  // In-flight workers write into the engine's buffer pool: wait them out
-  // here, before the pool member (declared before this backend in the
-  // engine) is freed. This is the GCD flavor of the IOCP cancel-and-drain
-  // rule.
-  ~gcd_reader() { pump_.destroy(); }
-  gcd_reader(const gcd_reader&) = delete;
-  gcd_reader& operator=(const gcd_reader&) = delete;
-
-  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
-  // Every window, the unaligned tail included, takes the async path:
-  // F_NOCACHE has no alignment contract, the kernel just serves unaligned
-  // edges through the cache.
-  [[nodiscard]] bool wants_async(std::uint64_t, std::size_t) const noexcept {
-    return use_gcd_;
-  }
-
-  void start(unsigned s, std::uint64_t off, std::span<std::byte> buf) {
-    slot& st = slots_[s];
-    st.dst = buf.data();
-    st.len = buf.size();
-    st.off = off;
-    st.filled = 0;
-    st.error = 0;
-    st.ready = false;
-    pump_.submit(&gcd_reader::run_read, &tasks_[s]);
-  }
-
-  // Blocks until slot s completes; throws the worker's deferred errno.
-  // ready/error are written under the pump lock, so even the "is it done
-  // already" check lives here; an unlocked peek would be a data race.
-  void wait(unsigned s) {
-    slot& st = slots_[s];
-    std::unique_lock<std::mutex> lk(pump_.m);
-    pump_.cv.wait(lk, [&] { return st.ready; });
-    if (st.error != 0) {
-      throw std::system_error(st.error, std::generic_category(),
-                              "gcd pread");
-    }
-  }
-
-  void read_sync(std::uint64_t off, std::span<std::byte> buf) {
-    f_.pread_all(f_.fd_plain, buf.data(), buf.size(), off);
-  }
-
- private:
-  struct slot {
+  struct read_op : read_op_base {
     std::byte* dst = nullptr;
     std::size_t len = 0;
     std::uint64_t off = 0;
     std::size_t filled = 0;
-    int error = 0;  // errno captured by the worker; thrown at wait()
-    bool ready = false;
-  };
-  struct task {
-    gcd_reader* self = nullptr;
-    unsigned s = 0;
+    int fd = -1;
+    int error = 0;              // errno captured by the worker
+    posix_file* sync_file = nullptr;  // the deferred path needs the pair
+    gcd_context* ctx = nullptr;
+    read_op* next_deferred = nullptr;  // queued, not yet read
+    read_op* next_done = nullptr;      // finished, not yet reported
   };
 
-  // Runs on a GCD worker: fills the slot's buffer with one positional
-  // read loop, then publishes completion under the pump lock. noexcept:
-  // errors travel through slot::error to the waiting thread.
-  static void run_read(void* ctx) noexcept {
-    const task t = *static_cast<task*>(ctx);
-    gcd_reader& r = *t.self;
-    slot& st = r.slots_[t.s];
+  class file {
+   public:
+    file(gcd_context& ctx, const std::filesystem::path& path,
+         bool direct_io) {
+      f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      size_ = f_.stat_size();
+      // Darwin's cache bypass is per-fd, not per-open, and tolerates any
+      // alignment, so one fd serves every window, tail included.
+      if (direct_io && set_nocache(f_.fd_plain)) {
+        f_.direct = true;
+      }
+      name_ = ctx.use_gcd_ ? (f_.direct ? "gcd+nocache" : "gcd")
+                          : (f_.direct ? "pread+nocache" : "pread");
+    }
+
+    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return name_; }
+
+   private:
+    friend class gcd_context;
+    posix_file f_;
+    std::uint64_t size_ = 0;
+    std::string_view name_ = "pread";
+  };
+
+  gcd_context(const reader_context_options& opts, unsigned) {
+    if (opts.async && pump_.init()) {
+      use_gcd_ = true;
+    }
+  }
+  gcd_context(const gcd_context&) = delete;
+  gcd_context& operator=(const gcd_context&) = delete;
+
+  // In-flight workers write into the engine's buffer pool, which is freed
+  // just after this: wait them out. Ops they finished on the way are left
+  // on the done list and deliberately never reported, which is the
+  // contract's teardown drain. A wake nobody consumed dies with the
+  // waiter and needs no nudge: nothing here waits on it.
+  ~gcd_context() { pump_.destroy(); }
+
+  void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
+                   read_op& op) {
+    op.dst = buf.data();
+    op.len = buf.size();
+    op.off = off;
+    op.filled = 0;
+    op.error = 0;
+    op.fd = f.f_.fd_plain;
+    op.sync_file = &f.f_;
+    op.ctx = this;
+    op.next_done = nullptr;
+    in_flight_++;
+    if (use_gcd_) {
+      pump_.submit(&gcd_context::run_read, &op);
+    } else {
+      deferred_.push(op);
+    }
+  }
+
+  // dispatch_group_async_f queues the work itself, so there is nothing
+  // batched to push. The contract keeps the call because io_uring has.
+  void flush() noexcept {}
+
+  std::size_t poll(bool block) {
+    std::size_t ran = drain_done() + run_one_deferred();
+    if (ran > 0 || !block) {
+      return ran;
+    }
+    for (;;) {
+      if (waiter_.take()) {
+        // Either a wake, or a worker's signal; the list says which.
+        ran += drain_done();
+        return ran;
+      }
+      waiter_.sleep();
+      ran += drain_done();
+      if (ran > 0) {
+        return ran;
+      }
+    }
+  }
+
+  void wake() noexcept { waiter_.wake(); }
+
+  [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+
+ private:
+  // Runs on a GCD worker: one positional read loop into the caller's
+  // buffer, then the op goes on the done list. noexcept: the error
+  // travels in the op to whoever calls poll().
+  static void run_read(void* p) noexcept {
+    auto& op = *static_cast<read_op*>(p);
+    gcd_context& c = *op.ctx;
     int err = 0;
     std::size_t got = 0;
-    while (got < st.len) {
-      const ssize_t n = ::pread(r.f_.fd_plain, st.dst + got, st.len - got,
-                                static_cast<off_t>(st.off + got));
+    while (got < op.len) {
+      const ssize_t n = ::pread(op.fd, op.dst + got, op.len - got,
+                                static_cast<off_t>(op.off + got));
       if (n < 0) {
         if (errno == EINTR) {
           continue;
@@ -207,22 +235,64 @@ class gcd_reader {
       }
       got += static_cast<std::size_t>(n);
     }
+    op.filled = got;
+    op.error = err;
     {
-      const std::lock_guard<std::mutex> lk(r.pump_.m);
-      st.filled = got;
-      st.error = err;
-      st.ready = true;
+      const std::lock_guard<std::mutex> lk(c.done_m_);
+      op.next_done = c.done_head_;
+      c.done_head_ = &op;
     }
-    r.pump_.cv.notify_all();
+    c.waiter_.wake();
   }
 
-  posix_file f_;
+  // Takes the whole finished list and runs their callbacks here, on the
+  // caller's thread. The list is LIFO, which the contract permits: the
+  // engine matches a completion to its window by the op, not by order.
+  std::size_t drain_done() noexcept {
+    read_op* head = nullptr;
+    {
+      const std::lock_guard<std::mutex> lk(done_m_);
+      head = std::exchange(done_head_, nullptr);
+    }
+    std::size_t ran = 0;
+    while (head != nullptr) {
+      read_op* const next = head->next_done;
+      in_flight_--;
+      head->done(head, head->error != 0
+                           ? std::error_code(head->error,
+                                             std::generic_category())
+                           : std::error_code{});
+      ran++;
+      head = next;
+    }
+    return ran;
+  }
+
+  std::size_t run_one_deferred() noexcept {
+    read_op* const next = deferred_.take();
+    if (next == nullptr) {
+      return 0;
+    }
+    read_op& op = *next;
+    std::error_code ec;
+    try {
+      op.sync_file->pread_all(op.fd, op.dst, op.len, op.off);
+      op.filled = op.len;
+    } catch (const std::system_error& e) {
+      ec = e.code();
+    }
+    in_flight_--;
+    op.done(&op, ec);
+    return 1;
+  }
+
   gcd_pump pump_;
-  std::vector<slot> slots_;
-  std::vector<task> tasks_;
-  std::uint64_t size_ = 0;
+  poll_waiter waiter_;
+  deferred_ops<read_op> deferred_;
+  std::mutex done_m_;
+  read_op* done_head_ = nullptr;
+  std::size_t in_flight_ = 0;
   bool use_gcd_ = false;
-  std::string_view name_ = "pread";
 };
 
 class gcd_writer {
@@ -362,7 +432,7 @@ class gcd_writer {
 };
 
 // Definition-site conformance check (see uring_backend.hpp).
-static_assert(reader_backend<gcd_reader>);
+static_assert(reader_context<gcd_context>);
 static_assert(writer_backend<gcd_writer>);
 
 }  // namespace blake3pp::detail::io_impl

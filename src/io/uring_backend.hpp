@@ -395,20 +395,24 @@ class uring_context {
   // these fds are reading into.
   class file {
    public:
-    file(uring_context&, const std::filesystem::path& path, bool direct_io) {
+    file(uring_context& ctx, const std::filesystem::path& path,
+         bool direct_io) {
       f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
       size_ = f_.stat_size();
       if (direct_io) {
         f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
       }
+      name_ = ctx.name_for(f_.direct);
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
    private:
     friend class uring_context;
     posix_file f_;
     std::uint64_t size_ = 0;
+    std::string name_;
   };
 
   uring_context(const reader_context_options& opts, unsigned max_inflight)
@@ -438,24 +442,6 @@ class uring_context {
     // ~uring drains the rest. No callback runs from here, by contract.
   }
 
-  [[nodiscard]] bool async() const noexcept { return use_uring_; }
-
-  // file_reader::backend() reports this verbatim, so the spellings, the
-  // order they combine in and the suffixes are observable API. Tools
-  // print it, and a run is read differently depending on which rung of
-  // the ladder it names.
-  [[nodiscard]] std::string describe(const file& f) const {
-    std::string n = use_uring_ ? (f.f_.direct ? "io_uring+direct" : "io_uring")
-                               : (f.f_.direct ? "pread+direct" : "pread");
-    if (use_uring_ && !offload_) {
-      n += " (inline submit)";
-    }
-    if (async_requested_ && !use_uring_ && ring_.setup_errno != 0) {
-      n += no_uring_suffix(ring_.setup_errno);
-    }
-    return n;
-  }
-
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
     op.buf = buf;
@@ -465,15 +451,15 @@ class uring_context {
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     in_flight_++;
-    // The question the old wants_async() answered, in the one place that
-    // now asks it: O_DIRECT rejects an unaligned length, so only whole
-    // granules may ride the ring and the tail is read synchronously.
+    // O_DIRECT rejects an unaligned length, so only whole granules may
+    // ride the ring; the tail is read synchronously inside poll(). This
+    // is the whole runtime-degradation question, asked in one place.
     if (use_uring_ && buf.size() % direct_align == 0) {
       ring_.fill_rw(IORING_OP_READ, op.fd, buf.data(),
                     static_cast<unsigned>(buf.size()), off, op_ud(&op),
                     offload_);
     } else {
-      defer(op);
+      deferred_.push(op);
     }
   }
 
@@ -507,6 +493,23 @@ class uring_context {
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
 
  private:
+  // Which rung of the ladder this context reached, for a file that did or
+  // did not get O_DIRECT. file_reader::backend() reports it verbatim, so
+  // the spellings, the order they combine in and the suffixes are
+  // observable API: tools print it, and a run is read differently
+  // depending on which rung it names.
+  [[nodiscard]] std::string name_for(bool direct) const {
+    std::string n = use_uring_ ? (direct ? "io_uring+direct" : "io_uring")
+                               : (direct ? "pread+direct" : "pread");
+    if (use_uring_ && !offload_) {
+      n += " (inline submit)";
+    }
+    if (async_requested_ && !use_uring_ && ring_.setup_errno != 0) {
+      n += no_uring_suffix(ring_.setup_errno);
+    }
+    return n;
+  }
+
   [[nodiscard]] std::uint64_t op_ud(read_op* op) const noexcept {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(op));
   }
@@ -522,15 +525,6 @@ class uring_context {
   void arm_wake() noexcept {
     ring_.fill_poll_add(waiter_.fd(), wake_ud());
     wake_armed_ = true;
-  }
-
-  void defer(read_op& op) noexcept {
-    if (deferred_tail_ == nullptr) {
-      deferred_head_ = deferred_tail_ = &op;
-    } else {
-      deferred_tail_->next_deferred = &op;
-      deferred_tail_ = &op;
-    }
   }
 
   void complete(read_op& op, std::error_code ec) noexcept {
@@ -588,14 +582,11 @@ class uring_context {
   // At most one per poll(): a synchronous read holds the calling thread
   // for the whole window, and the caller asked to be given control back.
   std::size_t run_one_deferred() noexcept {
-    if (deferred_head_ == nullptr) {
+    read_op* const next = deferred_.take();
+    if (next == nullptr) {
       return 0;
     }
-    read_op& op = *deferred_head_;
-    deferred_head_ = op.next_deferred;
-    if (deferred_head_ == nullptr) {
-      deferred_tail_ = nullptr;
-    }
+    read_op& op = *next;
     std::error_code ec;
     try {
       op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
@@ -634,8 +625,7 @@ class uring_context {
 
   uring ring_;
   read_op wake_op_{};  // address only: the wake completion's user_data
-  read_op* deferred_head_ = nullptr;
-  read_op* deferred_tail_ = nullptr;
+  deferred_ops<read_op> deferred_;
   std::size_t in_flight_ = 0;
   poll_waiter waiter_;
   bool async_requested_ = true;

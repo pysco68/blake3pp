@@ -1,9 +1,9 @@
 // file_reader implementation: a pimpl shell around the portable engine.
 // This TU contains no platform code and no engine logic:
 // io/backend_select.hpp names the engine the OS gets, already bound to
-// its backend -- io_uring (Linux), IOCP (Windows), GCD (macOS), plain
+// its context -- io_uring (Linux), IOCP (Windows), GCD (macOS), plain
 // pread (other POSIX), stdio (everything else) -- and io/engine.hpp is
-// the window/slot machine behind both of them. Runtime degradation
+// the window/slot machine behind it. Runtime degradation
 // (O_DIRECT refused -> buffered, async engine refused -> sync) happens
 // inside the backends.
 
@@ -21,8 +21,8 @@
 namespace blake3pp::detail {
 
 // Conformance is checked in the backend headers themselves (each ends
-// with definition-site static_asserts) and again by the reader_engine
-// constraint at this instantiation.
+// with definition-site static_asserts) and again by the
+// polled_reader_engine constraint at this instantiation.
 struct file_reader::impl : io_impl::native_reader_engine {
   using base = io_impl::native_reader_engine;
   using base::base;
