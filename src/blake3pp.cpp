@@ -280,6 +280,23 @@ void fold_sibling_cvs(const kern::kernel_ops* ops,
                       std::span<std::uint32_t, 8> out_cv) noexcept {
   core::fold_sibling_cvs_wide<>(*ops, cvs, key, base_flags, out_cv);
 }
+
+void parent_cv(const kern::kernel_ops* ops,
+               std::span<const std::uint32_t, 8> left,
+               std::span<const std::uint32_t, 8> right,
+               std::span<const std::uint32_t, 8> key,
+               std::uint32_t base_flags,
+               std::span<std::uint32_t, 8> out_cv) noexcept {
+  // The parent block carries copies of both children, so the compression
+  // reads nothing through out_cv and writing it last makes aliasing with
+  // either child safe.
+  const core::output o = core::parent_output(left, right, key, base_flags);
+  std::array<std::uint32_t, 8> cv;
+  core::chaining_value(*ops, o, cv);
+  for (std::size_t i = 0; i < 8; ++i) {
+    out_cv[i] = cv[i];
+  }
+}
 }  // namespace detail
 
 digest hash(std::span<const std::byte> input) noexcept {
