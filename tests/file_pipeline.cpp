@@ -1463,4 +1463,97 @@ TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
   CHECK_THROWS_AS(scope.run(), std::logic_error);
 }
 
+// A hasher part-way through a message is brought back onto the window
+// grid by one short first window. Every prior count that moves that
+// boundary is its own case, and the open mode moves with it: an
+// unaligned grid cannot use direct I/O at all, because every window
+// after the short one starts unaligned too.
+TEST_CASE("prior content sets the window grid and the open mode") {
+  using blake3pp::detail::direct_io_fits;
+  using blake3pp::detail::first_window_bytes;
+  using blake3pp::detail::io_driver;
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 3 * win + 1234;
+  const auto content = pattern(len, 121);
+  const temp_file f(content);
+
+  const std::size_t priors[] = {
+      0,             // a fresh hasher: no short window at all
+      win,           // already on a window boundary
+      8 * 1024,      // a chunk multiple, and a multiple of 4096
+      9 * 1024,      // a chunk multiple that is not a multiple of 4096
+      100,           // not even a chunk
+      win - 1,       // one byte short of the grid
+  };
+  for (const std::size_t prior : priors) {
+    CAPTURE(prior);
+    const auto head_content = pattern(prior, 122);
+    const std::size_t head = first_window_bytes(prior, win);
+    const bool direct_ok = direct_io_fits(head);
+    CHECK(direct_ok == (head % io_driver::direct_alignment == 0));
+
+    blake3pp::hasher h;
+    h.update(head_content);
+    blake3pp::update_file(h, f.path, sched, {.window_bytes = win});
+
+    blake3pp::hasher ref;
+    ref.update(head_content);
+    ref.update(content);
+    CHECK(h.finalize() == ref.finalize());
+
+    // What update_file decides about the open mode, checked where the
+    // decision shows: a grid the alignment cannot serve must never
+    // produce a direct-I/O file, whatever the filesystem would allow.
+    io_driver drv({}, 4);
+    io_driver::file file(drv, f.path, /*direct_io=*/direct_ok);
+    CAPTURE(file.name());
+    if (!direct_ok) {
+      CHECK(file.name().find("direct") == std::string_view::npos);
+      CHECK(file.name().find("nocache") == std::string_view::npos);
+    }
+  }
+}
+
+TEST_CASE("several files hash as one message, every one on the pool") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  // Sizes that are not window multiples, so every file after the first
+  // starts part-way through the grid.
+  const std::size_t sizes[] = {3 * win + 777, 2 * win + 4095, 5 * win + 1};
+  std::vector<std::byte> joined;
+  std::vector<std::unique_ptr<temp_file>> files;
+  for (const std::size_t n : sizes) {
+    const auto content = pattern(n, static_cast<std::uint32_t>(n));
+    joined.insert(joined.end(), content.begin(), content.end());
+    files.push_back(std::make_unique<temp_file>(content));
+  }
+
+  std::vector<blake3pp::window_record> records(128);
+  blake3pp::trace_buffer trace(records);
+  blake3pp::hasher h;
+  for (const auto& file : files) {
+    blake3pp::update_file(h, file->path, sched,
+                          {.window_bytes = win, .trace = &trace});
+  }
+  CHECK(h.finalize() == blake3pp::hash(joined));
+  CHECK(h.count() == joined.size());
+
+  // Every file's windows reached the pool, including the files that
+  // began off the grid: that is what the short first window buys.
+  std::size_t fanned = 0;
+  std::size_t short_first = 0;
+  for (const auto& r : trace.windows()) {
+    if ((r.flags & blake3pp::window_record::flag_parallel) != 0) {
+      ++fanned;
+    }
+    if ((r.flags & blake3pp::window_record::flag_short_first) != 0) {
+      ++short_first;
+    }
+  }
+  CHECK(fanned >= 3 * std::size(sizes));
+  // Two of the three files start off the grid.
+  CHECK(short_first == 2);
+}
+
 }  // TEST_SUITE

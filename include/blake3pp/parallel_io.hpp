@@ -114,26 +114,24 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const std::filesystem::path& path,
                  Scheduler&& sched, const file_io_options& opts = {}) {
-  // The pipeline drives the reads itself, from this thread, and absorbs
-  // windows in whatever order they finish. It can only do that where
-  // every full window is a subtree of the final tree; where it is not,
-  // the sequential window loop still is the answer.
-  if (detail::pipeline_can_take<Budget>(
-          h, detail::rounded_window_bytes(opts.window_bytes))) {
-    detail::io_driver drv(
-        {/*async=*/true, opts.offload_submit},
-        std::clamp<unsigned>(opts.queue_depth, 2, detail::max_queue_depth));
-    detail::io_driver::file file(drv, path, opts.direct_io);
-    detail::run_window_pipeline<Budget>(
-        h, drv, file, std::forward<Scheduler>(sched),
-        {opts.window_bytes, opts.queue_depth, opts.trace, 0});
-    return;
-  }
-  detail::file_reader reader(
-      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-             opts.offload_submit});
-  detail::update_from_reader<Budget>(h, reader, std::forward<Scheduler>(sched),
-                                     opts);
+  // Every file goes through the pipeline. A hasher already part-way
+  // through a message is brought back onto a window boundary by one
+  // short first window rather than by hashing the whole file
+  // sequentially, so there is no second path left to choose.
+  const std::size_t window = detail::rounded_window_bytes(opts.window_bytes);
+  const std::size_t head = detail::first_window_bytes(h.count(), window);
+  detail::io_driver drv(
+      {/*async=*/true, opts.offload_submit},
+      std::clamp<unsigned>(opts.queue_depth, 2, detail::max_queue_depth));
+  // Direct I/O wants aligned offsets, and every window after the short
+  // first one starts at head + n * window: an unaligned head misaligns
+  // all of them, so the file is opened buffered rather than degrading
+  // every read to the synchronous path inside poll().
+  detail::io_driver::file file(drv, path,
+                               opts.direct_io && detail::direct_io_fits(head));
+  detail::run_window_pipeline<Budget>(
+      h, drv, file, std::forward<Scheduler>(sched),
+      {opts.window_bytes, opts.queue_depth, opts.trace, 0});
 }
 
 /// Streams a file into a hasher over a scheduler, reporting failure

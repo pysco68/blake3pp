@@ -35,6 +35,9 @@ struct window_record {
   static constexpr std::uint32_t flag_parallel = 1u << 0;
   /// Bit in flags: the window reaches the end of the file.
   static constexpr std::uint32_t flag_last = 1u << 1;
+  /// Bit in flags: the short window that brings a hasher already
+  /// part-way through a message back onto a window boundary.
+  static constexpr std::uint32_t flag_short_first = 1u << 2;
 
   /// Position of the window within this update_file() call, from 0.
   std::uint64_t index;

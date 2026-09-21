@@ -551,6 +551,33 @@ inline constexpr std::size_t reducer_nodes = 256;
   return 2 * static_cast<std::size_t>(std::bit_width(parts));
 }
 
+// How many bytes of a file have to be read before its windows line up
+// with the hasher's own window grid.
+//
+// A hasher part-way through a message -- the second file of several
+// hashed as one -- sits at some count that is not a multiple of the
+// window. Reading one short window first brings it to a boundary, and
+// every window after that is a subtree like any other. Zero means the
+// hasher is already on a boundary, which is every fresh hasher.
+[[nodiscard]] constexpr std::size_t first_window_bytes(
+    std::uint64_t count, std::size_t window_bytes) noexcept {
+  const std::size_t offset = static_cast<std::size_t>(count % window_bytes);
+  return (window_bytes - offset) % window_bytes;
+}
+
+// Whether the platform's direct-I/O path can serve a file whose windows
+// start at `head` bytes in.
+//
+// Direct I/O wants aligned offsets as well as aligned lengths, and the
+// windows after a short first one start at head + n * window -- so an
+// unaligned head misaligns every window of the file, not just the first.
+// Degrading read by read would put every one of them on the synchronous
+// path inside poll(), on the driver thread; a buffered file keeps them
+// all asynchronous. So the choice is per file, and it is made once.
+[[nodiscard]] constexpr bool direct_io_fits(std::size_t head) noexcept {
+  return head % io_driver::direct_alignment == 0;
+}
+
 
 // Several window chains in flight over one file, all on the caller's
 // thread.
@@ -587,7 +614,11 @@ class window_scope {
         reducer_capacity_(opts.reducer_capacity == 0
                               ? reducer_nodes
                               : std::min(opts.reducer_capacity, reducer_nodes)),
-        base_chunk_(h.count() / chunk_size),
+        base_count_(h.count()),
+        head_window_bytes_(
+            first_window_bytes(h.count(), rounded_window_bytes(
+                                              opts.window_bytes))),
+        base_chunk_((h.count() + head_window_bytes_) / chunk_size),
         file_bytes_(file.size()),
         windows_(std::make_unique<window[]>(count_)),
         nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
@@ -678,6 +709,8 @@ class window_scope {
     // One cell of each shape per edge window: the first and the last can
     // be in flight together on a file of three windows, and either may
     // turn out to have no parts worth fanning out.
+    std::optional<edge_op> first_edge_cell;
+    std::optional<read_only_op> first_read_cell;
     std::optional<edge_op> last_edge_cell;
     std::optional<read_only_op> last_read_cell;
 
@@ -705,18 +738,26 @@ class window_scope {
         ++in_flight_;
         in_flight_nodes_ += w->node_cost;
         status_.outstanding = in_flight_;
-        if (!w->last) {
+        if (w->last) {
+          last_window_ = w;
+        }
+        if (!w->last && !w->short_first) {
           prepare_compress(*w);
           cells[w->slot].emplace(connect_full{this, w});
           ex::start(*cells[w->slot]);
         } else if (w->parts >= 2) {
-          last_window_ = w;
-          last_edge_cell.emplace(connect_edge{this, w});
-          ex::start(*last_edge_cell);
+          // An edge window: the short first one or the last one, each
+          // with its own cell, since a three-window file has both in
+          // flight at once.
+          std::optional<edge_op>& cell =
+              w->last ? last_edge_cell : first_edge_cell;
+          cell.emplace(connect_edge{this, w});
+          ex::start(*cell);
         } else {
-          last_window_ = w;
-          last_read_cell.emplace(connect_read{this, w});
-          ex::start(*last_read_cell);
+          std::optional<read_only_op>& cell =
+              w->last ? last_read_cell : first_read_cell;
+          cell.emplace(connect_read{this, w});
+          ex::start(*cell);
         }
       }
     }, [this] { this->report_stall(); });
@@ -769,6 +810,7 @@ class window_scope {
     window* next_free = nullptr;
     unsigned slot = 0;
     bool last = false;
+    bool short_first = false;
     // An edge window is split three ways. `head` is absorbed by the
     // hasher on the driver the moment the read lands, `parts` full parts
     // go to the pool and come back as nodes, and `tail` waits for the
@@ -832,6 +874,11 @@ class window_scope {
     return ex::then(loop_.read(file_, w.offset, w.buffer.first(w.bytes)),
                     [this, &w](std::span<const std::byte>) noexcept {
                       stamp_ready(w);
+                      // A short first window with nothing worth fanning
+                      // out is all head, and the hasher takes it now; a
+                      // last window is all tail, and the hasher takes it
+                      // once the reducer has drained.
+                      absorb_head(w);
                       stamp_joined(w);
                     });
   }
@@ -856,12 +903,23 @@ class window_scope {
         [this, &w](std::size_t nodes) noexcept { insert_edge_nodes(w, nodes); });
   }
 
+  // The bytes an edge window owes the hasher before anything else can
+  // reach it. Safe at any point before drain_into, because no reducer
+  // node reaches the hasher until then -- and it has to happen before
+  // the nodes do, since it is what puts the hasher on the boundary they
+  // are numbered from.
+  void absorb_head(window& w) noexcept {
+    if (w.head_bytes > 0) {
+      h_.update(std::span<const std::byte>(w.buffer.data(), w.head_bytes));
+    }
+  }
+
   [[nodiscard]] auto edge_compress_stage(window& w) {
     stamp_ready(w);
+    absorb_head(w);
     w.compress.prepare_edge(ops_, w.buffer.data() + w.head_bytes, w.part_chunks,
-                            w.parts,
-                            w.first_chunk + w.head_bytes / chunk_size,
-                            h_.key_words(), h_.mode_flags(), trace_, w.index);
+                            w.parts, w.first_chunk, h_.key_words(),
+                            h_.mode_flags(), trace_, w.index);
     const std::span<tree_reducer::node> out(edge_nodes_[w.edge_slot]);
     if constexpr (Traced) {
       return ex::then(compress_edge_on<true>(sched_, w.compress, out),
@@ -960,14 +1018,23 @@ class window_scope {
   // Whether the window that would start next is an edge one, which the
   // admission rule has to know before the window is taken.
   [[nodiscard]] bool next_is_edge() const noexcept {
+    const std::size_t want =
+        (next_offset_ == 0 && head_window_bytes_ > 0) ? head_window_bytes_
+                                                     : window_bytes_;
     const std::uint64_t bytes =
-        std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_);
+        std::min<std::uint64_t>(want, file_bytes_ - next_offset_);
     return next_offset_ + bytes >= file_bytes_;
   }
 
   // What the next window would reserve in the reducer, decided from the
   // same plan the window will get.
   [[nodiscard]] std::size_t next_window_cost() const noexcept {
+    // The short first window reserves like any other edge window; it is
+    // planned from the hasher's count rather than from the file's end.
+    if (next_offset_ == 0 && head_window_bytes_ > 0 &&
+        head_window_bytes_ < file_bytes_) {
+      return short_first_cost();
+    }
     if (!next_is_edge()) {
       return 1;
     }
@@ -975,6 +1042,13 @@ class window_scope {
         std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_));
     const std::size_t parts = last_window_parts(bytes);
     return parts >= 2 ? nodes_for(parts) : 1;
+  }
+
+  [[nodiscard]] std::size_t short_first_cost() const noexcept {
+    window probe{};
+    probe.bytes = head_window_bytes_;
+    const_cast<window_scope*>(this)->plan_short_first(probe);
+    return probe.node_cost;
   }
 
   // How many whole parts of a last window of `bytes` sit entirely before
@@ -994,11 +1068,22 @@ class window_scope {
   // Takes the next window's geometry and decides its three parts.
   void take_next(window& w) noexcept {
     w.offset = next_offset_;
+    const std::size_t want =
+        (w.offset == 0 && head_window_bytes_ > 0) ? head_window_bytes_
+                                                  : window_bytes_;
     w.bytes = static_cast<std::size_t>(
-        std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_));
+        std::min<std::uint64_t>(want, file_bytes_ - next_offset_));
     w.last = next_offset_ + w.bytes >= file_bytes_;
+    w.short_first = w.offset == 0 && head_window_bytes_ > 0;
     w.chunks = w.bytes / chunk_size;
-    w.first_chunk = base_chunk_ + w.offset / chunk_size;
+    // Where this window's contribution to the tree starts. For every
+    // window but the short first one that is the window itself; the
+    // short one's is wherever its head ends, which plan_short_first
+    // works out.
+    w.first_chunk =
+        base_chunk_ +
+        (w.offset - std::min<std::uint64_t>(w.offset, head_window_bytes_)) /
+            chunk_size;
     w.index = index_++;
     w.head_bytes = 0;
     w.tail_bytes = 0;
@@ -1007,9 +1092,60 @@ class window_scope {
     w.nodes = 0;
     w.node_cost = 1;
     next_offset_ += w.bytes;
+    // A window that is both ends of the file is the hasher's whole: it
+    // is misaligned at the front and carries the final chunk at the
+    // back, and nothing between them is worth a subtree.
     if (w.last) {
-      plan_last(w);
+      if (w.short_first) {
+        w.tail_bytes = w.bytes;
+      } else {
+        plan_last(w);
+      }
+    } else if (w.short_first) {
+      plan_short_first(w);
     }
+  }
+
+  // The short window that brings the hasher back to a window boundary.
+  //
+  // Its front belongs to the hasher: the bytes to the next chunk
+  // boundary, then whole chunks up to a part boundary, which is under
+  // one part in total and is absorbed on the driver the moment the read
+  // lands. What follows is whole parts, aligned in the message's own
+  // chunk space, and goes to the pool like any other window's.
+  void plan_short_first(window& w) noexcept {
+    const std::uint64_t count = base_count_;
+    const std::size_t to_chunk = static_cast<std::size_t>(
+        (chunk_size - count % chunk_size) % chunk_size);
+    const std::size_t chunks_left =
+        w.bytes > to_chunk ? (w.bytes - to_chunk) / chunk_size : 0;
+    if (chunks_left < 2) {
+      w.head_bytes = w.bytes;
+      return;
+    }
+    const std::size_t p = window_part_chunks<Budget>(chunks_left);
+    const std::uint64_t chunk_at = (count + to_chunk) / chunk_size;
+    const std::size_t to_part =
+        static_cast<std::size_t>((p - chunk_at % p) % p) * chunk_size;
+    const std::size_t head = to_chunk + to_part;
+    const std::size_t parts =
+        w.bytes > head ? (w.bytes - head) / (p * chunk_size) : 0;
+    if (parts < 2) {
+      w.head_bytes = w.bytes;
+      return;
+    }
+    w.head_bytes = head;
+    w.part_chunks = p;
+    w.parts = parts;
+    w.first_chunk = (count + head) / chunk_size;
+    w.node_cost = nodes_for(parts);
+    w.edge_slot = 0;
+    // The parts cover the window exactly: the head lands on a part
+    // boundary and the window ends on a window boundary, and the part
+    // size divides the window because both are powers of two and the
+    // part is the smaller.
+    assert(w.bytes == head + parts * p * chunk_size &&
+           "a short first window's parts must cover it exactly");
   }
 
   // The last window carries the message's final chunk, and a merged
@@ -1124,7 +1260,8 @@ class window_scope {
     if (w.rec != nullptr) {
       w.rec->index = w.index;
       w.rec->bytes = w.bytes;
-      w.rec->flags = w.last ? window_record::flag_last : 0;
+      w.rec->flags = (w.last ? window_record::flag_last : 0) |
+                     (w.short_first ? window_record::flag_short_first : 0);
       w.rec->slot = w.slot;
       w.rec->t_wait_begin = trace_->now();
     }
@@ -1170,7 +1307,9 @@ class window_scope {
   std::size_t window_bytes_ = 0;
   unsigned count_ = 0;
   unsigned in_flight_cap_ = 0;
-  std::uint64_t base_chunk_ = 0;
+  std::uint64_t base_count_ = 0;        // the hasher's byte count at start
+  std::size_t head_window_bytes_ = 0;   // the short first window, or zero
+  std::uint64_t base_chunk_ = 0;        // where the full windows' grid starts
   std::uint64_t file_bytes_ = 0;
   std::size_t reducer_capacity_ = reducer_nodes;
   std::unique_ptr<window[]> windows_;
@@ -1194,20 +1333,6 @@ class window_scope {
   std::error_code ec_{};
   std::exception_ptr eptr_{};
 };
-
-// Whether a file belongs on the pipeline at all.
-//
-// Every full window is absorbed as one subtree, which needs the hasher to
-// sit where a window begins -- always true for a fresh one -- and the
-// window to be worth fanning out. A hasher part-way through a window, or
-// a window below the fan-out floor, is what update_from_reader is for.
-template <stack_budget Budget>
-[[nodiscard]] inline bool pipeline_can_take(const hasher& h,
-                                            std::size_t window_bytes) noexcept {
-  const std::size_t chunks = window_bytes / chunk_size;
-  return h.count() % window_bytes == 0 &&
-         window_part_chunks<Budget>(chunks) < chunks;
-}
 
 // Runs one open file through the pipeline on the calling thread.
 //

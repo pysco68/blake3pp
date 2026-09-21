@@ -46,6 +46,10 @@ static_assert(alignof(native_op) <= io_read_op::storage_align,
 // only sound while destruction is a no-op. A backend whose op acquires
 // anything has to be released in trampoline() before the callback runs,
 // which no backend needs today.
+static_assert(io_driver::direct_alignment == io_impl::direct_align,
+              "the alignment callers plan their reads around must be the "
+              "one the backends enforce");
+
 static_assert(std::is_trivially_destructible_v<native_op>,
               "this platform's reader_context::read_op has a non-trivial "
               "destructor; io_read_op::storage is reused per read, so the "

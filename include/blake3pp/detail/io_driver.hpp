@@ -65,6 +65,13 @@ struct io_read_op_layout {
 
 class io_driver {
  public:
+  // What a read must be aligned to for the platform's direct-I/O path to
+  // take it: both the offset and the length, which is why a file whose
+  // windows start at an unaligned offset has to be opened buffered
+  // rather than degrading read by read. The value is checked against the
+  // backends' own constant in io_driver.cpp.
+  static constexpr std::size_t direct_alignment = 4096;
+
   io_driver(const io_driver_options& opts, unsigned max_inflight);
   ~io_driver();
   io_driver(const io_driver&) = delete;
