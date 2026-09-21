@@ -64,12 +64,6 @@ class polled_reader_engine {
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
         file_(ctx_, path, opts.direct_io) {
     num_windows_ = (file_.size() + window_ - 1) / window_;
-    // Offer the pool to a context that can pin it, before anything is
-    // submitted out of it. A context without the notion simply does not
-    // have the member, which keeps it out of the contract.
-    if constexpr (requires(C& c) { c.register_buffers(pool()); }) {
-      (void)ctx_.register_buffers(pool());
-    }
     const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
     for (unsigned s = 0; s < initial; ++s) {
       assign(s);
@@ -92,12 +86,6 @@ class polled_reader_engine {
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
         file_(ctx_, size) {
     num_windows_ = (file_.size() + window_ - 1) / window_;
-    // Offer the pool to a context that can pin it, before anything is
-    // submitted out of it. A context without the notion simply does not
-    // have the member, which keeps it out of the contract.
-    if constexpr (requires(C& c) { c.register_buffers(pool()); }) {
-      (void)ctx_.register_buffers(pool());
-    }
     const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
     for (unsigned s = 0; s < initial; ++s) {
       assign(s);

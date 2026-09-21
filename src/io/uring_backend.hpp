@@ -1,5 +1,11 @@
 #pragma once
 
+// Registered buffers (IORING_REGISTER_BUFFERS + IORING_OP_READ_FIXED)
+// measured 28-38% SLOWER here in every round of a four-round alternating
+// run, on Linux 6.8 over virtio-scsi; see the exp/registered-buffers
+// branch for the implementation, the reports and the hypothesis.
+// --inline-submit and offload_submit are unchanged by that result.
+//
 // The Linux backend: io_uring driven through raw syscalls (three of them:
 // setup, enter, and mmap for the rings), with no liburing dependency, so
 // every moving part is visible. Degrades per-feature at RUNTIME inside
@@ -14,7 +20,6 @@
 #include <string_view>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
-#include <sys/uio.h>
 #include <sys/syscall.h>
 
 #include <bit>
@@ -53,12 +58,6 @@ namespace blake3pp::detail::io_impl {
 
 inline int sys_io_uring_setup(unsigned entries, io_uring_params* p) noexcept {
   return static_cast<int>(::syscall(__NR_io_uring_setup, entries, p));
-}
-
-inline int sys_io_uring_register(int ring_fd, unsigned opcode, void* arg,
-                                 unsigned nr_args) noexcept {
-  return static_cast<int>(
-      ::syscall(__NR_io_uring_register, ring_fd, opcode, arg, nr_args));
 }
 
 inline int sys_io_uring_enter(int ring_fd, unsigned to_submit,
@@ -280,42 +279,6 @@ struct uring {
                                               std::memory_order_release);
   }
 
-  // Pins one contiguous region for IORING_OP_READ_FIXED. The kernel
-  // charges it against RLIMIT_MEMLOCK, so a pool larger than the limit is
-  // refused; that is a degradation, not an error.
-  [[nodiscard]] bool register_buffer(void* base, std::size_t len) noexcept {
-    ::iovec iov{};
-    iov.iov_base = base;
-    iov.iov_len = len;
-    return sys_io_uring_register(fd, IORING_REGISTER_BUFFERS, &iov, 1) == 0;
-  }
-
-  // One read against the registered region; buf must lie inside it. Same
-  // shape as fill_rw, minus the page pinning the kernel does per submit
-  // for an address it has not seen before.
-  void fill_read_fixed(int file_fd, const void* buf, unsigned len,
-                       std::uint64_t off, std::uint64_t user_data,
-                       bool offload) noexcept {
-    const unsigned tail = *sq_tail;
-    const unsigned idx = tail & *sq_mask;
-    io_uring_sqe sqe{};
-    std::memset(&sqe, 0, sizeof(sqe));
-    sqe.opcode = IORING_OP_READ_FIXED;
-    if (offload) {
-      sqe.flags |= IOSQE_ASYNC;
-    }
-    sqe.fd = file_fd;
-    sqe.addr = static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(buf));
-    sqe.len = len;
-    sqe.off = off;
-    sqe.user_data = user_data;
-    sqe.buf_index = 0;  // one region, registered as index 0
-    std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
-    std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
-    std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
-                                              std::memory_order_release);
-  }
-
   // Queues a one-shot poll on `poll_fd`, the wake path's arming step.
   void fill_poll_add(int poll_fd, std::uint64_t user_data) noexcept {
     const unsigned tail = *sq_tail;
@@ -485,22 +448,6 @@ class uring_context {
     // ~uring drains the rest. No callback runs from here, by contract.
   }
 
-  // Pins the engine's pool once, so reads out of it skip the per-submit
-  // page pinning. Best-effort: an RLIMIT_MEMLOCK refusal leaves every
-  // read on the ordinary path. The engine calls this before it submits
-  // anything out of that pool.
-  bool register_buffers(std::span<std::byte> pool) noexcept {
-    if (!use_uring_ || pool.empty()) {
-      return false;
-    }
-    fixed_ = ring_.register_buffer(pool.data(), pool.size());
-    if (fixed_) {
-      pool_begin_ = pool.data();
-      pool_end_ = pool.data() + pool.size();
-    }
-    return fixed_;
-  }
-
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
     op.buf = buf;
@@ -514,15 +461,9 @@ class uring_context {
     // ride the ring; the tail is read synchronously inside poll(). This
     // is the whole runtime-degradation question, asked in one place.
     if (use_uring_ && buf.size() % direct_align == 0) {
-      if (in_registered(buf)) {
-        ring_.fill_read_fixed(op.fd, buf.data(),
-                              static_cast<unsigned>(buf.size()), off,
-                              op_ud(&op), offload_);
-      } else {
-        ring_.fill_rw(IORING_OP_READ, op.fd, buf.data(),
-                      static_cast<unsigned>(buf.size()), off, op_ud(&op),
-                      offload_);
-      }
+      ring_.fill_rw(IORING_OP_READ, op.fd, buf.data(),
+                    static_cast<unsigned>(buf.size()), off, op_ud(&op),
+                    offload_);
     } else {
       deferred_.push(op);
     }
@@ -587,14 +528,6 @@ class uring_context {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(&wake_op_));
   }
 
-  // A buffer the kernel already has pinned: only then may a read name the
-  // registered index instead of an address for it to pin.
-  [[nodiscard]] bool in_registered(std::span<const std::byte> buf) const
-      noexcept {
-    return fixed_ && buf.data() >= pool_begin_ &&
-           buf.data() + buf.size() <= pool_end_;
-  }
-
   void arm_wake() noexcept {
     ring_.fill_poll_add(waiter_.fd(), wake_ud());
     wake_armed_ = true;
@@ -637,17 +570,9 @@ class uring_context {
                              static_cast<std::size_t>(res));
       op.filled += static_cast<std::size_t>(res);
       if (op.filled < op.buf.size()) {
-        const std::span<std::byte> rest{op.buf.data() + op.filled,
-                                        op.buf.size() - op.filled};
-        if (in_registered(rest)) {
-          ring_.fill_read_fixed(op.fd, rest.data(),
-                                static_cast<unsigned>(rest.size()),
-                                op.off + op.filled, ud, offload_);
-        } else {
-          ring_.fill_rw(IORING_OP_READ, op.fd, rest.data(),
-                        static_cast<unsigned>(rest.size()),
-                        op.off + op.filled, ud, offload_);
-        }
+        ring_.fill_rw(IORING_OP_READ, op.fd, op.buf.data() + op.filled,
+                      static_cast<unsigned>(op.buf.size() - op.filled),
+                      op.off + op.filled, ud, offload_);
         requeued = true;
         continue;
       }
@@ -710,12 +635,9 @@ class uring_context {
   std::size_t in_flight_ = 0;
   poll_waiter waiter_;
   bool async_requested_ = true;
-  const std::byte* pool_begin_ = nullptr;
-  const std::byte* pool_end_ = nullptr;
   bool use_uring_ = false;
   bool offload_ = false;
   bool wake_armed_ = false;
-  bool fixed_ = false;
 };
 
 class uring_writer {
