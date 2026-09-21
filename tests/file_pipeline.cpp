@@ -12,12 +12,23 @@
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <atomic>
+#include <bit>
 #include <concepts>
 #include <string_view>
+#include <thread>
 #include <system_error>
 #include <utility>
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <ios>
+#include <random>
+#include <vector>
+
 #include <blake3pp/detail/ex_compat.hpp>
+#include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/parallel.hpp>
 #include <doctest/doctest.h>
 
@@ -208,6 +219,50 @@ void check_adaptors(MakeReceiver make) {
   }
 }
 
+namespace fs = std::filesystem;
+
+std::vector<std::byte> pattern(std::size_t len, std::uint32_t seed) {
+  std::vector<std::byte> v(len);
+  std::uint32_t x = seed;
+  for (auto& b : v) {
+    x = x * 1'664'525u + 1'013'904'223u;
+    b = static_cast<std::byte>(x >> 24);
+  }
+  return v;
+}
+
+struct temp_file {
+  fs::path path;
+  explicit temp_file(const std::vector<std::byte>& content) {
+    static const unsigned run_id = std::random_device{}();
+    path = fs::temp_directory_path() /
+           ("blake3pp_pipe_test_" + std::to_string(run_id) + "_" +
+            std::to_string(counter++));
+    std::string chars(content.size(), '\0');
+    std::ranges::transform(content, chars.begin(),
+                           [](std::byte b) { return static_cast<char>(b); });
+    std::ofstream out(path, std::ios::binary);
+    out.write(chars.data(), static_cast<std::streamsize>(chars.size()));
+  }
+  ~temp_file() {
+    std::error_code ec;
+    fs::remove(path, ec);
+  }
+  static inline int counter = 0;
+};
+
+// Counts completions and remembers the error, like the backend probes.
+struct read_probe {
+  int calls = 0;
+  std::error_code ec{};
+  static void on_done(blake3pp::detail::io_read_op* op,
+                      std::error_code e) noexcept {
+    auto* const p = static_cast<read_probe*>(op->owner);
+    p->calls++;
+    p->ec = e;
+  }
+};
+
 }  // namespace
 
 TEST_SUITE("file_pipeline") {
@@ -255,6 +310,65 @@ TEST_CASE("std::execution senders are not silently untested") {
           << provider_name());
   CHECK(true);
 #endif
+}
+
+// The compiled seam: the same contract the backends keep, from behind a
+// pimpl, plus the arena whose lifetime the drain depends on.
+TEST_CASE("the io driver reads a file and keeps the callback discipline") {
+  using blake3pp::detail::io_driver;
+  using blake3pp::detail::io_read_op;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 13);
+  const temp_file f(content);
+
+  io_driver drv({}, 4);
+  io_driver::file file(drv, f.path, /*direct_io=*/false);
+  CHECK(file.size() == len);
+  CHECK(!file.name().empty());
+  MESSAGE("driver backend: " << file.name());
+
+  // The arena is the driver's, direct-I/O aligned, and outlives every
+  // read because the driver drains before freeing it.
+  const auto pool = drv.allocate(len);
+  REQUIRE(pool.size() == len);
+  CHECK(std::bit_cast<std::uintptr_t>(pool.data()) % 4096 == 0);
+
+  io_read_op op{};
+  read_probe probe;
+  op.done = &read_probe::on_done;
+  op.owner = &probe;
+  drv.submit_read(file, 0, pool, op);
+  CHECK(probe.calls == 0);
+  drv.flush();
+  CHECK(probe.calls == 0);        // never from submit or flush
+  CHECK(drv.in_flight() == 1);
+
+  std::size_t ran = 0;
+  while (probe.calls == 0) {
+    ran += drv.poll(true);
+  }
+  CHECK(ran == 1);
+  CHECK(probe.calls == 1);
+  CHECK(!probe.ec);
+  CHECK(drv.in_flight() == 0);
+  CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
+}
+
+TEST_CASE("the io driver wakes a blocked poll from another thread") {
+  using blake3pp::detail::io_driver;
+  io_driver drv({}, 4);
+  std::atomic<bool> entered{false};
+  std::size_t ran = 1;
+  std::thread driver([&] {
+    entered.store(true, std::memory_order_release);
+    ran = drv.poll(true);
+  });
+  while (!entered.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  drv.wake();
+  driver.join();
+  CHECK(ran == 0);
 }
 
 }  // TEST_SUITE
