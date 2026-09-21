@@ -43,16 +43,28 @@
 // Internal to the pipeline. Names an execution provider, so
 // <blake3pp/io.hpp> must not reach it.
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <memory>
+#include <optional>
 #include <span>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
+#include <blake3pp/core.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
+#include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/detail/io_driver.hpp>
+#include <blake3pp/detail/tree_reducer.hpp>
+#include <blake3pp/dispatch.hpp>
+#include <blake3pp/trace.hpp>
 
 namespace blake3pp::detail {
 
@@ -336,9 +348,15 @@ class driver_loop {
   // inside a completion this loop itself ran. Blocks only when there is
   // nothing to run, so the thread sleeps in the kernel rather than
   // spinning, and only ever here.
-  void run_until(const loop_status& status) {
+  //
+  // before_flush runs once per round, after the completions and before
+  // the submit: whatever it starts joins the same flush, so a batch of
+  // windows reaches the OS in one call rather than one each.
+  template <class BeforeFlush>
+  void run_until(const loop_status& status, BeforeFlush&& before_flush) {
     for (;;) {
       drain();
+      before_flush();
       if (status.done) {
         return;
       }
@@ -352,6 +370,10 @@ class driver_loop {
              "run queue and no chain outstanding: nothing can wake it");
       drv_->poll(block);
     }
+  }
+
+  void run_until(const loop_status& status) {
+    run_until(status, [] {});
   }
 
   // Runs everything parked on the queue, once. A node may be pushed
@@ -372,6 +394,453 @@ class driver_loop {
   D* drv_;
   run_queue queue_;
 };
+
+// --------------------------------------------------------------------
+// The bounded scope.
+
+// What the scope needs that the public options do not already say.
+struct pipeline_options {
+  std::size_t window_bytes = 8 * 1024 * 1024;
+  unsigned queue_depth = 4;
+  trace_buffer* trace = nullptr;
+  // Windows allowed in flight at once, capped to the window count; 0
+  // means the window count. The tests run the whole matrix at 1 first,
+  // where every insert arrives in file order, before letting the real
+  // count expose the out-of-order path.
+  unsigned in_flight_cap = 0;
+};
+
+// Pending nodes the reducer may hold. A window that cannot be inserted
+// is not recycled, so the count is also the backpressure: holes in the
+// inserted range cost nodes, and holding a window closes the hole that
+// produced it.
+inline constexpr std::size_t reducer_nodes = 256;
+
+// Several window chains in flight over one file, all on the caller's
+// thread.
+//
+// The shape of one window:
+//
+//     io.read(window)            // completes on the driver
+//       | let_value(compress)    // provider bulk, then fold, on the pool
+//       | continues_on(driver)   // back to the driver
+//       | then(reduce_into_tree) // order-free
+//
+// and the scope is what decides how many of those exist at once: a
+// window is a buffer, a part table and an operation cell, all allocated
+// at construction, and a chain may only start when one is free. The
+// reducer is what lets them finish in any order.
+template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
+class window_scope {
+ public:
+  using cv_type = std::array<std::uint32_t, 8>;
+
+  window_scope(hasher& h, D& drv, typename D::file& file, Scheduler sched,
+               const pipeline_options& opts)
+      : h_(h),
+        loop_(drv),
+        file_(file),
+        sched_(std::move(sched)),
+        trace_(opts.trace),
+        ops_(resolve(h.selected_arch())),
+        window_bytes_(rounded_window_bytes(opts.window_bytes)),
+        count_(std::clamp<unsigned>(opts.queue_depth, 2, max_queue_depth)),
+        in_flight_cap_(opts.in_flight_cap == 0
+                           ? count_
+                           : std::min<unsigned>(opts.in_flight_cap, count_)),
+        base_chunk_(h.count() / chunk_size),
+        file_bytes_(file.size()),
+        windows_(std::make_unique<window[]>(count_)),
+        nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
+        reducer_(ops_, h.key_words(), h.mode_flags(),
+                 std::span<tree_reducer::node>(nodes_.get(), reducer_nodes)) {
+    // The one buffer allocation of the whole run, owned by the driver so
+    // that it outlives every read the teardown has to drain.
+    const std::span<std::byte> pool =
+        drv.allocate(window_bytes_ * static_cast<std::size_t>(count_));
+    for (unsigned i = count_; i > 0; --i) {
+      window& w = windows_[i - 1];
+      w.buffer = pool.subspan(static_cast<std::size_t>(i - 1) * window_bytes_,
+                              window_bytes_);
+      w.slot = i - 1;
+      push_free(&w);
+    }
+  }
+
+  window_scope(const window_scope&) = delete;
+  window_scope& operator=(const window_scope&) = delete;
+
+  // Drives the whole file on this thread and absorbs it into the hasher.
+  // Throws the first error any window reported, once, after everything in
+  // flight has finished.
+  void run() {
+    if (file_bytes_ == 0) {
+      return;
+    }
+    // The operation cells: fixed storage for one connected chain per
+    // window, re-emplaced per use. optional does the destroy-then-construct
+    // and the conversion functions below do the construct-in-place, which
+    // is what lets an immovable operation state live in a container.
+    using full_op = ex::connect_result_t<
+        decltype(std::declval<window_scope&>().window_chain(
+            std::declval<window&>())),
+        scope_receiver>;
+    using last_op = ex::connect_result_t<
+        decltype(std::declval<window_scope&>().last_window_chain(
+            std::declval<window&>())),
+        scope_receiver>;
+
+    struct connect_full {
+      window_scope* scope;
+      window* w;
+      operator full_op() const {
+        return ex::connect(scope->window_chain(*w), scope_receiver{scope, w});
+      }
+    };
+    struct connect_last {
+      window_scope* scope;
+      window* w;
+      operator last_op() const {
+        return ex::connect(scope->last_window_chain(*w),
+                           scope_receiver{scope, w});
+      }
+    };
+
+    auto cells = std::make_unique<std::optional<full_op>[]>(count_);
+    std::optional<last_op> last_cell;
+
+    loop_.run_until(status_, [&] {
+      // Every window that can start, started before the one flush this
+      // round: the reads of a whole batch reach the OS in one call.
+      while (!stop_ && in_flight_ < in_flight_cap_ && free_ != nullptr) {
+        window* const w = free_;
+        if (!take_next(*w)) {
+          break;
+        }
+        free_ = w->next_free;
+        claim_record(*w);
+        ++in_flight_;
+        status_.outstanding = in_flight_;
+        if (w->last) {
+          last_window_ = w;
+          last_cell.emplace(connect_last{this, w});
+          ex::start(*last_cell);
+        } else {
+          prepare_compress(*w);
+          cells[w->slot].emplace(connect_full{this, w});
+          ex::start(*cells[w->slot]);
+        }
+      }
+    });
+
+    if (eptr_) {
+      std::rethrow_exception(eptr_);
+    }
+    if (ec_) {
+      throw std::system_error(ec_, "blake3pp: reading a window");
+    }
+    // Every complete window is a subtree of the final tree and goes in
+    // through the reducer; the last one carries the message end, so it
+    // can only ever be hashed by the hasher itself, and last.
+    reducer_.drain_into(h_);
+    if (last_window_ != nullptr) {
+      window& w = *last_window_;
+      h_.update(std::span<const std::byte>(w.buffer.data(), w.bytes));
+      if (w.rec != nullptr) {
+        // The last window is never folded, so its join and its absorb
+        // are the same instant: the hasher took it whole.
+        w.rec->t_joined = w.rec->t_absorbed = trace_->now();
+      }
+      stamp_released(w);
+    }
+  }
+
+ private:
+  struct window {
+    std::span<std::byte> buffer;
+    window_compress<Budget> compress;
+    cv_type cv{};
+    std::uint64_t index = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t first_chunk = 0;
+    std::uint64_t chunks = 0;
+    std::size_t bytes = 0;
+    window_record* rec = nullptr;
+    window* next_free = nullptr;
+    unsigned slot = 0;
+    bool last = false;
+    bool cv_pending = false;  // folded, but the reducer had no room
+  };
+
+  // The scope's receiver is a handle: the scope and the window it speaks
+  // for, nothing else. It must stay copy-constructible, because beman's
+  // continues_on stores the receiver by copy from an lvalue
+  // (continues_on.hpp, state_type), and the chain below runs through
+  // exactly that adaptor.
+  struct scope_receiver {
+    using receiver_concept = ex_compat::receiver_tag;
+    scope_receiver(window_scope* s, window* win) noexcept
+        : scope(s), w(win) {}
+    window_scope* scope;
+    window* w;
+
+    void set_value() && noexcept { scope->on_done(*w); }
+    void set_error(std::error_code ec) && noexcept { scope->on_error(*w, ec); }
+    void set_error(std::exception_ptr e) && noexcept {
+      scope->on_exception(*w, std::move(e));
+    }
+    void set_stopped() && noexcept {
+      scope->on_error(*w,
+                      std::make_error_code(std::errc::operation_canceled));
+    }
+  };
+
+  static_assert(std::copy_constructible<scope_receiver>);
+
+  // One window, start to finish. Phase 4 replaces the middle line and
+  // nothing else.
+  [[nodiscard]] auto window_chain(window& w) {
+    return ex::then(
+        ex::continues_on(
+            ex::let_value(loop_.read(file_, w.offset,
+                                     w.buffer.first(w.bytes)),
+                          [this, &w](std::span<const std::byte>) {
+                            return compress_stage(w);
+                          }),
+            loop_.scheduler()),
+        [this, &w](const cv_type& cv) noexcept { reduce_into_tree(w, cv); });
+  }
+
+  // The last window is never a subtree of anything: its read is issued
+  // like the others and its buffer is held until the run ends, where the
+  // hasher takes it after the reducer has drained.
+  [[nodiscard]] auto last_window_chain(window& w) {
+    return ex::then(loop_.read(file_, w.offset, w.buffer.first(w.bytes)),
+                    [this, &w](std::span<const std::byte>) noexcept {
+                      stamp_ready(w);
+                    });
+  }
+
+  [[nodiscard]] auto compress_stage(window& w) {
+    stamp_ready(w);
+    if constexpr (Traced) {
+      return ex::then(compress_on<true>(sched_, w.compress),
+                      [this, &w](const cv_type& cv) noexcept {
+                        if (w.rec != nullptr) {
+                          w.rec->t_joined = trace_->now();
+                          w.rec->agent_busy_ns =
+                              w.compress.pt.busy_ns.load(
+                                  std::memory_order_relaxed);
+                          w.rec->agents_active =
+                              w.compress.pt.active.load(
+                                  std::memory_order_relaxed);
+                          w.rec->flags |= window_record::flag_parallel;
+                        }
+                        return cv;
+                      });
+    } else {
+      return compress_on<false>(sched_, w.compress);
+    }
+  }
+
+  // Takes the next window's geometry, or false at end of file.
+  [[nodiscard]] bool take_next(window& w) noexcept {
+    if (next_offset_ >= file_bytes_) {
+      return false;
+    }
+    w.offset = next_offset_;
+    w.bytes = static_cast<std::size_t>(
+        std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_));
+    w.last = next_offset_ + w.bytes >= file_bytes_;
+    w.chunks = w.bytes / chunk_size;
+    w.first_chunk = base_chunk_ + w.offset / chunk_size;
+    w.index = index_++;
+    w.cv_pending = false;
+    next_offset_ += w.bytes;
+    return true;
+  }
+
+  void prepare_compress(window& w) noexcept {
+    const bool fanned =
+        w.compress.prepare(ops_, w.buffer.data(), w.chunks, w.first_chunk,
+                           h_.key_words(), h_.mode_flags(), trace_, w.index);
+    // update_file only reaches the pipeline for windows big enough to fan
+    // out; a window that is not is exactly what the fallback path exists
+    // for.
+    assert(fanned && "a window too small to fan out reached the pipeline");
+    (void)fanned;
+  }
+
+  void reduce_into_tree(window& w, const cv_type& cv) noexcept {
+    w.cv = cv;
+    w.cv_pending = !reducer_.insert(w.first_chunk, w.chunks, cv);
+    if (w.rec != nullptr) {
+      w.rec->t_absorbed = trace_->now();
+    }
+  }
+
+  void on_done(window& w) noexcept {
+    --in_flight_;
+    if (&w == last_window_) {
+      status_.outstanding = in_flight_;
+      settle();
+      return;
+    }
+    if (!w.cv_pending) {
+      release(w);
+    }
+    retry_held();
+    settle();
+  }
+
+  void on_error(window& w, std::error_code ec) noexcept {
+    if (!ec_) {
+      ec_ = ec;
+    }
+    stop_ = true;
+    --in_flight_;
+    w.cv_pending = false;
+    if (&w != last_window_) {
+      release(w);
+    }
+    settle();
+  }
+
+  void on_exception(window& w, std::exception_ptr e) noexcept {
+    if (!eptr_) {
+      eptr_ = std::move(e);
+    }
+    stop_ = true;
+    --in_flight_;
+    w.cv_pending = false;
+    if (&w != last_window_) {
+      release(w);
+    }
+    settle();
+  }
+
+  // A window whose CV the reducer had no room for keeps its buffer and
+  // its place: closing the hole it belongs to is what frees the node
+  // another window needs.
+  void retry_held() noexcept {
+    bool progress = true;
+    while (progress) {
+      progress = false;
+      for (unsigned i = 0; i < count_; ++i) {
+        window& w = windows_[i];
+        if (!w.cv_pending) {
+          continue;
+        }
+        if (reducer_.insert(w.first_chunk, w.chunks, w.cv)) {
+          w.cv_pending = false;
+          release(w);
+          progress = true;
+        }
+      }
+    }
+  }
+
+  void settle() noexcept {
+    status_.outstanding = in_flight_;
+    if (in_flight_ > 0) {
+      return;
+    }
+    if (stop_ || next_offset_ >= file_bytes_) {
+      status_.done = true;
+    }
+  }
+
+  void release(window& w) noexcept {
+    stamp_released(w);
+    push_free(&w);
+  }
+
+  void push_free(window* w) noexcept {
+    w->next_free = free_;
+    free_ = w;
+  }
+
+  void claim_record(window& w) noexcept {
+    w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
+    if (w.rec != nullptr) {
+      w.rec->index = w.index;
+      w.rec->bytes = w.bytes;
+      w.rec->flags = w.last ? window_record::flag_last : 0;
+      w.rec->t_wait_begin = trace_->now();
+    }
+  }
+
+  void stamp_ready(window& w) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_ready = trace_->now();
+    }
+  }
+
+  void stamp_released(window& w) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_released = trace_->now();
+    }
+  }
+
+  hasher& h_;
+  driver_loop<D> loop_;
+  typename D::file& file_;
+  Scheduler sched_;
+  trace_buffer* trace_ = nullptr;
+  const kern::kernel_ops* ops_ = nullptr;
+  std::size_t window_bytes_ = 0;
+  unsigned count_ = 0;
+  unsigned in_flight_cap_ = 0;
+  std::uint64_t base_chunk_ = 0;
+  std::uint64_t file_bytes_ = 0;
+  std::unique_ptr<window[]> windows_;
+  std::unique_ptr<tree_reducer::node[]> nodes_;
+  tree_reducer reducer_;
+
+  loop_status status_{};
+  window* free_ = nullptr;
+  window* last_window_ = nullptr;
+  std::uint64_t next_offset_ = 0;
+  std::uint64_t index_ = 0;
+  unsigned in_flight_ = 0;
+  bool stop_ = false;
+  std::error_code ec_{};
+  std::exception_ptr eptr_{};
+};
+
+// Whether a file belongs on the pipeline at all.
+//
+// Every full window is absorbed as one subtree, which needs the hasher to
+// sit where a window begins -- always true for a fresh one -- and the
+// window to be worth fanning out. A hasher part-way through a window, or
+// a window below the fan-out floor, is what update_from_reader is for.
+template <stack_budget Budget>
+[[nodiscard]] inline bool pipeline_can_take(const hasher& h,
+                                            std::size_t window_bytes) noexcept {
+  const std::size_t chunks = window_bytes / chunk_size;
+  return h.count() % window_bytes == 0 &&
+         window_part_chunks<Budget>(chunks) < chunks;
+}
+
+// Runs one open file through the pipeline on the calling thread.
+//
+// Tracing is a template parameter below this point, because the window
+// chain's type has to be settled before the run starts; here is where the
+// runtime choice becomes a compile-time one, once per run.
+template <stack_budget Budget, file_driver D, class Scheduler>
+void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
+                         Scheduler&& sched, const pipeline_options& opts) {
+  using sched_type = std::remove_cvref_t<Scheduler>;
+  if (opts.trace != nullptr) {
+    window_scope<true, Budget, D, sched_type> scope(
+        h, drv, file, std::forward<Scheduler>(sched), opts);
+    scope.run();
+  } else {
+    window_scope<false, Budget, D, sched_type> scope(
+        h, drv, file, std::forward<Scheduler>(sched), opts);
+    scope.run();
+  }
+}
 
 // Definition-site concept checks, as the I/O backends carry for theirs.
 // io_driver is the model every provider has to host; an operation state

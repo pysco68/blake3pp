@@ -31,6 +31,7 @@
 #include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/parallel.hpp>
+#include <blake3pp/parallel_io.hpp>
 #include <doctest/doctest.h>
 
 namespace {
@@ -610,6 +611,89 @@ TEST_CASE("the four-line window chain composes on this provider") {
   CHECK(returned_on == here);
   MESSAGE("compress stage left the driver thread: "
           << summed_elsewhere.load(std::memory_order_relaxed));
+}
+
+// --------------------------------------------------------------------
+// Section 5: the bounded scope.
+//
+// The pipeline absorbs windows in whatever order they finish, so the one
+// thing every case checks is the digest: any mistake in the geometry, the
+// reducer or the last window shows up there and nowhere else.
+
+namespace {
+
+// Runs one file through the pipeline and finalizes.
+[[nodiscard]] blake3pp::digest pipeline_digest(const fs::path& path,
+                                               std::size_t window,
+                                               unsigned depth, unsigned cap) {
+  using blake3pp::detail::io_driver;
+  auto sched = blake3pp::get_parallel_scheduler();
+  io_driver drv({/*async=*/true, /*offload_submit=*/true}, depth);
+  io_driver::file f(drv, path, /*direct_io=*/false);
+  blake3pp::hasher h;
+  blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+      h, drv, f, sched, {window, depth, nullptr, cap});
+  return h.finalize();
+}
+
+}  // namespace
+
+TEST_CASE("the pipeline's digest matches the sequential hash") {
+  constexpr std::size_t win = 64 * 1024;
+  // Empty, under one window, exactly one window, an exact multiple, and
+  // a multiple plus a tail: every shape the last window can take.
+  for (const std::size_t len :
+       {std::size_t{0}, win / 2, win, 4 * win, 4 * win + 4097}) {
+    const auto content = pattern(len, static_cast<std::uint32_t>(len + 1));
+    const temp_file f(content);
+    const auto expected = blake3pp::hash(content);
+    // One window in flight is the in-order case: every insert arrives
+    // where the reducer would have put it anyway. The full count is what
+    // lets windows finish out of order.
+    for (const unsigned cap : {1u, 0u}) {
+      for (const unsigned depth : {2u, 4u, 32u}) {
+        CAPTURE(len);
+        CAPTURE(cap);
+        CAPTURE(depth);
+        CHECK(pipeline_digest(f.path, win, depth, cap) == expected);
+      }
+    }
+  }
+}
+
+TEST_CASE("the pipeline's digest is independent of the window size") {
+  const std::size_t len = 3 * 1024 * 1024 + 12345;
+  const auto content = pattern(len, 3);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+  for (const std::size_t win :
+       {std::size_t{64} * 1024, std::size_t{256} * 1024,
+        std::size_t{1} << 20}) {
+    CAPTURE(win);
+    CHECK(pipeline_digest(f.path, win, 4, 0) == expected);
+    CHECK(pipeline_digest(f.path, win, 4, 1) == expected);
+  }
+}
+
+TEST_CASE("update_file over a scheduler takes the pipeline and agrees") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  const std::size_t len = 5 * 64 * 1024 + 77;
+  const auto content = pattern(len, 19);
+  const temp_file f(content);
+
+  blake3pp::hasher h;
+  blake3pp::update_file(h, f.path, sched, {.window_bytes = 64 * 1024});
+  CHECK(h.finalize() == blake3pp::hash(content));
+
+  // A hasher that is not on a window boundary cannot absorb windows as
+  // subtrees; it takes the sequential path and must still agree.
+  blake3pp::hasher part;
+  part.update(std::span(content).first(1000));
+  blake3pp::update_file(part, f.path, sched, {.window_bytes = 64 * 1024});
+  blake3pp::hasher ref;
+  ref.update(std::span(content).first(1000));
+  ref.update(content);
+  CHECK(part.finalize() == ref.finalize());
 }
 
 }  // TEST_SUITE
