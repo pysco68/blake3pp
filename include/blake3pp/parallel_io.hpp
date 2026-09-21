@@ -36,61 +36,6 @@
 
 namespace blake3pp {
 
-namespace detail {
-
-// The window loop, over anything shaped like file_reader: next() hands
-// windows out in file order, release() recycles them, and that is the
-// whole vocabulary it needs. update_file() drives it with a real
-// file_reader; the bench drives it with a source that performs no I/O,
-// which is how the pipeline's hash-bound ceiling is measured with no
-// device in the way. The tracing lives here, so both see the same
-// records.
-template <stack_budget Budget = default_stack_budget, class Reader,
-          class Scheduler>
-void update_from_reader(hasher& h, Reader& reader, Scheduler&& sched,
-                        const file_io_options& opts) {
-  const kern::kernel_ops* const ops = detail::resolve(h.selected_arch());
-  const std::uint64_t base = h.count();
-  const bool on_chunk_boundary = base % chunk_size == 0;
-  trace_buffer* const trace = opts.trace;
-  std::uint64_t index = 0;
-  for (;;) {
-    // The wait is timed before the record is claimed: the last next()
-    // returns nothing, and that iteration gets no record.
-    const std::int64_t t_wait_begin = trace ? trace->now() : 0;
-    auto w = reader.next();
-    if (!w) {
-      break;
-    }
-    window_record* const rec = trace ? trace->claim_window() : nullptr;
-    if (rec) {
-      rec->index = index;
-      rec->bytes = w->bytes;
-      rec->flags = w->last ? window_record::flag_last : 0;
-      rec->t_wait_begin = t_wait_begin;
-      rec->t_ready = trace->now();
-    }
-    const std::uint64_t chunks = w->bytes / chunk_size;
-    const std::uint64_t counter = base / chunk_size + w->offset / chunk_size;
-    if (!w->last && on_chunk_boundary && counter % chunks == 0) {
-      detail::hash_window_parallel<Budget>(ops, sched, h, w->data, chunks,
-                                           counter, trace, rec);
-    } else {
-      h.update(std::span<const std::byte>{w->data, w->bytes});
-      if (rec) {
-        rec->t_joined = rec->t_absorbed = trace->now();
-      }
-    }
-    reader.release(*w);
-    if (rec) {
-      rec->t_released = trace->now();
-    }
-    ++index;
-  }
-}
-
-}  // namespace detail
-
 /// Streams a file into a hasher with every complete window fanned out
 /// over a scheduler; the final window is absorbed by h itself.
 ///

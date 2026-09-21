@@ -69,7 +69,6 @@
 #include <blake3pp/parallel_backend.hpp>
 #endif
 
-#include "io/engine.hpp"
 #include <blake3pp/detail/file_pipeline.hpp>
 
 #include "io/null_backend.hpp"
@@ -703,7 +702,6 @@ int main(int argc, char** argv) {
   std::size_t make_mib = 0;
   unsigned pool_threads = b3tool::default_threads();
   bool seq_only = false;
-  bool legacy_loop = false;
   double null_gib = 0;
   bool inline_submit = false;
   bool no_direct = false;
@@ -739,9 +737,6 @@ int main(int argc, char** argv) {
       ->check(b3tool::at_least_one_thread)
       ->capture_default_str();
   app.add_flag("--seq-only", seq_only, "skip the parallel measurement");
-  app.add_flag("--legacy-loop", legacy_loop,
-               "hash through the pull loop over file_reader instead of the "
-               "window pipeline, so one binary can A/B the two paths");
   app.add_option("--null-source", null_gib,
                  "hash this many GiB from a source that performs no I/O: the "
                  "pipeline's hash-bound ceiling, with no file and no device")
@@ -814,23 +809,6 @@ int main(int argc, char** argv) {
       if (trace) {
         trace->clear();
       }
-      if (legacy_loop) {
-        io_impl::polled_reader_engine<io_impl::null_context> reader(
-            total, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-                    opts.offload_submit});
-        const auto pool = reader.pool();
-        for (std::size_t off = 0; off < pool.size(); off += win) {
-          std::memcpy(pool.data() + off, pattern.data(),
-                      std::min(win, pool.size() - off));
-        }
-        blake3pp::hasher h;
-        const auto t0 = std::chrono::steady_clock::now();
-        blake3pp::detail::update_from_reader(h, reader, sched, io_opts);
-        got = h.finalize();
-        const auto t1 = std::chrono::steady_clock::now();
-        best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
-        continue;
-      }
       null_driver drv(
           {/*async=*/true, opts.offload_submit}, opts.queue_depth, total,
           null_filler,
@@ -849,8 +827,7 @@ int main(int argc, char** argv) {
       const auto t1 = std::chrono::steady_clock::now();
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
-    println(stdout, "{:<10} {}   ({}...)  [{}]",
-            legacy_loop ? "null/legacy" : "null",
+    println(stdout, "{:<10} {}   ({}...)  [{}]", "null",
             b3tool::rate(static_cast<std::size_t>(total), best),
             got.to_hex().substr(0, 16),
             got == want ? "digest matches the in-memory hash"
@@ -999,20 +976,8 @@ int main(int argc, char** argv) {
             b3tool::affinity_cpu_count() > 0
                 ? std::format("{} cpus", b3tool::affinity_cpu_count())
                 : std::string{"unknown"});
-    run(legacy_loop ? "legacy" : "parallel", [&] {
-      if (!legacy_loop) {
-        return blake3pp::hash_file(path.c_str(), sched, opts);
-      }
-      // The pull loop this pipeline replaced: one window at a time,
-      // every read waited for where it was issued.
-      blake3pp::detail::file_reader reader(
-          path.c_str(), {opts.window_bytes, opts.queue_depth, opts.direct_io,
-                         true, opts.offload_submit});
-      blake3pp::hasher h = blake3pp::detail::make_hasher(
-          opts, blake3pp::detail::resolve(opts.a));
-      blake3pp::detail::update_from_reader(h, reader, sched, opts);
-      return h.finalize();
-    });
+    run("parallel",
+        [&] { return blake3pp::hash_file(path.c_str(), sched, opts); });
   }
   return 0;
 }
