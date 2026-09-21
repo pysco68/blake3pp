@@ -241,11 +241,18 @@ class null_driver {
  public:
   // The filler is what the source "reads": null_context completes a read
   // without touching the buffer, so the pool it hands out is the file.
+  //
+  // The pool is sized and faulted in here, before the caller starts its
+  // clock. Leaving it to allocate() would put a quarter of a gigabyte of
+  // first-touch page faults inside the measurement at 64 MiB windows,
+  // which is exactly the shape of a pipeline regression that is not one.
   null_driver(const blake3pp::detail::io_driver_options& opts,
-              unsigned max_inflight, std::uint64_t size, std::byte filler)
+              unsigned max_inflight, std::uint64_t size, std::byte filler,
+              std::size_t pool_bytes)
       : ctx_({opts.async, opts.offload_submit}, max_inflight),
         size_(size),
-        filler_(filler) {}
+        filler_(filler),
+        pool_(pool_bytes, filler) {}
   null_driver(const null_driver&) = delete;
   null_driver& operator=(const null_driver&) = delete;
 
@@ -279,8 +286,10 @@ class null_driver {
   }
 
   [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
-    pool_.assign(bytes, filler_);
-    return {pool_.data(), pool_.size()};
+    if (pool_.size() < bytes) {
+      pool_.assign(bytes, filler_);
+    }
+    return {pool_.data(), bytes};
   }
 
  private:
@@ -798,8 +807,12 @@ int main(int argc, char** argv) {
         best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
         continue;
       }
-      null_driver drv({/*async=*/true, opts.offload_submit},
-                      opts.queue_depth, total, null_filler);
+      null_driver drv(
+          {/*async=*/true, opts.offload_submit}, opts.queue_depth, total,
+          null_filler,
+          blake3pp::detail::rounded_window_bytes(opts.window_bytes) *
+              std::clamp<std::size_t>(opts.queue_depth, 2,
+                                      blake3pp::detail::max_queue_depth));
       null_driver::file nf(drv);
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
