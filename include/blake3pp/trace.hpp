@@ -115,6 +115,11 @@ struct driver_stats {
   std::uint64_t polls;
   /// Of those, the ones that blocked.
   std::uint64_t blocking_polls;
+  /// Blocking polls released without a completion of their own: a wake
+  /// from a thread handing a finished window back. One per window is the
+  /// expected shape; many more means the driver is being woken while it
+  /// still had work in hand.
+  std::uint64_t wakes;
   /// Completions run off the run queue: one per window coming back from
   /// the pool, plus any deferred failure.
   std::uint64_t queue_runs;

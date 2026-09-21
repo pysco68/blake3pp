@@ -1244,6 +1244,10 @@ TEST_CASE("the driver records where its own thread went") {
   CHECK(d.queue_runs >= 12);
   CHECK(d.busy_ns + d.parked_ns > 0);
   CHECK(d.blocking_polls <= d.polls);
+  // Every window handed back from the pool wakes the driver at most
+  // once, and a run with windows in flight has to have been woken.
+  CHECK(d.wakes > 0);
+  CHECK(d.wakes <= d.blocking_polls);
   // The default reducer capacity is far above what a twelve-window file
   // decomposes into.
   CHECK(d.admission_stalls == 0);

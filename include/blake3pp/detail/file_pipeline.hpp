@@ -426,12 +426,17 @@ class driver_loop {
       }
       const std::int64_t t_poll = trace_->now();
       stats_->busy_ns += static_cast<std::uint64_t>(t_poll - t);
-      drv_->poll(block);
+      const std::size_t ran = drv_->poll(block);
       t = trace_->now();
       ++stats_->polls;
       if (block) {
         ++stats_->blocking_polls;
         stats_->parked_ns += static_cast<std::uint64_t>(t - t_poll);
+        if (ran == 0) {
+          // Nothing of the driver's own finished, so what released this
+          // poll was a wake from a thread handing a window back.
+          ++stats_->wakes;
+        }
       } else {
         stats_->busy_ns += static_cast<std::uint64_t>(t - t_poll);
       }
