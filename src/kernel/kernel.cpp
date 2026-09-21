@@ -19,6 +19,7 @@
 #endif
 
 #include "kernel/rotate.hpp"
+#include "kernel/uninitialized.hpp"
 #include "kernel/simd_facade.hpp"
 #include "kernel/transpose.hpp"
 
@@ -318,7 +319,7 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
   // copy.
   const std::uint8_t* src = block;
 #if BLAKE3PP_ALIGN_MESSAGE_BLOCK
-  alignas(std::uint32_t) std::uint8_t staged[block_len];
+  alignas(std::uint32_t) std::uint8_t staged BLAKE3PP_CXXATTR_UNINITIALIZED [block_len];
   if ((std::bit_cast<std::uintptr_t>(src) &
        (alignof(std::uint32_t) - 1)) != 0) {
     std::memcpy(staged, src, block_len);
@@ -328,7 +329,7 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
       __builtin_assume_aligned(src, alignof(std::uint32_t)));
 #endif
 
-  std::uint32_t m[16];
+  std::uint32_t m BLAKE3PP_CXXATTR_UNINITIALIZED [16];
   for (std::size_t i = 0; i < 16; ++i) {
     m[i] = load32(src + 4 * i);
   }
@@ -386,8 +387,8 @@ struct counter_words {
 
 BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
     std::uint64_t counter, bool increment_counter) noexcept {
-  std::uint32_t lo[u32v::width];
-  std::uint32_t hi[u32v::width];
+  std::uint32_t lo BLAKE3PP_CXXATTR_UNINITIALIZED [u32v::width];
+  std::uint32_t hi BLAKE3PP_CXXATTR_UNINITIALIZED [u32v::width];
   for (std::size_t lane = 0; lane < u32v::width; ++lane) {
     const std::uint64_t c = counter + (increment_counter ? lane : 0);
     lo[lane] = counter_lo(c);
@@ -503,7 +504,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     }
   }
 
-  std::uint32_t lanes[W];
+  std::uint32_t lanes BLAKE3PP_CXXATTR_UNINITIALIZED [W];
   for (std::size_t j = 0; j < 8; ++j) {
     cv[j].store(lanes);
     for (std::size_t lane = 0; lane < W; ++lane) {
