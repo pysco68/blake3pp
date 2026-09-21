@@ -69,10 +69,12 @@ elseif(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
 else()
   # A stall in the pipeline or a backend used to wedge a lane: the run
   # would sit there until the CI job's own limit killed it, with nothing
-  # to say which case was stuck. The slowest case in this suite is under
-  # a second, sanitizers included, so a minute is only ever reached by
-  # something that has stopped making progress.
-  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 60)
+  # to say which case was stuck. A deadlock is unbounded, so any finite
+  # limit catches it; the number is set by the slowest honest case
+  # instead. That is the reducer's property cases under GCC with
+  # address+undefined, which hash a couple of gigabytes each and take
+  # about four minutes there against under a second on the plain lanes.
+  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 900)
 endif()
 
 # The sized parallel scheduler is one definition per program; the test
