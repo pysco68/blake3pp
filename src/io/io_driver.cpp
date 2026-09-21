@@ -156,7 +156,7 @@ void io_driver::submit_read(file& f, std::uint64_t off,
   impl_->ctx.submit_read(f.impl_->f, off, buf, *inner);
 }
 
-void io_driver::flush() { impl_->ctx.flush(); }
+void io_driver::flush() noexcept { impl_->ctx.flush(); }
 
 std::size_t io_driver::poll(bool block) { return impl_->ctx.poll(block); }
 

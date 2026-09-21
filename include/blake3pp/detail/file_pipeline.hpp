@@ -20,6 +20,22 @@
 // a pool thread cannot touch the driver, so it parks a node on the run
 // queue and nudges the driver awake instead.
 //
+// Two rules hold the shape together, and both are about where a
+// completion may run:
+//
+//   * callbacks run only inside poll(), which is the I/O contract from
+//     Phase 2a (src/io/backend.hpp);
+//   * nothing completes inside a start(), which is this header's.
+//
+// The second follows from the first plus who calls start(). The scope
+// starts the next window from inside its own receiver, so a sender that
+// completed its receiver from start() would run that receiver inside
+// itself -- recursing through the scope's bookkeeping while the earlier
+// completion is still halfway through it, to a depth set by how many
+// windows happen to be ready. A read that cannot even be queued
+// therefore parks its failure on the run queue and is completed from
+// the loop, like every other completion.
+//
 // A template over file_driver: io_driver for a real device, the bench's
 // driver over null_context for a pipeline measured with no device under
 // it, and a fake driver in the tests.

@@ -141,7 +141,7 @@ class fake_context {
     op.done_once = false;
     queue_.push_back(&op);
   }
-  void flush() {}
+  void flush() noexcept {}
 
   std::size_t poll(bool) {
     if (queue_.empty()) {
@@ -370,6 +370,77 @@ TEST_CASE("two files share one context") {
   }
 #endif
 }
+
+// A read the engine has taken is counted in in_flight(), and the caller
+// is owed its callback whatever happens next. io_uring can refuse a
+// submit -- the entries stay queued and unsent -- so the reads it
+// refused have to reach their callback another way, or in_flight()
+// never comes down and a blocking poll never returns. A working kernel
+// cannot be asked to refuse, so the recovery step is driven directly.
+#if defined(__linux__)
+TEST_CASE("io_uring: reads the ring would not take are served by poll()") {
+  constexpr std::size_t len = 16 * 1024;
+  const auto content = pattern(len, 41);
+  const temp_file f(content);
+
+  io_impl::uring_context ctx({}, 4);
+  io_impl::uring_context::file file(ctx, f.path, /*direct_io=*/false);
+
+  std::vector<std::byte> got_a(len / 2);
+  std::vector<std::byte> got_b(len / 2);
+  probe pa;
+  probe pb;
+  io_impl::uring_context::read_op a{};
+  io_impl::uring_context::read_op b{};
+  a.done = &probe::on_done;
+  a.owner = &pa;
+  b.done = &probe::on_done;
+  b.owner = &pb;
+  ctx.submit_read(file, 0, std::span(got_a), a);
+  ctx.submit_read(file, len / 2, std::span(got_b), b);
+  CHECK(ctx.in_flight() == 2);
+
+  // What a refused io_uring_enter leaves behind, without one.
+  ctx.defer_unsubmitted();
+  CHECK(pa.calls == 0);
+  CHECK(pb.calls == 0);
+  CHECK(ctx.in_flight() == 2);
+
+  // One deferred read per poll, on the caller's thread, same as every
+  // other read this backend cannot put on the ring.
+  std::size_t polls = 0;
+  while (pa.calls + pb.calls < 2) {
+    ctx.poll(true);
+    ++polls;
+    REQUIRE(polls < 8);
+  }
+  CHECK(!pa.ec);
+  CHECK(!pb.ec);
+  CHECK(ctx.in_flight() == 0);
+  CHECK(std::equal(got_a.begin(), got_a.end(), content.begin()));
+  CHECK(std::equal(got_b.begin(), got_b.end(), content.begin() + len / 2));
+}
+
+TEST_CASE("io_uring: giving up the ring mid-run leaves wake() working") {
+  io_impl::uring_context ctx({}, 4);
+  // The armed wake rides the same queue as the reads; taking the queue
+  // back drops it, and poll() has to notice and re-arm before it sleeps.
+  ctx.defer_unsubmitted();
+
+  std::atomic<bool> entered{false};
+  std::size_t ran = 1;
+  std::thread driver([&] {
+    entered.store(true, std::memory_order_release);
+    ran = ctx.poll(true);
+  });
+  while (!entered.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  ctx.wake();
+  driver.join();
+  CHECK(ran == 0);
+}
+#endif
 
 TEST_CASE("wake() releases a blocked poll from another thread") {
   const auto check = [](auto& ctx) {

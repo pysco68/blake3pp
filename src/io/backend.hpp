@@ -187,9 +187,16 @@ struct read_op_base {
 // callbacks. The engines' member order is what enforces both.
 //
 // Errors reach the callback as std::error_code: -res in the generic
-// category, and an unexpected EOF as EIO. flush() and poll() throw only
-// when the mechanism itself fails (io_uring_enter), never for a read's
-// own error.
+// category, and an unexpected EOF as EIO. poll() throws only when the
+// mechanism itself fails while waiting, never for a read's own error.
+//
+// A read that in_flight() counts must reach its callback. That is what
+// makes a submit failure a degradation rather than an exception: an
+// engine that refuses to take a read it was already handed leaves it on
+// the deferred list, where poll() reads it synchronously and reports
+// whatever happens then. An exception at that point would leave the
+// read counted, uncompleted and unreachable, which no caller can
+// recover from.
 template <class C>
 concept reader_context = requires(C c, const C cc, typename C::file& f,
                                   typename C::read_op& op, std::uint64_t off,
@@ -207,8 +214,9 @@ concept reader_context = requires(C c, const C cc, typename C::file& f,
   // deferred list and is read synchronously inside poll(), which is where
   // the old contract's "lazy at delivery" ended up.
   { c.submit_read(f, off, buf, op) };
-  // Pushes everything queued to the OS in one call. May throw.
-  { c.flush() };
+  // Pushes everything queued to the OS in one call. Never throws: what
+  // the OS refuses moves to the deferred list, still owed.
+  { c.flush() } noexcept;
   // Reaps completions, reissues short reads, performs at most one
   // deferred synchronous read, and runs the callbacks of every op that
   // finished. Flushes first. With block == true, sleeps until at least

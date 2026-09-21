@@ -319,6 +319,24 @@ struct uring {
     }
   }
 
+  // Takes back every entry the kernel has not accepted, oldest first,
+  // and leaves the queue empty. A caller that cannot submit needs to
+  // know which reads it is still holding, and a submit the kernel
+  // refused will not do better on the next try.
+  template <class Fn>
+  void take_unsubmitted(Fn&& fn) noexcept {
+    const unsigned tail = *sq_tail;  // we are the only writer
+    const unsigned head =
+        std::atomic_ref<unsigned>(*sq_head).load(std::memory_order_acquire);
+    for (unsigned i = head; i != tail; ++i) {
+      io_uring_sqe sqe{};
+      std::memcpy(&sqe, sqes + (i & *sq_mask) * sizeof(io_uring_sqe),
+                  sizeof(sqe));
+      fn(sqe.user_data);
+    }
+    std::atomic_ref<unsigned>(*sq_tail).store(head, std::memory_order_release);
+  }
+
   // Queues one READ or WRITE and submits immediately: the writer engine's
   // one-at-a-time shape, unchanged.
   void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
@@ -469,9 +487,18 @@ class uring_context {
     }
   }
 
-  void flush() {
-    if (use_uring_) {
+  // A refused submit is not an error the caller can do anything with:
+  // the reads are already counted in in_flight(), and an exception here
+  // would leave them counted and uncompleted. They take the ladder this
+  // backend already has for a read it cannot put on the ring instead.
+  void flush() noexcept {
+    if (!use_uring_) {
+      return;
+    }
+    try {
       ring_.flush();
+    } catch (const std::system_error&) {
+      defer_unsubmitted();
     }
   }
 
@@ -497,6 +524,27 @@ class uring_context {
   void wake() noexcept { waiter_.wake(); }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+
+  // Every entry the kernel refused to take names a read that in_flight()
+  // counts and the ring will never complete. Moving them to the deferred
+  // list is what keeps the contract's promise that a counted read
+  // reaches its callback: poll() reads each one synchronously and
+  // reports whatever happens then. The wake's one-shot poll comes back
+  // with them; take_wake() re-arms it.
+  //
+  // Called by flush() on a refused submit, and directly by the test that
+  // covers this path, since a working kernel cannot be asked to refuse.
+  void defer_unsubmitted() noexcept {
+    ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
+      if (ud == wake_ud()) {
+        wake_armed_ = false;
+        return;
+      }
+      read_op& op = *op_from(ud);
+      op.next_deferred = nullptr;
+      deferred_.push(op);
+    });
+  }
 
  private:
   // Which rung of the ladder this context reached, for a file that did or
@@ -580,7 +628,13 @@ class uring_context {
       ran++;
     }
     if (requeued) {
-      ring_.flush();
+      // The continuation of a short read is the same kind of entry as
+      // the read itself, and the same refusal leaves it owed.
+      try {
+        ring_.flush();
+      } catch (const std::system_error&) {
+        defer_unsubmitted();
+      }
     }
     return ran;
   }
