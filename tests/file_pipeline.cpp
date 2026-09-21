@@ -1284,6 +1284,13 @@ TEST_CASE("the sequential window loop leaves the driver record empty") {
 // come back as an unexpected EOF, which the backends report as EIO, and
 // that is the one error a device actually produces here.
 TEST_CASE("a file truncated under the pipeline fails once with EIO") {
+#if defined(_WIN32)
+  // Windows will not shorten a file another handle has open, and the
+  // pipeline's handle is open for the whole run -- so the shape this
+  // case provokes cannot happen there. The fake driver covers the same
+  // error path on every platform; this one covers the real backend's.
+  MESSAGE("skipped: this platform refuses to truncate an open file");
+#else
   using blake3pp::detail::io_driver;
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
@@ -1325,6 +1332,7 @@ TEST_CASE("a file truncated under the pipeline fails once with EIO") {
     // consistent records; the run just stops early.
     CHECK(trace.windows().size() <= 8);
   }
+#endif
 }
 
 // The last window is where the tree stops and the hasher takes over, so
