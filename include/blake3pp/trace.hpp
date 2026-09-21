@@ -58,6 +58,13 @@ struct window_record {
   std::uint32_t agents_active;
   /// flag_parallel, flag_last.
   std::uint32_t flags;
+  /// Which window object -- buffer, part table and operation cell --
+  /// carried this window. The pipeline reuses a fixed set of them, so
+  /// this is the track a window's phases belong on when several are in
+  /// flight; zero on the sequential path, which has one.
+  std::uint32_t slot;
+  /// Zero.
+  std::uint32_t reserved;
 };
 
 /// One bulk invocation that compressed at least one part of a window.
@@ -84,8 +91,40 @@ struct agent_record {
   std::uint32_t reserved;
 };
 
+/// What the thread driving the pipeline spent its own time on.
+///
+/// The stage shares of a window no longer sum to the wall clock once
+/// several windows are in flight, so this is the number that says
+/// whether the driver is the bottleneck: busy against parked is the
+/// thread's own split, and the loop counters say what it was doing when
+/// it was busy.
+///
+/// Written only by the driver thread, and only while it is inside its
+/// own loop.
+struct driver_stats {
+  /// Nanoseconds the driver spent outside a blocking poll: submitting,
+  /// reaping, running completions and inserting into the reducer.
+  std::uint64_t busy_ns;
+  /// Nanoseconds the driver spent inside a blocking poll, waiting for a
+  /// read or for a window to come back from the pool.
+  std::uint64_t parked_ns;
+  /// Times round the loop: one drain, one round of starts, one flush and
+  /// one poll each.
+  std::uint64_t iterations;
+  /// poll() calls, blocking and not.
+  std::uint64_t polls;
+  /// Of those, the ones that blocked.
+  std::uint64_t blocking_polls;
+  /// Completions run off the run queue: one per window coming back from
+  /// the pool, plus any deferred failure.
+  std::uint64_t queue_runs;
+  /// Windows the scope held back because the reducer had no node free.
+  std::uint64_t admission_stalls;
+};
+
 static_assert(std::is_trivially_copyable_v<window_record>);
 static_assert(std::is_trivially_copyable_v<agent_record>);
+static_assert(std::is_trivially_copyable_v<driver_stats>);
 
 /// Caller-owned storage for the records of one or more update_file()
 /// calls, handed in through file_io_options::trace.
@@ -178,6 +217,16 @@ class trace_buffer {
                                   agents_.size()));
   }
 
+  /// Where the driver thread's own time went. Only the pipeline path
+  /// fills this in; the sequential window loop leaves it zeroed, since
+  /// there is no driver thread to speak of.
+  [[nodiscard]] const driver_stats& driver() const noexcept {
+    return driver_;
+  }
+
+  /// The driver's own record, for the thread that owns the loop.
+  [[nodiscard]] driver_stats& driver() noexcept { return driver_; }
+
   /// Window claims refused for lack of storage.
   [[nodiscard]] std::uint64_t dropped_windows() const noexcept {
     return dropped_windows_;
@@ -193,6 +242,7 @@ class trace_buffer {
   void clear() noexcept {
     n_windows_ = 0;
     dropped_windows_ = 0;
+    driver_ = driver_stats{};
     next_agent_.store(0, std::memory_order_relaxed);
     dropped_agents_.store(0, std::memory_order_relaxed);
   }
@@ -203,6 +253,7 @@ class trace_buffer {
   std::chrono::steady_clock::time_point epoch_;
   std::size_t n_windows_ = 0;
   std::uint64_t dropped_windows_ = 0;
+  driver_stats driver_{};
   std::atomic<std::size_t> next_agent_{0};
   std::atomic<std::uint64_t> dropped_agents_{0};
 };

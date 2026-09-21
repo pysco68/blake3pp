@@ -32,6 +32,7 @@
 // the stopwatch that settles it per machine.
 
 #include <algorithm>
+#include <new>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -68,11 +69,15 @@
 #endif
 
 #include "io/engine.hpp"
+#include <blake3pp/detail/file_pipeline.hpp>
+
 #include "io/null_backend.hpp"
 
 #include "tool_common.hpp"
 
 namespace {
+
+namespace io_impl = blake3pp::detail::io_impl;
 
 using b3tool::println;
 
@@ -228,6 +233,72 @@ double iowq_cpu_seconds(const std::map<std::string, std::uint64_t>& before,
 // microseconds as the format wants; epoch_ns at the top level is the
 // records' zero as absolute CLOCK_MONOTONIC nanoseconds, for joining with
 // timestamps other tools take on the same clock.
+// The pipeline with no device under it: a driver over null_context, the
+// source whose reads complete with whatever is already in the buffer.
+// It is the same seam io_driver is, without the pimpl, and it is what
+// measures the pipeline's own ceiling.
+class null_driver {
+ public:
+  // The filler is what the source "reads": null_context completes a read
+  // without touching the buffer, so the pool it hands out is the file.
+  null_driver(const blake3pp::detail::io_driver_options& opts,
+              unsigned max_inflight, std::uint64_t size, std::byte filler)
+      : ctx_({opts.async, opts.offload_submit}, max_inflight),
+        size_(size),
+        filler_(filler) {}
+  null_driver(const null_driver&) = delete;
+  null_driver& operator=(const null_driver&) = delete;
+
+  class file {
+   public:
+    explicit file(null_driver& drv) noexcept : f_(drv.ctx_, drv.size_) {}
+    [[nodiscard]] std::uint64_t size() const noexcept { return f_.size(); }
+    [[nodiscard]] std::string_view name() const noexcept { return f_.name(); }
+
+   private:
+    friend class null_driver;
+    io_impl::null_context::file f_;
+  };
+
+  void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
+                   blake3pp::detail::io_read_op& op) {
+    static_assert(sizeof(io_impl::null_context::read_op) <=
+                  blake3pp::detail::io_read_op::storage_size);
+    auto* const inner = ::new (static_cast<void*>(op.storage))
+        io_impl::null_context::read_op{};
+    inner->done = &trampoline;
+    inner->owner = &op;
+    ctx_.submit_read(f.f_, off, buf, *inner);
+  }
+
+  void flush() noexcept { ctx_.flush(); }
+  std::size_t poll(bool block) { return ctx_.poll(block); }
+  void wake() noexcept { ctx_.wake(); }
+  [[nodiscard]] std::size_t in_flight() const noexcept {
+    return ctx_.in_flight();
+  }
+
+  [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
+    pool_.assign(bytes, filler_);
+    return {pool_.data(), pool_.size()};
+  }
+
+ private:
+  static void trampoline(io_impl::read_op_base* base,
+                         std::error_code ec) noexcept {
+    auto* const outer =
+        static_cast<blake3pp::detail::io_read_op*>(base->owner);
+    outer->done(outer, ec);
+  }
+
+  io_impl::null_context ctx_;
+  std::uint64_t size_;
+  std::byte filler_;
+  std::vector<std::byte> pool_;
+};
+
+static_assert(blake3pp::detail::file_driver<null_driver>);
+
 bool write_chrome_trace(const std::string& path,
                         const blake3pp::trace_buffer& trace,
                         std::string_view process_name) {
@@ -245,8 +316,35 @@ bool write_chrome_trace(const std::string& path,
                      "\"args\":{{\"name\":\"{}\"}}}},\n",
                      process_name);
   out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
-         "\"args\":{\"name\":\"pipeline\"}}";
+         "\"args\":{\"name\":\"driver\"}}";
+  // The driver's own track: one event over the whole run, carrying what
+  // that thread spent its time on. Windows go on the track of the window
+  // object that carried them, so several in flight read as parallel
+  // lanes rather than as one track nesting into itself.
+  const auto& d = trace.driver();
+  const auto windows = trace.windows();
+  if (d.iterations > 0 && !windows.empty()) {
+    const std::int64_t begin = windows.front().t_wait_begin;
+    const std::int64_t end = windows.back().t_released;
+    out << std::format(
+        ",\n{{\"name\":\"driver\",\"ph\":\"X\",\"pid\":1,\"tid\":1,"
+        "\"ts\":{:.3f},\"dur\":{:.3f},\"args\":{{\"busy_ns\":{},"
+        "\"parked_ns\":{},\"iterations\":{},\"polls\":{},"
+        "\"blocking_polls\":{},\"queue_runs\":{},"
+        "\"admission_stalls\":{}}}}}",
+        us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
+        d.polls, d.blocking_polls, d.queue_runs, d.admission_stalls);
+  }
+  std::map<std::uint32_t, bool> slots_named;
   for (const auto& w : trace.windows()) {
+    const std::uint32_t tid = 10 + w.slot;
+    if (!slots_named[tid]) {
+      slots_named[tid] = true;
+      out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
+                         "\"pid\":1,\"tid\":{},\"args\":{{\"name\":"
+                         "\"window object {}\"}}}}",
+                         tid, w.slot);
+    }
     const std::pair<const char*, std::pair<std::int64_t, std::int64_t>>
         phases[] = {{"wait", {w.t_wait_begin, w.t_ready}},
                     {"hash", {w.t_ready, w.t_joined}},
@@ -254,10 +352,10 @@ bool write_chrome_trace(const std::string& path,
                     {"release", {w.t_absorbed, w.t_released}}};
     for (const auto& [name, span] : phases) {
       out << std::format(",\n{{\"name\":\"{}\",\"ph\":\"X\",\"pid\":1,"
-                         "\"tid\":1,\"ts\":{:.3f},\"dur\":{:.3f},"
+                         "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
                          "\"args\":{{\"window\":{}}}}}",
-                         name, us(span.first), us(span.second - span.first),
-                         w.index);
+                         name, tid, us(span.first),
+                         us(span.second - span.first), w.index);
     }
   }
   std::map<std::uint32_t, bool> cpus_named;
@@ -317,9 +415,50 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
           "  trace (last rep): {} windows ({} fanned out, {} dropped), wall "
           "{:.3f} s",
           windows.size(), fanned, trace.dropped_windows(), wall_ns / 1e9);
+  // With several windows in flight these no longer sum to the wall
+  // clock: they are per-window shares of a pipeline, not a timeline.
   println(stdout,
-          "    wait {:5.1f}%  hash {:5.1f}%  absorb {:5.1f}%  release {:5.1f}%",
+          "    per window: wait {:5.1f}%  hash {:5.1f}%  absorb {:5.1f}%  "
+          "release {:5.1f}%",
           pct(wait), pct(hash), pct(absorb), pct(release));
+
+  // What the driver thread itself did, which is the number the compress
+  // stage is judged against: a driver parked most of the time has room
+  // for more work, one that is busy is the ceiling.
+  const auto& d = trace.driver();
+  if (d.iterations > 0) {
+    const double driver_ns = static_cast<double>(d.busy_ns + d.parked_ns);
+    println(stdout,
+            "    driver busy {:5.1f}% of its own {:.3f} s, {} iterations, {} "
+            "polls ({} blocking), {} completions, {} admission stalls",
+            100.0 * static_cast<double>(d.busy_ns) / driver_ns,
+            driver_ns / 1e9, d.iterations, d.polls, d.blocking_polls,
+            d.queue_runs, d.admission_stalls);
+  }
+
+  // Per-window latencies, as medians: with windows overlapping, an
+  // average over stages says less than where the middle window sat.
+  {
+    std::vector<std::int64_t> to_read;
+    std::vector<std::int64_t> to_cv;
+    std::vector<std::int64_t> to_reduced;
+    to_read.reserve(windows.size());
+    to_cv.reserve(windows.size());
+    to_reduced.reserve(windows.size());
+    for (const auto& w : windows) {
+      to_read.push_back(w.t_ready - w.t_wait_begin);
+      to_cv.push_back(w.t_joined - w.t_ready);
+      to_reduced.push_back(w.t_absorbed - w.t_joined);
+    }
+    const auto median = [](std::vector<std::int64_t>& v) {
+      std::ranges::nth_element(v, v.begin() + v.size() / 2);
+      return static_cast<double>(v[v.size() / 2]) / 1000.0;
+    };
+    println(stdout,
+            "    median per window: submit->read {:8.1f} us  read->cv {:8.1f} "
+            "us  cv->reduced {:8.1f} us",
+            median(to_read), median(to_cv), median(to_reduced));
+  }
   if (fanned > 0) {
     println(stdout,
             "    pool busy {:5.1f}% of {} threads, {:.1f} agents active per "
@@ -531,6 +670,7 @@ int main(int argc, char** argv) {
   std::size_t make_mib = 0;
   unsigned pool_threads = b3tool::default_threads();
   bool seq_only = false;
+  bool legacy_loop = false;
   double null_gib = 0;
   bool inline_submit = false;
   bool no_direct = false;
@@ -566,6 +706,9 @@ int main(int argc, char** argv) {
       ->check(b3tool::at_least_one_thread)
       ->capture_default_str();
   app.add_flag("--seq-only", seq_only, "skip the parallel measurement");
+  app.add_flag("--legacy-loop", legacy_loop,
+               "hash through the pull loop over file_reader instead of the "
+               "window pipeline, so one binary can A/B the two paths");
   app.add_option("--null-source", null_gib,
                  "hash this many GiB from a source that performs no I/O: the "
                  "pipeline's hash-bound ceiling, with no file and no device")
@@ -638,22 +781,39 @@ int main(int argc, char** argv) {
       if (trace) {
         trace->clear();
       }
-      io_impl::polled_reader_engine<io_impl::null_context> reader(
-          total, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-                  opts.offload_submit});
-      const auto pool = reader.pool();
-      for (std::size_t off = 0; off < pool.size(); off += win) {
-        std::memcpy(pool.data() + off, pattern.data(),
-                    std::min(win, pool.size() - off));
+      if (legacy_loop) {
+        io_impl::polled_reader_engine<io_impl::null_context> reader(
+            total, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
+                    opts.offload_submit});
+        const auto pool = reader.pool();
+        for (std::size_t off = 0; off < pool.size(); off += win) {
+          std::memcpy(pool.data() + off, pattern.data(),
+                      std::min(win, pool.size() - off));
+        }
+        blake3pp::hasher h;
+        const auto t0 = std::chrono::steady_clock::now();
+        blake3pp::detail::update_from_reader(h, reader, sched, io_opts);
+        got = h.finalize();
+        const auto t1 = std::chrono::steady_clock::now();
+        best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
+        continue;
       }
+      null_driver drv({/*async=*/true, opts.offload_submit},
+                      opts.queue_depth, total, null_filler);
+      null_driver::file nf(drv);
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
-      blake3pp::detail::update_from_reader(h, reader, sched, io_opts);
+      blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+          h, drv, nf, sched,
+          {.window_bytes = opts.window_bytes,
+           .queue_depth = opts.queue_depth,
+           .trace = io_opts.trace});
       got = h.finalize();
       const auto t1 = std::chrono::steady_clock::now();
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
-    println(stdout, "{:<10} {}   ({}...)  [{}]", "null",
+    println(stdout, "{:<10} {}   ({}...)  [{}]",
+            legacy_loop ? "null/legacy" : "null",
             b3tool::rate(static_cast<std::size_t>(total), best),
             got.to_hex().substr(0, 16),
             got == want ? "digest matches the in-memory hash"
@@ -796,8 +956,20 @@ int main(int argc, char** argv) {
             b3tool::affinity_cpu_count() > 0
                 ? std::format("{} cpus", b3tool::affinity_cpu_count())
                 : std::string{"unknown"});
-    run("parallel",
-        [&] { return blake3pp::hash_file(path.c_str(), sched, opts); });
+    run(legacy_loop ? "legacy" : "parallel", [&] {
+      if (!legacy_loop) {
+        return blake3pp::hash_file(path.c_str(), sched, opts);
+      }
+      // The pull loop this pipeline replaced: one window at a time,
+      // every read waited for where it was issued.
+      blake3pp::detail::file_reader reader(
+          path.c_str(), {opts.window_bytes, opts.queue_depth, opts.direct_io,
+                         true, opts.offload_submit});
+      blake3pp::hasher h = blake3pp::detail::make_hasher(
+          opts, blake3pp::detail::resolve(opts.a));
+      blake3pp::detail::update_from_reader(h, reader, sched, opts);
+      return h.finalize();
+    });
   }
   return 0;
 }

@@ -1204,4 +1204,52 @@ TEST_CASE("a driver with no device under it hashes the pattern it serves") {
   CHECK(h.finalize() == blake3pp::hash(content));
 }
 
+TEST_CASE("the driver records where its own thread went") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 12 * win + 500;
+  const auto content = pattern(len, 81);
+  const temp_file f(content);
+
+  std::vector<blake3pp::window_record> records(32);
+  blake3pp::trace_buffer trace(records);
+  blake3pp::hasher h;
+  blake3pp::update_file(h, f.path, sched,
+                        {.window_bytes = win, .trace = &trace});
+  CHECK(h.finalize() == blake3pp::hash(content));
+
+  const auto& d = trace.driver();
+  // One round of the loop per poll at least, one completion off the run
+  // queue per window that went to the pool, and time somewhere.
+  CHECK(d.iterations > 0);
+  CHECK(d.polls > 0);
+  CHECK(d.queue_runs >= 12);
+  CHECK(d.busy_ns + d.parked_ns > 0);
+  CHECK(d.blocking_polls <= d.polls);
+  // The default reducer capacity is far above what a twelve-window file
+  // decomposes into.
+  CHECK(d.admission_stalls == 0);
+  MESSAGE("driver busy " << d.busy_ns << " ns, parked " << d.parked_ns
+                         << " ns over " << d.iterations << " iterations, "
+                         << d.polls << " polls (" << d.blocking_polls
+                         << " blocking)");
+}
+
+TEST_CASE("the sequential window loop leaves the driver record empty") {
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 3 * win;
+  const auto content = pattern(len, 82);
+  const temp_file f(content);
+
+  std::vector<blake3pp::window_record> records(8);
+  blake3pp::trace_buffer trace(records);
+  blake3pp::hasher h;
+  // No scheduler: io.hpp's own update_file, which has no driver thread
+  // to account for.
+  blake3pp::update_file(h, f.path, {.window_bytes = win, .trace = &trace});
+  CHECK(h.finalize() == blake3pp::hash(content));
+  CHECK(trace.driver().iterations == 0);
+  CHECK(trace.driver().busy_ns == 0);
+}
+
 }  // TEST_SUITE
