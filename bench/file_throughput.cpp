@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <new>
+#include <numeric>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -394,7 +395,8 @@ bool write_chrome_trace(const std::string& path,
 // The per-row summary of one traced rep: where the wall time went, how
 // busy the pool was, and with agent records what each CPU delivered.
 void print_trace_summary(const blake3pp::trace_buffer& trace,
-                         unsigned threads, double iowq_cpu_s) {
+                         unsigned threads, double iowq_cpu_s,
+                         double achieved_gib_s = 0.0) {
   const auto windows = trace.windows();
   if (windows.empty()) {
     println(stdout, "  trace: no window records");
@@ -526,6 +528,17 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
             "worst max/min part on one agent: {:.1f}x",
             rates.front(), rates[rates.size() / 2], rates.back(),
             worst_spread);
+    // What the cpus managed while compressing, added up, against what
+    // the run actually delivered: the gap is everything that is not
+    // compression -- reading, waiting, and the parts of the file no cpu
+    // was working on at that moment.
+    const double sum = std::accumulate(rates.begin(), rates.end(), 0.0);
+    if (achieved_gib_s > 0.0 && sum > 0.0) {
+      println(stdout,
+              "      sum of per-cpu rates {:.2f} GiB/s; the run delivered "
+              "{:.2f} GiB/s, {:.1f}% of it",
+              sum, achieved_gib_s, 100.0 * achieved_gib_s / sum);
+    }
   }
 }
 
@@ -834,7 +847,9 @@ int main(int argc, char** argv) {
             got == want ? "digest matches the in-memory hash"
                         : "DIGEST MISMATCH");
     if (trace) {
-      print_trace_summary(*trace, threads, 0.0);
+      print_trace_summary(*trace, threads, 0.0,
+                          b3tool::gib_per_s(static_cast<std::size_t>(total),
+                                            best));
       const std::string file = trace_file_name(trace_path, "null", false);
       if (write_chrome_trace(file, *trace, "blake3pp_bench_file null")) {
         println(stdout, "    trace written to {}", file);
@@ -950,7 +965,9 @@ int main(int argc, char** argv) {
             b3tool::rate(static_cast<std::size_t>(bytes), best),
             d.to_hex().substr(0, 16), 100.0 * raw_s / best);
     if (trace) {
-      print_trace_summary(*trace, threads_for_trace, iowq_cpu_s);
+      print_trace_summary(
+          *trace, threads_for_trace, iowq_cpu_s,
+          b3tool::gib_per_s(static_cast<std::size_t>(bytes), best));
       const std::string file = trace_file_name(trace_path, label, !seq_only);
       if (write_chrome_trace(file, *trace,
                              std::format("blake3pp_bench_file {}", label))) {

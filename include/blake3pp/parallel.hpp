@@ -647,8 +647,24 @@ struct window_compress {
 // parts, then the fold that turns their CVs into the window's own. Value:
 // the window CV.
 //
+// Where this runs, which is the whole point of it being a sender:
+//
+// The file pipeline starts this sender from inside the read's
+// completion, which is on its driver thread, inside poll(). Starting it
+// starts `schedule(sched)`, and that only enqueues onto sched -- every
+// part of the bulk, and the fold behind it, then run on an agent of
+// sched. The driver's share of a window's compute is that enqueue and
+// nothing else, which is what lets one thread drive the reads for a
+// whole file while sitting parked over 99% of the time.
+//
+// A provider whose bulk ran its function on the thread that started the
+// sender would move the entire compression onto the driver instead, and
+// the driver's busy share in trace_buffer::driver() is where that would
+// show. Measured on both providers a preset can select: stdexec and
+// beman.execution both leave the driver at or below 1%.
+//
 // The fold runs on whichever agent finished the bulk, so the driver
-// thread never touches it. This is the one line Phase 4 exists to
+// thread never touches it either. This is the one line Phase 4 exists to
 // replace; the window chain around it does not know what is inside.
 template <bool Traced, stack_budget Budget, class Scheduler>
 [[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w) {

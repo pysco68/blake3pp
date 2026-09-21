@@ -16,6 +16,7 @@
 #include <bit>
 #include <concepts>
 #include <string_view>
+#include <cerrno>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -1272,6 +1273,55 @@ TEST_CASE("the sequential window loop leaves the driver record empty") {
   CHECK(h.finalize() == blake3pp::hash(content));
   CHECK(trace.driver().iterations == 0);
   CHECK(trace.driver().busy_ns == 0);
+}
+
+// The error path of the real driver, without a fault injector: a file
+// is opened through io_driver, which takes its size then, and truncated
+// on disk before the pipeline reads it. The windows past the new end
+// come back as an unexpected EOF, which the backends report as EIO, and
+// that is the one error a device actually produces here.
+TEST_CASE("a file truncated under the pipeline fails once with EIO") {
+  using blake3pp::detail::io_driver;
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 91);
+
+  const auto run_truncated = [&](blake3pp::trace_buffer* trace) {
+    const temp_file f(content);
+    io_driver drv({/*async=*/true, /*offload_submit=*/true}, 8);
+    // The size the pipeline will plan its windows from is taken here.
+    io_driver::file file(drv, f.path, /*direct_io=*/false);
+    REQUIRE(file.size() == len);
+    // Everything from the second window on is now gone.
+    std::error_code fs_ec;
+    fs::resize_file(f.path, win, fs_ec);
+    REQUIRE(!fs_ec);
+
+    blake3pp::hasher h;
+    int thrown = 0;
+    std::error_code seen;
+    try {
+      blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+          h, drv, file, sched,
+          {.window_bytes = win, .queue_depth = 8, .trace = trace});
+    } catch (const std::system_error& e) {
+      ++thrown;
+      seen = e.code();
+    }
+    CHECK(thrown == 1);
+    CHECK(seen == std::error_code(EIO, std::generic_category()));
+  };
+
+  SUBCASE("untraced") { run_truncated(nullptr); }
+  SUBCASE("traced") {
+    std::vector<blake3pp::window_record> records(16);
+    blake3pp::trace_buffer trace(records);
+    run_truncated(&trace);
+    // The windows that were claimed before the failure are still
+    // consistent records; the run just stops early.
+    CHECK(trace.windows().size() <= 8);
+  }
 }
 
 }  // TEST_SUITE
