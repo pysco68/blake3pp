@@ -34,6 +34,7 @@ add_executable(blake3pp_tests
   kernel_ops.cpp
   parallel.cpp
   subtree_fold.cpp
+  file_pipeline.cpp
   "${vectors_hpp}")
 # The io suite tests hash_file and the backend engines; without the
 # file-I/O layer there is nothing for it to link against.
