@@ -279,13 +279,19 @@ class iocp_context {
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.owner_file = &f;
-    in_flight_++;
-    f.inflight_++;
     // NO_BUFFERING rejects an unaligned length, so only whole granules
     // ride the port; the tail is read synchronously inside poll().
-    if (f.f_.use_iocp && buf.size() % direct_align == 0) {
+    const bool on_port = f.f_.use_iocp && buf.size() % direct_align == 0;
+    if (on_port) {
+      // ReadFile can fail outright and issue() throws when it does. The
+      // counters go up only once the port owes a completion: counting a
+      // read nobody will complete leaves in_flight() above zero for
+      // good, and a driver that blocks on it never wakes.
       issue(op);
-    } else {
+    }
+    in_flight_++;
+    f.inflight_++;
+    if (!on_port) {
       deferred_.push(op);
     }
   }
