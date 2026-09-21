@@ -311,7 +311,8 @@ static_assert(blake3pp::detail::file_driver<null_driver>);
 
 bool write_chrome_trace(const std::string& path,
                         const blake3pp::trace_buffer& trace,
-                        std::string_view process_name) {
+                        std::string_view process_name,
+                        unsigned pool_threads = 0) {
   std::ofstream out(path);
   if (!out.is_open()) {
     return false;
@@ -320,8 +321,8 @@ bool write_chrome_trace(const std::string& path,
     return static_cast<double>(ns) / 1000.0;
   };
   out << std::format("{{\"epoch_ns\":{},\"displayTimeUnit\":\"ns\","
-                     "\"traceEvents\":[\n",
-                     trace.epoch_ns());
+                     "\"pool_threads\":{},\"traceEvents\":[\n",
+                     trace.epoch_ns(), pool_threads);
   out << std::format("{{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,"
                      "\"args\":{{\"name\":\"{}\"}}}},\n",
                      process_name);
@@ -364,9 +365,17 @@ bool write_chrome_trace(const std::string& path,
     for (const auto& [name, span] : phases) {
       out << std::format(",\n{{\"name\":\"{}\",\"ph\":\"X\",\"pid\":1,"
                          "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
-                         "\"args\":{{\"window\":{}}}}}",
+                         "\"args\":{{\"window\":{},\"slot\":{},"
+                         "\"bytes\":{},\"last\":{},\"parallel\":{}}}}}",
                          name, tid, us(span.first),
-                         us(span.second - span.first), w.index);
+                         us(span.second - span.first), w.index, w.slot,
+                         w.bytes,
+                         (w.flags & blake3pp::window_record::flag_last) != 0
+                             ? 1
+                             : 0,
+                         (w.flags & blake3pp::window_record::flag_parallel) != 0
+                             ? 1
+                             : 0);
     }
   }
   std::map<std::uint32_t, bool> cpus_named;
@@ -851,7 +860,8 @@ int main(int argc, char** argv) {
                           b3tool::gib_per_s(static_cast<std::size_t>(total),
                                             best));
       const std::string file = trace_file_name(trace_path, "null", false);
-      if (write_chrome_trace(file, *trace, "blake3pp_bench_file null")) {
+      if (write_chrome_trace(file, *trace, "blake3pp_bench_file null",
+                             threads)) {
         println(stdout, "    trace written to {}", file);
       }
     }
@@ -970,7 +980,8 @@ int main(int argc, char** argv) {
           b3tool::gib_per_s(static_cast<std::size_t>(bytes), best));
       const std::string file = trace_file_name(trace_path, label, !seq_only);
       if (write_chrome_trace(file, *trace,
-                             std::format("blake3pp_bench_file {}", label))) {
+                             std::format("blake3pp_bench_file {}", label),
+                             threads_for_trace)) {
         println(stdout, "    trace written to {}", file);
       } else {
         println(stderr, "    could not write {}", file);
