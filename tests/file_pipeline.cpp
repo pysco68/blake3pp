@@ -928,4 +928,280 @@ TEST_CASE("the full reducer capacity never throttles a normal run") {
   CHECK(scope.admission_stalls() == 0);
 }
 
+// A scheduler that runs the work where it was started: the case that
+// must not deadlock, since the compress stage then runs inside the
+// driver's own poll.
+struct inline_scheduler;
+
+template <class Receiver>
+struct inline_op {
+  using operation_state_concept = compat::operation_state_tag;
+  inline_op(Receiver r) : rcvr(std::move(r)) {}
+  Receiver rcvr;
+  void start() & noexcept { ex::set_value(std::move(rcvr)); }
+};
+
+struct inline_env {
+  [[nodiscard]] inline_scheduler query(
+      ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept;
+};
+
+struct inline_sender {
+  using sender_concept = compat::sender_tag;
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t());
+  template <class Receiver>
+  inline_op<Receiver> connect(Receiver r) const {
+    return {std::move(r)};
+  }
+  [[nodiscard]] inline_env get_env() const noexcept { return {}; }
+};
+
+struct inline_scheduler : compat::weakly_parallel_scheduler {
+  using scheduler_concept = compat::scheduler_tag;
+  [[nodiscard]] inline_sender schedule() const noexcept { return {}; }
+  bool operator==(const inline_scheduler&) const noexcept = default;
+};
+
+inline inline_scheduler inline_env::query(
+    ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept {
+  return {};
+}
+
+static_assert(ex::scheduler<inline_scheduler>);
+
+// One worker thread and a queue: the other end of the range, where every
+// part of every window is serialized behind a single agent.
+class one_thread_pool {
+ public:
+  one_thread_pool() : worker_([this] { run(); }) {}
+  ~one_thread_pool() {
+    {
+      const std::lock_guard lock(m_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    worker_.join();
+  }
+  one_thread_pool(const one_thread_pool&) = delete;
+  one_thread_pool& operator=(const one_thread_pool&) = delete;
+
+  void post(run_node* n) {
+    {
+      const std::lock_guard lock(m_);
+      queue_.push_back(n);
+    }
+    cv_.notify_one();
+  }
+
+  struct scheduler;
+
+  template <class Receiver>
+  struct op : run_node {
+    using operation_state_concept = compat::operation_state_tag;
+    op(Receiver r, one_thread_pool* p) : rcvr(std::move(r)), pool(p) {
+      run = [](run_node* self) noexcept {
+        ex::set_value(std::move(static_cast<op*>(self)->rcvr));
+      };
+    }
+    Receiver rcvr;
+    one_thread_pool* pool;
+    void start() & noexcept { pool->post(this); }
+  };
+
+  struct env {
+    one_thread_pool* pool;
+    [[nodiscard]] scheduler query(
+        ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept;
+  };
+
+  struct sender {
+    using sender_concept = compat::sender_tag;
+    BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t());
+    one_thread_pool* pool;
+    template <class Receiver>
+    op<Receiver> connect(Receiver r) const {
+      return {std::move(r), pool};
+    }
+    [[nodiscard]] env get_env() const noexcept { return {pool}; }
+  };
+
+  struct scheduler : compat::weakly_parallel_scheduler {
+    using scheduler_concept = compat::scheduler_tag;
+    one_thread_pool* pool = nullptr;
+    [[nodiscard]] sender schedule() const noexcept { return {pool}; }
+    bool operator==(const scheduler&) const noexcept = default;
+  };
+
+  [[nodiscard]] scheduler get_scheduler() noexcept { return {{}, this}; }
+
+ private:
+  void run() {
+    for (;;) {
+      run_node* n = nullptr;
+      {
+        std::unique_lock lock(m_);
+        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+        if (queue_.empty()) {
+          if (stop_) {
+            return;
+          }
+          continue;
+        }
+        n = queue_.front();
+        queue_.erase(queue_.begin());
+      }
+      n->run(n);
+    }
+  }
+
+  std::mutex m_;
+  std::condition_variable cv_;
+  std::vector<run_node*> queue_;
+  bool stop_ = false;
+  std::thread worker_;
+};
+
+inline one_thread_pool::scheduler one_thread_pool::env::query(
+    ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept {
+  return {{}, pool};
+}
+
+static_assert(ex::scheduler<one_thread_pool::scheduler>);
+
+// Runs a file through the pipeline over the fake driver, with whatever
+// hasher and scheduler the case wants.
+template <class Sched>
+void fake_run(blake3pp::hasher& h, std::span<const std::byte> content,
+              std::size_t win, Sched sched, unsigned depth = 4,
+              fake_script script = {}, unsigned cap = 0) {
+  fake_driver drv(content, win, std::move(script));
+  fake_driver::file f(drv);
+  blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+      h, drv, f, std::move(sched),
+      {.window_bytes = win, .queue_depth = depth, .in_flight_cap = cap});
+}
+
+TEST_CASE("the pipeline matches the sequential hash in every mode") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 6 * win + 1234;
+  const auto content = pattern(len, 71);
+  std::array<std::byte, blake3pp::key_size> key{};
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<std::byte>(i * 7 + 1);
+  }
+
+  SUBCASE("plain") {
+    blake3pp::hasher h;
+    fake_run(h, content, win, sched);
+    CHECK(h.finalize() == blake3pp::hash(content));
+  }
+  SUBCASE("keyed") {
+    blake3pp::hasher h = blake3pp::hasher::keyed(key);
+    fake_run(h, content, win, sched);
+    CHECK(h.finalize() == blake3pp::keyed_hash(key, content));
+  }
+  SUBCASE("derive_key") {
+    blake3pp::hasher h = blake3pp::hasher::derive_key("blake3pp pipeline test");
+    fake_run(h, content, win, sched);
+    CHECK(h.finalize() ==
+          blake3pp::derive_key("blake3pp pipeline test", content));
+  }
+}
+
+TEST_CASE("an 8 MiB window is absorbed like any other") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 8 * 1024 * 1024;
+  const std::size_t len = 2 * win + 65536;
+  const auto content = pattern(len, 72);
+  blake3pp::hasher h;
+  fake_run(h, content, win, sched, 4, {.order = {1, 0}});
+  CHECK(h.finalize() == blake3pp::hash(content));
+}
+
+TEST_CASE("prior content decides which path a file takes") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 4 * win + 99;
+  const auto content = pattern(len, 73);
+  const temp_file f(content);
+
+  // A hasher already on a window boundary keeps the pipeline; one that
+  // is not falls back to the sequential loop. Both must agree with a
+  // hasher fed the same bytes by hand.
+  for (const std::size_t prior : {win, win + 1}) {
+    CAPTURE(prior);
+    const auto head = pattern(prior, 74);
+    blake3pp::hasher h;
+    h.update(head);
+    blake3pp::update_file(h, f.path, sched, {.window_bytes = win});
+
+    blake3pp::hasher ref;
+    ref.update(head);
+    ref.update(content);
+    CHECK(h.finalize() == ref.finalize());
+  }
+}
+
+TEST_CASE("a read error at one window surfaces once") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 75);
+
+  for (const int k : {0, 3, 7}) {
+    CAPTURE(k);
+    blake3pp::hasher h;
+    int thrown = 0;
+    std::error_code seen;
+    try {
+      fake_run(h, content, win, sched, 8, {.fail_at_window = k});
+    } catch (const std::system_error& e) {
+      ++thrown;
+      seen = e.code();
+    }
+    CHECK(thrown == 1);
+    CHECK(seen == std::make_error_code(std::errc::io_error));
+    // The hasher is left usable, which is the contract update_file
+    // already has for a failed read.
+    h.update(std::span<const std::byte>(content).first(64));
+    CHECK(h.finalize() != blake3pp::digest{});
+  }
+}
+
+TEST_CASE("the pipeline runs on an inline scheduler and on one thread") {
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 5 * win + 321;
+  const auto content = pattern(len, 76);
+  const auto expected = blake3pp::hash(content);
+
+  SUBCASE("inline") {
+    // Every part runs inside the driver's own poll; nothing may wait on
+    // another thread for it.
+    blake3pp::hasher h;
+    fake_run(h, content, win, inline_scheduler{});
+    CHECK(h.finalize() == expected);
+  }
+  SUBCASE("one thread") {
+    one_thread_pool pool;
+    blake3pp::hasher h;
+    fake_run(h, content, win, pool.get_scheduler());
+    CHECK(h.finalize() == expected);
+  }
+}
+
+TEST_CASE("a driver with no device under it hashes the pattern it serves") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  // The bench measures the pipeline this way: the same window repeated,
+  // so the digest is a property of the pipeline and not of any file.
+  std::vector<std::byte> content(16 * win);
+  for (std::size_t i = 0; i < content.size(); ++i) {
+    content[i] = static_cast<std::byte>(i % 251);
+  }
+  blake3pp::hasher h;
+  fake_run(h, content, win, sched, 8, {.order = {4, 9, 1}});
+  CHECK(h.finalize() == blake3pp::hash(content));
+}
+
 }  // TEST_SUITE
