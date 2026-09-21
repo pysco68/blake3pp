@@ -19,6 +19,34 @@
 
 namespace blake3pp::detail::io_impl {
 
+// The source half of the synchronous contract (sync_context in
+// backend.hpp supplies the deferred list, the poll loop and the wake).
+class pread_source {
+ public:
+  pread_source(const std::filesystem::path& path, bool direct_io) {
+    f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    size_ = f_.stat_size();
+    if (direct_io) {
+      f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
+    }
+  }
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+  [[nodiscard]] std::string_view name() const noexcept {
+    return f_.direct ? "pread+direct" : "pread";
+  }
+
+  void read_at(std::uint64_t off, std::span<std::byte> buf) {
+    f_.pread_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+  }
+
+ private:
+  posix_file f_;
+  std::uint64_t size_ = 0;
+};
+
+using pread_context = sync_context<pread_source>;
+
 class pread_reader {
  public:
   pread_reader(const std::filesystem::path& path,
@@ -87,6 +115,7 @@ class pread_writer {
 };
 
 // Definition-site conformance check (see uring_backend.hpp).
+static_assert(reader_context<pread_context>);
 static_assert(reader_backend<pread_reader>);
 static_assert(writer_backend<pread_writer>);
 

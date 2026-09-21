@@ -45,6 +45,50 @@ inline std::int64_t tell64(std::FILE* f) noexcept {
 #endif
 }
 
+// The source half of the synchronous contract; see pread_source.
+class stdio_source {
+ public:
+  stdio_source(const std::filesystem::path& path, bool) {
+    stream_ = std::fopen(path.string().c_str(), "rb");
+    if (stream_ == nullptr) {
+      throw_errno("fopen");
+    }
+    if (std::fseek(stream_, 0, SEEK_END) != 0) {
+      throw_errno("fseek(end)");
+    }
+    const std::int64_t end = tell64(stream_);
+    if (end < 0) {
+      throw_errno("ftell");
+    }
+    size_ = static_cast<std::uint64_t>(end);
+  }
+  ~stdio_source() {
+    if (stream_ != nullptr) {
+      std::fclose(stream_);
+    }
+  }
+  stdio_source(const stdio_source&) = delete;
+  stdio_source& operator=(const stdio_source&) = delete;
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+  [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
+
+  void read_at(std::uint64_t off, std::span<std::byte> buf) {
+    if (seek64(stream_, off) != 0) {
+      throw_errno("fseek");
+    }
+    if (std::fread(buf.data(), 1, buf.size(), stream_) != buf.size()) {
+      throw std::system_error(EIO, std::generic_category(), "fread");
+    }
+  }
+
+ private:
+  std::FILE* stream_ = nullptr;
+  std::uint64_t size_ = 0;
+};
+
+using stdio_context = sync_context<stdio_source>;
+
 class stdio_reader {
  public:
   stdio_reader(const std::filesystem::path& path, const file_reader_options&,
@@ -148,6 +192,7 @@ class stdio_writer {
 };
 
 // Definition-site conformance check (see uring_backend.hpp).
+static_assert(reader_context<stdio_context>);
 static_assert(reader_backend<stdio_reader>);
 static_assert(writer_backend<stdio_writer>);
 
