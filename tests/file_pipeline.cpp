@@ -16,6 +16,9 @@
 #include <bit>
 #include <concepts>
 #include <string_view>
+#include <condition_variable>
+#include <cstring>
+#include <mutex>
 #include <thread>
 #include <system_error>
 #include <utility>
@@ -304,6 +307,146 @@ struct temp_file {
   }
   static inline int counter = 0;
 };
+
+// A driver with no device under it: the file is a span of bytes, and the
+// test decides in what order, in how many pieces and how successfully
+// the reads finish. Everything the pipeline depends on that a real
+// device would only produce by luck -- out-of-order completion, a read
+// that takes several polls, a failure at one particular window -- is a
+// parameter here.
+struct fake_script {
+  // Preference order by window index; a queued read whose index is not
+  // named completes after every named one, in submission order.
+  std::vector<unsigned> order{};
+  // Bytes per completion; 0 delivers the whole window at once. A smaller
+  // number makes a read take several polls, the way a short read does.
+  std::size_t piece_bytes = 0;
+  // The window index whose read fails, or -1 for none.
+  int fail_at_window = -1;
+};
+
+class fake_driver {
+ public:
+  using script = fake_script;
+
+  fake_driver(std::span<const std::byte> content, std::size_t window_bytes,
+              script s = {})
+      : content_(content), window_bytes_(window_bytes), script_(std::move(s)) {}
+
+  class file {
+   public:
+    explicit file(fake_driver& d) noexcept : drv_(&d) {}
+    [[nodiscard]] std::uint64_t size() const noexcept {
+      return drv_->content_.size();
+    }
+    [[nodiscard]] std::string_view name() const noexcept { return "fake"; }
+
+   private:
+    fake_driver* drv_;
+  };
+
+  void submit_read(file&, std::uint64_t off, std::span<std::byte> buf,
+                   blake3pp::detail::io_read_op& op) {
+    queued_.push_back(read{&op, off, buf, 0});
+  }
+
+  void flush() noexcept {}
+
+  std::size_t poll(bool block) {
+    if (queued_.empty()) {
+      if (block) {
+        std::unique_lock lock(m_);
+        cv_.wait(lock, [this] { return woken_; });
+        woken_ = false;
+      }
+      return 0;
+    }
+    const std::size_t pick = choose();
+    read& r = queued_[pick];
+    const unsigned index = static_cast<unsigned>(r.off / window_bytes_);
+    if (script_.fail_at_window >= 0 &&
+        index == static_cast<unsigned>(script_.fail_at_window)) {
+      blake3pp::detail::io_read_op* const op = r.op;
+      queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      op->done(op, std::make_error_code(std::errc::io_error));
+      return 1;
+    }
+    const std::size_t want = r.buf.size() - r.filled;
+    const std::size_t take =
+        script_.piece_bytes == 0 ? want : std::min(script_.piece_bytes, want);
+    std::memcpy(r.buf.data() + r.filled,
+                content_.data() + r.off + r.filled, take);
+    r.filled += take;
+    if (r.filled < r.buf.size()) {
+      return 0;  // still owed: the read takes another poll
+    }
+    blake3pp::detail::io_read_op* const op = r.op;
+    queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+    op->done(op, std::error_code{});
+    return 1;
+  }
+
+  void wake() noexcept {
+    {
+      const std::lock_guard lock(m_);
+      woken_ = true;
+    }
+    cv_.notify_one();
+  }
+
+  [[nodiscard]] std::size_t in_flight() const noexcept {
+    return queued_.size();
+  }
+
+  [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
+    pool_.resize(bytes);
+    return {pool_.data(), pool_.size()};
+  }
+
+ private:
+  struct read {
+    blake3pp::detail::io_read_op* op;
+    std::uint64_t off;
+    std::span<std::byte> buf;
+    std::size_t filled;
+  };
+
+  // The queued read the script prefers: lowest rank wins, and a read the
+  // script does not name ranks after every one it does.
+  [[nodiscard]] std::size_t choose() const noexcept {
+    std::size_t best = 0;
+    std::size_t best_rank = rank_of(queued_.front());
+    for (std::size_t i = 1; i < queued_.size(); ++i) {
+      const std::size_t r = rank_of(queued_[i]);
+      if (r < best_rank) {
+        best = i;
+        best_rank = r;
+      }
+    }
+    return best;
+  }
+
+  [[nodiscard]] std::size_t rank_of(const read& r) const noexcept {
+    const auto index = static_cast<unsigned>(r.off / window_bytes_);
+    for (std::size_t i = 0; i < script_.order.size(); ++i) {
+      if (script_.order[i] == index) {
+        return i;
+      }
+    }
+    return script_.order.size() + index;
+  }
+
+  std::span<const std::byte> content_;
+  std::size_t window_bytes_;
+  script script_;
+  std::vector<read> queued_;
+  std::vector<std::byte> pool_;
+  std::mutex m_;
+  std::condition_variable cv_;
+  bool woken_ = false;
+};
+
+static_assert(blake3pp::detail::file_driver<fake_driver>);
 
 // Counts completions and remembers the error, like the backend probes.
 struct read_probe {
@@ -694,6 +837,95 @@ TEST_CASE("update_file over a scheduler takes the pipeline and agrees") {
   ref.update(std::span(content).first(1000));
   ref.update(content);
   CHECK(part.finalize() == ref.finalize());
+}
+
+// Runs the pipeline over the fake driver and returns the scope, so a
+// test can read what admission did.
+template <class Scope>
+void run_scope(Scope& scope) {
+  scope.run();
+}
+
+TEST_CASE("sibling windows the reducer cannot hold still finish") {
+  // The liveness case admission control exists for. With a retry list
+  // instead, two windows refused one after the other could never merge:
+  // the second looks for its sibling inside the reducer, and the first is
+  // held outside it. Every window ended up held, nothing was in flight
+  // and the run never finished.
+  using blake3pp::default_stack_budget;
+  using scope_type =
+      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+                                     blake3pp::parallel_scheduler_t>;
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 61);
+
+  fake_driver drv(content, win, {.order = {0, 4, 2, 3, 1, 5}});
+  fake_driver::file f(drv);
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  // Four nodes is the smallest capacity this file may legally run with:
+  // a contiguous run of k of its eight windows holds popcount(k) nodes,
+  // three at k = 7, and the rule needs one more than that. At two the
+  // scope stalls by construction, which is what the assert in the start
+  // hook says.
+  scope_type scope(h, drv, f, sched,
+                   {.window_bytes = win,
+                    .queue_depth = 8,
+                    .trace = nullptr,
+                    .in_flight_cap = 0,
+                    .reducer_capacity = 4});
+  run_scope(scope);
+  CHECK(h.finalize() == blake3pp::hash(content));
+}
+
+TEST_CASE("admission throttles starts instead of refusing an insert") {
+  using blake3pp::default_stack_budget;
+  using scope_type =
+      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+                                     blake3pp::parallel_scheduler_t>;
+  constexpr std::size_t win = 64 * 1024;
+  // Eight windows: a contiguous run of k of them holds popcount(k)
+  // nodes, three at most, so four is just above what this file needs and
+  // far below the eight windows that would otherwise start at once.
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 62);
+
+  fake_driver drv(content, win, {.order = {3, 1, 0, 2}});
+  fake_driver::file f(drv);
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  scope_type scope(h, drv, f, sched,
+                   {.window_bytes = win,
+                    .queue_depth = 8,
+                    .trace = nullptr,
+                    .in_flight_cap = 0,
+                    .reducer_capacity = 4});
+  run_scope(scope);
+  CHECK(h.finalize() == blake3pp::hash(content));
+  // The whole point: the scope held windows back rather than letting the
+  // reducer refuse one.
+  CHECK(scope.admission_stalls() > 0);
+}
+
+TEST_CASE("the full reducer capacity never throttles a normal run") {
+  using blake3pp::default_stack_budget;
+  using scope_type =
+      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+                                     blake3pp::parallel_scheduler_t>;
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 32 * win + 999;
+  const auto content = pattern(len, 63);
+
+  fake_driver drv(content, win, {.order = {5, 2, 9, 0, 7}});
+  fake_driver::file f(drv);
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  scope_type scope(h, drv, f, sched,
+                   {.window_bytes = win, .queue_depth = 8});
+  run_scope(scope);
+  CHECK(h.finalize() == blake3pp::hash(content));
+  CHECK(scope.admission_stalls() == 0);
 }
 
 }  // TEST_SUITE

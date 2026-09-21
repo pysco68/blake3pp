@@ -408,13 +408,27 @@ struct pipeline_options {
   // where every insert arrives in file order, before letting the real
   // count expose the out-of-order path.
   unsigned in_flight_cap = 0;
+  // Reducer nodes the scope will use, 0 for all of them. A test lowers
+  // it to watch admission throttle; it has to stay above the
+  // decomposition size of the file it is used on (see the liveness
+  // argument at admit_more()), which only a caller that knows the file
+  // can judge.
+  std::size_t reducer_capacity = 0;
 };
 
-// Pending nodes the reducer may hold. A window that cannot be inserted
-// is not recycled, so the count is also the backpressure: holes in the
-// inserted range cost nodes, and holding a window closes the hole that
-// produced it.
+// Pending nodes the reducer may hold.
+//
+// The scope admits a window only while a node is free for it, so the
+// count is what bounds how far ahead of the tree the reads may run. It
+// has to clear the worst a contiguous run of windows can decompose into
+// -- one ascending and one descending chain of aligned nodes, one per
+// level, 54 levels at BLAKE3's 2^64-byte limit -- plus the one node the
+// next window needs, or the scope could reach a state where no window
+// may start; see admit_more().
 inline constexpr std::size_t reducer_nodes = 256;
+static_assert(reducer_nodes > 2 * 54 + 1,
+              "the reducer must hold the decomposition of any contiguous "
+              "run of windows plus one, or admission can stall");
 
 // Several window chains in flight over one file, all on the caller's
 // thread.
@@ -448,6 +462,9 @@ class window_scope {
         in_flight_cap_(opts.in_flight_cap == 0
                            ? count_
                            : std::min<unsigned>(opts.in_flight_cap, count_)),
+        reducer_capacity_(opts.reducer_capacity == 0
+                              ? reducer_nodes
+                              : std::min(opts.reducer_capacity, reducer_nodes)),
         base_chunk_(h.count() / chunk_size),
         file_bytes_(file.size()),
         windows_(std::make_unique<window[]>(count_)),
@@ -513,6 +530,9 @@ class window_scope {
       // Every window that can start, started before the one flush this
       // round: the reads of a whole batch reach the OS in one call.
       while (!stop_ && in_flight_ < in_flight_cap_ && free_ != nullptr) {
+        if (!admit_more()) {
+          break;
+        }
         window* const w = free_;
         if (!take_next(*w)) {
           break;
@@ -531,6 +551,14 @@ class window_scope {
           ex::start(*cells[w->slot]);
         }
       }
+      // Nothing running, work left, a buffer free, and still nothing
+      // started: the only way out of that is a reducer capacity below
+      // what this file's windows decompose into, which is a caller
+      // error rather than a state the pipeline can recover from.
+      assert((stop_ || in_flight_ > 0 || next_offset_ >= file_bytes_ ||
+              free_ == nullptr) &&
+             "the reducer capacity is below this file's decomposition: no "
+             "window can start and nothing is in flight");
     });
 
     if (eptr_) {
@@ -555,11 +583,17 @@ class window_scope {
     }
   }
 
+  // How often a window that had a free buffer and work left to do was
+  // held back because the reducer had no node for it. Zero on any run
+  // whose capacity is the default; the admission test is what reads it.
+  [[nodiscard]] std::uint64_t admission_stalls() const noexcept {
+    return admission_stalls_;
+  }
+
  private:
   struct window {
     std::span<std::byte> buffer;
     window_compress<Budget> compress;
-    cv_type cv{};
     std::uint64_t index = 0;
     std::uint64_t offset = 0;
     std::uint64_t first_chunk = 0;
@@ -569,7 +603,6 @@ class window_scope {
     window* next_free = nullptr;
     unsigned slot = 0;
     bool last = false;
-    bool cv_pending = false;  // folded, but the reducer had no room
   };
 
   // The scope's receiver is a handle: the scope and the window it speaks
@@ -643,6 +676,29 @@ class window_scope {
     }
   }
 
+  // Whether one more window may start.
+  //
+  // Every chain in flight will insert exactly one node when it finishes,
+  // so a window may only start while the reducer has a node free for it.
+  // That is what makes insert() total here: it can refuse only when the
+  // storage is full and no merge happened, and this rule leaves room for
+  // each chain before it starts.
+  //
+  // The rule cannot stall the pipeline. Reads start in file order, so
+  // when nothing is in flight the windows that have finished are a
+  // contiguous run from the beginning, and a contiguous run of aligned
+  // subtrees decomposes into at most one ascending and one descending
+  // chain of nodes, one per level: 2 * 54 at BLAKE3's 2^64-byte limit.
+  // The capacity is above that, so with nothing in flight there is
+  // always a free node and always a window that may start.
+  [[nodiscard]] bool admit_more() noexcept {
+    if (reducer_.pending() + in_flight_ < reducer_capacity_) {
+      return true;
+    }
+    ++admission_stalls_;
+    return false;
+  }
+
   // Takes the next window's geometry, or false at end of file.
   [[nodiscard]] bool take_next(window& w) noexcept {
     if (next_offset_ >= file_bytes_) {
@@ -655,7 +711,6 @@ class window_scope {
     w.chunks = w.bytes / chunk_size;
     w.first_chunk = base_chunk_ + w.offset / chunk_size;
     w.index = index_++;
-    w.cv_pending = false;
     next_offset_ += w.bytes;
     return true;
   }
@@ -672,8 +727,10 @@ class window_scope {
   }
 
   void reduce_into_tree(window& w, const cv_type& cv) noexcept {
-    w.cv = cv;
-    w.cv_pending = !reducer_.insert(w.first_chunk, w.chunks, cv);
+    const bool inserted = reducer_.insert(w.first_chunk, w.chunks, cv);
+    // Admission reserved this node before the window started.
+    assert(inserted && "the reducer refused a window admission had room for");
+    (void)inserted;
     if (w.rec != nullptr) {
       w.rec->t_absorbed = trace_->now();
     }
@@ -681,15 +738,9 @@ class window_scope {
 
   void on_done(window& w) noexcept {
     --in_flight_;
-    if (&w == last_window_) {
-      status_.outstanding = in_flight_;
-      settle();
-      return;
-    }
-    if (!w.cv_pending) {
+    if (&w != last_window_) {
       release(w);
     }
-    retry_held();
     settle();
   }
 
@@ -699,7 +750,6 @@ class window_scope {
     }
     stop_ = true;
     --in_flight_;
-    w.cv_pending = false;
     if (&w != last_window_) {
       release(w);
     }
@@ -712,32 +762,10 @@ class window_scope {
     }
     stop_ = true;
     --in_flight_;
-    w.cv_pending = false;
     if (&w != last_window_) {
       release(w);
     }
     settle();
-  }
-
-  // A window whose CV the reducer had no room for keeps its buffer and
-  // its place: closing the hole it belongs to is what frees the node
-  // another window needs.
-  void retry_held() noexcept {
-    bool progress = true;
-    while (progress) {
-      progress = false;
-      for (unsigned i = 0; i < count_; ++i) {
-        window& w = windows_[i];
-        if (!w.cv_pending) {
-          continue;
-        }
-        if (reducer_.insert(w.first_chunk, w.chunks, w.cv)) {
-          w.cv_pending = false;
-          release(w);
-          progress = true;
-        }
-      }
-    }
   }
 
   void settle() noexcept {
@@ -793,6 +821,7 @@ class window_scope {
   unsigned in_flight_cap_ = 0;
   std::uint64_t base_chunk_ = 0;
   std::uint64_t file_bytes_ = 0;
+  std::size_t reducer_capacity_ = reducer_nodes;
   std::unique_ptr<window[]> windows_;
   std::unique_ptr<tree_reducer::node[]> nodes_;
   tree_reducer reducer_;
@@ -803,6 +832,7 @@ class window_scope {
   std::uint64_t next_offset_ = 0;
   std::uint64_t index_ = 0;
   unsigned in_flight_ = 0;
+  std::uint64_t admission_stalls_ = 0;
   bool stop_ = false;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
