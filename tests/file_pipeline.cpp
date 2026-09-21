@@ -21,6 +21,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 
@@ -1432,6 +1433,34 @@ TEST_CASE("a last window with many parts never refuses an insert") {
                     .reducer_capacity = 12});
   scope.run();
   CHECK(h.finalize() == blake3pp::hash(content));
+}
+
+// A capacity below what the file needs is a configuration the pipeline
+// cannot run, not a bug it can recover from -- and the way it used to
+// present was a driver asleep forever. It has to say so instead, in
+// every build, since a release lane has no asserts to fire.
+TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
+  using blake3pp::default_stack_budget;
+  using scope_type =
+      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+                                     blake3pp::parallel_scheduler_t>;
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 111);
+
+  fake_driver drv(content, win, {});
+  fake_driver::file f(drv);
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  // Two nodes cannot hold the three a run of seven windows leaves, let
+  // alone the last window's reservation on top.
+  scope_type scope(h, drv, f, sched,
+                   {.window_bytes = win,
+                    .queue_depth = 8,
+                    .trace = nullptr,
+                    .in_flight_cap = 0,
+                    .reducer_capacity = 2});
+  CHECK_THROWS_AS(scope.run(), std::logic_error);
 }
 
 }  // TEST_SUITE

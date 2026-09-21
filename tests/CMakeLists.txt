@@ -67,7 +67,12 @@ elseif(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   # aggregate; it becomes runnable on real hardware.
   add_test(NAME blake3pp_tests COMMAND blake3pp_tests --no-colors)
 else()
-  doctest_discover_tests(blake3pp_tests)
+  # A stall in the pipeline or a backend used to wedge a lane: the run
+  # would sit there until the CI job's own limit killed it, with nothing
+  # to say which case was stuck. The slowest case in this suite is under
+  # a second, sanitizers included, so a minute is only ever reached by
+  # something that has stopped making progress.
+  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 60)
 endif()
 
 # The sized parallel scheduler is one definition per program; the test

@@ -66,6 +66,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <type_traits>
@@ -390,8 +392,18 @@ class driver_loop {
   // before_flush runs once per round, after the completions and before
   // the submit: whatever it starts joins the same flush, so a batch of
   // windows reaches the OS in one call rather than one each.
-  template <class BeforeFlush>
-  void run_until(const loop_status& status, BeforeFlush&& before_flush) {
+  // The state that cannot resolve itself: about to sleep with no read
+  // owed, nothing to run and nothing outstanding. Callers that know why
+  // it happened pass their own; this one at least names the state.
+  [[noreturn]] static void stall() {
+    throw std::logic_error(
+        "blake3pp: the driver loop would block with no read in flight, an "
+        "empty run queue and nothing outstanding: nothing could wake it");
+  }
+
+  template <class BeforeFlush, class OnStall>
+  void run_until(const loop_status& status, BeforeFlush&& before_flush,
+                 OnStall&& on_stall) {
     // Also on the way out of a throwing poll(): the caller's next act is
     // to destroy the operation cells, and a thread inside publish() is
     // still reading this loop.
@@ -417,10 +429,14 @@ class driver_loop {
       const bool block = queue_.empty();
       // What in_flight() was kept across Phase 2b for. Sleeping with no
       // read owed by the driver, nothing to run and nothing outstanding
-      // anywhere else is a pipeline nobody will ever wake.
-      assert((!block || drv_->in_flight() > 0 || status.outstanding > 0) &&
-             "the driver is about to block with no read in flight, an empty "
-             "run queue and no chain outstanding: nothing can wake it");
+      // anywhere else is a pipeline nobody will ever wake, so it is
+      // reported rather than entered -- and reported in every build,
+      // because the shapes that reach it are configurations, not bugs a
+      // sanitizer lane would find. Nothing is in flight at this point,
+      // which is what makes unwinding from here safe.
+      if (block && drv_->in_flight() == 0 && status.outstanding == 0) {
+        on_stall();
+      }
       if (stats_ == nullptr) {
         drv_->poll(block);
         continue;
@@ -444,8 +460,13 @@ class driver_loop {
     }
   }
 
+  template <class BeforeFlush>
+  void run_until(const loop_status& status, BeforeFlush&& before_flush) {
+    run_until(status, std::forward<BeforeFlush>(before_flush), &stall);
+  }
+
   void run_until(const loop_status& status) {
-    run_until(status, [] {});
+    run_until(status, [] {}, &stall);
   }
 
   // Waits out the threads that are inside publish(). One eventfd write
@@ -519,10 +540,17 @@ struct pipeline_options {
 // next window needs, or the scope could reach a state where no window
 // may start; see admit_more().
 inline constexpr std::size_t reducer_nodes = 256;
-static_assert(reducer_nodes > 2 * 54 + 2 * 54,
-              "the reducer must hold the decomposition of any contiguous "
-              "run of windows plus the largest reservation one edge window "
-              "can make, or admission can stall");
+
+// The most nodes a run of `parts` equal parts can decompose into: one
+// ascending chain and one descending one, at most one node per level of
+// the run. An edge window reserves this rather than the worst case over
+// any run, which is what keeps a small reducer usable: a blanket 2 * 54
+// would make an edge window unadmittable below that capacity, and the
+// pipeline would stall rather than run slowly.
+[[nodiscard]] constexpr std::size_t nodes_for(std::size_t parts) noexcept {
+  return 2 * static_cast<std::size_t>(std::bit_width(parts));
+}
+
 
 // Several window chains in flight over one file, all on the caller's
 // thread.
@@ -581,6 +609,23 @@ class window_scope {
 
   window_scope(const window_scope&) = delete;
   window_scope& operator=(const window_scope&) = delete;
+
+  // The capacity the default storage has to clear, written from what the
+  // scope actually reserves:
+  //
+  //   2 * 54                 the windows already read, as a contiguous
+  //                          run, decompose into at most one node per
+  //                          level twice over
+  //   2 * nodes_for(parts)   the two edge windows -- a short first one
+  //                          and the last one can be in flight together
+  //                          -- each reserving what its own run of parts
+  //                          can decompose into
+  //
+  // nodes_for is logarithmic in the part count, so even an absurd stack
+  // budget leaves this far below the storage.
+  static_assert(reducer_nodes > 2 * 54 + 2 * nodes_for(Budget.parts()),
+                "reducer_nodes must clear a contiguous run's decomposition "
+                "plus both edge windows' reservations, or admission stalls");
 
   // Drives the whole file on this thread and absorbs it into the hasher.
   // Throws the first error any window reported, once, after everything in
@@ -674,15 +719,7 @@ class window_scope {
           ex::start(*last_read_cell);
         }
       }
-      // Nothing running, work left, a buffer free, and still nothing
-      // started: the only way out of that is a reducer capacity below
-      // what this file's windows decompose into, which is a caller
-      // error rather than a state the pipeline can recover from.
-      assert((stop_ || in_flight_ > 0 || next_offset_ >= file_bytes_ ||
-              free_ == nullptr) &&
-             "the reducer capacity is below this file's decomposition: no "
-             "window can start and nothing is in flight");
-    });
+    }, [this] { this->report_stall(); });
 
     if (trace_ != nullptr) {
       trace_->driver().admission_stalls = admission_stalls_;
@@ -744,16 +781,6 @@ class window_scope {
     unsigned edge_slot = 0;      // which node buffer this window uses
     std::size_t node_cost = 1;   // reducer slots admission reserved
   };
-
-  // The most nodes a run of `parts` parts can decompose into: one
-  // ascending chain and one descending one, at most one node per level
-  // of the run. Reserving this rather than the worst case over any run
-  // is what keeps a small reducer usable -- a blanket 2 * 54 would make
-  // an edge window unadmittable below that capacity, and hang.
-  [[nodiscard]] static constexpr std::size_t nodes_for(
-      std::size_t parts) noexcept {
-    return 2 * static_cast<std::size_t>(std::bit_width(parts));
-  }
 
   // What the node buffers hold: the worst case over any run, which is
   // what fold_aligned_runs asserts against.
@@ -883,6 +910,22 @@ class window_scope {
     } else {
       return compress_on<false>(sched_, w.compress);
     }
+  }
+
+  // Why no window could start. Reached only from the driver loop, with
+  // nothing in flight, so throwing here unwinds a pipeline that owes no
+  // callbacks.
+  [[noreturn]] void report_stall() const {
+    throw std::logic_error(
+        "blake3pp: the file pipeline cannot start a window and nothing is "
+        "in flight. The reducer holds " +
+        std::to_string(reducer_.pending()) + " of " +
+        std::to_string(reducer_capacity_) + " nodes, " +
+        std::to_string(in_flight_) + " windows are in flight holding " +
+        std::to_string(in_flight_nodes_) + " reserved nodes, and the next "
+        "window reserves " + std::to_string(next_window_cost()) +
+        " more. The capacity has to exceed what the windows already read "
+        "decompose into plus that reservation.");
   }
 
   // Whether one more window may start.
