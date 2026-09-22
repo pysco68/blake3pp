@@ -20,9 +20,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <new>
 #include <span>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 
 namespace blake3pp::detail {
 
@@ -50,6 +52,22 @@ struct io_read_op {
   static constexpr std::size_t storage_size = 160;
   static constexpr std::size_t storage_align = 16;
   alignas(storage_align) std::byte storage[storage_size];
+
+  // Constructs the backend's operation over the storage, fresh for this
+  // submit and over whatever the last one left: the one way a driver
+  // fills the storage, so the fit and the trivial destructor are checked
+  // wherever one does.
+  template <class Op>
+  [[nodiscard]] Op& emplace_native() noexcept {
+    static_assert(sizeof(Op) <= storage_size,
+                  "io_read_op::storage_size is smaller than this backend's op");
+    static_assert(alignof(Op) <= storage_align,
+                  "io_read_op::storage_align is weaker than this backend's op");
+    static_assert(std::is_trivially_destructible_v<Op>,
+                  "io_read_op::storage is reused per read, so the op must "
+                  "be trivially destructible");
+    return *::new (static_cast<void*>(storage)) Op{};
+  }
 };
 
 // Size and alignment of the platform backend's own read operation: what

@@ -1025,7 +1025,9 @@ class window_scope {
                             return edge_compress_stage(w);
                           }),
             loop_.scheduler()),
-        [this, &w](std::size_t nodes) noexcept { insert_edge_nodes(w, nodes); });
+        [this, &w](std::size_t nodes) noexcept {
+          insert_edge_nodes(w, nodes);
+        });
   }
 
   // The bytes an edge window owes the hasher before anything else can
@@ -1186,7 +1188,8 @@ class window_scope {
 
   // How many whole parts of a last window of `bytes` sit entirely before
   // its final chunk; below two there is nothing worth fanning out.
-  [[nodiscard]] std::size_t last_window_parts(std::size_t bytes) const noexcept {
+  [[nodiscard]] std::size_t last_window_parts(
+      std::size_t bytes) const noexcept {
     const std::uint64_t chunks_with_tail =
         (static_cast<std::uint64_t>(bytes) + chunk_size - 1) / chunk_size;
     if (chunks_with_tail < 2) {

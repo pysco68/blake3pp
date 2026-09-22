@@ -507,6 +507,7 @@ TEST_CASE("clear() returns the reducer to empty") {
 // would have produced from the same parts, so that a window folded on a
 // pool thread is indistinguishable from one inserted part by part.
 TEST_CASE("fold_aligned_runs matches inserting every part") {
+  using blake3pp::detail::cv_run;
   using blake3pp::detail::fold_aligned_runs;
   const auto* ops = blake3pp::detail::resolve(blake3pp::arch::auto_detect);
   hasher h;
@@ -541,8 +542,9 @@ TEST_CASE("fold_aligned_runs matches inserting every part") {
     // What the helper produces, inserted as nodes.
     tree_reducer a(ops, h.key_words(), h.mode_flags(), nodes_a);
     const std::size_t n = fold_aligned_runs(
-        ops, h.key_words(), h.mode_flags(), std::span(cvs), i0, i1, base_chunk,
-        part_chunks, std::span(folded_storage));
+        ops, h.key_words(), h.mode_flags(),
+        cv_run{std::span(cvs), i0, i1, base_chunk, part_chunks},
+        std::span(folded_storage));
     REQUIRE(n > 0);
     REQUIRE(n <= folded_storage.size());
     for (std::size_t k = 0; k < n; ++k) {
@@ -576,13 +578,15 @@ TEST_CASE("fold_aligned_runs matches inserting every part") {
 }
 
 TEST_CASE("fold_aligned_runs leaves an empty run alone") {
+  using blake3pp::detail::cv_run;
   using blake3pp::detail::fold_aligned_runs;
   const auto* ops = blake3pp::detail::resolve(blake3pp::arch::auto_detect);
   hasher h;
   std::vector<tree_reducer::cv_type> cvs(4);
   std::array<tree_reducer::node, 2 * 54> out{};
-  CHECK(fold_aligned_runs(ops, h.key_words(), h.mode_flags(), std::span(cvs), 2,
-                          2, 0, 16, std::span(out)) == 0);
+  CHECK(fold_aligned_runs(ops, h.key_words(), h.mode_flags(),
+                          cv_run{std::span(cvs), 2, 2, 0, 16},
+                          std::span(out)) == 0);
 }
 
 }  // TEST_SUITE

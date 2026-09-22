@@ -17,6 +17,7 @@
 // node of the tree by the same argument, and compressing them is the same
 // compression the hasher would have performed later.
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cassert>
@@ -57,9 +58,7 @@ class tree_reducer {
                std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
                std::span<node> storage) noexcept
       : ops_(ops), base_flags_(base_flags), storage_(storage) {
-    for (std::size_t i = 0; i < 8; ++i) {
-      key_[i] = key[i];
-    }
+    std::ranges::copy(key, key_.begin());
   }
 
   // Inserts the CV of the complete subtree over
@@ -199,50 +198,60 @@ class tree_reducer {
   bool sorted_ = true;
 };
 
-// Folds a run of equal-sized, adjacent part CVs into the nodes the
-// reducer would have ended up with, so a window's parts reach it as a
-// handful of subtrees instead of one node each.
+// A run of equal-sized, adjacent part CVs: parts [first, last) of cvs,
+// each covering part_chunks chunks, with cvs[0] at absolute chunk
+// base_chunk (a multiple of part_chunks). cvs is scratch to
+// fold_aligned_runs, which clobbers what it folds.
+struct cv_run {
+  std::span<tree_reducer::cv_type> cvs;
+  std::size_t first;
+  std::size_t last;
+  std::uint64_t base_chunk;
+  std::uint64_t part_chunks;
+};
+
+// Folds a run of part CVs into the nodes the reducer would have ended up
+// with, so a window's parts reach it as a handful of subtrees instead of
+// one node each.
 //
-// Parts [i0, i1) each cover part_chunks chunks, and part 0 sits at
-// absolute chunk base_chunk (a multiple of part_chunks). Grouping is by
-// absolute position, not by count: a group of 2^j parts is a node of the
-// tree only when its first part's absolute index is a multiple of 2^j,
-// which is why this cannot be a simple halving. Taking the largest legal
-// group at each step leaves the canonical decomposition -- one ascending
-// chain and one descending one, at most one node per level.
+// Grouping is by absolute position, not by count: a group of 2^j parts
+// is a node of the tree only when its first part's absolute index is a
+// multiple of 2^j, which is why this cannot be a simple halving. Taking
+// the largest legal group at each step leaves the canonical
+// decomposition -- one ascending chain and one descending one, at most
+// one node per level.
 //
-// part_cvs is scratch: fold_sibling_cvs clobbers what it folds. Writes
-// nodes left to right into out and returns how many; out needs 2 * 54
-// entries to cover any run at BLAKE3's 2^64-byte limit.
+// Writes nodes left to right into out and returns how many; out needs
+// 2 * 54 entries to cover any run at BLAKE3's 2^64-byte limit.
 //
 // Pool-side and provider-free: it runs on whichever agent finished the
 // bulk, and the driver only inserts what it produced.
 [[nodiscard]] inline std::size_t fold_aligned_runs(
     const kern::kernel_ops* ops, std::span<const std::uint32_t, 8> key,
-    std::uint32_t base_flags, std::span<tree_reducer::cv_type> part_cvs,
-    std::size_t i0, std::size_t i1, std::uint64_t base_chunk,
-    std::uint64_t part_chunks, std::span<tree_reducer::node> out) noexcept {
-  assert(part_chunks > 0 && std::has_single_bit(part_chunks));
-  assert(base_chunk % part_chunks == 0);
-  assert(i1 <= part_cvs.size());
+    std::uint32_t base_flags, const cv_run& run,
+    std::span<tree_reducer::node> out) noexcept {
+  assert(run.part_chunks > 0 && std::has_single_bit(run.part_chunks));
+  assert(run.base_chunk % run.part_chunks == 0);
+  assert(run.last <= run.cvs.size());
   std::size_t count = 0;
-  std::size_t i = i0;
-  while (i < i1) {
+  std::size_t i = run.first;
+  while (i < run.last) {
     // The largest aligned group that starts here and still fits.
-    const std::uint64_t first_part = base_chunk / part_chunks + i;
+    const std::uint64_t first_part = run.base_chunk / run.part_chunks + i;
     std::size_t parts = 1;
-    while (parts * 2 <= i1 - i && first_part % (2 * parts) == 0) {
+    while (parts * 2 <= run.last - i && first_part % (2 * parts) == 0) {
       parts *= 2;
     }
     assert(count < out.size() &&
            "fold_aligned_runs needs 2 * 54 nodes for the worst run");
     tree_reducer::node& node = out[count++];
-    node.first_chunk = base_chunk + static_cast<std::uint64_t>(i) * part_chunks;
-    node.chunks = static_cast<std::uint64_t>(parts) * part_chunks;
+    node.first_chunk =
+        run.base_chunk + static_cast<std::uint64_t>(i) * run.part_chunks;
+    node.chunks = static_cast<std::uint64_t>(parts) * run.part_chunks;
     if (parts == 1) {
-      node.cv = part_cvs[i];
+      node.cv = run.cvs[i];
     } else {
-      fold_sibling_cvs(ops, part_cvs.subspan(i, parts), key, base_flags,
+      fold_sibling_cvs(ops, run.cvs.subspan(i, parts), key, base_flags,
                        node.cv);
     }
     i += parts;

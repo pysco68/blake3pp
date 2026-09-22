@@ -718,9 +718,11 @@ template <bool Traced, stack_budget Budget, class Scheduler>
                                     std::span<tree_reducer::node> out) {
   return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt) |
          ex::then([&w, out]() noexcept {
-           return fold_aligned_runs(w.ops, w.key, w.flags,
-                                    std::span(w.cvs).first(w.n_parts), 0,
-                                    w.n_parts, w.chunk_counter, w.part, out);
+           return fold_aligned_runs(
+               w.ops, w.key, w.flags,
+               cv_run{std::span(w.cvs).first(w.n_parts), 0, w.n_parts,
+                      w.chunk_counter, w.part},
+               out);
          });
 }
 
