@@ -36,19 +36,16 @@
 namespace blake3pp::detail::io_impl {
 
 // The read-side window/slot engine on the completion-callback contract
-// (reader_context in io/backend.hpp). Observably identical to
-// reader_engine above: windows are delivered strictly in file order,
-// release() recycles a slot and that recycling is the backpressure, and a
-// submission that fails inside the noexcept release() is latched for the
-// next next() to throw.
+// (reader_context in io/backend.hpp): windows are delivered strictly in
+// file order, release() recycles a slot and that recycling is the
+// backpressure, and a submission that fails inside the noexcept
+// release() is latched for the next next() to throw.
 //
-// What changed is where a read finishes. The context reports completion
-// by calling back, only from inside poll(), so a slot is "ready" when its
-// callback said so rather than when a blocking wait(slot) returned. next()
-// therefore drives poll() until the window it wants is the one that
-// arrived, absorbing the others on the way -- the same reordering the old
-// wait() absorbed, moved to where a later phase can share one poll across
-// several windows and, after that, several files.
+// A read finishes when the context calls back, only from inside poll(),
+// so a slot is "ready" when its callback said so. next() therefore
+// drives poll() until the window it wants is the one that arrived,
+// absorbing the others on the way; one poll serves every window in
+// flight, which is what lets the file pipeline share it across several.
 template <reader_context C>
 class polled_reader_engine {
  public:
@@ -81,8 +78,8 @@ class polled_reader_engine {
   }
 
   std::optional<window> next() {
-    // See reader_engine::next(): release() is noexcept, so a failed
-    // submission is latched there and thrown here.
+    // release() is noexcept, so a failed submission is latched there and
+    // thrown here.
     if (submit_failed_) {
       std::rethrow_exception(submit_failed_);
     }

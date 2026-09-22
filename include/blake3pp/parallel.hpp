@@ -684,8 +684,9 @@ struct window_compress {
 // beman.execution both leave the driver at or below 1%.
 //
 // The fold runs on whichever agent finished the bulk, so the driver
-// thread never touches it either. This is the one line Phase 4 exists to
-// replace; the window chain around it does not know what is inside.
+// thread never touches it either. The window chain around this sender
+// does not know what is inside it, which makes this the one place a
+// different compress stage would go.
 template <bool Traced, stack_budget Budget, class Scheduler>
 [[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w) {
   return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt) |

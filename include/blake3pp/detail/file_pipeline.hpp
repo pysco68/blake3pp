@@ -23,8 +23,8 @@
 // Three rules hold the shape together, and all of them are about where a
 // completion may run and who may touch what afterwards:
 //
-//   * callbacks run only inside poll(), which is the I/O contract from
-//     Phase 2a (src/io/backend.hpp);
+//   * callbacks run only inside poll(), which is the I/O backends'
+//     contract (src/io/backend.hpp);
 //   * nothing completes inside a start(), which is this header's;
 //   * once a node is on the run queue, the thread that put it there
 //     touches neither the node nor the operation state it lives in ever
@@ -432,7 +432,7 @@ class driver_loop {
       }
       drv_->flush();
       const bool block = queue_.empty();
-      // What in_flight() was kept across Phase 2b for. Sleeping with no
+      // What in_flight() exists for. Sleeping with no
       // read owed by the driver, nothing to run and nothing outstanding
       // anywhere else is a pipeline nobody will ever wake, so it is
       // reported rather than entered -- and reported in every build,
@@ -978,8 +978,8 @@ class window_scope {
 
   static_assert(std::copy_constructible<scope_receiver>);
 
-  // One window, start to finish. Phase 4 replaces the middle line and
-  // nothing else.
+  // One window, start to finish. The middle line is the compress stage;
+  // everything around it is the same for every window.
   [[nodiscard]] auto window_chain(window& w) {
     return ex::then(
         ex::continues_on(
