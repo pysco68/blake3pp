@@ -483,7 +483,9 @@ class driver_loop {
     }
   }
 
- private:
+  // The two halves of one round, for a caller winding the pipeline down
+  // outside run_until: what is parked runs, and nothing else; then one
+  // flush and one blocking poll, which throws what poll() throws.
   // Runs everything parked on the queue, once. A node may be pushed
   // again by its own completion, so the successor is read before the
   // node runs.
@@ -501,7 +503,12 @@ class driver_loop {
     return ran;
   }
 
+  void poll_once() {
+    drv_->flush();
+    drv_->poll(true);
+  }
 
+ private:
   D* drv_;
   run_queue queue_;
   std::atomic<unsigned> publishers_{0};
@@ -714,53 +721,19 @@ class window_scope {
     std::optional<edge_op> last_edge_cell;
     std::optional<read_only_op> last_read_cell;
 
-    loop_.run_until(status_, [&] {
-      // Every window that can start, started before the one flush this
-      // round: the reads of a whole batch reach the OS in one call.
-      while (!stop_ && in_flight_ < in_flight_cap_ && free_ != nullptr) {
-        if (next_offset_ >= file_bytes_) {
-          break;
-        }
-        // An edge window reserves room for a whole decomposition rather
-        // than for one node, so what it costs has to be known before it
-        // is admitted.
-        // The cost is the window's own, not a worst case: plan it
-        // before admitting it, since an edge window reserves a whole
-        // decomposition.
-        const std::size_t cost = this->next_window_cost();
-        if (!admit_more(cost)) {
-          break;
-        }
-        window* const w = free_;
-        take_next(*w);
-        free_ = w->next_free;
-        claim_record(*w);
-        ++in_flight_;
-        in_flight_nodes_ += w->node_cost;
-        status_.outstanding = in_flight_;
-        if (w->last) {
-          last_window_ = w;
-        }
-        if (!w->last && !w->short_first) {
-          prepare_compress(*w);
-          cells[w->slot].emplace(connect_full{this, w});
-          ex::start(*cells[w->slot]);
-        } else if (w->parts >= 2) {
-          // An edge window: the short first one or the last one, each
-          // with its own cell, since a three-window file has both in
-          // flight at once.
-          std::optional<edge_op>& cell =
-              w->last ? last_edge_cell : first_edge_cell;
-          cell.emplace(connect_edge{this, w});
-          ex::start(*cell);
-        } else {
-          std::optional<read_only_op>& cell =
-              w->last ? last_read_cell : first_read_cell;
-          cell.emplace(connect_read{this, w});
-          ex::start(*cell);
-        }
-      }
-    }, [this] { this->report_stall(); });
+    // The cells are locals, so an exception leaving run_until would
+    // destroy them while a window can still be on the pool, about to
+    // publish into one. The handler waits those windows out first; the
+    // cells are still alive inside it.
+    try {
+      run_windows(cells, first_edge_cell, first_read_cell, last_edge_cell,
+                  last_read_cell, connect_full{}, connect_read{},
+                  connect_edge{});
+    } catch (...) {
+      quiesce();
+      throw;
+    }
+    assert(in_flight_ == 0 && "run_until returned with a window in flight");
 
     if (trace_ != nullptr) {
       trace_->driver().admission_stalls = admission_stalls_;
@@ -798,6 +771,101 @@ class window_scope {
   }
 
  private:
+  // The loop proper: starts every window that may start before each
+  // flush, until the pipeline reports itself done. The cell types and
+  // the conversion functions that fill them are run()'s locals, which
+  // is why they arrive as template parameters.
+  template <class Cells, class EdgeCell, class ReadCell, class ConnectFull,
+            class ConnectRead, class ConnectEdge>
+  void run_windows(Cells& cells, EdgeCell& first_edge_cell,
+                   ReadCell& first_read_cell, EdgeCell& last_edge_cell,
+                   ReadCell& last_read_cell, ConnectFull, ConnectRead,
+                   ConnectEdge) {
+    loop_.run_until(status_, [&] {
+      // Every window that can start, started before the one flush this
+      // round: the reads of a whole batch reach the OS in one call.
+      while (!stop_ && in_flight_ < in_flight_cap_ && free_ != nullptr) {
+        if (next_offset_ >= file_bytes_) {
+          break;
+        }
+        // An edge window reserves room for a whole decomposition rather
+        // than for one node, so what it costs has to be known before it
+        // is admitted.
+        // The cost is the window's own, not a worst case: plan it
+        // before admitting it, since an edge window reserves a whole
+        // decomposition.
+        const std::size_t cost = this->next_window_cost();
+        if (!admit_more(cost)) {
+          break;
+        }
+        window* const w = free_;
+        take_next(*w);
+        free_ = w->next_free;
+        claim_record(*w);
+        ++in_flight_;
+        in_flight_nodes_ += w->node_cost;
+        status_.outstanding = in_flight_;
+        if (w->last) {
+          last_window_ = w;
+        }
+        if (!w->last && !w->short_first) {
+          prepare_compress(*w);
+          cells[w->slot].emplace(ConnectFull{this, w});
+          ex::start(*cells[w->slot]);
+        } else if (w->parts >= 2) {
+          // An edge window: the short first one or the last one, each
+          // with its own cell, since a three-window file has both in
+          // flight at once.
+          auto& cell = w->last ? last_edge_cell : first_edge_cell;
+          cell.emplace(ConnectEdge{this, w});
+          ex::start(*cell);
+        } else {
+          auto& cell = w->last ? last_read_cell : first_read_cell;
+          cell.emplace(ConnectRead{this, w});
+          ex::start(*cell);
+        }
+      }
+    }, [this] { this->report_stall(); });
+  }
+
+  // Waits out every window still in flight after an exception has left
+  // the loop, so that nothing on the pool can publish into an operation
+  // cell once the cells are destroyed. No new window starts; what is
+  // parked runs, and a blocking poll brings the rest back. The error the
+  // caller is already unwinding with is the one it keeps: whatever a
+  // poll throws here is dropped, and after max_failed_polls of them the
+  // driver is not asked again. From then on the run queue alone is
+  // watched, since a window on the pool publishes without the driver's
+  // help, and the reads the driver still owes are left to its own
+  // teardown drain, which runs no callback and touches no operation.
+  static constexpr unsigned max_failed_polls = 8;
+
+  void quiesce() noexcept {
+    stop_ = true;
+    unsigned failed_polls = 0;
+    for (;;) {
+      loop_.drain();
+      if (in_flight_ == 0) {
+        break;
+      }
+      if (failed_polls < max_failed_polls) {
+        try {
+          loop_.poll_once();
+        } catch (...) {
+          ++failed_polls;
+        }
+        continue;
+      }
+      // Every chain the driver does not owe as a read is on the pool or
+      // on the run queue, and comes back on its own.
+      if (in_flight_ <= loop_.driver().in_flight()) {
+        break;
+      }
+      std::this_thread::yield();
+    }
+    loop_.settle_publishers();
+  }
+
   struct window {
     std::span<std::byte> buffer;
     window_compress<Budget> compress;

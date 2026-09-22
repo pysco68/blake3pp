@@ -17,6 +17,7 @@
 #include <concepts>
 #include <string_view>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -325,6 +326,10 @@ struct fake_script {
   std::size_t piece_bytes = 0;
   // The window index whose read fails, or -1 for none.
   int fail_at_window = -1;
+  // The poll() call, counted from 0, that throws instead of serving a
+  // read; -1 for none. With keep_throwing every later poll throws too.
+  int throw_at_poll = -1;
+  bool keep_throwing = false;
 };
 
 class fake_driver {
@@ -355,6 +360,12 @@ class fake_driver {
   void flush() noexcept {}
 
   std::size_t poll(bool block) {
+    const int nth = polls_++;
+    if (script_.throw_at_poll >= 0 &&
+        (nth == script_.throw_at_poll ||
+         (script_.keep_throwing && nth > script_.throw_at_poll))) {
+      throw std::runtime_error("poll failed");
+    }
     if (queued_.empty()) {
       if (block) {
         std::unique_lock lock(m_);
@@ -446,6 +457,7 @@ class fake_driver {
   std::mutex m_;
   std::condition_variable cv_;
   bool woken_ = false;
+  int polls_ = 0;
 };
 
 static_assert(blake3pp::detail::file_driver<fake_driver>);
@@ -1002,7 +1014,11 @@ static_assert(ex::scheduler<inline_scheduler>);
 // part of every window is serialized behind a single agent.
 class one_thread_pool {
  public:
-  one_thread_pool() : worker_([this] { run(); }) {}
+  // With a delay, the worker sleeps that long before running each node:
+  // a window handed to the pool then stays there long enough for the
+  // driver to fail underneath it.
+  explicit one_thread_pool(std::chrono::milliseconds delay = {})
+      : delay_(delay), worker_([this] { run(); }) {}
   ~one_thread_pool() {
     {
       const std::lock_guard lock(m_);
@@ -1079,6 +1095,9 @@ class one_thread_pool {
         n = queue_.front();
         queue_.erase(queue_.begin());
       }
+      if (delay_.count() > 0) {
+        std::this_thread::sleep_for(delay_);
+      }
       n->run(n);
     }
   }
@@ -1087,6 +1106,7 @@ class one_thread_pool {
   std::condition_variable cv_;
   std::vector<run_node*> queue_;
   bool stop_ = false;
+  std::chrono::milliseconds delay_;
   std::thread worker_;
 };
 
@@ -1213,6 +1233,33 @@ TEST_CASE("a read error at one window surfaces once") {
     // already has for a failed read.
     h.update(std::span<const std::byte>(content).first(64));
     CHECK(h.finalize() != blake3pp::digest{});
+  }
+}
+
+// An exception out of poll() is the one way run() unwinds with windows
+// still in flight, and the scope has to wait them out before its
+// operation cells go, or a pool thread publishes into freed memory. Two
+// shapes, both for the sanitizer lanes: a poll that fails once and then
+// serves the rest, and one that never works again, where the window on
+// the pool has to come back with no help from the driver and the reads
+// the driver still holds are left to it.
+TEST_CASE("an exception from poll waits for the pool before unwinding") {
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 91);
+  for (const bool keep : {false, true}) {
+    CAPTURE(keep);
+    one_thread_pool pool(std::chrono::milliseconds(20));
+    blake3pp::hasher h;
+    int thrown = 0;
+    try {
+      fake_run(h, content, win, pool.get_scheduler(), 4,
+               {.throw_at_poll = 1, .keep_throwing = keep});
+    } catch (const std::runtime_error& e) {
+      ++thrown;
+      CHECK(std::string_view(e.what()) == "poll failed");
+    }
+    CHECK(thrown == 1);
   }
 }
 
