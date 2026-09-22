@@ -157,7 +157,11 @@ std::size_t io_driver::in_flight() const noexcept {
 
 std::span<std::byte> io_driver::allocate(std::size_t bytes) {
   // One arena per driver, taken once at pipeline construction. Aligned
-  // for direct I/O, which rejects an unaligned buffer outright.
+  // for direct I/O, which rejects an unaligned buffer outright. A second
+  // call would free memory a read of the first scope may still target,
+  // which is why it is a contract violation and not a reallocation.
+  assert(!impl_->buffers && "io_driver::allocate() called twice: the arena "
+                            "is taken once per driver");
   impl_->buffers = io_impl::make_aligned_buffer(bytes);
   return {impl_->buffers.get(), bytes};
 }

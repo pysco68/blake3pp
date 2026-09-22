@@ -568,6 +568,31 @@ TEST_CASE("the io driver reads a file and keeps the callback discipline") {
   CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
 }
 
+// The teardown contract the arena exists for: a driver destroyed with a
+// read still owed drains it, running no callback, before the memory that
+// read targets is freed. The sanitizer lanes are what would object.
+TEST_CASE("the io driver drains a read in flight before freeing its arena") {
+  using blake3pp::detail::io_driver;
+  using blake3pp::detail::io_read_op;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 17);
+  const temp_file f(content);
+
+  read_probe probe;
+  {
+    io_driver drv({}, 4);
+    io_driver::file file(drv, f.path, /*direct_io=*/false);
+    const auto pool = drv.allocate(len);
+    io_read_op op{};
+    op.done = &read_probe::on_done;
+    op.owner = &probe;
+    drv.submit_read(file, 0, pool, op);
+    drv.flush();
+    CHECK(drv.in_flight() == 1);
+  }
+  CHECK(probe.calls == 0);
+}
+
 TEST_CASE("the io driver wakes a blocked poll from another thread") {
   using blake3pp::detail::io_driver;
   io_driver drv({}, 4);

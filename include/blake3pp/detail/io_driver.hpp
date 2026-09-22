@@ -117,8 +117,10 @@ class io_driver {
 
   // Direct-I/O-aligned memory owned by the driver, valid until the
   // driver is destroyed -- which drains first, so no read is ever in
-  // flight into freed memory. One call, at pipeline construction; there
-  // is no free().
+  // flight into freed memory. Exactly one call per driver, made by the
+  // pipeline scope at construction: the driver hosts one scope at a
+  // time today, and a second call is a contract violation that debug
+  // builds assert on rather than a reallocation. There is no free().
   [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes);
 
  private:
