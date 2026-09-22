@@ -41,6 +41,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <new>
 #include <span>
 #include <string>
@@ -58,18 +59,20 @@ namespace blake3pp::detail::io_impl {
 // The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule.
 constexpr std::size_t direct_align = 4096;
 
-// The engines' buffer arena: one direct-I/O-aligned allocation, RAII so
-// member declaration order alone sequences teardown against the backend.
-struct aligned_pool {
-  std::byte* data = nullptr;
-
-  explicit aligned_pool(std::size_t bytes)
-      : data(static_cast<std::byte*>(
-            ::operator new(bytes, std::align_val_t{direct_align}))) {}
-  ~aligned_pool() { ::operator delete(data, std::align_val_t{direct_align}); }
-  aligned_pool(const aligned_pool&) = delete;
-  aligned_pool& operator=(const aligned_pool&) = delete;
+// The buffer arena of the engines and the driver: one direct-I/O-aligned
+// allocation behind an owning pointer, so member declaration order alone
+// sequences its release against the backend's drain.
+struct aligned_delete {
+  void operator()(std::byte* p) const noexcept {
+    ::operator delete(p, std::align_val_t{direct_align});
+  }
 };
+using aligned_buffer = std::unique_ptr<std::byte[], aligned_delete>;
+
+[[nodiscard]] inline aligned_buffer make_aligned_buffer(std::size_t bytes) {
+  return aligned_buffer(static_cast<std::byte*>(
+      ::operator new(bytes, std::align_val_t{direct_align})));
+}
 
 // What a context needs to know at construction; the engine fills it from
 // file_reader_options. Deliberately not file_reader_options itself: the

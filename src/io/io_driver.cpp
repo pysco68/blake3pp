@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <new>
 #include <span>
 #include <string>
 #include <string_view>
@@ -63,26 +62,12 @@ void trampoline(io_impl::read_op_base* base, std::error_code ec) noexcept {
 }
 }  // namespace
 
-// The buffer arena, allocated on demand and freed by its destructor, so
-// member order alone decides when that happens relative to the drain.
-struct arena {
-  std::byte* data = nullptr;
-  arena() = default;
-  arena(const arena&) = delete;
-  arena& operator=(const arena&) = delete;
-  ~arena() {
-    if (data != nullptr) {
-      ::operator delete(data, std::align_val_t{io_impl::direct_align});
-    }
-  }
-};
-
 struct io_driver::impl {
   // Declaration order is the teardown contract: the context drains every
   // read still owed BEFORE the arena those reads target is freed, so the
   // arena is declared FIRST and therefore destroyed LAST. Do not
   // reorder.
-  arena buffers;
+  io_impl::aligned_buffer buffers;
   context ctx;
 #ifndef NDEBUG
   // A file holds a reference to the context that opened it. One that
@@ -173,10 +158,8 @@ std::size_t io_driver::in_flight() const noexcept {
 std::span<std::byte> io_driver::allocate(std::size_t bytes) {
   // One arena per driver, taken once at pipeline construction. Aligned
   // for direct I/O, which rejects an unaligned buffer outright.
-  auto* const raw = static_cast<std::byte*>(
-      ::operator new(bytes, std::align_val_t{io_impl::direct_align}));
-  impl_->buffers.data = raw;
-  return {raw, bytes};
+  impl_->buffers = io_impl::make_aligned_buffer(bytes);
+  return {impl_->buffers.get(), bytes};
 }
 
 }  // namespace blake3pp::detail

@@ -546,13 +546,13 @@ TEST_CASE("io_uring destroy reaps in-flight reads before the ring goes") {
   posix_file file;
   file.open(f.path.c_str(), O_RDONLY | O_CLOEXEC);
   file.try_odirect(f.path.c_str(), O_RDONLY | O_CLOEXEC);
-  aligned_pool buf(content.size());
-  std::memset(buf.data, 0, content.size());
-  ring.submit_rw(IORING_OP_READ, file.fd, buf.data,
+  const aligned_buffer buf = make_aligned_buffer(content.size());
+  std::memset(buf.get(), 0, content.size());
+  ring.submit_rw(IORING_OP_READ, file.fd, buf.get(),
                  static_cast<unsigned>(content.size()), 0, 0, true);
   ring.destroy();
   CHECK(ring.outstanding == 0);
-  CHECK(std::equal(content.begin(), content.end(), buf.data));
+  CHECK(std::equal(content.begin(), content.end(), buf.get()));
 }
 #endif
 
