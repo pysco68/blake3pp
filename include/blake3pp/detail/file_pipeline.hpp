@@ -526,6 +526,8 @@ class driver_loop {
 
 // What the scope needs that the public options do not already say.
 struct pipeline_options {
+  // The requests plan_pipeline() rounds and clamps; the scope itself
+  // reads only the plan.
   std::size_t window_bytes = 8 * 1024 * 1024;
   unsigned queue_depth = 4;
   trace_buffer* trace = nullptr;
@@ -590,6 +592,32 @@ inline constexpr std::size_t reducer_nodes = 256;
   return head % io_driver::direct_alignment == 0;
 }
 
+// The geometry of one update_file() call, decided once from the hasher's
+// count and the caller's requests and handed to the driver, the file and
+// the scope alike, so that no two of them round or clamp differently.
+struct pipeline_plan {
+  // The window, as rounded_window_bytes() rounds the request.
+  std::size_t window_bytes;
+  // Windows in flight at most, and window objects allocated: the queue
+  // depth as clamp_queue_depth() clamps the request.
+  unsigned queue_depth;
+  // The short first window that brings the hasher onto the window grid;
+  // zero for a hasher already on it.
+  std::size_t head_bytes;
+  // Whether the file is opened for direct I/O: the caller asked, and the
+  // grid is one the platform's alignment can serve.
+  bool direct_io;
+};
+
+[[nodiscard]] constexpr pipeline_plan plan_pipeline(
+    std::uint64_t count, std::size_t window_bytes, unsigned queue_depth,
+    bool direct_io) noexcept {
+  const std::size_t window = rounded_window_bytes(window_bytes);
+  const std::size_t head = first_window_bytes(count, window);
+  return {window, clamp_queue_depth(queue_depth), head,
+          direct_io && direct_io_fits(head)};
+}
+
 
 // Several window chains in flight over one file, all on the caller's
 // thread.
@@ -611,27 +639,25 @@ class window_scope {
   using cv_type = std::array<std::uint32_t, 8>;
 
   window_scope(hasher& h, D& drv, typename D::file& file, Scheduler sched,
-               const pipeline_options& opts)
+               const pipeline_plan& plan, const pipeline_options& opts)
       : h_(h),
         loop_(drv),
         file_(file),
         sched_(std::move(sched)),
         trace_(opts.trace),
         ops_(resolve(h.selected_arch())),
-        window_bytes_(rounded_window_bytes(opts.window_bytes)),
-        count_(std::clamp<unsigned>(opts.queue_depth, 2, max_queue_depth)),
+        window_bytes_(plan.window_bytes),
+        count_(plan.queue_depth),
         in_flight_cap_(opts.in_flight_cap == 0
                            ? count_
                            : std::min<unsigned>(opts.in_flight_cap, count_)),
+        base_count_(h.count()),
+        head_window_bytes_(plan.head_bytes),
+        base_chunk_((h.count() + head_window_bytes_) / chunk_size),
+        file_bytes_(file.size()),
         reducer_capacity_(opts.reducer_capacity == 0
                               ? reducer_nodes
                               : std::min(opts.reducer_capacity, reducer_nodes)),
-        base_count_(h.count()),
-        head_window_bytes_(
-            first_window_bytes(h.count(), rounded_window_bytes(
-                                              opts.window_bytes))),
-        base_chunk_((h.count() + head_window_bytes_) / chunk_size),
-        file_bytes_(file.size()),
         windows_(std::make_unique<window[]>(count_)),
         nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
         reducer_(ops_, h.key_words(), h.mode_flags(),
@@ -649,6 +675,15 @@ class window_scope {
       push_free(&w);
     }
   }
+
+  // Over a file the caller opened itself, planned from the requests in
+  // opts; what the tests construct directly.
+  window_scope(hasher& h, D& drv, typename D::file& file, Scheduler sched,
+               const pipeline_options& opts)
+      : window_scope(h, drv, file, std::move(sched),
+                     plan_pipeline(h.count(), opts.window_bytes,
+                                   opts.queue_depth, false),
+                     opts) {}
 
   window_scope(const window_scope&) = delete;
   window_scope& operator=(const window_scope&) = delete;
@@ -1414,17 +1449,30 @@ class window_scope {
 // runtime choice becomes a compile-time one, once per run.
 template <stack_budget Budget, file_driver D, class Scheduler>
 void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
-                         Scheduler&& sched, const pipeline_options& opts) {
+                         Scheduler&& sched, const pipeline_plan& plan,
+                         const pipeline_options& opts) {
   using sched_type = std::remove_cvref_t<Scheduler>;
   if (opts.trace != nullptr) {
     window_scope<true, Budget, D, sched_type> scope(
-        h, drv, file, std::forward<Scheduler>(sched), opts);
+        h, drv, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   } else {
     window_scope<false, Budget, D, sched_type> scope(
-        h, drv, file, std::forward<Scheduler>(sched), opts);
+        h, drv, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   }
+}
+
+// The same over a driver whose file is already open, planned from the
+// options alone: what the tests and the bench call, where the open mode
+// was the caller's.
+template <stack_budget Budget, file_driver D, class Scheduler>
+void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
+                         Scheduler&& sched, const pipeline_options& opts) {
+  run_window_pipeline<Budget>(
+      h, drv, file, std::forward<Scheduler>(sched),
+      plan_pipeline(h.count(), opts.window_bytes, opts.queue_depth, false),
+      opts);
 }
 
 // Definition-site concept checks, as the I/O backends carry for theirs.

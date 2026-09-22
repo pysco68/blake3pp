@@ -19,7 +19,6 @@
 /// Same shape as io.hpp: `update_file()` is the primitive, `hash_file()` the
 /// one-shot convenience, each with a throwing and a std::error_code form.
 
-#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -62,20 +61,18 @@ void update_file(hasher& h, const std::filesystem::path& path,
   // Every file goes through the pipeline. A hasher already part-way
   // through a message is brought back onto a window boundary by one
   // short first window rather than by hashing the whole file
-  // sequentially, so there is no second path left to choose.
-  const std::size_t window = detail::rounded_window_bytes(opts.window_bytes);
-  const std::size_t head = detail::first_window_bytes(h.count(), window);
-  detail::io_driver drv(
-      {/*async=*/true, opts.offload_submit},
-      std::clamp<unsigned>(opts.queue_depth, 2, detail::max_queue_depth));
-  // Direct I/O wants aligned offsets, and every window after the short
-  // first one starts at head + n * window: an unaligned head misaligns
-  // all of them, so the file is opened buffered rather than degrading
-  // every read to the synchronous path inside poll().
-  detail::io_driver::file file(drv, path,
-                               opts.direct_io && detail::direct_io_fits(head));
+  // sequentially, so there is no second path left to choose. The plan
+  // is made once here and is the only geometry the driver, the file and
+  // the scope see; its direct_io is the caller's wish only where the
+  // grid is aligned, since an unaligned head misaligns every window
+  // after it and would degrade each read to the synchronous path.
+  const detail::pipeline_plan plan = detail::plan_pipeline(
+      h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io);
+  detail::io_driver drv({/*async=*/true, opts.offload_submit},
+                        plan.queue_depth);
+  detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(
-      h, drv, file, std::forward<Scheduler>(sched),
+      h, drv, file, std::forward<Scheduler>(sched), plan,
       {opts.window_bytes, opts.queue_depth, opts.trace, 0});
 }
 

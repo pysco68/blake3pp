@@ -1587,6 +1587,7 @@ TEST_CASE("prior content sets the window grid and the open mode") {
   using blake3pp::detail::direct_io_fits;
   using blake3pp::detail::first_window_bytes;
   using blake3pp::detail::io_driver;
+  using blake3pp::detail::plan_pipeline;
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 3 * win + 1234;
@@ -1607,6 +1608,12 @@ TEST_CASE("prior content sets the window grid and the open mode") {
     const std::size_t head = first_window_bytes(prior, win);
     const bool direct_ok = direct_io_fits(head);
     CHECK(direct_ok == (head % io_driver::direct_alignment == 0));
+    // The plan update_file makes carries the same two answers.
+    const auto plan = plan_pipeline(prior, win, 4, true);
+    CHECK(plan.window_bytes == win);
+    CHECK(plan.head_bytes == head);
+    CHECK(plan.direct_io == direct_ok);
+    CHECK(plan_pipeline(prior, win, 4, false).direct_io == false);
 
     blake3pp::hasher h;
     h.update(head_content);

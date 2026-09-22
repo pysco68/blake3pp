@@ -809,12 +809,12 @@ int main(int argc, char** argv) {
       if (trace) {
         trace->clear();
       }
-      null_driver drv(
-          {/*async=*/true, opts.offload_submit}, opts.queue_depth, total,
-          null_filler,
-          blake3pp::detail::rounded_window_bytes(opts.window_bytes) *
-              std::clamp<std::size_t>(opts.queue_depth, 2,
-                                      blake3pp::detail::max_queue_depth));
+      const blake3pp::detail::pipeline_plan plan =
+          blake3pp::detail::plan_pipeline(0, opts.window_bytes,
+                                          opts.queue_depth, false);
+      null_driver drv({/*async=*/true, opts.offload_submit},
+                      plan.queue_depth, total, null_filler,
+                      plan.window_bytes * plan.queue_depth);
       null_driver::file nf(drv);
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
