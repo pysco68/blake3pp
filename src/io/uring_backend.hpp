@@ -460,7 +460,9 @@ class uring_context {
     // The armed poll completes only when the eventfd becomes readable,
     // and ~uring drains everything outstanding before it unmaps: without
     // this nudge that drain waits forever. Runs before any member is
-    // destroyed, which is the whole reason it is in the body.
+    // destroyed, and the eventfd itself outlives the ring by declaration
+    // order, so the nudge lands on an open descriptor and the drain
+    // reaps the poll it completes.
     if (wake_armed_) {
       waiter_.wake();
     }
@@ -691,11 +693,15 @@ class uring_context {
     waiter_.sleep();
   }
 
-  uring ring_;
+  // Declaration order is the teardown contract: the ring drains, and
+  // with it the one-shot poll armed on the eventfd, before the eventfd
+  // is closed and before the op whose address that poll wears goes.
+  // Do not move ring_ above these two.
+  poll_waiter waiter_;
   read_op wake_op_{};  // address only: the wake completion's user_data
+  uring ring_;
   deferred_ops<read_op> deferred_;
   std::size_t in_flight_ = 0;
-  poll_waiter waiter_;
   bool async_requested_ = true;
   bool use_uring_ = false;
   bool offload_ = false;
