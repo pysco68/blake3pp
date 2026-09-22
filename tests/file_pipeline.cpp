@@ -419,6 +419,8 @@ class fake_driver {
     return queued_.size();
   }
 
+  void drain() noexcept { queued_.clear(); }
+
   [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
     pool_.resize(bytes);
     return {pool_.data(), pool_.size()};
@@ -611,6 +613,41 @@ TEST_CASE("the io driver drains a read in flight before freeing its arena") {
     CHECK(drv.in_flight() == 1);
   }
   CHECK(probe.calls == 0);
+}
+
+// The same drain on a live driver: the owed read is reaped and never
+// reported, the op may go, and the driver then serves another read.
+TEST_CASE("the io driver drains on request and reads again afterwards") {
+  using blake3pp::detail::io_driver;
+  using blake3pp::detail::io_read_op;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 19);
+  const temp_file f(content);
+
+  io_driver drv({}, 4);
+  io_driver::file file(drv, f.path, /*direct_io=*/false);
+  const auto pool = drv.allocate(len);
+  read_probe probe;
+  {
+    io_read_op op{};
+    op.done = &read_probe::on_done;
+    op.owner = &probe;
+    drv.submit_read(file, 0, pool, op);
+    drv.flush();
+    drv.drain();
+    CHECK(drv.in_flight() == 0);
+    CHECK(probe.calls == 0);
+  }
+  io_read_op op{};
+  op.done = &read_probe::on_done;
+  op.owner = &probe;
+  drv.submit_read(file, 0, pool, op);
+  while (probe.calls == 0) {
+    drv.poll(true);
+  }
+  CHECK(probe.calls == 1);
+  CHECK(!probe.ec);
+  CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
 }
 
 TEST_CASE("the io driver wakes a blocked poll from another thread") {
@@ -1258,16 +1295,22 @@ TEST_CASE("an exception from poll waits for the pool before unwinding") {
   for (const bool keep : {false, true}) {
     CAPTURE(keep);
     one_thread_pool pool(std::chrono::milliseconds(20));
+    fake_driver drv(content, win, {.throw_at_poll = 1, .keep_throwing = keep});
+    fake_driver::file f(drv);
     blake3pp::hasher h;
     int thrown = 0;
     try {
-      fake_run(h, content, win, pool.get_scheduler(), 4,
-               {.throw_at_poll = 1, .keep_throwing = keep});
+      blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+          h, drv, f, pool.get_scheduler(),
+          {.window_bytes = win, .queue_depth = 4});
     } catch (const std::runtime_error& e) {
       ++thrown;
       CHECK(std::string_view(e.what()) == "poll failed");
     }
     CHECK(thrown == 1);
+    // Whichever way the scope left, the driver holds no read: either the
+    // polls served them all, or the give-up branch drained them.
+    CHECK(drv.in_flight() == 0);
   }
 }
 

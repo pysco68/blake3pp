@@ -132,6 +132,12 @@ class io_driver {
   // The only member another thread may call.
   void wake() noexcept;
   [[nodiscard]] std::size_t in_flight() const noexcept;
+  // Waits out every read still owed, running no callback, and forgets
+  // the rest. The invariant it establishes: afterwards in_flight() is
+  // zero and the driver references no io_read_op, so the caller may
+  // destroy the ops it submitted. The driver stays usable. The
+  // destructor drains too, a no-op after this.
+  void drain() noexcept;
 
   // Direct-I/O-aligned memory owned by the driver, valid until the
   // driver is destroyed -- which drains first, so no read is ever in
@@ -162,6 +168,7 @@ concept file_driver =
       { d.poll(block) } -> std::same_as<std::size_t>;
       { d.wake() } noexcept;
       { cd.in_flight() } noexcept -> std::same_as<std::size_t>;
+      { d.drain() } noexcept;
       { d.allocate(bytes) } -> std::same_as<std::span<std::byte>>;
     };
 

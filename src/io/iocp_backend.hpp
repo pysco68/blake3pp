@@ -252,6 +252,7 @@ class iocp_context {
     std::uint64_t size_ = 0;
     std::string_view name_ = "readfile";
     iocp_context* ctx_ = nullptr;
+    file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
   };
 
@@ -270,9 +271,9 @@ class iocp_context {
 
   // Every file is gone by now (they must outlive nothing and be destroyed
   // first), so their handles are closed and the requests they owned have
-  // reported. What can remain is a wake nobody consumed, which the port
-  // drops with itself.
-  ~iocp_context() = default;
+  // reported; the drain finds nothing. What can remain is a wake nobody
+  // consumed, which the port drops with itself.
+  ~iocp_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
@@ -334,6 +335,39 @@ class iocp_context {
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
 
+  // Cancels what every open file still has on the port, reaps all of it
+  // without reporting any, and forgets the deferred list. CancelIoEx
+  // bounds the wait: every cancelled request completes, successfully or
+  // with ERROR_OPERATION_ABORTED. A null OVERLAPPED that is not the wake
+  // sentinel means the port itself has failed and nothing more can
+  // arrive.
+  void drain() noexcept {
+    for (file* f = files_; f != nullptr; f = f->next_) {
+      if (f->f_.use_iocp && f->inflight_ > 0) {
+        ::CancelIoEx(f->f_.h(), nullptr);
+      }
+    }
+    while (port_owed_ > 0) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      ::GetQueuedCompletionStatus(port_.get(), &bytes, &key, &pov, INFINITE);
+      if (pov == nullptr) {
+        if (key == wake_key) {
+          woken_ = true;
+          continue;
+        }
+        break;
+      }
+      --port_owed_;
+    }
+    for (file* f = files_; f != nullptr; f = f->next_) {
+      f->inflight_ = 0;
+    }
+    deferred_.clear();
+    in_flight_ = 0;
+  }
+
  private:
   static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
 
@@ -342,7 +376,20 @@ class iocp_context {
     return port_ ? port_.get() : nullptr;
   }
 
-  void adopt(file& f) noexcept { f.ctx_ = this; }
+  void adopt(file& f) noexcept {
+    f.ctx_ = this;
+    f.next_ = files_;
+    files_ = &f;
+  }
+
+  void unlink(file& f) noexcept {
+    for (file** link = &files_; *link != nullptr; link = &(*link)->next_) {
+      if (*link == &f) {
+        *link = f.next_;
+        return;
+      }
+    }
+  }
 
   // A file about to close cancels what it still owes and waits it out: the
   // requests target the engine's pool, which is freed just after, and a
@@ -357,6 +404,7 @@ class iocp_context {
   // destructor. The engine never does it (one file per context), and a
   // multi-file driver should idle a file before closing it.
   void forget(file& f) noexcept {
+    unlink(f);
     if (!f.f_.use_iocp || f.inflight_ == 0) {
       return;
     }
@@ -376,6 +424,7 @@ class iocp_context {
         break;  // the port is unusable; no completion can arrive
       }
       read_op& op = *op_of(pov);
+      --port_owed_;
       if (op.owner_file == &f) {
         in_flight_--;
         f.inflight_--;  // reaped, and deliberately not reported
@@ -422,6 +471,7 @@ class iocp_context {
         ::GetLastError() != ERROR_IO_PENDING) {
       throw_winerr("ReadFile(async)");
     }
+    ++port_owed_;
   }
 
   void complete(read_op& op, std::error_code ec) noexcept {
@@ -460,6 +510,7 @@ class iocp_context {
         throw_winerr("GetQueuedCompletionStatus");
       }
       read_op& op = *op_of(pov);
+      --port_owed_;
       if (ok == 0) {
         complete(op, std::error_code(static_cast<int>(::GetLastError()),
                                      std::system_category()));
@@ -531,7 +582,9 @@ class iocp_context {
   bool async_requested_ = true;
   unique_handle port_;
   deferred_ops<read_op> deferred_;
+  file* files_ = nullptr;      // every open file, for the drain
   std::size_t in_flight_ = 0;
+  std::size_t port_owed_ = 0;  // requests the port has yet to hand back
   bool woken_ = false;
 };
 

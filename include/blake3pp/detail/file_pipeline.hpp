@@ -876,8 +876,8 @@ class window_scope {
   // poll throws here is dropped, and after max_failed_polls of them the
   // driver is not asked again. From then on the run queue alone is
   // watched, since a window on the pool publishes without the driver's
-  // help, and the reads the driver still owes are left to its own
-  // teardown drain, which runs no callback and touches no operation.
+  // help, and the reads the driver still owes are drained through it,
+  // which runs no callback and leaves no operation referenced.
   static constexpr unsigned max_failed_polls = 8;
 
   void quiesce() noexcept {
@@ -897,8 +897,11 @@ class window_scope {
         continue;
       }
       // Every chain the driver does not owe as a read is on the pool or
-      // on the run queue, and comes back on its own.
+      // on the run queue, and comes back on its own. Once only reads are
+      // left the driver drains them itself, running no callback, so no
+      // context still references an op once the cells are gone.
       if (in_flight_ <= loop_.driver().in_flight()) {
+        loop_.driver().drain();
         break;
       }
       std::this_thread::yield();

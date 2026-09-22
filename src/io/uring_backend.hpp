@@ -456,18 +456,10 @@ class uring_context {
   uring_context(const uring_context&) = delete;
   uring_context& operator=(const uring_context&) = delete;
 
-  ~uring_context() {
-    // The armed poll completes only when the eventfd becomes readable,
-    // and ~uring drains everything outstanding before it unmaps: without
-    // this nudge that drain waits forever. Runs before any member is
-    // destroyed, and the eventfd itself outlives the ring by declaration
-    // order, so the nudge lands on an open descriptor and the drain
-    // reaps the poll it completes.
-    if (wake_armed_) {
-      waiter_.wake();
-    }
-    // ~uring drains the rest. No callback runs from here, by contract.
-  }
+  // Runs before any member is destroyed, and the eventfd outlives the
+  // ring by declaration order, so the nudge the drain needs lands on an
+  // open descriptor. ~uring drains again and finds nothing.
+  ~uring_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
@@ -527,6 +519,30 @@ class uring_context {
   void wake() noexcept { waiter_.wake(); }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+
+  // Entries the kernel never took are withdrawn, the reads it did take
+  // are reaped and discarded, and the deferred list is forgotten. The
+  // armed wake poll completes only when the eventfd becomes readable,
+  // so it is nudged first; the ring's drain reaps it with the rest, and
+  // the next blocking poll re-arms it. A wake that arrives meanwhile is
+  // kept in the eventfd's counter, so nothing is lost: at worst the next
+  // poll returns once with nothing to report.
+  void drain() noexcept {
+    if (use_uring_) {
+      ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
+        if (ud == wake_ud()) {
+          wake_armed_ = false;
+        }
+      });
+      if (wake_armed_) {
+        waiter_.wake();
+      }
+      ring_.drain();
+      wake_armed_ = false;
+    }
+    deferred_.clear();
+    in_flight_ = 0;
+  }
 
   // Every entry the kernel refused to take names a read that in_flight()
   // counts and the ring will never complete. Moving them to the deferred

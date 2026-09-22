@@ -237,6 +237,13 @@ concept reader_context = requires(C c, const C cc, typename C::file& f,
   // return. Idempotent; a wake with no blocked poll is remembered.
   { c.wake() } noexcept;
   { cc.in_flight() } noexcept -> std::same_as<std::size_t>;
+  // Waits out every read still owed, running no callback, and forgets
+  // the rest: afterwards in_flight() is zero and the context references
+  // no read_op, so the caller may destroy them. The context stays
+  // usable. The destructor drains too, a no-op after this. Never
+  // throws: nothing it could report would change what the caller has
+  // to do next.
+  { c.drain() } noexcept;
 };
 
 // The queue of reads a context could not hand to its async engine --
@@ -273,6 +280,10 @@ class deferred_ops {
   }
 
   [[nodiscard]] bool empty() const noexcept { return head_ == nullptr; }
+
+  // Forgets every queued op: none was ever issued, so there is nothing
+  // to wait for, and none gets its callback.
+  void clear() noexcept { head_ = tail_ = nullptr; }
 
  private:
   Op* head_ = nullptr;
@@ -355,6 +366,12 @@ class sync_context {
   void wake() noexcept { waiter_.wake(); }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
+
+  // Nothing was ever issued: the queued reads are simply forgotten.
+  void drain() noexcept {
+    queue_.clear();
+    queued_ = 0;
+  }
 
  private:
   deferred_ops<read_op> queue_;

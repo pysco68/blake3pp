@@ -103,6 +103,7 @@ io_driver::~io_driver() {
          "an io_driver::file outlived its io_driver: every file must be "
          "destroyed before the driver it was opened on");
 #endif
+  drain();
 }
 
 io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
@@ -136,6 +137,8 @@ void io_driver::wake() noexcept { impl_->ctx.wake(); }
 std::size_t io_driver::in_flight() const noexcept {
   return impl_->ctx.in_flight();
 }
+
+void io_driver::drain() noexcept { impl_->ctx.drain(); }
 
 std::span<std::byte> io_driver::allocate(std::size_t bytes) {
   // One arena per driver, taken once at pipeline construction. Aligned

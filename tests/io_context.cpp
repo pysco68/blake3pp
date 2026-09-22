@@ -174,6 +174,7 @@ class fake_context {
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return queue_.size();
   }
+  void drain() noexcept { queue_.clear(); }
 
   // The engine deliberately gives no way to reach its context, so the
   // window to fail is named before the engine is built. A static on a
@@ -522,6 +523,73 @@ TEST_CASE("a context destroyed with reads in flight runs no callback") {
   CHECK(p.calls == 0);
 }
 #endif
+
+// drain() on a live context: the owed read is reaped and never
+// reported, the counters say nothing is owed, and the context then
+// serves a fresh read as if nothing had happened -- on io_uring that
+// means the wake poll was reaped with the rest and re-armed.
+TEST_CASE("drain() reaps owed reads without a callback and keeps the context usable") {
+  const auto content = pattern(2 * 1024 * 1024, 5);
+  const temp_file f(content);
+  std::vector<std::byte> buf(content.size());
+  const auto check = [&](auto& ctx, auto& file, std::string_view tag) {
+    CAPTURE(tag);
+    using ctx_type = std::remove_reference_t<decltype(ctx)>;
+    probe p;
+    typename ctx_type::read_op op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, std::span{buf}, op);
+    ctx.flush();
+    ctx.drain();
+    CHECK(p.calls == 0);
+    CHECK(ctx.in_flight() == 0);
+
+    // Still usable, and the callback discipline still holds.
+    typename ctx_type::read_op again{};
+    again.done = &probe::on_done;
+    again.owner = &p;
+    ctx.submit_read(file, 0, std::span{buf}, again);
+    ctx.flush();
+    CHECK(p.calls == 0);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    CHECK(std::equal(content.begin(), content.end(), buf.begin()));
+    ctx.drain();  // nothing owed: a no-op
+    CHECK(ctx.in_flight() == 0);
+  };
+#if defined(__linux__)
+  {
+    io_impl::uring_context ctx({}, 4);
+    io_impl::uring_context::file file(ctx, f.path, false);
+    check(ctx, file, file.name());
+  }
+#endif
+#if defined(_WIN32)
+  {
+    io_impl::iocp_context ctx({}, 4);
+    io_impl::iocp_context::file file(ctx, f.path, false);
+    check(ctx, file, file.name());
+  }
+#endif
+#if defined(__APPLE__)
+  {
+    io_impl::gcd_context ctx({}, 4);
+    io_impl::gcd_context::file file(ctx, f.path, false);
+    check(ctx, file, file.name());
+  }
+#endif
+#if defined(__unix__) || defined(__APPLE__)
+  {
+    io_impl::pread_context ctx({}, 4);
+    io_impl::pread_context::file file(ctx, f.path, false);
+    check(ctx, file, "pread");
+  }
+#endif
+}
 
 // A wake nobody consumed is still queued when the context dies: an
 // eventfd counter, a sentinel in the completion port, a signalled

@@ -86,6 +86,11 @@ class null_context {
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
 
+  void drain() noexcept {
+    head_ = tail_ = nullptr;
+    queued_ = 0;
+  }
+
  private:
   read_op* head_ = nullptr;
   read_op* tail_ = nullptr;

@@ -158,11 +158,12 @@ class gcd_context {
   gcd_context& operator=(const gcd_context&) = delete;
 
   // In-flight workers write into the engine's buffer pool, which is freed
-  // just after this: wait them out. Ops they finished on the way are left
-  // on the done list and deliberately never reported, which is the
-  // contract's teardown drain. A wake nobody consumed dies with the
+  // just after this: wait them out. A wake nobody consumed dies with the
   // waiter and needs no nudge: nothing here waits on it.
-  ~gcd_context() { pump_.destroy(); }
+  ~gcd_context() {
+    drain();
+    pump_.destroy();
+  }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
@@ -209,6 +210,20 @@ class gcd_context {
   void wake() noexcept { waiter_.wake(); }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+
+  // Waits every worker out, then forgets what they finished and what
+  // was never started: none of it is reported.
+  void drain() noexcept {
+    if (use_gcd_) {
+      dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
+    }
+    {
+      const std::lock_guard<std::mutex> lk(done_m_);
+      done_head_ = nullptr;
+    }
+    deferred_.clear();
+    in_flight_ = 0;
+  }
 
  private:
   // Runs on a GCD worker: one positional read loop into the caller's
