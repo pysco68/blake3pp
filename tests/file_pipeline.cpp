@@ -1285,11 +1285,17 @@ TEST_CASE("the sequential window loop leaves the driver record empty") {
 // that is the one error a device actually produces here.
 TEST_CASE("a file truncated under the pipeline fails once with EIO") {
 #if defined(_WIN32)
-  // Windows will not shorten a file another handle has open, and the
-  // pipeline's handle is open for the whole run -- so the shape this
-  // case provokes cannot happen there. The fake driver covers the same
-  // error path on every platform; this one covers the real backend's.
-  MESSAGE("skipped: this platform refuses to truncate an open file");
+  // The backend opens files FILE_SHARE_READ (src/io/iocp_backend.hpp),
+  // so no other handle can get the write access a truncation needs and
+  // fs::resize_file fails with a sharing violation. FILE_SHARE_DELETE
+  // would not change that -- it permits delete and rename, not a
+  // shortening write -- and FILE_SHARE_WRITE, which would, is the wrong
+  // trade for a hasher: it would let anything rewrite a file underneath
+  // a digest in progress. So the shape this case provokes cannot arise
+  // on Windows, and the case says so rather than pretending to cover
+  // it. The same error path is covered on every platform through the
+  // fake driver; this one covers the real backend's.
+  MESSAGE("skipped: the backend's share mode makes an open file untruncatable");
 #else
   using blake3pp::detail::io_driver;
   auto sched = blake3pp::get_parallel_scheduler();
