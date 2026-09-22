@@ -372,17 +372,11 @@ template <bool Traced, class Scheduler, class Body>
 }
 
 // Runs body(i) for every i in [0, n) on sched and waits for all of them.
-//
-// With pt set the traced body runs instead; the choice is made once
-// here, so the untraced bulk body is untouched.
+// Untraced: the one-shot engine has no window records to fill, and the
+// file pipeline, which does, connects part_bulk_sender itself.
 template <class Scheduler, class Body>
-void for_each_part(Scheduler& sched, std::size_t n, Body body,
-                   part_trace* pt = nullptr) {
+void for_each_part(Scheduler& sched, std::size_t n, Body body) {
   std::atomic<std::size_t> next{0};
-  if (pt != nullptr) {
-    wait_for_parts(part_bulk_sender<true>(sched, n, body, next, pt));
-    return;
-  }
   wait_for_parts(part_bulk_sender<false>(sched, n, body, next, nullptr));
 }
 
@@ -731,59 +725,34 @@ template <bool Traced, stack_budget Budget, class Scheduler>
 }
 
 // Fans one full window (num_chunks: power of two, counter-aligned) out
-// over the scheduler and absorbs the part CVs in order.
-//
-// With rec set (and buf with it), the window's compute is recorded: the
-// join and absorb times, the agents' summed busy time and count, and
-// flag_parallel when the window was fanned out. The inline fallback has
-// no absorb step, so its two stamps are one clock read.
+// over the scheduler and absorbs it as one subtree. parallel_hasher's
+// window; update_file's go through the file pipeline instead.
 template <stack_budget Budget, class Scheduler>
 void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
                           hasher& h, const std::byte* data,
                           std::size_t num_chunks,
-                          std::uint64_t chunk_counter,
-                          trace_buffer* buf = nullptr,
-                          window_record* rec = nullptr) {
+                          std::uint64_t chunk_counter) {
   const std::size_t part = window_part_chunks<Budget>(num_chunks);
   if (part >= num_chunks) {
     // Window too small to fan out; hash it inline.
     h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
-    if (rec) {
-      rec->t_joined = rec->t_absorbed = buf->now();
-    }
     return;
   }
   const std::size_t n_parts = num_chunks / part;
   part_cvs<Budget> cvs;
-
-  const auto body = [&](std::size_t i) noexcept {
+  for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
     compress_subtree_cv(ops, data + i * part * chunk_size, part,
                         chunk_counter + i * part, h.key_words(),
                         h.mode_flags(), cvs[i]);
-  };
-  if (rec) {
-    part_trace pt{buf, rec->index, static_cast<std::uint32_t>(part)};
-    for_each_part(sched, n_parts, body, &pt);
-    rec->t_joined = buf->now();
-    rec->agent_busy_ns = pt.busy_ns.load(std::memory_order_relaxed);
-    rec->agents_active = pt.active.load(std::memory_order_relaxed);
-    rec->flags |= window_record::flag_parallel;
-  } else {
-    for_each_part(sched, n_parts, body);
-  }
-  // Every part pairs with a sibling all the way up: both callers hand in
-  // a power-of-two window (parallel_hasher rounds its buffer down to one,
-  // and update_file fans out only a full non-last window, which the
-  // reader has sized as a power-of-two multiple of the chunk size) and
-  // part is a power of two, so n_parts is one too.
+  });
+  // Every part pairs with a sibling all the way up: parallel_hasher
+  // rounds its buffer down to a power-of-two number of chunks and part
+  // is a power of two, so n_parts is one too.
   assert(std::has_single_bit(n_parts));
   std::array<std::uint32_t, 8> window_cv;
   fold_sibling_cvs(ops, std::span{cvs}.first(n_parts), h.key_words(),
                    h.mode_flags(), window_cv);
   h.push_subtree_cv(window_cv, num_chunks);
-  if (rec) {
-    rec->t_absorbed = buf->now();
-  }
 }
 
 }  // namespace detail
