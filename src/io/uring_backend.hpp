@@ -535,6 +535,13 @@ class uring_context {
   // Called by flush() on a refused submit, and directly by the test that
   // covers this path, since a working kernel cannot be asked to refuse.
   void defer_unsubmitted() noexcept {
+    // A context that never got a ring has nothing published to take
+    // back, and its ring pointers are null: every read it was handed is
+    // already on the deferred list. Callers reach this from flush(),
+    // which knows, and from a test, which does not.
+    if (!use_uring_) {
+      return;
+    }
     ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
       if (ud == wake_ud()) {
         wake_armed_ = false;
