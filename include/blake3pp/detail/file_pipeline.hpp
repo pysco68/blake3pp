@@ -793,7 +793,7 @@ class window_scope {
       window& w = *last_window_;
       // Only the tail: the parts before it are already in the tree.
       h_.update(std::span<const std::byte>(
-          w.buffer.data() + (w.bytes - w.tail_bytes), w.tail_bytes));
+          w.buffer.data() + (w.bytes - w.plan.tail_bytes), w.plan.tail_bytes));
       if (w.rec != nullptr) {
         // The last window is never folded, so its join and its absorb
         // are the same instant: the hasher took it whole.
@@ -843,7 +843,7 @@ class window_scope {
         free_ = w->next_free;
         claim_record(*w);
         ++in_flight_;
-        in_flight_nodes_ += w->node_cost;
+        in_flight_nodes_ += w->plan.node_cost;
         status_.outstanding = in_flight_;
         if (w->last) {
           last_window_ = w;
@@ -852,7 +852,7 @@ class window_scope {
           prepare_compress(*w);
           cells[w->slot].emplace(ConnectFull{this, w});
           ex::start(*cells[w->slot]);
-        } else if (w->parts >= 2) {
+        } else if (w->plan.parts >= 2) {
           // An edge window: the short first one or the last one, each
           // with its own cell, since a three-window file has both in
           // flight at once.
@@ -906,12 +906,38 @@ class window_scope {
     loop_.settle_publishers();
   }
 
+  // Where the next window sits in the file: what take_next() hands out,
+  // computed from the scope's cursor alone so a window can be planned
+  // before it is taken.
+  struct geometry {
+    std::uint64_t offset = 0;
+    std::size_t bytes = 0;
+    bool last = false;
+    bool short_first = false;
+  };
+
+  // How a window is split three ways. `head` is absorbed by the hasher
+  // on the driver the moment the read lands, `parts` full parts go to
+  // the pool and come back as nodes, and `tail` waits for the reducer to
+  // drain. A full window is all parts and no ends. Decided by
+  // plan_window() from the geometry, with nothing else touched, which is
+  // what lets admission cost a window that has not been built.
+  struct window_plan {
+    std::uint64_t first_chunk = 0;  // where its contribution to the tree starts
+    std::size_t head_bytes = 0;
+    std::size_t tail_bytes = 0;
+    std::size_t parts = 0;
+    std::size_t part_chunks = 0;
+    std::size_t node_cost = 1;   // reducer slots admission reserves
+    unsigned edge_slot = 0;      // which node buffer an edge window uses
+  };
+  static_assert(std::is_trivially_copyable_v<window_plan>);
+
   struct window {
     std::span<std::byte> buffer;
     window_compress<Budget> compress;
     std::uint64_t index = 0;
     std::uint64_t offset = 0;
-    std::uint64_t first_chunk = 0;
     std::uint64_t chunks = 0;
     std::size_t bytes = 0;
     window_record* rec = nullptr;
@@ -919,17 +945,8 @@ class window_scope {
     unsigned slot = 0;
     bool last = false;
     bool short_first = false;
-    // An edge window is split three ways. `head` is absorbed by the
-    // hasher on the driver the moment the read lands, `parts` full parts
-    // go to the pool and come back as nodes, and `tail` waits for the
-    // reducer to drain. A full window is all parts and no ends.
-    std::size_t head_bytes = 0;
-    std::size_t tail_bytes = 0;
-    std::size_t parts = 0;
-    std::size_t part_chunks = 0;
-    std::size_t nodes = 0;       // nodes the fold produced
-    unsigned edge_slot = 0;      // which node buffer this window uses
-    std::size_t node_cost = 1;   // reducer slots admission reserved
+    window_plan plan;
+    std::size_t nodes = 0;  // nodes the fold produced
   };
 
   // What the node buffers hold: the worst case over any run, which is
@@ -1017,18 +1034,20 @@ class window_scope {
   // the nodes do, since it is what puts the hasher on the boundary they
   // are numbered from.
   void absorb_head(window& w) noexcept {
-    if (w.head_bytes > 0) {
-      h_.update(std::span<const std::byte>(w.buffer.data(), w.head_bytes));
+    if (w.plan.head_bytes > 0) {
+      h_.update(
+          std::span<const std::byte>(w.buffer.data(), w.plan.head_bytes));
     }
   }
 
   [[nodiscard]] auto edge_compress_stage(window& w) {
     stamp_ready(w);
     absorb_head(w);
-    w.compress.prepare_edge(ops_, w.buffer.data() + w.head_bytes, w.part_chunks,
-                            w.parts, w.first_chunk, h_.key_words(),
-                            h_.mode_flags(), trace_, w.index);
-    const std::span<tree_reducer::node> out(edge_nodes_[w.edge_slot]);
+    const window_plan& p = w.plan;
+    w.compress.prepare_edge(ops_, w.buffer.data() + p.head_bytes,
+                            p.part_chunks, p.parts, p.first_chunk,
+                            h_.key_words(), h_.mode_flags(), trace_, w.index);
+    const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
     if constexpr (Traced) {
       return ex::then(compress_edge_on<true>(sched_, w.compress, out),
                       [this, &w](std::size_t nodes) noexcept {
@@ -1044,7 +1063,7 @@ class window_scope {
   void insert_edge_nodes(window& w, std::size_t nodes) noexcept {
     w.nodes = nodes;
     for (std::size_t i = 0; i < nodes; ++i) {
-      const tree_reducer::node& n = edge_nodes_[w.edge_slot][i];
+      const tree_reducer::node& n = edge_nodes_[w.plan.edge_slot][i];
       const bool inserted = reducer_.insert(n.first_chunk, n.chunks, n.cv);
       // Admission reserved a whole decomposition for this window.
       assert(inserted && "the reducer refused an edge window's node");
@@ -1123,40 +1142,46 @@ class window_scope {
     return false;
   }
 
-  // Whether the window that would start next is an edge one, which the
-  // admission rule has to know before the window is taken.
-  [[nodiscard]] bool next_is_edge() const noexcept {
-    const std::size_t want =
-        (next_offset_ == 0 && head_window_bytes_ > 0) ? head_window_bytes_
-                                                     : window_bytes_;
-    const std::uint64_t bytes =
-        std::min<std::uint64_t>(want, file_bytes_ - next_offset_);
-    return next_offset_ + bytes >= file_bytes_;
+  [[nodiscard]] geometry next_geometry() const noexcept {
+    geometry g;
+    g.offset = next_offset_;
+    g.short_first = g.offset == 0 && head_window_bytes_ > 0;
+    const std::size_t want = g.short_first ? head_window_bytes_ : window_bytes_;
+    g.bytes = static_cast<std::size_t>(
+        std::min<std::uint64_t>(want, file_bytes_ - next_offset_));
+    g.last = next_offset_ + g.bytes >= file_bytes_;
+    return g;
   }
 
-  // What the next window would reserve in the reducer, decided from the
-  // same plan the window will get.
+  // What the next window would reserve in the reducer, from the same
+  // plan the window will get.
   [[nodiscard]] std::size_t next_window_cost() const noexcept {
-    // The short first window reserves like any other edge window; it is
-    // planned from the hasher's count rather than from the file's end.
-    if (next_offset_ == 0 && head_window_bytes_ > 0 &&
-        head_window_bytes_ < file_bytes_) {
-      return short_first_cost();
-    }
-    if (!next_is_edge()) {
-      return 1;
-    }
-    const std::size_t bytes = static_cast<std::size_t>(
-        std::min<std::uint64_t>(window_bytes_, file_bytes_ - next_offset_));
-    const std::size_t parts = last_window_parts(bytes);
-    return parts >= 2 ? nodes_for(parts) : 1;
+    return plan_window(next_geometry()).node_cost;
   }
 
-  [[nodiscard]] std::size_t short_first_cost() const noexcept {
-    window probe{};
-    probe.bytes = head_window_bytes_;
-    const_cast<window_scope*>(this)->plan_short_first(probe);
-    return probe.node_cost;
+  // Decides a window's three parts. A window that is both ends of the
+  // file is the hasher's whole: it is misaligned at the front and
+  // carries the final chunk at the back, and nothing between them is
+  // worth a subtree. For every window but the short first one the
+  // contribution starts at the window itself; the short one's starts
+  // wherever its head ends, which plan_short_first works out.
+  [[nodiscard]] window_plan plan_window(const geometry& g) const noexcept {
+    window_plan p;
+    p.first_chunk =
+        base_chunk_ +
+        (g.offset - std::min<std::uint64_t>(g.offset, head_window_bytes_)) /
+            chunk_size;
+    if (g.last && g.short_first) {
+      p.tail_bytes = g.bytes;
+      return p;
+    }
+    if (g.last) {
+      return plan_last(g.bytes, p);
+    }
+    if (g.short_first) {
+      return plan_short_first(g.bytes, p);
+    }
+    return p;
   }
 
   // How many whole parts of a last window of `bytes` sit entirely before
@@ -1173,45 +1198,18 @@ class window_scope {
     return k < 2 ? 0 : static_cast<std::size_t>(k);
   }
 
-  // Takes the next window's geometry and decides its three parts.
+  // Takes the next window's geometry and plan into w and advances.
   void take_next(window& w) noexcept {
-    w.offset = next_offset_;
-    const std::size_t want =
-        (w.offset == 0 && head_window_bytes_ > 0) ? head_window_bytes_
-                                                  : window_bytes_;
-    w.bytes = static_cast<std::size_t>(
-        std::min<std::uint64_t>(want, file_bytes_ - next_offset_));
-    w.last = next_offset_ + w.bytes >= file_bytes_;
-    w.short_first = w.offset == 0 && head_window_bytes_ > 0;
+    const geometry g = next_geometry();
+    w.plan = plan_window(g);
+    w.offset = g.offset;
+    w.bytes = g.bytes;
+    w.last = g.last;
+    w.short_first = g.short_first;
     w.chunks = w.bytes / chunk_size;
-    // Where this window's contribution to the tree starts. For every
-    // window but the short first one that is the window itself; the
-    // short one's is wherever its head ends, which plan_short_first
-    // works out.
-    w.first_chunk =
-        base_chunk_ +
-        (w.offset - std::min<std::uint64_t>(w.offset, head_window_bytes_)) /
-            chunk_size;
     w.index = index_++;
-    w.head_bytes = 0;
-    w.tail_bytes = 0;
-    w.parts = 0;
-    w.part_chunks = 0;
     w.nodes = 0;
-    w.node_cost = 1;
     next_offset_ += w.bytes;
-    // A window that is both ends of the file is the hasher's whole: it
-    // is misaligned at the front and carries the final chunk at the
-    // back, and nothing between them is worth a subtree.
-    if (w.last) {
-      if (w.short_first) {
-        w.tail_bytes = w.bytes;
-      } else {
-        plan_last(w);
-      }
-    } else if (w.short_first) {
-      plan_short_first(w);
-    }
   }
 
   // The short window that brings the hasher back to a window boundary.
@@ -1221,39 +1219,41 @@ class window_scope {
   // one part in total and is absorbed on the driver the moment the read
   // lands. What follows is whole parts, aligned in the message's own
   // chunk space, and goes to the pool like any other window's.
-  void plan_short_first(window& w) noexcept {
+  [[nodiscard]] window_plan plan_short_first(std::size_t bytes,
+                                             window_plan p) const noexcept {
     const std::uint64_t count = base_count_;
     const std::size_t to_chunk = static_cast<std::size_t>(
         (chunk_size - count % chunk_size) % chunk_size);
     const std::size_t chunks_left =
-        w.bytes > to_chunk ? (w.bytes - to_chunk) / chunk_size : 0;
+        bytes > to_chunk ? (bytes - to_chunk) / chunk_size : 0;
     if (chunks_left < 2) {
-      w.head_bytes = w.bytes;
-      return;
+      p.head_bytes = bytes;
+      return p;
     }
-    const std::size_t p = window_part_chunks<Budget>(chunks_left);
+    const std::size_t part = window_part_chunks<Budget>(chunks_left);
     const std::uint64_t chunk_at = (count + to_chunk) / chunk_size;
     const std::size_t to_part =
-        static_cast<std::size_t>((p - chunk_at % p) % p) * chunk_size;
+        static_cast<std::size_t>((part - chunk_at % part) % part) * chunk_size;
     const std::size_t head = to_chunk + to_part;
     const std::size_t parts =
-        w.bytes > head ? (w.bytes - head) / (p * chunk_size) : 0;
+        bytes > head ? (bytes - head) / (part * chunk_size) : 0;
     if (parts < 2) {
-      w.head_bytes = w.bytes;
-      return;
+      p.head_bytes = bytes;
+      return p;
     }
-    w.head_bytes = head;
-    w.part_chunks = p;
-    w.parts = parts;
-    w.first_chunk = (count + head) / chunk_size;
-    w.node_cost = nodes_for(parts);
-    w.edge_slot = 0;
+    p.head_bytes = head;
+    p.part_chunks = part;
+    p.parts = parts;
+    p.first_chunk = (count + head) / chunk_size;
+    p.node_cost = nodes_for(parts);
+    p.edge_slot = 0;
     // The parts cover the window exactly: the head lands on a part
     // boundary and the window ends on a window boundary, and the part
     // size divides the window because both are powers of two and the
     // part is the smaller.
-    assert(w.bytes == head + parts * p * chunk_size &&
+    assert(bytes == head + parts * part * chunk_size &&
            "a short first window's parts must cover it exactly");
+    return p;
   }
 
   // The last window carries the message's final chunk, and a merged
@@ -1268,26 +1268,29 @@ class window_scope {
   // than the one the driver rule allows elsewhere: the final part is its
   // by definition, and the one before it is not worth splitting out
   // alone.
-  void plan_last(window& w) noexcept {
-    const std::size_t parts = last_window_parts(w.bytes);
+  [[nodiscard]] window_plan plan_last(std::size_t bytes,
+                                      window_plan p) const noexcept {
+    const std::size_t parts = last_window_parts(bytes);
     if (parts == 0) {
-      w.tail_bytes = w.bytes;
-      return;
+      p.tail_bytes = bytes;
+      return p;
     }
     const std::uint64_t chunks_with_tail =
-        (static_cast<std::uint64_t>(w.bytes) + chunk_size - 1) / chunk_size;
-    w.part_chunks =
+        (static_cast<std::uint64_t>(bytes) + chunk_size - 1) / chunk_size;
+    p.part_chunks =
         window_part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
-    w.parts = parts;
-    w.tail_bytes = w.bytes - parts * w.part_chunks * chunk_size;
-    w.node_cost = nodes_for(parts);
-    w.edge_slot = 1;
+    p.parts = parts;
+    p.tail_bytes = bytes - parts * p.part_chunks * chunk_size;
+    p.node_cost = nodes_for(parts);
+    p.edge_slot = 1;
+    return p;
   }
 
   void prepare_compress(window& w) noexcept {
     const bool fanned =
-        w.compress.prepare(ops_, w.buffer.data(), w.chunks, w.first_chunk,
-                           h_.key_words(), h_.mode_flags(), trace_, w.index);
+        w.compress.prepare(ops_, w.buffer.data(), w.chunks,
+                           w.plan.first_chunk, h_.key_words(), h_.mode_flags(),
+                           trace_, w.index);
     // update_file only reaches the pipeline for windows big enough to fan
     // out; a window that is not is exactly what the fallback path exists
     // for.
@@ -1296,7 +1299,7 @@ class window_scope {
   }
 
   void reduce_into_tree(window& w, const cv_type& cv) noexcept {
-    const bool inserted = reducer_.insert(w.first_chunk, w.chunks, cv);
+    const bool inserted = reducer_.insert(w.plan.first_chunk, w.chunks, cv);
     // Admission reserved this node before the window started.
     assert(inserted && "the reducer refused a window admission had room for");
     (void)inserted;
@@ -1310,7 +1313,7 @@ class window_scope {
     --in_flight_;
     // Whatever this window reserved in the reducer is now either in it
     // or never coming.
-    in_flight_nodes_ -= w.node_cost;
+    in_flight_nodes_ -= w.plan.node_cost;
     if (&w != last_window_) {
       release(w);
     }
@@ -1323,7 +1326,7 @@ class window_scope {
     }
     stop_ = true;
     --in_flight_;
-    in_flight_nodes_ -= w.node_cost;
+    in_flight_nodes_ -= w.plan.node_cost;
     if (&w != last_window_) {
       release(w);
     }
@@ -1336,7 +1339,7 @@ class window_scope {
     }
     stop_ = true;
     --in_flight_;
-    in_flight_nodes_ -= w.node_cost;
+    in_flight_nodes_ -= w.plan.node_cost;
     if (&w != last_window_) {
       release(w);
     }
