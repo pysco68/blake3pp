@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <stdexcept>
 #include <system_error>
@@ -330,6 +331,8 @@ struct fake_script {
   // read; -1 for none. With keep_throwing every later poll throws too.
   int throw_at_poll = -1;
   bool keep_throwing = false;
+  // The window index whose submit_read() throws std::bad_alloc, or -1.
+  int bad_alloc_at_window = -1;
 };
 
 class fake_driver {
@@ -354,6 +357,11 @@ class fake_driver {
 
   void submit_read(file&, std::uint64_t off, std::span<std::byte> buf,
                    blake3pp::detail::io_read_op& op) {
+    if (script_.bad_alloc_at_window >= 0 &&
+        off / window_bytes_ ==
+            static_cast<std::uint64_t>(script_.bad_alloc_at_window)) {
+      throw std::bad_alloc();
+    }
     queued_.push_back(read{&op, off, buf, 0});
   }
 
@@ -1258,6 +1266,27 @@ TEST_CASE("an exception from poll waits for the pool before unwinding") {
     } catch (const std::runtime_error& e) {
       ++thrown;
       CHECK(std::string_view(e.what()) == "poll failed");
+    }
+    CHECK(thrown == 1);
+  }
+}
+
+// A submit that throws something other than a system_error reports that
+// exception, not a substitute error code: the read sender carries both
+// error channels and the scope keeps the first of either.
+TEST_CASE("a read the driver could not queue reports what it threw") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 93);
+  for (const int k : {0, 2, 7}) {
+    CAPTURE(k);
+    blake3pp::hasher h;
+    int thrown = 0;
+    try {
+      fake_run(h, content, win, sched, 4, {.bad_alloc_at_window = k});
+    } catch (const std::bad_alloc&) {
+      ++thrown;
     }
     CHECK(thrown == 1);
   }
