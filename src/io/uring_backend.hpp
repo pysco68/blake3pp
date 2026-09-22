@@ -25,6 +25,7 @@
 #include <bit>
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -742,6 +743,11 @@ class uring_writer {
 
   void start_write(unsigned s, std::uint64_t off,
                    std::span<const std::byte> buf) {
+    // The engine asks wants_async() first, which is false without a
+    // ring; reaching here degraded would submit through null ring
+    // pointers. The synchronous writers state the same invariant with
+    // the same assert.
+    assert(use_uring_ && "the uring writer has no async path without a ring");
     slots_[s] = {buf, off, 0, true};
     ring_.submit_rw(IORING_OP_WRITE, f_.fd, buf.data(),
                     static_cast<unsigned>(buf.size()), off, s, offload_);

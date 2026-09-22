@@ -123,6 +123,14 @@ class poll_waiter {
   }
 
   void sleep() {
+    if (fd_ < 0) {
+      // poll() ignores a negative descriptor and would then wait on
+      // nothing, forever, which is the one outcome a caller cannot
+      // recover from or even see. A context whose eventfd could not be
+      // created says so instead.
+      throw std::system_error(EBADF, std::generic_category(),
+                              "blake3pp: no wake descriptor to sleep on");
+    }
     ::pollfd p{fd_, POLLIN, 0};
     while (::poll(&p, 1, -1) < 0) {
       if (errno != EINTR) {
