@@ -699,6 +699,11 @@ struct pipeline_options {
   // argument at admit_more()), which only a caller that knows the file
   // can judge.
   std::size_t reducer_capacity = 0;
+  // The kernel table the windows compress with, or null to take the
+  // hasher's. The expert entry points hand a caller-supplied table
+  // straight through; resolving the hasher's variant back to a
+  // registered table would quietly replace it with the library's own.
+  const kern::kernel_ops* ops = nullptr;
   // A stop the caller owns. The scope watches it for the whole run and
   // requests its own stop from it, so a token requested from any thread
   // reaches the driver through the one member another thread may call.
@@ -823,6 +828,25 @@ struct pipeline_plan {
 }
 
 
+// The same geometry for a source already in memory.
+//
+// Two of the file plan's inputs mean nothing here: there is no device to
+// keep reads in flight for, and the window budget buys nothing when a
+// window is a view rather than a buffer. What is left is how many
+// windows may be in flight, which is what bounds the reducer and the
+// part tables, and the span's own window count.
+[[nodiscard]] constexpr pipeline_plan plan_memory_pipeline(
+    std::uint64_t count, std::size_t window_bytes,
+    std::uint64_t span_bytes) noexcept {
+  const std::size_t window = rounded_window_bytes(window_bytes);
+  const std::size_t head = first_window_bytes(count, window);
+  const unsigned windows =
+      span_bytes == 0
+          ? 1
+          : std::min(max_queue_depth, file_windows(span_bytes, window, head));
+  return {window, windows, windows, head, false};
+}
+
 // Several window chains in flight over one file, all on the caller's
 // thread.
 //
@@ -852,7 +876,7 @@ class window_scope {
         file_(file),
         sched_(std::move(sched)),
         trace_(opts.trace),
-        ops_(resolve(h.selected_arch())),
+        ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
         window_bytes_(plan.window_bytes),
         count_(plan.windows),
         reads_in_flight_(plan.reads_in_flight),
@@ -1294,9 +1318,17 @@ class window_scope {
     window_plan plan;
     std::size_t nodes = 0;  // nodes the fold produced
 
-    // The window's bytes, for everything that compresses or absorbs
-    // them. The assert is the contract the arena needs and the in-memory
-    // source satisfies trivially; it is live in the sanitizer lanes.
+    // Where this window's bytes are, which is settled when the window is
+    // taken. Only the ADDRESS is: use this to record where a later stage
+    // will read, never to read now.
+    [[nodiscard]] const std::byte* at() const noexcept {
+      return bytes_view.data();
+    }
+
+    // The window's bytes themselves, for everything that compresses or
+    // absorbs them. The assert is the contract the arena needs and the
+    // in-memory source satisfies trivially; it is live in the sanitizer
+    // lanes.
     [[nodiscard]] std::span<const std::byte> view() const noexcept {
       assert(view_ready &&
              "a window's bytes are only defined once its read has "
@@ -1676,9 +1708,12 @@ class window_scope {
     return p;
   }
 
+  // Runs at admission, BEFORE the read: what it records is where the
+  // compress stage will find the window, and that stage only starts once
+  // the read has completed. Hence at() rather than view().
   void prepare_compress(window& w) noexcept {
     const bool fanned =
-        w.compress.prepare(ops_, w.view().data(), w.chunks,
+        w.compress.prepare(ops_, w.at(), w.chunks,
                            w.plan.first_chunk, h_.key_words(), h_.mode_flags(),
                            trace_, w.index);
     // update_file only reaches the pipeline for windows big enough to fan

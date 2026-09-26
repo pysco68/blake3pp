@@ -41,6 +41,8 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/ex.hpp>
+#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/memory_driver.hpp>
 #include <blake3pp/detail/tree_reducer.hpp>
 #include <blake3pp/trace.hpp>
 
@@ -145,41 +147,54 @@ using parallel_scheduler_t =
 
 namespace detail {
 
-// The one-shot engine: partitions input into aligned subtrees, fans them
-// out over sched, and finishes inside h, whose key_words() and
-// mode_flags() drive the workers. Plain, keyed and derive_key hashers all
-// work.
+// Below this, the pipeline is not worth starting: a scope builds its
+// window objects and its reducer before the first byte is compressed,
+// and the sequential hasher beats all of it.
+//
+// Measured on the Z13 (Ryzen 7 PRO 6860Z, 16 threads), best of 81, this
+// build's sequential path against the same build's pipeline forced on:
+//
+//     320 KiB   3.9-4.1  against  2.6-2.9 GiB/s
+//     384 KiB   3.5-4.0  against  2.6-3.3
+//     448 KiB   3.3-3.5  against  2.7-3.1
+//     512 KiB   3.4-3.5  against  3.3-3.4      <- even
+//     640 KiB   3.5-3.6  against  4.0-4.7
+//
+// So the crossover is 512 KiB, and from 640 KiB the pipeline is ahead by
+// a fifth and climbing. The figure is one machine's; it is a threshold
+// rather than a tuned constant because the shape either side of it is
+// flat enough that being wrong by a factor of two costs little.
+inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
+
+// The window a source already in memory is cut into. A window is a view,
+// so this buys no buffers: what it sets is the subtree granularity and
+// how many windows the reducer sees.
+inline constexpr std::size_t memory_window_bytes = 8 * 1024 * 1024;
+
+// The one-shot engine: the same pipeline update_file drives, over a
+// source whose windows are views of the caller's span.
+//
+// Every full window folds to one chaining value and the ends go through
+// the canonical decomposition, so the reducer takes them in any order
+// and the hasher sees them in message order. That is what lets the part
+// count stop being a power of two, which one bulk over the whole span
+// had to be. Plain, keyed and derive_key hashers all work.
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched,
                                const kern::kernel_ops* ops) {
-  // Only chunks with at least one byte after them may be offloaded: the
-  // message's final chunk must stay with the hasher for ROOT finalization.
-  const std::size_t safe_chunks =
-      input.size() > chunk_size ? (input.size() - 1) / chunk_size : 0;
-
-  if (safe_chunks >= 2 * min_part_chunks) {
-    const std::size_t part = part_chunks<Budget>(safe_chunks);
-    const std::size_t n_parts = safe_chunks / part;  // <= Budget.parts()
-    part_cvs<Budget> cvs;
-    const std::byte* const base = input.data();
-
-    // Starting from counter 0 in part-sized steps, every part is
-    // automatically subtree-aligned.
-    for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
-      detail::compress_subtree_cv(ops, base + i * part * chunk_size, part,
-                                  static_cast<std::uint64_t>(i) * part,
-                                  h.key_words(), h.mode_flags(), cvs[i]);
-    });
-
-    for (std::size_t i = 0; i < n_parts; ++i) {
-      h.push_subtree_cv(cvs[i], part);
-    }
-    h.update(input.subspan(n_parts * part * chunk_size));
+  if (input.size() < min_pipeline_bytes) {
+    h.update(input);
     return h.finalize();
   }
-
-  h.update(input);
+  memory_driver drv;
+  memory_driver::file f(drv, input);
+  const pipeline_plan plan = plan_memory_pipeline(
+      h.count(), memory_window_bytes,
+      static_cast<std::uint64_t>(input.size()));
+  run_window_pipeline<Budget>(
+      h, drv, f, std::forward<Scheduler>(sched), plan,
+      {.window_bytes = memory_window_bytes, .ops = ops});
   return h.finalize();
 }
 
