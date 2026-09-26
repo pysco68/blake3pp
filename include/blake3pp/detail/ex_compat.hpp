@@ -15,7 +15,7 @@
 // Internal to the pipeline; <blake3pp/io.hpp> must not reach this, since
 // it would drag the provider into the public I/O surface.
 
-#include <blake3pp/parallel.hpp>
+#include <blake3pp/detail/ex.hpp>
 
 namespace blake3pp::detail::ex_compat {
 
@@ -96,5 +96,20 @@ using scheduler_tag = ::blake3pp::ex::scheduler_t;
 // receiver cannot pass through it there. The pipeline's receivers are
 // handles -- a window pointer and a scope pointer -- which is why this
 // costs nothing.
+
+// A receiver that accepts every completion, for the concept check each
+// custom sender and operation state ends with. An operation state is
+// only a type once a receiver is named, so the check needs one, and a
+// receiver written for that purpose is exactly where RULE 5's aggregate
+// trap gets sprung: hence the user-provided constructor.
+struct probe_receiver {
+  using receiver_concept = receiver_tag;
+  probe_receiver() noexcept {}
+  template <class... Values>
+  void set_value(Values&&...) && noexcept {}
+  template <class Error>
+  void set_error(Error&&) && noexcept {}
+  void set_stopped() && noexcept {}
+};
 
 }  // namespace blake3pp::detail::ex_compat

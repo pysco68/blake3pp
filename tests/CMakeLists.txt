@@ -33,17 +33,32 @@ add_executable(blake3pp_tests
   incremental.cpp
   kernel_ops.cpp
   parallel.cpp
+  memory_source.cpp
   subtree_fold.cpp
-  file_pipeline.cpp
+  tree_reducer.cpp
   "${vectors_hpp}")
 # The io suite tests hash_file and the backend engines; without the
 # file-I/O layer there is nothing for it to link against.
 if(BLAKE3PP_WITH_IO)
-  target_sources(blake3pp_tests PRIVATE io.cpp io_context.cpp)
+  target_sources(blake3pp_tests PRIVATE
+    io.cpp io_context.cpp io_no_provider.cpp file_pipeline.cpp)
 endif()
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"
   "${PROJECT_SOURCE_DIR}/src")
+# A sanitized build runs the reducer's property cases tens of times
+# slower, to the point where one case takes minutes and a timeout can no
+# longer tell a stall from work. Those lanes run a prefix of the same
+# fixed-seed sequence; the plain lanes keep the full count.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+  target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_REDUCED_CASES=1)
+endif()
+# The blocking update_file() has no stop parameter until Phase 7 exposes
+# one, so the seam in <blake3pp/parallel_io.hpp> that installs a stop is
+# compiled here and nowhere else. Every TU of this target gets it, which
+# is what keeps the inline function it guards one definition; the library
+# itself never includes that header.
+target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_PIPELINE_STOP=1)
 target_link_libraries(blake3pp_tests PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
@@ -66,7 +81,14 @@ elseif(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   # aggregate; it becomes runnable on real hardware.
   add_test(NAME blake3pp_tests COMMAND blake3pp_tests --no-colors)
 else()
-  doctest_discover_tests(blake3pp_tests)
+  # Without a per-case limit a stall in the pipeline or a backend holds
+  # the run until the CI job's own limit, with nothing to say which case
+  # was stuck. A deadlock is unbounded, so any finite limit catches it,
+  # and the number is set by the slowest case doing real work: the
+  # reducer's property cases under GCC with address+undefined, which hash
+  # a couple of gigabytes each and take about four minutes there against
+  # under a second on the plain lanes.
+  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 900)
 endif()
 
 # The sized parallel scheduler is one definition per program; the test

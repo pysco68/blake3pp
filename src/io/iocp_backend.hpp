@@ -36,6 +36,15 @@ namespace blake3pp::detail::io_impl {
                           std::system_category(), what);
 }
 
+// A read the port reports as aborted is one CancelIoEx reached. The
+// contract names that outcome operation_canceled on every platform, so a
+// caller can recognise it without asking which OS it is on.
+[[nodiscard]] inline std::error_code read_error(DWORD err) noexcept {
+  return err == ERROR_OPERATION_ABORTED
+             ? std::make_error_code(std::errc::operation_canceled)
+             : std::error_code(static_cast<int>(err), std::system_category());
+}
+
 // Writes that land beyond the file's valid data length force NTFS to
 // zero-fill the gap synchronously, the Windows twin of ext4's
 // extending-write serialization. SetFileValidData waives the zero-fill,
@@ -213,12 +222,19 @@ class iocp_context {
     win_file* sync_file = nullptr;  // the deferred path needs the handles
     void* owner_file = nullptr;     // which file's drain owes this op
     read_op* next_deferred = nullptr;
+    bool on_port = false;   // the port owes a completion, so cancel is CancelIoEx
+    bool cancelled = false;  // a cancel was asked for; one is enough
   };
 
   class file {
    public:
     file(iocp_context& ctx, const std::filesystem::path& path,
          bool direct_io) {
+      // FILE_SHARE_READ and nothing else: a digest describes the bytes
+      // that were there, so nothing may rewrite or shorten the file
+      // while it is being read. The cost is that a test cannot truncate
+      // a file the pipeline holds open, which is why the truncation
+      // case in tests/file_pipeline.cpp does not run here.
       f_.open(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
       size_ = f_.stat_size();
@@ -247,6 +263,7 @@ class iocp_context {
     std::uint64_t size_ = 0;
     std::string_view name_ = "readfile";
     iocp_context* ctx_ = nullptr;
+    file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
   };
 
@@ -263,11 +280,10 @@ class iocp_context {
   iocp_context(const iocp_context&) = delete;
   iocp_context& operator=(const iocp_context&) = delete;
 
-  // Every file is gone by now (they must outlive nothing and be destroyed
-  // first), so their handles are closed and the requests they owned have
-  // reported. What can remain is a wake nobody consumed, which the port
-  // drops with itself.
-  ~iocp_context() = default;
+  // Every file is destroyed first, and each one's destructor forgot its
+  // own transfers, so the drain finds nothing owed. What can remain is a
+  // wake nobody consumed, which the port drops with itself.
+  ~iocp_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
@@ -279,6 +295,8 @@ class iocp_context {
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.owner_file = &f;
+    op.on_port = false;
+    op.cancelled = false;
     // NO_BUFFERING rejects an unaligned length, so only whole granules
     // ride the port; the tail is read synchronously inside poll().
     bool queued = f.f_.use_iocp && buf.size() % direct_align == 0;
@@ -294,10 +312,26 @@ class iocp_context {
         queued = false;
       }
     }
+    op.on_port = queued;
     in_flight_++;
     f.inflight_++;
     if (!queued) {
       deferred_.push(op);
+    }
+  }
+
+  // CancelIoEx names one request by its OVERLAPPED, so a sibling read on
+  // the same handle is untouched. It fails with ERROR_NOT_FOUND for a
+  // request that has already finished, which is not an error here: that
+  // completion is already on the port and arrives normally. A read on
+  // the deferred list was never issued to anything, so the flag alone is
+  // the whole cancel and run_one_deferred() honours it.
+  void cancel(read_op& op) noexcept {
+    if (std::exchange(op.cancelled, true)) {
+      return;
+    }
+    if (op.on_port) {
+      ::CancelIoEx(op.h, &op.ov);
     }
   }
 
@@ -329,6 +363,39 @@ class iocp_context {
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
 
+  // Cancels what every open file still has on the port, reaps all of it
+  // without reporting any, and forgets the deferred list. CancelIoEx
+  // bounds the wait: every cancelled request completes, successfully or
+  // with ERROR_OPERATION_ABORTED. A null OVERLAPPED that is not the wake
+  // sentinel means the port itself has failed and nothing more can
+  // arrive.
+  void drain() noexcept {
+    for (file* f = files_; f != nullptr; f = f->next_) {
+      if (f->f_.use_iocp && f->inflight_ > 0) {
+        ::CancelIoEx(f->f_.h(), nullptr);
+      }
+    }
+    while (port_owed_ > 0) {
+      DWORD bytes = 0;
+      ULONG_PTR key = 0;
+      OVERLAPPED* pov = nullptr;
+      ::GetQueuedCompletionStatus(port_.get(), &bytes, &key, &pov, INFINITE);
+      if (pov == nullptr) {
+        if (key == wake_key) {
+          woken_ = true;
+          continue;
+        }
+        break;
+      }
+      --port_owed_;
+    }
+    for (file* f = files_; f != nullptr; f = f->next_) {
+      f->inflight_ = 0;
+    }
+    deferred_.clear();
+    in_flight_ = 0;
+  }
+
  private:
   static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
 
@@ -337,7 +404,20 @@ class iocp_context {
     return port_ ? port_.get() : nullptr;
   }
 
-  void adopt(file& f) noexcept { f.ctx_ = this; }
+  void adopt(file& f) noexcept {
+    f.ctx_ = this;
+    f.next_ = files_;
+    files_ = &f;
+  }
+
+  void unlink(file& f) noexcept {
+    for (file** link = &files_; *link != nullptr; link = &(*link)->next_) {
+      if (*link == &f) {
+        *link = f.next_;
+        return;
+      }
+    }
+  }
 
   // A file about to close cancels what it still owes and waits it out: the
   // requests target the engine's pool, which is freed just after, and a
@@ -352,6 +432,7 @@ class iocp_context {
   // destructor. The engine never does it (one file per context), and a
   // multi-file driver should idle a file before closing it.
   void forget(file& f) noexcept {
+    unlink(f);
     if (!f.f_.use_iocp || f.inflight_ == 0) {
       return;
     }
@@ -371,14 +452,14 @@ class iocp_context {
         break;  // the port is unusable; no completion can arrive
       }
       read_op& op = *op_of(pov);
+      --port_owed_;
       if (op.owner_file == &f) {
         in_flight_--;
         f.inflight_--;  // reaped, not reported
         continue;
       }
       if (ok == 0) {
-        complete(op, std::error_code(static_cast<int>(::GetLastError()),
-                                     std::system_category()));
+        complete(op, read_error(::GetLastError()));
       } else if (bytes == 0) {
         complete(op, std::error_code(EIO, std::generic_category()));
       } else {
@@ -417,6 +498,7 @@ class iocp_context {
         ::GetLastError() != ERROR_IO_PENDING) {
       throw_winerr("ReadFile(async)");
     }
+    ++port_owed_;
   }
 
   void complete(read_op& op, std::error_code ec) noexcept {
@@ -455,9 +537,9 @@ class iocp_context {
         throw_winerr("GetQueuedCompletionStatus");
       }
       read_op& op = *op_of(pov);
+      --port_owed_;
       if (ok == 0) {
-        complete(op, std::error_code(static_cast<int>(::GetLastError()),
-                                     std::system_category()));
+        complete(op, read_error(::GetLastError()));
         ran++;
         continue;
       }
@@ -485,11 +567,15 @@ class iocp_context {
     }
     read_op& op = *next;
     std::error_code ec;
-    try {
-      read_sync(*op.sync_file, op.off, {op.dst, op.len});
-      op.filled = op.len;
-    } catch (const std::system_error& e) {
-      ec = e.code();
+    if (op.cancelled) {
+      ec = std::make_error_code(std::errc::operation_canceled);
+    } else {
+      try {
+        read_sync(*op.sync_file, op.off, {op.dst, op.len});
+        op.filled = op.len;
+      } catch (const std::system_error& e) {
+        ec = e.code();
+      }
     }
     complete(op, ec);
     return 1;
@@ -526,7 +612,9 @@ class iocp_context {
   bool async_requested_ = true;
   unique_handle port_;
   deferred_ops<read_op> deferred_;
+  file* files_ = nullptr;      // every open file, for the drain
   std::size_t in_flight_ = 0;
+  std::size_t port_owed_ = 0;  // requests the port has yet to hand back
   bool woken_ = false;
 };
 

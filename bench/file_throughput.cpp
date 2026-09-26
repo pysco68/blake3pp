@@ -32,6 +32,9 @@
 // the stopwatch that settles it per machine.
 
 #include <algorithm>
+#include <array>
+#include <new>
+#include <numeric>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -47,6 +50,7 @@
 #include <optional>
 #include <ostream>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -67,12 +71,14 @@
 #include <blake3pp/parallel_backend.hpp>
 #endif
 
-#include "io/engine.hpp"
-#include "io/null_backend.hpp"
+#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/memory_driver.hpp>
+
 
 #include "tool_common.hpp"
 
 namespace {
+
 
 using b3tool::println;
 
@@ -221,6 +227,104 @@ double iowq_cpu_seconds(const std::map<std::string, std::uint64_t>& before,
 #endif
 }
 
+// Whole-machine counters around one rep, so the kernel's share of the
+// machine can be told from the pool's. /proc/stat's first line is printed
+// as cores over the rep's wall time. /proc/interrupts is read per CPU, so
+// a CPU that services the device can be told from a slow one. Linux only,
+// and diagnostic only: nothing passes or fails on them.
+struct kernel_counters {
+  static constexpr const char* names[] = {"user",   "nice", "sys",     "idle",
+                                          "iowait", "irq",  "softirq", "steal"};
+  std::array<std::uint64_t, 8> stat{};
+  std::vector<std::uint64_t> irqs;  // per-CPU interrupt totals
+  std::chrono::steady_clock::time_point at{};
+  bool valid = false;
+};
+
+kernel_counters read_kernel_counters() {
+  kernel_counters k;
+  k.at = std::chrono::steady_clock::now();
+#if defined(__linux__)
+  {
+    std::ifstream stat("/proc/stat");
+    std::string tag;
+    if (stat >> tag && tag == "cpu") {
+      for (auto& v : k.stat) {
+        stat >> v;
+      }
+      k.valid = !stat.fail();
+    }
+  }
+  {
+    // The header names the CPUs; every line below it is one source with
+    // one count per CPU, except the totals at the end (ERR, MIS) with a
+    // single number, which the per-CPU read rejects.
+    std::ifstream irq("/proc/interrupts");
+    std::string line;
+    std::size_t ncpu = 0;
+    if (std::getline(irq, line)) {
+      std::istringstream header(line);
+      std::string tok;
+      while (header >> tok) {
+        ncpu += tok.starts_with("CPU") ? 1 : 0;
+      }
+    }
+    k.irqs.assign(ncpu, 0);
+    while (std::getline(irq, line)) {
+      std::istringstream row(line);
+      std::string source;
+      row >> source;
+      std::vector<std::uint64_t> counts;
+      std::uint64_t v = 0;
+      while (counts.size() < ncpu && row >> v) {
+        counts.push_back(v);
+      }
+      if (counts.size() != ncpu) {
+        continue;
+      }
+      for (std::size_t c = 0; c < ncpu; ++c) {
+        k.irqs[c] += counts[c];
+      }
+    }
+  }
+#endif
+  return k;
+}
+
+struct kernel_deltas {
+  std::array<double, 8> cores{};    // each /proc/stat field over the wall
+  std::vector<std::uint64_t> irqs;  // per-CPU interrupts during the rep
+  bool valid = false;
+};
+
+kernel_deltas kernel_delta(const kernel_counters& before,
+                           const kernel_counters& after) {
+  kernel_deltas d;
+  if (!before.valid || !after.valid) {
+    return d;
+  }
+  const double wall = std::chrono::duration<double>(after.at - before.at).count();
+#if defined(__linux__)
+  const long hz = ::sysconf(_SC_CLK_TCK);
+#else
+  const long hz = 0;
+#endif
+  if (wall <= 0.0 || hz <= 0) {
+    return d;
+  }
+  for (std::size_t i = 0; i < d.cores.size(); ++i) {
+    d.cores[i] = static_cast<double>(after.stat[i] - before.stat[i]) /
+                 static_cast<double>(hz) / wall;
+  }
+  const std::size_t n = std::min(before.irqs.size(), after.irqs.size());
+  d.irqs.resize(n);
+  for (std::size_t c = 0; c < n; ++c) {
+    d.irqs[c] = after.irqs[c] - before.irqs[c];
+  }
+  d.valid = true;
+  return d;
+}
+
 // The record kinds as Chrome trace JSON, one complete ("X") event per
 // phase per window on tid 1 and, with agent records, one "compress" event
 // per record on a tid per CPU (100 + cpu; 99 where the CPU is unknown),
@@ -228,9 +332,88 @@ double iowq_cpu_seconds(const std::map<std::string, std::uint64_t>& before,
 // microseconds as the format wants; epoch_ns at the top level is the
 // records' zero as absolute CLOCK_MONOTONIC nanoseconds, for joining with
 // timestamps other tools take on the same clock.
+// The pipeline with no device under it, and no bytes either.
+//
+// The file is VIRTUAL: it reports whatever size the run asks for, while
+// the driver owns only windows x window_bytes of buffer and every window
+// reuses its slot's slice. Reads complete with whatever is already there,
+// so what this measures is the engine, the fan-out and the fold, with
+// the device removed -- the ceiling a real one is measured against.
+//
+// That is deliberately NOT the same benchmark as hashing a real span:
+// the bytes here are a handful of resident windows, not a working set.
+// See bench/README.md.
+//
+// The completion half is memory_driver's, because a source with nothing
+// to read has exactly one job -- report from poll() and not before.
+class null_driver {
+ public:
+  // The pool is sized and faulted in at construction, before the caller
+  // starts its clock. Leaving it to reserve() would put a quarter of a
+  // gigabyte of first-touch page faults inside the measurement at 64 MiB
+  // windows, which is exactly the shape of a pipeline regression that is
+  // not one.
+  null_driver(const blake3pp::detail::io_driver_options&, unsigned,
+              std::uint64_t size, std::byte filler, std::size_t pool_bytes)
+      : size_(size), pool_(pool_bytes, filler) {}
+  null_driver(const null_driver&) = delete;
+  null_driver& operator=(const null_driver&) = delete;
+
+  class file {
+   public:
+    explicit file(null_driver& drv) noexcept : drv_(&drv) {}
+    [[nodiscard]] std::uint64_t size() const noexcept { return drv_->size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return "null"; }
+
+   private:
+    null_driver* drv_;
+  };
+
+  void reserve(unsigned windows, std::size_t window_bytes) {
+    const std::size_t want = window_bytes * windows;
+    if (pool_.size() < want) {
+      pool_.assign(want, filler_);
+    }
+    window_stride_ = window_bytes;
+  }
+
+  // Each slot owns one slice, which every window through that slot
+  // reuses: the source has no distinct bytes, and separate slots keep
+  // the reads from overlapping.
+  [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
+      file&, unsigned slot, std::uint64_t, std::size_t bytes) noexcept {
+    const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
+                                     bytes};
+    return {slice, std::span<const std::byte>(slice)};
+  }
+
+  void submit_read(file&, std::uint64_t, std::span<std::byte>,
+                   blake3pp::detail::io_read_op& op) noexcept {
+    reads_.push(op);
+  }
+  void flush() noexcept {}
+  std::size_t poll(bool block) { return reads_.poll(block); }
+  void wake() noexcept { reads_.wake(); }
+  void cancel(blake3pp::detail::io_read_op& op) noexcept { reads_.cancel(op); }
+  [[nodiscard]] std::size_t in_flight() const noexcept {
+    return reads_.in_flight();
+  }
+  void drain() noexcept { reads_.drain(); }
+
+ private:
+  std::uint64_t size_;
+  std::byte filler_{};
+  std::size_t window_stride_ = 0;
+  std::vector<std::byte> pool_;
+  blake3pp::detail::queued_reads reads_;
+};
+
+static_assert(blake3pp::detail::file_driver<null_driver>);
+
 bool write_chrome_trace(const std::string& path,
                         const blake3pp::trace_buffer& trace,
-                        std::string_view process_name) {
+                        std::string_view process_name,
+                        unsigned pool_threads = 0) {
   std::ofstream out(path);
   if (!out.is_open()) {
     return false;
@@ -239,14 +422,42 @@ bool write_chrome_trace(const std::string& path,
     return static_cast<double>(ns) / 1000.0;
   };
   out << std::format("{{\"epoch_ns\":{},\"displayTimeUnit\":\"ns\","
-                     "\"traceEvents\":[\n",
-                     trace.epoch_ns());
+                     "\"pool_threads\":{},\"traceEvents\":[\n",
+                     trace.epoch_ns(), pool_threads);
   out << std::format("{{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,"
                      "\"args\":{{\"name\":\"{}\"}}}},\n",
                      process_name);
   out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
-         "\"args\":{\"name\":\"pipeline\"}}";
+         "\"args\":{\"name\":\"driver\"}}";
+  // The driver's own track: one event over the whole run, carrying what
+  // that thread spent its time on. Windows go on the track of the window
+  // object that carried them, so several in flight read as parallel
+  // lanes rather than as one track nesting into itself.
+  const auto& d = trace.driver();
+  const auto windows = trace.windows();
+  if (d.iterations > 0 && !windows.empty()) {
+    const std::int64_t begin = windows.front().t_wait_begin;
+    const std::int64_t end = windows.back().t_released;
+    out << std::format(
+        ",\n{{\"name\":\"driver\",\"ph\":\"X\",\"pid\":1,\"tid\":1,"
+        "\"ts\":{:.3f},\"dur\":{:.3f},\"args\":{{\"busy_ns\":{},"
+        "\"parked_ns\":{},\"iterations\":{},\"polls\":{},"
+        "\"blocking_polls\":{},\"wakes\":{},\"queue_runs\":{},"
+        "\"admission_stalls\":{},\"max_pending\":{}}}}}",
+        us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
+        d.polls, d.blocking_polls, d.wakes, d.queue_runs, d.admission_stalls,
+        d.max_pending);
+  }
+  std::map<std::uint32_t, bool> slots_named;
   for (const auto& w : trace.windows()) {
+    const std::uint32_t tid = 10 + w.slot;
+    if (!slots_named[tid]) {
+      slots_named[tid] = true;
+      out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
+                         "\"pid\":1,\"tid\":{},\"args\":{{\"name\":"
+                         "\"window object {}\"}}}}",
+                         tid, w.slot);
+    }
     const std::pair<const char*, std::pair<std::int64_t, std::int64_t>>
         phases[] = {{"wait", {w.t_wait_begin, w.t_ready}},
                     {"hash", {w.t_ready, w.t_joined}},
@@ -254,10 +465,18 @@ bool write_chrome_trace(const std::string& path,
                     {"release", {w.t_absorbed, w.t_released}}};
     for (const auto& [name, span] : phases) {
       out << std::format(",\n{{\"name\":\"{}\",\"ph\":\"X\",\"pid\":1,"
-                         "\"tid\":1,\"ts\":{:.3f},\"dur\":{:.3f},"
-                         "\"args\":{{\"window\":{}}}}}",
-                         name, us(span.first), us(span.second - span.first),
-                         w.index);
+                         "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
+                         "\"args\":{{\"window\":{},\"slot\":{},"
+                         "\"bytes\":{},\"last\":{},\"parallel\":{}}}}}",
+                         name, tid, us(span.first),
+                         us(span.second - span.first), w.index, w.slot,
+                         w.bytes,
+                         (w.flags & blake3pp::window_record::flag_last) != 0
+                             ? 1
+                             : 0,
+                         (w.flags & blake3pp::window_record::flag_parallel) != 0
+                             ? 1
+                             : 0);
     }
   }
   std::map<std::uint32_t, bool> cpus_named;
@@ -286,7 +505,9 @@ bool write_chrome_trace(const std::string& path,
 // The per-row summary of one traced rep: where the wall time went, how
 // busy the pool was, and with agent records what each CPU delivered.
 void print_trace_summary(const blake3pp::trace_buffer& trace,
-                         unsigned threads, double iowq_cpu_s) {
+                         unsigned threads, double iowq_cpu_s,
+                         double achieved_gib_s = 0.0,
+                         const kernel_deltas* kernel = nullptr) {
   const auto windows = trace.windows();
   if (windows.empty()) {
     println(stdout, "  trace: no window records");
@@ -317,9 +538,53 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
           "  trace (last rep): {} windows ({} fanned out, {} dropped), wall "
           "{:.3f} s",
           windows.size(), fanned, trace.dropped_windows(), wall_ns / 1e9);
+  // With several windows in flight these no longer sum to the wall
+  // clock: they are per-window shares of a pipeline, not a timeline.
   println(stdout,
-          "    wait {:5.1f}%  hash {:5.1f}%  absorb {:5.1f}%  release {:5.1f}%",
+          "    per window: wait {:5.1f}%  hash {:5.1f}%  absorb {:5.1f}%  "
+          "release {:5.1f}%",
           pct(wait), pct(hash), pct(absorb), pct(release));
+
+  // What the driver thread itself did, which is the number the compress
+  // stage is judged against: a driver parked most of the time has room
+  // for more work, one that is busy is the ceiling.
+  const auto& d = trace.driver();
+  if (d.iterations > 0) {
+    const double driver_ns = static_cast<double>(d.busy_ns + d.parked_ns);
+    println(stdout,
+            "    driver busy {:5.1f}% of its own {:.3f} s, {} iterations, {} "
+            "polls ({} blocking, {} woken), {} completions, {} admission "
+            "stalls, reducer held at most {}, at most {} reads and {} "
+            "windows in flight",
+            100.0 * static_cast<double>(d.busy_ns) / driver_ns,
+            driver_ns / 1e9, d.iterations, d.polls, d.blocking_polls,
+            d.wakes, d.queue_runs, d.admission_stalls, d.max_pending,
+            d.max_reads_in_flight, d.max_windows_in_flight);
+  }
+
+  // Per-window latencies, as medians: with windows overlapping, an
+  // average over stages says less than where the middle window sat.
+  {
+    std::vector<std::int64_t> to_read;
+    std::vector<std::int64_t> to_cv;
+    std::vector<std::int64_t> to_reduced;
+    to_read.reserve(windows.size());
+    to_cv.reserve(windows.size());
+    to_reduced.reserve(windows.size());
+    for (const auto& w : windows) {
+      to_read.push_back(w.t_ready - w.t_wait_begin);
+      to_cv.push_back(w.t_joined - w.t_ready);
+      to_reduced.push_back(w.t_absorbed - w.t_joined);
+    }
+    const auto median = [](std::vector<std::int64_t>& v) {
+      std::ranges::nth_element(v, v.begin() + v.size() / 2);
+      return static_cast<double>(v[v.size() / 2]) / 1000.0;
+    };
+    println(stdout,
+            "    median per window: submit->read {:8.1f} us  read->cv {:8.1f} "
+            "us  cv->reduced {:8.1f} us",
+            median(to_read), median(to_cv), median(to_reduced));
+  }
   if (fanned > 0) {
     println(stdout,
             "    pool busy {:5.1f}% of {} threads, {:.1f} agents active per "
@@ -327,8 +592,17 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
             100.0 * busy / (static_cast<double>(threads) * wall_ns), threads,
             active / static_cast<double>(fanned));
   }
-  println(stdout, "    io-wq cpu = {:.2f} cores (worker threads' cpu / wall)",
-          iowq_cpu_s / (wall_ns / 1e9));
+  std::string machine;
+  if (kernel != nullptr && kernel->valid) {
+    machine = "; machine (/proc/stat):";
+    for (std::size_t i = 0; i < kernel->cores.size(); ++i) {
+      machine += std::format(" {} {:.2f}", kernel_counters::names[i],
+                             kernel->cores[i]);
+    }
+    machine += " cores";
+  }
+  println(stdout, "    io-wq cpu = {:.2f} cores (worker threads' cpu / wall){}",
+          iowq_cpu_s / (wall_ns / 1e9), machine);
 
   const auto agents = trace.agents();
   if (agents.empty() && trace.dropped_agents() == 0) {
@@ -359,15 +633,22 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
   std::vector<double> rates;
   println(stdout, "    {} agent records ({} dropped) on {} cpus:",
           agents.size(), trace.dropped_agents(), per_cpu.size());
-  println(stdout, "      {:>5} {:>8} {:>8} {:>10} {:>14}", "cpu", "records",
-          "parts", "busy ms", "effective");
+  const bool irqs = kernel != nullptr && kernel->valid && !kernel->irqs.empty();
+  println(stdout, "      {:>5} {:>8} {:>8} {:>10} {:>14}{}", "cpu", "records",
+          "parts", "busy ms", "effective", irqs ? "      irqs" : "");
   for (const auto& [cpu, c] : per_cpu) {
     const double secs = static_cast<double>(c.busy_ns) / 1e9;
     rates.push_back(b3tool::gib_per_s(c.bytes, secs));
-    println(stdout, "      {:>5} {:>8} {:>8} {:>10.1f} {}",
+    std::string irq_col;
+    if (irqs) {
+      irq_col = cpu < kernel->irqs.size()
+                    ? std::format("  {:>8}", kernel->irqs[cpu])
+                    : std::string{"         -"};
+    }
+    println(stdout, "      {:>5} {:>8} {:>8} {:>10.1f} {}{}",
             cpu == ~std::uint32_t{0} ? std::string{"?"} : std::to_string(cpu),
             c.records, c.parts, static_cast<double>(c.busy_ns) / 1e6,
-            b3tool::rate(c.bytes, secs));
+            b3tool::rate(c.bytes, secs), irq_col);
   }
   if (!rates.empty()) {
     std::ranges::sort(rates);
@@ -376,6 +657,17 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
             "worst max/min part on one agent: {:.1f}x",
             rates.front(), rates[rates.size() / 2], rates.back(),
             worst_spread);
+    // What the cpus managed while compressing, added up, against what
+    // the run actually delivered: the gap is everything that is not
+    // compression -- reading, waiting, and the parts of the file no cpu
+    // was working on at that moment.
+    const double sum = std::accumulate(rates.begin(), rates.end(), 0.0);
+    if (achieved_gib_s > 0.0 && sum > 0.0) {
+      println(stdout,
+              "      sum of per-cpu rates {:.2f} GiB/s; the run delivered "
+              "{:.2f} GiB/s, {:.1f}% of it",
+              sum, achieved_gib_s, 100.0 * achieved_gib_s / sum);
+    }
   }
 }
 
@@ -591,8 +883,7 @@ int main(int argc, char** argv) {
   opts.direct_io = !no_direct;
   opts.offload_submit = !inline_submit;
   if (null_gib > 0) {
-    namespace io_impl = blake3pp::detail::io_impl;
-    const auto total =
+        const auto total =
         static_cast<std::uint64_t>(null_gib * 1024.0 * 1024.0 * 1024.0);
     const std::size_t win =
         blake3pp::detail::rounded_window_bytes(opts.window_bytes);
@@ -632,24 +923,30 @@ int main(int argc, char** argv) {
     b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
     double best = 1e30;
     blake3pp::digest got{};
+    kernel_deltas kernel;
     for (int r = 0; r < reps; ++r) {
       cooldown();
       if (trace) {
         trace->clear();
       }
-      io_impl::polled_reader_engine<io_impl::null_context> reader(
-          total, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-                  opts.offload_submit});
-      const auto pool = reader.pool();
-      for (std::size_t off = 0; off < pool.size(); off += win) {
-        std::memcpy(pool.data() + off, pattern.data(),
-                    std::min(win, pool.size() - off));
-      }
+      const kernel_counters kernel_before = read_kernel_counters();
+      const blake3pp::detail::pipeline_plan plan =
+          blake3pp::detail::plan_pipeline(0, opts.window_bytes,
+                                          opts.queue_depth, false, total);
+      null_driver drv({/*async=*/true, opts.offload_submit},
+                      plan.reads_in_flight, total, null_filler,
+                      plan.window_bytes * plan.windows);
+      null_driver::file nf(drv);
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
-      blake3pp::detail::update_from_reader(h, reader, sched, io_opts);
+      blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+          h, drv, nf, sched,
+          {.window_bytes = opts.window_bytes,
+           .queue_depth = opts.queue_depth,
+           .trace = io_opts.trace});
       got = h.finalize();
       const auto t1 = std::chrono::steady_clock::now();
+      kernel = kernel_delta(kernel_before, read_kernel_counters());
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
     println(stdout, "{:<10} {}   ({}...)  [{}]", "null",
@@ -658,9 +955,13 @@ int main(int argc, char** argv) {
             got == want ? "digest matches the in-memory hash"
                         : "DIGEST MISMATCH");
     if (trace) {
-      print_trace_summary(*trace, threads, 0.0);
+      print_trace_summary(*trace, threads, 0.0,
+                          b3tool::gib_per_s(static_cast<std::size_t>(total),
+                                            best),
+                          &kernel);
       const std::string file = trace_file_name(trace_path, "null", false);
-      if (write_chrome_trace(file, *trace, "blake3pp_bench_file null")) {
+      if (write_chrome_trace(file, *trace, "blake3pp_bench_file null",
+                             threads)) {
         println(stdout, "    trace written to {}", file);
       }
     }
@@ -757,27 +1058,34 @@ int main(int argc, char** argv) {
     blake3pp::digest d{};
     std::map<std::string, std::uint64_t> iowq_before;
     double iowq_cpu_s = 0.0;
+    kernel_counters kernel_before;
+    kernel_deltas kernel;
     const double best = best_cold_seconds(
         reps, cold, [&] { d = fn(); },
         [&] {
           if (trace) {
             trace->clear();
             iowq_before = iowq_cpu_ticks();
+            kernel_before = read_kernel_counters();
           }
         },
         [&] {
           if (trace) {
             iowq_cpu_s = iowq_cpu_seconds(iowq_before, iowq_cpu_ticks());
+            kernel = kernel_delta(kernel_before, read_kernel_counters());
           }
         });
     println(stdout, "{:<10} {}   ({}...)  [{:3.0f}% of raw]", label,
             b3tool::rate(static_cast<std::size_t>(bytes), best),
             d.to_hex().substr(0, 16), 100.0 * raw_s / best);
     if (trace) {
-      print_trace_summary(*trace, threads_for_trace, iowq_cpu_s);
+      print_trace_summary(
+          *trace, threads_for_trace, iowq_cpu_s,
+          b3tool::gib_per_s(static_cast<std::size_t>(bytes), best), &kernel);
       const std::string file = trace_file_name(trace_path, label, !seq_only);
       if (write_chrome_trace(file, *trace,
-                             std::format("blake3pp_bench_file {}", label))) {
+                             std::format("blake3pp_bench_file {}", label),
+                             threads_for_trace)) {
         println(stdout, "    trace written to {}", file);
       } else {
         println(stderr, "    could not write {}", file);

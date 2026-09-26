@@ -27,6 +27,7 @@
 #include <utility>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
@@ -35,58 +36,28 @@
 namespace blake3pp {
 
 namespace detail {
-
-// The window loop, over anything shaped like file_reader: next() hands
-// windows out in file order, release() recycles them, and that is the
-// whole vocabulary it needs. update_file() drives it with a real
-// file_reader; the bench drives it with a source that performs no I/O,
-// which is how the pipeline's hash-bound ceiling is measured with no
-// device in the way. The tracing lives here, so both see the same
-// records.
-template <stack_budget Budget = default_stack_budget, class Reader,
-          class Scheduler>
-void update_from_reader(hasher& h, Reader& reader, Scheduler&& sched,
-                        const file_io_options& opts) {
-  const kern::kernel_ops* const ops = detail::resolve(h.selected_arch());
-  const std::uint64_t base = h.count();
-  const bool on_chunk_boundary = base % chunk_size == 0;
-  trace_buffer* const trace = opts.trace;
-  std::uint64_t index = 0;
-  for (;;) {
-    // The wait is timed before the record is claimed: the last next()
-    // returns nothing, and that iteration gets no record.
-    const std::int64_t t_wait_begin = trace ? trace->now() : 0;
-    auto w = reader.next();
-    if (!w) {
-      break;
-    }
-    window_record* const rec = trace ? trace->claim_window() : nullptr;
-    if (rec) {
-      rec->index = index;
-      rec->bytes = w->bytes;
-      rec->flags = w->last ? window_record::flag_last : 0;
-      rec->t_wait_begin = t_wait_begin;
-      rec->t_ready = trace->now();
-    }
-    const std::uint64_t chunks = w->bytes / chunk_size;
-    const std::uint64_t counter = base / chunk_size + w->offset / chunk_size;
-    if (!w->last && on_chunk_boundary && counter % chunks == 0) {
-      detail::hash_window_parallel<Budget>(ops, sched, h, w->data, chunks,
-                                           counter, trace, rec);
-    } else {
-      h.update(std::span<const std::byte>{w->data, w->bytes});
-      if (rec) {
-        rec->t_joined = rec->t_absorbed = trace->now();
-      }
-    }
-    reader.release(*w);
-    if (rec) {
-      rec->t_released = trace->now();
-    }
-    ++index;
-  }
+#if defined(BLAKE3PP_TEST_PIPELINE_STOP)
+// The stop the blocking entry points hand the pipeline.
+//
+// Phase 7 gives callers a stop of their own; until then the stop path
+// has no way in from the public API, so the test executable compiles
+// this header with a seam that lets one be installed. The shipped
+// library has neither the pointer nor the branch: the other definition
+// returns a token with no state, which the scope tests once per run.
+inline ex::inplace_stop_source*& installed_stop_source() noexcept {
+  static ex::inplace_stop_source* src = nullptr;
+  return src;
 }
 
+[[nodiscard]] inline ex::inplace_stop_token blocking_stop_token() noexcept {
+  ex::inplace_stop_source* const src = installed_stop_source();
+  return src != nullptr ? src->get_token() : ex::inplace_stop_token{};
+}
+#else
+[[nodiscard]] inline ex::inplace_stop_token blocking_stop_token() noexcept {
+  return {};
+}
+#endif
 }  // namespace detail
 
 /// Streams a file into a hasher with every complete window fanned out
@@ -107,16 +78,39 @@ void update_from_reader(hasher& h, Reader& reader, Scheduler&& sched,
 /// @param sched  Where the subtree reductions run.
 /// @param opts   The pipeline knobs.
 /// @throws std::system_error on I/O failure, and whatever the execution
-///         provider raises.
+///         provider raises. A run that was stopped throws
+///         std::errc::operation_canceled; h is then left wherever the
+///         stop found it, as it is after a failed read, and is still
+///         usable for further input.
 template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const std::filesystem::path& path,
                  Scheduler&& sched, const file_io_options& opts = {}) {
-  detail::file_reader reader(
-      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-             opts.offload_submit});
-  detail::update_from_reader<Budget>(h, reader, std::forward<Scheduler>(sched),
-                                     opts);
+  // Every file goes through the pipeline. A hasher already part-way
+  // through a message is brought back onto a window boundary by one
+  // short first window rather than by hashing the whole file
+  // sequentially, so there is no second path left to choose. The plan
+  // is made once here and is the only geometry the driver, the file and
+  // the scope see; its direct_io is the caller's wish only where the
+  // grid is aligned, since an unaligned head misaligns every window
+  // after it and would degrade each read to the synchronous path.
+  // The size is read before the open because the plan decides the open
+  // mode and sizes the window objects to the file; a size the filesystem
+  // cannot give leaves the count to the budget, and the open reports why.
+  std::error_code size_ec;
+  const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
+  const detail::pipeline_plan plan = detail::plan_pipeline(
+      h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io,
+      size_ec ? 0 : static_cast<std::uint64_t>(size));
+  detail::io_driver drv({/*async=*/true, opts.offload_submit},
+                        plan.reads_in_flight);
+  detail::io_driver::file file(drv, path, plan.direct_io);
+  detail::run_window_pipeline<Budget>(
+      h, drv, file, std::forward<Scheduler>(sched), plan,
+      {.window_bytes = opts.window_bytes,
+       .queue_depth = opts.queue_depth,
+       .trace = opts.trace,
+       .stop_token = detail::blocking_stop_token()});
 }
 
 /// Streams a file into a hasher over a scheduler, reporting failure

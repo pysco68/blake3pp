@@ -239,6 +239,26 @@ concept reader_context = requires(C c, const C cc, typename C::file& f,
   // return. Idempotent; a wake with no blocked poll is remembered.
   { c.wake() } noexcept;
   { cc.in_flight() } noexcept -> std::same_as<std::size_t>;
+  // Waits out every read still owed, running no callback, and forgets
+  // the rest: afterwards in_flight() is zero and the context references
+  // no read_op, so the caller may destroy them. The context stays
+  // usable. The destructor drains too, a no-op after this. Never
+  // throws: nothing it could report would change what the caller has
+  // to do next.
+  { c.drain() } noexcept;
+  // Asks the OS to abandon one read. Advisory, and never a completion in
+  // itself: the op is still owed its callback and still counted by
+  // in_flight(), and the only way it can arrive is a later poll(). What
+  // the callback then reports is whichever happened first --
+  // operation_canceled if the cancel won, the data if the read did, some
+  // other error if the read failed on its own -- so a caller that has to
+  // know cannot infer it from having asked.
+  //
+  // Legal only from the thread that calls poll(), and only for an op
+  // that was submitted and whose callback has not run. A backend with no
+  // cancel mechanism does nothing, which is a conforming implementation:
+  // the read runs to completion and reports normally.
+  { c.cancel(op) } noexcept;
 };
 
 // The queue of reads a context could not hand to its async engine --
@@ -276,6 +296,10 @@ class deferred_ops {
 
   [[nodiscard]] bool empty() const noexcept { return head_ == nullptr; }
 
+  // Forgets every queued op: none was ever issued, so there is nothing
+  // to wait for, and none gets its callback.
+  void clear() noexcept { head_ = tail_ = nullptr; }
+
  private:
   Op* head_ = nullptr;
   Op* tail_ = nullptr;
@@ -296,6 +320,7 @@ class sync_context {
     std::uint64_t off = 0;
     Source* src = nullptr;
     read_op* next_deferred = nullptr;
+    bool cancelled = false;
   };
 
   class file {
@@ -324,6 +349,7 @@ class sync_context {
     op.buf = buf;
     op.off = off;
     op.src = &f.src_;
+    op.cancelled = false;
     queue_.push(op);
     queued_++;
   }
@@ -345,10 +371,15 @@ class sync_context {
     read_op& op = *next;
     queued_--;
     std::error_code ec;
-    try {
-      op.src->read_at(op.off, op.buf);
-    } catch (const std::system_error& e) {
-      ec = e.code();
+    if (op.cancelled) {
+      // Nothing was read, so there is no data to prefer over the cancel.
+      ec = std::make_error_code(std::errc::operation_canceled);
+    } else {
+      try {
+        op.src->read_at(op.off, op.buf);
+      } catch (const std::system_error& e) {
+        ec = e.code();
+      }
     }
     op.done(&op, ec);
     return 1;
@@ -356,7 +387,18 @@ class sync_context {
 
   void wake() noexcept { waiter_.wake(); }
 
+  // A queued read is dropped by flagging it: the queue is singly linked
+  // and poll() reaches every entry anyway, so the flag costs nothing and
+  // an unlink would cost a walk.
+  void cancel(read_op& op) noexcept { op.cancelled = true; }
+
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
+
+  // Nothing was ever issued: the queued reads are simply forgotten.
+  void drain() noexcept {
+    queue_.clear();
+    queued_ = 0;
+  }
 
  private:
   deferred_ops<read_op> queue_;

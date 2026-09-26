@@ -713,6 +713,33 @@ int main(int argc, char** argv) {
         [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); });
   }
 
+  // The streaming shape: a caller that does not have the message in one
+  // span feeds it in read-sized pieces. parallel_hasher hashes whole
+  // windows of the caller's own bytes where they lie and copies only
+  // what it takes to finish a window a previous call left part-built, so
+  // the feed size is what decides how much copying there is -- a feed of
+  // one window copies all of it, a feed of eight copies an eighth.
+  //
+  // It is below the one-shot rows for a structural reason worth seeing:
+  // each window flush is its own pipeline scope, so consecutive windows
+  // do not overlap, where the one-shot amortises one scope over the
+  // whole span.
+  for (const std::size_t feed :
+       {std::size_t{256} << 10, std::size_t{1} << 20, std::size_t{8} << 20}) {
+    auto sched = engine_sched;
+    row(std::format("blake3pp/stream {}K", feed >> 10),
+        std::format("parallel_hasher, {} KiB feed", feed >> 10),
+        [&] {
+          blake3pp::parallel_hasher ph{sched};
+          const std::span<const std::byte> all{input};
+          for (std::size_t at = 0; at < all.size(); at += feed) {
+            ph.update(all.subspan(at, std::min(feed, all.size() - at)));
+          }
+          return ph.finalize();
+        },
+        20);
+  }
+
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
   // The identical sender pipeline on Apple's platform runtime: stdexec's
   // libdispatch scheduler submits the bulk work to GCD's global pool

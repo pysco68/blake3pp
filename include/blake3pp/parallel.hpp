@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -38,38 +39,25 @@
 #include <vector>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/compress.hpp>
+#include <blake3pp/detail/ex.hpp>
+#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/memory_driver.hpp>
+#include <blake3pp/detail/tree_reducer.hpp>
 #include <blake3pp/trace.hpp>
 
 #if defined(__linux__)
 #include <sched.h>  // sched_getcpu() for agent_record::cpu
 #endif
 
-#if defined(BLAKE3PP_EXECUTION_STD)
-#include <execution>
-#elif defined(BLAKE3PP_EXECUTION_BEMAN)
-#include <beman/execution/execution.hpp>
-#else  // BLAKE3PP_EXECUTION_STDEXEC
-#include <stdexec/execution.hpp>
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) || \
+    (!defined(BLAKE3PP_EXECUTION_STD) && !defined(BLAKE3PP_EXECUTION_BEMAN))
 #if BLAKE3PP_HAS_STD_THREAD
 #include <exec/static_thread_pool.hpp>
 #endif
 #endif
 
 namespace blake3pp {
-
-/// The sender/receiver vocabulary this build uses (std::execution,
-/// beman::execution or stdexec), so the library and its callers spell
-/// schedule, bulk and sync_wait the same way whichever provider is built.
-namespace ex {
-#if defined(BLAKE3PP_EXECUTION_STD)
-using namespace std::execution;
-using std::this_thread::sync_wait;
-#elif defined(BLAKE3PP_EXECUTION_BEMAN)
-using namespace beman::execution;
-#else
-using namespace stdexec;
-#endif
-}  // namespace ex
 
 // The process-wide parallel scheduler, in P2079's shape: the same call
 // C++26 application code makes. Calling it is the explicit opt-in that may
@@ -158,243 +146,81 @@ using parallel_scheduler_t =
         // own scheduler because only it knows what its agents should be.
 
 namespace detail {
-// Deliberately not constexpr and never defined: a stack_budget constructor
-// that reaches one fails its constant evaluation, and the diagnostic names
-// the violated rule.
-void stack_budget_not_a_multiple_of_32_bytes();
-void stack_budget_below_two_parts();
-}  // namespace detail
 
-/// The stack the multi-core functions may spend on their table of part
-/// chaining values, passed as their first template argument:
-///
-/// @code
-/// blake3pp::hash<blake3pp::stack_budget{1024}>(input, sched);   // 32 parts
-/// @endcode
-///
-/// The input is split into at most parts() parts whatever its size, and
-/// each part's 32-byte chaining value sits in that table. The default is
-/// 32 KiB, which is 1024 parts. A budget that is not a multiple of 32
-/// bytes, or that holds fewer than two parts, does not compile.
-///
-/// There is no upper limit, because the stack a calling thread has is not
-/// known where this header is compiled. Code that knows its own thread
-/// checks the budget against it:
-///
-/// @code
-/// constexpr blake3pp::stack_budget budget{1024};
-/// static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
-/// @endcode
-///
-/// @warning The budget covers this table alone. Lowering it makes each part
-/// larger, which makes the per-agent reduction deeper, so it moves stack
-/// from the caller to the agents rather than saving any. Nothing checks an
-/// agent thread's stack at run time.
-///
-/// @see docs/api.md for what the knob trades away, and
-/// docs/freestanding.md for the measured frames and a worked case.
-struct stack_budget {
-  /// The stack one part's chaining value takes.
-  static constexpr std::size_t bytes_per_part = 32;
-
-  /// The budget in bytes.
-  std::size_t bytes;
-
-  /// @param n  A multiple of bytes_per_part, at least two parts' worth.
-  consteval explicit stack_budget(std::size_t n) : bytes{n} {
-    if (n % bytes_per_part != 0) {
-      detail::stack_budget_not_a_multiple_of_32_bytes();
-    }
-    if (n / bytes_per_part < 2) {
-      detail::stack_budget_below_two_parts();
-    }
-  }
-
-  /// The most parts the input is split into.
-  [[nodiscard]] constexpr std::size_t parts() const noexcept {
-    return bytes / bytes_per_part;
-  }
-};
-
-/// The default budget: 32 KiB of stack, 1024 parts.
-inline constexpr stack_budget default_stack_budget{32 * 1024};
-
-namespace detail {
-
-// A part is at least 16 chunks (16 KiB), which keeps small inputs in few
-// tasks.
-inline constexpr std::size_t min_part_chunks = 16;
-
-// The part size in chunks for num_chunks: a power of two, so every part
-// starting at a multiple of it is subtree-aligned, and large enough that
-// num_chunks / part <= Budget.parts().
-template <stack_budget Budget>
-[[nodiscard]] constexpr std::size_t part_chunks(std::size_t num_chunks) noexcept {
-  return std::bit_ceil(std::max(
-      (num_chunks + Budget.parts() - 1) / Budget.parts(), min_part_chunks));
-}
-
-// One CV slot per part, on the caller's stack. The slots are unpadded:
-// each is written once per part-sized task, so neighbours sharing a cache
-// line cost nothing measurable.
-template <stack_budget Budget>
-using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
-static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
-
-// What one for_each_part() call records when tracing: the agents' summed
-// compress time and their count, each one atomic add per bulk invocation,
-// and through buf one agent_record per invocation when the buffer wants
-// them. window is the id the caller gives the records; for_each_part()
-// does not know what it is running over.
-struct part_trace {
-  trace_buffer* buf;
-  std::uint64_t window;
-  std::uint32_t part_chunks;
-  std::atomic<std::uint64_t> busy_ns{0};
-  std::atomic<std::uint32_t> active{0};
-};
-
-// A scheduler may complete the work stopped instead of running it, on a
-// stop request or with a pool already shutting down. sync_wait then
-// returns an empty optional and nothing was computed, so the caller must
-// not read its results. That is reported as operation_canceled rather
-// than finished sequentially, because the caller asked for the work to
-// stop.
-template <class Work>
-void wait_for_parts(Work&& work) {
-  if (!ex::sync_wait(std::forward<Work>(work))) {
-    throw std::system_error(std::make_error_code(std::errc::operation_canceled),
-                            "the scheduler stopped the parallel hash");
-  }
-}
-
-// The traced form of for_each_part()'s bulk body: the same pull loop with
-// the clock read once before the first part and, when agent records are
-// wanted, once after every part (the end of one is the start of the
-// next). Per bulk invocation, not per part: two atomic adds on pt and at
-// most one record claim. An invocation that finds the counter exhausted
-// records nothing and is not an active agent.
-template <class Scheduler, class Body>
-void for_each_part_traced(Scheduler& sched, std::size_t n, Body& body,
-                          std::atomic<std::size_t>& next, part_trace& pt) {
-  auto work =
-      ex::schedule(sched) |
-      ex::bulk(ex::par, n, [&](std::size_t) noexcept {
-        std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-        if (i >= n) {
-          return;
-        }
-        trace_buffer& buf = *pt.buf;
-        const bool per_agent = buf.wants_agents();
-        const std::int64_t t_begin = buf.now();
-        std::int64_t t = t_begin;
-        std::uint32_t parts = 0;
-        std::uint64_t min_ns = ~std::uint64_t{0};
-        std::uint64_t max_ns = 0;
-        std::uint32_t cpu = ~std::uint32_t{0};
-        if (per_agent) {
-#if defined(__linux__)
-          const int c = ::sched_getcpu();
-          cpu = c < 0 ? ~std::uint32_t{0} : static_cast<std::uint32_t>(c);
-#endif
-          do {
-            body(i);
-            const std::int64_t t_end = buf.now();
-            const auto d = static_cast<std::uint64_t>(t_end - t);
-            min_ns = std::min(min_ns, d);
-            max_ns = std::max(max_ns, d);
-            t = t_end;
-            ++parts;
-            i = next.fetch_add(1, std::memory_order_relaxed);
-          } while (i < n);
-        } else {
-          do {
-            body(i);
-            ++parts;
-            i = next.fetch_add(1, std::memory_order_relaxed);
-          } while (i < n);
-          t = buf.now();
-        }
-        const auto busy = static_cast<std::uint64_t>(t - t_begin);
-        pt.busy_ns.fetch_add(busy, std::memory_order_relaxed);
-        pt.active.fetch_add(1, std::memory_order_relaxed);
-        if (per_agent) {
-          if (agent_record* const r = buf.claim_agent()) {
-            r->window = pt.window;
-            r->t_begin = t_begin;
-            r->busy_ns = busy;
-            r->min_part_ns = min_ns;
-            r->max_part_ns = max_ns;
-            r->parts = parts;
-            r->part_chunks = pt.part_chunks;
-            r->cpu = cpu;
-          }
-        }
-      });
-  wait_for_parts(std::move(work));
-}
-
-// Runs body(i) for every i in [0, n) on sched. The bulk shape only
-// provides the agents: each call pulls indices from a shared counter until
-// none are left, so the split follows each agent's actual speed rather
-// than the fixed shares the provider's bulk may hand out. Every index runs
-// exactly once however the implementation distributes the calls.
+// Below this, the pipeline is not worth starting: a scope builds its
+// window objects and its reducer before the first byte is compressed,
+// and the sequential hasher beats all of it.
 //
-// With pt set the traced body runs instead (see for_each_part_traced);
-// the choice is made once here, so the untraced bulk body is untouched.
-template <class Scheduler, class Body>
-void for_each_part(Scheduler& sched, std::size_t n, Body body,
-                   part_trace* pt = nullptr) {
-  std::atomic<std::size_t> next{0};
-  if (pt != nullptr) {
-    for_each_part_traced(sched, n, body, next, *pt);
-    return;
-  }
-  auto work = ex::schedule(sched) |
-              ex::bulk(ex::par, n, [&](std::size_t) noexcept {
-                for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                     i < n; i = next.fetch_add(1, std::memory_order_relaxed)) {
-                  body(i);
-                }
-              });
-  wait_for_parts(std::move(work));
+// Measured on the Z13 (Ryzen 7 PRO 6860Z, 16 threads), best of 81, this
+// build's sequential path against the same build's pipeline forced on:
+//
+//     320 KiB   3.9-4.1  against  2.6-2.9 GiB/s
+//     384 KiB   3.5-4.0  against  2.6-3.3
+//     448 KiB   3.3-3.5  against  2.7-3.1
+//     512 KiB   3.4-3.5  against  3.3-3.4      <- even
+//     640 KiB   3.5-3.6  against  4.0-4.7
+//
+// So the crossover is 512 KiB, and from 640 KiB the pipeline is ahead by
+// a fifth and climbing. The figure is one machine's; it is a threshold
+// rather than a tuned constant because the shape either side of it is
+// flat enough that being wrong by a factor of two costs little.
+//
+// What sits below the crossover is the scope: window objects and a
+// reducer built per call. Once a context owns that storage across calls
+// the fixed cost mostly goes, and this number should come down with it.
+inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
+
+// The window a span already in memory is cut into.
+//
+// A window is what a file pipeline reads while it hashes the previous
+// one. A span has nothing to overlap: the bytes are all there already,
+// so a window buys no concurrency and costs a join, a reducer insert and
+// a part table. What it still does is bound the part table, which is why
+// there is a ceiling at all rather than one window per span always.
+//
+// So the answer is the FEWEST windows the budget allows, not a round of
+// them in flight. Measured on the Z13 against the engine this replaced
+// (16 threads, ABBA, eight samples a side, medians):
+//
+//                    8 MiB fixed   span/32, 8-64 MiB   one window
+//      8 MiB             +2.0 %          +7.5 %          +10.2 %
+//     64 MiB             -8.1 %          -9.6 %           +5.7 %
+//      1 GiB            -23.0 %         -10.9 %          +17.7 %
+//
+// The first column is 128 narrow fan-outs where the old engine did one
+// wide one; the last is one fan-out of the same width, through the
+// pipeline. Below max_window_bytes that is a single window.
+[[nodiscard]] constexpr std::size_t memory_window_bytes(
+    std::uint64_t span_bytes) noexcept {
+  constexpr std::size_t floor_bytes = 8 * 1024 * 1024;
+  return std::clamp(static_cast<std::size_t>(span_bytes), floor_bytes,
+                    max_window_bytes);
 }
 
-// The one-shot engine: partitions input into aligned subtrees, fans them
-// out over sched, and finishes inside h, whose key_words() and
-// mode_flags() drive the workers. Plain, keyed and derive_key hashers all
-// work.
+// The one-shot engine: the same pipeline update_file drives, over a
+// source whose windows are views of the caller's span.
+//
+// Every full window folds to one chaining value and the ends go through
+// the canonical decomposition, so the reducer takes them in any order
+// and the hasher sees them in message order. That is what lets the part
+// count stop being a power of two, which one bulk over the whole span
+// had to be. Plain, keyed and derive_key hashers all work.
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched,
                                const kern::kernel_ops* ops) {
-  // Only chunks with at least one byte after them may be offloaded: the
-  // message's final chunk must stay with the hasher for ROOT finalization.
-  const std::size_t safe_chunks =
-      input.size() > chunk_size ? (input.size() - 1) / chunk_size : 0;
-
-  if (safe_chunks >= 2 * min_part_chunks) {
-    const std::size_t part = part_chunks<Budget>(safe_chunks);
-    const std::size_t n_parts = safe_chunks / part;  // <= Budget.parts()
-    part_cvs<Budget> cvs;
-    const std::byte* const base = input.data();
-
-    // Starting from counter 0 in part-sized steps, every part is
-    // automatically subtree-aligned.
-    for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
-      detail::compress_subtree_cv(ops, base + i * part * chunk_size, part,
-                                  static_cast<std::uint64_t>(i) * part,
-                                  h.key_words(), h.mode_flags(), cvs[i]);
-    });
-
-    for (std::size_t i = 0; i < n_parts; ++i) {
-      h.push_subtree_cv(cvs[i], part);
-    }
-    h.update(input.subspan(n_parts * part * chunk_size));
+  if (input.size() < min_pipeline_bytes) {
+    h.update(input);
     return h.finalize();
   }
-
-  h.update(input);
+  const std::size_t window =
+      memory_window_bytes(static_cast<std::uint64_t>(input.size()));
+  memory_driver drv;
+  memory_driver::file f(drv, input);
+  const pipeline_plan plan = plan_memory_pipeline(
+      h.count(), window, static_cast<std::uint64_t>(input.size()));
+  run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
+                              {.window_bytes = window, .ops = ops});
   return h.finalize();
 }
 
@@ -540,59 +366,6 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
       std::forward<Scheduler>(sched), a);
 }
 
-namespace detail {
-
-// Fans one full window (num_chunks: power of two, counter-aligned) out
-// over the scheduler and absorbs the part CVs in order.
-//
-// With rec set (and buf with it), the window's compute is recorded: the
-// join and absorb times, the agents' summed busy time and count, and
-// flag_parallel when the window was fanned out. The inline fallback has
-// no absorb step, so its two stamps are one clock read.
-template <stack_budget Budget, class Scheduler>
-void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
-                          hasher& h, const std::byte* data,
-                          std::size_t num_chunks,
-                          std::uint64_t chunk_counter,
-                          trace_buffer* buf = nullptr,
-                          window_record* rec = nullptr) {
-  const std::size_t part = part_chunks<Budget>(num_chunks);
-  if (part >= num_chunks) {
-    // Window too small to fan out; hash it inline.
-    h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
-    if (rec) {
-      rec->t_joined = rec->t_absorbed = buf->now();
-    }
-    return;
-  }
-  const std::size_t n_parts = num_chunks / part;
-  part_cvs<Budget> cvs;
-
-  const auto body = [&](std::size_t i) noexcept {
-    compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                        chunk_counter + i * part, h.key_words(),
-                        h.mode_flags(), cvs[i]);
-  };
-  if (rec) {
-    part_trace pt{buf, rec->index, static_cast<std::uint32_t>(part)};
-    for_each_part(sched, n_parts, body, &pt);
-    rec->t_joined = buf->now();
-    rec->agent_busy_ns = pt.busy_ns.load(std::memory_order_relaxed);
-    rec->agents_active = pt.active.load(std::memory_order_relaxed);
-    rec->flags |= window_record::flag_parallel;
-  } else {
-    for_each_part(sched, n_parts, body);
-  }
-  for (std::size_t i = 0; i < n_parts; ++i) {
-    h.push_subtree_cv(cvs[i], part);
-  }
-  if (rec) {
-    rec->t_absorbed = buf->now();
-  }
-}
-
-}  // namespace detail
-
 /// parallel_hasher's knobs.
 struct parallel_hasher_options {
   /// The SIMD variant of the internal hasher.
@@ -644,7 +417,7 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(ops_),
-        window_(std::bit_floor(
+        remainder_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
   /// Keyed (MAC/PRF) mode.
@@ -656,7 +429,7 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::keyed(key, ops_)),
-        window_(std::bit_floor(
+        remainder_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
   /// Key-derivation mode: the input is the key material, domain-separated
@@ -669,27 +442,56 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::derive_key(context, ops_)),
-        window_(std::bit_floor(
+        remainder_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
   /// Absorbs the next bytes of the message; complete windows are fanned
   /// out over the scheduler from here.
+  ///
+  /// Whole windows of `input` are hashed where they lie, so the cost in
+  /// copying is bounded: at most ONE window is copied per call, and only
+  /// to finish a window a previous call left part-built. The buffer that
+  /// holds it is one window, never more.
   /// @param input  Any length, including zero.
   void update(std::span<const std::byte> input) {
-    const std::byte* p = input.data();
-    std::size_t len = input.size();
-    while (len > 0) {
-      if (filled_ == window_.size()) {
-        // More input exists, so the buffered window is provably not the
-        // message's end: safe to offload.
-        flush_window();
-      }
-      const std::size_t take = std::min(window_.size() - filled_, len);
-      std::copy_n(p, take, window_.data() + filled_);
-      filled_ += take;
-      p += take;
-      len -= take;
+    if (input.empty()) {
+      return;
     }
+    // Whole windows of the caller's own bytes are hashed where they lie.
+    // The only copying is what it takes to finish a window the last call
+    // left part-built, which is under one window and never more.
+    if (filled_ > 0) {
+      const std::size_t take =
+          std::min(remainder_.size() - filled_, input.size());
+      std::copy_n(input.data(), take, remainder_.data() + filled_);
+      filled_ += take;
+      input = input.subspan(take);
+      if (input.empty()) {
+        return;
+      }
+      // More input exists, so what is buffered is provably not the
+      // message's end: it may go to the pool as a subtree.
+      absorb(std::span<const std::byte>{remainder_});
+      filled_ = 0;
+    }
+
+    // What is left starts on a window boundary, because the hasher does:
+    // everything absorbed below is a whole number of windows.
+    //
+    // The final window is always held back, even when the input ends
+    // exactly on a boundary. A subtree pushed into the hasher must not
+    // contain the message's last chunk -- that chunk is finalized as the
+    // root -- and from here there is no way to know whether more is
+    // coming. So the remainder is never empty once anything has arrived,
+    // and finalize absorbs it through the hasher itself.
+    const std::size_t rest = input.size() % remainder_.size();
+    const std::size_t keep = rest == 0 ? remainder_.size() : rest;
+    if (const std::size_t whole = input.size() - keep; whole > 0) {
+      absorb(input.first(whole));
+      input = input.subspan(whole);
+    }
+    std::copy_n(input.data(), input.size(), remainder_.data());
+    filled_ = input.size();
   }
 
   /// Absorbs the next bytes of the message, given as text.
@@ -724,7 +526,6 @@ class parallel_hasher {
   void reset() noexcept {
     h_.reset();
     filled_ = 0;
-    chunk_counter_ = 0;
   }
 
   /// Total bytes absorbed since construction or reset.
@@ -736,26 +537,59 @@ class parallel_hasher {
   // The finalize seam: a copy of the flat internal hasher with the
   // buffered tail absorbed. Copying is what keeps every finalize form
   // const and non-destructive, exactly like hasher's.
+  //
+  // The tail is up to a whole window, so it is worth fanning out too.
+  // This is the one absorb that DOES end the message, which is what the
+  // pipeline's last-window chain is for: the parts before the final
+  // chunk go to the pool, and only the part carrying that chunk stays
+  // with the hasher.
   [[nodiscard]] hasher drained() const {
     hasher h = h_;
-    h.update(std::span<const std::byte>{window_.data(), filled_});
+    const std::span<const std::byte> tail{remainder_.data(), filled_};
+    if (filled_ < detail::min_pipeline_bytes) {
+      h.update(tail);
+      return h;
+    }
+    detail::memory_driver drv;
+    detail::memory_driver::file f(drv, tail);
+    const detail::pipeline_plan plan = detail::plan_memory_pipeline(
+        h.count(), remainder_.size(), static_cast<std::uint64_t>(filled_));
+    detail::run_window_pipeline<Budget>(
+        h, drv, f, sched_, plan,
+        {.window_bytes = remainder_.size(), .ops = ops_});
     return h;
   }
 
-  void flush_window() {
-    const std::size_t chunks = window_.size() / chunk_size;
-    detail::hash_window_parallel<Budget>(ops_, sched_, h_, window_.data(),
-                                         chunks, chunk_counter_);
-    chunk_counter_ += chunks;
-    filled_ = 0;
+  // A whole number of windows, straight into the hasher. The pipeline
+  // reduces them in any order and drains the reducer before it returns,
+  // which is what leaves the hasher on a window boundary for the next
+  // call. Below the threshold the scope costs more than it saves.
+  void absorb(std::span<const std::byte> bytes) {
+    if (bytes.size() < detail::min_pipeline_bytes) {
+      h_.update(bytes);
+      return;
+    }
+    detail::memory_driver drv;
+    detail::memory_driver::file f(drv, bytes);
+    detail::pipeline_plan plan = detail::plan_memory_pipeline(
+        h_.count(), remainder_.size(),
+        static_cast<std::uint64_t>(bytes.size()));
+    // Never: update() holds the final window back, so nothing absorbed
+    // here can contain the message's end.
+    plan.ends_message = false;
+    detail::run_window_pipeline<Budget>(
+        h_, drv, f, sched_, plan,
+        {.window_bytes = remainder_.size(), .ops = ops_});
   }
 
   Scheduler sched_;
   const kern::kernel_ops* ops_;
   hasher h_;
-  std::vector<std::byte> window_;
+  // One window's worth, holding whatever has not yet reached a window
+  // boundary. Never more: the rest of the message is hashed where the
+  // caller put it.
+  std::vector<std::byte> remainder_;
   std::size_t filled_ = 0;
-  std::uint64_t chunk_counter_ = 0;
 };
 
 /// Fills a buffer from an output reader on every core: the request is

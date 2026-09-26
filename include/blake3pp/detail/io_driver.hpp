@@ -15,7 +15,6 @@
 // included by <blake3pp/io.hpp>: it names no execution provider, and
 // nothing here should drag one in.
 
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +22,8 @@
 #include <span>
 #include <string_view>
 #include <system_error>
+
+#include <blake3pp/detail/driver.hpp>
 
 namespace blake3pp::detail {
 
@@ -33,38 +34,13 @@ struct io_driver_options {
   bool offload_submit = true;  // io_uring: issue on io-wq (IOSQE_ASYNC)
 };
 
-// A read in flight. Caller-owned and at a fixed address from submit_read
-// until its callback has run.
-//
-// The backend's own operation lives in `storage`: sized and aligned here
-// for the widest backend, checked against the real type by a
-// static_assert in io_driver.cpp, so a backend that outgrows it fails the
-// build rather than corrupting the neighbouring bytes. One io_read_op
-// serves read after read, each submit constructing a fresh backend op
-// over the last one's bytes, which is why that type has to be trivially
-// destructible -- also checked there.
-struct io_read_op {
-  void (*done)(io_read_op*, std::error_code) noexcept = nullptr;
-  void* owner = nullptr;
-
-  static constexpr std::size_t storage_size = 160;
-  static constexpr std::size_t storage_align = 16;
-  alignas(storage_align) std::byte storage[storage_size];
-};
-
-// Size and alignment of the platform backend's own read operation: what
-// io_read_op::storage has to hold. The static_assert in io_driver.cpp is
-// the one that sees the real type, so this reports the margin on
-// platforms whose backend nobody here can compile.
-struct io_read_op_layout {
-  std::size_t size;
-  std::size_t align;
-};
-
-[[nodiscard]] io_read_op_layout native_read_op_layout() noexcept;
 
 class io_driver {
  public:
+  // The granule this driver's direct-I/O path needs, which is the
+  // portable one; io_driver.cpp checks it against the backends' own.
+  static constexpr std::size_t direct_alignment = detail::direct_alignment;
+
   io_driver(const io_driver_options& opts, unsigned max_inflight);
   ~io_driver();
   io_driver(const io_driver&) = delete;
@@ -106,39 +82,45 @@ class io_driver {
   std::size_t poll(bool block);
   // The only member another thread may call.
   void wake() noexcept;
+  // Asks the OS to abandon one read. Advisory, and never a completion in
+  // itself: the op is still owed its callback and still counted by
+  // in_flight(), and the only way it can arrive is a later poll(). What
+  // the callback reports is whichever happened first --
+  // std::errc::operation_canceled if the cancel won, the data if the
+  // read did, some other error if the read failed on its own.
+  //
+  // Legal only from the thread that calls poll(), and only for an op
+  // that was submitted and whose callback has not run. A platform with
+  // no cancel mechanism does nothing and the read runs to completion.
+  void cancel(io_read_op& op) noexcept;
   [[nodiscard]] std::size_t in_flight() const noexcept;
+  // Waits out every read still owed, running no callback, and forgets
+  // the rest. The invariant it establishes: afterwards in_flight() is
+  // zero and the driver references no io_read_op, so the caller may
+  // destroy the ops it submitted. The driver stays usable. The
+  // destructor drains too, a no-op after this.
+  void drain() noexcept;
 
-  // Direct-I/O-aligned memory owned by the driver, valid until the
-  // driver is destroyed -- which drains first, so no read is ever in
-  // flight into freed memory. Exactly one call per driver, made by the
-  // pipeline scope at construction: the driver hosts one scope at a
-  // time today, and a second call is a contract violation that debug
-  // builds assert on rather than a reallocation. There is no free().
-  [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes);
+  // Takes the run's window memory: one direct-I/O-aligned arena of
+  // windows * window_bytes, valid until the driver is destroyed -- which
+  // drains first, so no read is ever in flight into freed memory.
+  // Exactly one call per driver, made by the pipeline scope at
+  // construction: the driver hosts one scope at a time today, and a
+  // second call is a contract violation that debug builds assert on
+  // rather than a reallocation. There is no free().
+  void reserve(unsigned windows, std::size_t window_bytes);
+
+  // The slice of that arena window `slot` reads into, and the same bytes
+  // as the view the pipeline reads back. The view names the arena from
+  // here, but what is IN it is the driver's until the read completes.
+  [[nodiscard]] window_storage window_storage_for(file& f, unsigned slot,
+                                                  std::uint64_t off,
+                                                  std::size_t bytes) noexcept;
 
  private:
   struct impl;
   std::unique_ptr<impl> impl_;
 };
-
-// What the pipeline needs of whatever is feeding it. io_driver models
-// it; so does the bench's driver over the null source, which is how the
-// pipeline gets measured with no device under it.
-template <class D>
-concept file_driver =
-    requires(D& d, const D& cd, typename D::file& f, io_read_op& op,
-             std::uint64_t off, std::span<std::byte> buf, bool block,
-             std::size_t bytes) {
-      typename D::file;
-      { f.size() } noexcept -> std::same_as<std::uint64_t>;
-      { f.name() } noexcept -> std::same_as<std::string_view>;
-      { d.submit_read(f, off, buf, op) };
-      { d.flush() } noexcept;
-      { d.poll(block) } -> std::same_as<std::size_t>;
-      { d.wake() } noexcept;
-      { cd.in_flight() } noexcept -> std::same_as<std::size_t>;
-      { d.allocate(bytes) } -> std::same_as<std::span<std::byte>>;
-    };
 
 static_assert(file_driver<io_driver>);
 
