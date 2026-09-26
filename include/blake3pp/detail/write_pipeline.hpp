@@ -301,6 +301,10 @@ class write_scope {
         [this, &w]() noexcept { landed(w); });
   }
 
+  // Marked noexcept, which is the caller's contract too: an exception
+  // escaping the generator terminates rather than unwinding through a
+  // stage whose window is already counted in flight. write_file's
+  // documentation says so.
   void fill_window(window& w) noexcept {
     fill_(w.buffer.first(w.bytes), w.offset);
   }

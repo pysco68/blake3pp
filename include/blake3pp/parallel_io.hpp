@@ -86,7 +86,10 @@ struct file_write_options {
 /// offset)` on the scheduler's agents, once per window, and must fill
 /// every byte of `out`; windows are filled and written concurrently, in
 /// no particular order, so a generator must depend on its offset and
-/// nothing else.
+/// nothing else. It must also not throw: the fill runs inside a noexcept
+/// stage, so an exception escaping it terminates. A generator that can
+/// fail should record the failure and fill the window, leaving the
+/// caller to check afterwards.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is

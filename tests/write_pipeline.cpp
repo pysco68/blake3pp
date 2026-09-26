@@ -6,6 +6,7 @@
 // the digest of a generator's output is computable without the pipeline.
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
