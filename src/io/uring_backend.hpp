@@ -423,14 +423,20 @@ struct uring {
 class uring_context {
  public:
   struct read_op : read_op_base {
-    std::span<std::byte> buf{};
+    std::span<std::byte> buf{};         // reads fill this
+    std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
     std::size_t filled = 0;
-    int fd = -1;                      // the fd this read rides
+    int fd = -1;                      // the fd this transfer rides
     posix_file* sync_file = nullptr;  // the deferred path needs the pair
     read_op* next_deferred = nullptr;
-    bool on_ring = false;   // the kernel has it, so a cancel is an SQE
+    bool on_ring = false;    // the kernel has it, so a cancel is an SQE
     bool cancelled = false;  // a cancel was asked for; one is enough
+    bool is_write = false;
+
+    [[nodiscard]] std::size_t length() const noexcept {
+      return is_write ? wbuf.size() : buf.size();
+    }
   };
 
   // An open file bound to a context. Every file must be destroyed before
@@ -439,23 +445,47 @@ class uring_context {
   class file {
    public:
     file(uring_context& ctx, const std::filesystem::path& path,
-         bool direct_io) {
-      f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
-      size_ = f_.stat_size();
-      if (direct_io) {
-        f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
+         const file_open_options& how)
+        : write_(how.write) {
+      const int base = write_ ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY;
+      f_.open(path.c_str(), base | O_CLOEXEC, 0644);
+      size_ = write_ ? 0 : f_.stat_size();
+      // Preallocation belongs to the OPEN, not to the finish: a write
+      // that extends the file serializes on the inode lock, and with
+      // async direct I/O that collapses the whole queue to one stalled
+      // write at a time. set_size() trims back afterwards.
+      if (write_ && how.preallocate_bytes > 0 &&
+          ::fallocate(f_.fd_plain, 0, 0,
+                      static_cast<off_t>(how.preallocate_bytes)) == 0) {
+        prealloc_ = how.preallocate_bytes;
       }
-      name_ = ctx.name_for(f_.direct);
+      if (how.direct_io) {
+        // Not TRUNC on the reopen: already truncated, and the tail keeps
+        // a plain fd.
+        f_.try_odirect(path.c_str(), (write_ ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
+      }
+      name_ = ctx.name_for(f_.direct, write_);
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
+    // Trims a preallocation back to what was written. Harmless when
+    // nothing was preallocated, which is what a reader's file is.
+    void set_size(std::uint64_t bytes) {
+      if (::ftruncate(f_.fd_plain, static_cast<off_t>(bytes)) != 0) {
+        throw_errno("ftruncate");
+      }
+      prealloc_ = 0;
+    }
+
    private:
     friend class uring_context;
     posix_file f_;
     std::uint64_t size_ = 0;
+    std::uint64_t prealloc_ = 0;
     std::string name_;
+    bool write_ = false;
   };
 
   uring_context(const reader_context_options& opts, unsigned max_inflight)
@@ -489,15 +519,49 @@ class uring_context {
     op.fd = f.f_.fd;
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
+    op.wbuf = {};
     op.on_ring = false;
     op.cancelled = false;
+    op.is_write = false;
     in_flight_++;
     // O_DIRECT rejects an unaligned length, so only whole granules may
     // ride the ring; the tail is read synchronously inside poll(). This
     // is the whole runtime-degradation question, asked in one place.
-    if (use_uring_ && buf.size() % direct_align == 0) {
+    if (use_uring_ && !buf.empty() && buf.size() % direct_align == 0) {
       op.on_ring = true;
       ring_.fill_rw(IORING_OP_READ, op.fd, buf.data(),
+                    static_cast<unsigned>(buf.size()), off, op_ud(&op),
+                    offload_);
+    } else {
+      deferred_.push(op);
+    }
+  }
+
+  // Same rules as submit_read, and the same ladder: a length O_DIRECT
+  // cannot take rides the deferred list and is written synchronously
+  // inside poll(), through the plain fd. That is what the writer did
+  // before, decided by wants_async(); it now lives here, so nothing
+  // above the context sees the difference.
+  void submit_write(file& f, std::uint64_t off,
+                    std::span<const std::byte> buf, read_op& op) {
+    op.buf = {};
+    op.wbuf = buf;
+    op.off = off;
+    op.filled = 0;
+    op.fd = f.f_.fd;
+    op.sync_file = &f.f_;
+    op.next_deferred = nullptr;
+    op.on_ring = false;
+    op.cancelled = false;
+    op.is_write = true;
+    in_flight_++;
+    // A zero-length transfer never goes to the kernel: io_uring reports
+    // it as res == 0, which is the signature of a short transfer with
+    // nothing left to give. It is a no-op, and the deferred path is
+    // where no-ops belong -- still completed from poll(), like the rest.
+    if (use_uring_ && !buf.empty() && buf.size() % direct_align == 0) {
+      op.on_ring = true;
+      ring_.fill_rw(IORING_OP_WRITE, op.fd, buf.data(),
                     static_cast<unsigned>(buf.size()), off, op_ud(&op),
                     offload_);
     } else {
@@ -616,9 +680,15 @@ class uring_context {
   // did not get O_DIRECT. file_reader::backend() reports it verbatim and
   // tools print it, so the spellings, their order and the suffixes are
   // observable API.
-  [[nodiscard]] std::string name_for(bool direct) const {
-    std::string n = use_uring_ ? (direct ? "io_uring+direct" : "io_uring")
-                               : (direct ? "pread+direct" : "pread");
+  [[nodiscard]] std::string name_for(bool direct, bool write) const {
+    // The degradation strings are observable API -- tools print them and
+    // a run is read differently depending on which rung it names -- so
+    // the write side keeps the spellings the writer used before.
+    const char* const sync_name = write ? "pwrite" : "pread";
+    std::string n = use_uring_
+                        ? (direct ? "io_uring+direct" : "io_uring")
+                        : (direct ? std::string(sync_name) + "+direct"
+                                  : std::string(sync_name));
     if (use_uring_ && !offload_) {
       n += " (inline submit)";
     }
@@ -687,12 +757,18 @@ class uring_context {
         ran++;
         continue;
       }
-      BLAKE3PP_MSAN_UNPOISON(op.buf.data() + op.filled,
-                             static_cast<std::size_t>(res));
+      if (!op.is_write) {
+        BLAKE3PP_MSAN_UNPOISON(op.buf.data() + op.filled,
+                               static_cast<std::size_t>(res));
+      }
       op.filled += static_cast<std::size_t>(res);
-      if (op.filled < op.buf.size()) {
-        ring_.fill_rw(IORING_OP_READ, op.fd, op.buf.data() + op.filled,
-                      static_cast<unsigned>(op.buf.size() - op.filled),
+      if (op.filled < op.length()) {
+        // A short transfer continues from where it stopped, reads and
+        // writes alike; only the opcode and which span it walks differ.
+        const std::byte* const from =
+            op.is_write ? op.wbuf.data() + op.filled : op.buf.data() + op.filled;
+        ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, op.fd,
+                      from, static_cast<unsigned>(op.length() - op.filled),
                       op.off + op.filled, ud, offload_);
         requeued = true;
         continue;
@@ -725,9 +801,14 @@ class uring_context {
       ec = std::make_error_code(std::errc::operation_canceled);
     } else {
       try {
-        op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
-                                op.buf.data(), op.buf.size(), op.off);
-        op.filled = op.buf.size();
+        if (op.is_write) {
+          op.sync_file->pwrite_all(op.sync_file->sync_fd(op.wbuf.size()),
+                                   op.wbuf.data(), op.wbuf.size(), op.off);
+        } else {
+          op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
+                                  op.buf.data(), op.buf.size(), op.off);
+        }
+        op.filled = op.length();
       } catch (const std::system_error& e) {
         ec = e.code();
       }
@@ -889,7 +970,7 @@ class uring_writer {
 // Definition-site conformance check. Concepts only verify use-sites, so
 // without this a drifting backend wouldn't be diagnosed until an engine
 // instantiation in some other TU; this makes the header self-checking.
-static_assert(reader_context<uring_context>);
+static_assert(io_context<uring_context>);
 static_assert(writer_backend<uring_writer>);
 
 }  // namespace blake3pp::detail::io_impl

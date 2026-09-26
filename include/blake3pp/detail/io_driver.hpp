@@ -46,12 +46,26 @@ class io_driver {
   io_driver(const io_driver&) = delete;
   io_driver& operator=(const io_driver&) = delete;
 
+  // How a file is opened: reading or writing, direct or buffered, and
+  // for a write how much to preallocate. Preallocation belongs to the
+  // open because a write that extends a file serializes on the inode
+  // lock, which collapses an async direct queue to one write at a time.
+  struct open_options {
+    bool write = false;
+    bool direct_io = false;
+    std::uint64_t preallocate_bytes = 0;
+  };
+
   // An open file bound to a driver. Destroy every file before its
   // driver: the driver's drain protects the memory these are reading
   // into.
   class file {
    public:
-    file(io_driver& drv, const std::filesystem::path& path, bool direct_io);
+    file(io_driver& drv, const std::filesystem::path& path,
+         const open_options& how);
+    // A read-only open, as the pipeline's callers spell it.
+    file(io_driver& drv, const std::filesystem::path& path, bool direct_io)
+        : file(drv, path, open_options{.direct_io = direct_io}) {}
     ~file();
     file(const file&) = delete;
     file& operator=(const file&) = delete;
@@ -59,6 +73,8 @@ class io_driver {
     [[nodiscard]] std::uint64_t size() const noexcept;
     // What file_reader::backend() reports for this file.
     [[nodiscard]] std::string_view name() const noexcept;
+    // Trims a preallocation back to what was actually written.
+    void set_size(std::uint64_t bytes);
 
    private:
     friend class io_driver;
@@ -71,6 +87,11 @@ class io_driver {
   // synchronously inside poll(), as it is in the backends.
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    io_read_op& op);
+  // The write side of the same contract: no syscall, no callback, and a
+  // length the platform cannot take asynchronously is written inside
+  // poll() like an unalignable read is.
+  void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
+                    io_read_op& op);
   // Pushes everything queued to the OS in one call. A read the OS
   // refuses is not lost: it is read synchronously inside poll(), which
   // is why nothing here reports a submit failure.

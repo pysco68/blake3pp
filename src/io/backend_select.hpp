@@ -9,7 +9,7 @@
 //
 // The reader side names a whole engine rather than a backend, which is
 // what lets a platform bring its own: every one of them now runs
-// polled_reader_engine over a reader_context, and the alias is the seam
+// polled_reader_engine over a io_context, and the alias is the seam
 // where a future engine could differ again. The context is named
 // alongside it because detail::io_driver (the file pipeline's compiled
 // seam) drives one directly, without an engine over it. Internal to

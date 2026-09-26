@@ -2,7 +2,7 @@
 
 // The two portable I/O engines, written exactly once as class templates
 // constrained by the concepts in io/backend.hpp: the reader over
-// reader_context, the writer over writer_backend. The public
+// io_context, the writer over writer_backend. The public
 // file_reader/file_writer TUs instantiate them with what
 // backend_select.hpp picks; the tests instantiate them again with the
 // off-platform contexts and backends, so those stay compiled AND executed
@@ -36,7 +36,7 @@
 namespace blake3pp::detail::io_impl {
 
 // The read-side window/slot engine on the completion-callback contract
-// (reader_context in io/backend.hpp): windows are delivered strictly in
+// (io_context in io/backend.hpp): windows are delivered strictly in
 // file order, release() recycles a slot and that recycling is the
 // backpressure, and a submission that fails inside the noexcept
 // release() is latched for the next next() to throw.
@@ -46,7 +46,7 @@ namespace blake3pp::detail::io_impl {
 // drives poll() until the window it wants is the one that arrived,
 // absorbing the others on the way; one poll serves every window in
 // flight, which is what lets the file pipeline share it across several.
-template <reader_context C>
+template <io_context C>
 class polled_reader_engine {
  public:
   using window = file_reader::window;
@@ -54,8 +54,10 @@ class polled_reader_engine {
   polled_reader_engine(const std::filesystem::path& path,
                        const file_reader_options& opts)
     requires std::constructible_from<typename C::file, C&,
-                                     const std::filesystem::path&, bool>
-      : polled_reader_engine(over_file{}, opts, path, opts.direct_io) {}
+                                     const std::filesystem::path&,
+                                     const file_open_options&>
+      : polled_reader_engine(over_file{}, opts, path,
+                             file_open_options{.direct_io = opts.direct_io}) {}
 
   // A source with no path: the null source is constructed from the size
   // it should pretend to have. Everything downstream -- window count,

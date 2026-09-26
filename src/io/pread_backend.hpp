@@ -23,16 +23,25 @@ namespace blake3pp::detail::io_impl {
 // backend.hpp supplies the deferred list, the poll loop and the wake).
 class pread_source {
  public:
-  pread_source(const std::filesystem::path& path, bool direct_io) {
-    f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    size_ = f_.stat_size();
-    if (direct_io) {
-      f_.try_odirect(path.c_str(), O_RDONLY | O_CLOEXEC);
+  pread_source(const std::filesystem::path& path,
+               const file_open_options& how)
+      : write_(how.write) {
+    const int base = write_ ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY;
+    f_.open(path.c_str(), base | O_CLOEXEC, 0644);
+    size_ = write_ ? 0 : f_.stat_size();
+    // No preallocation: fallocate is Linux and F_PREALLOCATE is Darwin,
+    // each living in its own backend, and synchronous writes do not
+    // suffer the extending-write serialization that makes it matter.
+    if (how.direct_io) {
+      f_.try_odirect(path.c_str(), (write_ ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
     }
   }
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
   [[nodiscard]] std::string_view name() const noexcept {
+    if (write_) {
+      return f_.direct ? "pwrite+direct" : "pwrite";
+    }
     return f_.direct ? "pread+direct" : "pread";
   }
 
@@ -40,9 +49,20 @@ class pread_source {
     f_.pread_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
   }
 
+  void write_at(std::uint64_t off, std::span<const std::byte> buf) {
+    f_.pwrite_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+  }
+
+  void set_size(std::uint64_t bytes) {
+    if (::ftruncate(f_.fd_plain, static_cast<off_t>(bytes)) != 0) {
+      throw_errno("ftruncate");
+    }
+  }
+
  private:
   posix_file f_;
   std::uint64_t size_ = 0;
+  bool write_ = false;
 };
 
 using pread_context = sync_context<pread_source>;
@@ -82,7 +102,7 @@ class pread_writer {
 };
 
 // Definition-site conformance check (see uring_backend.hpp).
-static_assert(reader_context<pread_context>);
+static_assert(io_context<pread_context>);
 static_assert(writer_backend<pread_writer>);
 
 }  // namespace blake3pp::detail::io_impl

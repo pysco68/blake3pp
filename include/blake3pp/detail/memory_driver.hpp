@@ -27,6 +27,7 @@
 #include <string_view>
 #include <system_error>
 
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <utility>
@@ -169,6 +170,12 @@ class memory_driver {
    public:
     file(memory_driver&, std::span<const std::byte> bytes) noexcept
         : bytes_(bytes) {}
+    // A file the pipeline may write into; reads of it see what was
+    // written.
+    file(memory_driver&, std::span<std::byte> bytes) noexcept
+        : bytes_(bytes), writable_(bytes) {}
+
+    void set_size(std::uint64_t) noexcept {}  // a span has the size it has
 
     [[nodiscard]] std::uint64_t size() const noexcept {
       return static_cast<std::uint64_t>(bytes_.size());
@@ -178,6 +185,7 @@ class memory_driver {
    private:
     friend class memory_driver;
     std::span<const std::byte> bytes_;
+    std::span<std::byte> writable_{};
   };
 
   memory_driver() = default;
@@ -205,6 +213,18 @@ class memory_driver {
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
                    io_read_op& op) noexcept {
+    reads_.push(op);
+  }
+
+  // A "file" in memory is written by copying into its span, which is the
+  // one place this driver moves bytes at all. The span has to be one the
+  // caller may write to, which is why the write side names it separately.
+  void submit_write(file& f, std::uint64_t off,
+                    std::span<const std::byte> buf, io_read_op& op) noexcept {
+    assert(off + buf.size() <= f.writable_.size() &&
+           "a write past the end of the span this file is over");
+    std::copy_n(buf.data(), buf.size(),
+                f.writable_.data() + static_cast<std::size_t>(off));
     reads_.push(op);
   }
   void flush() noexcept {}

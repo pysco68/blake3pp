@@ -15,6 +15,7 @@
 #if defined(__APPLE__)
 
 #include <dispatch/dispatch.h>
+#include <string>
 #include <string_view>
 #include <fcntl.h>
 #include <sys/types.h>
@@ -116,6 +117,8 @@ class gcd_context {
     std::uint64_t off = 0;
     std::size_t filled = 0;
     int fd = -1;
+    const std::byte* src = nullptr;   // writes read from this
+    bool is_write = false;
     int error = 0;              // errno captured by the worker
     posix_file* sync_file = nullptr;  // the deferred path needs the pair
     gcd_context* ctx = nullptr;
@@ -126,26 +129,46 @@ class gcd_context {
   class file {
    public:
     file(gcd_context& ctx, const std::filesystem::path& path,
-         bool direct_io) {
-      f_.open(path.c_str(), O_RDONLY | O_CLOEXEC);
-      size_ = f_.stat_size();
+         const file_open_options& how)
+        : write_(how.write) {
+      const int base = write_ ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY;
+      f_.open(path.c_str(), base | O_CLOEXEC, 0644);
+      size_ = write_ ? 0 : f_.stat_size();
+      // Preallocation belongs to the open for the reason it does
+      // everywhere else: an extending write serializes, which collapses
+      // an async queue to one write at a time. F_PREALLOCATE is
+      // best-effort, and set_size() trims back afterwards.
+      if (write_ && how.preallocate_bytes > 0 &&
+          preallocate(f_.fd_plain, how.preallocate_bytes)) {
+        prealloc_ = how.preallocate_bytes;
+      }
       // Darwin's cache bypass is per-fd, not per-open, and tolerates any
       // alignment, so one fd serves every window, tail included.
-      if (direct_io && set_nocache(f_.fd_plain)) {
+      if (how.direct_io && set_nocache(f_.fd_plain)) {
         f_.direct = true;
       }
-      name_ = ctx.use_gcd_ ? (f_.direct ? "gcd+nocache" : "gcd")
-                          : (f_.direct ? "pread+nocache" : "pread");
+      name_ = ctx.name_for(f_.direct, write_);
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
+    // Trims a preallocation back to what was written. Harmless when
+    // nothing was preallocated, which is what a reader's file is.
+    void set_size(std::uint64_t bytes) {
+      if (::ftruncate(f_.fd_plain, static_cast<off_t>(bytes)) != 0) {
+        throw_errno("ftruncate");
+      }
+      prealloc_ = 0;
+    }
+
    private:
     friend class gcd_context;
     posix_file f_;
     std::uint64_t size_ = 0;
-    std::string_view name_ = "pread";
+    std::uint64_t prealloc_ = 0;
+    bool write_ = false;
+    std::string name_ = "pread";
   };
 
   gcd_context(const reader_context_options& opts, unsigned) {
@@ -171,13 +194,39 @@ class gcd_context {
     op.off = off;
     op.filled = 0;
     op.error = 0;
+    op.src = nullptr;
+    op.is_write = false;
     op.fd = f.f_.fd_plain;
     op.sync_file = &f.f_;
     op.ctx = this;
     op.next_done = nullptr;
     in_flight_++;
     if (use_gcd_) {
-      pump_.submit(&gcd_context::run_read, &op);
+      pump_.submit(&gcd_context::run_transfer, &op);
+    } else {
+      deferred_.push(op);
+    }
+  }
+
+  // The write half of the same contract. Darwin's F_NOCACHE tolerates any
+  // alignment, so unlike O_DIRECT there is no length a write cannot take:
+  // the deferred list here is only the no-GCD rung.
+  void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
+                    read_op& op) {
+    op.dst = nullptr;
+    op.src = buf.data();
+    op.is_write = true;
+    op.len = buf.size();
+    op.off = off;
+    op.filled = 0;
+    op.error = 0;
+    op.fd = f.f_.fd_plain;
+    op.sync_file = &f.f_;
+    op.ctx = this;
+    op.next_done = nullptr;
+    in_flight_++;
+    if (use_gcd_) {
+      pump_.submit(&gcd_context::run_transfer, &op);
     } else {
       deferred_.push(op);
     }
@@ -232,17 +281,21 @@ class gcd_context {
   }
 
  private:
-  // Runs on a GCD worker: one positional read loop into the caller's
-  // buffer, then the op goes on the done list. noexcept: the error
-  // travels in the op to whoever calls poll().
-  static void run_read(void* p) noexcept {
+  // Runs on a GCD worker: one positional read or write loop over the
+  // caller's buffer, then the op goes on the done list. noexcept: the
+  // error travels in the op to whoever calls poll().
+  static void run_transfer(void* p) noexcept {
     auto& op = *static_cast<read_op*>(p);
     gcd_context& c = *op.ctx;
     int err = 0;
     std::size_t got = 0;
     while (got < op.len) {
-      const ssize_t n = ::pread(op.fd, op.dst + got, op.len - got,
-                                static_cast<off_t>(op.off + got));
+      const ssize_t n =
+          op.is_write
+              ? ::pwrite(op.fd, op.src + got, op.len - got,
+                         static_cast<off_t>(op.off + got))
+              : ::pread(op.fd, op.dst + got, op.len - got,
+                        static_cast<off_t>(op.off + got));
       if (n < 0) {
         if (errno == EINTR) {
           continue;
@@ -251,7 +304,9 @@ class gcd_context {
         break;
       }
       if (n == 0) {
-        err = EIO;  // unexpected EOF
+        // A read that ends early ended the file; a write that moves no
+        // bytes would spin, so both stop here.
+        err = EIO;
         break;
       }
       got += static_cast<std::size_t>(n);
@@ -297,7 +352,11 @@ class gcd_context {
     read_op& op = *next;
     std::error_code ec;
     try {
-      op.sync_file->pread_all(op.fd, op.dst, op.len, op.off);
+      if (op.is_write) {
+        op.sync_file->pwrite_all(op.fd, op.src, op.len, op.off);
+      } else {
+        op.sync_file->pread_all(op.fd, op.dst, op.len, op.off);
+      }
       op.filled = op.len;
     } catch (const std::system_error& e) {
       ec = e.code();
@@ -305,6 +364,18 @@ class gcd_context {
     in_flight_--;
     op.done(&op, ec);
     return 1;
+  }
+
+  // The degradation strings are observable API, so the synchronous rung
+  // keeps the spellings the other backends use.
+  [[nodiscard]] std::string name_for(bool direct, bool write) const {
+    const char* const sync_name = write ? "pwrite" : "pread";
+    const char* const fast_name = write ? "gcd-write" : "gcd";
+    std::string n = use_gcd_ ? fast_name : sync_name;
+    if (direct) {
+      n += "+nocache";
+    }
+    return n;
   }
 
   gcd_pump pump_;
@@ -453,7 +524,7 @@ class gcd_writer {
 };
 
 // Definition-site conformance check (see uring_backend.hpp).
-static_assert(reader_context<gcd_context>);
+static_assert(io_context<gcd_context>);
 static_assert(writer_backend<gcd_writer>);
 
 }  // namespace blake3pp::detail::io_impl

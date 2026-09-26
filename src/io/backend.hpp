@@ -5,7 +5,7 @@
 //
 // The two sides have different shapes. A WRITER backend is per file and
 // owns its slots: start_write() names a buffer by slot and wait_slot()
-// blocks for it. A READER runs on reader_context, where the completion
+// blocks for it. A READER runs on io_context, where the completion
 // mechanism is separate from the file, a read is named by a caller-owned
 // operation, and completions arrive as callbacks.
 //
@@ -73,6 +73,17 @@ using aligned_buffer = std::unique_ptr<std::byte[], aligned_delete>;
   return aligned_buffer(static_cast<std::byte*>(
       ::operator new(bytes, std::align_val_t{direct_align})));
 }
+
+// How a file is opened on a context. Reads want a path and maybe direct
+// I/O; writes want the file created, and preallocated where the platform
+// can, because a write that EXTENDS a file serializes on the inode lock
+// and collapses an async direct queue to one stalled write at a time.
+// The backends that can preallocate do it here, at the open, not later.
+struct file_open_options {
+  bool write = false;          // create/truncate for writing
+  bool direct_io = false;      // O_DIRECT / FILE_FLAG_NO_BUFFERING
+  std::uint64_t preallocate_bytes = 0;  // writes only; 0 for none
+};
 
 // What a context needs to know at construction; the engine fills it from
 // file_reader_options. A type of its own because the window size and
@@ -179,7 +190,7 @@ struct read_op_base {
   void* owner = nullptr;  // for the caller's use
 };
 
-// The completion-callback reader contract.
+// The completion-callback I/O contract.
 //
 // A context owns the completion mechanism (a ring, a port, a queue) and
 // nothing about any particular file. C::file is an open file bound to a
@@ -211,9 +222,11 @@ struct read_op_base {
 // read counted, uncompleted and unreachable, which no caller can
 // recover from.
 template <class C>
-concept reader_context = requires(C c, const C cc, typename C::file& f,
-                                  typename C::read_op& op, std::uint64_t off,
-                                  std::span<std::byte> buf, bool block) {
+concept io_context = requires(C c, const C cc, typename C::file& f,
+                              typename C::read_op& op, std::uint64_t off,
+                              std::span<std::byte> buf,
+                              std::span<const std::byte> cbuf, bool block,
+                              std::uint64_t bytes) {
   typename C::file;
   typename C::read_op;
   requires std::derived_from<typename C::read_op, read_op_base>;
@@ -227,6 +240,15 @@ concept reader_context = requires(C c, const C cc, typename C::file& f,
   // deferred list and is read synchronously inside poll(), which is where
   // the old contract's "lazy at delivery" ended up.
   { c.submit_read(f, off, buf, op) };
+  // Queues one write of exactly cbuf.size() bytes at off. Same rules as
+  // submit_read: no syscall, no callback, and a write the file cannot
+  // take asynchronously -- an unaligned length under O_DIRECT, or no
+  // engine at all -- goes on the deferred list and is written inside
+  // poll(). The caller's bytes must stay put until the callback runs.
+  { c.submit_write(f, off, cbuf, op) };
+  // Sets the file's size, for trimming a preallocation back to what was
+  // actually written. Only meaningful on a file opened for writing.
+  { f.set_size(bytes) };
   // Pushes everything queued to the OS in one call. Never throws: what
   // the OS refuses moves to the deferred list, still owed.
   { c.flush() } noexcept;
@@ -316,22 +338,26 @@ template <class Source>
 class sync_context {
  public:
   struct read_op : read_op_base {
-    std::span<std::byte> buf{};
+    std::span<std::byte> buf{};        // reads fill this
+    std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
     Source* src = nullptr;
     read_op* next_deferred = nullptr;
     bool cancelled = false;
+    bool is_write = false;
   };
 
   class file {
    public:
-    file(sync_context&, const std::filesystem::path& path, bool direct_io)
-        : src_(path, direct_io) {}
+    file(sync_context&, const std::filesystem::path& path,
+         const file_open_options& how)
+        : src_(path, how) {}
 
     [[nodiscard]] std::uint64_t size() const noexcept { return src_.size(); }
     [[nodiscard]] std::string_view name() const noexcept {
       return src_.name();
     }
+    void set_size(std::uint64_t bytes) { src_.set_size(bytes); }
 
    private:
     friend class sync_context;
@@ -347,9 +373,25 @@ class sync_context {
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
     op.buf = buf;
+    op.wbuf = {};
     op.off = off;
     op.src = &f.src_;
     op.cancelled = false;
+    op.is_write = false;
+    queue_.push(op);
+    queued_++;
+  }
+
+  // Queued like a read and performed in poll(), which is the whole point:
+  // nothing this context does is allowed to happen inside submit.
+  void submit_write(file& f, std::uint64_t off,
+                    std::span<const std::byte> buf, read_op& op) {
+    op.buf = {};
+    op.wbuf = buf;
+    op.off = off;
+    op.src = &f.src_;
+    op.cancelled = false;
+    op.is_write = true;
     queue_.push(op);
     queued_++;
   }
@@ -376,7 +418,11 @@ class sync_context {
       ec = std::make_error_code(std::errc::operation_canceled);
     } else {
       try {
-        op.src->read_at(op.off, op.buf);
+        if (op.is_write) {
+          op.src->write_at(op.off, op.wbuf);
+        } else {
+          op.src->read_at(op.off, op.buf);
+        }
       } catch (const std::system_error& e) {
         ec = e.code();
       }
