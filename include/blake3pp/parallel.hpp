@@ -313,13 +313,31 @@ void wait_for_parts(Work&& work) {
 // start of the next). Per bulk invocation, not per part: two atomic adds
 // on pt and at most one record claim. An invocation that finds the
 // counter exhausted records nothing and is not an active agent.
-template <bool Traced, class Scheduler, class Body>
+// Whether the agents should stop claiming parts. An unstoppable token
+// -- what every caller but the file pipeline passes -- makes this a
+// compile-time false, so the loops below keep their exact shape and the
+// hot path pays nothing.
+template <class Token>
+[[nodiscard]] constexpr bool parts_stopped(const Token& tok) noexcept {
+  if constexpr (ex::unstoppable_token<Token>) {
+    return false;
+  } else {
+    return tok.stop_requested();
+  }
+}
+
+template <bool Traced, class Scheduler, class Body,
+          class Token = ex::never_stop_token>
 [[nodiscard]] auto part_bulk_sender(Scheduler& sched, std::size_t n,
                                     Body& body, std::atomic<std::size_t>& next,
-                                    part_trace* pt) {
+                                    part_trace* pt, Token tok = {}) {
   if constexpr (Traced) {
     return ex::schedule(sched) |
-           ex::bulk(ex::par, n, [n, &body, &next, pt](std::size_t) noexcept {
+           ex::bulk(ex::par, n, [n, &body, &next, pt,
+                                tok](std::size_t) noexcept {
+             if (parts_stopped(tok)) {
+               return;
+             }
              std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
              if (i >= n) {
                return;
@@ -345,12 +363,18 @@ template <bool Traced, class Scheduler, class Body>
                  max_ns = std::max(max_ns, d);
                  t = t_end;
                  ++parts;
+                 if (parts_stopped(tok)) {
+                   break;
+                 }
                  i = next.fetch_add(1, std::memory_order_relaxed);
                } while (i < n);
              } else {
                do {
                  body(i);
                  ++parts;
+                 if (parts_stopped(tok)) {
+                   break;
+                 }
                  i = next.fetch_add(1, std::memory_order_relaxed);
                } while (i < n);
                t = buf.now();
@@ -373,9 +397,13 @@ template <bool Traced, class Scheduler, class Body>
            });
   } else {
     return ex::schedule(sched) |
-           ex::bulk(ex::par, n, [n, &body, &next](std::size_t) noexcept {
-             for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                  i < n; i = next.fetch_add(1, std::memory_order_relaxed)) {
+           ex::bulk(ex::par, n, [n, &body, &next, tok](std::size_t) noexcept {
+             while (!parts_stopped(tok)) {
+               const std::size_t i =
+                   next.fetch_add(1, std::memory_order_relaxed);
+               if (i >= n) {
+                 return;
+               }
                body(i);
              }
            });
@@ -698,10 +726,18 @@ struct window_compress {
 // thread never touches it either. The window chain around this sender
 // does not know what is inside it, which makes this the one place a
 // different compress stage would go.
-template <bool Traced, stack_budget Budget, class Scheduler>
-[[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w) {
-  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt) |
+template <bool Traced, stack_budget Budget, class Scheduler,
+          class Token = ex::never_stop_token>
+[[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w,
+                               Token tok = {}) {
+  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt, tok) |
          ex::then([&w]() noexcept {
+           // The fold runs even when the agents stopped early: the part
+           // table is zeroed with the window it lives in, so this reads
+           // nothing uninitialised, and what it produces is dropped by
+           // the stop check behind this stage rather than branched
+           // around here, on the path every window takes.
+           //
            // Every part pairs with a sibling all the way up: the window
            // is a power-of-two number of chunks and part is a power of
            // two, so n_parts is one too.
@@ -724,11 +760,13 @@ template <bool Traced, stack_budget Budget, class Scheduler>
 //
 // The fold runs on the agent that finished the bulk, like the full
 // window's; `out` is the caller's and must outlive the sender.
-template <bool Traced, stack_budget Budget, class Scheduler>
+template <bool Traced, stack_budget Budget, class Scheduler,
+          class Token = ex::never_stop_token>
 [[nodiscard]] auto compress_edge_on(Scheduler& sched,
                                     window_compress<Budget>& w,
-                                    std::span<tree_reducer::node> out) {
-  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt) |
+                                    std::span<tree_reducer::node> out,
+                                    Token tok = {}) {
+  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt, tok) |
          ex::then([&w, out]() noexcept {
            return fold_aligned_runs(
                w.ops, w.key, w.flags,
