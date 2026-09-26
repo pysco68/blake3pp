@@ -869,6 +869,34 @@ class window_scope {
         nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
         reducer_(ops_, h.key_words(), h.mode_flags(),
                  std::span<tree_reducer::node>(nodes_.get(), reducer_nodes)) {
+    // The window objects above are value-initialised, and the fold of a
+    // stopped compress stage depends on it: the agents stop claiming
+    // parts where the stop found them, and the fold still reads every
+    // slot of the part table, including the ones nobody wrote. Those
+    // slots are zero because make_unique<window[]> zero-fills the whole
+    // window before any constructor runs, and the table has no
+    // initialiser of its own to replace that fill with.
+    //
+    // The check is the outcome rather than a trait: what the guarantee
+    // actually rests on is a default constructor that is neither
+    // user-provided nor deleted, and no standard trait spells that --
+    // is_trivially_default_constructible is already false here, for the
+    // members that do carry initialisers.
+    static_assert(
+        [] {
+          const window probe{};
+          for (const auto& part : probe.compress.cvs) {
+            for (const std::uint32_t word : part) {
+              if (word != 0) {
+                return false;
+              }
+            }
+          }
+          return true;
+        }(),
+        "a window's part table must value-initialise to zero: the fold "
+        "of a stopped compress stage reads part slots no agent claimed");
+
     // The one buffer allocation of the whole run, owned by the driver so
     // that it outlives every read the teardown has to drain.
     const std::span<std::byte> pool =
