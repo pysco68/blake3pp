@@ -86,6 +86,19 @@ struct io_read_op_layout {
 
 [[nodiscard]] io_read_op_layout native_read_op_layout() noexcept;
 
+// Where one window's bytes live, as the driver that owns them says.
+//
+// `read_into` is what a read fills; it is empty for a source whose bytes
+// are already in memory, and a read of an empty target is one that has
+// nothing to move. `view` is what the pipeline compresses and absorbs,
+// and its CONTENT is defined only once the window's read has completed
+// -- for an arena the bytes are the driver's until then, and the window
+// enforces that rather than trusting its callers.
+struct window_storage {
+  std::span<std::byte> read_into;
+  std::span<const std::byte> view;
+};
+
 // What the pipeline needs of whatever is feeding it: a source of
 // windows that reports its completions from poll(), on the thread that
 // called it.
@@ -93,7 +106,7 @@ template <class D>
 concept file_driver =
     requires(D& d, const D& cd, typename D::file& f, io_read_op& op,
              std::uint64_t off, std::span<std::byte> buf, bool block,
-             std::size_t bytes) {
+             std::size_t bytes, unsigned windows) {
       typename D::file;
       { f.size() } noexcept -> std::same_as<std::uint64_t>;
       { f.name() } noexcept -> std::same_as<std::string_view>;
@@ -104,7 +117,13 @@ concept file_driver =
       { d.cancel(op) } noexcept;
       { cd.in_flight() } noexcept -> std::same_as<std::size_t>;
       { d.drain() } noexcept;
-      { d.allocate(bytes) } -> std::same_as<std::span<std::byte>>;
+      // How much window memory the run will use. A driver that owns an
+      // arena takes it here; one whose windows are views of memory the
+      // caller already has takes nothing and remembers the geometry.
+      { d.reserve(windows, bytes) };
+      // Where window `slot`, covering `bytes` bytes at `off`, lives.
+      { d.window_storage_for(f, windows, off, bytes) }
+          -> std::same_as<window_storage>;
     };
 
 }  // namespace blake3pp::detail

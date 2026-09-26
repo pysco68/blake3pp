@@ -899,15 +899,15 @@ class window_scope {
         "a window's part table must value-initialise to zero: the fold "
         "of a stopped compress stage reads part slots no agent claimed");
 
-    // The one buffer allocation of the whole run, owned by the driver so
-    // that it outlives every read the teardown has to drain.
-    const std::span<std::byte> pool =
-        drv.allocate(window_bytes_ * static_cast<std::size_t>(count_));
+    // The run's window memory, taken once and owned by the driver so
+    // that it outlives every read the teardown has to drain. Where each
+    // window's bytes actually are is the driver's answer, and it is
+    // asked per window, because a source already in memory has a
+    // different view for every offset.
+    drv.reserve(count_, window_bytes_);
     loop_.record_into(trace_);
     for (unsigned i = count_; i > 0; --i) {
       window& w = windows_[i - 1];
-      w.buffer = pool.subspan(static_cast<std::size_t>(i - 1) * window_bytes_,
-                              window_bytes_);
       w.slot = i - 1;
       push_free(&w);
     }
@@ -1069,7 +1069,8 @@ class window_scope {
       window& w = *last_window_;
       // Only the tail: the parts before it are already in the tree.
       h_.update(std::span<const std::byte>(
-          w.buffer.data() + (w.bytes - w.plan.tail_bytes), w.plan.tail_bytes));
+          w.view().data() + (w.bytes - w.plan.tail_bytes),
+          w.plan.tail_bytes));
       if (w.rec != nullptr) {
         // The last window is never folded, so its join and its absorb
         // are the same instant: the hasher took it whole.
@@ -1267,7 +1268,17 @@ class window_scope {
   static_assert(std::is_trivially_copyable_v<window_plan>);
 
   struct window {
-    std::span<std::byte> buffer;
+    // Where this window's bytes live, as the driver says: what the read
+    // fills, and what the pipeline reads back. For an arena the two name
+    // the same bytes; for a source already in memory the first is empty,
+    // because there is nothing to move.
+    std::span<std::byte> read_into;
+    std::span<const std::byte> bytes_view;
+    // Whether bytes_view's CONTENT is defined yet. Set when the read
+    // completes, cleared when the window is taken for the next one: an
+    // arena window names its slice from the moment it is taken, and what
+    // is in it belongs to the driver until poll() says otherwise.
+    bool view_ready = false;
     window_compress<Budget> compress;
     std::uint64_t index = 0;
     std::uint64_t offset = 0;
@@ -1282,6 +1293,17 @@ class window_scope {
     bool cancel_asked = false;  // the sweep has already asked for this read
     window_plan plan;
     std::size_t nodes = 0;  // nodes the fold produced
+
+    // The window's bytes, for everything that compresses or absorbs
+    // them. The assert is the contract the arena needs and the in-memory
+    // source satisfies trivially; it is live in the sanitizer lanes.
+    [[nodiscard]] std::span<const std::byte> view() const noexcept {
+      assert(view_ready &&
+             "a window's bytes are only defined once its read has "
+             "completed: the view names the storage from the moment the "
+             "window is taken, the content arrives in poll()");
+      return bytes_view;
+    }
     // The read's operation, alive for as long as the window object: the
     // driver may still owe this read after the chain's cell is gone, and
     // the stop sweep names it from here. Last, so that adding it left
@@ -1335,7 +1357,7 @@ class window_scope {
     return ex::then(
         ex::continues_on(
             ex::let_value(loop_.read(file_, w.offset,
-                                     w.buffer.first(w.bytes), w.op),
+                                     w.read_into, w.op),
                           [this, &w](std::span<const std::byte>) {
                             return compress_stage(w);
                           }),
@@ -1347,8 +1369,7 @@ class window_scope {
   // let the hasher take the whole thing at the end. Small last windows
   // land here, and so does a file below one window.
   [[nodiscard]] auto read_only_chain(window& w) {
-    return ex::then(loop_.read(file_, w.offset, w.buffer.first(w.bytes),
-                               w.op),
+    return ex::then(loop_.read(file_, w.offset, w.read_into, w.op),
                     [this, &w](std::span<const std::byte>) noexcept {
                       read_landed(w);
                       // A short first window with nothing worth fanning
@@ -1372,8 +1393,7 @@ class window_scope {
   [[nodiscard]] auto edge_chain(window& w) {
     return ex::then(
         ex::continues_on(
-            ex::let_value(loop_.read(file_, w.offset, w.buffer.first(w.bytes),
-                                     w.op),
+            ex::let_value(loop_.read(file_, w.offset, w.read_into, w.op),
                           [this, &w](std::span<const std::byte>) {
                             return edge_compress_stage(w);
                           }),
@@ -1391,7 +1411,7 @@ class window_scope {
   void absorb_head(window& w) noexcept {
     if (w.plan.head_bytes > 0) {
       h_.update(
-          std::span<const std::byte>(w.buffer.data(), w.plan.head_bytes));
+          std::span<const std::byte>(w.view().data(), w.plan.head_bytes));
     }
   }
 
@@ -1399,7 +1419,7 @@ class window_scope {
     read_landed(w);
     absorb_head(w);
     const window_plan& p = w.plan;
-    w.compress.prepare_edge(ops_, w.buffer.data() + p.head_bytes,
+    w.compress.prepare_edge(ops_, w.view().data() + p.head_bytes,
                             p.part_chunks, p.parts, p.first_chunk,
                             h_.key_words(), h_.mode_flags(), trace_, w.index);
     const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
@@ -1565,6 +1585,7 @@ class window_scope {
   // Takes the next window's geometry and plan into w and advances.
   void take_next(window& w) noexcept {
     w.cancel_asked = false;
+    w.view_ready = false;
     const geometry g = next_geometry();
     w.plan = plan_window(g);
     w.offset = g.offset;
@@ -1574,6 +1595,10 @@ class window_scope {
     w.chunks = w.bytes / chunk_size;
     w.index = index_++;
     w.nodes = 0;
+    const window_storage storage =
+        loop_.driver().window_storage_for(file_, w.slot, w.offset, w.bytes);
+    w.read_into = storage.read_into;
+    w.bytes_view = storage.view;
     next_offset_ += w.bytes;
   }
 
@@ -1653,7 +1678,7 @@ class window_scope {
 
   void prepare_compress(window& w) noexcept {
     const bool fanned =
-        w.compress.prepare(ops_, w.buffer.data(), w.chunks,
+        w.compress.prepare(ops_, w.view().data(), w.chunks,
                            w.plan.first_chunk, h_.key_words(), h_.mode_flags(),
                            trace_, w.index);
     // update_file only reaches the pipeline for windows big enough to fan
@@ -1793,6 +1818,7 @@ class window_scope {
   // The read is in memory: the window gives its read slot back and
   // keeps its buffer. On the driver, inside the read's completion.
   void read_landed(window& w) noexcept {
+    w.view_ready = true;
     release_read_slot(w);
     if (w.rec != nullptr) {
       w.rec->t_ready = trace_->now();

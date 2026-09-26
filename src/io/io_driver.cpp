@@ -52,6 +52,8 @@ struct io_driver::impl {
   // arena is declared FIRST and therefore destroyed LAST. Do not
   // reorder.
   io_impl::aligned_buffer buffers;
+  std::size_t window_bytes = 0;
+  std::size_t arena_bytes = 0;
   context ctx;
 #ifndef NDEBUG
   // A file holds a reference to the context that opened it. One that
@@ -146,15 +148,26 @@ std::size_t io_driver::in_flight() const noexcept {
 
 void io_driver::drain() noexcept { impl_->ctx.drain(); }
 
-std::span<std::byte> io_driver::allocate(std::size_t bytes) {
+void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
   // One arena per driver, taken once at pipeline construction. Aligned
   // for direct I/O, which rejects an unaligned buffer outright. A second
   // call would free memory a read of the first scope may still target,
   // which is why it is a contract violation and not a reallocation.
-  assert(!impl_->buffers && "io_driver::allocate() called twice: the arena "
+  assert(!impl_->buffers && "io_driver::reserve() called twice: the arena "
                             "is taken once per driver");
-  impl_->buffers = io_impl::make_aligned_buffer(bytes);
-  return {impl_->buffers.get(), bytes};
+  impl_->window_bytes = window_bytes;
+  impl_->arena_bytes = window_bytes * windows;
+  impl_->buffers = io_impl::make_aligned_buffer(impl_->arena_bytes);
+}
+
+window_storage io_driver::window_storage_for(file&, unsigned slot,
+                                             std::uint64_t,
+                                             std::size_t bytes) noexcept {
+  const std::size_t at = static_cast<std::size_t>(slot) * impl_->window_bytes;
+  assert(at + bytes <= impl_->arena_bytes &&
+         "a window asked for arena the reserve did not take");
+  const std::span<std::byte> slice{impl_->buffers.get() + at, bytes};
+  return {slice, std::span<const std::byte>(slice)};
 }
 
 }  // namespace blake3pp::detail

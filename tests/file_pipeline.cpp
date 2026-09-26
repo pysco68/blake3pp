@@ -545,10 +545,17 @@ class fake_driver {
   static constexpr std::size_t guard_bytes = 4096;
   static constexpr std::byte guard_fill{0xA5};
 
-  [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
-    pool_.assign(bytes + guard_bytes, guard_fill);
-    arena_bytes_ = bytes;
-    return {pool_.data(), bytes};
+  void reserve(unsigned windows, std::size_t window_bytes) {
+    arena_bytes_ = window_bytes * windows;
+    window_stride_ = window_bytes;
+    pool_.assign(arena_bytes_ + guard_bytes, guard_fill);
+  }
+
+  [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
+      file&, unsigned slot, std::uint64_t, std::size_t bytes) noexcept {
+    const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
+                                     bytes};
+    return {slice, std::span<const std::byte>(slice)};
   }
 
   [[nodiscard]] bool guard_intact() const noexcept {
@@ -610,6 +617,7 @@ class fake_driver {
   unsigned cancels_ = 0;
   unsigned callbacks_ = 0;
   std::size_t arena_bytes_ = 0;
+  std::size_t window_stride_ = 0;
 };
 
 static_assert(blake3pp::detail::file_driver<fake_driver>);
@@ -767,7 +775,8 @@ TEST_CASE("the io driver reads a file and keeps the callback discipline") {
 
   // The arena is the driver's, direct-I/O aligned, and outlives every
   // read because the driver drains before freeing it.
-  const auto pool = drv.allocate(len);
+  drv.reserve(1, len);
+  const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
   REQUIRE(pool.size() == len);
   CHECK(std::bit_cast<std::uintptr_t>(pool.data()) % 4096 == 0);
 
@@ -806,7 +815,8 @@ TEST_CASE("the io driver drains a read in flight before freeing its arena") {
   {
     io_driver drv({}, 4);
     io_driver::file file(drv, f.path, /*direct_io=*/false);
-    const auto pool = drv.allocate(len);
+    drv.reserve(1, len);
+  const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
     io_read_op op{};
     op.done = &read_probe::on_done;
     op.owner = &probe;
@@ -828,7 +838,8 @@ TEST_CASE("the io driver drains on request and reads again afterwards") {
 
   io_driver drv({}, 4);
   io_driver::file file(drv, f.path, /*direct_io=*/false);
-  const auto pool = drv.allocate(len);
+  drv.reserve(1, len);
+  const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
   read_probe probe;
   {
     io_read_op op{};
@@ -883,7 +894,8 @@ TEST_CASE("a window read is a sender the driver loop completes") {
   io_driver drv({}, 4);
   driver_loop<io_driver> io(drv);
   io_driver::file file(drv, f.path, /*direct_io=*/false);
-  const auto pool = drv.allocate(len);
+  drv.reserve(1, len);
+  const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
 
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
@@ -911,7 +923,8 @@ TEST_CASE("a read that fails reports through the error channel") {
   io_driver drv({}, 4);
   driver_loop<io_driver> io(drv);
   io_driver::file file(drv, f.path, /*direct_io=*/false);
-  const auto pool = drv.allocate(len);
+  drv.reserve(1, len);
+  const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
 
   // Past the end of the file: the backend reports the unexpected EOF as
   // an error, and the chain sees it as std::error_code, not a value.
@@ -958,7 +971,8 @@ TEST_CASE("work parked from another thread wakes a blocked driver") {
   io_driver drv({}, 4);
   driver_loop<io_driver> io(drv);
   io_driver::file file(drv, f.path, /*direct_io=*/false);
-  const auto pool = drv.allocate(len);
+  drv.reserve(1, len);
+  const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
 
   // Two chains, so the loop runs until both are in: the read is what
   // makes blocking legitimate, and the other thread's schedule is what
@@ -1001,7 +1015,8 @@ TEST_CASE("the four-line window chain composes on this provider") {
   io_driver drv({}, 4);
   driver_loop<io_driver> io(drv);
   io_driver::file file(drv, f.path, /*direct_io=*/false);
-  const auto pool = drv.allocate(len);
+  drv.reserve(1, len);
+  const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
 
   // The shape of the real window chain, with a stand-in for the compress
   // stage: read on the driver, work on the pool, back on the driver.

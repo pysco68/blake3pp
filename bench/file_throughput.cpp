@@ -386,11 +386,19 @@ class null_driver {
   }
   void drain() noexcept { ctx_.drain(); }
 
-  [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
+  void reserve(unsigned windows, std::size_t window_bytes) {
+    const std::size_t bytes = window_bytes * windows;
+    window_stride_ = window_bytes;
     if (pool_.size() < bytes) {
       pool_.assign(bytes, filler_);
     }
-    return {pool_.data(), bytes};
+  }
+
+  [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
+      file&, unsigned slot, std::uint64_t, std::size_t bytes) noexcept {
+    const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
+                                     bytes};
+    return {slice, std::span<const std::byte>(slice)};
   }
 
  private:
@@ -404,6 +412,7 @@ class null_driver {
   io_impl::null_context ctx_;
   std::uint64_t size_;
   std::byte filler_;
+  std::size_t window_stride_ = 0;
   std::vector<std::byte> pool_;
 };
 
