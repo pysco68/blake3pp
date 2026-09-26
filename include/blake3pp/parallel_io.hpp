@@ -35,6 +35,31 @@
 
 namespace blake3pp {
 
+namespace detail {
+#if defined(BLAKE3PP_TEST_PIPELINE_STOP)
+// The stop the blocking entry points hand the pipeline.
+//
+// Phase 7 gives callers a stop of their own; until then the stop path
+// has no way in from the public API, so the test executable compiles
+// this header with a seam that lets one be installed. The shipped
+// library has neither the pointer nor the branch: the other definition
+// returns a token with no state, which the scope tests once per run.
+inline ex::inplace_stop_source*& installed_stop_source() noexcept {
+  static ex::inplace_stop_source* src = nullptr;
+  return src;
+}
+
+[[nodiscard]] inline ex::inplace_stop_token blocking_stop_token() noexcept {
+  ex::inplace_stop_source* const src = installed_stop_source();
+  return src != nullptr ? src->get_token() : ex::inplace_stop_token{};
+}
+#else
+[[nodiscard]] inline ex::inplace_stop_token blocking_stop_token() noexcept {
+  return {};
+}
+#endif
+}  // namespace detail
+
 /// Streams a file into a hasher with every complete window fanned out
 /// over a scheduler; the final window is absorbed by h itself.
 ///
@@ -53,7 +78,10 @@ namespace blake3pp {
 /// @param sched  Where the subtree reductions run.
 /// @param opts   The pipeline knobs.
 /// @throws std::system_error on I/O failure, and whatever the execution
-///         provider raises.
+///         provider raises. A run that was stopped throws
+///         std::errc::operation_canceled; h is then left wherever the
+///         stop found it, as it is after a failed read, and is still
+///         usable for further input.
 template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const std::filesystem::path& path,
@@ -79,7 +107,10 @@ void update_file(hasher& h, const std::filesystem::path& path,
   detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched), plan,
-      {opts.window_bytes, opts.queue_depth, opts.trace, 0});
+      {.window_bytes = opts.window_bytes,
+       .queue_depth = opts.queue_depth,
+       .trace = opts.trace,
+       .stop_token = detail::blocking_stop_token()});
 }
 
 /// Streams a file into a hasher over a scheduler, reporting failure

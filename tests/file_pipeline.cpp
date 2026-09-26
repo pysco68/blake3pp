@@ -400,6 +400,14 @@ struct fake_script {
   // Polls between the ask and the cancelled completion, the way a real
   // ring takes a round or two to give the request back.
   unsigned cancel_after_polls = 0;
+  // Requests stop through `stop_source` as window k's read is about to
+  // be served, which is a stop arriving with windows in flight and the
+  // driver in the middle of a round. -1 for none.
+  int stop_at_window = -1;
+  ex::inplace_stop_source* stop_source = nullptr;
+  // Polls between that request and the failure at fail_at_window, for
+  // the case where the two race.
+  int fail_after_stop_polls = 0;
 };
 
 class fake_driver {
@@ -451,6 +459,13 @@ class fake_driver {
     }
     const std::size_t pick = choose();
     read& r = queued_[pick];
+    if (script_.stop_at_window >= 0 && script_.stop_source != nullptr &&
+        r.off / window_bytes_ ==
+            static_cast<std::uint64_t>(script_.stop_at_window)) {
+      script_.stop_source->request_stop();
+      script_.stop_at_window = -1;  // once
+      return 0;  // the stop lands before this read does
+    }
     if (r.cancelled) {
       if (r.cancel_polls > 0) {
         --r.cancel_polls;
@@ -458,6 +473,7 @@ class fake_driver {
       }
       blake3pp::detail::io_read_op* const op = r.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      ++callbacks_;
       op->done(op, std::make_error_code(std::errc::operation_canceled));
       return 1;
     }
@@ -466,6 +482,7 @@ class fake_driver {
         index == static_cast<unsigned>(script_.fail_at_window)) {
       blake3pp::detail::io_read_op* const op = r.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      ++callbacks_;
       op->done(op, std::make_error_code(std::errc::io_error));
       return 1;
     }
@@ -480,6 +497,7 @@ class fake_driver {
     }
     blake3pp::detail::io_read_op* const op = r.op;
     queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+    ++callbacks_;
     op->done(op, std::error_code{});
     return 1;
   }
@@ -510,20 +528,39 @@ class fake_driver {
   // sweep asked once per read rather than once per round.
   [[nodiscard]] unsigned cancels() const noexcept { return cancels_; }
 
+  // Callbacks this driver has run, for the rule that none may run after
+  // the pipeline has completed.
+  [[nodiscard]] unsigned callbacks() const noexcept { return callbacks_; }
+
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return queued_.size();
   }
 
   void drain() noexcept { queued_.clear(); }
 
+  // A guard past the arena, filled with a byte the content never
+  // contains. Nothing the pipeline does may reach it, so a read that
+  // landed after the run was over, or one that overran its window, shows
+  // up here even without a sanitizer.
+  static constexpr std::size_t guard_bytes = 4096;
+  static constexpr std::byte guard_fill{0xA5};
+
   [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
-    pool_.resize(bytes);
-    return {pool_.data(), pool_.size()};
+    pool_.assign(bytes + guard_bytes, guard_fill);
+    arena_bytes_ = bytes;
+    return {pool_.data(), bytes};
+  }
+
+  [[nodiscard]] bool guard_intact() const noexcept {
+    return std::all_of(pool_.begin() +
+                           static_cast<std::ptrdiff_t>(arena_bytes_),
+                       pool_.end(),
+                       [](std::byte b) { return b == guard_fill; });
   }
 
   // What the scope asked for: the window objects it allocated, in bytes.
   [[nodiscard]] std::size_t pool_bytes() const noexcept {
-    return pool_.size();
+    return arena_bytes_;
   }
 
  private:
@@ -571,6 +608,8 @@ class fake_driver {
   bool woken_ = false;
   int polls_ = 0;
   unsigned cancels_ = 0;
+  unsigned callbacks_ = 0;
+  std::size_t arena_bytes_ = 0;
 };
 
 static_assert(blake3pp::detail::file_driver<fake_driver>);
@@ -1339,6 +1378,352 @@ void fake_run(blake3pp::hasher& h, std::span<const std::byte> content,
   blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
       h, drv, f, std::move(sched),
       {.window_bytes = win, .queue_depth = depth, .in_flight_cap = cap});
+}
+
+// The stop cases all want the driver afterwards -- how many reads it was
+// asked to cancel, how many callbacks it ran -- so they drive the scope
+// themselves rather than through fake_run.
+struct stop_outcome {
+  bool threw = false;
+  std::error_code ec{};
+  unsigned cancels = 0;
+  unsigned callbacks_at_return = 0;
+  unsigned callbacks_after = 0;
+  std::size_t still_queued = 0;
+  bool guard_intact = true;
+};
+
+template <class Sched>
+stop_outcome stop_run(blake3pp::hasher& h, std::span<const std::byte> content,
+                      std::size_t win, Sched sched,
+                      ex::inplace_stop_source& src, fake_script script,
+                      unsigned depth = 4, unsigned cap = 0) {
+  script.stop_source = &src;
+  stop_outcome out;
+  fake_driver drv(content, win, std::move(script));
+  fake_driver::file f(drv);
+  try {
+    blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+        h, drv, f, std::move(sched),
+        {.window_bytes = win,
+         .queue_depth = depth,
+         .in_flight_cap = cap,
+         .stop_token = src.get_token()});
+  } catch (const std::system_error& e) {
+    out.threw = true;
+    out.ec = e.code();
+  }
+  out.cancels = drv.cancels();
+  out.callbacks_at_return = drv.callbacks();
+  out.still_queued = drv.in_flight();
+  // Nothing the pipeline owns may still be reached: every read it was
+  // owed has reported, so a further poll has nothing to run.
+  drv.poll(false);
+  out.callbacks_after = drv.callbacks() - out.callbacks_at_return;
+  out.guard_intact = drv.guard_intact();
+  return out;
+}
+
+TEST_CASE("an external stop mid-file ends the run once, as cancelled") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 12 * win + 777;
+  const auto content = pattern(len, 91);
+
+  // All three answers a device can give about a cancel. The pipeline has
+  // to report the same thing under each.
+  for (const auto mode : {fake_script::cancel_aborts, fake_script::cancel_loses,
+                          fake_script::cancel_ignored}) {
+    CAPTURE(static_cast<int>(mode));
+    ex::inplace_stop_source src;
+    blake3pp::hasher h;
+    const stop_outcome out = stop_run(
+        h, content, win, sched, src,
+        {.cancel_behaviour = mode, .cancel_after_polls = 1,
+         .stop_at_window = 3});
+
+    CHECK(out.threw);
+    CHECK(out.ec == std::errc::operation_canceled);
+    CHECK(out.still_queued == 0);
+    CHECK(out.callbacks_after == 0);
+    CHECK(out.guard_intact);
+  }
+}
+
+TEST_CASE("the sweep asks the device once per read it has not landed") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 12 * win;
+  const auto content = pattern(len, 92);
+  ex::inplace_stop_source src;
+  blake3pp::hasher h;
+  // Reads take two polls to come back, so several are certainly still
+  // reading when the stop lands.
+  const stop_outcome out =
+      stop_run(h, content, win, sched, src,
+               {.cancel_after_polls = 2, .stop_at_window = 2});
+  CHECK(out.threw);
+  CHECK(out.ec == std::errc::operation_canceled);
+  // At least the one the driver was about to serve, and never more than
+  // the reads the plan allows in flight.
+  CHECK(out.cancels >= 1);
+  CHECK(out.cancels <= 4);
+  CHECK(out.still_queued == 0);
+  CHECK(out.callbacks_after == 0);
+  CHECK(out.guard_intact);
+}
+
+TEST_CASE("a failure outranks the stop it caused") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 12 * win + 31;
+  const auto content = pattern(len, 93);
+  ex::inplace_stop_source src;
+  blake3pp::hasher h;
+  // The read at window 2 fails; the external stop lands on window 3,
+  // which the driver serves after it. The caller hears the failure.
+  const stop_outcome out = stop_run(
+      h, content, win, sched, src,
+      {.fail_at_window = 2, .cancel_after_polls = 1, .stop_at_window = 3});
+  CHECK(out.threw);
+  CHECK(out.ec == std::errc::io_error);
+  CHECK(out.still_queued == 0);
+  CHECK(out.callbacks_after == 0);
+  CHECK(out.guard_intact);
+}
+
+TEST_CASE("a stop requested before the run submits no read at all") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 6 * win;
+  const auto content = pattern(len, 94);
+  ex::inplace_stop_source src;
+  src.request_stop();
+  blake3pp::hasher h;
+  const stop_outcome out = stop_run(h, content, win, sched, src, {});
+  CHECK(out.threw);
+  CHECK(out.ec == std::errc::operation_canceled);
+  CHECK(out.callbacks_at_return == 0);
+  CHECK(out.cancels == 0);
+  CHECK(out.still_queued == 0);
+}
+
+TEST_CASE("a stop lands on the last window and on one window in flight") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+
+  SUBCASE("the last window, which carries the message end") {
+    // Six windows and a short tail: the stop arrives as the last one is
+    // served, so the edge chain is what sees it.
+    const std::size_t len = 6 * win + 4321;
+    const auto content = pattern(len, 95);
+    ex::inplace_stop_source src;
+    blake3pp::hasher h;
+    const stop_outcome out =
+        stop_run(h, content, win, sched, src, {.stop_at_window = 6});
+    CHECK(out.threw);
+    CHECK(out.ec == std::errc::operation_canceled);
+    CHECK(out.still_queued == 0);
+    CHECK(out.callbacks_after == 0);
+    CHECK(out.guard_intact);
+  }
+
+  SUBCASE("one window in flight at a time") {
+    const std::size_t len = 8 * win;
+    const auto content = pattern(len, 96);
+    ex::inplace_stop_source src;
+    blake3pp::hasher h;
+    const stop_outcome out = stop_run(h, content, win, sched, src,
+                                      {.stop_at_window = 3}, 4, /*cap=*/1);
+    CHECK(out.threw);
+    CHECK(out.ec == std::errc::operation_canceled);
+    CHECK(out.still_queued == 0);
+    CHECK(out.callbacks_after == 0);
+    CHECK(out.guard_intact);
+  }
+}
+
+TEST_CASE("a stop ends the run on an inline scheduler and on one thread") {
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 10 * win + 5;
+  const auto content = pattern(len, 97);
+
+  SUBCASE("inline") {
+    ex::inplace_stop_source src;
+    blake3pp::hasher h;
+    const stop_outcome out = stop_run(h, content, win, inline_scheduler{}, src,
+                                      {.stop_at_window = 4});
+    CHECK(out.threw);
+    CHECK(out.ec == std::errc::operation_canceled);
+    CHECK(out.still_queued == 0);
+    CHECK(out.callbacks_after == 0);
+    CHECK(out.guard_intact);
+  }
+  SUBCASE("one thread") {
+    one_thread_pool pool;
+    ex::inplace_stop_source src;
+    blake3pp::hasher h;
+    const stop_outcome out = stop_run(h, content, win, pool.get_scheduler(),
+                                      src, {.stop_at_window = 4});
+    CHECK(out.threw);
+    CHECK(out.ec == std::errc::operation_canceled);
+    CHECK(out.still_queued == 0);
+    CHECK(out.callbacks_after == 0);
+    CHECK(out.guard_intact);
+  }
+}
+
+TEST_CASE("a stop requested from another thread reaches a parked driver") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 64 * win;
+  const auto content = pattern(len, 98);
+  ex::inplace_stop_source src;
+  blake3pp::hasher h;
+  // Nothing in the driver's own round requests this one: another thread
+  // does, which is the path that needs wake() to break a blocking poll.
+  std::thread stopper([&src] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    src.request_stop();
+  });
+  fake_driver drv(content, win, {.cancel_after_polls = 1});
+  fake_driver::file f(drv);
+  bool threw = false;
+  std::error_code ec;
+  try {
+    blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+        h, drv, f, sched,
+        {.window_bytes = win, .queue_depth = 4,
+         .stop_token = src.get_token()});
+  } catch (const std::system_error& e) {
+    threw = true;
+    ec = e.code();
+  }
+  stopper.join();
+  // Either it finished the file before the stop arrived or it stopped;
+  // both are correct, and neither may leave a read owed.
+  if (threw) {
+    CHECK(ec == std::errc::operation_canceled);
+  }
+  CHECK(drv.in_flight() == 0);
+}
+
+// The blocking entry point has no stop parameter until Phase 7, so the
+// only way into its stop path is the seam the test target compiles.
+// What it has to prove is the mapping and the aftermath: one
+// operation_canceled, and a hasher that is still a hasher.
+// The real driver, with reads genuinely on the ring. The buffer arena
+// belongs to the io_driver and is freed when update_file() returns, so a
+// read that landed after the pipeline completed is a write into freed
+// memory -- which is what the sanitizer lanes are here to catch, and a
+// stricter canary than any pattern the test could write itself.
+//
+// Whether a given attempt stops mid-file is a race with the device, so
+// this runs several and reports how many landed; every one of them, stop
+// or no stop, has to leave the driver owing nothing.
+TEST_CASE("a real driver stops mid-file with reads in flight") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 48 * win + 4095;
+  const auto content = pattern(len, 100);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+
+  int stopped = 0;
+  constexpr int attempts = 8;
+  for (int i = 0; i < attempts; ++i) {
+    ex::inplace_stop_source src;
+    blake3pp::detail::installed_stop_source() = &src;
+    blake3pp::hasher h;
+    std::error_code ec;
+    // Requested from another thread while the driver is inside poll():
+    // the path that needs wake() to break a blocking poll, and the one
+    // ThreadSanitizer has something to say about.
+    std::thread stopper([&src, i] {
+      std::this_thread::sleep_for(std::chrono::microseconds(50 * i));
+      src.request_stop();
+    });
+    blake3pp::update_file(h, f.path, sched, ec, {.window_bytes = win});
+    stopper.join();
+    blake3pp::detail::installed_stop_source() = nullptr;
+    if (ec) {
+      CHECK(ec == std::errc::operation_canceled);
+      ++stopped;
+    } else {
+      CHECK(h.finalize() == expected);
+    }
+  }
+  MESSAGE("stopped mid-file on " << stopped << " of " << attempts
+                                 << " attempts");
+  // The file is large enough that at least one of a spread of delays has
+  // to land inside it; a run where none did has not tested anything.
+  CHECK(stopped > 0);
+}
+
+TEST_CASE("a stopped update_file reports operation_canceled") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 20 * win + 909;
+  const auto content = pattern(len, 99);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+
+  SUBCASE("stopped before it starts, so the hasher is untouched") {
+    ex::inplace_stop_source src;
+    src.request_stop();
+    blake3pp::detail::installed_stop_source() = &src;
+    blake3pp::hasher h;
+    std::error_code ec;
+    CHECK_THROWS_AS(
+        blake3pp::update_file(h, f.path, sched, {.window_bytes = win}),
+        std::system_error);
+    try {
+      blake3pp::update_file(h, f.path, sched, {.window_bytes = win});
+    } catch (const std::system_error& e) {
+      ec = e.code();
+    }
+    CHECK(ec == std::errc::operation_canceled);
+
+    // Nothing was read, so the same hasher still hashes the file to the
+    // digest a fresh one would produce.
+    blake3pp::detail::installed_stop_source() = nullptr;
+    blake3pp::update_file(h, f.path, sched, {.window_bytes = win});
+    CHECK(h.finalize() == expected);
+  }
+
+  SUBCASE("the error_code overload reports it instead of throwing") {
+    ex::inplace_stop_source src;
+    src.request_stop();
+    blake3pp::detail::installed_stop_source() = &src;
+    blake3pp::hasher h;
+    std::error_code ec;
+    blake3pp::update_file(h, f.path, sched, ec, {.window_bytes = win});
+    CHECK(ec == std::errc::operation_canceled);
+    blake3pp::detail::installed_stop_source() = nullptr;
+  }
+
+  SUBCASE("stopped part-way, and the hasher still works afterwards") {
+    ex::inplace_stop_source src;
+    blake3pp::detail::installed_stop_source() = &src;
+    blake3pp::hasher h;
+    std::thread stopper([&src] { src.request_stop(); });
+    std::error_code ec;
+    blake3pp::update_file(h, f.path, sched, ec, {.window_bytes = win});
+    stopper.join();
+    blake3pp::detail::installed_stop_source() = nullptr;
+    // A race: the file is small enough that it may finish first. Either
+    // outcome is correct, and neither may leave the hasher broken.
+    if (ec) {
+      CHECK(ec == std::errc::operation_canceled);
+    }
+    // Whatever it absorbed, it is still a hasher: it takes more input
+    // and finalizes, and a fresh one over the same file is unaffected.
+    h.update(content);
+    (void)h.finalize();
+    blake3pp::hasher again;
+    blake3pp::update_file(again, f.path, sched, {.window_bytes = win});
+    CHECK(again.finalize() == expected);
+  }
 }
 
 TEST_CASE("the pipeline matches the sequential hash in every mode") {

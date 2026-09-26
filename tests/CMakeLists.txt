@@ -52,6 +52,12 @@ target_include_directories(blake3pp_tests PRIVATE
 if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
   target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_REDUCED_CASES=1)
 endif()
+# The blocking update_file() has no stop parameter until Phase 7 exposes
+# one, so the seam in <blake3pp/parallel_io.hpp> that installs a stop is
+# compiled here and nowhere else. Every TU of this target gets it, which
+# is what keeps the inline function it guards one definition; the library
+# itself never includes that header.
+target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_PIPELINE_STOP=1)
 target_link_libraries(blake3pp_tests PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
