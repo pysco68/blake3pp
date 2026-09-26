@@ -32,6 +32,7 @@
 // the stopwatch that settles it per machine.
 
 #include <algorithm>
+#include <array>
 #include <new>
 #include <numeric>
 #include <bit>
@@ -49,6 +50,7 @@
 #include <optional>
 #include <ostream>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -224,6 +226,104 @@ double iowq_cpu_seconds(const std::map<std::string, std::uint64_t>& before,
   (void)delta;
   return 0.0;
 #endif
+}
+
+// Whole-machine counters around one rep, so the kernel's share of the
+// machine can be told from the pool's. /proc/stat's first line is printed
+// as cores over the rep's wall time. /proc/interrupts is read per CPU, so
+// a CPU that services the device can be told from a slow one. Linux only,
+// and diagnostic only: nothing passes or fails on them.
+struct kernel_counters {
+  static constexpr const char* names[] = {"user",   "nice", "sys",     "idle",
+                                          "iowait", "irq",  "softirq", "steal"};
+  std::array<std::uint64_t, 8> stat{};
+  std::vector<std::uint64_t> irqs;  // per-CPU interrupt totals
+  std::chrono::steady_clock::time_point at{};
+  bool valid = false;
+};
+
+kernel_counters read_kernel_counters() {
+  kernel_counters k;
+  k.at = std::chrono::steady_clock::now();
+#if defined(__linux__)
+  {
+    std::ifstream stat("/proc/stat");
+    std::string tag;
+    if (stat >> tag && tag == "cpu") {
+      for (auto& v : k.stat) {
+        stat >> v;
+      }
+      k.valid = !stat.fail();
+    }
+  }
+  {
+    // The header names the CPUs; every line below it is one source with
+    // one count per CPU, except the totals at the end (ERR, MIS) with a
+    // single number, which the per-CPU read rejects.
+    std::ifstream irq("/proc/interrupts");
+    std::string line;
+    std::size_t ncpu = 0;
+    if (std::getline(irq, line)) {
+      std::istringstream header(line);
+      std::string tok;
+      while (header >> tok) {
+        ncpu += tok.starts_with("CPU") ? 1 : 0;
+      }
+    }
+    k.irqs.assign(ncpu, 0);
+    while (std::getline(irq, line)) {
+      std::istringstream row(line);
+      std::string source;
+      row >> source;
+      std::vector<std::uint64_t> counts;
+      std::uint64_t v = 0;
+      while (counts.size() < ncpu && row >> v) {
+        counts.push_back(v);
+      }
+      if (counts.size() != ncpu) {
+        continue;
+      }
+      for (std::size_t c = 0; c < ncpu; ++c) {
+        k.irqs[c] += counts[c];
+      }
+    }
+  }
+#endif
+  return k;
+}
+
+struct kernel_deltas {
+  std::array<double, 8> cores{};    // each /proc/stat field over the wall
+  std::vector<std::uint64_t> irqs;  // per-CPU interrupts during the rep
+  bool valid = false;
+};
+
+kernel_deltas kernel_delta(const kernel_counters& before,
+                           const kernel_counters& after) {
+  kernel_deltas d;
+  if (!before.valid || !after.valid) {
+    return d;
+  }
+  const double wall = std::chrono::duration<double>(after.at - before.at).count();
+#if defined(__linux__)
+  const long hz = ::sysconf(_SC_CLK_TCK);
+#else
+  const long hz = 0;
+#endif
+  if (wall <= 0.0 || hz <= 0) {
+    return d;
+  }
+  for (std::size_t i = 0; i < d.cores.size(); ++i) {
+    d.cores[i] = static_cast<double>(after.stat[i] - before.stat[i]) /
+                 static_cast<double>(hz) / wall;
+  }
+  const std::size_t n = std::min(before.irqs.size(), after.irqs.size());
+  d.irqs.resize(n);
+  for (std::size_t c = 0; c < n; ++c) {
+    d.irqs[c] = after.irqs[c] - before.irqs[c];
+  }
+  d.valid = true;
+  return d;
 }
 
 // The record kinds as Chrome trace JSON, one complete ("X") event per
@@ -402,7 +502,8 @@ bool write_chrome_trace(const std::string& path,
 // busy the pool was, and with agent records what each CPU delivered.
 void print_trace_summary(const blake3pp::trace_buffer& trace,
                          unsigned threads, double iowq_cpu_s,
-                         double achieved_gib_s = 0.0) {
+                         double achieved_gib_s = 0.0,
+                         const kernel_deltas* kernel = nullptr) {
   const auto windows = trace.windows();
   if (windows.empty()) {
     println(stdout, "  trace: no window records");
@@ -449,10 +550,12 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     println(stdout,
             "    driver busy {:5.1f}% of its own {:.3f} s, {} iterations, {} "
             "polls ({} blocking, {} woken), {} completions, {} admission "
-            "stalls, reducer held at most {}",
+            "stalls, reducer held at most {}, at most {} reads and {} "
+            "windows in flight",
             100.0 * static_cast<double>(d.busy_ns) / driver_ns,
             driver_ns / 1e9, d.iterations, d.polls, d.blocking_polls,
-            d.wakes, d.queue_runs, d.admission_stalls, d.max_pending);
+            d.wakes, d.queue_runs, d.admission_stalls, d.max_pending,
+            d.max_reads_in_flight, d.max_windows_in_flight);
   }
 
   // Per-window latencies, as medians: with windows overlapping, an
@@ -485,8 +588,17 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
             100.0 * busy / (static_cast<double>(threads) * wall_ns), threads,
             active / static_cast<double>(fanned));
   }
-  println(stdout, "    io-wq cpu = {:.2f} cores (worker threads' cpu / wall)",
-          iowq_cpu_s / (wall_ns / 1e9));
+  std::string machine;
+  if (kernel != nullptr && kernel->valid) {
+    machine = "; machine (/proc/stat):";
+    for (std::size_t i = 0; i < kernel->cores.size(); ++i) {
+      machine += std::format(" {} {:.2f}", kernel_counters::names[i],
+                             kernel->cores[i]);
+    }
+    machine += " cores";
+  }
+  println(stdout, "    io-wq cpu = {:.2f} cores (worker threads' cpu / wall){}",
+          iowq_cpu_s / (wall_ns / 1e9), machine);
 
   const auto agents = trace.agents();
   if (agents.empty() && trace.dropped_agents() == 0) {
@@ -517,15 +629,22 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
   std::vector<double> rates;
   println(stdout, "    {} agent records ({} dropped) on {} cpus:",
           agents.size(), trace.dropped_agents(), per_cpu.size());
-  println(stdout, "      {:>5} {:>8} {:>8} {:>10} {:>14}", "cpu", "records",
-          "parts", "busy ms", "effective");
+  const bool irqs = kernel != nullptr && kernel->valid && !kernel->irqs.empty();
+  println(stdout, "      {:>5} {:>8} {:>8} {:>10} {:>14}{}", "cpu", "records",
+          "parts", "busy ms", "effective", irqs ? "      irqs" : "");
   for (const auto& [cpu, c] : per_cpu) {
     const double secs = static_cast<double>(c.busy_ns) / 1e9;
     rates.push_back(b3tool::gib_per_s(c.bytes, secs));
-    println(stdout, "      {:>5} {:>8} {:>8} {:>10.1f} {}",
+    std::string irq_col;
+    if (irqs) {
+      irq_col = cpu < kernel->irqs.size()
+                    ? std::format("  {:>8}", kernel->irqs[cpu])
+                    : std::string{"         -"};
+    }
+    println(stdout, "      {:>5} {:>8} {:>8} {:>10.1f} {}{}",
             cpu == ~std::uint32_t{0} ? std::string{"?"} : std::to_string(cpu),
             c.records, c.parts, static_cast<double>(c.busy_ns) / 1e6,
-            b3tool::rate(c.bytes, secs));
+            b3tool::rate(c.bytes, secs), irq_col);
   }
   if (!rates.empty()) {
     std::ranges::sort(rates);
@@ -801,11 +920,13 @@ int main(int argc, char** argv) {
     b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
     double best = 1e30;
     blake3pp::digest got{};
+    kernel_deltas kernel;
     for (int r = 0; r < reps; ++r) {
       cooldown();
       if (trace) {
         trace->clear();
       }
+      const kernel_counters kernel_before = read_kernel_counters();
       const blake3pp::detail::pipeline_plan plan =
           blake3pp::detail::plan_pipeline(0, opts.window_bytes,
                                           opts.queue_depth, false, total);
@@ -822,6 +943,7 @@ int main(int argc, char** argv) {
            .trace = io_opts.trace});
       got = h.finalize();
       const auto t1 = std::chrono::steady_clock::now();
+      kernel = kernel_delta(kernel_before, read_kernel_counters());
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
     println(stdout, "{:<10} {}   ({}...)  [{}]", "null",
@@ -832,7 +954,8 @@ int main(int argc, char** argv) {
     if (trace) {
       print_trace_summary(*trace, threads, 0.0,
                           b3tool::gib_per_s(static_cast<std::size_t>(total),
-                                            best));
+                                            best),
+                          &kernel);
       const std::string file = trace_file_name(trace_path, "null", false);
       if (write_chrome_trace(file, *trace, "blake3pp_bench_file null",
                              threads)) {
@@ -932,17 +1055,21 @@ int main(int argc, char** argv) {
     blake3pp::digest d{};
     std::map<std::string, std::uint64_t> iowq_before;
     double iowq_cpu_s = 0.0;
+    kernel_counters kernel_before;
+    kernel_deltas kernel;
     const double best = best_cold_seconds(
         reps, cold, [&] { d = fn(); },
         [&] {
           if (trace) {
             trace->clear();
             iowq_before = iowq_cpu_ticks();
+            kernel_before = read_kernel_counters();
           }
         },
         [&] {
           if (trace) {
             iowq_cpu_s = iowq_cpu_seconds(iowq_before, iowq_cpu_ticks());
+            kernel = kernel_delta(kernel_before, read_kernel_counters());
           }
         });
     println(stdout, "{:<10} {}   ({}...)  [{:3.0f}% of raw]", label,
@@ -951,7 +1078,7 @@ int main(int argc, char** argv) {
     if (trace) {
       print_trace_summary(
           *trace, threads_for_trace, iowq_cpu_s,
-          b3tool::gib_per_s(static_cast<std::size_t>(bytes), best));
+          b3tool::gib_per_s(static_cast<std::size_t>(bytes), best), &kernel);
       const std::string file = trace_file_name(trace_path, label, !seq_only);
       if (write_chrome_trace(file, *trace,
                              std::format("blake3pp_bench_file {}", label),
