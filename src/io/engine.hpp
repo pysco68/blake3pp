@@ -58,7 +58,7 @@ class polled_reader_engine {
     requires std::constructible_from<typename C::file, C&,
                                      const std::filesystem::path&, bool>
       : window_(rounded_window_bytes(opts.window_bytes)),
-        qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
+        qd_(clamp_queue_depth(opts.queue_depth)),
         slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
@@ -80,7 +80,7 @@ class polled_reader_engine {
   polled_reader_engine(std::uint64_t size, const file_reader_options& opts)
     requires std::constructible_from<typename C::file, C&, std::uint64_t>
       : window_(rounded_window_bytes(opts.window_bytes)),
-        qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
+        qd_(clamp_queue_depth(opts.queue_depth)),
         slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
@@ -237,7 +237,7 @@ class writer_engine {
   writer_engine(const std::filesystem::path& path,
                 const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
-        qd_(std::clamp(opts.queue_depth, 2u, max_queue_depth)),
+        qd_(clamp_queue_depth(opts.queue_depth)),
         pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
         backend_(path, opts, qd_) {}
 

@@ -55,6 +55,13 @@ constexpr std::size_t max_window_bytes =
       std::clamp<std::size_t>(requested, 64 * 1024, max_window_bytes));
 }
 
+// The queue depth the engines and the pipeline actually use for a
+// requested one: at least two, so one window can be read while another
+// is hashed, and at most max_queue_depth.
+[[nodiscard]] constexpr unsigned clamp_queue_depth(unsigned requested) noexcept {
+  return std::clamp(requested, 2u, max_queue_depth);
+}
+
 struct file_reader_options {
   // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB,
   // max 1 GiB.
