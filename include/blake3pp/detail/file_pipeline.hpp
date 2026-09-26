@@ -672,7 +672,10 @@ struct pipeline_plan {
 //
 // and the scope is what decides how many of those exist at once: a
 // window is a buffer, a part table and an operation cell, all allocated
-// at construction, and a chain may only start when one is free. The
+// at construction, and a chain may only start when one is free and
+// fewer than the plan's reads are still reading. The two bounds are
+// separate on purpose: the device wants a few reads in flight, the pool
+// wants windows to work on, and one number cannot serve both. The
 // reducer is what lets them finish in any order.
 template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
 class window_scope {
@@ -688,7 +691,8 @@ class window_scope {
         trace_(opts.trace),
         ops_(resolve(h.selected_arch())),
         window_bytes_(plan.window_bytes),
-        count_(plan.reads_in_flight),
+        count_(plan.windows),
+        reads_in_flight_(plan.reads_in_flight),
         in_flight_cap_(opts.in_flight_cap == 0
                            ? count_
                            : std::min<unsigned>(opts.in_flight_cap, count_)),
@@ -817,8 +821,11 @@ class window_scope {
     assert(in_flight_ == 0 && "run_until returned with a window in flight");
 
     if (trace_ != nullptr) {
-      trace_->driver().admission_stalls = admission_stalls_;
-      trace_->driver().max_pending = max_pending_;
+      driver_stats& d = trace_->driver();
+      d.admission_stalls = admission_stalls_;
+      d.max_pending = max_pending_;
+      d.max_reads_in_flight = max_reading_;
+      d.max_windows_in_flight = max_windows_;
     }
     if (eptr_) {
       std::rethrow_exception(eptr_);
@@ -865,7 +872,11 @@ class window_scope {
     loop_.run_until(status_, [&] {
       // Every window that can start, started before the one flush this
       // round: the reads of a whole batch reach the OS in one call.
-      while (!stop_ && in_flight_ < in_flight_cap_ && free_ != nullptr) {
+      // A window holds a read slot from its submit until its read lands,
+      // and a buffer until it has been reduced; the device is fed by the
+      // first bound and the pool by the second.
+      while (!stop_ && in_flight_ < in_flight_cap_ &&
+             reading_ < reads_in_flight_ && free_ != nullptr) {
         if (next_offset_ >= file_bytes_) {
           break;
         }
@@ -881,6 +892,10 @@ class window_scope {
         free_ = w->next_free;
         claim_record(*w);
         ++in_flight_;
+        w->reading = true;
+        ++reading_;
+        max_reading_ = std::max(max_reading_, reading_);
+        max_windows_ = std::max(max_windows_, in_flight_);
         in_flight_nodes_ += w->plan.node_cost;
         status_.outstanding = in_flight_;
         if (w->last) {
@@ -986,6 +1001,7 @@ class window_scope {
     unsigned slot = 0;
     bool last = false;
     bool short_first = false;
+    bool reading = false;  // submitted, and the read has not landed
     window_plan plan;
     std::size_t nodes = 0;  // nodes the fold produced
   };
@@ -1039,7 +1055,7 @@ class window_scope {
   [[nodiscard]] auto read_only_chain(window& w) {
     return ex::then(loop_.read(file_, w.offset, w.buffer.first(w.bytes)),
                     [this, &w](std::span<const std::byte>) noexcept {
-                      stamp_ready(w);
+                      read_landed(w);
                       // A short first window with nothing worth fanning
                       // out is all head, and the hasher takes it now; a
                       // last window is all tail, and the hasher takes it
@@ -1084,7 +1100,7 @@ class window_scope {
   }
 
   [[nodiscard]] auto edge_compress_stage(window& w) {
-    stamp_ready(w);
+    read_landed(w);
     absorb_head(w);
     const window_plan& p = w.plan;
     w.compress.prepare_edge(ops_, w.buffer.data() + p.head_bytes,
@@ -1119,7 +1135,7 @@ class window_scope {
   }
 
   [[nodiscard]] auto compress_stage(window& w) {
-    stamp_ready(w);
+    read_landed(w);
     if constexpr (Traced) {
       return ex::then(compress_on<true>(sched_, w.compress),
                       [this, &w](const cv_type& cv) noexcept {
@@ -1149,7 +1165,9 @@ class window_scope {
         "in flight. The reducer holds " +
         std::to_string(reducer_.pending()) + " of " +
         std::to_string(reducer_capacity_) + " nodes, " +
-        std::to_string(in_flight_) + " windows are in flight holding " +
+        std::to_string(in_flight_) + " windows are in flight (" +
+        std::to_string(reading_) + " reading, of " +
+        std::to_string(reads_in_flight_) + " allowed) holding " +
         std::to_string(in_flight_nodes_) + " reserved nodes, and the next "
         "window reserves " + std::to_string(next_window_cost()) +
         " more. The capacity has to exceed what the windows already read "
@@ -1369,6 +1387,7 @@ class window_scope {
       ec_ = ec;
     }
     stop_ = true;
+    release_read_slot(w);
     --in_flight_;
     in_flight_nodes_ -= w.plan.node_cost;
     if (&w != last_window_) {
@@ -1382,6 +1401,7 @@ class window_scope {
       eptr_ = std::move(e);
     }
     stop_ = true;
+    release_read_slot(w);
     --in_flight_;
     in_flight_nodes_ -= w.plan.node_cost;
     if (&w != last_window_) {
@@ -1422,9 +1442,19 @@ class window_scope {
     }
   }
 
-  void stamp_ready(window& w) noexcept {
+  // The read is in memory: the window gives its read slot back and
+  // keeps its buffer. On the driver, inside the read's completion.
+  void read_landed(window& w) noexcept {
+    release_read_slot(w);
     if (w.rec != nullptr) {
       w.rec->t_ready = trace_->now();
+    }
+  }
+
+  void release_read_slot(window& w) noexcept {
+    if (w.reading) {
+      w.reading = false;
+      --reading_;
     }
   }
 
@@ -1460,7 +1490,8 @@ class window_scope {
   trace_buffer* trace_ = nullptr;
   const kern::kernel_ops* ops_ = nullptr;
   std::size_t window_bytes_ = 0;
-  unsigned count_ = 0;
+  unsigned count_ = 0;            // window objects, and windows in flight at most
+  unsigned reads_in_flight_ = 0;  // windows reading at most: what the device sees
   unsigned in_flight_cap_ = 0;
   std::uint64_t base_count_ = 0;        // the hasher's byte count at start
   std::size_t head_window_bytes_ = 0;   // the short first window, or zero
@@ -1481,6 +1512,9 @@ class window_scope {
   std::uint64_t next_offset_ = 0;
   std::uint64_t index_ = 0;
   unsigned in_flight_ = 0;
+  unsigned reading_ = 0;  // windows whose read has not landed
+  unsigned max_reading_ = 0;
+  unsigned max_windows_ = 0;
   std::size_t in_flight_nodes_ = 0;
   std::uint64_t admission_stalls_ = 0;
   std::size_t max_pending_ = 0;

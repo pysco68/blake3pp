@@ -426,6 +426,11 @@ class fake_driver {
     return {pool_.data(), pool_.size()};
   }
 
+  // What the scope asked for: the window objects it allocated, in bytes.
+  [[nodiscard]] std::size_t pool_bytes() const noexcept {
+    return pool_.size();
+  }
+
  private:
   struct read {
     blake3pp::detail::io_read_op* op;
@@ -1391,9 +1396,10 @@ TEST_CASE("the driver records where its own thread went") {
   CHECK(d.queue_runs >= 12);
   CHECK(d.busy_ns + d.parked_ns > 0);
   CHECK(d.blocking_polls <= d.polls);
-  // Every window handed back from the pool wakes the driver at most
-  // once, and a run with windows in flight has to have been woken.
-  CHECK(d.wakes > 0);
+  // A wake is a blocking poll released with no completion of its own,
+  // so there is at most one per blocking poll, and there need not be
+  // any: a driver that finds every window already back on its run
+  // queue never sleeps for the pool.
   CHECK(d.wakes <= d.blocking_polls);
   // The default reducer capacity is far above what a twelve-window file
   // decomposes into.
@@ -1670,6 +1676,61 @@ TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the fi
   // An unknown size leaves the count to the budget; an empty file has
   // no windows at all.
   CHECK(plan_pipeline(0, 8 * mib, 4, false, 0).windows == 16);
+}
+
+// The two bounds, apart: with two reads allowed and eight windows, the
+// device never sees a third read while the pool, held slow by a
+// one-thread scheduler that sleeps per node, fills every window object.
+// The cap on windows in flight still wins over both.
+TEST_CASE("reads in flight stay under the plan while windows fill the pool") {
+  using blake3pp::detail::pipeline_plan;
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 16 * win;
+  const auto content = pattern(len, 97);
+  const pipeline_plan plan{win, 2, 8, 0, false};
+
+  for (const unsigned cap : {0u, 1u}) {
+    CAPTURE(cap);
+    one_thread_pool pool(std::chrono::milliseconds(5));
+    fake_driver drv(content, win);
+    fake_driver::file f(drv);
+    std::vector<blake3pp::window_record> records(20);
+    blake3pp::trace_buffer trace(records);
+    blake3pp::hasher h;
+    blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+        h, drv, f, pool.get_scheduler(), plan,
+        {.window_bytes = win,
+         .queue_depth = 2,
+         .trace = &trace,
+         .in_flight_cap = cap});
+    CHECK(h.finalize() == blake3pp::hash(content));
+    CHECK(drv.pool_bytes() == 8 * win);
+    const auto& d = trace.driver();
+    CHECK(d.max_reads_in_flight <= 2);
+    if (cap == 0) {
+      CHECK(d.max_windows_in_flight == 8);
+    } else {
+      CHECK(d.max_windows_in_flight == 1);
+      CHECK(d.max_reads_in_flight == 1);
+    }
+    MESSAGE("cap " << cap << ": max reads " << d.max_reads_in_flight
+                   << ", max windows " << d.max_windows_in_flight);
+  }
+}
+
+// A file of three windows gets three window objects, whatever the
+// budget would buy.
+TEST_CASE("a three-window file allocates exactly three windows") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const auto content = pattern(3 * win, 98);
+  fake_driver drv(content, win);
+  fake_driver::file f(drv);
+  blake3pp::hasher h;
+  blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+      h, drv, f, sched, {.window_bytes = win, .queue_depth = 4});
+  CHECK(h.finalize() == blake3pp::hash(content));
+  CHECK(drv.pool_bytes() == 3 * win);
 }
 
 // A hasher part-way through a message is brought back onto the window

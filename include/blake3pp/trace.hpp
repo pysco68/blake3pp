@@ -131,6 +131,13 @@ struct driver_stats {
   /// The most subtrees the reducer held at once: how far ahead of the
   /// tree the reads ran, and what the node storage has to cover.
   std::uint64_t max_pending;
+  /// The most reads submitted and not yet landed at once: what the
+  /// device saw, bounded by the queue depth.
+  std::uint64_t max_reads_in_flight;
+  /// The most windows in flight at once -- reading, on the pool or
+  /// waiting to reduce -- bounded by the window objects the plan
+  /// allocated.
+  std::uint64_t max_windows_in_flight;
 };
 
 static_assert(std::is_trivially_copyable_v<window_record>);
