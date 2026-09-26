@@ -36,7 +36,6 @@
 
 #include "io/backend.hpp"
 #include "io/engine.hpp"
-#include "io/null_backend.hpp"
 #include "io/stdio_backend.hpp"
 #if defined(__unix__) || defined(__APPLE__)
 #include "io/pread_backend.hpp"
@@ -343,10 +342,6 @@ TEST_CASE("callbacks run only inside poll") {
       "stdio", [&](io_impl::stdio_context& c) {
         return io_impl::stdio_context::file(c, f.path, /*direct_io=*/false);
       });
-  check_callback_discipline<io_impl::null_context>(
-      "null", [](io_impl::null_context& c) {
-        return io_impl::null_context::file(c, 16384);
-      });
 }
 
 TEST_CASE("a cancelled read still reports exactly once, from poll") {
@@ -393,12 +388,6 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
         return io_impl::stdio_context::file(c, f.path, /*direct_io=*/false);
       },
       expect);
-  check_cancel_discipline<io_impl::null_context>(
-      "null",
-      [](io_impl::null_context& c) {
-        return io_impl::null_context::file(c, 64 * 1024);
-      },
-      {});
 }
 
 TEST_CASE("the engine survives a context that finishes in pieces and out of order") {
@@ -614,10 +603,6 @@ TEST_CASE("wake() releases a blocked poll from another thread") {
     check(ctx);
   }
 #endif
-  {
-    io_impl::null_context ctx({}, 4);
-    check(ctx);
-  }
 }
 
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
@@ -754,37 +739,6 @@ TEST_CASE("a context destroyed with a wake pending tears down cleanly") {
   check([] { return std::make_unique<io_impl::gcd_context>(
                  io_impl::reader_context_options{}, 4u); });
 #endif
-  check([] { return std::make_unique<io_impl::null_context>(
-                 io_impl::reader_context_options{}, 4u); });
-}
-
-TEST_CASE("the null source hashes the pattern it was filled with") {
-  // A size that is not a window multiple: the last window is short, which
-  // is where a reader that mis-sizes the tail shows up as a wrong digest.
-  constexpr std::uint64_t size = 5 * 64 * 1024 + 4321;
-  constexpr std::size_t window = 64 * 1024;
-  io_impl::polled_reader_engine<io_impl::null_context> r(
-      size, {.window_bytes = window, .queue_depth = 3});
-  CHECK(r.backend_name() == "null");
-  const auto pat = pattern(window, 97);
-  const auto pool = r.pool();
-  for (std::size_t off = 0; off < pool.size(); off += window) {
-    std::memcpy(pool.data() + off, pat.data(),
-                std::min(window, pool.size() - off));
-  }
-  blake3pp::hasher h;
-  while (auto w = r.next()) {
-    h.update(std::span<const std::byte>{w->data, w->bytes});
-    r.release(*w);
-  }
-  blake3pp::hasher expect;
-  for (std::uint64_t done = 0; done < size;) {
-    const auto n =
-        static_cast<std::size_t>(std::min<std::uint64_t>(window, size - done));
-    expect.update(std::span<const std::byte>{pat.data(), n});
-    done += n;
-  }
-  CHECK(h.finalize() == expect.finalize());
 }
 
 TEST_CASE("the degradation ladder keeps its backend strings") {

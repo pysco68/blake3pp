@@ -172,6 +172,17 @@ TEST_CASE("wake releases a memory driver blocked in poll") {
   CHECK(ran == 0);
 }
 
+// A wake nobody consumed must not keep anything alive or block the
+// destructor: the last thing a driver sees can be a wake for a poll that
+// never comes.
+TEST_CASE("a memory driver destroyed with a wake pending tears down cleanly") {
+  {
+    detail::memory_driver drv;
+    drv.wake();
+  }
+  CHECK(true);  // reaching here without a hang or a crash is the check
+}
+
 TEST_CASE("two spans share one memory driver") {
   const auto a = pattern(8 * 1024, 7);
   const auto b = pattern(8 * 1024, 8);

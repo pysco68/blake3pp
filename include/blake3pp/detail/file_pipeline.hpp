@@ -58,9 +58,10 @@
 // which is the same rule as the teardown drain, reached from the other
 // direction.
 //
-// A template over file_driver: io_driver for a real device, the bench's
-// driver over null_context for a pipeline measured with no device under
-// it, and a fake driver in the tests.
+// A template over file_driver: io_driver for a real device,
+// memory_driver for a span already in memory, the bench's virtual source
+// for a pipeline measured with no device under it, and a fake driver in
+// the tests.
 //
 // Internal to the pipeline. Names an execution provider, so
 // <blake3pp/io.hpp> must not reach it.
