@@ -253,32 +253,35 @@ class read_op_state : public run_node {
   // Queues the read and returns: no flush, because the loop flushes once
   // for every read it started this round, and no completion, because the
   // backend only ever calls back from inside poll().
+  //
+  // A read that could not be queued owes no callback, but completing the
+  // receiver from start() would run the rest of the window chain inside
+  // whatever started this one. The run queue is already the way back
+  // onto the loop, so the failure takes it and arrives like every other
+  // completion: a system_error as its code, anything else as the
+  // exception itself.
   void start() & noexcept {
     op_.done = &on_read_done;
     op_.owner = this;
     try {
       loop_->driver().submit_read(*file_, off_, buf_, op_);
     } catch (const std::system_error& e) {
-      fail(e.code());
+      ec_ = e.code();
+      loop_->publish(this);
     } catch (...) {
-      fail(std::make_error_code(std::errc::io_error));
+      eptr_ = std::current_exception();
+      loop_->publish(this);
     }
   }
 
  private:
-  // A read that could not be queued owes no callback, but completing the
-  // receiver from start() would run the rest of the window chain inside
-  // whatever started this one. The run queue is already the way back
-  // onto the loop, so the failure takes it and arrives like every other
-  // completion.
-  void fail(std::error_code ec) noexcept {
-    ec_ = ec;
-    loop_->publish(this);
-  }
-
   static void deliver_submit_failure(run_node* n) noexcept {
     auto* const self = static_cast<read_op_state*>(n);
-    ex::set_error(std::move(self->rcvr_), self->ec_);
+    if (self->eptr_) {
+      ex::set_error(std::move(self->rcvr_), std::move(self->eptr_));
+    } else {
+      ex::set_error(std::move(self->rcvr_), self->ec_);
+    }
   }
 
   static void on_read_done(io_read_op* op, std::error_code ec) noexcept {
@@ -299,6 +302,7 @@ class read_op_state : public run_node {
   std::uint64_t off_;
   std::span<std::byte> buf_;
   std::error_code ec_{};
+  std::exception_ptr eptr_{};
   io_read_op op_{};
 };
 
@@ -308,7 +312,8 @@ class read_sender {
   using sender_concept = ex_compat::sender_tag;
   BLAKE3PP_EX_COMPLETION_SIGNATURES(
       ex::set_value_t(std::span<const std::byte>),
-      ex::set_error_t(std::error_code));
+      ex::set_error_t(std::error_code),
+      ex::set_error_t(std::exception_ptr));
 
   read_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
               std::span<std::byte> buf) noexcept
