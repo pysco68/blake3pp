@@ -126,10 +126,10 @@ template <stack_budget Budget>
 using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
 static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
 
-// What one for_each_part() call records when tracing: the agents' summed
+// What one bulk over a window's parts records when tracing: the agents' summed
 // compress time and their count, each one atomic add per bulk invocation,
 // and through buf one agent_record per invocation when the buffer wants
-// them. window is the id the caller gives the records; for_each_part()
+// them. window is the id the caller gives the records; the sender
 // does not know what it is running over.
 struct part_trace {
   trace_buffer* buf;
@@ -139,22 +139,8 @@ struct part_trace {
   std::atomic<std::uint32_t> active{0};
 };
 
-// A scheduler may complete the work stopped instead of running it, on a
-// stop request or with a pool already shutting down. sync_wait then
-// returns an empty optional and nothing was computed, so the caller must
-// not read its results. That is reported as operation_canceled rather
-// than finished sequentially, because the caller asked for the work to
-// stop.
-template <class Work>
-void wait_for_parts(Work&& work) {
-  if (!ex::sync_wait(std::forward<Work>(work))) {
-    throw std::system_error(std::make_error_code(std::errc::operation_canceled),
-                            "the scheduler stopped the parallel hash");
-  }
-}
-
 // The schedule-and-bulk sender that runs body(i) for every i in [0, n).
-// for_each_part() waits on it; the file pipeline starts one per window
+// The file pipeline starts one per window
 // and lets the driver loop carry on.
 //
 // The bulk shape only provides the agents: each call pulls indices from
@@ -164,7 +150,7 @@ void wait_for_parts(Work&& work) {
 // the calls.
 //
 // `body` and `next` are the caller's and must outlive the sender --
-// for_each_part keeps them in its own frame, the pipeline in the window
+// the pipeline keeps them in the window
 // object.
 //
 // Traced is a template parameter and not a null check inside the body
@@ -274,14 +260,6 @@ template <bool Traced, class Scheduler, class Body,
   }
 }
 
-// Runs body(i) for every i in [0, n) on sched and waits for all of them.
-// Untraced: the one-shot engine has no window records to fill, and the
-// file pipeline, which does, connects part_bulk_sender itself.
-template <class Scheduler, class Body>
-void for_each_part(Scheduler& sched, std::size_t n, Body body) {
-  std::atomic<std::size_t> next{0};
-  wait_for_parts(part_bulk_sender<false>(sched, n, body, next, nullptr));
-}
 
 }  // namespace detail
 
@@ -299,7 +277,7 @@ template <stack_budget Budget>
 
 // One window's compress stage, and everything it touches.
 //
-// hash_window_parallel keeps the part table and the pull counter in its
+// A window's compress stage keeps the part table and the pull counter in its
 // own frame because it waits for them there. The pipeline cannot: its
 // compress stage is a sender that outlives the call which built it, and
 // several are in flight at once. So the state moves into an object the
@@ -330,7 +308,7 @@ struct window_compress {
 
   // Takes a full, counter-aligned window. False means it is too small to
   // fan out and belongs on the sequential path, the same verdict
-  // hash_window_parallel reaches.
+  // a window's compress stage reaches.
   [[nodiscard]] bool prepare(const kern::kernel_ops* o, const std::byte* d,
                              std::size_t chunks, std::uint64_t counter,
                              std::span<const std::uint32_t, 8> k,
@@ -460,37 +438,6 @@ template <bool Traced, stack_budget Budget, class Scheduler,
                       w.chunk_counter, w.part},
                out);
          });
-}
-
-// Fans one full window (num_chunks: power of two, counter-aligned) out
-// over the scheduler and absorbs it as one subtree. parallel_hasher's
-// window; update_file's go through the file pipeline instead.
-template <stack_budget Budget, class Scheduler>
-void hash_window_parallel(const kern::kernel_ops* ops, Scheduler& sched,
-                          hasher& h, const std::byte* data,
-                          std::size_t num_chunks,
-                          std::uint64_t chunk_counter) {
-  const std::size_t part = window_part_chunks<Budget>(num_chunks);
-  if (part >= num_chunks) {
-    // Window too small to fan out; hash it inline.
-    h.update(std::span<const std::byte>{data, num_chunks * chunk_size});
-    return;
-  }
-  const std::size_t n_parts = num_chunks / part;
-  part_cvs<Budget> cvs;
-  for_each_part(sched, n_parts, [&](std::size_t i) noexcept {
-    compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                        chunk_counter + i * part, h.key_words(),
-                        h.mode_flags(), cvs[i]);
-  });
-  // Every part pairs with a sibling all the way up: parallel_hasher
-  // rounds its buffer down to a power-of-two number of chunks and part
-  // is a power of two, so n_parts is one too.
-  assert(std::has_single_bit(n_parts));
-  std::array<std::uint32_t, 8> window_cv;
-  fold_sibling_cvs(ops, std::span{cvs}.first(n_parts), h.key_words(),
-                   h.mode_flags(), window_cv);
-  h.push_subtree_cv(window_cv, num_chunks);
 }
 
 }  // namespace detail

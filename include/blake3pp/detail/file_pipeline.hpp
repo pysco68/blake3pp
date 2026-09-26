@@ -789,6 +789,13 @@ struct pipeline_plan {
   // Whether the file is opened for direct I/O: the caller asked, and the
   // grid is one the platform's alignment can serve.
   bool direct_io;
+  // Whether this span ends the message. False for a caller streaming a
+  // sequence of spans into one hasher: the final window is then an
+  // interior one like any other, and goes to the pool as a subtree
+  // instead of to the hasher as a tail. A span that does not end the
+  // message has to be a whole number of windows, which the scope
+  // asserts, since a partial one could not be a subtree.
+  bool ends_message = true;
 };
 
 // How many windows a file of file_bytes has on this grid, the short
@@ -885,6 +892,7 @@ class window_scope {
                            : std::min<unsigned>(opts.in_flight_cap, count_)),
         base_count_(h.count()),
         head_window_bytes_(plan.head_bytes),
+        ends_message_(plan.ends_message),
         base_chunk_((h.count() + head_window_bytes_) / chunk_size),
         file_bytes_(file.size()),
         reducer_capacity_(opts.reducer_capacity == 0
@@ -928,6 +936,9 @@ class window_scope {
     // window's bytes actually are is the driver's answer, and it is
     // asked per window, because a source already in memory has a
     // different view for every offset.
+    assert((ends_message_ || file_bytes_ % window_bytes_ == 0) &&
+           "a span that does not end the message must be a whole number "
+           "of windows: a partial one cannot be absorbed as a subtree");
     drv.reserve(count_, window_bytes_);
     loop_.record_into(trace_);
     for (unsigned i = count_; i > 0; --i) {
@@ -1564,7 +1575,7 @@ class window_scope {
     const std::size_t want = g.short_first ? head_window_bytes_ : window_bytes_;
     g.bytes = static_cast<std::size_t>(
         std::min<std::uint64_t>(want, file_bytes_ - next_offset_));
-    g.last = next_offset_ + g.bytes >= file_bytes_;
+    g.last = ends_message_ && next_offset_ + g.bytes >= file_bytes_;
     return g;
   }
 
@@ -1904,6 +1915,7 @@ class window_scope {
   unsigned in_flight_cap_ = 0;
   std::uint64_t base_count_ = 0;        // the hasher's byte count at start
   std::size_t head_window_bytes_ = 0;   // the short first window, or zero
+  bool ends_message_ = true;
   std::uint64_t base_chunk_ = 0;        // where the full windows' grid starts
   std::uint64_t file_bytes_ = 0;
   std::size_t reducer_capacity_ = reducer_nodes;

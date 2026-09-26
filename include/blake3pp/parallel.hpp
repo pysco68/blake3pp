@@ -164,6 +164,10 @@ namespace detail {
 // a fifth and climbing. The figure is one machine's; it is a threshold
 // rather than a tuned constant because the shape either side of it is
 // flat enough that being wrong by a factor of two costs little.
+//
+// What sits below the crossover is the scope: window objects and a
+// reducer built per call. Once a context owns that storage across calls
+// the fixed cost mostly goes, and this number should come down with it.
 inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
 
 // The window a source already in memory is cut into. A window is a view,
@@ -391,7 +395,7 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(ops_),
-        window_(std::bit_floor(
+        remainder_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
   /// Keyed (MAC/PRF) mode.
@@ -403,7 +407,7 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::keyed(key, ops_)),
-        window_(std::bit_floor(
+        remainder_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
   /// Key-derivation mode: the input is the key material, domain-separated
@@ -416,27 +420,51 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::derive_key(context, ops_)),
-        window_(std::bit_floor(
+        remainder_(std::bit_floor(
             std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
 
   /// Absorbs the next bytes of the message; complete windows are fanned
   /// out over the scheduler from here.
   /// @param input  Any length, including zero.
   void update(std::span<const std::byte> input) {
-    const std::byte* p = input.data();
-    std::size_t len = input.size();
-    while (len > 0) {
-      if (filled_ == window_.size()) {
-        // More input exists, so the buffered window is provably not the
-        // message's end: safe to offload.
-        flush_window();
-      }
-      const std::size_t take = std::min(window_.size() - filled_, len);
-      std::copy_n(p, take, window_.data() + filled_);
-      filled_ += take;
-      p += take;
-      len -= take;
+    if (input.empty()) {
+      return;
     }
+    // Whole windows of the caller's own bytes are hashed where they lie.
+    // The only copying is what it takes to finish a window the last call
+    // left part-built, which is under one window and never more.
+    if (filled_ > 0) {
+      const std::size_t take =
+          std::min(remainder_.size() - filled_, input.size());
+      std::copy_n(input.data(), take, remainder_.data() + filled_);
+      filled_ += take;
+      input = input.subspan(take);
+      if (input.empty()) {
+        return;
+      }
+      // More input exists, so what is buffered is provably not the
+      // message's end: it may go to the pool as a subtree.
+      absorb(std::span<const std::byte>{remainder_});
+      filled_ = 0;
+    }
+
+    // What is left starts on a window boundary, because the hasher does:
+    // everything absorbed below is a whole number of windows.
+    //
+    // The final window is always held back, even when the input ends
+    // exactly on a boundary. A subtree pushed into the hasher must not
+    // contain the message's last chunk -- that chunk is finalized as the
+    // root -- and from here there is no way to know whether more is
+    // coming. So the remainder is never empty once anything has arrived,
+    // and finalize absorbs it through the hasher itself.
+    const std::size_t rest = input.size() % remainder_.size();
+    const std::size_t keep = rest == 0 ? remainder_.size() : rest;
+    if (const std::size_t whole = input.size() - keep; whole > 0) {
+      absorb(input.first(whole));
+      input = input.subspan(whole);
+    }
+    std::copy_n(input.data(), input.size(), remainder_.data());
+    filled_ = input.size();
   }
 
   /// Absorbs the next bytes of the message, given as text.
@@ -471,7 +499,6 @@ class parallel_hasher {
   void reset() noexcept {
     h_.reset();
     filled_ = 0;
-    chunk_counter_ = 0;
   }
 
   /// Total bytes absorbed since construction or reset.
@@ -485,24 +512,40 @@ class parallel_hasher {
   // const and non-destructive, exactly like hasher's.
   [[nodiscard]] hasher drained() const {
     hasher h = h_;
-    h.update(std::span<const std::byte>{window_.data(), filled_});
+    h.update(std::span<const std::byte>{remainder_.data(), filled_});
     return h;
   }
 
-  void flush_window() {
-    const std::size_t chunks = window_.size() / chunk_size;
-    detail::hash_window_parallel<Budget>(ops_, sched_, h_, window_.data(),
-                                         chunks, chunk_counter_);
-    chunk_counter_ += chunks;
-    filled_ = 0;
+  // A whole number of windows, straight into the hasher. The pipeline
+  // reduces them in any order and drains the reducer before it returns,
+  // which is what leaves the hasher on a window boundary for the next
+  // call. Below the threshold the scope costs more than it saves.
+  void absorb(std::span<const std::byte> bytes) {
+    if (bytes.size() < detail::min_pipeline_bytes) {
+      h_.update(bytes);
+      return;
+    }
+    detail::memory_driver drv;
+    detail::memory_driver::file f(drv, bytes);
+    detail::pipeline_plan plan = detail::plan_memory_pipeline(
+        h_.count(), remainder_.size(),
+        static_cast<std::uint64_t>(bytes.size()));
+    // Never: update() holds the final window back, so nothing absorbed
+    // here can contain the message's end.
+    plan.ends_message = false;
+    detail::run_window_pipeline<Budget>(
+        h_, drv, f, sched_, plan,
+        {.window_bytes = remainder_.size(), .ops = ops_});
   }
 
   Scheduler sched_;
   const kern::kernel_ops* ops_;
   hasher h_;
-  std::vector<std::byte> window_;
+  // One window's worth, holding whatever has not yet reached a window
+  // boundary. Never more: the rest of the message is hashed where the
+  // caller put it.
+  std::vector<std::byte> remainder_;
   std::size_t filled_ = 0;
-  std::uint64_t chunk_counter_ = 0;
 };
 
 /// Fills a buffer from an output reader on every core: the request is
