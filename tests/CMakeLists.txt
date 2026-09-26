@@ -33,6 +33,7 @@ add_executable(blake3pp_tests
   incremental.cpp
   kernel_ops.cpp
   parallel.cpp
+  memory_source.cpp
   subtree_fold.cpp
   tree_reducer.cpp
   "${vectors_hpp}")

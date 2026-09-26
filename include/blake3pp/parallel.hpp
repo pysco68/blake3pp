@@ -425,6 +425,11 @@ class parallel_hasher {
 
   /// Absorbs the next bytes of the message; complete windows are fanned
   /// out over the scheduler from here.
+  ///
+  /// Whole windows of `input` are hashed where they lie, so the cost in
+  /// copying is bounded: at most ONE window is copied per call, and only
+  /// to finish a window a previous call left part-built. The buffer that
+  /// holds it is one window, never more.
   /// @param input  Any length, including zero.
   void update(std::span<const std::byte> input) {
     if (input.empty()) {
@@ -510,9 +515,26 @@ class parallel_hasher {
   // The finalize seam: a copy of the flat internal hasher with the
   // buffered tail absorbed. Copying is what keeps every finalize form
   // const and non-destructive, exactly like hasher's.
+  //
+  // The tail is up to a whole window, so it is worth fanning out too.
+  // This is the one absorb that DOES end the message, which is what the
+  // pipeline's last-window chain is for: the parts before the final
+  // chunk go to the pool, and only the part carrying that chunk stays
+  // with the hasher.
   [[nodiscard]] hasher drained() const {
     hasher h = h_;
-    h.update(std::span<const std::byte>{remainder_.data(), filled_});
+    const std::span<const std::byte> tail{remainder_.data(), filled_};
+    if (filled_ < detail::min_pipeline_bytes) {
+      h.update(tail);
+      return h;
+    }
+    detail::memory_driver drv;
+    detail::memory_driver::file f(drv, tail);
+    const detail::pipeline_plan plan = detail::plan_memory_pipeline(
+        h.count(), remainder_.size(), static_cast<std::uint64_t>(filled_));
+    detail::run_window_pipeline<Budget>(
+        h, drv, f, sched_, plan,
+        {.window_bytes = remainder_.size(), .ops = ops_});
     return h;
   }
 
