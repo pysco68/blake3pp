@@ -1,6 +1,7 @@
 #pragma once
 
-// A source whose windows are already in memory.
+// A source whose windows are already in memory, and the completion
+// machinery every such source shares.
 //
 // The pipeline was written for a device: a window is a buffer the driver
 // fills and hands back from poll(). A span needs none of that, and the
@@ -34,6 +35,132 @@
 
 namespace blake3pp::detail {
 
+// The completion half of a source that needs no I/O.
+//
+// A read of bytes already in memory has nothing to do, but it may not
+// say so from submit_read(): the scope starts the next window from
+// inside a completion, so completing inline would run one window's chain
+// inside the start of another -- the recursion the pipeline's second
+// rule exists to prevent. Reads are remembered here and reported from
+// poll(), which is the one place callbacks may run.
+//
+// Shared by every such source: the in-memory driver below, and the
+// bench's virtual source, which differ only in where a window's bytes
+// come from.
+class queued_reads {
+ public:
+  queued_reads() = default;
+  queued_reads(const queued_reads&) = delete;
+  queued_reads& operator=(const queued_reads&) = delete;
+
+  void push(io_read_op& op) noexcept {
+    // Constructed fresh over whatever the last read left, which is the
+    // one way the caller's storage is ever filled.
+    op_node& n = op.emplace_native<op_node>();
+    n.next = nullptr;
+    n.cancelled = false;
+    if (tail_ == nullptr) {
+      head_ = tail_ = &op;
+    } else {
+      node_of(*tail_).next = &op;
+      tail_ = &op;
+    }
+    ++queued_;
+  }
+
+  // The bytes are already there, so a cancel always wins: nothing has
+  // been done that a completion could prefer over it.
+  void cancel(io_read_op& op) noexcept { node_of(op).cancelled = true; }
+
+  // Everything queued, in submission order. There is no work to pace,
+  // and pacing it would only add this source's own cost to a
+  // measurement.
+  std::size_t poll(bool block) {
+    if (head_ == nullptr) {
+      if (block) {
+        while (!waiter_.take()) {
+          waiter_.sleep();
+        }
+      }
+      return 0;
+    }
+    std::size_t ran = 0;
+    io_read_op* op = head_;
+    head_ = tail_ = nullptr;
+    queued_ = 0;
+    while (op != nullptr) {
+      io_read_op* const next = node_of(*op).next;
+      const bool cancelled = node_of(*op).cancelled;
+      op->done(op, cancelled
+                       ? std::make_error_code(std::errc::operation_canceled)
+                       : std::error_code{});
+      ++ran;
+      op = next;
+    }
+    return ran;
+  }
+
+  void wake() noexcept { waiter_.wake(); }
+
+  [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
+
+  // Queued reads are forgotten, and none gets its callback: the
+  // contract's teardown drain for a source with nothing in flight.
+  void drain() noexcept {
+    head_ = tail_ = nullptr;
+    queued_ = 0;
+  }
+
+ private:
+  // The queue links live in the caller's operation, like every backend's
+  // do, so nothing is allocated per read either.
+  struct op_node {
+    io_read_op* next = nullptr;
+    bool cancelled = false;
+  };
+  static_assert(sizeof(op_node) <= io_read_op::storage_size);
+  static_assert(alignof(op_node) <= io_read_op::storage_align);
+
+  [[nodiscard]] static op_node& node_of(io_read_op& op) noexcept {
+    return op.native<op_node>();
+  }
+
+  // The only shared state: a pool thread handing a window back wakes a
+  // driver parked in poll(). Everything else here is the driver's own
+  // thread by contract.
+  class waiter {
+   public:
+    void wake() noexcept {
+      {
+        const std::lock_guard<std::mutex> lock(m_);
+        signalled_ = true;
+      }
+      cv_.notify_one();
+    }
+    [[nodiscard]] bool take() noexcept {
+      const std::lock_guard<std::mutex> lock(m_);
+      return std::exchange(signalled_, false);
+    }
+    void sleep() {
+      std::unique_lock<std::mutex> lock(m_);
+      cv_.wait(lock, [this] { return signalled_; });
+    }
+
+   private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    bool signalled_ = false;
+  };
+
+  io_read_op* head_ = nullptr;
+  io_read_op* tail_ = nullptr;
+  std::size_t queued_ = 0;
+  waiter waiter_;
+};
+
+// A source whose windows are views of bytes the caller already has:
+// nothing is allocated, nothing is copied, and a read is the act of
+// noticing that the bytes are there.
 class memory_driver {
  public:
   // The bytes of one "file". Several may share a driver, which is what
@@ -76,116 +203,24 @@ class memory_driver {
     return {{}, f.bytes_.subspan(static_cast<std::size_t>(off), bytes)};
   }
 
-  // Queued, not completed: see the note at the top about why this may
-  // not call back from here.
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
                    io_read_op& op) noexcept {
-    // Constructed fresh over whatever the last read left, which is the
-    // one way the caller's storage is ever filled.
-    op_node& n = op.emplace_native<op_node>();
-    n.next = nullptr;
-    n.cancelled = false;
-    if (tail_ == nullptr) {
-      head_ = tail_ = &op;
-    } else {
-      node_of(*tail_).next = &op;
-      tail_ = &op;
-    }
-    ++queued_;
+    reads_.push(op);
   }
-
   void flush() noexcept {}
-
-  // Everything queued, in submission order. There is no work to pace and
-  // pacing it would only add this source's own cost to a measurement.
-  std::size_t poll(bool block) {
-    if (head_ == nullptr) {
-      if (block) {
-        while (!waiter_.take()) {
-          waiter_.sleep();
-        }
-      }
-      return 0;
-    }
-    std::size_t ran = 0;
-    io_read_op* op = head_;
-    head_ = tail_ = nullptr;
-    queued_ = 0;
-    while (op != nullptr) {
-      io_read_op* const next = node_of(*op).next;
-      const bool cancelled = node_of(*op).cancelled;
-      op->done(op, cancelled
-                       ? std::make_error_code(std::errc::operation_canceled)
-                       : std::error_code{});
-      ++ran;
-      op = next;
-    }
-    return ran;
+  std::size_t poll(bool block) { return reads_.poll(block); }
+  void wake() noexcept { reads_.wake(); }
+  void cancel(io_read_op& op) noexcept { reads_.cancel(op); }
+  [[nodiscard]] std::size_t in_flight() const noexcept {
+    return reads_.in_flight();
   }
-
-  void wake() noexcept { waiter_.wake(); }
-
-  // The bytes are already there, so a cancel always wins: nothing has
-  // been done that a completion could prefer over it.
-  void cancel(io_read_op& op) noexcept { node_of(op).cancelled = true; }
-
-  [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
-
-  // Queued reads are forgotten, and none gets its callback: the
-  // contract's teardown drain for a source with nothing in flight.
-  void drain() noexcept {
-    head_ = tail_ = nullptr;
-    queued_ = 0;
-  }
+  void drain() noexcept { reads_.drain(); }
 
  private:
-  // The queue links live in the caller's operation, like every backend's
-  // do, so the driver allocates nothing per read either.
-  struct op_node {
-    io_read_op* next = nullptr;
-    bool cancelled = false;
-  };
-  static_assert(sizeof(op_node) <= io_read_op::storage_size);
-  static_assert(alignof(op_node) <= io_read_op::storage_align);
-
-  [[nodiscard]] static op_node& node_of(io_read_op& op) noexcept {
-    return op.native<op_node>();
-  }
-
-  io_read_op* head_ = nullptr;
-  io_read_op* tail_ = nullptr;
-  std::size_t queued_ = 0;
+  queued_reads reads_;
 #ifndef NDEBUG
   unsigned windows_ = 0;
 #endif
-  // The only shared state: a pool thread handing a window back wakes a
-  // driver parked in poll(). Everything else here is the driver's own
-  // thread by contract.
-  class waiter {
-   public:
-    void wake() noexcept {
-      {
-        const std::lock_guard<std::mutex> lock(m_);
-        signalled_ = true;
-      }
-      cv_.notify_one();
-    }
-    [[nodiscard]] bool take() noexcept {
-      const std::lock_guard<std::mutex> lock(m_);
-      return std::exchange(signalled_, false);
-    }
-    void sleep() {
-      std::unique_lock<std::mutex> lock(m_);
-      cv_.wait(lock, [this] { return signalled_; });
-    }
-
-   private:
-    std::mutex m_;
-    std::condition_variable cv_;
-    bool signalled_ = false;
-  };
-
-  waiter waiter_;
 };
 
 static_assert(file_driver<memory_driver>);

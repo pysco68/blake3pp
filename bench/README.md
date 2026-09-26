@@ -9,6 +9,28 @@ with `BLAKE3PP_BUILD_BENCH` and are documented by their `--help`.
 The third, `blake3pp_dispatch_cost_<variant>`, answers one question and
 is off by default (`-DBLAKE3PP_BENCH_DISPATCH_COST=ON`).
 
+## --null-source: a ceiling, not a working set
+
+`blake3pp_bench_file --null-source N` runs the pipeline over a file that
+does not exist. It reports N GiB, but the driver owns only
+`windows x window_bytes` of buffer and every window reuses its slot's
+slice; a read completes with whatever is already there. What that
+measures is the engine, the fan-out and the fold with the device
+removed, which is the ceiling a real device is measured against.
+
+Two things follow, and neither is a defect:
+
+- **The bytes are cache-resident by construction.** A handful of windows
+  is all there is, so wherever the L3 holds them the per-core rate is
+  higher than any real device could reproduce -- with DMA every window
+  lands in DRAM whatever the count. Read a null-source rate as an upper
+  bound on the engine, never as a throughput anyone can reach.
+- **It is not comparable to `blake3pp_bench`'s `hash()` rows.** Those
+  hash a real span, so they pay for a working set the caches do not
+  hold, and they exercise the same pipeline over a source that has
+  distinct bytes at every offset. The two numbers answer different
+  questions and must not be put in one column.
+
 ## file_throughput: where a window's time goes (`--trace`)
 
 `blake3pp_bench_file FILE --trace PATH` hands the pipeline a

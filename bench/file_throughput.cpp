@@ -72,14 +72,13 @@
 #endif
 
 #include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/memory_driver.hpp>
 
-#include "io/null_backend.hpp"
 
 #include "tool_common.hpp"
 
 namespace {
 
-namespace io_impl = blake3pp::detail::io_impl;
 
 using b3tool::println;
 
@@ -333,67 +332,54 @@ kernel_deltas kernel_delta(const kernel_counters& before,
 // microseconds as the format wants; epoch_ns at the top level is the
 // records' zero as absolute CLOCK_MONOTONIC nanoseconds, for joining with
 // timestamps other tools take on the same clock.
-// The pipeline with no device under it: a driver over null_context, the
-// source whose reads complete with whatever is already in the buffer.
-// It is the same seam io_driver is, without the pimpl, and it is what
-// measures the pipeline's own ceiling.
+// The pipeline with no device under it, and no bytes either.
+//
+// The file is VIRTUAL: it reports whatever size the run asks for, while
+// the driver owns only windows x window_bytes of buffer and every window
+// reuses its slot's slice. Reads complete with whatever is already there,
+// so what this measures is the engine, the fan-out and the fold, with
+// the device removed -- the ceiling a real one is measured against.
+//
+// That is deliberately NOT the same benchmark as hashing a real span:
+// the bytes here are a handful of resident windows, not a working set.
+// See bench/README.md.
+//
+// The completion half is memory_driver's, because a source with nothing
+// to read has exactly one job -- report from poll() and not before.
 class null_driver {
  public:
-  // The filler is what the source "reads": null_context completes a read
-  // without touching the buffer, so the pool it hands out is the file.
-  //
-  // The pool is sized and faulted in here, before the caller starts its
-  // clock. Leaving it to allocate() would put a quarter of a gigabyte of
-  // first-touch page faults inside the measurement at 64 MiB windows,
-  // which is exactly the shape of a pipeline regression that is not one.
-  null_driver(const blake3pp::detail::io_driver_options& opts,
-              unsigned max_inflight, std::uint64_t size, std::byte filler,
-              std::size_t pool_bytes)
-      : ctx_({opts.async, opts.offload_submit}, max_inflight),
-        size_(size),
-        filler_(filler),
-        pool_(pool_bytes, filler) {}
+  // The pool is sized and faulted in at construction, before the caller
+  // starts its clock. Leaving it to reserve() would put a quarter of a
+  // gigabyte of first-touch page faults inside the measurement at 64 MiB
+  // windows, which is exactly the shape of a pipeline regression that is
+  // not one.
+  null_driver(const blake3pp::detail::io_driver_options&, unsigned,
+              std::uint64_t size, std::byte filler, std::size_t pool_bytes)
+      : size_(size), pool_(pool_bytes, filler) {}
   null_driver(const null_driver&) = delete;
   null_driver& operator=(const null_driver&) = delete;
 
   class file {
    public:
-    explicit file(null_driver& drv) noexcept : f_(drv.ctx_, drv.size_) {}
-    [[nodiscard]] std::uint64_t size() const noexcept { return f_.size(); }
-    [[nodiscard]] std::string_view name() const noexcept { return f_.name(); }
+    explicit file(null_driver& drv) noexcept : drv_(&drv) {}
+    [[nodiscard]] std::uint64_t size() const noexcept { return drv_->size_; }
+    [[nodiscard]] std::string_view name() const noexcept { return "null"; }
 
    private:
-    friend class null_driver;
-    io_impl::null_context::file f_;
+    null_driver* drv_;
   };
 
-  void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   blake3pp::detail::io_read_op& op) {
-    auto& inner = op.emplace_native<io_impl::null_context::read_op>();
-    inner.done = &trampoline;
-    inner.owner = &op;
-    ctx_.submit_read(f.f_, off, buf, inner);
-  }
-
-  void flush() noexcept { ctx_.flush(); }
-  std::size_t poll(bool block) { return ctx_.poll(block); }
-  void wake() noexcept { ctx_.wake(); }
-  void cancel(blake3pp::detail::io_read_op& op) noexcept {
-    ctx_.cancel(op.native<io_impl::null_context::read_op>());
-  }
-  [[nodiscard]] std::size_t in_flight() const noexcept {
-    return ctx_.in_flight();
-  }
-  void drain() noexcept { ctx_.drain(); }
-
   void reserve(unsigned windows, std::size_t window_bytes) {
-    const std::size_t bytes = window_bytes * windows;
-    window_stride_ = window_bytes;
-    if (pool_.size() < bytes) {
-      pool_.assign(bytes, filler_);
+    const std::size_t want = window_bytes * windows;
+    if (pool_.size() < want) {
+      pool_.assign(want, filler_);
     }
+    window_stride_ = window_bytes;
   }
 
+  // Each slot owns one slice, which every window through that slot
+  // reuses: the source has no distinct bytes, and separate slots keep
+  // the reads from overlapping.
   [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
       file&, unsigned slot, std::uint64_t, std::size_t bytes) noexcept {
     const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
@@ -401,19 +387,25 @@ class null_driver {
     return {slice, std::span<const std::byte>(slice)};
   }
 
- private:
-  static void trampoline(io_impl::read_op_base* base,
-                         std::error_code ec) noexcept {
-    auto* const outer =
-        static_cast<blake3pp::detail::io_read_op*>(base->owner);
-    outer->done(outer, ec);
+  void submit_read(file&, std::uint64_t, std::span<std::byte>,
+                   blake3pp::detail::io_read_op& op) noexcept {
+    reads_.push(op);
   }
+  void flush() noexcept {}
+  std::size_t poll(bool block) { return reads_.poll(block); }
+  void wake() noexcept { reads_.wake(); }
+  void cancel(blake3pp::detail::io_read_op& op) noexcept { reads_.cancel(op); }
+  [[nodiscard]] std::size_t in_flight() const noexcept {
+    return reads_.in_flight();
+  }
+  void drain() noexcept { reads_.drain(); }
 
-  io_impl::null_context ctx_;
+ private:
   std::uint64_t size_;
-  std::byte filler_;
+  std::byte filler_{};
   std::size_t window_stride_ = 0;
   std::vector<std::byte> pool_;
+  blake3pp::detail::queued_reads reads_;
 };
 
 static_assert(blake3pp::detail::file_driver<null_driver>);
@@ -891,8 +883,7 @@ int main(int argc, char** argv) {
   opts.direct_io = !no_direct;
   opts.offload_submit = !inline_submit;
   if (null_gib > 0) {
-    namespace io_impl = blake3pp::detail::io_impl;
-    const auto total =
+        const auto total =
         static_cast<std::uint64_t>(null_gib * 1024.0 * 1024.0 * 1024.0);
     const std::size_t win =
         blake3pp::detail::rounded_window_bytes(opts.window_bytes);
