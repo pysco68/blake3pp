@@ -539,9 +539,8 @@ class uring_context {
 
   // Same rules as submit_read, and the same ladder: a length O_DIRECT
   // cannot take rides the deferred list and is written synchronously
-  // inside poll(), through the plain fd. That is what the writer did
-  // before, decided by wants_async(); it now lives here, so nothing
-  // above the context sees the difference.
+  // inside poll(), through the plain fd. Nothing above the context sees
+  // the difference.
   void submit_write(file& f, std::uint64_t off,
                     std::span<const std::byte> buf, read_op& op) {
     op.buf = {};
@@ -857,121 +856,10 @@ class uring_context {
   bool wake_armed_ = false;
 };
 
-class uring_writer {
- public:
-  uring_writer(const std::filesystem::path& path,
-               const file_writer_options& opts, unsigned nslots)
-      : slots_(nslots) {
-    f_.open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    // Preallocating turns every write into an overwrite of existing
-    // extents. Extending writes serialize on the inode lock; with async
-    // direct I/O that collapses the whole queue to one stalled write at a
-    // time.
-    if (opts.preallocate_bytes > 0 &&
-        ::fallocate(f_.fd_plain, 0, 0,
-                    static_cast<off_t>(opts.preallocate_bytes)) == 0) {
-      prealloc_ = opts.preallocate_bytes;
-    }
-    if (opts.direct_io) {
-      // Reopen (not TRUNC, already truncated) so the tail keeps a plain fd.
-      f_.try_odirect(path.c_str(), O_WRONLY | O_CLOEXEC);
-    }
-    if (opts.async && ring_.init(2 * nslots)) {
-      use_uring_ = true;
-      offload_ = opts.offload_submit;
-    }
-    name_ = use_uring_ ? (f_.direct ? "io_uring+direct" : "io_uring")
-                       : (f_.direct ? "pwrite+direct" : "pwrite");
-    if (use_uring_ && !offload_) {
-      name_ += " (inline submit)";
-    }
-    if (opts.async && !use_uring_ && ring_.setup_errno != 0) {
-      name_ += no_uring_suffix(ring_.setup_errno);
-    }
-  }
-
-  [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
-  [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
-    return use_uring_ && len % direct_align == 0;
-  }
-
-  void start_write(unsigned s, std::uint64_t off,
-                   std::span<const std::byte> buf) {
-    // The engine asks wants_async() first, which is false without a
-    // ring; reaching here degraded would submit through null ring
-    // pointers. The synchronous writers state the same invariant with
-    // the same assert.
-    assert(use_uring_ && "the uring writer has no async path without a ring");
-    slots_[s] = {buf, off, 0, true};
-    ring_.submit_rw(IORING_OP_WRITE, f_.fd, buf.data(),
-                    static_cast<unsigned>(buf.size()), off, s, offload_);
-  }
-
-  void wait_slot(unsigned s) {
-    while (slots_[s].busy) {
-      reap_one();
-    }
-  }
-
-  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
-    f_.pwrite_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
-  }
-
-  void finish(std::uint64_t written) {
-    for (unsigned s = 0; s < slots_.size(); ++s) {
-      wait_slot(s);
-    }
-    // fallocate set the file size up front; trim if less was written.
-    if (prealloc_ > written &&
-        ::ftruncate(f_.fd_plain, static_cast<off_t>(written)) != 0) {
-      throw_errno("ftruncate");
-    }
-    prealloc_ = 0;
-  }
-
- private:
-  struct slot {
-    std::span<const std::byte> buf{};
-    std::uint64_t off = 0;
-    std::size_t done = 0;
-    bool busy = false;
-  };
-
-  // Reaps one completion, issuing a continuation on a short write. The
-  // device may complete slots in any order; each carries its slot index.
-  void reap_one() {
-    const auto [ud, res] = ring_.wait_one();
-    const unsigned s = static_cast<unsigned>(ud);
-    slot& st = slots_[s];
-    if (res <= 0) {
-      throw std::system_error(res < 0 ? -res : EIO, std::generic_category(),
-                              "io_uring write");
-    }
-    st.done += static_cast<std::size_t>(res);
-    if (st.done < st.buf.size()) {
-      ring_.submit_rw(IORING_OP_WRITE, f_.fd, st.buf.data() + st.done,
-                      static_cast<unsigned>(st.buf.size() - st.done),
-                      st.off + st.done, s, offload_);
-    } else {
-      st.busy = false;
-    }
-  }
-
-  posix_file f_;
-  uring ring_;
-  std::vector<slot> slots_;
-  std::uint64_t prealloc_ = 0;
-  bool use_uring_ = false;
-  bool offload_ = false;
-  std::string name_ = "pwrite";
-};
-
 // Definition-site conformance check. Concepts only verify use-sites, so
 // without this a drifting backend wouldn't be diagnosed until an engine
 // instantiation in some other TU; this makes the header self-checking.
 static_assert(io_context<uring_context>);
-static_assert(writer_backend<uring_writer>);
 
 }  // namespace blake3pp::detail::io_impl
 

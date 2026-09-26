@@ -1,8 +1,7 @@
 #pragma once
 
 // The two portable I/O engines, written exactly once as class templates
-// constrained by the concepts in io/backend.hpp: the reader over
-// io_context, the writer over writer_backend. The public
+// constrained by io_context, the concept in io/backend.hpp. The public
 // file_reader/file_writer TUs instantiate them with what
 // backend_select.hpp picks; the tests instantiate them again with the
 // off-platform contexts and backends, so those stay compiled AND executed
@@ -223,19 +222,13 @@ class polled_reader_engine {
 // acquire() blocking on a slot whose write is still in flight is the
 // entire backpressure story.
 //
-// What changed when this moved onto the contract. The old engine asked
-// the backend wants_async() and, when the answer was no, wrote
-// synchronously inside submit(). Now every submit queues and the context
-// decides; a length the platform cannot take asynchronously rides the
-// backend's deferred list and lands inside poll(), where a read that
-// cannot be issued asynchronously already landed. So:
+// Every submit queues; the context decides how the bytes travel, and a
+// length the platform cannot take asynchronously rides the backend's
+// deferred list and lands inside poll(), exactly as such a read does.
+// Hence the timing both paths now share:
 //
 //   submit() ACCEPTS bytes. finish() LANDS them.
 //   Errors surface from acquire() or finish(), never from submit().
-//
-// That is the same contract the async path always had -- its errors
-// surfaced from acquire() too -- so the two paths now report alike
-// rather than one throwing early and the other late.
 template <io_context C>
 class polled_writer_engine {
  public:
@@ -245,14 +238,14 @@ class polled_writer_engine {
                        const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
         qd_(clamp_queue_depth(opts.queue_depth)),
+        preallocated_(opts.preallocate_bytes),
         slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
         ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
         file_(ctx_, path,
               file_open_options{.write = true,
                                 .direct_io = opts.direct_io,
-                                .preallocate_bytes = opts.preallocate_bytes}),
-        preallocated_(opts.preallocate_bytes) {}
+                                .preallocate_bytes = opts.preallocate_bytes}) {}
 
   [[nodiscard]] std::uint64_t bytes_written() const noexcept {
     return written_;

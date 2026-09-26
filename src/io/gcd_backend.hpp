@@ -22,7 +22,6 @@
 #include <unistd.h>
 
 #include <cerrno>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -68,8 +67,6 @@ inline bool preallocate(int fd, std::uint64_t len) noexcept {
 // buffer pool, so destroy() must wait them out before the pool is freed.
 struct gcd_pump {
   dispatch_group_t group = nullptr;
-  std::mutex m;
-  std::condition_variable cv;
 
   bool init() noexcept {
     group = dispatch_group_create();
@@ -387,145 +384,8 @@ class gcd_context {
   bool use_gcd_ = false;
 };
 
-class gcd_writer {
- public:
-  gcd_writer(const std::filesystem::path& path,
-             const file_writer_options& opts, unsigned nslots) {
-    f_.open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    // Same story as Linux's fallocate, via Darwin's spelling: queued
-    // writes should land as overwrites, not size-extending appends.
-    if (opts.preallocate_bytes > 0 &&
-        preallocate(f_.fd_plain, opts.preallocate_bytes)) {
-      prealloc_ = opts.preallocate_bytes;
-    }
-    if (opts.direct_io && set_nocache(f_.fd_plain)) {
-      f_.direct = true;
-    }
-    name_ = f_.direct ? "pwrite+nocache" : "pwrite";
-    if (opts.async && pump_.init()) {
-      use_gcd_ = true;
-      slots_.resize(nslots);
-      tasks_.resize(nslots);
-      for (unsigned s = 0; s < nslots; ++s) {
-        tasks_[s] = {this, s};
-      }
-      name_ = f_.direct ? "gcd+nocache" : "gcd";
-    }
-  }
-
-  // If finish() threw (or was skipped), workers may still be writing from
-  // the engine's pool: wait them all out before it is freed.
-  ~gcd_writer() { pump_.destroy(); }
-  gcd_writer(const gcd_writer&) = delete;
-  gcd_writer& operator=(const gcd_writer&) = delete;
-
-  [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
-  [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
-    return use_gcd_ && len % direct_align == 0;
-  }
-
-  void start_write(unsigned s, std::uint64_t off,
-                   std::span<const std::byte> buf) {
-    slot& st = slots_[s];
-    st.src = buf.data();
-    st.len = buf.size();
-    st.off = off;
-    st.done = 0;
-    st.busy = true;
-    pump_.submit(&gcd_writer::run_write, &tasks_[s]);
-  }
-
-  // Blocks until slot s is idle; surfaces its deferred write error once
-  // (cleared after the throw so the slot stays reusable).
-  void wait_slot(unsigned s) {
-    if (!use_gcd_) {
-      return;
-    }
-    slot& st = slots_[s];
-    std::unique_lock<std::mutex> lk(pump_.m);
-    pump_.cv.wait(lk, [&] { return !st.busy; });
-    if (st.error != 0) {
-      const int e = st.error;
-      st.error = 0;
-      throw std::system_error(e, std::generic_category(), "gcd pwrite");
-    }
-  }
-
-  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
-    f_.pwrite_all(f_.fd_plain, buf.data(), buf.size(), off);
-  }
-
-  void finish(std::uint64_t written) {
-    if (use_gcd_) {
-      for (unsigned s = 0; s < slots_.size(); ++s) {
-        wait_slot(s);
-      }
-    }
-    // F_PREALLOCATE/ftruncate set the size up front; trim if less was
-    // written.
-    if (prealloc_ > written &&
-        ::ftruncate(f_.fd_plain, static_cast<off_t>(written)) != 0) {
-      throw_errno("ftruncate");
-    }
-    prealloc_ = 0;
-  }
-
- private:
-  struct slot {
-    const std::byte* src = nullptr;
-    std::size_t len = 0;
-    std::uint64_t off = 0;
-    std::size_t done = 0;
-    int error = 0;  // errno captured by the worker; thrown at wait_slot()
-    bool busy = false;
-  };
-  struct task {
-    gcd_writer* self = nullptr;
-    unsigned s = 0;
-  };
-
-  // Runs on a GCD worker: drains the slot's buffer with one positional
-  // write loop, then publishes completion under the pump lock.
-  static void run_write(void* ctx) noexcept {
-    const task t = *static_cast<task*>(ctx);
-    gcd_writer& w = *t.self;
-    slot& st = w.slots_[t.s];
-    int err = 0;
-    std::size_t put = 0;
-    while (put < st.len) {
-      const ssize_t n = ::pwrite(w.f_.fd_plain, st.src + put, st.len - put,
-                                 static_cast<off_t>(st.off + put));
-      if (n < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        err = errno;
-        break;
-      }
-      put += static_cast<std::size_t>(n);
-    }
-    {
-      const std::lock_guard<std::mutex> lk(w.pump_.m);
-      st.done = put;
-      st.error = err;
-      st.busy = false;
-    }
-    w.pump_.cv.notify_all();
-  }
-
-  posix_file f_;
-  gcd_pump pump_;
-  std::vector<slot> slots_;
-  std::vector<task> tasks_;
-  std::uint64_t prealloc_ = 0;
-  bool use_gcd_ = false;
-  std::string_view name_ = "pwrite";
-};
-
 // Definition-site conformance check (see uring_backend.hpp).
 static_assert(io_context<gcd_context>);
-static_assert(writer_backend<gcd_writer>);
 
 }  // namespace blake3pp::detail::io_impl
 

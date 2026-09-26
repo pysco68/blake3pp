@@ -108,51 +108,7 @@ class stdio_source {
 
 using stdio_context = sync_context<stdio_source>;
 
-class stdio_writer {
- public:
-  stdio_writer(const std::filesystem::path& path, const file_writer_options&,
-               unsigned) {
-    stream_ = std::fopen(path.string().c_str(), "wb");
-    if (stream_ == nullptr) {
-      throw_errno("fopen");
-    }
-  }
-  ~stdio_writer() {
-    if (stream_ != nullptr) {
-      std::fclose(stream_);
-    }
-  }
-  stdio_writer(const stdio_writer&) = delete;
-  stdio_writer& operator=(const stdio_writer&) = delete;
-
-  [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
-  [[nodiscard]] bool wants_async(std::size_t) const noexcept { return false; }
-
-  void start_write(unsigned, std::uint64_t, std::span<const std::byte>) {
-    assert(false && "stdio backend has no async path");
-  }
-  void wait_slot(unsigned) {}  // nothing is ever in flight
-
-  // Writes are strictly sequential (the engine's offset only grows), so
-  // the stream position is already `off` and no seek is needed.
-  void write_sync(std::uint64_t, std::span<const std::byte> buf) {
-    if (std::fwrite(buf.data(), 1, buf.size(), stream_) != buf.size()) {
-      throw std::system_error(EIO, std::generic_category(), "fwrite");
-    }
-  }
-
-  void finish(std::uint64_t) {
-    if (std::fflush(stream_) != 0) {
-      throw_errno("fflush");
-    }
-  }
-
- private:
-  std::FILE* stream_ = nullptr;
-};
-
 // Definition-site conformance check (see uring_backend.hpp).
 static_assert(io_context<stdio_context>);
-static_assert(writer_backend<stdio_writer>);
 
 }  // namespace blake3pp::detail::io_impl

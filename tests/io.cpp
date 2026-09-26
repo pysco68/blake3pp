@@ -23,9 +23,9 @@
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
-// The portable engines and the backends the platform selector never
-// picks here: instantiating reader_engine/writer_engine with them below
-// keeps the off-platform code compiled AND executed on every platform
+// The portable engines and the I/O contexts the platform selector never
+// picks here: instantiating the engines with them below keeps the
+// off-platform code compiled AND executed on every platform
 // (on Linux the selector only ever compiles the io_uring backend).
 #include "io/engine.hpp"
 #include "io/stdio_backend.hpp"

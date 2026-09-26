@@ -1,29 +1,22 @@
 #pragma once
 
-// The portable contract between the file_reader/file_writer engines and
-// the per-OS I/O backends. 
+// The portable contract between the engines and the per-OS I/O
+// backends. Reads and writes share it: an io_context owns the completion
+// mechanism, a file is opened against it, and every transfer is named by
+// a caller-owned operation whose callback reports it.
 //
-// The two sides have different shapes. A WRITER backend is per file and
-// owns its slots: start_write() names a buffer by slot and wait_slot()
-// blocks for it. A READER runs on io_context, where the completion
-// mechanism is separate from the file, a read is named by a caller-owned
-// operation, and completions arrive as callbacks.
-//
-// Three contract rules span every operation, so they live here rather
-// than on any one requirement below:
-//  - Slot exclusivity (writers): start_write() may only be called for a
-//    slot the backend claimed via wants_async(...), and only while
-//    nothing else is outstanding on that slot.
-//  - Teardown drain: a backend's or context's destructor drains every
-//    in-flight operation, running no callback. The engines declare their
-//    buffer pool member BEFORE it precisely so the drain runs before the
-//    pool is freed.
-//  - Callback discipline (readers): a read's callback runs ONLY inside
-//    poll(), on the thread that called poll(). Never from submit_read(),
-//    flush(), wake() or a destructor. Everything a later phase wants to
-//    build on this -- several windows, then several files, driven as
-//    senders from one thread -- depends on there being exactly one place
-//    where caller code regains control.
+// Two contract rules span every operation, so they live here rather than
+// on any one requirement below:
+//  - Teardown drain: a context's destructor drains every in-flight
+//    operation, running no callback. The engines declare their buffer
+//    pool member BEFORE it precisely so the drain runs before the pool
+//    is freed.
+//  - Callback discipline: a transfer's callback runs ONLY inside poll(),
+//    on the thread that called poll(). Never from submit_read(),
+//    submit_write(), flush(), wake() or a destructor. The pipelines --
+//    several windows, then several files, driven as senders from one
+//    thread -- depend on there being exactly one place where caller code
+//    regains control.
 // Internal to src/io/, never installed.
 
 #include <cerrno>
@@ -451,41 +444,5 @@ class sync_context {
   std::size_t queued_ = 0;
   poll_waiter waiter_;
 };
-
-template <class B>
-concept writer_backend =
-    // Creates/truncates the file, preallocates if asked (fallocate /
-    // SetEndOfFile+VDL / F_PREALLOCATE), and engages what it can of the
-    // fast path. The unsigned is the engine's queue depth.
-    std::constructible_from<B, const std::filesystem::path&,
-                            const file_writer_options&, unsigned> &&
-    requires(B b, const B cb, unsigned slot, std::uint64_t off,
-             std::span<const std::byte> buf, std::uint64_t written) {
-      { cb.name() } noexcept -> std::convertible_to<std::string_view>;
-      // The reader's degradation question, minus the offset: the engine
-      // writes strictly sequentially and only the final submit may be
-      // unaligned, so the length alone decides. False routes the buffer
-      // to write_sync.
-      { cb.wants_async(std::size_t{}) } noexcept -> std::same_as<bool>;
-      // Begins an async write of buf at off, owned by `slot`; legal only
-      // after wants_async() said yes for this length. Returns without
-      // waiting: the device drains while the producer fills the next
-      // buffer.
-      { b.start_write(slot, off, buf) };
-      // Blocks until `slot` is idle (trivially so on sync backends).
-      // This is the engine's backpressure point: acquire() calls it
-      // before recycling the slot's buffer. Throws the slot's deferred
-      // write error as std::system_error.
-      { b.wait_slot(slot) };
-      // Positional synchronous write: completes fully or throws. Handle
-      // choice (direct vs buffered) for the length's alignment is
-      // backend business, same as read_sync.
-      { b.write_sync(off, buf) };
-      // End of stream: drain every in-flight write, trim the
-      // preallocation back to `written` bytes, flush what needs
-      // flushing. May be called more than once; the destructor is the
-      // error-swallowing fallback for what finish() didn't get to.
-      { b.finish(written) };
-    };
 
 }  // namespace blake3pp::detail::io_impl

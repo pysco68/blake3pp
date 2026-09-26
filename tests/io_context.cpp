@@ -323,8 +323,7 @@ void check_cancel_discipline(std::string_view tag, MakeFile make_file,
 // The write half of the same contract: submit queues, flush pushes,
 // poll reports, and the bytes that land are the bytes that were handed
 // over. Lengths either side of the direct-I/O granule are the point --
-// an unaligned one takes the deferred path inside the backend, which is
-// where the old writer's wants_async() decision now lives.
+// an unaligned one takes the deferred path inside the backend.
 template <class C, class MakeFile>
 void check_write_discipline(std::string_view tag, const fs::path& path,
                             bool direct, std::size_t len, MakeFile make_file) {

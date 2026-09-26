@@ -67,43 +67,8 @@ class pread_source {
 
 using pread_context = sync_context<pread_source>;
 
-class pread_writer {
- public:
-  pread_writer(const std::filesystem::path& path,
-               const file_writer_options& opts, unsigned) {
-    f_.open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    // No preallocation here: fallocate is Linux, F_PREALLOCATE is Darwin,
-    // and each lives in its platform's backend. Synchronous writes don't
-    // suffer the extending-write serialization anyway.
-    (void)opts;
-    if (opts.direct_io) {
-      f_.try_odirect(path.c_str(), O_WRONLY | O_CLOEXEC);
-    }
-  }
-
-  [[nodiscard]] std::string_view name() const noexcept {
-    return f_.direct ? "pwrite+direct" : "pwrite";
-  }
-  [[nodiscard]] bool wants_async(std::size_t) const noexcept { return false; }
-
-  void start_write(unsigned, std::uint64_t, std::span<const std::byte>) {
-    assert(false && "pread backend has no async path");
-  }
-  void wait_slot(unsigned) {}  // nothing is ever in flight
-
-  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
-    f_.pwrite_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
-  }
-
-  void finish(std::uint64_t) {}  // no queue to drain, no preallocation
-
- private:
-  posix_file f_;
-};
-
 // Definition-site conformance check (see uring_backend.hpp).
 static_assert(io_context<pread_context>);
-static_assert(writer_backend<pread_writer>);
 
 }  // namespace blake3pp::detail::io_impl
 
