@@ -376,6 +376,118 @@ class read_sender {
 };
 
 // --------------------------------------------------------------------
+// write_sender: one window's write.
+//
+// The same operation state as a read, because from the pipeline's side
+// the two are one shape: queue it, do not complete inside start(), and
+// take whatever poll() reports. Only the direction differs, and only
+// the driver knows it.
+template <file_driver D, class Receiver>
+class write_op_state : public run_node {
+ public:
+  using operation_state_concept = ex_compat::operation_state_tag;
+
+  write_op_state(Receiver r, driver_loop<D>* loop, typename D::file* f,
+                 std::uint64_t off, std::span<const std::byte> buf,
+                 io_read_op* op)
+      : rcvr_(std::move(r)), loop_(loop), file_(f), off_(off), buf_(buf),
+        op_(op) {
+    run = &deliver_parked;
+  }
+
+  write_op_state(const write_op_state&) = delete;
+  write_op_state& operator=(const write_op_state&) = delete;
+
+  void start() & noexcept {
+    if (stop_token().stop_requested()) {
+      stopped_ = true;
+      loop_->publish(this);
+      return;
+    }
+    op_->done = &on_write_done;
+    op_->owner = this;
+    try {
+      loop_->driver().submit_write(*file_, off_, buf_, *op_);
+    } catch (const std::system_error& e) {
+      ec_ = e.code();
+      loop_->publish(this);
+    } catch (...) {
+      eptr_ = std::current_exception();
+      loop_->publish(this);
+    }
+  }
+
+ private:
+  using token_type = decltype(ex::get_stop_token(
+      ex::get_env(std::declval<const Receiver&>())));
+
+  [[nodiscard]] token_type stop_token() const noexcept {
+    return ex::get_stop_token(ex::get_env(rcvr_));
+  }
+
+  static void deliver_parked(run_node* n) noexcept {
+    auto* const self = static_cast<write_op_state*>(n);
+    if (self->stopped_) {
+      ex::set_stopped(std::move(self->rcvr_));
+    } else if (self->eptr_) {
+      ex::set_error(std::move(self->rcvr_), std::move(self->eptr_));
+    } else {
+      ex::set_error(std::move(self->rcvr_), self->ec_);
+    }
+  }
+
+  static void on_write_done(io_read_op* op, std::error_code ec) noexcept {
+    auto* const self = static_cast<write_op_state*>(op->owner);
+    if (ec) {
+      if (ec == std::errc::operation_canceled &&
+          self->stop_token().stop_requested()) {
+        ex::set_stopped(std::move(self->rcvr_));
+        return;
+      }
+      ex::set_error(std::move(self->rcvr_), ec);
+      return;
+    }
+    ex::set_value(std::move(self->rcvr_));
+  }
+
+  Receiver rcvr_;
+  driver_loop<D>* loop_;
+  typename D::file* file_;
+  std::uint64_t off_;
+  std::span<const std::byte> buf_;
+  io_read_op* op_;
+  std::error_code ec_{};
+  std::exception_ptr eptr_{};
+  bool stopped_ = false;
+};
+
+template <file_driver D>
+class write_sender {
+ public:
+  using sender_concept = ex_compat::sender_tag;
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(),
+                                    ex::set_error_t(std::error_code),
+                                    ex::set_error_t(std::exception_ptr),
+                                    ex::set_stopped_t());
+
+  write_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
+               std::span<const std::byte> buf, io_read_op* op) noexcept
+      : loop_(loop), file_(f), off_(off), buf_(buf), op_(op) {}
+
+  template <class Receiver>
+  [[nodiscard]] write_op_state<D, Receiver> connect(Receiver r) const {
+    return {std::move(r), loop_, file_, off_, buf_, op_};
+  }
+
+ private:
+  driver_loop<D>* loop_;
+  typename D::file* file_;
+  std::uint64_t off_;
+  std::span<const std::byte> buf_;
+  io_read_op* op_;
+};
+
+// --------------------------------------------------------------------
 // stopped_if: the point in a stage where a value becomes a stop.
 //
 // ex::then cannot produce set_stopped, and a stage whose agents stopped
@@ -516,6 +628,12 @@ class driver_loop {
                                     std::span<std::byte> buf,
                                     io_read_op& op) noexcept {
     return read_sender<D>{this, &f, off, buf, &op};
+  }
+
+  [[nodiscard]] write_sender<D> write(typename D::file& f, std::uint64_t off,
+                                      std::span<const std::byte> buf,
+                                      io_read_op& op) noexcept {
+    return write_sender<D>{this, &f, off, buf, &op};
   }
 
   [[nodiscard]] driver_scheduler<D> scheduler() noexcept {
@@ -1997,6 +2115,8 @@ using probe = ex_compat::probe_receiver;
 
 static_assert(ex::sender<read_sender<io_driver>>);
 static_assert(ex::operation_state<read_op_state<io_driver, probe>>);
+static_assert(ex::sender<write_sender<io_driver>>);
+static_assert(ex::operation_state<write_op_state<io_driver, probe>>);
 // stopped_if over a sender with no surprises of its own, so the asserts
 // are about the adaptor and not about whatever it happens to wrap.
 using stopped_cv_child = decltype(ex::just(std::array<std::uint32_t, 8>{}));

@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -41,6 +42,8 @@
 #include "io/pread_backend.hpp"
 #endif
 #if defined(__linux__)
+#include <unistd.h>  // getpid, for a temporary name under /dev/shm
+
 #include "io/uring_backend.hpp"
 #endif
 #if defined(_WIN32)
@@ -124,6 +127,7 @@ class fake_context {
     file(fake_context&, std::uint64_t size) noexcept : size_(size) {}
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] std::string_view name() const noexcept { return "fake"; }
+    void set_size(std::uint64_t bytes) noexcept { size_ = bytes; }
 
    private:
     std::uint64_t size_ = 0;
@@ -143,6 +147,18 @@ class fake_context {
     queue_.push_back(&op);
   }
   void flush() noexcept {}
+
+  // The engine under test never writes; the contract still asks, so this
+  // records the write and completes it like any other operation.
+  void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
+                    read_op& op) {
+    op.buf = {};
+    op.off = off;
+    op.filled = buf.size();
+    op.done_once = false;
+    op.cancelled = false;
+    queue_.push_back(&op);
+  }
 
   void cancel(read_op& op) noexcept { op.cancelled = true; }
 
@@ -195,7 +211,7 @@ class fake_context {
   io_impl::poll_waiter waiter_;
 };
 
-static_assert(io_impl::reader_context<fake_context>);
+static_assert(io_impl::io_context<fake_context>);
 
 // submit_read() then flush() must produce no callback at all; poll() must
 // produce every one of them.
@@ -307,6 +323,53 @@ void check_cancel_discipline(std::string_view tag, MakeFile make_file,
   CHECK(!pc.ec);
 }
 
+// The write half of the same contract: submit queues, flush pushes,
+// poll reports, and the bytes that land are the bytes that were handed
+// over. Lengths either side of the direct-I/O granule are the point --
+// an unaligned one takes the deferred path inside the backend.
+template <class C, class MakeFile>
+void check_write_discipline(std::string_view tag, const fs::path& path,
+                            bool direct, std::size_t len, MakeFile make_file) {
+  CAPTURE(tag);
+  CAPTURE(direct);
+  CAPTURE(len);
+  const auto content = pattern(len, static_cast<std::uint32_t>(len + 1));
+  {
+    C ctx({}, 4);
+    auto f = make_file(ctx);
+    typename C::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+
+    ctx.submit_write(f, 0, std::span<const std::byte>{content}, op);
+    CHECK(p.calls == 0);
+    ctx.flush();
+    CHECK(p.calls == 0);
+    if (len > 0) {
+      CHECK(ctx.in_flight() == 1);
+    }
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    CHECK(p.ran_on == std::this_thread::get_id());
+    CHECK(ctx.in_flight() == 0);
+    f.set_size(len);
+  }
+  // What landed is what was submitted, byte for byte.
+  std::ifstream in(path, std::ios::binary);
+  std::vector<char> got((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+  REQUIRE(got.size() == len);
+  // memcmp's arguments are non-null even for a zero length, and an empty
+  // vector's data() is not.
+  if (len > 0) {
+    CHECK(std::memcmp(got.data(), content.data(), len) == 0);
+  }
+}
+
 }  // namespace
 
 TEST_SUITE("io_context") {
@@ -317,30 +380,30 @@ TEST_CASE("callbacks run only inside poll") {
 #if defined(__linux__)
   check_callback_discipline<io_impl::uring_context>(
       "uring", [&](io_impl::uring_context& c) {
-        return io_impl::uring_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::uring_context::file(c, f.path, io_impl::file_open_options{});
       });
 #endif
 #if defined(__unix__) || defined(__APPLE__)
   check_callback_discipline<io_impl::pread_context>(
       "pread", [&](io_impl::pread_context& c) {
-        return io_impl::pread_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::pread_context::file(c, f.path, io_impl::file_open_options{});
       });
 #endif
 #if defined(_WIN32)
   check_callback_discipline<io_impl::iocp_context>(
       "iocp", [&](io_impl::iocp_context& c) {
-        return io_impl::iocp_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::iocp_context::file(c, f.path, io_impl::file_open_options{});
       });
 #endif
 #if defined(__APPLE__)
   check_callback_discipline<io_impl::gcd_context>(
       "gcd", [&](io_impl::gcd_context& c) {
-        return io_impl::gcd_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::gcd_context::file(c, f.path, io_impl::file_open_options{});
       });
 #endif
   check_callback_discipline<io_impl::stdio_context>(
       "stdio", [&](io_impl::stdio_context& c) {
-        return io_impl::stdio_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::stdio_context::file(c, f.path, io_impl::file_open_options{});
       });
 }
 
@@ -352,7 +415,7 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
   check_cancel_discipline<io_impl::uring_context>(
       "uring",
       [&](io_impl::uring_context& c) {
-        return io_impl::uring_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::uring_context::file(c, f.path, io_impl::file_open_options{});
       },
       expect);
 #endif
@@ -360,7 +423,7 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
   check_cancel_discipline<io_impl::pread_context>(
       "pread",
       [&](io_impl::pread_context& c) {
-        return io_impl::pread_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::pread_context::file(c, f.path, io_impl::file_open_options{});
       },
       expect);
 #endif
@@ -368,7 +431,7 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
   check_cancel_discipline<io_impl::iocp_context>(
       "iocp",
       [&](io_impl::iocp_context& c) {
-        return io_impl::iocp_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::iocp_context::file(c, f.path, io_impl::file_open_options{});
       },
       expect);
 #endif
@@ -378,17 +441,141 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
   check_cancel_discipline<io_impl::gcd_context>(
       "gcd",
       [&](io_impl::gcd_context& c) {
-        return io_impl::gcd_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::gcd_context::file(c, f.path, io_impl::file_open_options{});
       },
       expect);
 #endif
   check_cancel_discipline<io_impl::stdio_context>(
       "stdio",
       [&](io_impl::stdio_context& c) {
-        return io_impl::stdio_context::file(c, f.path, /*direct_io=*/false);
+        return io_impl::stdio_context::file(c, f.path, io_impl::file_open_options{});
       },
       expect);
 }
+
+TEST_CASE("a write reports only from poll, and lands what it was given") {
+  // Every length in [0, 2 blocks] at the interesting boundaries: the
+  // direct-I/O path can only take whole granules, so the rest go down
+  // the backend's deferred ladder and must still arrive.
+  const std::vector<std::size_t> lens{0,
+                                      1,
+                                      4095,
+                                      4096,
+                                      4097,
+                                      8191,
+                                      8192};
+  for (const bool direct : {false, true}) {
+    for (const std::size_t len : lens) {
+      const temp_file out({});
+#if defined(__linux__)
+      check_write_discipline<io_impl::uring_context>(
+          "uring", out.path, direct, len,
+          [&](io_impl::uring_context& c) {
+            return io_impl::uring_context::file(
+                c, out.path,
+                io_impl::file_open_options{.write = true,
+                                           .direct_io = direct,
+                                           .preallocate_bytes = len});
+          });
+#endif
+#if defined(__unix__) || defined(__APPLE__)
+      check_write_discipline<io_impl::pread_context>(
+          "pread", out.path, direct, len,
+          [&](io_impl::pread_context& c) {
+            return io_impl::pread_context::file(
+                c, out.path,
+                io_impl::file_open_options{.write = true, .direct_io = direct});
+          });
+#endif
+      check_write_discipline<io_impl::stdio_context>(
+          "stdio", out.path, /*direct=*/false, len,
+          [&](io_impl::stdio_context& c) {
+            return io_impl::stdio_context::file(
+                c, out.path, io_impl::file_open_options{.write = true});
+          });
+    }
+  }
+}
+
+// A read of nothing has the same ambiguity a write of nothing does:
+// io_uring reports res == 0, which is how it reports a short transfer
+// with nothing left to give. Neither may reach the kernel.
+TEST_CASE("an empty transfer completes from poll, not as an error") {
+  const auto content = pattern(8192, 21);
+  const temp_file f(content);
+#if defined(__linux__)
+  {
+    io_impl::uring_context ctx({}, 4);
+    io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
+    io_impl::uring_context::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, {}, op);
+    CHECK(p.calls == 0);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    CHECK(ctx.in_flight() == 0);
+  }
+#endif
+  {
+    io_impl::stdio_context ctx({}, 4);
+    io_impl::stdio_context::file file(ctx, f.path, io_impl::file_open_options{});
+    io_impl::stdio_context::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, {}, op);
+    CHECK(p.calls == 0);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+  }
+}
+
+#if defined(__linux__)
+// Preallocation is a hint. A filesystem that refuses it must leave a
+// usable file behind, not a failed open: the writes simply extend the
+// file as they land, which is what every backend without fallocate does
+// anyway. Forced here by asking for more than the filesystem holds.
+TEST_CASE("a refused preallocation degrades to an ordinary writable open") {
+  const fs::path out = fs::path("/dev/shm") /
+                       ("blake3pp_prealloc_" + std::to_string(::getpid()));
+  const auto content = pattern(64 * 1024, 22);
+  {
+    io_impl::uring_context ctx({}, 4);
+    // Far more than /dev/shm holds: fallocate answers ENOSPC.
+    io_impl::uring_context::file file(
+        ctx, out,
+        io_impl::file_open_options{.write = true,
+                                   .direct_io = false,
+                                   .preallocate_bytes = std::uint64_t{1} << 48});
+    io_impl::uring_context::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_write(file, 0, std::span<const std::byte>{content}, op);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    file.set_size(content.size());
+  }
+  std::ifstream in(out, std::ios::binary);
+  std::vector<char> got((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+  CHECK(got.size() == content.size());
+  CHECK(std::memcmp(got.data(), content.data(), content.size()) == 0);
+  std::error_code ec;
+  fs::remove(out, ec);
+}
+#endif
 
 TEST_CASE("the engine survives a context that finishes in pieces and out of order") {
   constexpr std::uint64_t size = 300 * 1024 + 77;
@@ -438,8 +625,8 @@ TEST_CASE("two files share one context") {
   const temp_file fb(b);
   const auto run = [&](auto& ctx) {
     using C = std::remove_reference_t<decltype(ctx)>;
-    typename C::file file_a(ctx, fa.path, false);
-    typename C::file file_b(ctx, fb.path, false);
+    typename C::file file_a(ctx, fa.path, io_impl::file_open_options{});
+    typename C::file file_b(ctx, fb.path, io_impl::file_open_options{});
     std::vector<std::byte> got_a(a.size());
     std::vector<std::byte> got_b(b.size());
     typename C::read_op op_a{};
@@ -502,7 +689,7 @@ TEST_CASE("io_uring: reads the ring would not take are served by poll()") {
   const temp_file f(content);
 
   io_impl::uring_context ctx({}, 4);
-  io_impl::uring_context::file file(ctx, f.path, /*direct_io=*/false);
+  io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
 
   std::vector<std::byte> got_a(len / 2);
   std::vector<std::byte> got_b(len / 2);
@@ -624,7 +811,7 @@ TEST_CASE("a context destroyed with reads in flight runs no callback") {
   probe p;
   {
     ctx_type ctx({}, 4);
-    ctx_type::file file(ctx, f.path, false);
+    ctx_type::file file(ctx, f.path, io_impl::file_open_options{});
     ctx_type::read_op op{};
     op.done = &probe::on_done;
     op.owner = &p;
@@ -677,28 +864,28 @@ TEST_CASE("drain() reaps owed reads without a callback and keeps the context usa
 #if defined(__linux__)
   {
     io_impl::uring_context ctx({}, 4);
-    io_impl::uring_context::file file(ctx, f.path, false);
+    io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
     check(ctx, file, file.name());
   }
 #endif
 #if defined(_WIN32)
   {
     io_impl::iocp_context ctx({}, 4);
-    io_impl::iocp_context::file file(ctx, f.path, false);
+    io_impl::iocp_context::file file(ctx, f.path, io_impl::file_open_options{});
     check(ctx, file, file.name());
   }
 #endif
 #if defined(__APPLE__)
   {
     io_impl::gcd_context ctx({}, 4);
-    io_impl::gcd_context::file file(ctx, f.path, false);
+    io_impl::gcd_context::file file(ctx, f.path, io_impl::file_open_options{});
     check(ctx, file, file.name());
   }
 #endif
 #if defined(__unix__) || defined(__APPLE__)
   {
     io_impl::pread_context ctx({}, 4);
-    io_impl::pread_context::file file(ctx, f.path, false);
+    io_impl::pread_context::file file(ctx, f.path, io_impl::file_open_options{});
     check(ctx, file, "pread");
   }
 #endif
@@ -852,7 +1039,7 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
   {
     io_impl::uring_context ctx({}, 4);
     check(ctx, [&](io_impl::uring_context& c) {
-      return io_impl::uring_context::file(c, f.path, false);
+      return io_impl::uring_context::file(c, f.path, io_impl::file_open_options{});
     });
   }
 #endif
@@ -860,7 +1047,7 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
   {
     io_impl::gcd_context ctx({}, 4);
     check(ctx, [&](io_impl::gcd_context& c) {
-      return io_impl::gcd_context::file(c, f.path, false);
+      return io_impl::gcd_context::file(c, f.path, io_impl::file_open_options{});
     });
   }
 #endif
@@ -868,7 +1055,7 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
   {
     io_impl::iocp_context ctx({}, 4);
     check(ctx, [&](io_impl::iocp_context& c) {
-      return io_impl::iocp_context::file(c, f.path, false);
+      return io_impl::iocp_context::file(c, f.path, io_impl::file_open_options{});
     });
   }
 #endif

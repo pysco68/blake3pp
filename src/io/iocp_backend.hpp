@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <string>
 #include <string_view>
 
 #include <cerrno>
@@ -159,7 +160,7 @@ struct win_file {
   // and the failure handling are the same either way.
   void engage(const wchar_t* path, DWORD access, DWORD share,
               bool want_direct, bool want_async,
-              HANDLE shared_port = nullptr) noexcept {
+              HANDLE shared_port = nullptr, bool writing = false) noexcept {
     if (!want_direct && !want_async) {
       return;
     }
@@ -170,6 +171,11 @@ struct win_file {
     if (want_async) {
       flags |= FILE_FLAG_OVERLAPPED;
     }
+    // OPEN_EXISTING on the reopen in both directions: the plain handle
+    // has already created and truncated a file being written, and a
+    // second CREATE_ALWAYS here would truncate it again -- including any
+    // preallocation just set on it.
+    (void)writing;
     unique_handle cand(::CreateFileW(path, access, share, nullptr,
                                      OPEN_EXISTING, flags, nullptr));
     if (!cand) {
@@ -214,10 +220,12 @@ class iocp_context {
  public:
   struct read_op : read_op_base {
     OVERLAPPED ov{};
-    std::byte* dst = nullptr;
+    std::byte* dst = nullptr;         // reads fill this
+    const std::byte* src = nullptr;   // writes read from this
     std::size_t len = 0;
     std::uint64_t off = 0;
     std::size_t filled = 0;
+    bool is_write = false;
     HANDLE h = INVALID_HANDLE_VALUE;
     win_file* sync_file = nullptr;  // the deferred path needs the handles
     void* owner_file = nullptr;     // which file's drain owes this op
@@ -229,20 +237,42 @@ class iocp_context {
   class file {
    public:
     file(iocp_context& ctx, const std::filesystem::path& path,
-         bool direct_io) {
+         const file_open_options& how)
+        : write_(how.write) {
       // FILE_SHARE_READ and nothing else: a digest describes the bytes
       // that were there, so nothing may rewrite or shorten the file
       // while it is being read. The cost is that a test cannot truncate
       // a file the pipeline holds open, which is why the truncation
       // case in tests/file_pipeline.cpp does not run here.
-      f_.open(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+      const DWORD access = write_ ? GENERIC_WRITE : GENERIC_READ;
+      const DWORD creation = write_ ? CREATE_ALWAYS : OPEN_EXISTING;
+      // A writable open shares write access with ITSELF: engage() reopens
+      // the same path for the direct/overlapped handle, and two
+      // GENERIC_WRITE handles can only coexist if the first one permits
+      // it. Without FILE_SHARE_WRITE the reopen fails with a sharing
+      // violation every time, and every write silently takes the
+      // synchronous buffered rung.
+      const DWORD share =
+          write_ ? (FILE_SHARE_READ | FILE_SHARE_WRITE) : FILE_SHARE_READ;
+      f_.open(path.c_str(), access, share, creation,
               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
-      size_ = f_.stat_size();
-      f_.engage(path.c_str(), GENERIC_READ, FILE_SHARE_READ, direct_io,
-                ctx.port_wanted(), ctx.port());
-      name_ = f_.use_iocp ? (f_.direct ? "iocp+direct" : "iocp")
-              : f_.direct ? "readfile+direct"
-                          : "readfile";
+      size_ = write_ ? 0 : f_.stat_size();
+      // Preallocation belongs to the OPEN, not to the finish: a write
+      // that extends the file serializes, and with an async direct queue
+      // that collapses it to one stalled write at a time. Windows
+      // preallocates by setting the end of file and then the valid data
+      // length, which is what keeps the extension from zero-filling;
+      // SetFileValidData needs a privilege the process may not hold, so
+      // it is best-effort and the size alone still helps. set_size()
+      // trims back afterwards.
+      if (write_ && how.preallocate_bytes > 0) {
+        if (set_end_of_file(how.preallocate_bytes)) {
+          prealloc_ = how.preallocate_bytes;
+        }
+      }
+      f_.engage(path.c_str(), access, share, how.direct_io,
+                ctx.port_wanted(), ctx.port(), write_);
+      name_ = ctx.name_for(f_.direct, f_.use_iocp, write_);
       ctx.adopt(*this);
     }
 
@@ -257,11 +287,35 @@ class iocp_context {
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
+    // Trims a preallocation back to what was written. Harmless when
+    // nothing was preallocated, which is what a reader's file is.
+    void set_size(std::uint64_t bytes) {
+      if (!set_end_of_file(bytes)) {
+        throw_winerr("SetEndOfFile");
+      }
+      prealloc_ = 0;
+    }
+
    private:
     friend class iocp_context;
+
+    // SetFilePointerEx + SetEndOfFile on the PLAIN handle: the fast one
+    // may be FILE_FLAG_NO_BUFFERING, whose file pointer has alignment
+    // rules of its own, and the plain handle has none.
+    [[nodiscard]] bool set_end_of_file(std::uint64_t bytes) noexcept {
+      LARGE_INTEGER to;
+      to.QuadPart = static_cast<LONGLONG>(bytes);
+      if (::SetFilePointerEx(f_.plain.get(), to, nullptr, FILE_BEGIN) == 0) {
+        return false;
+      }
+      return ::SetEndOfFile(f_.plain.get()) != 0;
+    }
+
     win_file f_;
     std::uint64_t size_ = 0;
-    std::string_view name_ = "readfile";
+    std::uint64_t prealloc_ = 0;
+    bool write_ = false;
+    std::string name_ = "readfile";
     iocp_context* ctx_ = nullptr;
     file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
@@ -288,6 +342,8 @@ class iocp_context {
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
     op.dst = buf.data();
+    op.src = nullptr;
+    op.is_write = false;
     op.len = buf.size();
     op.off = off;
     op.filled = 0;
@@ -309,6 +365,46 @@ class iocp_context {
         // down the ladder an unalignable read already takes: read
         // synchronously inside poll(), where a second failure reaches
         // the caller as every other read error does.
+        queued = false;
+      }
+    }
+    op.on_port = queued;
+    in_flight_++;
+    f.inflight_++;
+    if (!queued) {
+      deferred_.push(op);
+    }
+  }
+
+  // The write half of the same contract, and the same ladder: a length
+  // NO_BUFFERING cannot take, or a file whose reopen never engaged,
+  // rides the deferred list and is written synchronously inside poll()
+  // through the plain handle. Nothing above the context sees the
+  // difference.
+  //
+  // A zero-length write takes the deferred path too: WriteFile of zero
+  // bytes posts a completion carrying zero bytes, which is the same
+  // shape as a short transfer and cannot be told apart from one.
+  void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
+                    read_op& op) {
+    op.dst = nullptr;
+    op.src = buf.data();
+    op.len = buf.size();
+    op.off = off;
+    op.filled = 0;
+    op.is_write = true;
+    op.h = f.f_.h();
+    op.sync_file = &f.f_;
+    op.next_deferred = nullptr;
+    op.owner_file = &f;
+    op.on_port = false;
+    op.cancelled = false;
+    bool queued = f.f_.use_iocp && buf.size() > 0 &&
+                  buf.size() % direct_align == 0;
+    if (queued) {
+      try {
+        issue(op);
+      } catch (const std::system_error&) {
         queued = false;
       }
     }
@@ -398,6 +494,18 @@ class iocp_context {
 
  private:
   static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
+
+  // The degradation strings are observable API -- tools print them and a
+  // run is read differently depending on which rung it names -- so the
+  // write side keeps the spellings the writer used before.
+  [[nodiscard]] std::string name_for(bool direct, bool use_iocp,
+                                     bool write) const {
+    const char* const sync_name = write ? "writefile" : "readfile";
+    if (use_iocp) {
+      return direct ? "iocp+direct" : "iocp";
+    }
+    return direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
+  }
 
   [[nodiscard]] bool port_wanted() const noexcept { return async_requested_; }
   [[nodiscard]] HANDLE port() const noexcept {
@@ -492,11 +600,13 @@ class iocp_context {
     const std::uint64_t off = op.off + op.filled;
     op.ov.Offset = static_cast<DWORD>(off);
     op.ov.OffsetHigh = static_cast<DWORD>(off >> 32);
-    if (::ReadFile(op.h, op.dst + op.filled,
-                   static_cast<DWORD>(op.len - op.filled), nullptr,
-                   &op.ov) == 0 &&
-        ::GetLastError() != ERROR_IO_PENDING) {
-      throw_winerr("ReadFile(async)");
+    const DWORD rest = static_cast<DWORD>(op.len - op.filled);
+    const BOOL ok =
+        op.is_write
+            ? ::WriteFile(op.h, op.src + op.filled, rest, nullptr, &op.ov)
+            : ::ReadFile(op.h, op.dst + op.filled, rest, nullptr, &op.ov);
+    if (ok == 0 && ::GetLastError() != ERROR_IO_PENDING) {
+      throw_winerr(op.is_write ? "WriteFile(async)" : "ReadFile(async)");
     }
     ++port_owed_;
   }
@@ -571,7 +681,11 @@ class iocp_context {
       ec = std::make_error_code(std::errc::operation_canceled);
     } else {
       try {
-        read_sync(*op.sync_file, op.off, {op.dst, op.len});
+        if (op.is_write) {
+          write_sync(*op.sync_file, op.off, {op.src, op.len});
+        } else {
+          read_sync(*op.sync_file, op.off, {op.dst, op.len});
+        }
         op.filled = op.len;
       } catch (const std::system_error& e) {
         ec = e.code();
@@ -609,115 +723,21 @@ class iocp_context {
     }
   }
 
-  bool async_requested_ = true;
-  unique_handle port_;
-  deferred_ops<read_op> deferred_;
-  file* files_ = nullptr;      // every open file, for the drain
-  std::size_t in_flight_ = 0;
-  std::size_t port_owed_ = 0;  // requests the port has yet to hand back
-  bool woken_ = false;
-};
-
-class iocp_writer {
- public:
-  iocp_writer(const std::filesystem::path& path,
-              const file_writer_options& opts, unsigned nslots)
-      : slots_(nslots), ovs_(nslots) {
-    // Two opens of one file need explicit sharing on Windows.
-    constexpr DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE;
-    file_.open(path.c_str(), GENERIC_WRITE, share, CREATE_ALWAYS,
-               FILE_ATTRIBUTE_NORMAL);
-    bool vdl = false;
-    if (opts.preallocate_bytes > 0) {
-      // SetEndOfFile is the fallocate twin: writes become overwrites of an
-      // existing region. NTFS adds a second lock beyond ext4's, the valid
-      // data length: any write landing past VDL zero-fills the gap
-      // synchronously. SetFileValidData waives that, privilege permitting.
-      LARGE_INTEGER target;
-      target.QuadPart = static_cast<std::int64_t>(opts.preallocate_bytes);
-      if (::SetFilePointerEx(file_.plain.get(), target, nullptr,
-                             FILE_BEGIN) != 0 &&
-          ::SetEndOfFile(file_.plain.get()) != 0) {
-        prealloc_ = opts.preallocate_bytes;
-        vdl = try_set_valid_data(file_.plain.get(), target.QuadPart);
-      }
-      LARGE_INTEGER zero{};
-      ::SetFilePointerEx(file_.plain.get(), zero, nullptr, FILE_BEGIN);
+  // The write twin of read_sync, and the same handle choice: the
+  // overlapped handle is never used synchronously, and a length
+  // NO_BUFFERING cannot take goes through the plain one.
+  //
+  // A zero-length write returns without calling WriteFile, which would
+  // only set the file pointer.
+  static void write_sync(win_file& f, std::uint64_t off,
+                         std::span<const std::byte> buf) {
+    if (buf.empty()) {
+      return;
     }
-    file_.engage(path.c_str(), GENERIC_WRITE, share, opts.direct_io,
-                 opts.async);
-    name_ = file_.use_iocp
-                ? (file_.direct ? (vdl ? "iocp+direct+vdl" : "iocp+direct")
-                                : "iocp")
-                : file_.direct
-                    ? (vdl ? "writefile+direct+vdl" : "writefile+direct")
-                    : "writefile";
-  }
-
-
-  // Cancels every in-flight request and waits for ALL of them to report.
-  // The wait is INFINITE on purpose. These requests target the engine's
-  // buffer pool, which is declared before this backend and therefore freed
-  // AFTER it, so returning while one is still pending hands the kernel a
-  // window to write into freed memory. CancelIoEx makes that wait bounded
-  // in practice: once it returns, every outstanding request is guaranteed
-  // to complete, successfully or with ERROR_OPERATION_ABORTED. A null
-  // OVERLAPPED here therefore means the port itself has failed, not that a
-  // request is merely slow: no completion can ever arrive, so breaking is
-  // the only option left.
-  void drain_cancelled() noexcept {
-    ::CancelIoEx(file_.h(), nullptr);
-    while (outstanding_ > 0) {
-      DWORD bytes = 0;
-      ULONG_PTR key = 0;
-      OVERLAPPED* pov = nullptr;
-      ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key, &pov,
-                                  INFINITE);
-      if (pov == nullptr) {
-        break;  // port unusable: no completion will ever arrive
-      }
-      --outstanding_;
-    }
-  }
-
-  // Only the drain is hand-written now: every handle belongs to file_,
-  // whose destructor runs after this body, that is, after the last
-  // request has reported, which is the ordering the drain exists for.
-  ~iocp_writer() {
-    // finish() may have thrown or been skipped, leaving writes in flight.
-    if (file_.use_iocp && outstanding_ > 0) {
-      drain_cancelled();
-    }
-  }
-  iocp_writer(const iocp_writer&) = delete;
-  iocp_writer& operator=(const iocp_writer&) = delete;
-
-  [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
-  [[nodiscard]] bool wants_async(std::size_t len) const noexcept {
-    return file_.use_iocp && len % direct_align == 0;
-  }
-
-  void start_write(unsigned s, std::uint64_t off,
-                   std::span<const std::byte> buf) {
-    slots_[s] = {buf.data(), buf.size(), off, 0, true};
-    submit_async(s, 0);
-  }
-
-  void wait_slot(unsigned s) {
-    while (slots_[s].busy) {
-      reap_one();
-    }
-  }
-
-  // Positional synchronous write on a non-OVERLAPPED handle; the
-  // unaligned tail always takes the buffered handle (NO_BUFFERING rejects
-  // unaligned lengths, same story as O_DIRECT).
-  void write_sync(std::uint64_t off, std::span<const std::byte> buf) {
-    const HANDLE use_h = file_.direct && !file_.use_iocp &&
-                                 buf.size() % direct_align == 0
-                             ? file_.h()
-                             : file_.plain.get();
+    const HANDLE use_h =
+        f.direct && !f.use_iocp && buf.size() % direct_align == 0
+            ? f.h()
+            : f.plain.get();
     std::size_t put = 0;
     while (put < buf.size()) {
       OVERLAPPED ov{};
@@ -731,93 +751,25 @@ class iocp_writer {
       }
       if (n == 0) {
         throw std::system_error(EIO, std::generic_category(),
-                                "WriteFile wrote nothing");
+                                "write made no progress");
       }
       put += n;
     }
   }
 
-  void finish(std::uint64_t written) {
-    for (unsigned s = 0; s < slots_.size(); ++s) {
-      wait_slot(s);
-    }
-    // SetEndOfFile set the size up front; trim back if less was written.
-    if (prealloc_ > written) {
-      LARGE_INTEGER n;
-      n.QuadPart = static_cast<std::int64_t>(written);
-      if (::SetFilePointerEx(file_.plain.get(), n, nullptr, FILE_BEGIN) == 0 ||
-          ::SetEndOfFile(file_.plain.get()) == 0) {
-        throw_winerr("SetEndOfFile(trim)");
-      }
-    }
-    prealloc_ = 0;
-  }
-
- private:
-  struct slot {
-    const std::byte* src = nullptr;
-    std::size_t len = 0;
-    std::uint64_t off = 0;
-    std::size_t done = 0;
-    bool busy = false;
-  };
-
-  void submit_async(unsigned s, std::size_t from) {
-    slot& st = slots_[s];
-    OVERLAPPED& ov = ovs_[s];
-    std::memset(&ov, 0, sizeof(ov));
-    const std::uint64_t o = st.off + from;
-    ov.Offset = static_cast<DWORD>(o);
-    ov.OffsetHigh = static_cast<DWORD>(o >> 32);
-    if (::WriteFile(file_.h(), st.src + from,
-                    static_cast<DWORD>(st.len - from), nullptr, &ov) == 0 &&
-        ::GetLastError() != ERROR_IO_PENDING) {
-      throw_winerr("WriteFile(async)");
-    }
-    ++outstanding_;
-  }
-
-  void reap_one() {
-    DWORD bytes = 0;
-    ULONG_PTR key = 0;
-    OVERLAPPED* pov = nullptr;
-    const BOOL ok = ::GetQueuedCompletionStatus(file_.port.get(), &bytes, &key,
-                                                &pov, INFINITE);
-    if (pov == nullptr) {
-      throw_winerr("GetQueuedCompletionStatus");
-    }
-    --outstanding_;
-    const unsigned s = static_cast<unsigned>(pov - ovs_.data());
-    slot& st = slots_[s];
-    if (ok == 0 || bytes == 0) {
-      throw_winerr("iocp write");
-    }
-    st.done += bytes;
-    if (st.done < st.len) {
-      submit_async(s, st.done);
-    } else {
-      st.busy = false;
-    }
-  }
-
-  std::vector<slot> slots_;
-  std::vector<OVERLAPPED> ovs_;  // one per slot
-  std::uint64_t prealloc_ = 0;
-  unsigned outstanding_ = 0;
-  std::string_view name_ = "writefile";
-  // Declared LAST so it is destroyed FIRST: the handles must close before
-  // ovs_ goes away. drain_cancelled() normally guarantees nothing is in
-  // flight by then, but it gives up early if the port itself has failed,
-  // and closing the handles is what cancels any request still holding an
-  // OVERLAPPED in that path.
-  win_file file_;  // plain (tail, trim) + fast reopen + IOCP port
+  bool async_requested_ = true;
+  unique_handle port_;
+  deferred_ops<read_op> deferred_;
+  file* files_ = nullptr;      // every open file, for the drain
+  std::size_t in_flight_ = 0;
+  std::size_t port_owed_ = 0;  // requests the port has yet to hand back
+  bool woken_ = false;
 };
 
 // Definition-site conformance check (see uring_backend.hpp): fails here,
 // with the missed requirement named, the first time MSVC compiles this
 // header, before any engine instantiation exists.
-static_assert(reader_context<iocp_context>);
-static_assert(writer_backend<iocp_writer>);
+static_assert(io_context<iocp_context>);
 
 }  // namespace blake3pp::detail::io_impl
 

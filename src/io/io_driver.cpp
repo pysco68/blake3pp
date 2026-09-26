@@ -25,7 +25,7 @@
 namespace blake3pp::detail {
 
 namespace {
-using context = io_impl::native_reader_context;
+using context = io_impl::native_io_context;
 using native_op = context::read_op;
 
 // The backend's operation lives inside the caller's io_read_op, whose
@@ -74,8 +74,9 @@ struct io_driver::file::impl {
   io_driver::impl* drv = nullptr;
 #endif
 
-  impl(io_driver::impl& d, const std::filesystem::path& path, bool direct_io)
-      : f(d.ctx, path, direct_io) {
+  impl(io_driver::impl& d, const std::filesystem::path& path,
+       const io_impl::file_open_options& how)
+      : f(d.ctx, path, how) {
 #ifndef NDEBUG
     drv = &d;
     ++d.live_files;
@@ -109,8 +110,11 @@ io_driver::~io_driver() {
 }
 
 io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
-                      bool direct_io)
-    : impl_(std::make_unique<impl>(*drv.impl_, path, direct_io)) {}
+                      const open_options& how)
+    : impl_(std::make_unique<impl>(
+          *drv.impl_, path,
+          io_impl::file_open_options{how.write, how.direct_io,
+                                     how.preallocate_bytes})) {}
 
 io_driver::file::~file() = default;
 
@@ -122,12 +126,24 @@ std::string_view io_driver::file::name() const noexcept {
   return impl_->f.name();
 }
 
+void io_driver::file::set_size(std::uint64_t bytes) {
+  impl_->f.set_size(bytes);
+}
+
 void io_driver::submit_read(file& f, std::uint64_t off,
                             std::span<std::byte> buf, io_read_op& op) {
   native_op& inner = op.emplace_native<native_op>();
   inner.done = &trampoline;
   inner.owner = &op;
   impl_->ctx.submit_read(f.impl_->f, off, buf, inner);
+}
+
+void io_driver::submit_write(file& f, std::uint64_t off,
+                             std::span<const std::byte> buf, io_read_op& op) {
+  native_op& inner = op.emplace_native<native_op>();
+  inner.done = &trampoline;
+  inner.owner = &op;
+  impl_->ctx.submit_write(f.impl_->f, off, buf, inner);
 }
 
 void io_driver::flush() noexcept { impl_->ctx.flush(); }

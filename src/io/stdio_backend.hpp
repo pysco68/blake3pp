@@ -46,10 +46,14 @@ inline std::int64_t tell64(std::FILE* f) noexcept {
 // The source half of the synchronous contract; see pread_source.
 class stdio_source {
  public:
-  stdio_source(const std::filesystem::path& path, bool) {
-    stream_ = std::fopen(path.string().c_str(), "rb");
+  stdio_source(const std::filesystem::path& path,
+               const file_open_options& how) {
+    stream_ = std::fopen(path.string().c_str(), how.write ? "wb" : "rb");
     if (stream_ == nullptr) {
       throw_errno("fopen");
+    }
+    if (how.write) {
+      return;  // created empty; there is no size to learn
     }
     if (std::fseek(stream_, 0, SEEK_END) != 0) {
       throw_errno("fseek(end)");
@@ -80,47 +84,18 @@ class stdio_source {
     }
   }
 
- private:
-  std::FILE* stream_ = nullptr;
-  std::uint64_t size_ = 0;
-};
-
-using stdio_context = sync_context<stdio_source>;
-
-class stdio_writer {
- public:
-  stdio_writer(const std::filesystem::path& path, const file_writer_options&,
-               unsigned) {
-    stream_ = std::fopen(path.string().c_str(), "wb");
-    if (stream_ == nullptr) {
-      throw_errno("fopen");
+  void write_at(std::uint64_t off, std::span<const std::byte> buf) {
+    if (seek64(stream_, off) != 0) {
+      throw_errno("fseek");
     }
-  }
-  ~stdio_writer() {
-    if (stream_ != nullptr) {
-      std::fclose(stream_);
-    }
-  }
-  stdio_writer(const stdio_writer&) = delete;
-  stdio_writer& operator=(const stdio_writer&) = delete;
-
-  [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
-  [[nodiscard]] bool wants_async(std::size_t) const noexcept { return false; }
-
-  void start_write(unsigned, std::uint64_t, std::span<const std::byte>) {
-    assert(false && "stdio backend has no async path");
-  }
-  void wait_slot(unsigned) {}  // nothing is ever in flight
-
-  // Writes are strictly sequential (the engine's offset only grows), so
-  // the stream position is already `off` and no seek is needed.
-  void write_sync(std::uint64_t, std::span<const std::byte> buf) {
     if (std::fwrite(buf.data(), 1, buf.size(), stream_) != buf.size()) {
       throw std::system_error(EIO, std::generic_category(), "fwrite");
     }
   }
 
-  void finish(std::uint64_t) {
+  // stdio has no truncate; flushing is the most it can promise, and the
+  // writer above it only ever asks for a size it has actually written.
+  void set_size(std::uint64_t) {
     if (std::fflush(stream_) != 0) {
       throw_errno("fflush");
     }
@@ -128,10 +103,12 @@ class stdio_writer {
 
  private:
   std::FILE* stream_ = nullptr;
+  std::uint64_t size_ = 0;
 };
 
+using stdio_context = sync_context<stdio_source>;
+
 // Definition-site conformance check (see uring_backend.hpp).
-static_assert(reader_context<stdio_context>);
-static_assert(writer_backend<stdio_writer>);
+static_assert(io_context<stdio_context>);
 
 }  // namespace blake3pp::detail::io_impl

@@ -21,10 +21,19 @@
 // next buffer while the device drains this one. acquire() blocking on a
 // still-in-flight slot is the backpressure.
 //
+// SUBMIT ACCEPTS, FINISH LANDS. submit() never writes: it hands the
+// bytes to the I/O context and returns, and they reach the file inside a
+// later poll() -- during another acquire(), or during finish(). So a
+// write error NEVER comes out of submit(). It surfaces from the next
+// acquire() or from finish(), whichever the caller reaches first, and
+// the first error is held until one of them reports it, so nothing a
+// submit accepted is dropped silently. finish() lands everything
+// outstanding before it reports.
+//
 // O_DIRECT demands 4 KiB-aligned lengths, so only the final submit() may
-// be partial or unaligned. That one is written through a plain fd, the
-// same trick the reader uses for its tail. finish() drains all in-flight
-// writes.
+// be partial or unaligned. That one goes through a plain fd, the same
+// trick the reader uses for its tail; the context decides, so this class
+// does not know which path a buffer took.
 //
 // Not thread-safe, so drive it from one producer thread. The buffers it
 // hands out may be filled by many.
@@ -72,19 +81,22 @@ class file_writer {
     unsigned slot;
   };
 
-  // Next free buffer; blocks until the slot's previous write completes.
-  // Throws std::system_error if that write failed.
+  // Next buffer in round-robin order; blocks until that slot's previous
+  // write has landed. Throws std::system_error if any write so far
+  // failed.
   buffer acquire();
 
-  // Queues `bytes` from the buffer at the next sequential file offset and
-  // returns without waiting. `bytes` must be a multiple of 4 KiB except on
-  // the final submit before finish(). Throws std::system_error on
-  // submission failure.
+  // Accepts `bytes` from the buffer for the next sequential file offset
+  // and returns without waiting or writing. `bytes` must be a multiple of
+  // 4 KiB except on the final submit before finish(). Throws only for a
+  // buffer this writer did not hand out, a length larger than it holds,
+  // or a submit after a partial one; a WRITE error is reported by the
+  // next acquire() or by finish(), never from here.
   void submit(const buffer& b, std::size_t bytes);
 
-  // Blocks until every queued write has hit the file; surfaces any
-  // deferred write error. Implicit in the destructor, but only finish()
-  // can report failure, so call it.
+  // Lands every accepted byte and surfaces the first write error there
+  // was. Implicit in the destructor, but only finish() can report
+  // failure, so call it.
   void finish();
 
   [[nodiscard]] std::uint64_t bytes_written() const noexcept;

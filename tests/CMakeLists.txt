@@ -41,7 +41,8 @@ add_executable(blake3pp_tests
 # file-I/O layer there is nothing for it to link against.
 if(BLAKE3PP_WITH_IO)
   target_sources(blake3pp_tests PRIVATE
-    io.cpp io_context.cpp io_no_provider.cpp file_pipeline.cpp)
+    io.cpp io_context.cpp io_no_provider.cpp file_pipeline.cpp
+    write_pipeline.cpp)
 endif()
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"

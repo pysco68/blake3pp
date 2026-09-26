@@ -23,9 +23,9 @@
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
-// The portable engines and the backends the platform selector never
-// picks here: instantiating reader_engine/writer_engine with them below
-// keeps the off-platform code compiled AND executed on every platform
+// The portable engines and the I/O contexts the platform selector never
+// picks here: instantiating the engines with them below keeps the
+// off-platform code compiled AND executed on every platform
 // (on Linux the selector only ever compiles the io_uring backend).
 #include "io/engine.hpp"
 #include "io/stdio_backend.hpp"
@@ -684,24 +684,27 @@ TEST_CASE("writer submit modes deliver identical data") {
         w.submit(b, n);
         done += n;
       }
+      CHECK(w.bytes_written() == content.size());
       w.finish();
+      CHECK(w.bytes_written() == content.size());
     }
     CHECK(blake3pp::hash_file(f.path) == expected);
   }
 }
 
-// Writes `content` through writer_engine<W>, reads it back through
-// polled_reader_engine<C>, and checks byte identity. Small buffers and low
-// queue depth force slot recycling; the odd length forces an unaligned
-// tail through the deferred path.
-template <class C, class W>
+// Writes `content` through polled_writer_engine<C>, reads it back
+// through polled_reader_engine<C>, and checks byte identity. Small
+// buffers and low queue depth force slot recycling; the odd length
+// forces an unaligned tail through the deferred path. One context type
+// serves both directions.
+template <class C>
 void roundtrip_engines(std::string_view tag) {
   namespace io_impl = blake3pp::detail::io_impl;
   const auto content = make_input(300 * 1024 + 77);
   const temp_file f({});  // placeholder path; the writer recreates it
 
   {
-    io_impl::writer_engine<W> w(
+    io_impl::polled_writer_engine<C> w(
         f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2,
                  .preallocate_bytes = content.size()});
     MESSAGE(tag << " writer backend: " << w.backend_name());
@@ -736,9 +739,9 @@ void roundtrip_engines(std::string_view tag) {
 // everywhere, not just where the selector picks them.
 TEST_CASE("engine templates drive the off-platform backends") {
   namespace io_impl = blake3pp::detail::io_impl;
-  roundtrip_engines<io_impl::stdio_context, io_impl::stdio_writer>("stdio");
+  roundtrip_engines<io_impl::stdio_context>("stdio");
 #if defined(__unix__) || defined(__APPLE__)
-  roundtrip_engines<io_impl::pread_context, io_impl::pread_writer>("pread");
+  roundtrip_engines<io_impl::pread_context>("pread");
 #endif
 }
 
