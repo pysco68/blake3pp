@@ -278,6 +278,18 @@
       }
     },
     {
+      "name": "linux-gcc16-cxx26-no-io",
+      "displayName": "GCC 16, C++26, file I/O layer off: the parallel path must not need it",
+      "inherits": "linux-gcc16-cxx26",
+      "binaryDir": "${sourceDir}/build/linux-gcc16-cxx26-no-io",
+      "cacheVariables": {
+        "BLAKE3PP_WITH_IO": "OFF",
+        "BLAKE3PP_BUILD_TESTS": "ON",
+        "BLAKE3PP_BUILD_BENCH": "OFF",
+        "BLAKE3PP_BUILD_CLI": "OFF"
+      }
+    },
+    {
       "name": "include-audit",
       "displayName": "clang 22, every optional component on: the compile database the include audit reads",
       "inherits": "linux-clang22-cxx26",
@@ -411,6 +423,10 @@
     {
       "name": "linux-s390x-gcc15-cxx23-coverage",
       "configurePreset": "linux-s390x-gcc15-cxx23-coverage"
+    },
+    {
+      "name": "linux-gcc16-cxx26-no-io",
+      "configurePreset": "linux-gcc16-cxx26-no-io"
     }
   ],
   "testPresets": [

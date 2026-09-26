@@ -15,7 +15,7 @@
 // Internal to the pipeline; <blake3pp/io.hpp> must not reach this, since
 // it would drag the provider into the public I/O surface.
 
-#include <blake3pp/parallel.hpp>
+#include <blake3pp/detail/ex.hpp>
 
 namespace blake3pp::detail::ex_compat {
 

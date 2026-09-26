@@ -85,8 +85,10 @@
 #include <utility>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/detail/file_reader.hpp>
+#include <blake3pp/detail/driver.hpp>
 #include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/detail/tree_reducer.hpp>
 #include <blake3pp/dispatch.hpp>
@@ -750,7 +752,7 @@ inline constexpr std::size_t reducer_nodes = 256;
 // path inside poll(), on the driver thread; a buffered file keeps them
 // all asynchronous. So the choice is per file, and it is made once.
 [[nodiscard]] constexpr bool direct_io_fits(std::size_t head) noexcept {
-  return head % io_driver::direct_alignment == 0;
+  return head % direct_alignment == 0;
 }
 
 // Buffer memory the pipeline spends on windows beyond the reads the
