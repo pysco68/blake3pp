@@ -218,36 +218,54 @@ class polled_reader_engine {
   typename C::file file_;
 };
 
-// The write-side slot engine, the reader's inverse. The producer fills
-// buffers ahead of the device, and acquire() blocking on a slot whose write
-// is still in flight is the entire backpressure story.
+// The write-side slot engine, the reader's inverse, over the same
+// io_context: the producer fills buffers ahead of the device, and
+// acquire() blocking on a slot whose write is still in flight is the
+// entire backpressure story.
 //
-// The unaligned tail, and only the final submit may be one, always goes
-// through the backend's synchronous buffered path, because O_DIRECT and
-// NO_BUFFERING both reject unaligned lengths. The backends that do not care
-// route it the same way, for uniformity.
-template <writer_backend B>
-class writer_engine {
+// What changed when this moved onto the contract. The old engine asked
+// the backend wants_async() and, when the answer was no, wrote
+// synchronously inside submit(). Now every submit queues and the context
+// decides; a length the platform cannot take asynchronously rides the
+// backend's deferred list and lands inside poll(), where a read that
+// cannot be issued asynchronously already landed. So:
+//
+//   submit() ACCEPTS bytes. finish() LANDS them.
+//   Errors surface from acquire() or finish(), never from submit().
+//
+// That is the same contract the async path always had -- its errors
+// surfaced from acquire() too -- so the two paths now report alike
+// rather than one throwing early and the other late.
+template <io_context C>
+class polled_writer_engine {
  public:
   using buffer = file_writer::buffer;
 
-  writer_engine(const std::filesystem::path& path,
-                const file_writer_options& opts)
+  polled_writer_engine(const std::filesystem::path& path,
+                       const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
         qd_(clamp_queue_depth(opts.queue_depth)),
+        slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
-        backend_(path, opts, qd_) {}
+        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
+        file_(ctx_, path,
+              file_open_options{.write = true,
+                                .direct_io = opts.direct_io,
+                                .preallocate_bytes = opts.preallocate_bytes}),
+        preallocated_(opts.preallocate_bytes) {}
 
   [[nodiscard]] std::uint64_t bytes_written() const noexcept {
     return written_;
   }
   [[nodiscard]] std::string_view backend_name() const noexcept {
-    return backend_.name();
+    return file_.name();
   }
 
+  // Round-robin, as before: the next slot in order, waited out.
   buffer acquire() {
     const unsigned s = next_slot_;
-    backend_.wait_slot(s);
+    wait_slot(s);
+    throw_if_failed();
     return buffer{buf(s), buffer_, s};
   }
 
@@ -267,20 +285,66 @@ class writer_engine {
     if (bytes % direct_align != 0) {
       tail_submitted_ = true;
     }
-    const std::span<const std::byte> data{b.data, bytes};
-    if (backend_.wants_async(bytes)) {
-      backend_.start_write(b.slot, offset_, data);
-    } else {
-      backend_.write_sync(offset_, data);
-    }
+    slot_state& st = slots_[b.slot];
+    st.busy = true;
+    st.ec = {};
+    st.op.done = &on_done;
+    st.op.owner = &st;
+    ctx_.submit_write(file_, offset_, {b.data, bytes}, st.op);
+    ctx_.flush();
     offset_ += bytes;
     written_ += bytes;
     next_slot_ = (b.slot + 1) % qd_;
   }
 
-  void finish() { backend_.finish(written_); }
+  // Lands everything accepted, then reports the first error any of it
+  // produced. No byte a submit() accepted is dropped on the way.
+  void finish() {
+    for (unsigned s = 0; s < qd_; ++s) {
+      wait_slot(s);
+    }
+    throw_if_failed();
+    if (preallocated_ > written_) {
+      file_.set_size(written_);
+      preallocated_ = 0;
+    }
+  }
 
  private:
+  struct slot_state {
+    typename C::read_op op{};
+    std::error_code ec{};
+    bool busy = false;
+  };
+
+  // The one place the context hands control back. Marking the slot is all
+  // it may do: the engine is not reentrant.
+  static void on_done(read_op_base* base, std::error_code ec) noexcept {
+    auto* const st = static_cast<slot_state*>(base->owner);
+    st->ec = ec;
+    st->busy = false;
+  }
+
+  void wait_slot(unsigned s) {
+    while (slots_[s].busy) {
+      ctx_.poll(true);
+    }
+    // The first error wins and is remembered until someone asks, so a
+    // failure can never be lost between a submit that accepted it and
+    // the acquire or finish that reports it.
+    if (slots_[s].ec && !failed_) {
+      failed_ = slots_[s].ec;
+    }
+  }
+
+  void throw_if_failed() {
+    if (failed_) {
+      const std::error_code ec = failed_;
+      failed_ = {};
+      throw std::system_error(ec, "blake3pp: writing a file");
+    }
+  }
+
   // Round up to the O_DIRECT length granule; >= 64 KiB so queued writes
   // are worth their submission cost.
   static std::size_t rounded_buffer(std::size_t bytes) noexcept {
@@ -299,13 +363,18 @@ class writer_engine {
   unsigned next_slot_ = 0;       // round-robin acquire order
   std::uint64_t offset_ = 0;     // next sequential file offset
   std::uint64_t written_ = 0;    // total bytes accepted via submit()
+  std::uint64_t preallocated_ = 0;
+  std::error_code failed_{};     // the first error, until it is reported
   bool tail_submitted_ = false;  // a partial submit closes the stream
+  std::vector<slot_state> slots_;
 
-  // Declaration order is the teardown contract: the backend destructs
-  // FIRST, draining any in-flight writes that read from the pool, and the
-  // pool is freed after. Do not reorder these two members.
+  // Declaration order is the teardown contract: the file closes first,
+  // then the context drains every write still owed (running no callback),
+  // and only then is the pool it was writing from freed. Do not reorder
+  // these three members.
   aligned_buffer pool_;
-  B backend_;
+  C ctx_;
+  typename C::file file_;
 };
 
 }  // namespace blake3pp::detail::io_impl

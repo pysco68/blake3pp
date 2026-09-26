@@ -495,6 +495,86 @@ TEST_CASE("a write reports only from poll, and lands what it was given") {
   }
 }
 
+// A read of nothing has the same ambiguity a write of nothing does:
+// io_uring reports res == 0, which is how it reports a short transfer
+// with nothing left to give. Neither may reach the kernel.
+TEST_CASE("an empty transfer completes from poll, not as an error") {
+  const auto content = pattern(8192, 21);
+  const temp_file f(content);
+#if defined(__linux__)
+  {
+    io_impl::uring_context ctx({}, 4);
+    io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
+    io_impl::uring_context::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, {}, op);
+    CHECK(p.calls == 0);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    CHECK(ctx.in_flight() == 0);
+  }
+#endif
+  {
+    io_impl::stdio_context ctx({}, 4);
+    io_impl::stdio_context::file file(ctx, f.path, io_impl::file_open_options{});
+    io_impl::stdio_context::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, {}, op);
+    CHECK(p.calls == 0);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+  }
+}
+
+#if defined(__linux__)
+// Preallocation is a hint. A filesystem that refuses it must leave a
+// usable file behind, not a failed open: the writes simply extend the
+// file as they land, which is what every backend without fallocate does
+// anyway. Forced here by asking for more than the filesystem holds.
+TEST_CASE("a refused preallocation degrades to an ordinary writable open") {
+  const fs::path out = fs::path("/dev/shm") /
+                       ("blake3pp_prealloc_" + std::to_string(::getpid()));
+  const auto content = pattern(64 * 1024, 22);
+  {
+    io_impl::uring_context ctx({}, 4);
+    // Far more than /dev/shm holds: fallocate answers ENOSPC.
+    io_impl::uring_context::file file(
+        ctx, out,
+        io_impl::file_open_options{.write = true,
+                                   .direct_io = false,
+                                   .preallocate_bytes = std::uint64_t{1} << 48});
+    io_impl::uring_context::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_write(file, 0, std::span<const std::byte>{content}, op);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    file.set_size(content.size());
+  }
+  std::ifstream in(out, std::ios::binary);
+  std::vector<char> got((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+  CHECK(got.size() == content.size());
+  CHECK(std::memcmp(got.data(), content.data(), content.size()) == 0);
+  std::error_code ec;
+  fs::remove(out, ec);
+}
+#endif
+
 TEST_CASE("the engine survives a context that finishes in pieces and out of order") {
   constexpr std::uint64_t size = 300 * 1024 + 77;
   io_impl::polled_reader_engine<fake_context> r(

@@ -690,18 +690,19 @@ TEST_CASE("writer submit modes deliver identical data") {
   }
 }
 
-// Writes `content` through writer_engine<W>, reads it back through
-// polled_reader_engine<C>, and checks byte identity. Small buffers and low
-// queue depth force slot recycling; the odd length forces an unaligned
-// tail through the deferred path.
-template <class C, class W>
+// Writes `content` through polled_writer_engine<C>, reads it back
+// through polled_reader_engine<C>, and checks byte identity. Small
+// buffers and low queue depth force slot recycling; the odd length
+// forces an unaligned tail through the deferred path. One context type
+// serves both directions.
+template <class C>
 void roundtrip_engines(std::string_view tag) {
   namespace io_impl = blake3pp::detail::io_impl;
   const auto content = make_input(300 * 1024 + 77);
   const temp_file f({});  // placeholder path; the writer recreates it
 
   {
-    io_impl::writer_engine<W> w(
+    io_impl::polled_writer_engine<C> w(
         f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2,
                  .preallocate_bytes = content.size()});
     MESSAGE(tag << " writer backend: " << w.backend_name());
@@ -736,9 +737,9 @@ void roundtrip_engines(std::string_view tag) {
 // everywhere, not just where the selector picks them.
 TEST_CASE("engine templates drive the off-platform backends") {
   namespace io_impl = blake3pp::detail::io_impl;
-  roundtrip_engines<io_impl::stdio_context, io_impl::stdio_writer>("stdio");
+  roundtrip_engines<io_impl::stdio_context>("stdio");
 #if defined(__unix__) || defined(__APPLE__)
-  roundtrip_engines<io_impl::pread_context, io_impl::pread_writer>("pread");
+  roundtrip_engines<io_impl::pread_context>("pread");
 #endif
 }
 

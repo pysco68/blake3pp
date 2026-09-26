@@ -20,8 +20,8 @@ namespace blake3pp::detail {
 // Conformance is checked in the backend headers themselves (each ends
 // with definition-site static_asserts) and again by the writer_engine
 // constraint at this instantiation.
-struct file_writer::impl : io_impl::writer_engine<io_impl::native_writer> {
-  using writer_engine::writer_engine;
+struct file_writer::impl : io_impl::native_writer_engine {
+  using io_impl::native_writer_engine::native_writer_engine;
 };
 
 file_writer::file_writer(const std::filesystem::path& path,

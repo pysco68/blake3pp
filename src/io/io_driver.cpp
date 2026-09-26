@@ -25,7 +25,7 @@
 namespace blake3pp::detail {
 
 namespace {
-using context = io_impl::native_reader_context;
+using context = io_impl::native_io_context;
 using native_op = context::read_op;
 
 // The backend's operation lives inside the caller's io_read_op, whose
