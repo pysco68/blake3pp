@@ -9,14 +9,17 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <random>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <blake3pp/detail/write_pipeline.hpp>

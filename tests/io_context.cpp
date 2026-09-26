@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -41,6 +42,8 @@
 #include "io/pread_backend.hpp"
 #endif
 #if defined(__linux__)
+#include <unistd.h>  // getpid, for a temporary name under /dev/shm
+
 #include "io/uring_backend.hpp"
 #endif
 #if defined(_WIN32)

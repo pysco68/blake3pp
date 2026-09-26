@@ -28,6 +28,11 @@
 #include <utility>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
 #include <filesystem>
 #include <fstream>
 #include <ios>
