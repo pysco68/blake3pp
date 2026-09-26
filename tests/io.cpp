@@ -684,7 +684,9 @@ TEST_CASE("writer submit modes deliver identical data") {
         w.submit(b, n);
         done += n;
       }
+      CHECK(w.bytes_written() == content.size());
       w.finish();
+      CHECK(w.bytes_written() == content.size());
     }
     CHECK(blake3pp::hash_file(f.path) == expected);
   }
