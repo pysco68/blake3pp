@@ -281,6 +281,7 @@ class null_driver {
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return ctx_.in_flight();
   }
+  void drain() noexcept { ctx_.drain(); }
 
   [[nodiscard]] std::span<std::byte> allocate(std::size_t bytes) {
     if (pool_.size() < bytes) {
