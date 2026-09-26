@@ -228,6 +228,60 @@ void check_adaptors(MakeReceiver make) {
   }
 }
 
+// A receiver that carries a stop token, and a sender that reports what
+// its own receiver's environment answers. Between them they ask the
+// question the window chain depends on: does the token the scope hands
+// down survive the adaptors above each stage?
+//
+// The discriminating case is a source that is ALREADY stopped. A token
+// that was forwarded reports stop_requested(); one the adaptor replaced
+// with never_stop_token reports false, which is also what a stage that
+// silently never stops would do.
+struct stop_env {
+  ex::inplace_stop_token token;
+  [[nodiscard]] ex::inplace_stop_token query(
+      ex::get_stop_token_t) const noexcept {
+    return token;
+  }
+};
+
+struct stop_receiver {
+  using receiver_concept = compat::receiver_tag;
+  stop_receiver(int* s, ex::inplace_stop_token t) noexcept
+      : sink(s), token(t) {}
+  int* sink;
+  ex::inplace_stop_token token;
+
+  [[nodiscard]] stop_env get_env() const noexcept { return {token}; }
+  void set_value(int v) && noexcept { *sink = v; }
+  void set_value() && noexcept { *sink = -1; }
+  void set_error(std::error_code) && noexcept { *sink = -2; }
+  void set_error(std::exception_ptr) && noexcept { *sink = -3; }
+  void set_stopped() && noexcept { *sink = -4; }
+};
+
+template <class Receiver>
+struct token_probe_op {
+  using operation_state_concept = compat::operation_state_tag;
+  Receiver rcvr;
+  bool* seen;
+  void start() & noexcept {
+    *seen = ex::get_stop_token(ex::get_env(rcvr)).stop_requested();
+    ex::set_value(std::move(rcvr), 1);
+  }
+};
+
+struct token_probe_sender {
+  using sender_concept = compat::sender_tag;
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(int));
+  bool* seen = nullptr;
+
+  template <class Receiver>
+  token_probe_op<Receiver> connect(Receiver r) const {
+    return {std::move(r), seen};
+  }
+};
+
 // What the pipeline's own receivers will be: a handle, copyable, with a
 // real constructor. This one records the completion and takes the chain
 // off the loop's outstanding count, which is what ends the run.
@@ -518,6 +572,66 @@ TEST_CASE("the adaptors compose with a move-only receiver") {
 #else
   check_adaptors<true>([](int* v) { return move_only_receiver{v}; });
 #endif
+}
+
+// The window chain is read | let_value(compress) | continues_on | then,
+// and every stage below the scope has to see the scope's token: the read
+// so a cancelled completion can be told from a failed one, the compress
+// stage so it stops claiming parts. The adaptors in between are the only
+// thing that could drop it, and whether they do is provider business.
+TEST_CASE("the adaptors forward a stop token down the window chain") {
+  ex::inplace_stop_source source;
+  source.request_stop();
+
+  bool at_head = false;
+  bool in_let_value = false;
+  run_queue q;
+  test_scheduler sch{{}, &q};
+  int v = 0;
+
+  auto chain = ex::then(
+      ex::continues_on(
+          ex::let_value(token_probe_sender{&at_head},
+                        [&](int) { return token_probe_sender{&in_let_value}; }),
+          sch),
+      [](int x) { return x + 40; });
+
+  auto op = ex::connect(std::move(chain), stop_receiver{&v, source.get_token()});
+  ex::start(op);
+  while (q.drain_one()) {
+  }
+
+  CHECK(at_head);
+  CHECK(in_let_value);
+  CHECK(v == 41);
+}
+
+// The same chain over a source nobody stopped: the token is live, so the
+// probes must report false rather than throwing or refusing to compile.
+TEST_CASE("a forwarded stop token that was never requested reads false") {
+  ex::inplace_stop_source source;
+
+  bool at_head = true;
+  bool in_let_value = true;
+  run_queue q;
+  test_scheduler sch{{}, &q};
+  int v = 0;
+
+  auto chain = ex::then(
+      ex::continues_on(
+          ex::let_value(token_probe_sender{&at_head},
+                        [&](int) { return token_probe_sender{&in_let_value}; }),
+          sch),
+      [](int x) { return x + 40; });
+
+  auto op = ex::connect(std::move(chain), stop_receiver{&v, source.get_token()});
+  ex::start(op);
+  while (q.drain_one()) {
+  }
+
+  CHECK(!at_head);
+  CHECK(!in_let_value);
+  CHECK(v == 41);
 }
 
 // The std::execution path has never been built or run: no toolchain in
