@@ -848,7 +848,8 @@ TEST_CASE("a window read is a sender the driver loop completes") {
 
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
-  auto op = ex::connect(io.read(file, 0, pool), chain_receiver{&r, &st});
+  blake3pp::detail::io_read_op rop{};
+  auto op = ex::connect(io.read(file, 0, pool, rop), chain_receiver{&r, &st});
   // start() queues the read and nothing else: no flush, no callback.
   ex::start(op);
   CHECK(!r.completed);
@@ -877,7 +878,8 @@ TEST_CASE("a read that fails reports through the error channel") {
   // an error, and the chain sees it as std::error_code, not a value.
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
-  auto op = ex::connect(io.read(file, len, pool), chain_receiver{&r, &st});
+  blake3pp::detail::io_read_op rop{};
+  auto op = ex::connect(io.read(file, len, pool, rop), chain_receiver{&r, &st});
   ex::start(op);
   io.run_until(st);
   CHECK(r.completed);
@@ -924,8 +926,9 @@ TEST_CASE("work parked from another thread wakes a blocked driver") {
   // has to get through to a driver already asleep.
   blake3pp::detail::loop_status st{false, 2};
   chain_result read_done;
-  auto read_op =
-      ex::connect(io.read(file, 0, pool), chain_receiver{&read_done, &st});
+  blake3pp::detail::io_read_op rop{};
+  auto read_op = ex::connect(io.read(file, 0, pool, rop),
+                             chain_receiver{&read_done, &st});
   chain_result parked;
   auto sched_op =
       ex::connect(ex::schedule(io.scheduler()), chain_receiver{&parked, &st});
@@ -972,10 +975,11 @@ TEST_CASE("the four-line window chain composes on this provider") {
 
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
+  blake3pp::detail::io_read_op rop{};
   auto op = ex::connect(
       ex::then(
           ex::continues_on(
-              ex::let_value(io.read(file, 0, pool),
+              ex::let_value(io.read(file, 0, pool, rop),
                             [&, sched](std::span<const std::byte> w) {
                               return ex::then(ex::schedule(sched), [&, w] {
                                 summed_elsewhere.store(

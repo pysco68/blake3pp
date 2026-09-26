@@ -242,9 +242,10 @@ class read_op_state : public run_node {
   using operation_state_concept = ex_compat::operation_state_tag;
 
   read_op_state(Receiver r, driver_loop<D>* loop, typename D::file* f,
-                std::uint64_t off, std::span<std::byte> buf)
-      : rcvr_(std::move(r)), loop_(loop), file_(f), off_(off), buf_(buf) {
-    run = &deliver_submit_failure;
+                std::uint64_t off, std::span<std::byte> buf, io_read_op* op)
+      : rcvr_(std::move(r)), loop_(loop), file_(f), off_(off), buf_(buf),
+        op_(op) {
+    run = &deliver_parked;
   }
 
   read_op_state(const read_op_state&) = delete;
@@ -254,17 +255,22 @@ class read_op_state : public run_node {
   // for every read it started this round, and no completion, because the
   // backend only ever calls back from inside poll().
   //
-  // A read that could not be queued owes no callback, but completing the
-  // receiver from start() would run the rest of the window chain inside
-  // whatever started this one. The run queue is already the way back
-  // onto the loop, so the failure takes it and arrives like every other
-  // completion: a system_error as its code, anything else as the
-  // exception itself.
+  // A read that could not be queued owes no callback, and neither does
+  // one that was never submitted because stop had already been
+  // requested. Completing the receiver from start() would run the rest
+  // of the window chain inside whatever started this one, so both park
+  // on the run queue and arrive like every other completion: a
+  // system_error as its code, anything else as the exception itself.
   void start() & noexcept {
-    op_.done = &on_read_done;
-    op_.owner = this;
+    if (stop_token().stop_requested()) {
+      stopped_ = true;
+      loop_->publish(this);
+      return;
+    }
+    op_->done = &on_read_done;
+    op_->owner = this;
     try {
-      loop_->driver().submit_read(*file_, off_, buf_, op_);
+      loop_->driver().submit_read(*file_, off_, buf_, *op_);
     } catch (const std::system_error& e) {
       ec_ = e.code();
       loop_->publish(this);
@@ -275,25 +281,43 @@ class read_op_state : public run_node {
   }
 
  private:
-  static void deliver_submit_failure(run_node* n) noexcept {
+  using token_type = decltype(ex::get_stop_token(
+      ex::get_env(std::declval<const Receiver&>())));
+
+  [[nodiscard]] token_type stop_token() const noexcept {
+    return ex::get_stop_token(ex::get_env(rcvr_));
+  }
+
+  static void deliver_parked(run_node* n) noexcept {
     auto* const self = static_cast<read_op_state*>(n);
-    if (self->eptr_) {
+    if (self->stopped_) {
+      ex::set_stopped(std::move(self->rcvr_));
+    } else if (self->eptr_) {
       ex::set_error(std::move(self->rcvr_), std::move(self->eptr_));
     } else {
       ex::set_error(std::move(self->rcvr_), self->ec_);
     }
   }
 
+  // A cancelled read is only a stop if this chain's token says so. The
+  // backends report the outcome, not the cause: operation_canceled from
+  // a device nobody asked to cancel is a read error like any other, and
+  // a cancel that lost the race brings data, which is used.
   static void on_read_done(io_read_op* op, std::error_code ec) noexcept {
     auto* const self = static_cast<read_op_state*>(op->owner);
     if (ec) {
+      if (ec == std::errc::operation_canceled &&
+          self->stop_token().stop_requested()) {
+        ex::set_stopped(std::move(self->rcvr_));
+        return;
+      }
       ex::set_error(std::move(self->rcvr_), ec);
-    } else {
-      // The backend reads exactly what was asked for or reports an
-      // error, so the whole window is there.
-      ex::set_value(std::move(self->rcvr_),
-                    std::span<const std::byte>(self->buf_));
+      return;
     }
+    // The backend reads exactly what was asked for or reports an
+    // error, so the whole window is there.
+    ex::set_value(std::move(self->rcvr_),
+                  std::span<const std::byte>(self->buf_));
   }
 
   Receiver rcvr_;
@@ -301,9 +325,13 @@ class read_op_state : public run_node {
   typename D::file* file_;
   std::uint64_t off_;
   std::span<std::byte> buf_;
+  // The caller's, and outliving this state: the read is still owed when
+  // a stopped chain's cell is re-emplaced, and the scope has to be able
+  // to name it to cancel it.
+  io_read_op* op_;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
-  io_read_op op_{};
+  bool stopped_ = false;
 };
 
 template <file_driver D>
@@ -313,15 +341,16 @@ class read_sender {
   BLAKE3PP_EX_COMPLETION_SIGNATURES(
       ex::set_value_t(std::span<const std::byte>),
       ex::set_error_t(std::error_code),
-      ex::set_error_t(std::exception_ptr));
+      ex::set_error_t(std::exception_ptr),
+      ex::set_stopped_t());
 
   read_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
-              std::span<std::byte> buf) noexcept
-      : loop_(loop), file_(f), off_(off), buf_(buf) {}
+              std::span<std::byte> buf, io_read_op* op) noexcept
+      : loop_(loop), file_(f), off_(off), buf_(buf), op_(op) {}
 
   template <class Receiver>
   [[nodiscard]] read_op_state<D, Receiver> connect(Receiver r) const {
-    return {std::move(r), loop_, file_, off_, buf_};
+    return {std::move(r), loop_, file_, off_, buf_, op_};
   }
 
  private:
@@ -329,6 +358,7 @@ class read_sender {
   typename D::file* file_;
   std::uint64_t off_;
   std::span<std::byte> buf_;
+  io_read_op* op_;
 };
 
 // --------------------------------------------------------------------
@@ -355,9 +385,13 @@ class driver_loop {
   driver_loop(const driver_loop&) = delete;
   driver_loop& operator=(const driver_loop&) = delete;
 
+  // The operation is the caller's: it has to outlive the chain that owns
+  // this sender, because a read the driver still owes survives the cell
+  // its chain lived in.
   [[nodiscard]] read_sender<D> read(typename D::file& f, std::uint64_t off,
-                                    std::span<std::byte> buf) noexcept {
-    return read_sender<D>{this, &f, off, buf};
+                                    std::span<std::byte> buf,
+                                    io_read_op& op) noexcept {
+    return read_sender<D>{this, &f, off, buf, &op};
   }
 
   [[nodiscard]] driver_scheduler<D> scheduler() noexcept {
@@ -1004,6 +1038,11 @@ class window_scope {
     bool reading = false;  // submitted, and the read has not landed
     window_plan plan;
     std::size_t nodes = 0;  // nodes the fold produced
+    // The read's operation, alive for as long as the window object: the
+    // driver may still owe this read after the chain's cell is gone, and
+    // the stop sweep names it from here. Last, so that adding it left
+    // the offsets of everything the agents touch where they were.
+    io_read_op op{};
   };
 
   // What the node buffers hold: the worst case over any run, which is
@@ -1041,7 +1080,7 @@ class window_scope {
     return ex::then(
         ex::continues_on(
             ex::let_value(loop_.read(file_, w.offset,
-                                     w.buffer.first(w.bytes)),
+                                     w.buffer.first(w.bytes), w.op),
                           [this, &w](std::span<const std::byte>) {
                             return compress_stage(w);
                           }),
@@ -1053,7 +1092,8 @@ class window_scope {
   // let the hasher take the whole thing at the end. Small last windows
   // land here, and so does a file below one window.
   [[nodiscard]] auto read_only_chain(window& w) {
-    return ex::then(loop_.read(file_, w.offset, w.buffer.first(w.bytes)),
+    return ex::then(loop_.read(file_, w.offset, w.buffer.first(w.bytes),
+                               w.op),
                     [this, &w](std::span<const std::byte>) noexcept {
                       read_landed(w);
                       // A short first window with nothing worth fanning
@@ -1077,7 +1117,8 @@ class window_scope {
   [[nodiscard]] auto edge_chain(window& w) {
     return ex::then(
         ex::continues_on(
-            ex::let_value(loop_.read(file_, w.offset, w.buffer.first(w.bytes)),
+            ex::let_value(loop_.read(file_, w.offset, w.buffer.first(w.bytes),
+                                     w.op),
                           [this, &w](std::span<const std::byte>) {
                             return edge_compress_stage(w);
                           }),
