@@ -134,6 +134,12 @@ std::size_t io_driver::poll(bool block) { return impl_->ctx.poll(block); }
 
 void io_driver::wake() noexcept { impl_->ctx.wake(); }
 
+void io_driver::cancel(io_read_op& op) noexcept {
+  // The backend's own op is the one the context knows, and it lives in
+  // the storage this read's submit constructed it in.
+  impl_->ctx.cancel(op.native<native_op>());
+}
+
 std::size_t io_driver::in_flight() const noexcept {
   return impl_->ctx.in_flight();
 }

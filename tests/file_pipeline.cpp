@@ -387,6 +387,19 @@ struct fake_script {
   bool keep_throwing = false;
   // The window index whose submit_read() throws std::bad_alloc, or -1.
   int bad_alloc_at_window = -1;
+  // What the device does about a cancel. All three are conforming, and
+  // the pipeline has to report the same thing under each: the backends
+  // differ exactly here (io_uring aborts, IOCP aborts, GCD has no
+  // cancel at all, and any of them can lose the race to the data).
+  enum cancel_mode {
+    cancel_aborts,   // the read ends operation_canceled
+    cancel_loses,    // the data had already arrived; the ask changes nothing
+    cancel_ignored,  // the backend has no cancel mechanism
+  };
+  cancel_mode cancel_behaviour = cancel_aborts;
+  // Polls between the ask and the cancelled completion, the way a real
+  // ring takes a round or two to give the request back.
+  unsigned cancel_after_polls = 0;
 };
 
 class fake_driver {
@@ -416,7 +429,7 @@ class fake_driver {
             static_cast<std::uint64_t>(script_.bad_alloc_at_window)) {
       throw std::bad_alloc();
     }
-    queued_.push_back(read{&op, off, buf, 0});
+    queued_.push_back(read{&op, off, buf, 0, false, 0});
   }
 
   void flush() noexcept {}
@@ -438,6 +451,16 @@ class fake_driver {
     }
     const std::size_t pick = choose();
     read& r = queued_[pick];
+    if (r.cancelled) {
+      if (r.cancel_polls > 0) {
+        --r.cancel_polls;
+        return 0;  // asked for, not yet given back
+      }
+      blake3pp::detail::io_read_op* const op = r.op;
+      queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      op->done(op, std::make_error_code(std::errc::operation_canceled));
+      return 1;
+    }
     const unsigned index = static_cast<unsigned>(r.off / window_bytes_);
     if (script_.fail_at_window >= 0 &&
         index == static_cast<unsigned>(script_.fail_at_window)) {
@@ -469,6 +492,24 @@ class fake_driver {
     cv_.notify_one();
   }
 
+  // What the script says this driver's device does about a cancel. The
+  // three answers a real one can give are all here, because which of
+  // them the pipeline gets must not change what it reports.
+  void cancel(blake3pp::detail::io_read_op& op) noexcept {
+    ++cancels_;
+    for (read& r : queued_) {
+      if (r.op == &op) {
+        r.cancel_polls = script_.cancel_after_polls;
+        r.cancelled = script_.cancel_behaviour != fake_script::cancel_ignored;
+        return;
+      }
+    }
+  }
+
+  // How many times cancel() was called, so a test can check that the
+  // sweep asked once per read rather than once per round.
+  [[nodiscard]] unsigned cancels() const noexcept { return cancels_; }
+
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return queued_.size();
   }
@@ -491,6 +532,8 @@ class fake_driver {
     std::uint64_t off;
     std::span<std::byte> buf;
     std::size_t filled;
+    bool cancelled = false;
+    unsigned cancel_polls = 0;
   };
 
   // The queued read the script prefers: lowest rank wins, and a read the
@@ -527,6 +570,7 @@ class fake_driver {
   std::condition_variable cv_;
   bool woken_ = false;
   int polls_ = 0;
+  unsigned cancels_ = 0;
 };
 
 static_assert(blake3pp::detail::file_driver<fake_driver>);

@@ -68,6 +68,16 @@ struct io_read_op {
                   "be trivially destructible");
     return *::new (static_cast<void*>(storage)) Op{};
   }
+
+  // The operation emplace_native() left in the storage. Only the driver
+  // that submitted this read may ask, and only while the read is owed:
+  // the bytes hold that op until the next submit builds another over
+  // them. The hop through void* is what keeps this out of
+  // reinterpret_cast, as it does in the kernel tables.
+  template <class Op>
+  [[nodiscard]] Op& native() noexcept {
+    return *std::launder(static_cast<Op*>(static_cast<void*>(storage)));
+  }
 };
 
 // Size and alignment of the platform backend's own read operation: what
@@ -131,6 +141,17 @@ class io_driver {
   std::size_t poll(bool block);
   // The only member another thread may call.
   void wake() noexcept;
+  // Asks the OS to abandon one read. Advisory, and never a completion in
+  // itself: the op is still owed its callback and still counted by
+  // in_flight(), and the only way it can arrive is a later poll(). What
+  // the callback reports is whichever happened first --
+  // std::errc::operation_canceled if the cancel won, the data if the
+  // read did, some other error if the read failed on its own.
+  //
+  // Legal only from the thread that calls poll(), and only for an op
+  // that was submitted and whose callback has not run. A platform with
+  // no cancel mechanism does nothing and the read runs to completion.
+  void cancel(io_read_op& op) noexcept;
   [[nodiscard]] std::size_t in_flight() const noexcept;
   // Waits out every read still owed, running no callback, and forgets
   // the rest. The invariant it establishes: afterwards in_flight() is
@@ -167,6 +188,7 @@ concept file_driver =
       { d.flush() } noexcept;
       { d.poll(block) } -> std::same_as<std::size_t>;
       { d.wake() } noexcept;
+      { d.cancel(op) } noexcept;
       { cd.in_flight() } noexcept -> std::same_as<std::size_t>;
       { d.drain() } noexcept;
       { d.allocate(bytes) } -> std::same_as<std::span<std::byte>>;

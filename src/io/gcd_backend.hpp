@@ -187,6 +187,13 @@ class gcd_context {
   // batched to push. The contract keeps the call because io_uring has.
   void flush() noexcept {}
 
+  // Darwin has no way to recall a pread a dispatch worker is already
+  // inside, and the deferred list is served by the same call on the
+  // polling thread. So a cancel changes nothing here and the read runs
+  // to completion, which the contract allows: the callback still runs
+  // exactly once, from poll(), with whatever the read produced.
+  void cancel(read_op&) noexcept {}
+
   std::size_t poll(bool block) {
     std::size_t ran = drain_done() + run_one_deferred();
     if (ran > 0 || !block) {

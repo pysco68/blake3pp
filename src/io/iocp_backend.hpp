@@ -36,6 +36,15 @@ namespace blake3pp::detail::io_impl {
                           std::system_category(), what);
 }
 
+// A read the port reports as aborted is one CancelIoEx reached. The
+// contract names that outcome operation_canceled on every platform, so a
+// caller can recognise it without asking which OS it is on.
+[[nodiscard]] inline std::error_code read_error(DWORD err) noexcept {
+  return err == ERROR_OPERATION_ABORTED
+             ? std::make_error_code(std::errc::operation_canceled)
+             : std::error_code(static_cast<int>(err), std::system_category());
+}
+
 // Writes that land beyond the file's valid data length force NTFS to
 // zero-fill the gap synchronously, the Windows twin of ext4's
 // extending-write serialization. SetFileValidData waives the zero-fill,
@@ -213,6 +222,8 @@ class iocp_context {
     win_file* sync_file = nullptr;  // the deferred path needs the handles
     void* owner_file = nullptr;     // which file's drain owes this op
     read_op* next_deferred = nullptr;
+    bool on_port = false;   // the port owes a completion, so cancel is CancelIoEx
+    bool cancelled = false;  // a cancel was asked for; one is enough
   };
 
   class file {
@@ -284,6 +295,8 @@ class iocp_context {
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.owner_file = &f;
+    op.on_port = false;
+    op.cancelled = false;
     // NO_BUFFERING rejects an unaligned length, so only whole granules
     // ride the port; the tail is read synchronously inside poll().
     bool queued = f.f_.use_iocp && buf.size() % direct_align == 0;
@@ -299,10 +312,26 @@ class iocp_context {
         queued = false;
       }
     }
+    op.on_port = queued;
     in_flight_++;
     f.inflight_++;
     if (!queued) {
       deferred_.push(op);
+    }
+  }
+
+  // CancelIoEx names one request by its OVERLAPPED, so a sibling read on
+  // the same handle is untouched. It fails with ERROR_NOT_FOUND for a
+  // request that has already finished, which is not an error here: that
+  // completion is already on the port and arrives normally. A read on
+  // the deferred list was never issued to anything, so the flag alone is
+  // the whole cancel and run_one_deferred() honours it.
+  void cancel(read_op& op) noexcept {
+    if (std::exchange(op.cancelled, true)) {
+      return;
+    }
+    if (op.on_port) {
+      ::CancelIoEx(op.h, &op.ov);
     }
   }
 
@@ -430,8 +459,7 @@ class iocp_context {
         continue;
       }
       if (ok == 0) {
-        complete(op, std::error_code(static_cast<int>(::GetLastError()),
-                                     std::system_category()));
+        complete(op, read_error(::GetLastError()));
       } else if (bytes == 0) {
         complete(op, std::error_code(EIO, std::generic_category()));
       } else {
@@ -511,8 +539,7 @@ class iocp_context {
       read_op& op = *op_of(pov);
       --port_owed_;
       if (ok == 0) {
-        complete(op, std::error_code(static_cast<int>(::GetLastError()),
-                                     std::system_category()));
+        complete(op, read_error(::GetLastError()));
         ran++;
         continue;
       }
@@ -540,11 +567,15 @@ class iocp_context {
     }
     read_op& op = *next;
     std::error_code ec;
-    try {
-      read_sync(*op.sync_file, op.off, {op.dst, op.len});
-      op.filled = op.len;
-    } catch (const std::system_error& e) {
-      ec = e.code();
+    if (op.cancelled) {
+      ec = std::make_error_code(std::errc::operation_canceled);
+    } else {
+      try {
+        read_sync(*op.sync_file, op.off, {op.dst, op.len});
+        op.filled = op.len;
+      } catch (const std::system_error& e) {
+        ec = e.code();
+      }
     }
     complete(op, ec);
     return 1;

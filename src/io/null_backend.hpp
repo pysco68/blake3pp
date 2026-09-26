@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <span>
 #include <string_view>
+#include <system_error>
 
 #include "io/backend.hpp"
 
@@ -24,6 +25,7 @@ class null_context {
  public:
   struct read_op : read_op_base {
     read_op* next_queued = nullptr;
+    bool cancelled = false;
   };
 
   class file {
@@ -47,6 +49,7 @@ class null_context {
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
                    read_op& op) noexcept {
     op.next_queued = nullptr;
+    op.cancelled = false;
     if (tail_ == nullptr) {
       head_ = tail_ = &op;
     } else {
@@ -75,7 +78,9 @@ class null_context {
     queued_ = 0;
     while (op != nullptr) {
       read_op* const next = op->next_queued;
-      op->done(op, {});
+      op->done(op, op->cancelled
+                       ? std::make_error_code(std::errc::operation_canceled)
+                       : std::error_code{});
       ran++;
       op = next;
     }
@@ -83,6 +88,10 @@ class null_context {
   }
 
   void wake() noexcept { waiter_.wake(); }
+
+  // This source performs no I/O, so a cancel always wins: the read has
+  // done nothing a completion could prefer over it.
+  void cancel(read_op& op) noexcept { op.cancelled = true; }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
 

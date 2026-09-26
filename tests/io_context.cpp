@@ -117,6 +117,7 @@ class fake_context {
     std::uint64_t off = 0;
     std::size_t filled = 0;
     bool done_once = false;
+    bool cancelled = false;
   };
 
   class file {
@@ -139,9 +140,12 @@ class fake_context {
     op.off = off;
     op.filled = 0;
     op.done_once = false;
+    op.cancelled = false;
     queue_.push_back(&op);
   }
   void flush() noexcept {}
+
+  void cancel(read_op& op) noexcept { op.cancelled = true; }
 
   std::size_t poll(bool) {
     if (queue_.empty()) {
@@ -153,6 +157,11 @@ class fake_context {
     if (op.off == fail_offset) {
       op.done_once = true;
       op.done(&op, std::error_code(EIO, std::generic_category()));
+      return 1;
+    }
+    if (op.cancelled) {
+      op.done_once = true;
+      op.done(&op, std::make_error_code(std::errc::operation_canceled));
       return 1;
     }
     // In pieces, a third at a time, but only one callback at the end.
@@ -232,6 +241,73 @@ void check_callback_discipline(std::string_view tag, MakeFile make_file) {
   CHECK(pb.ran_on == std::this_thread::get_id());
 }
 
+// cancel() is advisory: what a read reports afterwards is whichever
+// happened first, and that differs per backend and per run. What must
+// hold everywhere is the discipline around it -- one callback, from
+// poll(), an error that is operation_canceled and nothing else, a
+// neighbouring read untouched, and a context still usable.
+template <class C, class MakeFile>
+void check_cancel_discipline(std::string_view tag, MakeFile make_file,
+                             std::span<const std::byte> content) {
+  CAPTURE(tag);
+  C ctx({}, 4);
+  auto f = make_file(ctx);
+  std::array<std::byte, 8192> a{};
+  std::array<std::byte, 8192> b{};
+  typename C::read_op op_a{};
+  typename C::read_op op_b{};
+  probe pa;
+  probe pb;
+  op_a.done = &probe::on_done;
+  op_a.owner = &pa;
+  op_b.done = &probe::on_done;
+  op_b.owner = &pb;
+
+  ctx.submit_read(f, 0, std::span{a}, op_a);
+  ctx.submit_read(f, a.size(), std::span{b}, op_b);
+  ctx.flush();
+  ctx.cancel(op_a);
+  // Still owed: a cancel completes nothing by itself.
+  CHECK(pa.calls == 0);
+  CHECK(pb.calls == 0);
+  CHECK(ctx.in_flight() == 2);
+
+  while (pa.calls + pb.calls < 2) {
+    ctx.poll(true);
+  }
+  CHECK(pa.calls == 1);
+  CHECK(pb.calls == 1);
+  CHECK(pa.ran_on == std::this_thread::get_id());
+  CHECK(ctx.in_flight() == 0);
+  // Either the cancel won or the read did; no third answer.
+  if (pa.ec) {
+    CHECK(pa.ec == std::errc::operation_canceled);
+  }
+  const std::string verdict =
+      pa.ec ? "the cancel took the read" : "the read won the race";
+  MESSAGE(tag << ": " << verdict);
+  // The read nobody cancelled is untouched, which is the part a
+  // whole-handle cancel would get wrong. An empty expectation is the
+  // null source, which completes reads without filling anything.
+  CHECK(!pb.ec);
+  if (!content.empty()) {
+    CHECK(std::ranges::equal(b, content.subspan(a.size(), b.size())));
+  }
+
+  // A cancel leaves the context usable, like drain() does.
+  typename C::read_op op_c{};
+  probe pc;
+  op_c.done = &probe::on_done;
+  op_c.owner = &pc;
+  std::array<std::byte, 8192> c{};
+  ctx.submit_read(f, 0, std::span{c}, op_c);
+  while (pc.calls == 0) {
+    ctx.poll(true);
+  }
+  CHECK(pc.calls == 1);
+  CHECK(!pc.ec);
+}
+
 }  // namespace
 
 TEST_SUITE("io_context") {
@@ -271,6 +347,58 @@ TEST_CASE("callbacks run only inside poll") {
       "null", [](io_impl::null_context& c) {
         return io_impl::null_context::file(c, 16384);
       });
+}
+
+TEST_CASE("a cancelled read still reports exactly once, from poll") {
+  const auto content = pattern(64 * 1024, 11);
+  const temp_file f(content);
+  const std::span<const std::byte> expect{content};
+#if defined(__linux__)
+  check_cancel_discipline<io_impl::uring_context>(
+      "uring",
+      [&](io_impl::uring_context& c) {
+        return io_impl::uring_context::file(c, f.path, /*direct_io=*/false);
+      },
+      expect);
+#endif
+#if defined(__unix__) || defined(__APPLE__)
+  check_cancel_discipline<io_impl::pread_context>(
+      "pread",
+      [&](io_impl::pread_context& c) {
+        return io_impl::pread_context::file(c, f.path, /*direct_io=*/false);
+      },
+      expect);
+#endif
+#if defined(_WIN32)
+  check_cancel_discipline<io_impl::iocp_context>(
+      "iocp",
+      [&](io_impl::iocp_context& c) {
+        return io_impl::iocp_context::file(c, f.path, /*direct_io=*/false);
+      },
+      expect);
+#endif
+#if defined(__APPLE__)
+  // No cancel mechanism at all: the read runs to completion and reports
+  // its data, which is the contract's other legal answer.
+  check_cancel_discipline<io_impl::gcd_context>(
+      "gcd",
+      [&](io_impl::gcd_context& c) {
+        return io_impl::gcd_context::file(c, f.path, /*direct_io=*/false);
+      },
+      expect);
+#endif
+  check_cancel_discipline<io_impl::stdio_context>(
+      "stdio",
+      [&](io_impl::stdio_context& c) {
+        return io_impl::stdio_context::file(c, f.path, /*direct_io=*/false);
+      },
+      expect);
+  check_cancel_discipline<io_impl::null_context>(
+      "null",
+      [](io_impl::null_context& c) {
+        return io_impl::null_context::file(c, 64 * 1024);
+      },
+      {});
 }
 
 TEST_CASE("the engine survives a context that finishes in pieces and out of order") {

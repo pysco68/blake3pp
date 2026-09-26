@@ -378,6 +378,9 @@ class null_driver {
   void flush() noexcept { ctx_.flush(); }
   std::size_t poll(bool block) { return ctx_.poll(block); }
   void wake() noexcept { ctx_.wake(); }
+  void cancel(blake3pp::detail::io_read_op& op) noexcept {
+    ctx_.cancel(op.native<io_impl::null_context::read_op>());
+  }
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return ctx_.in_flight();
   }

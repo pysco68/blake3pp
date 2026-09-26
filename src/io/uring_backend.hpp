@@ -274,6 +274,29 @@ struct uring {
                                               std::memory_order_release);
   }
 
+  // Queues a cancel for the request carrying `target`. With no matching
+  // flags the kernel keys on user_data, which is the op's own address.
+  //
+  // Its CQE is separate from the target's and reports whether a request
+  // was found (0), was already past cancelling (-EALREADY) or was never
+  // there (-ENOENT). None of that changes what the caller has to do, so
+  // it rides a user_data of its own and the reaper drops it; what
+  // matters is the target's completion, which arrives either way.
+  void fill_cancel(std::uint64_t target, std::uint64_t user_data) noexcept {
+    const unsigned tail = *sq_tail;
+    const unsigned idx = tail & *sq_mask;
+    io_uring_sqe sqe{};
+    std::memset(&sqe, 0, sizeof(sqe));
+    sqe.opcode = IORING_OP_ASYNC_CANCEL;
+    sqe.fd = -1;
+    sqe.addr = target;
+    sqe.user_data = user_data;
+    std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
+    std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
+    std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
+                                              std::memory_order_release);
+  }
+
   // Queues a one-shot poll on `poll_fd`, the wake path's arming step.
   void fill_poll_add(int poll_fd, std::uint64_t user_data) noexcept {
     const unsigned tail = *sq_tail;
@@ -406,6 +429,8 @@ class uring_context {
     int fd = -1;                      // the fd this read rides
     posix_file* sync_file = nullptr;  // the deferred path needs the pair
     read_op* next_deferred = nullptr;
+    bool on_ring = false;   // the kernel has it, so a cancel is an SQE
+    bool cancelled = false;  // a cancel was asked for; one is enough
   };
 
   // An open file bound to a context. Every file must be destroyed before
@@ -435,9 +460,11 @@ class uring_context {
 
   uring_context(const reader_context_options& opts, unsigned max_inflight)
       : async_requested_(opts.async) {
-    // Two entries beyond the reads: the armed wake poll, and one spare so
-    // a short read's continuation always finds a free entry even with
-    // every slot in flight.
+    // What one batch between two flushes can hold: a transfer and its
+    // continuation for every slot, plus the armed wake poll and one
+    // spare. A cancel sweep fits inside the same bound: the scope stops
+    // starting transfers before it cancels them, so the two never share
+    // a batch.
     if (opts.async && ring_.init(2 * max_inflight + 2)) {
       use_uring_ = true;
       offload_ = opts.offload_submit;
@@ -462,16 +489,31 @@ class uring_context {
     op.fd = f.f_.fd;
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
+    op.on_ring = false;
+    op.cancelled = false;
     in_flight_++;
     // O_DIRECT rejects an unaligned length, so only whole granules may
     // ride the ring; the tail is read synchronously inside poll(). This
     // is the whole runtime-degradation question, asked in one place.
     if (use_uring_ && buf.size() % direct_align == 0) {
+      op.on_ring = true;
       ring_.fill_rw(IORING_OP_READ, op.fd, buf.data(),
                     static_cast<unsigned>(buf.size()), off, op_ud(&op),
                     offload_);
     } else {
       deferred_.push(op);
+    }
+  }
+
+  // The kernel is asked once; a second ask would only add a CQE to drop.
+  // A read on the deferred list has not been issued to anything, so the
+  // flag alone is the whole cancel and run_one_deferred() honours it.
+  void cancel(read_op& op) noexcept {
+    if (std::exchange(op.cancelled, true)) {
+      return;
+    }
+    if (op.on_ring) {
+      ring_.fill_cancel(op_ud(&op), cancel_ud());
     }
   }
 
@@ -559,8 +601,12 @@ class uring_context {
         wake_armed_ = false;
         return;
       }
+      if (ud == cancel_ud()) {
+        return;  // withdrawn with its target; nothing owes a completion
+      }
       read_op& op = *op_from(ud);
       op.next_deferred = nullptr;
+      op.on_ring = false;  // the kernel never took it; no SQE to cancel
       deferred_.push(op);
     });
   }
@@ -589,9 +635,15 @@ class uring_context {
     return std::bit_cast<read_op*>(static_cast<std::uintptr_t>(ud));
   }
   // The wake completion needs a user_data no read_op can wear; its own
-  // op's address is one, and costs nothing.
+  // op's address is one, and costs nothing. A cancel's CQE needs the
+  // same, and for the same reason: reaping it as a read would walk to a
+  // read_op that does not exist.
   [[nodiscard]] std::uint64_t wake_ud() const noexcept {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(&wake_op_));
+  }
+  [[nodiscard]] std::uint64_t cancel_ud() const noexcept {
+    return static_cast<std::uint64_t>(
+        std::bit_cast<std::uintptr_t>(&cancel_op_));
   }
 
   void arm_wake() noexcept {
@@ -618,6 +670,9 @@ class uring_context {
       if (ud == wake_ud()) {
         wake_armed_ = false;  // one-shot; take_wake() re-arms
         continue;
+      }
+      if (ud == cancel_ud()) {
+        continue;  // the target's own completion is the one that matters
       }
       read_op& op = *op_from(ud);
       if (res < 0) {
@@ -666,12 +721,16 @@ class uring_context {
     }
     read_op& op = *next;
     std::error_code ec;
-    try {
-      op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
-                              op.buf.data(), op.buf.size(), op.off);
-      op.filled = op.buf.size();
-    } catch (const std::system_error& e) {
-      ec = e.code();
+    if (op.cancelled) {
+      ec = std::make_error_code(std::errc::operation_canceled);
+    } else {
+      try {
+        op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
+                                op.buf.data(), op.buf.size(), op.off);
+        op.filled = op.buf.size();
+      } catch (const std::system_error& e) {
+        ec = e.code();
+      }
     }
     complete(op, ec);
     return 1;
@@ -706,7 +765,8 @@ class uring_context {
   // is closed and before the op whose address that poll wears goes.
   // Do not move ring_ above these two.
   poll_waiter waiter_;
-  read_op wake_op_{};  // address only: the wake completion's user_data
+  read_op wake_op_{};    // address only: the wake completion's user_data
+  read_op cancel_op_{};  // address only: every cancel CQE's user_data
   uring ring_;
   deferred_ops<read_op> deferred_;
   std::size_t in_flight_ = 0;
