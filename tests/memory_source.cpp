@@ -210,7 +210,7 @@ TEST_CASE("two spans share one memory driver") {
 
 TEST_CASE("hash_into agrees with the sequential hasher at every size") {
   auto sched = blake3pp::get_parallel_scheduler();
-  const std::size_t win = blake3pp::detail::memory_window_bytes;
+  const std::size_t win = blake3pp::detail::memory_window_bytes(8u << 20);
   const std::size_t part = blake3pp::chunk_size * blake3pp::detail::min_part_chunks;
   const std::vector<std::size_t> sizes{
       0, 1, 1024, part, blake3pp::detail::min_pipeline_bytes - 1,
@@ -240,7 +240,7 @@ TEST_CASE("hash_into agrees with the sequential hasher at every size") {
 
 TEST_CASE("hash_into agrees on every arch the build can reach") {
   auto sched = blake3pp::get_parallel_scheduler();
-  const std::size_t win = blake3pp::detail::memory_window_bytes;
+  const std::size_t win = blake3pp::detail::memory_window_bytes(8u << 20);
   const auto bytes = pattern(2 * win + 777, 12);
   const std::span<const std::byte> in{bytes};
   for (const auto a : blake3pp::available_arches()) {

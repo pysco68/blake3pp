@@ -170,10 +170,32 @@ namespace detail {
 // the fixed cost mostly goes, and this number should come down with it.
 inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
 
-// The window a source already in memory is cut into. A window is a view,
-// so this buys no buffers: what it sets is the subtree granularity and
-// how many windows the reducer sees.
-inline constexpr std::size_t memory_window_bytes = 8 * 1024 * 1024;
+// The window a span already in memory is cut into.
+//
+// A window is what a file pipeline reads while it hashes the previous
+// one. A span has nothing to overlap: the bytes are all there already,
+// so a window buys no concurrency and costs a join, a reducer insert and
+// a part table. What it still does is bound the part table, which is why
+// there is a ceiling at all rather than one window per span always.
+//
+// So the answer is the FEWEST windows the budget allows, not a round of
+// them in flight. Measured on the Z13 against the engine this replaced
+// (16 threads, ABBA, eight samples a side, medians):
+//
+//                    8 MiB fixed   span/32, 8-64 MiB   one window
+//      8 MiB             +2.0 %          +7.5 %          +10.2 %
+//     64 MiB             -8.1 %          -9.6 %           +5.7 %
+//      1 GiB            -23.0 %         -10.9 %          +17.7 %
+//
+// The first column is 128 narrow fan-outs where the old engine did one
+// wide one; the last is one fan-out of the same width, through the
+// pipeline. Below max_window_bytes that is a single window.
+[[nodiscard]] constexpr std::size_t memory_window_bytes(
+    std::uint64_t span_bytes) noexcept {
+  constexpr std::size_t floor_bytes = 8 * 1024 * 1024;
+  return std::clamp(static_cast<std::size_t>(span_bytes), floor_bytes,
+                    max_window_bytes);
+}
 
 // The one-shot engine: the same pipeline update_file drives, over a
 // source whose windows are views of the caller's span.
@@ -191,14 +213,14 @@ template <stack_budget Budget, class Scheduler>
     h.update(input);
     return h.finalize();
   }
+  const std::size_t window =
+      memory_window_bytes(static_cast<std::uint64_t>(input.size()));
   memory_driver drv;
   memory_driver::file f(drv, input);
   const pipeline_plan plan = plan_memory_pipeline(
-      h.count(), memory_window_bytes,
-      static_cast<std::uint64_t>(input.size()));
-  run_window_pipeline<Budget>(
-      h, drv, f, std::forward<Scheduler>(sched), plan,
-      {.window_bytes = memory_window_bytes, .ops = ops});
+      h.count(), window, static_cast<std::uint64_t>(input.size()));
+  run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
+                              {.window_bytes = window, .ops = ops});
   return h.finalize();
 }
 
