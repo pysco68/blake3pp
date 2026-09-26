@@ -25,6 +25,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <blake3pp/detail/file_reader.hpp>
@@ -57,41 +58,14 @@ class polled_reader_engine {
                        const file_reader_options& opts)
     requires std::constructible_from<typename C::file, C&,
                                      const std::filesystem::path&, bool>
-      : window_(rounded_window_bytes(opts.window_bytes)),
-        qd_(clamp_queue_depth(opts.queue_depth)),
-        slots_(qd_),
-        pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
-        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
-        file_(ctx_, path, opts.direct_io) {
-    num_windows_ = (file_.size() + window_ - 1) / window_;
-    const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
-    for (unsigned s = 0; s < initial; ++s) {
-      assign(s);
-    }
-    // One flush for the whole initial batch: the contract separates
-    // queueing from submitting precisely so this is one io_uring_enter
-    // rather than queue_depth of them.
-    ctx_.flush();
-  }
+      : polled_reader_engine(over_file{}, opts, path, opts.direct_io) {}
 
   // A source with no path: the null source is constructed from the size
   // it should pretend to have. Everything downstream -- window count,
   // slots, delivery order -- is the same machine.
   polled_reader_engine(std::uint64_t size, const file_reader_options& opts)
     requires std::constructible_from<typename C::file, C&, std::uint64_t>
-      : window_(rounded_window_bytes(opts.window_bytes)),
-        qd_(clamp_queue_depth(opts.queue_depth)),
-        slots_(qd_),
-        pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
-        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
-        file_(ctx_, size) {
-    num_windows_ = (file_.size() + window_ - 1) / window_;
-    const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
-    for (unsigned s = 0; s < initial; ++s) {
-      assign(s);
-    }
-    ctx_.flush();
-  }
+      : polled_reader_engine(over_file{}, opts, size) {}
 
   [[nodiscard]] std::uint64_t file_size() const noexcept {
     return file_.size();
@@ -171,6 +145,30 @@ class polled_reader_engine {
     bool ready = false;  // the callback has run for this window
     bool held = false;   // delivered, not yet released
   };
+
+  // The engine behind both public constructors: the file is whatever the
+  // context makes of the arguments after opts, and the first batch of
+  // reads goes out before the constructor returns.
+  struct over_file {};
+  template <class... FileArgs>
+  polled_reader_engine(over_file, const file_reader_options& opts,
+                       FileArgs&&... file_args)
+      : window_(rounded_window_bytes(opts.window_bytes)),
+        qd_(clamp_queue_depth(opts.queue_depth)),
+        slots_(qd_),
+        pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
+        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
+        file_(ctx_, std::forward<FileArgs>(file_args)...) {
+    num_windows_ = (file_.size() + window_ - 1) / window_;
+    const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
+    for (unsigned s = 0; s < initial; ++s) {
+      assign(s);
+    }
+    // One flush for the whole initial batch: the contract separates
+    // queueing from submitting precisely so this is one io_uring_enter
+    // rather than queue_depth of them.
+    ctx_.flush();
+  }
 
   // The one place a context hands control back. Marking the slot is all
   // it may do: the engine is not reentrant, and the contract's promise is

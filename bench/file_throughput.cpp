@@ -269,13 +269,10 @@ class null_driver {
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    blake3pp::detail::io_read_op& op) {
-    static_assert(sizeof(io_impl::null_context::read_op) <=
-                  blake3pp::detail::io_read_op::storage_size);
-    auto* const inner = ::new (static_cast<void*>(op.storage))
-        io_impl::null_context::read_op{};
-    inner->done = &trampoline;
-    inner->owner = &op;
-    ctx_.submit_read(f.f_, off, buf, *inner);
+    auto& inner = op.emplace_native<io_impl::null_context::read_op>();
+    inner.done = &trampoline;
+    inner.owner = &op;
+    ctx_.submit_read(f.f_, off, buf, inner);
   }
 
   void flush() noexcept { ctx_.flush(); }

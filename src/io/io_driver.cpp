@@ -17,7 +17,6 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <type_traits>
 #include <utility>
 
 #include "io/backend.hpp"
@@ -29,30 +28,15 @@ namespace {
 using context = io_impl::native_reader_context;
 using native_op = context::read_op;
 
-// The backend's operation lives inside the caller's io_read_op. If a
-// backend outgrows this, the build stops here rather than writing past
-// the storage: raise storage_size in the header.
-static_assert(sizeof(native_op) <= io_read_op::storage_size,
-              "io_read_op::storage_size is smaller than this platform's "
-              "reader_context::read_op");
-static_assert(alignof(native_op) <= io_read_op::storage_align,
-              "io_read_op::storage_align is weaker than this platform's "
-              "reader_context::read_op requires");
-
-// One io_read_op is reused for read after read -- the window cells hold
-// theirs for the pipeline's lifetime -- and each submit constructs a new
-// backend op over the previous one's bytes without destroying it. That is
-// only sound while destruction is a no-op. A backend whose op acquires
-// anything has to be released in trampoline() before the callback runs,
-// which no backend needs today.
+// The backend's operation lives inside the caller's io_read_op, whose
+// emplace_native() checks the fit and the trivial destructor where the
+// op is constructed. A backend that outgrows the storage fails that
+// check: raise storage_size in the header. One whose op acquires
+// anything would have to be released in trampoline() before the
+// callback runs, which no backend needs today.
 static_assert(io_driver::direct_alignment == io_impl::direct_align,
               "the alignment callers plan their reads around must be the "
               "one the backends enforce");
-
-static_assert(std::is_trivially_destructible_v<native_op>,
-              "this platform's reader_context::read_op has a non-trivial "
-              "destructor; io_read_op::storage is reused per read, so the "
-              "op must be destroyed in trampoline() before the callback");
 
 // The backend completes its own op; this carries that across to the
 // caller's, which is the only one the pipeline knows about.
@@ -137,12 +121,10 @@ std::string_view io_driver::file::name() const noexcept {
 
 void io_driver::submit_read(file& f, std::uint64_t off,
                             std::span<std::byte> buf, io_read_op& op) {
-  // The backend's op is constructed in place, once per submit; it holds
-  // no state across submissions.
-  native_op* const inner = ::new (static_cast<void*>(op.storage)) native_op{};
-  inner->done = &trampoline;
-  inner->owner = &op;
-  impl_->ctx.submit_read(f.impl_->f, off, buf, *inner);
+  native_op& inner = op.emplace_native<native_op>();
+  inner.done = &trampoline;
+  inner.owner = &op;
+  impl_->ctx.submit_read(f.impl_->f, off, buf, inner);
 }
 
 void io_driver::flush() noexcept { impl_->ctx.flush(); }
