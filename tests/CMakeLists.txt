@@ -45,6 +45,13 @@ endif()
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"
   "${PROJECT_SOURCE_DIR}/src")
+# A sanitized build runs the reducer's property cases tens of times
+# slower, to the point where one case takes minutes and a timeout can no
+# longer tell a stall from work. Those lanes run a prefix of the same
+# fixed-seed sequence; the plain lanes keep the full count.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+  target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_REDUCED_CASES=1)
+endif()
 target_link_libraries(blake3pp_tests PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings

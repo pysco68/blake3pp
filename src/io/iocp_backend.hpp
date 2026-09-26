@@ -219,6 +219,11 @@ class iocp_context {
    public:
     file(iocp_context& ctx, const std::filesystem::path& path,
          bool direct_io) {
+      // FILE_SHARE_READ and nothing else: a digest describes the bytes
+      // that were there, so nothing may rewrite or shorten the file
+      // while it is being read. The cost is that a test cannot truncate
+      // a file the pipeline holds open, which is why the truncation
+      // case in tests/file_pipeline.cpp does not run here.
       f_.open(path.c_str(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
       size_ = f_.stat_size();

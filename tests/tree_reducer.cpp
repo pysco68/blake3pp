@@ -32,6 +32,23 @@ using blake3pp::detail::tree_reducer;
 // Fixed so a failure reproduces from the reported parameters alone.
 constexpr std::uint64_t seed = 0x5eed'b1a3'e300'0001ULL;
 
+// How many random cases the two property tests run.
+//
+// They hash a couple of gigabytes between them, which is seconds on a
+// plain lane and about four minutes each under GCC with address and
+// undefined behaviour sanitizers -- long enough that a real stall and an
+// honest case stop being distinguishable by a timeout. The sanitizer
+// lanes run a prefix of the same sequence instead: the seed is fixed, so
+// case i is case i whatever the count, and a failure a short lane finds
+// reproduces in a long one.
+#if defined(BLAKE3PP_TEST_REDUCED_CASES)
+constexpr int order_cases = 12;
+constexpr int split_cases = 6;
+#else
+constexpr int order_cases = 100;
+constexpr int split_cases = 50;
+#endif
+
 // Deterministic, non-repeating bytes: a repeating pattern would hide an
 // error that swaps two chunks or two CVs.
 [[nodiscard]] std::vector<std::byte> pattern(std::size_t bytes) {
@@ -237,7 +254,7 @@ TEST_CASE("windows arriving in any order absorb as the message they are") {
   std::size_t max_pending = 0;
   for (const mode m : {mode::plain, mode::keyed, mode::derive_key}) {
     CAPTURE(mode_name(m));
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < order_cases; ++i) {
       static constexpr std::uint64_t window_sizes[] = {2, 4, 8, 16, 64};
       case_params p;
       p.m = m;
@@ -262,7 +279,7 @@ TEST_CASE("windows split into their two children reduce the same way") {
   std::size_t max_pending = 0;
   for (const mode m : {mode::plain, mode::keyed, mode::derive_key}) {
     CAPTURE(mode_name(m));
-    for (int i = 0; i < 50; ++i) {
+    for (int i = 0; i < split_cases; ++i) {
       static constexpr std::uint64_t window_sizes[] = {4, 8, 16, 64};
       case_params p;
       p.m = m;
