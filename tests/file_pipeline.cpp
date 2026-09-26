@@ -34,6 +34,8 @@
 #include <random>
 #include <vector>
 
+#include "test_schedulers.hpp"
+
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/io_driver.hpp>
@@ -1234,154 +1236,6 @@ TEST_CASE("the full reducer capacity never throttles a normal run") {
   CHECK(scope.admission_stalls() == 0);
 }
 
-// A scheduler that runs the work where it was started: the case that
-// must not deadlock, since the compress stage then runs inside the
-// driver's own poll.
-struct inline_scheduler;
-
-template <class Receiver>
-struct inline_op {
-  using operation_state_concept = compat::operation_state_tag;
-  inline_op(Receiver r) : rcvr(std::move(r)) {}
-  Receiver rcvr;
-  void start() & noexcept { ex::set_value(std::move(rcvr)); }
-};
-
-struct inline_env {
-  [[nodiscard]] inline_scheduler query(
-      ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept;
-};
-
-struct inline_sender {
-  using sender_concept = compat::sender_tag;
-  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t());
-  template <class Receiver>
-  inline_op<Receiver> connect(Receiver r) const {
-    return {std::move(r)};
-  }
-  [[nodiscard]] inline_env get_env() const noexcept { return {}; }
-};
-
-struct inline_scheduler : compat::weakly_parallel_scheduler {
-  using scheduler_concept = compat::scheduler_tag;
-  [[nodiscard]] inline_sender schedule() const noexcept { return {}; }
-  bool operator==(const inline_scheduler&) const noexcept = default;
-};
-
-inline inline_scheduler inline_env::query(
-    ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept {
-  return {};
-}
-
-static_assert(ex::scheduler<inline_scheduler>);
-
-// One worker thread and a queue: the other end of the range, where every
-// part of every window is serialized behind a single agent.
-class one_thread_pool {
- public:
-  // With a delay, the worker sleeps that long before running each node:
-  // a window handed to the pool then stays there long enough for the
-  // driver to fail underneath it.
-  explicit one_thread_pool(std::chrono::milliseconds delay = {})
-      : delay_(delay), worker_([this] { run(); }) {}
-  ~one_thread_pool() {
-    {
-      const std::lock_guard lock(m_);
-      stop_ = true;
-    }
-    cv_.notify_all();
-    worker_.join();
-  }
-  one_thread_pool(const one_thread_pool&) = delete;
-  one_thread_pool& operator=(const one_thread_pool&) = delete;
-
-  void post(run_node* n) {
-    {
-      const std::lock_guard lock(m_);
-      queue_.push_back(n);
-    }
-    cv_.notify_one();
-  }
-
-  struct scheduler;
-
-  template <class Receiver>
-  struct op : run_node {
-    using operation_state_concept = compat::operation_state_tag;
-    op(Receiver r, one_thread_pool* p) : rcvr(std::move(r)), pool(p) {
-      run = [](run_node* self) noexcept {
-        ex::set_value(std::move(static_cast<op*>(self)->rcvr));
-      };
-    }
-    Receiver rcvr;
-    one_thread_pool* pool;
-    void start() & noexcept { pool->post(this); }
-  };
-
-  struct env {
-    one_thread_pool* pool;
-    [[nodiscard]] scheduler query(
-        ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept;
-  };
-
-  struct sender {
-    using sender_concept = compat::sender_tag;
-    BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t());
-    one_thread_pool* pool;
-    template <class Receiver>
-    op<Receiver> connect(Receiver r) const {
-      return {std::move(r), pool};
-    }
-    [[nodiscard]] env get_env() const noexcept { return {pool}; }
-  };
-
-  struct scheduler : compat::weakly_parallel_scheduler {
-    using scheduler_concept = compat::scheduler_tag;
-    one_thread_pool* pool = nullptr;
-    [[nodiscard]] sender schedule() const noexcept { return {pool}; }
-    bool operator==(const scheduler&) const noexcept = default;
-  };
-
-  [[nodiscard]] scheduler get_scheduler() noexcept { return {{}, this}; }
-
- private:
-  void run() {
-    for (;;) {
-      run_node* n = nullptr;
-      {
-        std::unique_lock lock(m_);
-        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
-        if (queue_.empty()) {
-          if (stop_) {
-            return;
-          }
-          continue;
-        }
-        n = queue_.front();
-        queue_.erase(queue_.begin());
-      }
-      if (delay_.count() > 0) {
-        std::this_thread::sleep_for(delay_);
-      }
-      n->run(n);
-    }
-  }
-
-  std::mutex m_;
-  std::condition_variable cv_;
-  std::vector<run_node*> queue_;
-  bool stop_ = false;
-  std::chrono::milliseconds delay_;
-  std::thread worker_;
-};
-
-inline one_thread_pool::scheduler one_thread_pool::env::query(
-    ex::get_completion_scheduler_t<ex::set_value_t>) const noexcept {
-  return {{}, pool};
-}
-
-static_assert(ex::scheduler<one_thread_pool::scheduler>);
-
 // Runs a file through the pipeline over the fake driver, with whatever
 // hasher and scheduler the case wants.
 template <class Sched>
@@ -1566,7 +1420,7 @@ TEST_CASE("a stop ends the run on an inline scheduler and on one thread") {
   SUBCASE("inline") {
     ex::inplace_stop_source src;
     blake3pp::hasher h;
-    const stop_outcome out = stop_run(h, content, win, inline_scheduler{}, src,
+    const stop_outcome out = stop_run(h, content, win, b3test::inline_scheduler{}, src,
                                       {.stop_at_window = 4});
     CHECK(out.threw);
     CHECK(out.ec == std::errc::operation_canceled);
@@ -1575,7 +1429,7 @@ TEST_CASE("a stop ends the run on an inline scheduler and on one thread") {
     CHECK(out.guard_intact);
   }
   SUBCASE("one thread") {
-    one_thread_pool pool;
+    b3test::one_thread_pool pool;
     ex::inplace_stop_source src;
     blake3pp::hasher h;
     const stop_outcome out = stop_run(h, content, win, pool.get_scheduler(),
@@ -1860,7 +1714,7 @@ TEST_CASE("an exception from poll waits for the pool before unwinding") {
   const auto content = pattern(len, 91);
   for (const bool keep : {false, true}) {
     CAPTURE(keep);
-    one_thread_pool pool(std::chrono::milliseconds(20));
+    b3test::one_thread_pool pool(std::chrono::milliseconds(20));
     fake_driver drv(content, win, {.throw_at_poll = 1, .keep_throwing = keep});
     fake_driver::file f(drv);
     blake3pp::hasher h;
@@ -1911,11 +1765,11 @@ TEST_CASE("the pipeline runs on an inline scheduler and on one thread") {
     // Every part runs inside the driver's own poll; nothing may wait on
     // another thread for it.
     blake3pp::hasher h;
-    fake_run(h, content, win, inline_scheduler{});
+    fake_run(h, content, win, b3test::inline_scheduler{});
     CHECK(h.finalize() == expected);
   }
   SUBCASE("one thread") {
-    one_thread_pool pool;
+    b3test::one_thread_pool pool;
     blake3pp::hasher h;
     fake_run(h, content, win, pool.get_scheduler());
     CHECK(h.finalize() == expected);
@@ -2253,7 +2107,7 @@ TEST_CASE("reads in flight stay under the plan while windows fill the pool") {
 
   for (const unsigned cap : {0u, 1u}) {
     CAPTURE(cap);
-    one_thread_pool pool(std::chrono::milliseconds(5));
+    b3test::one_thread_pool pool(std::chrono::milliseconds(5));
     fake_driver drv(content, win);
     fake_driver::file f(drv);
     std::vector<blake3pp::window_record> records(20);

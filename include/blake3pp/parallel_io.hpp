@@ -29,6 +29,7 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/file_reader.hpp>
+#include <blake3pp/detail/write_pipeline.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
 #include <blake3pp/trace.hpp>
@@ -59,6 +60,63 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 }
 #endif
 }  // namespace detail
+
+/// Knobs for write_file(): the geometry of a generated file.
+///
+/// The defaults are blake3ppgen's measured shape, not the reader's:
+/// 64 MiB windows, two in flight. On four PCIe 5 drives in RAID 0 with
+/// 32 threads that measured 24.2 GiB/s, against 20.7 at 128 MiB x 4 and
+/// 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
+/// volume slows down.
+struct file_write_options {
+  /// Bytes per window; rounded to a power of two in the reader's range.
+  std::size_t window_bytes = detail::default_write_window_bytes;
+  /// Windows in flight, clamped to [2, 32].
+  unsigned queue_depth = detail::default_write_queue_depth;
+  /// Bypass the page cache where the platform can.
+  bool direct_io = true;
+  /// io_uring: issue on io-wq rather than inline in the submit call.
+  bool offload_submit = true;
+};
+
+/// Generates a file of exactly `size` bytes, filling each window over a
+/// scheduler and writing it through the platform's fastest path.
+///
+/// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
+/// offset)` on the scheduler's agents, once per window, and must fill
+/// every byte of `out`; windows are filled and written concurrently, in
+/// no particular order, so a generator must depend on its offset and
+/// nothing else.
+///
+/// On success the file is exactly `size` bytes. On failure the file is
+/// left as far as it got: what lies past the last landed window is
+/// unspecified, and it is NOT truncated, because a length invented for
+/// bytes that were never produced would hide the failure.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param path   The file to create or truncate.
+/// @param size   How many bytes to generate.
+/// @param fill   The generator, called per window on the pool.
+/// @param sched  Where the fills run.
+/// @param opts   The geometry.
+/// @throws std::system_error on I/O failure, and whatever the execution
+///         provider raises.
+template <class Scheduler, class Fill>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void write_file(const std::filesystem::path& path, std::uint64_t size,
+                Fill&& fill, Scheduler&& sched,
+                const file_write_options& opts = {}) {
+  detail::io_driver drv({/*async=*/true, opts.offload_submit},
+                        detail::clamp_queue_depth(opts.queue_depth));
+  detail::io_driver::file file(
+      drv, path,
+      detail::io_driver::open_options{.write = true,
+                                      .direct_io = opts.direct_io,
+                                      .preallocate_bytes = size});
+  detail::run_write_pipeline(drv, file, std::forward<Scheduler>(sched),
+                             std::forward<Fill>(fill), size,
+                             {.window_bytes = opts.window_bytes,
+                              .queue_depth = opts.queue_depth});
+}
 
 /// Streams a file into a hasher with every complete window fanned out
 /// over a scheduler; the final window is absorbed by h itself.

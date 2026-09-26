@@ -149,9 +149,10 @@ int main(int argc, char** argv) {
 
   b3tool::compute_pool pool(threads);
 
-  // Each parallel task fills one segment of this size, and the sinks
-  // then buffer one segment per thread so every fill fans out fully, up
-  // to max_buffer (--window overrides both).
+  // Each parallel fill task takes one segment of this size. The pipelined
+  // file sink makes each window one segment; the sequential file sink and
+  // stdout buffer one segment per thread so every fill fans out fully, the
+  // file sink capped at max_buffer. --window overrides the file sinks.
   constexpr std::size_t segment = 4 * 1024 * 1024;
   constexpr std::size_t max_buffer = 64 * 1024 * 1024;
 
@@ -187,6 +188,43 @@ int main(int argc, char** argv) {
       blake3pp::fill(stream, out);
     }
   };
+
+  if (output != "-" && pool.parallel() && remaining.total()) {
+    // File sink, pipelined: windows are filled on the pool and written
+    // by the driver, overlapping generation with the device instead of
+    // alternating between them.
+    //
+    // The generator has to be addressable by offset, which an extended
+    // output already is: seeking it is O(1), so each window copies the
+    // reader and seeks its own position. The fill of one window is
+    // sequential. The parallelism is the windows in flight, and a fan-out
+    // nested inside a pool agent would deadlock a one-thread pool.
+    try {
+      blake3pp::file_write_options wopts;
+      wopts.direct_io = !no_direct;
+      wopts.offload_submit = !inline_submit;
+      // One window per thread, so every core has a window to generate
+      // into, each the size one task used to fill.
+      wopts.window_bytes = window_mib > 0 ? window_mib * 1024 * 1024 : segment;
+      wopts.queue_depth = qd > 0 ? qd : threads;
+      const std::uint64_t total = *remaining.total();
+      blake3pp::write_file(
+          output, total,
+          [&stream, seek](std::span<std::byte> out, std::uint64_t off) {
+            blake3pp::output_reader r = stream;
+            r.seek(seek + off);
+            blake3pp::fill(r, out);
+          },
+          pool.scheduler(), wopts);
+      if (verbose) {
+        println(stderr, "blake3ppgen: write backend: pipeline");
+      }
+    } catch (const std::exception& e) {
+      println(stderr, "blake3ppgen: {}", e.what());
+      return b3tool::exit_failure;
+    }
+    return 0;
+  }
 
   if (output != "-") {
     // File sink: generate straight into the writer's O_DIRECT-aligned
