@@ -9,6 +9,7 @@
 //                       [--no-direct] [--seq-only] [--cooldown S]
 //                       [--trace PATH [--trace-agents]]
 //   blake3pp_bench_file <FILE> --io-sweep   # window x qd pacing matrix
+//   blake3pp_bench_file --null-sink <GiB>   # write pipeline, no device
 //   blake3pp_bench_file --make <MiB>   # create a test file and use it
 //
 // Note: with direct I/O the page cache is bypassed, so repetitions measure
@@ -73,6 +74,7 @@
 
 #include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/memory_driver.hpp>
+#include <blake3pp/detail/write_pipeline.hpp>
 
 
 #include "tool_common.hpp"
@@ -364,6 +366,9 @@ class null_driver {
     explicit file(null_driver& drv) noexcept : drv_(&drv) {}
     [[nodiscard]] std::uint64_t size() const noexcept { return drv_->size_; }
     [[nodiscard]] std::string_view name() const noexcept { return "null"; }
+    // The sink has no length to trim: the write scope calls this at the
+    // ends of a run and the answer is the same either way.
+    void set_size(std::uint64_t) noexcept {}
 
    private:
     null_driver* drv_;
@@ -389,6 +394,12 @@ class null_driver {
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
                    blake3pp::detail::io_read_op& op) noexcept {
+    reads_.push(op);
+  }
+  // The sink half: the bytes are already where they were generated, so
+  // the only work is reporting from poll() and not before.
+  void submit_write(file&, std::uint64_t, std::span<const std::byte>,
+                    blake3pp::detail::io_read_op& op) noexcept {
     reads_.push(op);
   }
   void flush() noexcept {}
@@ -823,6 +834,7 @@ int main(int argc, char** argv) {
   unsigned pool_threads = b3tool::default_threads();
   bool seq_only = false;
   double null_gib = 0;
+  double null_sink_gib = 0;
   bool inline_submit = false;
   bool no_direct = false;
   blake3pp::hash_file_options opts;
@@ -860,6 +872,10 @@ int main(int argc, char** argv) {
   app.add_option("--null-source", null_gib,
                  "hash this many GiB from a source that performs no I/O: the "
                  "pipeline's hash-bound ceiling, with no file and no device")
+      ->check(CLI::PositiveNumber);
+  app.add_option("--null-sink", null_sink_gib,
+                 "write N GiB through the write pipeline into a sink that "
+                 "completes immediately (the device-free ceiling)")
       ->check(CLI::PositiveNumber);
   bool sweep = false;
   auto* sweep_opt =
@@ -966,6 +982,61 @@ int main(int argc, char** argv) {
       }
     }
     return got == want ? 0 : 1;
+  }
+
+  // The write pipeline with the device removed: windows are generated on
+  // the pool and handed to a sink that completes them from poll(). What
+  // is left is the generator, the chain and the loop -- the ceiling a
+  // real drive is measured against, the mirror of --null-source.
+  if (null_sink_gib > 0) {
+    const auto total =
+        static_cast<std::uint64_t>(null_sink_gib * 1024.0 * 1024.0 * 1024.0);
+    const std::size_t win =
+        blake3pp::detail::rounded_window_bytes(opts.window_bytes);
+    const unsigned threads =
+        pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
+    println(stdout,
+            "null sink: {:.2f} GiB, window {} MiB, qd {}, {} threads",
+            null_sink_gib, win >> 20, opts.queue_depth, threads);
+
+    // The same generator blake3ppgen uses, so the fill costs what it
+    // costs there: an extended output seeks in O(1), so each window
+    // copies the reader and seeks its own offset.
+    blake3pp::hasher seed;
+    seed.update(std::span<const std::byte>{&null_filler, 1});
+    const blake3pp::output_reader stream = seed.finalize_xof();
+
+    engine_threads engine(threads);
+    auto sched = engine.scheduler();
+    b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
+    double best = 1e30;
+    for (int r = 0; r < reps; ++r) {
+      cooldown();
+      // Size the pool exactly as the write scope will ask for it, so its
+      // reserve() is a no-op and no first-touch page fault lands inside
+      // the clock.
+      const unsigned windows = static_cast<unsigned>(std::min<std::uint64_t>(
+          (total + win - 1) / win, opts.queue_depth));
+      null_driver drv({/*async=*/true, opts.offload_submit}, windows, total,
+                      null_filler, win * windows);
+      null_driver::file nf(drv);
+      const auto t0 = std::chrono::steady_clock::now();
+      blake3pp::detail::run_write_pipeline(
+          drv, nf, sched,
+          [&stream](std::span<std::byte> out, std::uint64_t off) {
+            blake3pp::output_reader rd = stream;
+            rd.seek(off);
+            blake3pp::fill(rd, out);
+          },
+          total,
+          {.window_bytes = opts.window_bytes,
+           .queue_depth = opts.queue_depth});
+      const auto t1 = std::chrono::steady_clock::now();
+      best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
+    }
+    println(stdout, "{:<10} {}", "null sink",
+            b3tool::rate(static_cast<std::size_t>(total), best));
+    return 0;
   }
 
   if (make_mib > 0) {
