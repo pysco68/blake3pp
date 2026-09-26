@@ -592,15 +592,29 @@ inline constexpr std::size_t reducer_nodes = 256;
   return head % io_driver::direct_alignment == 0;
 }
 
+// Buffer memory the pipeline spends on windows beyond the reads the
+// device sees, so that a pool has windows to work on while the device
+// serves the next ones. Provisional: at 8 MiB windows this is 16 of
+// them, twice what a 16-thread pool needed on a source with no device
+// under it, and the same 256 MiB a caller of 64 MiB x qd 4 already
+// spends; a wider pool and a real device will move it.
+inline constexpr std::size_t default_window_budget_bytes = std::size_t{128} << 20;
+
 // The geometry of one update_file() call, decided once from the hasher's
-// count and the caller's requests and handed to the driver, the file and
-// the scope alike, so that no two of them round or clamp differently.
+// count, the file's size and the caller's requests and handed to the
+// driver, the file and the scope alike, so that no two of them round or
+// clamp differently.
 struct pipeline_plan {
   // The window, as rounded_window_bytes() rounds the request.
   std::size_t window_bytes;
-  // Windows in flight at most, and window objects allocated: the queue
-  // depth as clamp_queue_depth() clamps the request.
-  unsigned queue_depth;
+  // Reads the device sees at once: the queue depth as
+  // clamp_queue_depth() clamps the request.
+  unsigned reads_in_flight;
+  // Window objects -- buffer, part table and operation cell -- and so
+  // windows in flight at most, reading or on the pool: at least
+  // reads_in_flight, as many as the budget buys up to max_queue_depth,
+  // and never more than the file has.
+  unsigned windows;
   // The short first window that brings the hasher onto the window grid;
   // zero for a hasher already on it.
   std::size_t head_bytes;
@@ -609,13 +623,40 @@ struct pipeline_plan {
   bool direct_io;
 };
 
+// How many windows a file of file_bytes has on this grid, the short
+// first one included; saturates at max_queue_depth, which is all a plan
+// can use.
+[[nodiscard]] constexpr unsigned file_windows(std::uint64_t file_bytes,
+                                              std::size_t window_bytes,
+                                              std::size_t head_bytes) noexcept {
+  if (file_bytes == 0) {
+    return 0;
+  }
+  std::uint64_t n = 0;
+  std::uint64_t rest = file_bytes;
+  if (head_bytes > 0) {
+    n = 1;
+    rest -= std::min<std::uint64_t>(head_bytes, rest);
+  }
+  n += (rest + window_bytes - 1) / window_bytes;
+  return n > max_queue_depth ? max_queue_depth : static_cast<unsigned>(n);
+}
+
+// file_bytes is the file's size, or zero when unknown: the window count
+// is then the budget's, and the open that follows reports why.
 [[nodiscard]] constexpr pipeline_plan plan_pipeline(
     std::uint64_t count, std::size_t window_bytes, unsigned queue_depth,
-    bool direct_io) noexcept {
+    bool direct_io, std::uint64_t file_bytes) noexcept {
   const std::size_t window = rounded_window_bytes(window_bytes);
   const std::size_t head = first_window_bytes(count, window);
-  return {window, clamp_queue_depth(queue_depth), head,
-          direct_io && direct_io_fits(head)};
+  const unsigned reads = clamp_queue_depth(queue_depth);
+  const std::size_t by_budget = default_window_budget_bytes / window;
+  const auto windows = static_cast<unsigned>(std::clamp<std::size_t>(
+      std::max<std::size_t>(reads, by_budget), reads, max_queue_depth));
+  return {window, reads,
+          file_bytes == 0 ? windows
+                          : std::min(windows, file_windows(file_bytes, window, head)),
+          head, direct_io && direct_io_fits(head)};
 }
 
 
@@ -647,7 +688,7 @@ class window_scope {
         trace_(opts.trace),
         ops_(resolve(h.selected_arch())),
         window_bytes_(plan.window_bytes),
-        count_(plan.queue_depth),
+        count_(plan.reads_in_flight),
         in_flight_cap_(opts.in_flight_cap == 0
                            ? count_
                            : std::min<unsigned>(opts.in_flight_cap, count_)),
@@ -682,7 +723,7 @@ class window_scope {
                const pipeline_options& opts)
       : window_scope(h, drv, file, std::move(sched),
                      plan_pipeline(h.count(), opts.window_bytes,
-                                   opts.queue_depth, false),
+                                   opts.queue_depth, false, file.size()),
                      opts) {}
 
   window_scope(const window_scope&) = delete;
@@ -1477,7 +1518,8 @@ void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
                          Scheduler&& sched, const pipeline_options& opts) {
   run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched),
-      plan_pipeline(h.count(), opts.window_bytes, opts.queue_depth, false),
+      plan_pipeline(h.count(), opts.window_bytes, opts.queue_depth, false,
+                    file.size()),
       opts);
 }
 

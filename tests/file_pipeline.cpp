@@ -1619,6 +1619,59 @@ TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
   CHECK_THROWS_AS(scope.run(), std::logic_error);
 }
 
+// The window count is arithmetic over four inputs, so it is checked as
+// arithmetic: the budget buys windows beyond the reads, the reads are
+// the floor, max_queue_depth the ceiling, and the file the last word.
+TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the file") {
+  using blake3pp::detail::default_window_budget_bytes;
+  using blake3pp::detail::max_queue_depth;
+  using blake3pp::detail::plan_pipeline;
+  constexpr std::size_t mib = std::size_t{1} << 20;
+  constexpr std::uint64_t large = std::uint64_t{64} << 30;
+  static_assert(default_window_budget_bytes == 128 * mib);
+
+  // A large file at 8 MiB x qd 4: the budget buys 16 windows, the
+  // device still sees 4 reads.
+  {
+    const auto p = plan_pipeline(0, 8 * mib, 4, false, large);
+    CHECK(p.reads_in_flight == 4);
+    CHECK(p.windows == 16);
+  }
+  // Large windows: the budget buys two, which is below the reads, so
+  // the reads are the floor and memory is what it was.
+  {
+    const auto p = plan_pipeline(0, 64 * mib, 4, false, large);
+    CHECK(p.reads_in_flight == 4);
+    CHECK(p.windows == 4);
+    CHECK(p.windows * p.window_bytes == 256 * mib);
+  }
+  // A deeper queue lifts the floor with it.
+  CHECK(plan_pipeline(0, 64 * mib, 8, false, large).windows == 8);
+  // Small windows: the budget would buy 2048; the ceiling holds.
+  {
+    const auto p = plan_pipeline(0, 64 * 1024, 4, false, large);
+    CHECK(p.windows == max_queue_depth);
+    CHECK(p.reads_in_flight == 4);
+  }
+  // The ceiling also bounds a queue depth asked above it.
+  CHECK(plan_pipeline(0, 8 * mib, 64, false, large).reads_in_flight ==
+        max_queue_depth);
+  CHECK(plan_pipeline(0, 8 * mib, 64, false, large).windows == max_queue_depth);
+  // A small file gets exactly its windows, edges included.
+  CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024).windows == 3);
+  CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024 + 1).windows == 4);
+  CHECK(plan_pipeline(0, 64 * 1024, 4, false, 1).windows == 1);
+  // A short first window counts as one, then the rest on the grid.
+  {
+    const auto p = plan_pipeline(1000, 64 * 1024, 4, false, 2 * 64 * 1024);
+    CHECK(p.head_bytes == 64 * 1024 - 1000);
+    CHECK(p.windows == 3);
+  }
+  // An unknown size leaves the count to the budget; an empty file has
+  // no windows at all.
+  CHECK(plan_pipeline(0, 8 * mib, 4, false, 0).windows == 16);
+}
+
 // A hasher part-way through a message is brought back onto the window
 // grid by one short first window. Every prior count that moves that
 // boundary is its own case, and the open mode moves with it: an
@@ -1650,11 +1703,11 @@ TEST_CASE("prior content sets the window grid and the open mode") {
     const bool direct_ok = direct_io_fits(head);
     CHECK(direct_ok == (head % io_driver::direct_alignment == 0));
     // The plan update_file makes carries the same two answers.
-    const auto plan = plan_pipeline(prior, win, 4, true);
+    const auto plan = plan_pipeline(prior, win, 4, true, len);
     CHECK(plan.window_bytes == win);
     CHECK(plan.head_bytes == head);
     CHECK(plan.direct_io == direct_ok);
-    CHECK(plan_pipeline(prior, win, 4, false).direct_io == false);
+    CHECK(plan_pipeline(prior, win, 4, false, len).direct_io == false);
 
     blake3pp::hasher h;
     h.update(head_content);

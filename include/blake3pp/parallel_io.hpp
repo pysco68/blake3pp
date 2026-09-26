@@ -66,10 +66,16 @@ void update_file(hasher& h, const std::filesystem::path& path,
   // the scope see; its direct_io is the caller's wish only where the
   // grid is aligned, since an unaligned head misaligns every window
   // after it and would degrade each read to the synchronous path.
+  // The size is read before the open because the plan decides the open
+  // mode and sizes the window objects to the file; a size the filesystem
+  // cannot give leaves the count to the budget, and the open reports why.
+  std::error_code size_ec;
+  const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
   const detail::pipeline_plan plan = detail::plan_pipeline(
-      h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io);
+      h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io,
+      size_ec ? 0 : static_cast<std::uint64_t>(size));
   detail::io_driver drv({/*async=*/true, opts.offload_submit},
-                        plan.queue_depth);
+                        plan.reads_in_flight);
   detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched), plan,

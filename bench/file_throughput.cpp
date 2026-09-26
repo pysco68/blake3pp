@@ -808,10 +808,10 @@ int main(int argc, char** argv) {
       }
       const blake3pp::detail::pipeline_plan plan =
           blake3pp::detail::plan_pipeline(0, opts.window_bytes,
-                                          opts.queue_depth, false);
+                                          opts.queue_depth, false, total);
       null_driver drv({/*async=*/true, opts.offload_submit},
-                      plan.queue_depth, total, null_filler,
-                      plan.window_bytes * plan.queue_depth);
+                      plan.reads_in_flight, total, null_filler,
+                      plan.window_bytes * plan.windows);
       null_driver::file nf(drv);
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
