@@ -200,10 +200,53 @@ macro(_blake3pp_fetch_stdexec)
       SOURCE_SUBDIR include
       BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/stdexec-build")
     hfc_FetchContent_MakeAvailable_interlocked(stdexec)
+    set(_blake3pp_stdexec_include "${stdexec_SOURCE_DIR}/include")
+    # Where std::size_t has 32 bits, static_thread_pool's work-stealing
+    # queue loses tasks and the pool hangs; the patch says why. It is
+    # applied to a copy in the build tree, because the source cache is
+    # shared with 64-bit builds and with other checkouts.
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+      set(_blake3pp_stdexec_copy "${CMAKE_BINARY_DIR}/_deps/stdexec-patched")
+      set(_blake3pp_stdexec_include "${_blake3pp_stdexec_copy}/include")
+      set(_blake3pp_stdexec_patch
+        "${PROJECT_SOURCE_DIR}/cmake/patches/stdexec-bwos-counter-width.patch")
+      # Redone only when the source or the patch changes: a fresh copy on
+      # every configure would rebuild everything that includes stdexec. The
+      # hash of the header the patch changes covers a source directory that
+      # is edited in place, such as one set by FETCHCONTENT_SOURCE_DIR_STDEXEC.
+      file(SHA256 "${_blake3pp_stdexec_patch}" _blake3pp_stamp)
+      file(SHA256 "${stdexec_SOURCE_DIR}/include/exec/detail/bwos_lifo_queue.hpp"
+        _blake3pp_stamp_header)
+      string(APPEND _blake3pp_stamp " ${_blake3pp_stamp_header} ${stdexec_SOURCE_DIR}")
+      set(_blake3pp_stamp_old "")
+      if(EXISTS "${_blake3pp_stdexec_copy}/.patched")
+        file(READ "${_blake3pp_stdexec_copy}/.patched" _blake3pp_stamp_old)
+      endif()
+      if(NOT _blake3pp_stamp_old STREQUAL _blake3pp_stamp)
+        file(REMOVE_RECURSE "${_blake3pp_stdexec_copy}")
+        file(COPY "${stdexec_SOURCE_DIR}/include"
+          DESTINATION "${_blake3pp_stdexec_copy}")
+        find_package(Git REQUIRED)
+        # The ceiling stops git from finding the repository around the
+        # build tree, which would resolve the patch's paths from its root.
+        execute_process(
+          COMMAND "${CMAKE_COMMAND}" -E env
+            "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps"
+            "${GIT_EXECUTABLE}" apply -p1 "${_blake3pp_stdexec_patch}"
+          WORKING_DIRECTORY "${_blake3pp_stdexec_copy}"
+          RESULT_VARIABLE _blake3pp_patch_rc
+          ERROR_VARIABLE _blake3pp_patch_err)
+        if(NOT _blake3pp_patch_rc EQUAL 0)
+          message(FATAL_ERROR "blake3pp: ${_blake3pp_stdexec_patch} does not "
+            "apply to ${stdexec_SOURCE_DIR}: ${_blake3pp_patch_err}")
+        endif()
+        file(WRITE "${_blake3pp_stdexec_copy}/.patched" "${_blake3pp_stamp}")
+      endif()
+    endif()
     find_package(Threads REQUIRED)
     add_library(blake3pp_stdexec INTERFACE)
     target_include_directories(blake3pp_stdexec SYSTEM INTERFACE
-      "${stdexec_SOURCE_DIR}/include")
+      "${_blake3pp_stdexec_include}")
     target_link_libraries(blake3pp_stdexec INTERFACE Threads::Threads)
   endif()
 endmacro()
