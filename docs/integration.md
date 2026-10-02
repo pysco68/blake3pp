@@ -83,6 +83,13 @@ dispatch intact. Two of them are even the work of two compilers at
 once. How that works, and why it holds up, is explained in
 [docs/static-linux-binaries.md](static-linux-binaries.md).
 
+On powerpc64 Linux with LLVM's libunwind (zig, or clang with
+`-unwindlib=libunwind`), the unwinder does not restore vector registers
+v20-v31 after a caught exception. blake3pp's own programs carry a
+workaround; a program that links the library with that toolchain should
+apply it too. See
+[ppc64le: vector registers after a caught exception](static-linux-binaries.md#ppc64le-vector-registers-after-a-caught-exception).
+
 ## Header layout
 
 The split follows one rule. Members are the sequential primitives of the

@@ -45,6 +45,52 @@ toolchain files live in `cmake/toolchains/linux-*zigmusl*/` and
 document the zig-specific plumbing (wrapper scripts, linker-probe
 workarounds) in place.
 
+### ppc64le: vector registers after a caught exception
+
+LLVM's libunwind, which zig links on `linux-ppc64le-zigmusl-cxx23-static`
+(and which any clang toolchain using `-unwindlib=libunwind` links), does
+not restore the callee-saved vector registers v20-v31 when it resumes at a
+`catch` on powerpc64 Linux:
+
+- Its ppc64 `jumpto` restores them only for the bits set in VRSAVE, and
+  the ELFv2 ABI leaves VRSAVE at 0, so none are restored.
+- A value the compiler kept in one of them comes back as whatever the
+  throwing code left there.
+
+Seen in this project as a test that took the wrong branch after catching
+a `system_error`, and as a hang where a counter kept in a vector register
+lost an update on the exception path. libgcc's unwinder
+(`linux-ppc64le-gcc15-cxx23`) restores them and is not affected.
+Reproduced with zig 0.16 to 0.18-dev and with Debian's clang and
+libunwind 21.1.8, under qemu-ppc64le. Reported upstream as
+[llvm/llvm-project#231806](https://github.com/llvm/llvm-project/issues/231806).
+
+**The programs this project builds carry a workaround.**
+`tooling/vrsave_workaround.cpp` sets VRSAVE to all ones before `main()`;
+threads created afterwards inherit it, and libunwind then restores every
+vector register. It is compiled into the tools, the tests and the
+benchmarks through `blake3pp::node_program`, and is empty on every other
+target. `tests/unwinder.cpp` keeps the toolchain bug visible: one case
+clears VRSAVE and is expected to fail on this toolchain, and another
+checks that the workaround reaches a new thread. When the first case
+reports that it should have failed, the toolchain is fixed, and both the
+workaround and the expectation can go.
+
+**The library does not apply it.** Changing a process-wide register
+setting is the program's decision. A program that links blake3pp with
+LLVM's libunwind on powerpc64 Linux and catches exceptions should do the
+same in its own startup:
+
+```cpp
+#include <version>  // defines _LIBCPP_VERSION under libc++
+
+#if defined(__powerpc64__) && defined(__linux__) && defined(_LIBCPP_VERSION)
+[[gnu::constructor]] static void mark_vector_registers_live() {
+  asm volatile("mtvrsave %0" ::"r"(-1));
+}
+#endif
+```
+
 ## Why runtime SIMD dispatch survives static linking
 
 The usual casualty of full static linking is runtime CPU dispatch,

@@ -319,13 +319,19 @@ endif()
 # runtime torn down when main() returns (a program with live workers
 # otherwise keeps node alive). The browser module (web/) links none of
 # this and states its own embedding instead. Empty elsewhere, so the
-# link sites need no platform test.
+# link sites need no platform test. Every program also gets
+# tooling/vrsave_workaround.cpp, which compiles to nothing except on
+# powerpc64 Linux with LLVM's libunwind.
 add_library(blake3pp_node_program INTERFACE)
 add_library(blake3pp::node_program ALIAS blake3pp_node_program)
 if(EMSCRIPTEN)
   target_link_options(blake3pp_node_program INTERFACE
     -sNODERAWFS=1 -sPTHREAD_POOL_SIZE=8 -sEXIT_RUNTIME=1)
 endif()
+# ppc64 with LLVM's libunwind: restore v20-v31 after a caught exception
+# (see the file; it compiles to nothing on every other target).
+target_sources(blake3pp_node_program INTERFACE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tooling/vrsave_workaround.cpp)
 
 # --- Command-line tooling (CLI tools + benchmarks) ---------------------------
 # Everything the executables share, so the two CLI tools and the two
