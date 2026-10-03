@@ -1364,9 +1364,14 @@ class window_scope {
     // publish into one. The handler waits those windows out first; the
     // cells are still alive inside it.
     try {
-      run_windows(cells, first_edge_cell, first_read_cell, last_edge_cell,
-                  last_read_cell, connect_full{}, connect_read{},
-                  connect_edge{});
+      loop_.run_until(
+          status_,
+          [&] {
+            admit_round(cells, first_edge_cell, first_read_cell,
+                        last_edge_cell, last_read_cell, connect_full{},
+                        connect_read{}, connect_edge{});
+          },
+          [this] { on_stall(); });
     } catch (...) {
       quiesce();
       throw;
@@ -1451,17 +1456,20 @@ class window_scope {
     }
   }
 
-  // The loop proper: starts every window that may start before each
-  // flush, until the pipeline reports itself done. The cell types and
-  // the conversion functions that fill them are run()'s locals, which
-  // is why they arrive as template parameters.
+  // One round's worth of starts: every window that may start, started
+  // before the one flush that follows. The loop calls this once per
+  // round, which is what lets several pipelines share a loop -- each is
+  // offered a round in turn and admits what it can.
+  //
+  // The cell types and the conversion functions that fill them are
+  // run()'s locals, which is why they arrive as template parameters.
   template <class Cells, class EdgeCell, class ReadCell, class ConnectFull,
             class ConnectRead, class ConnectEdge>
-  void run_windows(Cells& cells, EdgeCell& first_edge_cell,
+  void admit_round(Cells& cells, EdgeCell& first_edge_cell,
                    ReadCell& first_read_cell, EdgeCell& last_edge_cell,
                    ReadCell& last_read_cell, ConnectFull, ConnectRead,
                    ConnectEdge) {
-    loop_.run_until(status_, [&] {
+    {
       if (stop_requested()) {
         sweep_cancels();
       }
@@ -1522,8 +1530,12 @@ class window_scope {
       // Without this the loop would reach the stall report, which exists
       // for a pipeline nobody can wake -- and this one is simply over.
       settle();
-    }, [this] { this->report_stall(); });
+    }
   }
+
+  // What the loop does when it would sleep with nothing owed: for one
+  // pipeline that is a configuration it cannot run.
+  void on_stall() const { this->report_stall(); }
 
   // The stop path for a loop that can no longer be trusted to run.
   //
