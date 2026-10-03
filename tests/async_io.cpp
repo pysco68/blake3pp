@@ -227,8 +227,13 @@ TEST_CASE("the sender reports the context as its completion scheduler") {
 
   auto sndr = async::async_hash_file(ctx, f.path(), sched);
   const auto env = ex::get_env(sndr);
-  auto where = ex::get_completion_scheduler<ex::set_value_t>(env);
-  CHECK(where == ctx.scheduler());
+  // Every channel completes on the context, not just the value one: an
+  // adaptor that wants to stay on this thread after an error has to be
+  // able to ask.
+  CHECK(ex::get_completion_scheduler<ex::set_value_t>(env) == ctx.scheduler());
+  CHECK(ex::get_completion_scheduler<ex::set_error_t>(env) == ctx.scheduler());
+  CHECK(ex::get_completion_scheduler<ex::set_stopped_t>(env) ==
+        ctx.scheduler());
 }
 
 TEST_CASE("then and let_value compose over the sender") {

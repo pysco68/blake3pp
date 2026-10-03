@@ -390,29 +390,6 @@ struct uring {
       throw_errno("io_uring_enter(wait)");
     }
   }
-
-  // Blocks for one completion and returns (user_data, result).
-  std::pair<std::uint64_t, int> wait_one() {
-    for (;;) {
-      const unsigned head = *cq_head;  // we are the only consumer
-      const unsigned tail =
-          std::atomic_ref<unsigned>(*cq_tail).load(std::memory_order_acquire);
-      if (head != tail) {
-        io_uring_cqe cqe{};
-        std::memcpy(&cqe, cqes + (head & *cq_mask) * sizeof(io_uring_cqe),
-                    sizeof(cqe));
-        const std::pair<std::uint64_t, int> out{cqe.user_data, cqe.res};
-        std::atomic_ref<unsigned>(*cq_head).store(head + 1,
-                                                  std::memory_order_release);
-        outstanding -= std::min(1u, outstanding);
-        return out;
-      }
-      if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
-          errno != EINTR) {
-        throw_errno("io_uring_enter(wait)");
-      }
-    }
-  }
 };
 
 // The io_uring reader context: one ring, any number of files, reads named
