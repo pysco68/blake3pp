@@ -675,7 +675,9 @@ class driver_loop {
   // windows reaches the OS in one call rather than one each.
   // The state that cannot resolve itself: about to sleep with no read
   // owed, nothing to run and nothing outstanding. Callers that know why
-  // it happened pass their own; this one at least names the state.
+  // it happened pass their own; this one at least names the state, and
+  // is the default for the overloads below that take none -- which is
+  // why it has no coverage: the cases using them never reach the state.
   [[noreturn]] static void stall() {
     throw std::logic_error(
         "blake3pp: the driver loop would block with no read in flight, an "
