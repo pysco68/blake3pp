@@ -1288,6 +1288,17 @@ class window_scope {
   window_scope(const window_scope&) = delete;
   window_scope& operator=(const window_scope&) = delete;
 
+  // Everything still borrowed goes back to the pool.
+  //
+  // The last window is held past the end of the run on purpose -- its
+  // tail is the message end, absorbed after every other window -- and a
+  // failed or stopped run may still hold whatever it had when it gave
+  // up. Nothing is in flight here: the run either ended with nothing
+  // outstanding or was quiesced, both of which are checked above this
+  // point. A pool that outlives the scope would otherwise lose a window
+  // per run, and with it eventually every window it has.
+  ~window_scope() { give_back_all(); }
+
   // The capacity the default storage has to clear, written from what the
   // scope actually reserves:
   //
@@ -1352,6 +1363,14 @@ class window_scope {
   // What the hasher already took -- the heads of the edge windows that
   // had landed -- stays.
   [[nodiscard]] outcome end(stop_watch& watch) {
+    // Whatever this run still holds goes back before it reports, on
+    // every path. Holding one window past the completion is what turns a
+    // shared pool into a deadlock: with more runs than windows, each
+    // would keep one and none could ever start.
+    struct give_back_guard {
+      window_scope* scope;
+      ~give_back_guard() { scope->give_back_all(); }
+    } const guard{this};
     // Nothing is in flight, so no stop can still be on its way into a
     // stage; the watch is done before anything is reported.
     watch.reset();
@@ -1398,6 +1417,29 @@ class window_scope {
   [[nodiscard]] std::exception_ptr exception() const noexcept {
     return eptr_;
   }
+
+  // What the loop reads to decide whether this run is over and whether
+  // anything is still owed. A caller driving several runs on one loop
+  // sums the second across them and ends when every first is set.
+  [[nodiscard]] const loop_status& status() const noexcept { return status_; }
+
+  // Waits out every window still in flight without running another
+  // round, for a caller whose round threw: the cells cannot be
+  // destroyed while a pool thread is about to publish into one.
+  void abandon() noexcept { quiesce(); }
+
+  // Asks this run to stop, from the driver thread.
+  void stop() noexcept { request_stop(); }
+
+  // Whether a stop has taken this run, for a caller reporting a run that
+  // never started.
+  [[nodiscard]] bool stopped() const noexcept {
+    return stopped_ || stop_requested();
+  }
+
+  // How many windows this run may hold at once, which is how many
+  // operation cells its caller has to provide.
+  [[nodiscard]] unsigned count() const noexcept { return count_; }
 
   // Drives the whole file on this thread and absorbs it into the hasher.
   //
@@ -1463,6 +1505,7 @@ class window_scope {
     }
   }
 
+ public:
   // One round's worth of starts: every window that may start, started
   // before the one flush that follows. The loop calls this once per
   // round, which is what lets several pipelines share a loop -- each is
@@ -1539,6 +1582,8 @@ class window_scope {
   // What the loop does when it would sleep with nothing owed: for one
   // pipeline that is a configuration it cannot run.
   void on_stall() const { this->report_stall(); }
+
+ private:
 
   // The stop path for a loop that can no longer be trusted to run.
   //
@@ -2087,6 +2132,26 @@ class window_scope {
         loop_.driver().cancel(w->op);
       }
     }
+  }
+
+  // Returns every window this scope still holds. Legal only with
+  // nothing in flight: the run either ended with nothing outstanding or
+  // was quiesced, both of which are established before this is reached.
+  //
+  // What is normally left here is the last window, which is held past
+  // the end of the run on purpose -- its tail is the message end,
+  // absorbed after every other window -- plus whatever a failed or
+  // stopped run still had when it gave up.
+  void give_back_all() noexcept {
+    while (taken_ != nullptr) {
+      window* const w = taken_;
+      taken_ = w->next_taken;
+      w->next_taken = nullptr;
+      w->reading = false;
+      w->rec = nullptr;
+      pool_.give_back(w);
+    }
+    last_window_ = nullptr;
   }
 
   void release(window& w) noexcept {
