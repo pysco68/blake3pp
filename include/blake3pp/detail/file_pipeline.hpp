@@ -1186,15 +1186,31 @@ class pipeline_host {
   window_pool<Budget> pool_;
 };
 
-template <class Scope>
+template <class Scope, class FullOp, class ReadOnlyOp, class EdgeOp>
 struct pipeline_cells;
+
+// What a caller of window_scope spells. The op types come from the
+// scope's own chain builders, and carrying them through the alias is
+// what keeps the instantiation internal to this translation unit.
+template <class Scope>
+using pipeline_cells_for = pipeline_cells<
+    Scope,
+    ex::connect_result_t<decltype(std::declval<Scope&>().window_chain(
+                             std::declval<typename Scope::window&>())),
+                         typename Scope::scope_receiver>,
+    ex::connect_result_t<decltype(std::declval<Scope&>().read_only_chain(
+                             std::declval<typename Scope::window&>())),
+                         typename Scope::scope_receiver>,
+    ex::connect_result_t<decltype(std::declval<Scope&>().edge_chain(
+                             std::declval<typename Scope::window&>())),
+                         typename Scope::scope_receiver>>;
 
 template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
 class window_scope {
   // The cell store is built outside this class, because the cell types
   // are the return types of the chain builders below and those are only
   // nameable once the class is complete.
-  template <class Scope>
+  template <class Scope, class FullOp, class ReadOnlyOp, class EdgeOp>
   friend struct pipeline_cells;
 
  public:
@@ -1459,7 +1475,7 @@ class window_scope {
     // would destroy them while a window can still be on the pool, about
     // to publish into one. The handler waits those windows out first;
     // the cells are still alive inside it.
-    pipeline_cells<window_scope> cells(count_);
+    pipeline_cells_for<window_scope> cells(count_);
     try {
       loop_.run_until(
           status_, [&] { admit_round(cells); }, [this] { on_stall(); });
@@ -1654,6 +1670,13 @@ class window_scope {
   // what fold_aligned_runs asserts against.
   static constexpr std::size_t edge_node_cap = 2 * 54;
 
+ public:
+  // The three chain builders, the receiver they complete and the
+  // environment they carry are public because the cell store that
+  // connects them lives outside this class: the cell types are these
+  // builders' return types, which cannot be named until the class is
+  // complete.
+
   // What every stage below the scope reads the scope's stop from. The
   // adaptors forward it down the chain, which the conformance cases in
   // tests/file_pipeline.cpp check on both providers.
@@ -1741,6 +1764,8 @@ class window_scope {
           insert_edge_nodes(w, nodes);
         });
   }
+
+ private:
 
   // The bytes an edge window owes the hasher before anything else can
   // reach it. Safe at any point before drain_into, because no reducer
@@ -2288,20 +2313,23 @@ class window_scope {
 // class is complete. Whoever drives a run owns one of these and must
 // keep it alive until nothing is in flight: a window on the pool is
 // about to publish into a cell.
-template <class Scope>
+//
+// The three operation types are template parameters, not member aliases.
+// A provider's sender types have INTERNAL linkage (stdexec defines __sexpr
+// inside an anonymous namespace), so naming them here gives this template
+// internal linkage too and every translation unit gets its own.
+//
+// Parameterised on Scope alone it would have external linkage while its
+// members differed per translation unit, and the linker would then let
+// one unit's destructor run over another's object -- which the
+// sanitizer lane reports as a vptr mismatch, correctly.
+template <class Scope, class FullOp, class ReadOnlyOp, class EdgeOp>
 struct pipeline_cells {
   using window = typename Scope::window;
   using receiver = typename Scope::scope_receiver;
-  using full_op = ex::connect_result_t<
-      decltype(std::declval<Scope&>().window_chain(std::declval<window&>())),
-      receiver>;
-  using read_only_op = ex::connect_result_t<
-      decltype(std::declval<Scope&>().read_only_chain(
-          std::declval<window&>())),
-      receiver>;
-  using edge_op = ex::connect_result_t<
-      decltype(std::declval<Scope&>().edge_chain(std::declval<window&>())),
-      receiver>;
+  using full_op = FullOp;
+  using read_only_op = ReadOnlyOp;
+  using edge_op = EdgeOp;
 
   explicit pipeline_cells(unsigned count)
       : full(std::make_unique<std::optional<full_op>[]>(count)) {}

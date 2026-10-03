@@ -309,7 +309,7 @@ class update_file_op final : public pipeline_node {
   using operation_state_concept = blake3pp::detail::ex_compat::operation_state_tag;
   using scope_type =
       blake3pp::detail::window_scope<false, Budget, io_driver, Sched>;
-  using cells_type = blake3pp::detail::pipeline_cells<scope_type>;
+  using cells_type = blake3pp::detail::pipeline_cells_for<scope_type>;
 
   // Over a hasher the caller owns: it must outlive the operation, and
   // nothing else may touch it while this runs.
