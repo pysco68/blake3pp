@@ -1186,8 +1186,18 @@ class pipeline_host {
   window_pool<Budget> pool_;
 };
 
+template <class Scope>
+struct pipeline_cells;
+
 template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
 class window_scope {
+  // The cell store is built outside this class, because the cell types
+  // are the return types of the chain builders below and those are only
+  // nameable once the class is complete.
+  template <class Scope>
+  friend struct pipeline_cells;
+
+ public:
  public:
   using cv_type = std::array<std::uint32_t, 8>;
   // The window objects are the pool's; the scope only borrows them.
@@ -1403,68 +1413,14 @@ class window_scope {
       throw_if_stopped();
       return;
     }
-    // The operation cells: fixed storage for one connected chain per
-    // window, re-emplaced per use. optional does the destroy-then-construct
-    // and the conversion functions below do the construct-in-place, which
-    // is what lets an immovable operation state live in a container.
-    using full_op = ex::connect_result_t<
-        decltype(std::declval<window_scope&>().window_chain(
-            std::declval<window&>())),
-        scope_receiver>;
-    using read_only_op = ex::connect_result_t<
-        decltype(std::declval<window_scope&>().read_only_chain(
-            std::declval<window&>())),
-        scope_receiver>;
-    using edge_op = ex::connect_result_t<
-        decltype(std::declval<window_scope&>().edge_chain(
-            std::declval<window&>())),
-        scope_receiver>;
-
-    struct connect_full {
-      window_scope* scope;
-      window* w;
-      operator full_op() const {
-        return ex::connect(scope->window_chain(*w), scope_receiver{scope, w});
-      }
-    };
-    struct connect_read {
-      window_scope* scope;
-      window* w;
-      operator read_only_op() const {
-        return ex::connect(scope->read_only_chain(*w),
-                           scope_receiver{scope, w});
-      }
-    };
-    struct connect_edge {
-      window_scope* scope;
-      window* w;
-      operator edge_op() const {
-        return ex::connect(scope->edge_chain(*w), scope_receiver{scope, w});
-      }
-    };
-
-    auto cells = std::make_unique<std::optional<full_op>[]>(count_);
-    // One cell of each shape per edge window: the first and the last can
-    // be in flight together on a file of three windows, and either may
-    // turn out to have no parts worth fanning out.
-    std::optional<edge_op> first_edge_cell;
-    std::optional<read_only_op> first_read_cell;
-    std::optional<edge_op> last_edge_cell;
-    std::optional<read_only_op> last_read_cell;
-
-    // The cells are locals, so an exception leaving run_until would
-    // destroy them while a window can still be on the pool, about to
-    // publish into one. The handler waits those windows out first; the
-    // cells are still alive inside it.
+    // The operation cells are a local, so an exception leaving run_until
+    // would destroy them while a window can still be on the pool, about
+    // to publish into one. The handler waits those windows out first;
+    // the cells are still alive inside it.
+    pipeline_cells<window_scope> cells(count_);
     try {
       loop_.run_until(
-          status_,
-          [&] {
-            admit_round(cells, first_edge_cell, first_read_cell,
-                        last_edge_cell, last_read_cell, connect_full{},
-                        connect_read{}, connect_edge{});
-          },
-          [this] { on_stall(); });
+          status_, [&] { admit_round(cells); }, [this] { on_stall(); });
     } catch (...) {
       quiesce();
       throw;
@@ -1514,12 +1470,8 @@ class window_scope {
   //
   // The cell types and the conversion functions that fill them are
   // run()'s locals, which is why they arrive as template parameters.
-  template <class Cells, class EdgeCell, class ReadCell, class ConnectFull,
-            class ConnectRead, class ConnectEdge>
-  void admit_round(Cells& cells, EdgeCell& first_edge_cell,
-                   ReadCell& first_read_cell, EdgeCell& last_edge_cell,
-                   ReadCell& last_read_cell, ConnectFull, ConnectRead,
-                   ConnectEdge) {
+  template <class Cells>
+  void admit_round(Cells& cells) {
     {
       if (stop_requested()) {
         sweep_cancels();
@@ -1562,18 +1514,18 @@ class window_scope {
         }
         if (!w->last && !w->short_first) {
           prepare_compress(*w);
-          cells[w->cell].emplace(ConnectFull{this, w});
-          ex::start(*cells[w->cell]);
+          cells.full[w->cell].emplace(typename Cells::connect_full{this, w});
+          ex::start(*cells.full[w->cell]);
         } else if (w->plan.parts >= 2) {
           // An edge window: the short first one or the last one, each
           // with its own cell, since a three-window file has both in
           // flight at once.
-          auto& cell = w->last ? last_edge_cell : first_edge_cell;
-          cell.emplace(ConnectEdge{this, w});
+          auto& cell = w->last ? cells.last_edge : cells.first_edge;
+          cell.emplace(typename Cells::connect_edge{this, w});
           ex::start(*cell);
         } else {
-          auto& cell = w->last ? last_read_cell : first_read_cell;
-          cell.emplace(ConnectRead{this, w});
+          auto& cell = w->last ? cells.last_read : cells.first_read;
+          cell.emplace(typename Cells::connect_read{this, w});
           ex::start(*cell);
         }
       }
@@ -2258,6 +2210,70 @@ class window_scope {
   std::uint64_t dropped_failures_ = 0;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
+};
+
+// The connected chains of one run: one cell per window the scope may
+// hold at once, plus one of each edge shape, re-emplaced per use.
+// optional does the destroy-then-construct and the conversion functions
+// do the construct-in-place, which is what lets an immovable operation
+// state live in a container.
+//
+// It lives outside window_scope because the cell types are the return
+// types of that class's chain builders, which cannot be named until the
+// class is complete. Whoever drives a run owns one of these and must
+// keep it alive until nothing is in flight: a window on the pool is
+// about to publish into a cell.
+template <class Scope>
+struct pipeline_cells {
+  using window = typename Scope::window;
+  using receiver = typename Scope::scope_receiver;
+  using full_op = ex::connect_result_t<
+      decltype(std::declval<Scope&>().window_chain(std::declval<window&>())),
+      receiver>;
+  using read_only_op = ex::connect_result_t<
+      decltype(std::declval<Scope&>().read_only_chain(
+          std::declval<window&>())),
+      receiver>;
+  using edge_op = ex::connect_result_t<
+      decltype(std::declval<Scope&>().edge_chain(std::declval<window&>())),
+      receiver>;
+
+  explicit pipeline_cells(unsigned count)
+      : full(std::make_unique<std::optional<full_op>[]>(count)) {}
+
+  pipeline_cells(const pipeline_cells&) = delete;
+  pipeline_cells& operator=(const pipeline_cells&) = delete;
+
+  struct connect_full {
+    Scope* scope;
+    window* w;
+    operator full_op() const {
+      return ex::connect(scope->window_chain(*w), receiver{scope, w});
+    }
+  };
+  struct connect_read {
+    Scope* scope;
+    window* w;
+    operator read_only_op() const {
+      return ex::connect(scope->read_only_chain(*w), receiver{scope, w});
+    }
+  };
+  struct connect_edge {
+    Scope* scope;
+    window* w;
+    operator edge_op() const {
+      return ex::connect(scope->edge_chain(*w), receiver{scope, w});
+    }
+  };
+
+  std::unique_ptr<std::optional<full_op>[]> full;
+  // One cell of each shape per edge window: the first and the last can
+  // be in flight together on a file of three windows, and either may
+  // turn out to have no parts worth fanning out.
+  std::optional<edge_op> first_edge;
+  std::optional<read_only_op> first_read;
+  std::optional<edge_op> last_edge;
+  std::optional<read_only_op> last_read;
 };
 
 // Runs one open file through the pipeline on the calling thread.
