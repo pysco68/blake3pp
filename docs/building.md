@@ -44,6 +44,31 @@ recipes are in `docker/README.md` too. Two kernel sets are opt-in:
   XTheadVector (draft RVV 0.7.1) kernel, which only T-Head's qemu fork
   can execute
 
+## Coverage
+
+The `linux-clang22-cxx26-coverage` preset instruments at the plain
+matrix's optimisation level, so the numbers describe the code that
+ships:
+
+```bash
+tools/tc linux-clang22-cxx26 -- bash -c '
+  cmake --preset linux-clang22-cxx26-coverage &&
+  cmake --build --preset linux-clang22-cxx26-coverage &&
+  LLVM_PROFILE_FILE="$PWD/build/linux-clang22-cxx26-coverage/profraw/%p.profraw" \
+    ctest --test-dir build/linux-clang22-cxx26-coverage'
+llvm-profdata merge -sparse build/linux-clang22-cxx26-coverage/profraw/*.profraw \
+  -o build/linux-clang22-cxx26-coverage/all.profdata
+llvm-cov report build/linux-clang22-cxx26-coverage/tests/blake3pp_tests \
+  -instr-profile=build/linux-clang22-cxx26-coverage/all.profdata src/io include
+```
+
+If an LLVM tool sits there burning no CPU, it is waiting on a
+descriptor, not working: the base image sets `DEBUGINFOD_URLS` to
+Canonical's server, the connect never completes from here, and the tool
+polls for it for ever. The devcontainer sets the variable empty for that
+reason; outside it, put `env -u DEBUGINFOD_URLS` in front of the
+command.
+
 ## Building through cmake-re
 
 Every containerized preset also builds through [tipi cmake-re]. It runs
