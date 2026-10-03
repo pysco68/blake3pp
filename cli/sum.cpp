@@ -114,6 +114,45 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
   throw std::runtime_error("key must be exactly 32 raw bytes or 64 hex characters");
 }
 
+// One file's outcome: a digest, or why there is none.
+struct result {
+  std::string hex;
+  std::string error;
+};
+
+// The hasher one file streams into, and where its result goes.
+struct slot {
+  blake3pp::hasher h;
+  result* out = nullptr;
+  std::size_t len = 0;
+};
+
+// Writes the result and nothing else: it runs inside the context's loop,
+// and starting the next file from there would destroy an operation state
+// from inside its own completion.
+struct file_receiver {
+  using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
+  slot* s;
+  void set_value() const noexcept {
+    std::vector<std::byte> out(s->len);
+    s->h.finalize(out);
+    s->out->hex = blake3pp::to_hex(out);
+  }
+  void set_error(std::error_code ec) const noexcept {
+    s->out->error = ec.message();
+  }
+  void set_error(std::exception_ptr e) const noexcept {
+    try {
+      std::rethrow_exception(e);
+    } catch (const std::exception& ex) {
+      s->out->error = ex.what();
+    } catch (...) {
+      s->out->error = "unknown failure";
+    }
+  }
+  void set_stopped() const noexcept { s->out->error = "cancelled"; }
+};
+
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
@@ -172,11 +211,6 @@ class engine {
   // Results come back in input order, which is what the output has to
   // be, and a file that fails carries its message instead of a digest so
   // one bad file does not end the run.
-  struct result {
-    std::string hex;
-    std::string error;
-  };
-
   std::vector<result> hash_many(const std::vector<std::string>& files,
                                 std::size_t out_len) {
     // The arena is a byte budget rather than a window count, because the
@@ -198,41 +232,10 @@ class engine {
                                      .direct_io = opts_.io.direct_io,
                                      .offload_submit = opts_.io.offload_submit});
 
-    struct slot {
-      blake3pp::hasher h;
-      result* out = nullptr;
-      std::size_t len = 0;
-    };
-    // The receiver writes the result and nothing else: it runs inside
-    // the context's loop, and starting the next file from there would
-    // destroy an operation state from inside its own completion.
-    struct receiver {
-      using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
-      slot* s;
-      void set_value() const noexcept {
-        std::vector<std::byte> out(s->len);
-        s->h.finalize(out);
-        s->out->hex = blake3pp::to_hex(out);
-      }
-      void set_error(std::error_code ec) const noexcept {
-        s->out->error = ec.message();
-      }
-      void set_error(std::exception_ptr e) const noexcept {
-        try {
-          std::rethrow_exception(e);
-        } catch (const std::exception& ex) {
-          s->out->error = ex.what();
-        } catch (...) {
-          s->out->error = "unknown failure";
-        }
-      }
-      void set_stopped() const noexcept { s->out->error = "cancelled"; }
-    };
-
     using sender_t = decltype(blake3pp::async::async_update_file(
         ctx, std::declval<blake3pp::hasher&>(), std::string{},
         pool_.scheduler(), opts_.io));
-    using op_t = blake3pp::ex::connect_result_t<sender_t, receiver>;
+    using op_t = blake3pp::ex::connect_result_t<sender_t, file_receiver>;
     struct make_op {
       blake3pp::async::io_context* ctx;
       slot* s;
@@ -242,7 +245,7 @@ class engine {
       operator op_t() const {
         return blake3pp::ex::connect(
             blake3pp::async::async_update_file(*ctx, s->h, *path, sched, io),
-            receiver{s});
+            file_receiver{s});
       }
     };
 
