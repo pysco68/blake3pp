@@ -7,7 +7,7 @@
 // pimpl, and memory_driver, a span the pipeline reads views out of.
 // Neither is named here on purpose -- a caller that only wants the
 // in-memory path must not pull in the file I/O layer to get the concept,
-// and Phase 7's public context has to host both without preferring one.
+// and the async context hosts both without preferring one.
 //
 // Internal to the library. Standard library only, and no execution
 // provider: the concept is about reads, not about senders.

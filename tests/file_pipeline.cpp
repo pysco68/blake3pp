@@ -1027,8 +1027,8 @@ TEST_CASE("the four-line window chain composes on this provider") {
 
   // The shape of the real window chain, with a stand-in for the compress
   // stage: read on the driver, work on the pool, back on the driver.
-  // Phase 4 replaces only the middle line, so this is the case that says
-  // whether the shape itself holds on this provider.
+  // Only the middle line differs from the real thing, so this is the
+  // case that says whether the shape itself holds on this provider.
   auto sched = blake3pp::get_parallel_scheduler();
   const auto here = std::this_thread::get_id();
   std::atomic<bool> summed_elsewhere{false};
@@ -1500,8 +1500,9 @@ TEST_CASE("a stop requested from another thread reaches a parked driver") {
   CHECK(drv.in_flight() == 0);
 }
 
-// The blocking entry point has no stop parameter until Phase 7, so the
-// only way into its stop path is the seam the test target compiles.
+// The blocking entry points take no stop token -- async_io.hpp is where
+// a caller brings one -- so the only way into their stop path is the
+// seam the test target compiles.
 // What it has to prove is the mapping and the aftermath: one
 // operation_canceled, and a hasher that is still a hasher.
 // The real driver, with reads genuinely on the ring. The buffer arena

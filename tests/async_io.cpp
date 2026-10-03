@@ -3,7 +3,7 @@
 //
 // What these check that the blocking suites cannot: that several files
 // share one arena and one thread, that a receiver's stop reaches the
-// pipeline through the seam Phase 5 built, and that the four completion
+// pipeline through the scope's stop seam, and that the four completion
 // signals are the only way an operation ever ends.
 
 #include <array>
