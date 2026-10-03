@@ -257,6 +257,34 @@ TEST_CASE("then and let_value compose over the sender") {
   CHECK(rec.values == 1);
 }
 
+TEST_CASE("when_all over two files completes once with both digests") {
+  const auto a = pattern(2 * 64 * 1024 + 11, 30);
+  const auto b = pattern(3 * 64 * 1024 + 22, 31);
+  const temp_file fa(a);
+  const temp_file fb(b);
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+
+  blake3pp::digest ga{};
+  blake3pp::digest gb{};
+  record rec;
+  auto work = ex::then(
+      ex::when_all(async::async_hash_file(ctx, fa.path(), sched),
+                   async::async_hash_file(ctx, fb.path(), sched)),
+      [&](blake3pp::digest da, blake3pp::digest db) noexcept {
+        ga = da;
+        gb = db;
+      });
+  auto op = ex::connect(std::move(work), move_only_receiver{&rec});
+  ex::start(op);
+  ctx.run_until_idle();
+  CHECK(rec.total() == 1);
+  CHECK(rec.values == 1);
+  CHECK(ga == blake3pp::hash(a));
+  CHECK(gb == blake3pp::hash(b));
+}
+
 TEST_CASE("several files run on one context at once") {
   // Four files, two windows: the pool runs out, and a pipeline that
   // finds none resumes when another gives one back.
