@@ -1158,6 +1158,24 @@ void run_scope(Scope& scope) {
   scope.run();
 }
 
+// A scope and the pool it borrows windows from, paired the way a
+// blocking entry point pairs them: the pool is sized from the same plan
+// the scope runs.
+template <class Scope, class D, class Sched>
+struct pooled_scope {
+  pooled_scope(blake3pp::hasher& h, D& drv, typename D::file& f, Sched sched,
+               const blake3pp::detail::pipeline_options& opts)
+      : plan(blake3pp::detail::plan_pipeline(h.count(), opts.window_bytes,
+                                             opts.queue_depth, false,
+                                             f.size())),
+        pool(drv, plan.windows, plan.window_bytes),
+        scope(h, drv, pool, f, std::move(sched), plan, opts) {}
+
+  blake3pp::detail::pipeline_plan plan;
+  blake3pp::detail::window_pool<blake3pp::default_stack_budget> pool;
+  Scope scope;
+};
+
 TEST_CASE("sibling windows the reducer cannot hold still finish") {
   // The liveness case admission control exists for. Were the reducer to
   // refuse inserts and the scope retry them, two windows refused one
@@ -1182,13 +1200,13 @@ TEST_CASE("sibling windows the reducer cannot hold still finish") {
   // the decomposition of its own three parts, four more. Below the sum
   // the scope stalls by construction, which is what the assert in the
   // start hook says.
-  scope_type scope(h, drv, f, sched,
+  pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 8,
                     .trace = nullptr,
                     .in_flight_cap = 0,
                     .reducer_capacity = 8});
-  run_scope(scope);
+  run_scope(ps.scope);
   CHECK(h.finalize() == blake3pp::hash(content));
 }
 
@@ -1209,16 +1227,16 @@ TEST_CASE("admission throttles starts instead of refusing an insert") {
   fake_driver::file f(drv);
   auto sched = blake3pp::get_parallel_scheduler();
   blake3pp::hasher h;
-  scope_type scope(h, drv, f, sched,
+  pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 8,
                     .trace = nullptr,
                     .in_flight_cap = 0,
                     .reducer_capacity = 8});
-  run_scope(scope);
+  run_scope(ps.scope);
   CHECK(h.finalize() == blake3pp::hash(content));
   // The scope held windows back, so the reducer refused none.
-  CHECK(scope.admission_stalls() > 0);
+  CHECK(ps.scope.admission_stalls() > 0);
 }
 
 TEST_CASE("the full reducer capacity never throttles a normal run") {
@@ -1234,11 +1252,11 @@ TEST_CASE("the full reducer capacity never throttles a normal run") {
   fake_driver::file f(drv);
   auto sched = blake3pp::get_parallel_scheduler();
   blake3pp::hasher h;
-  scope_type scope(h, drv, f, sched,
+  pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win, .queue_depth = 8});
-  run_scope(scope);
+  run_scope(ps.scope);
   CHECK(h.finalize() == blake3pp::hash(content));
-  CHECK(scope.admission_stalls() == 0);
+  CHECK(ps.scope.admission_stalls() == 0);
 }
 
 // Runs a file through the pipeline over the fake driver, with whatever
@@ -2009,13 +2027,13 @@ TEST_CASE("a last window with many parts never refuses an insert") {
   blake3pp::hasher h;
   // Just above what this file needs: three nodes for a run of three
   // windows, plus the last window's own reservation.
-  scope_type scope(h, drv, f, sched,
+  pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 4,
                     .trace = nullptr,
                     .in_flight_cap = 0,
                     .reducer_capacity = 12});
-  scope.run();
+  ps.scope.run();
   CHECK(h.finalize() == blake3pp::hash(content));
 }
 
@@ -2037,13 +2055,13 @@ TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
   blake3pp::hasher h;
   // Two nodes cannot hold the three a run of seven windows leaves, let
   // alone the last window's reservation on top.
-  scope_type scope(h, drv, f, sched,
+  pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 8,
                     .trace = nullptr,
                     .in_flight_cap = 0,
                     .reducer_capacity = 2});
-  CHECK_THROWS_AS(scope.run(), std::logic_error);
+  CHECK_THROWS_AS(ps.scope.run(), std::logic_error);
 }
 
 // The window count is arithmetic over four inputs, so it is checked as

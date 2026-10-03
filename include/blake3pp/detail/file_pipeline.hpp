@@ -990,38 +990,106 @@ struct pipeline_plan {
 // separate on purpose: the device wants a few reads in flight, the pool
 // wants windows to work on, and one number cannot serve both. The
 // reducer is what lets them finish in any order.
-template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
-class window_scope {
- public:
-  using cv_type = std::array<std::uint32_t, 8>;
+// How a window is split three ways. `head` is absorbed by the hasher
+// on the driver the moment the read lands, `parts` full parts go to
+// the pool and come back as nodes, and `tail` waits for the reducer to
+// drain. A full window is all parts and no ends. Decided by
+// plan_window() from the geometry, with nothing else touched, which is
+// what lets admission cost a window that has not been built.
+struct window_plan {
+  std::uint64_t first_chunk = 0;  // where its contribution to the tree starts
+  std::size_t head_bytes = 0;
+  std::size_t tail_bytes = 0;
+  std::size_t parts = 0;
+  std::size_t part_chunks = 0;
+  std::size_t node_cost = 1;   // reducer slots admission reserves
+  unsigned edge_slot = 0;      // which node buffer an edge window uses
+};
+static_assert(std::is_trivially_copyable_v<window_plan>);
 
-  window_scope(hasher& h, D& drv, typename D::file& file, Scheduler sched,
-               const pipeline_plan& plan, const pipeline_options& opts)
-      : h_(h),
-        loop_(drv),
-        file_(file),
-        sched_(std::move(sched)),
-        trace_(opts.trace),
-        ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
-        window_bytes_(plan.window_bytes),
-        count_(plan.windows),
-        reads_in_flight_(plan.reads_in_flight),
-        in_flight_cap_(opts.in_flight_cap == 0
-                           ? count_
-                           : std::min<unsigned>(opts.in_flight_cap, count_)),
-        base_count_(h.count()),
-        head_window_bytes_(plan.head_bytes),
-        ends_message_(plan.ends_message),
-        base_chunk_((h.count() + head_window_bytes_) / chunk_size),
-        file_bytes_(file.size()),
-        reducer_capacity_(opts.reducer_capacity == 0
-                              ? reducer_nodes
-                              : std::min(opts.reducer_capacity, reducer_nodes)),
-        opts_stop_token_(opts.stop_token),
-        windows_(std::make_unique<window[]>(count_)),
-        nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
-        reducer_(ops_, h.key_words(), h.mode_flags(),
-                 std::span<tree_reducer::node>(nodes_.get(), reducer_nodes)) {
+
+// One window of a run: where its bytes are, the part table its compress
+// stage fills, and the read operation the driver owes. Allocated by the
+// pool rather than the scope, so a context can hold one set of these
+// and lend them to whichever pipeline is running.
+template <stack_budget Budget>
+struct pipeline_window {
+  // Where this window's bytes live, as the driver says: what the read
+  // fills, and what the pipeline reads back. For an arena the two name
+  // the same bytes; for a source already in memory the first is empty,
+  // because there is nothing to move.
+  std::span<std::byte> read_into;
+  std::span<const std::byte> bytes_view;
+  // Whether bytes_view's CONTENT is defined yet. Set when the read
+  // completes, cleared when the window is taken for the next one: an
+  // arena window names its slice from the moment it is taken, and what
+  // is in it belongs to the driver until poll() says otherwise.
+  bool view_ready = false;
+  window_compress<Budget> compress;
+  std::uint64_t index = 0;
+  std::uint64_t offset = 0;
+  std::uint64_t chunks = 0;
+  std::size_t bytes = 0;
+  window_record* rec = nullptr;
+  // The pool's free list and the scope's list of what it currently
+  // holds. A window is on exactly one of them, never both.
+  pipeline_window* next_free = nullptr;
+  pipeline_window* next_taken = nullptr;
+  unsigned slot = 0;      // which window of the pool this is
+  unsigned cell = 0;      // which operation cell of the borrowing scope
+  bool last = false;
+  bool short_first = false;
+  bool reading = false;      // submitted, and the read has not landed
+  bool cancel_asked = false;  // the sweep has already asked for this read
+  window_plan plan;
+  std::size_t nodes = 0;  // nodes the fold produced
+
+  // Where this window's bytes are, which is settled when the window is
+  // taken. Only the ADDRESS is: use this to record where a later stage
+  // will read, never to read now.
+  [[nodiscard]] const std::byte* at() const noexcept {
+    return bytes_view.data();
+  }
+
+  // The window's bytes themselves, for everything that compresses or
+  // absorbs them. The assert is the contract the arena needs and the
+  // in-memory source satisfies trivially; it is live in the sanitizer
+  // lanes.
+  [[nodiscard]] std::span<const std::byte> view() const noexcept {
+    assert(view_ready &&
+           "a window's bytes are only defined once its read has "
+           "completed: the view names the storage from the moment the "
+           "window is taken, the content arrives in poll()");
+    return bytes_view;
+  }
+  // The read's operation, alive for as long as the window object: the
+  // driver may still owe this read after the chain's cell is gone, and
+  // the stop sweep names it from here. Last, so that adding it left
+  // the offsets of everything the agents touch where they were.
+  io_read_op op{};
+};
+
+// The window storage of a run: the driver's arena, the window objects
+// over it and their part tables, allocated and faulted once. A scope
+// borrows windows from here and gives them back; the pool never gives
+// out the same window twice.
+//
+// It is separate from the scope because the storage outlives any one
+// run: a context holds one pool and lends it to whichever pipeline is
+// running, so several files can share an arena instead of each faulting
+// in its own.
+template <stack_budget Budget>
+class window_pool {
+ public:
+  using window = pipeline_window<Budget>;
+
+  // The arena is the driver's, so that it outlives every read the
+  // teardown has to drain; the window objects are this pool's.
+  template <file_driver D>
+  window_pool(D& drv, unsigned windows, std::size_t window_bytes)
+      : count_(windows),
+        window_bytes_(window_bytes),
+        windows_(std::make_unique<window[]>(windows)) {
     // The window objects above are value-initialised, and the fold of a
     // stopped compress stage depends on it: the agents stop claiming
     // parts where the stop found them, and the fold still reads every
@@ -1049,29 +1117,112 @@ class window_scope {
         }(),
         "a window's part table must value-initialise to zero: the fold "
         "of a stopped compress stage reads part slots no agent claimed");
+    drv.reserve(count_, window_bytes_);
+    for (unsigned i = count_; i > 0; --i) {
+      windows_[i - 1].slot = i - 1;
+      push_free(&windows_[i - 1]);
+    }
+  }
 
-    // The run's window memory, taken once and owned by the driver so
-    // that it outlives every read the teardown has to drain. Where each
-    // window's bytes actually are is the driver's answer, and it is
-    // asked per window, because a source already in memory has a
+  window_pool(const window_pool&) = delete;
+  window_pool& operator=(const window_pool&) = delete;
+
+  [[nodiscard]] unsigned count() const noexcept { return count_; }
+  [[nodiscard]] std::size_t window_bytes() const noexcept {
+    return window_bytes_;
+  }
+  [[nodiscard]] bool empty() const noexcept { return free_ == nullptr; }
+
+  // The next free window, or null when every one is lent out. Borrowing
+  // is the admission point a scope stalls on.
+  [[nodiscard]] window* take() noexcept {
+    window* const w = free_;
+    if (w != nullptr) {
+      free_ = w->next_free;
+      w->next_free = nullptr;
+    }
+    return w;
+  }
+
+  void give_back(window* w) noexcept { push_free(w); }
+
+ private:
+  void push_free(window* w) noexcept {
+    w->next_free = free_;
+    free_ = w;
+  }
+
+  unsigned count_ = 0;
+  std::size_t window_bytes_ = 0;
+  std::unique_ptr<window[]> windows_;
+  window* free_ = nullptr;
+};
+
+template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
+class window_scope {
+ public:
+  using cv_type = std::array<std::uint32_t, 8>;
+  // The window objects are the pool's; the scope only borrows them.
+  using window = pipeline_window<Budget>;
+
+  // The pool is the caller's: a blocking entry point builds one beside
+  // the scope, a context keeps one and lends it to every pipeline it
+  // runs. Either way it outlives the scope, because a read the teardown
+  // drains is still targeting its arena.
+  window_scope(hasher& h, D& drv, window_pool<Budget>& pool,
+               typename D::file& file, Scheduler sched,
+               const pipeline_plan& plan, const pipeline_options& opts)
+      : h_(h),
+        loop_(drv),
+        pool_(pool),
+        file_(file),
+        sched_(std::move(sched)),
+        trace_(opts.trace),
+        ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
+        window_bytes_(plan.window_bytes),
+        count_(std::min(plan.windows, pool.count())),
+        reads_in_flight_(plan.reads_in_flight),
+        in_flight_cap_(opts.in_flight_cap == 0
+                           ? count_
+                           : std::min<unsigned>(opts.in_flight_cap, count_)),
+        base_count_(h.count()),
+        head_window_bytes_(plan.head_bytes),
+        ends_message_(plan.ends_message),
+        base_chunk_((h.count() + head_window_bytes_) / chunk_size),
+        file_bytes_(file.size()),
+        reducer_capacity_(opts.reducer_capacity == 0
+                              ? reducer_nodes
+                              : std::min(opts.reducer_capacity, reducer_nodes)),
+        opts_stop_token_(opts.stop_token),
+        nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
+        reducer_(ops_, h.key_words(), h.mode_flags(),
+                 std::span<tree_reducer::node>(nodes_.get(), reducer_nodes)) {
+    // Where each window's bytes actually are is the driver's answer, and
+    // it is asked per window, because a source already in memory has a
     // different view for every offset.
     assert((ends_message_ || file_bytes_ % window_bytes_ == 0) &&
            "a span that does not end the message must be a whole number "
            "of windows: a partial one cannot be absorbed as a subtree");
-    drv.reserve(count_, window_bytes_);
+    assert(pool.window_bytes() >= window_bytes_ &&
+           "the pool's windows are smaller than this run plans to read");
     loop_.record_into(trace_);
-    for (unsigned i = count_; i > 0; --i) {
-      window& w = windows_[i - 1];
-      w.slot = i - 1;
-      push_free(&w);
+    // One operation cell per window this run may hold at once. The cells
+    // are the scope's; the windows are not, so a borrowed window carries
+    // the index of the cell it was lent with. Handed out lowest first,
+    // which keeps a run that never fills the pool on the same few cells.
+    free_cells_ = std::make_unique<unsigned[]>(count_);
+    for (unsigned i = 0; i < count_; ++i) {
+      free_cells_[i] = count_ - 1 - i;
     }
+    free_cell_count_ = count_;
   }
 
   // Over a file the caller opened itself, planned from the requests in
   // opts; what the tests construct directly.
-  window_scope(hasher& h, D& drv, typename D::file& file, Scheduler sched,
+  window_scope(hasher& h, D& drv, window_pool<Budget>& pool,
+               typename D::file& file, Scheduler sched,
                const pipeline_options& opts)
-      : window_scope(h, drv, file, std::move(sched),
+      : window_scope(h, drv, pool, file, std::move(sched),
                      plan_pipeline(h.count(), opts.window_bytes,
                                    opts.queue_depth, false, file.size()),
                      opts) {}
@@ -1291,8 +1442,11 @@ class window_scope {
       // A window holds a read slot from its submit until its read lands,
       // and a buffer until it has been reduced; the device is fed by the
       // first bound and the pool by the second.
+      // `pool_.empty()` is the fourth wait condition: with several
+      // pipelines on one context the windows may all be lent out, and
+      // this one resumes when any of them gives one back.
       while (!stop_requested() && in_flight_ < in_flight_cap_ &&
-             reading_ < reads_in_flight_ && free_ != nullptr) {
+             reading_ < reads_in_flight_ && !pool_.empty()) {
         if (next_offset_ >= file_bytes_) {
           break;
         }
@@ -1303,9 +1457,11 @@ class window_scope {
         if (!admit_more(cost)) {
           break;
         }
-        window* const w = free_;
+        window* const w = pool_.take();
+        w->cell = free_cells_[--free_cell_count_];
+        w->next_taken = taken_;
+        taken_ = w;
         take_next(*w);
-        free_ = w->next_free;
         claim_record(*w);
         ++in_flight_;
         w->reading = true;
@@ -1319,8 +1475,8 @@ class window_scope {
         }
         if (!w->last && !w->short_first) {
           prepare_compress(*w);
-          cells[w->slot].emplace(ConnectFull{this, w});
-          ex::start(*cells[w->slot]);
+          cells[w->cell].emplace(ConnectFull{this, w});
+          ex::start(*cells[w->cell]);
         } else if (w->plan.parts >= 2) {
           // An edge window: the short first one or the last one, each
           // with its own cell, since a three-window file has both in
@@ -1404,74 +1560,7 @@ class window_scope {
     bool short_first = false;
   };
 
-  // How a window is split three ways. `head` is absorbed by the hasher
-  // on the driver the moment the read lands, `parts` full parts go to
-  // the pool and come back as nodes, and `tail` waits for the reducer to
-  // drain. A full window is all parts and no ends. Decided by
-  // plan_window() from the geometry, with nothing else touched, which is
-  // what lets admission cost a window that has not been built.
-  struct window_plan {
-    std::uint64_t first_chunk = 0;  // where its contribution to the tree starts
-    std::size_t head_bytes = 0;
-    std::size_t tail_bytes = 0;
-    std::size_t parts = 0;
-    std::size_t part_chunks = 0;
-    std::size_t node_cost = 1;   // reducer slots admission reserves
-    unsigned edge_slot = 0;      // which node buffer an edge window uses
-  };
-  static_assert(std::is_trivially_copyable_v<window_plan>);
 
-  struct window {
-    // Where this window's bytes live, as the driver says: what the read
-    // fills, and what the pipeline reads back. For an arena the two name
-    // the same bytes; for a source already in memory the first is empty,
-    // because there is nothing to move.
-    std::span<std::byte> read_into;
-    std::span<const std::byte> bytes_view;
-    // Whether bytes_view's CONTENT is defined yet. Set when the read
-    // completes, cleared when the window is taken for the next one: an
-    // arena window names its slice from the moment it is taken, and what
-    // is in it belongs to the driver until poll() says otherwise.
-    bool view_ready = false;
-    window_compress<Budget> compress;
-    std::uint64_t index = 0;
-    std::uint64_t offset = 0;
-    std::uint64_t chunks = 0;
-    std::size_t bytes = 0;
-    window_record* rec = nullptr;
-    window* next_free = nullptr;
-    unsigned slot = 0;
-    bool last = false;
-    bool short_first = false;
-    bool reading = false;      // submitted, and the read has not landed
-    bool cancel_asked = false;  // the sweep has already asked for this read
-    window_plan plan;
-    std::size_t nodes = 0;  // nodes the fold produced
-
-    // Where this window's bytes are, which is settled when the window is
-    // taken. Only the ADDRESS is: use this to record where a later stage
-    // will read, never to read now.
-    [[nodiscard]] const std::byte* at() const noexcept {
-      return bytes_view.data();
-    }
-
-    // The window's bytes themselves, for everything that compresses or
-    // absorbs them. The assert is the contract the arena needs and the
-    // in-memory source satisfies trivially; it is live in the sanitizer
-    // lanes.
-    [[nodiscard]] std::span<const std::byte> view() const noexcept {
-      assert(view_ready &&
-             "a window's bytes are only defined once its read has "
-             "completed: the view names the storage from the moment the "
-             "window is taken, the content arrives in poll()");
-      return bytes_view;
-    }
-    // The read's operation, alive for as long as the window object: the
-    // driver may still owe this read after the chain's cell is gone, and
-    // the stop sweep names it from here. Last, so that adding it left
-    // the offsets of everything the agents touch where they were.
-    io_read_op op{};
-  };
 
   // What the node buffers hold: the worst case over any run, which is
   // what fold_aligned_runs asserts against.
@@ -1949,23 +2038,27 @@ class window_scope {
   // Nothing completes here. A cancelled read still owes its callback and
   // still holds its buffer, and only poll() can deliver either.
   void sweep_cancels() noexcept {
-    for (unsigned i = 0; i < count_; ++i) {
-      window& w = windows_[i];
-      if (w.reading && !w.cancel_asked) {
-        w.cancel_asked = true;
-        loop_.driver().cancel(w.op);
+    for (window* w = taken_; w != nullptr; w = w->next_taken) {
+      if (w->reading && !w->cancel_asked) {
+        w->cancel_asked = true;
+        loop_.driver().cancel(w->op);
       }
     }
   }
 
   void release(window& w) noexcept {
     stamp_released(w);
-    push_free(&w);
-  }
-
-  void push_free(window* w) noexcept {
-    w->next_free = free_;
-    free_ = w;
+    // Off this scope's list before it goes back on the pool's: a window
+    // is on exactly one of the two.
+    window** link = &taken_;
+    while (*link != nullptr && *link != &w) {
+      link = &(*link)->next_taken;
+    }
+    assert(*link == &w && "a window released twice, or never taken");
+    *link = w.next_taken;
+    w.next_taken = nullptr;
+    free_cells_[free_cell_count_++] = w.cell;
+    pool_.give_back(&w);
   }
 
   void claim_record(window& w) noexcept {
@@ -2024,6 +2117,7 @@ class window_scope {
 
   hasher& h_;
   driver_loop<D> loop_;
+  window_pool<Budget>& pool_;
   typename D::file& file_;
   Scheduler sched_;
   trace_buffer* trace_ = nullptr;
@@ -2039,7 +2133,6 @@ class window_scope {
   std::uint64_t file_bytes_ = 0;
   std::size_t reducer_capacity_ = reducer_nodes;
   ex::inplace_stop_token opts_stop_token_{};
-  std::unique_ptr<window[]> windows_;
   std::unique_ptr<tree_reducer::node[]> nodes_;
   tree_reducer reducer_;
   // Where an edge window's fold leaves its nodes: one buffer for the
@@ -2048,7 +2141,11 @@ class window_scope {
   std::array<std::array<tree_reducer::node, edge_node_cap>, 2> edge_nodes_{};
 
   loop_status status_{};
-  window* free_ = nullptr;
+  // What this scope currently holds, so the cancel sweep names its own
+  // reads and not another pipeline's sharing the same pool.
+  window* taken_ = nullptr;
+  std::unique_ptr<unsigned[]> free_cells_;
+  unsigned free_cell_count_ = 0;
   window* last_window_ = nullptr;
   std::uint64_t next_offset_ = 0;
   std::uint64_t index_ = 0;
@@ -2078,19 +2175,32 @@ class window_scope {
 // chain's type has to be settled before the run starts; here is where the
 // runtime choice becomes a compile-time one, once per run.
 template <stack_budget Budget, file_driver D, class Scheduler>
-void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
-                         Scheduler&& sched, const pipeline_plan& plan,
+void run_window_pipeline(hasher& h, D& drv, window_pool<Budget>& pool,
+                         typename D::file& file, Scheduler&& sched,
+                         const pipeline_plan& plan,
                          const pipeline_options& opts) {
   using sched_type = std::remove_cvref_t<Scheduler>;
   if (opts.trace != nullptr) {
     window_scope<true, Budget, D, sched_type> scope(
-        h, drv, file, std::forward<Scheduler>(sched), plan, opts);
+        h, drv, pool, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   } else {
     window_scope<false, Budget, D, sched_type> scope(
-        h, drv, file, std::forward<Scheduler>(sched), plan, opts);
+        h, drv, pool, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   }
+}
+
+// The same over a driver that has no pool yet: one is built for this run
+// alone, which is what a blocking call does. A caller that runs several
+// files keeps its own pool and uses the overload above.
+template <stack_budget Budget, file_driver D, class Scheduler>
+void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
+                         Scheduler&& sched, const pipeline_plan& plan,
+                         const pipeline_options& opts) {
+  window_pool<Budget> pool(drv, plan.windows, plan.window_bytes);
+  run_window_pipeline<Budget>(h, drv, pool, file,
+                              std::forward<Scheduler>(sched), plan, opts);
 }
 
 // The same over a driver whose file is already open, planned from the
