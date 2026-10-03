@@ -215,6 +215,23 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
                 # An uninstrumented libc++ makes MSan report other people's
                 # uninitialised memory, so point it at the instrumented build.
                 new["MSAN_LIBCXX_PREFIX"] = "/opt/libcxx-msan"
+            if inst == "asan" and not is_clang and "g++-16" in tc["CXX_COMPILER"]:
+                # GCC 16's null checks leak into constant evaluation: with
+                # -fsanitize=null (or its two nonnull-attribute siblings),
+                # comparing the addresses of two variable-template
+                # instantiations stops being a constant expression, and
+                # anything that identifies types by address -- stdexec's
+                # completion signatures, for one -- fails to compile.
+                #
+                #   template <class T> struct id { static constexpr int v = 0; };
+                #   template <class T> inline constexpr const int* tid = &id<T>::v;
+                #   static_assert(tid<int> != tid<long>);   // rejected
+                #
+                # Clang 22 accepts it, so the clang asan lane keeps the full
+                # set and the null checks stay covered by the matrix.
+                new["EXTRA_CXX_FLAGS"] = [
+                    "-fno-sanitize=null,nonnull-attribute,returns-nonnull-attribute"
+                ]
             out.append((f"{name}-{inst}", f"{desc} + {inst}", new))
     return out
 
