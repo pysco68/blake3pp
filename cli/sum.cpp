@@ -152,6 +152,123 @@ class engine {
     return finish(h);
   }
 
+  // Whether hash_many() would do anything the per-file loop does not.
+  // Standard input has no file to hand to a context, and one file needs
+  // no arena shared with anything.
+  [[nodiscard]] bool can_batch(const std::vector<std::string>& files) const {
+    return pool_.parallel() && files.size() > 1 &&
+           std::none_of(files.begin(), files.end(),
+                        [](const std::string& f) { return f == "-"; });
+  }
+
+  // Several files over one context, a fixed few in flight at a time.
+  //
+  // What this buys over calling hash_hex() per file is the arena: the
+  // blocking path allocates and first-touches windows * window_bytes per
+  // call and lets no two files overlap, while here one allocation serves
+  // every file and several are in flight at once. On a directory of
+  // small files that allocation is most of the work.
+  //
+  // Results come back in input order, which is what the output has to
+  // be, and a file that fails carries its message instead of a digest so
+  // one bad file does not end the run.
+  struct result {
+    std::string hex;
+    std::string error;
+  };
+
+  std::vector<result> hash_many(const std::vector<std::string>& files,
+                                std::size_t out_len) {
+    // The arena is a byte budget rather than a window count, because the
+    // window size is the caller's: at the 8 MiB default this is sixteen
+    // windows, and at 64 MiB it is two.
+    constexpr std::size_t arena_budget = 128u << 20;
+    const unsigned qd = std::max(1u, opts_.io.queue_depth);
+    const auto by_budget = static_cast<unsigned>(
+        std::max<std::size_t>(1, arena_budget / std::max<std::size_t>(
+                                                    1, opts_.io.window_bytes)));
+    const unsigned windows = std::clamp(by_budget, qd, 32u);
+    // One file may hold queue_depth windows, so this many keep the arena
+    // busy without any of them starving.
+    const unsigned in_flight = std::max(1u, windows / qd);
+
+    blake3pp::async::io_context ctx({.window_bytes = opts_.io.window_bytes,
+                                     .queue_depth = qd,
+                                     .windows = windows,
+                                     .direct_io = opts_.io.direct_io,
+                                     .offload_submit = opts_.io.offload_submit});
+
+    struct slot {
+      blake3pp::hasher h;
+      result* out = nullptr;
+      std::size_t len = 0;
+    };
+    // The receiver writes the result and nothing else: it runs inside
+    // the context's loop, and starting the next file from there would
+    // destroy an operation state from inside its own completion.
+    struct receiver {
+      using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
+      slot* s;
+      void set_value() const noexcept {
+        std::vector<std::byte> out(s->len);
+        s->h.finalize(out);
+        s->out->hex = blake3pp::to_hex(out);
+      }
+      void set_error(std::error_code ec) const noexcept {
+        s->out->error = ec.message();
+      }
+      void set_error(std::exception_ptr e) const noexcept {
+        try {
+          std::rethrow_exception(e);
+        } catch (const std::exception& ex) {
+          s->out->error = ex.what();
+        } catch (...) {
+          s->out->error = "unknown failure";
+        }
+      }
+      void set_stopped() const noexcept { s->out->error = "cancelled"; }
+    };
+
+    using sender_t = decltype(blake3pp::async::async_update_file(
+        ctx, std::declval<blake3pp::hasher&>(), std::string{},
+        pool_.scheduler(), opts_.io));
+    using op_t = blake3pp::ex::connect_result_t<sender_t, receiver>;
+    struct make_op {
+      blake3pp::async::io_context* ctx;
+      slot* s;
+      const std::string* path;
+      decltype(std::declval<b3tool::compute_pool&>().scheduler()) sched;
+      blake3pp::file_io_options io;
+      operator op_t() const {
+        return blake3pp::ex::connect(
+            blake3pp::async::async_update_file(*ctx, s->h, *path, sched, io),
+            receiver{s});
+      }
+    };
+
+    std::vector<result> out(files.size());
+    std::vector<slot> slots;
+    std::vector<std::optional<op_t>> ops(in_flight);
+    for (std::size_t base = 0; base < files.size(); base += in_flight) {
+      const std::size_t n = std::min<std::size_t>(in_flight, files.size() - base);
+      slots.clear();
+      slots.reserve(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        slots.push_back({make_hasher(), &out[base + i], out_len});
+      }
+      for (std::size_t i = 0; i < n; ++i) {
+        ops[i].emplace(make_op{&ctx, &slots[i], &files[base + i],
+                               pool_.scheduler(), opts_.io});
+        blake3pp::ex::start(*ops[i]);
+      }
+      ctx.run_until_idle();
+      for (std::size_t i = 0; i < n; ++i) {
+        ops[i].reset();
+      }
+    }
+    return out;
+  }
+
  private:
   blake3pp::hasher make_hasher() const {
     if (!opts_.derive_context.empty()) {
@@ -324,12 +441,26 @@ int main(int argc, char** argv) {
       return failures == 0 ? 0 : b3tool::exit_failure;
     }
 
-    for (const auto& f : o.files) {
-      try {
-        println(stdout, "{}  {}", eng.hash_hex(f, o.out_len), f);
-      } catch (const std::exception& e) {
-        println(stderr, "blake3ppsum: {}: {}", f, e.what());
-        failures++;
+    if (eng.can_batch(o.files)) {
+      // Several files over one context: one arena, several in flight,
+      // results in input order.
+      const auto results = eng.hash_many(o.files, o.out_len);
+      for (std::size_t i = 0; i < o.files.size(); ++i) {
+        if (results[i].error.empty()) {
+          println(stdout, "{}  {}", results[i].hex, o.files[i]);
+        } else {
+          println(stderr, "blake3ppsum: {}: {}", o.files[i], results[i].error);
+          failures++;
+        }
+      }
+    } else {
+      for (const auto& f : o.files) {
+        try {
+          println(stdout, "{}  {}", eng.hash_hex(f, o.out_len), f);
+        } catch (const std::exception& e) {
+          println(stderr, "blake3ppsum: {}: {}", f, e.what());
+          failures++;
+        }
       }
     }
   } catch (const std::exception& e) {
