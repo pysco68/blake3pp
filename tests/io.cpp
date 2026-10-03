@@ -526,6 +526,68 @@ TEST_CASE("reader reports a backend") {
   CHECK(!r.backend().empty());
 }
 
+// The engaged rung, asserted rather than merely printed.
+//
+// backend() exists so a degradation is visible, and every layer takes
+// trouble to keep it accurate -- but a name nobody checks buys nothing.
+// Both of the platform backends have shipped in a state where the async
+// path could never engage and every test still passed on the bytes: the
+// Windows writer opened its two handles with share modes that could only
+// collide, and the whole suite stayed green while every write went down
+// the synchronous rung.
+//
+// So: with async asked for and direct I/O out of the picture, the name
+// must either name the platform's async engine or say why it could not
+// be had. A silent fallback fails here, which is the point; a fallback
+// that explains itself passes, because that is the contract.
+TEST_CASE("an engaged backend is the platform's async engine, or says why not") {
+#if defined(__linux__)
+  constexpr std::string_view engine = "io_uring";
+#elif defined(_WIN32)
+  constexpr std::string_view engine = "iocp";
+#elif defined(__APPLE__)
+  constexpr std::string_view engine = "gcd";
+#else
+  constexpr std::string_view engine = "";
+#endif
+  if constexpr (engine.empty()) {
+    MESSAGE("no async engine on this platform; nothing to assert");
+    return;
+  } else {
+    // A degradation the backend could explain carries the reason in
+    // brackets, as uring_backend.hpp's no_uring_suffix() does.
+    const auto engaged_or_explained = [&](std::string_view name) {
+      return name.find(engine) != std::string_view::npos ||
+             name.find('[') != std::string_view::npos;
+    };
+
+    const auto content = make_input(256 * 1024);
+    {
+      const temp_file f(content);
+      blake3pp::detail::file_reader r(
+          f.path, {.direct_io = false, .async = true});
+      const std::string_view name = r.backend();
+      CAPTURE(name);
+      CHECK(engaged_or_explained(name));
+    }
+    {
+      const temp_file f({});  // placeholder path; the writer recreates it
+      blake3pp::detail::file_writer w(
+          f.path, {.buffer_bytes = 64 * 1024,
+                   .queue_depth = 2,
+                   .direct_io = false,
+                   .async = true});
+      const std::string_view name = w.backend();
+      CAPTURE(name);
+      CHECK(engaged_or_explained(name));
+      auto b = w.acquire();
+      std::memcpy(b.data, content.data(), 4096);
+      w.submit(b, 4096);
+      w.finish();
+    }
+  }
+}
+
 #if defined(__linux__)
 // Closing the ring fd does not wait for the reads it still owes, so a
 // ring torn down with a read in flight lets the kernel complete into
