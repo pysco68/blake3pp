@@ -1168,11 +1168,11 @@ struct pooled_scope {
       : plan(blake3pp::detail::plan_pipeline(h.count(), opts.window_bytes,
                                              opts.queue_depth, false,
                                              f.size())),
-        pool(drv, plan.windows, plan.window_bytes),
-        scope(h, drv, pool, f, std::move(sched), plan, opts) {}
+        host(drv, plan.windows, plan.window_bytes),
+        scope(h, host, f, std::move(sched), plan, opts) {}
 
   blake3pp::detail::pipeline_plan plan;
-  blake3pp::detail::window_pool<blake3pp::default_stack_budget> pool;
+  blake3pp::detail::pipeline_host<blake3pp::default_stack_budget, D> host;
   Scope scope;
 };
 

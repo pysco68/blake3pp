@@ -1158,6 +1158,34 @@ class window_pool {
   window* free_ = nullptr;
 };
 
+// What a run borrows rather than owns: the driver, the one run queue
+// every stage publishes into, and the window pool. Whoever holds this
+// outlives every run on it -- a blocking call builds one for its single
+// run, a context keeps one for its lifetime and lends it to each
+// pipeline it starts.
+//
+// There is exactly one loop per host, because the loop IS the thread
+// that may touch the driver: several pipelines sharing a host share that
+// thread, and each is driven a round at a time.
+template <stack_budget Budget, file_driver D>
+class pipeline_host {
+ public:
+  pipeline_host(D& drv, unsigned windows, std::size_t window_bytes)
+      : drv_(&drv), loop_(drv), pool_(drv, windows, window_bytes) {}
+
+  pipeline_host(const pipeline_host&) = delete;
+  pipeline_host& operator=(const pipeline_host&) = delete;
+
+  [[nodiscard]] D& driver() noexcept { return *drv_; }
+  [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
+  [[nodiscard]] window_pool<Budget>& pool() noexcept { return pool_; }
+
+ private:
+  D* drv_;
+  driver_loop<D> loop_;
+  window_pool<Budget> pool_;
+};
+
 template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
 class window_scope {
  public:
@@ -1165,22 +1193,22 @@ class window_scope {
   // The window objects are the pool's; the scope only borrows them.
   using window = pipeline_window<Budget>;
 
-  // The pool is the caller's: a blocking entry point builds one beside
+  // The host is the caller's: a blocking entry point builds one beside
   // the scope, a context keeps one and lends it to every pipeline it
   // runs. Either way it outlives the scope, because a read the teardown
   // drains is still targeting its arena.
-  window_scope(hasher& h, D& drv, window_pool<Budget>& pool,
+  window_scope(hasher& h, pipeline_host<Budget, D>& host,
                typename D::file& file, Scheduler sched,
                const pipeline_plan& plan, const pipeline_options& opts)
       : h_(h),
-        loop_(drv),
-        pool_(pool),
+        loop_(host.loop()),
+        pool_(host.pool()),
         file_(file),
         sched_(std::move(sched)),
         trace_(opts.trace),
         ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
         window_bytes_(plan.window_bytes),
-        count_(std::min(plan.windows, pool.count())),
+        count_(std::min(plan.windows, host.pool().count())),
         reads_in_flight_(plan.reads_in_flight),
         in_flight_cap_(opts.in_flight_cap == 0
                            ? count_
@@ -1203,7 +1231,7 @@ class window_scope {
     assert((ends_message_ || file_bytes_ % window_bytes_ == 0) &&
            "a span that does not end the message must be a whole number "
            "of windows: a partial one cannot be absorbed as a subtree");
-    assert(pool.window_bytes() >= window_bytes_ &&
+    assert(host.pool().window_bytes() >= window_bytes_ &&
            "the pool's windows are smaller than this run plans to read");
     loop_.record_into(trace_);
     // One operation cell per window this run may hold at once. The cells
@@ -1219,10 +1247,10 @@ class window_scope {
 
   // Over a file the caller opened itself, planned from the requests in
   // opts; what the tests construct directly.
-  window_scope(hasher& h, D& drv, window_pool<Budget>& pool,
+  window_scope(hasher& h, pipeline_host<Budget, D>& host,
                typename D::file& file, Scheduler sched,
                const pipeline_options& opts)
-      : window_scope(h, drv, pool, file, std::move(sched),
+      : window_scope(h, host, file, std::move(sched),
                      plan_pipeline(h.count(), opts.window_bytes,
                                    opts.queue_depth, false, file.size()),
                      opts) {}
@@ -2116,7 +2144,7 @@ class window_scope {
   }
 
   hasher& h_;
-  driver_loop<D> loop_;
+  driver_loop<D>& loop_;
   window_pool<Budget>& pool_;
   typename D::file& file_;
   Scheduler sched_;
@@ -2175,32 +2203,32 @@ class window_scope {
 // chain's type has to be settled before the run starts; here is where the
 // runtime choice becomes a compile-time one, once per run.
 template <stack_budget Budget, file_driver D, class Scheduler>
-void run_window_pipeline(hasher& h, D& drv, window_pool<Budget>& pool,
+void run_window_pipeline(hasher& h, pipeline_host<Budget, D>& host,
                          typename D::file& file, Scheduler&& sched,
                          const pipeline_plan& plan,
                          const pipeline_options& opts) {
   using sched_type = std::remove_cvref_t<Scheduler>;
   if (opts.trace != nullptr) {
     window_scope<true, Budget, D, sched_type> scope(
-        h, drv, pool, file, std::forward<Scheduler>(sched), plan, opts);
+        h, host, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   } else {
     window_scope<false, Budget, D, sched_type> scope(
-        h, drv, pool, file, std::forward<Scheduler>(sched), plan, opts);
+        h, host, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   }
 }
 
-// The same over a driver that has no pool yet: one is built for this run
+// The same over a driver with no host yet: one is built for this run
 // alone, which is what a blocking call does. A caller that runs several
-// files keeps its own pool and uses the overload above.
+// files keeps its own host and uses the overload above.
 template <stack_budget Budget, file_driver D, class Scheduler>
 void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
                          Scheduler&& sched, const pipeline_plan& plan,
                          const pipeline_options& opts) {
-  window_pool<Budget> pool(drv, plan.windows, plan.window_bytes);
-  run_window_pipeline<Budget>(h, drv, pool, file,
-                              std::forward<Scheduler>(sched), plan, opts);
+  pipeline_host<Budget, D> host(drv, plan.windows, plan.window_bytes);
+  run_window_pipeline<Budget>(h, host, file, std::forward<Scheduler>(sched),
+                              plan, opts);
 }
 
 // The same over a driver whose file is already open, planned from the
