@@ -303,13 +303,21 @@ struct forward_stop {
 // could not be made, a plan that cannot run -- is latched and reported
 // from the first round, which is the same rule every stage inside the
 // pipeline already obeys.
-template <stack_budget Budget, class Sched, class Receiver, class Value>
+// The cell store is a template parameter, not a member alias, for the
+// reason RULE 6 in detail/ex_compat.hpp gives: it carries provider
+// sender types, which have internal linkage, so naming it here keeps
+// this operation state internal to its translation unit too. Without
+// it, two units connecting the same sender with the same
+// externally-linked receiver would agree on this class's name and
+// disagree on its layout.
+template <stack_budget Budget, class Sched, class Receiver, class Value,
+          class Cells>
 class update_file_op final : public pipeline_node {
  public:
   using operation_state_concept = blake3pp::detail::ex_compat::operation_state_tag;
   using scope_type =
       blake3pp::detail::window_scope<false, Budget, io_driver, Sched>;
-  using cells_type = blake3pp::detail::pipeline_cells_for<scope_type>;
+  using cells_type = Cells;
 
   // Over a hasher the caller owns: it must outlive the operation, and
   // nothing else may touch it while this runs.
@@ -529,9 +537,15 @@ class update_file_sender {
     return {ctx_->scheduler()};
   }
 
+  // The scope and its cell store, named here so connect() can spell the
+  // operation state's type.
+  using scope_type =
+      blake3pp::detail::window_scope<false, Budget, io_driver, Sched>;
+  using cells_type = blake3pp::detail::pipeline_cells_for<scope_type>;
+
   template <class Receiver>
-  [[nodiscard]] update_file_op<Budget, Sched, Receiver, Value> connect(
-      Receiver r) const {
+  [[nodiscard]] update_file_op<Budget, Sched, Receiver, Value, cells_type>
+  connect(Receiver r) const {
     if constexpr (std::is_void_v<Value>) {
       return {*ctx_, *h_, path_, sched_, opts_, std::move(r)};
     } else {

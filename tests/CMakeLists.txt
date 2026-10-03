@@ -43,7 +43,12 @@ add_executable(blake3pp_tests
 if(BLAKE3PP_WITH_IO)
   target_sources(blake3pp_tests PRIVATE
     io.cpp io_context.cpp io_no_provider.cpp file_pipeline.cpp
-    write_pipeline.cpp async_io.cpp)
+    write_pipeline.cpp async_io.cpp
+    # Two translation units on purpose: see RULE 6 in
+    # detail/ex_compat.hpp. One drives the pipeline through the async
+    # senders and one through the blocking entry point, and only the
+    # pair reproduces the linkage defect they guard.
+    provider_linkage.cpp provider_linkage_tu2.cpp)
 endif()
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"
