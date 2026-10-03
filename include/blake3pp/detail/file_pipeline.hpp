@@ -1193,6 +1193,26 @@ class window_scope {
   // The window objects are the pool's; the scope only borrows them.
   using window = pipeline_window<Budget>;
 
+  // What the caller's stop does, from whichever thread requested it.
+  // Both halves are safe from any thread: requesting is atomic, and
+  // wake() is the one member of a driver another thread may call.
+  struct request_scope_stop {
+    ex::inplace_stop_source* source;
+    D* drv;
+    void operator()() const noexcept {
+      source->request_stop();
+      drv->wake();
+    }
+  };
+  using outer_stop_callback =
+      ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
+
+  // What a caller holds for the length of a run so the stop stays
+  // watched: begin() fills it, end() empties it, and it must outlive
+  // every window in flight.
+  using stop_watch = std::optional<outer_stop_callback>;
+
+
   // The host is the caller's: a blocking entry point builds one beside
   // the scope, a context keeps one and lends it to every pipeline it
   // runs. Either way it outlives the scope, because a read the teardown
@@ -1275,6 +1295,100 @@ class window_scope {
                 "reducer_nodes must clear a contiguous run's decomposition "
                 "plus both edge windows' reservations, or admission stalls");
 
+  // Watches the caller's stop and says whether there is a run at all.
+  //
+  // The callback does the two things that are safe from a thread that is
+  // not the driver's: request this scope's stop, and nudge the driver
+  // out of a blocking poll. Everything the stop then causes -- the
+  // cancels, the admission halt, the completion -- happens on the driver
+  // thread, in its own round.
+  //
+  // Destroying the watch is the hand-off back: an inplace_stop_callback's
+  // destructor waits for a callback already running, so past that
+  // object's lifetime no outer stop can still be arriving. The caller
+  // owns it, because it has to outlive every window in flight.
+  //
+  // False means there is nothing to drive: an empty file, or a token
+  // that was already stopped -- which stopped_ tells apart.
+  [[nodiscard]] bool begin(stop_watch& watch) {
+    if (file_bytes_ == 0) {
+      return false;
+    }
+    if (opts_stop_token_.stop_possible()) {
+      if (opts_stop_token_.stop_requested()) {
+        // Stopped before anything was submitted. Nothing to cancel,
+        // nothing to absorb, and the hasher is untouched.
+        stopped_ = true;
+        request_stop();
+        return false;
+      }
+      watch.emplace(opts_stop_token_,
+                    request_scope_stop{&stop_source_, &loop_.driver()});
+    }
+    return true;
+  }
+
+  // How a finished run ended, for a caller that has somewhere to report
+  // it. The blocking entry points turn these into exceptions; a sender
+  // turns them into completion signals.
+  enum class outcome { value, error, exception, stopped };
+
+  // The tail of a run: stop watching, record what the round counters
+  // saw, and -- only if the run actually produced a tree -- absorb it
+  // into the hasher.
+  //
+  // A stopped or failed run absorbs nothing: the reducer's nodes are
+  // discarded with it, and the last window is not taken into the hasher.
+  // What the hasher already took -- the heads of the edge windows that
+  // had landed -- stays.
+  [[nodiscard]] outcome end(stop_watch& watch) {
+    // Nothing is in flight, so no stop can still be on its way into a
+    // stage; the watch is done before anything is reported.
+    watch.reset();
+
+    if (trace_ != nullptr) {
+      driver_stats& d = trace_->driver();
+      d.admission_stalls = admission_stalls_;
+      d.max_pending = max_pending_;
+      d.max_reads_in_flight = max_reading_;
+      d.max_windows_in_flight = max_windows_;
+    }
+    if (eptr_) {
+      return outcome::exception;
+    }
+    if (ec_) {
+      return outcome::error;
+    }
+    if (stopped_ || stop_requested()) {
+      return outcome::stopped;
+    }
+    // Every complete window is a subtree of the final tree and goes in
+    // through the reducer; the last one carries the message end, so it
+    // can only ever be hashed by the hasher itself, and last.
+    reducer_.drain_into(h_);
+    if (last_window_ != nullptr) {
+      window& w = *last_window_;
+      // Only the tail: the parts before it are already in the tree.
+      h_.update(std::span<const std::byte>(
+          w.view().data() + (w.bytes - w.plan.tail_bytes),
+          w.plan.tail_bytes));
+      if (w.rec != nullptr) {
+        // The last window is never folded, so its join and its absorb
+        // are the same instant: the hasher took it whole.
+        w.rec->t_joined = w.rec->t_absorbed = trace_->now();
+      }
+      stamp_released(w);
+    }
+    return outcome::value;
+  }
+
+  // The error a failed run carries, for the caller that has to report
+  // it. Only meaningful for the matching outcome.
+  [[nodiscard]] std::error_code error() const noexcept { return ec_; }
+  [[nodiscard]] std::exception_ptr exception() const noexcept {
+    return eptr_;
+  }
+
   // Drives the whole file on this thread and absorbs it into the hasher.
   //
   // Ends exactly once, and only after everything in flight has finished:
@@ -1284,31 +1398,10 @@ class window_scope {
   // the reducer's nodes are discarded and the last window is not taken
   // -- and the hasher keeps whatever it had already absorbed.
   void run() {
-    if (file_bytes_ == 0) {
+    stop_watch watch;
+    if (!begin(watch)) {
+      throw_if_stopped();
       return;
-    }
-    // The caller's stop, watched for exactly as long as the run. The
-    // callback does the two things that are safe from a thread that is
-    // not the driver's: request this scope's stop, and nudge the driver
-    // out of a blocking poll. Everything the stop then causes -- the
-    // cancels, the admission halt, the completion -- happens on the
-    // driver thread, in its own round.
-    //
-    // Destroying it is the hand-off back: an inplace_stop_callback's
-    // destructor waits for a callback already running, so past this
-    // object's lifetime no outer stop can still be arriving.
-    std::optional<outer_stop_callback> watch;
-    if (opts_stop_token_.stop_possible()) {
-      if (opts_stop_token_.stop_requested()) {
-        // Stopped before anything was submitted. Nothing to cancel,
-        // nothing to absorb, and the hasher is untouched.
-        stopped_ = true;
-        request_stop();
-        throw_if_stopped();
-        return;
-      }
-      watch.emplace(opts_stop_token_,
-                    request_scope_stop{&stop_source_, &loop_.driver()});
     }
     // The operation cells: fixed storage for one connected chain per
     // window, re-emplaced per use. optional does the destroy-then-construct
@@ -1377,44 +1470,16 @@ class window_scope {
       throw;
     }
     assert(in_flight_ == 0 && "run_until returned with a window in flight");
-    // Nothing is in flight, so no stop can still be on its way into a
-    // stage; the watch is done before anything is reported.
-    watch.reset();
-
-    if (trace_ != nullptr) {
-      driver_stats& d = trace_->driver();
-      d.admission_stalls = admission_stalls_;
-      d.max_pending = max_pending_;
-      d.max_reads_in_flight = max_reading_;
-      d.max_windows_in_flight = max_windows_;
-    }
-    if (eptr_) {
-      std::rethrow_exception(eptr_);
-    }
-    if (ec_) {
-      throw std::system_error(ec_, "blake3pp: reading a window");
-    }
-    // A stopped run absorbs nothing: the reducer's nodes are discarded
-    // with it, and the last window is not taken into the hasher. What
-    // the hasher already took -- the heads of the edge windows that had
-    // landed -- stays, exactly as it does when a read fails.
-    throw_if_stopped();
-    // Every complete window is a subtree of the final tree and goes in
-    // through the reducer; the last one carries the message end, so it
-    // can only ever be hashed by the hasher itself, and last.
-    reducer_.drain_into(h_);
-    if (last_window_ != nullptr) {
-      window& w = *last_window_;
-      // Only the tail: the parts before it are already in the tree.
-      h_.update(std::span<const std::byte>(
-          w.view().data() + (w.bytes - w.plan.tail_bytes),
-          w.plan.tail_bytes));
-      if (w.rec != nullptr) {
-        // The last window is never folded, so its join and its absorb
-        // are the same instant: the hasher took it whole.
-        w.rec->t_joined = w.rec->t_absorbed = trace_->now();
-      }
-      stamp_released(w);
+    switch (end(watch)) {
+      case outcome::exception:
+        std::rethrow_exception(eptr_);
+      case outcome::error:
+        throw std::system_error(ec_, "blake3pp: reading a window");
+      case outcome::stopped:
+        throw_if_stopped();
+        break;
+      case outcome::value:
+        break;
     }
   }
 
@@ -1431,20 +1496,6 @@ class window_scope {
   }
 
  private:
-  // What the caller's stop does, from whichever thread requested it.
-  // Both halves are safe from any thread: requesting is atomic, and
-  // wake() is the one member of a driver another thread may call.
-  struct request_scope_stop {
-    ex::inplace_stop_source* source;
-    D* drv;
-    void operator()() const noexcept {
-      source->request_stop();
-      drv->wake();
-    }
-  };
-  using outer_stop_callback =
-      ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
-
   // The stop's own completion, for the blocking entry points: they have
   // no receiver to report set_stopped to, and an error_code is the only
   // channel they have.
