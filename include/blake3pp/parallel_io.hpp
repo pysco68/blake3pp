@@ -40,11 +40,13 @@ namespace detail {
 #if defined(BLAKE3PP_TEST_PIPELINE_STOP)
 // The stop the blocking entry points hand the pipeline.
 //
-// Phase 7 gives callers a stop of their own; until then the stop path
-// has no way in from the public API, so the test executable compiles
-// this header with a seam that lets one be installed. The shipped
-// library has neither the pointer nor the branch: the other definition
-// returns a token with no state, which the scope tests once per run.
+// These entry points block, so they have no receiver whose stop token
+// they could honour; async_io.hpp is where a caller brings its own. The
+// test executable compiles this header with a seam that installs one
+// anyway, so the stop path can be exercised without the async API. The
+// shipped library has neither the pointer nor the branch: the other
+// definition returns a token with no state, which the scope tests once
+// per run.
 inline ex::inplace_stop_source*& installed_stop_source() noexcept {
   static ex::inplace_stop_source* src = nullptr;
   return src;

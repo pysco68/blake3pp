@@ -208,6 +208,12 @@ which halved the pipeline there, 22 against 41 GiB/s. The
 submit inline (`--inline-submit` in the tools), and the writer behind
 `blake3ppgen --output` takes the same option.
 
+For many files rather than one large one, there is a third layer:
+`<blake3pp/async_io.hpp>` turns the same pipeline into senders over a
+context that owns the window arena, so several files share one
+allocation instead of each faulting in its own. It is experimental;
+[Many files at once](async.md) has it.
+
 The parallel form hands each complete window to the scheduler as a
 subtree, which needs the hasher to sit on a window-aligned boundary when
 the file starts. That is true for a fresh hasher and after files whose
