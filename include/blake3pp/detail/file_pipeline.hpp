@@ -1443,8 +1443,14 @@ class window_scope {
 
   // Waits out every window still in flight without running another
   // round, for a caller whose round threw: the cells cannot be
-  // destroyed while a pool thread is about to publish into one.
-  void abandon() noexcept { quiesce(); }
+  // destroyed while a pool thread is about to publish into one. What
+  // the run held goes back to the pool here, since end() will not be
+  // called for it; a window kept past the failure is what starves the
+  // runs sharing the pool.
+  void abandon() noexcept {
+    quiesce();
+    give_back_all();
+  }
 
   // Asks this run to stop, from the driver thread.
   void stop() noexcept { request_stop(); }

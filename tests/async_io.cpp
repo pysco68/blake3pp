@@ -290,6 +290,41 @@ TEST_CASE("when_all over two files completes once with both digests") {
   CHECK(gb == blake3pp::hash(b));
 }
 
+// The context's thread and the thread starting operations are usually
+// different ones: a thread runs the context, producers start files on
+// it. start() must therefore be safe against a loop that is walking its
+// list at that moment, and an operation started while the loop is
+// parked must wake it. Under TSan this is the case that sees a torn
+// list; without it, it sees a hang.
+TEST_CASE("operations started from another thread join a running context") {
+  const auto a = pattern(2 * 64 * 1024 + 11, 40);
+  const auto b = pattern(5 * 64 * 1024 + 3, 41);
+  const temp_file fa(a);
+  const temp_file fb(b);
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+  std::thread runner([&] { ctx.run(); });
+
+  // Both start() calls run here, while the runner drives the context.
+  auto first = ex::sync_wait(
+      ex::when_all(async::async_hash_file(ctx, fa.path(), sched),
+                   async::async_hash_file(ctx, fb.path(), sched)));
+  REQUIRE(first.has_value());
+  const auto [da, db] = *first;
+  CHECK(da == blake3pp::hash(a));
+  CHECK(db == blake3pp::hash(b));
+
+  // And once more with the loop idle and parked in the driver: the
+  // start has to wake it.
+  auto second = ex::sync_wait(async::async_hash_file(ctx, fb.path(), sched));
+  REQUIRE(second.has_value());
+  CHECK(std::get<0>(*second) == blake3pp::hash(b));
+
+  ctx.request_stop();
+  runner.join();
+}
+
 TEST_CASE("several files run on one context at once") {
   // Four files, two windows: the pool runs out, and a pipeline that
   // finds none resumes when another gives one back.

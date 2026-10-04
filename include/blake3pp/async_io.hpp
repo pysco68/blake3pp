@@ -13,17 +13,27 @@
 /// Here the storage moves up. An io_context owns the driver, the window
 /// arena and the run queue; a sender borrows windows from it for as long
 /// as one file takes, and several senders may be in flight at once. One
-/// thread runs the context, and every operation completes on it.
+/// thread runs the context, and every operation completes on it; an
+/// operation may be started from any thread, and its file is opened and
+/// its reads begin on the running thread.
 ///
 /// ```cpp
 /// blake3pp::async::io_context ctx;
 /// exec::static_thread_pool pool{std::thread::hardware_concurrency()};
+/// std::thread runner([&] { ctx.run(); });  // until request_stop()
 ///
 /// auto work = stdexec::when_all(
 ///     blake3pp::async::async_hash_file(ctx, "a.bin", pool.get_scheduler()),
 ///     blake3pp::async::async_hash_file(ctx, "b.bin", pool.get_scheduler()));
-/// auto [digests] = stdexec::sync_wait(std::move(work)).value();
+/// auto [a, b] = stdexec::sync_wait(std::move(work)).value();
+///
+/// ctx.request_stop();
+/// runner.join();
 /// ```
+///
+/// A thread with nothing else to do can drive the context itself:
+/// start the operations, then run_until_idle() returns once they have
+/// completed.
 ///
 /// What is experimental about it: the error channels and the names of
 /// the context options. The run model and the lifetime rules below are
@@ -113,9 +123,12 @@ struct pipeline_node {
 /// A driver, an arena of windows and the one thread that runs them.
 ///
 /// One thread may call run() or run_until_idle(); every other thread may
-/// only call request_stop(). Operations complete on the running thread,
-/// inside the run call, which is also the only place a receiver of one
-/// of these senders is ever invoked.
+/// call request_stop(), and may start operations on the context: a
+/// started operation joins the loop's list through an atomic push, and
+/// everything it does -- the open, the plan, the reads -- happens on the
+/// running thread from its first round. Operations complete on the
+/// running thread, inside the run call, which is also the only place a
+/// receiver of one of these senders is ever invoked.
 ///
 /// @tparam Budget The stack a window's part table may take. It is the
 ///                context's rather than the call's because the context
@@ -144,7 +157,7 @@ class basic_io_context {
     // P2300's rule: an operation state may not be destroyed between
     // start() and its completion, and the context is what would have
     // completed it.
-    assert(head_ == nullptr &&
+    assert(head_ == nullptr && pending_.load(std::memory_order_acquire) == nullptr &&
            "an io_context was destroyed with an operation started and not "
            "completed");
   }
@@ -192,12 +205,15 @@ class basic_io_context {
     return opts_;
   }
 
-  // Joins the loop's round-robin. The node is the caller's; it leaves
-  // the list when it reports.
+  // Joins the loop's round-robin, from any thread. The node is the
+  // caller's; it waits on the pending list until the running thread
+  // adopts it at the top of a pass, and leaves the list when it reports.
   void link(detail::pipeline_node* n) noexcept {
-    n->next = head_;
-    head_ = n;
-    ++live_;
+    n->next = pending_.load(std::memory_order_relaxed);
+    while (!pending_.compare_exchange_weak(n->next, n,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)) {
+    }
     // A node started from another operation's completion joins a loop
     // that is already running; one started before run() is picked up
     // when it begins. Either way the driver is nudged, because the loop
@@ -217,12 +233,30 @@ class basic_io_context {
     const bool was_running = running_.exchange(true, std::memory_order_acq_rel);
     assert(!was_running &&
            "only one thread may run an io_context; the others may call "
-           "request_stop() and nothing else");
+           "request_stop() and start operations, nothing else");
     (void)was_running;
+    // Whatever leaves this frame, the context is runnable again: an
+    // exception out of the driver's poll leaves the started operations
+    // linked and unfinished, and the next run() continues them.
+    struct running_guard {
+      std::atomic<bool>& flag;
+      ~running_guard() { flag.store(false, std::memory_order_release); }
+    } const guard{running_};
     blake3pp::detail::loop_status status{};
     host_.loop().run_until(
         status,
         [&] {
+          // Operations started since the last pass, from any thread,
+          // join the list here, on the running thread.
+          for (detail::pipeline_node* n =
+                   pending_.exchange(nullptr, std::memory_order_acquire);
+               n != nullptr;) {
+            detail::pipeline_node* const next = n->next;
+            n->next = head_;
+            head_ = n;
+            ++live_;
+            n = next;
+          }
           if (stop_.load(std::memory_order_acquire)) {
             for (detail::pipeline_node* n = head_; n != nullptr; n = n->next) {
               n->request_stop();
@@ -254,8 +288,12 @@ class basic_io_context {
             n->report();  // may destroy n, and may start another
           }
           status.outstanding = owed;
-          status.done = live_ == 0 && (until_idle || stop_.load(
-                                                         std::memory_order_acquire));
+          // A report may have started another operation; it is pending,
+          // not live, so the list is consulted too.
+          status.done =
+              live_ == 0 &&
+              pending_.load(std::memory_order_acquire) == nullptr &&
+              (until_idle || stop_.load(std::memory_order_acquire));
         },
         [&] {
           // Nothing owed, nothing to run, and nothing the driver can
@@ -264,7 +302,6 @@ class basic_io_context {
           // run_until only calls this when it is about to block, and a
           // wake() from link() or request_stop() is what ends it.
         });
-    running_.store(false, std::memory_order_release);
     stop_.store(false, std::memory_order_release);
   }
 
@@ -274,6 +311,9 @@ class basic_io_context {
   blake3pp::detail::pipeline_host<Budget, blake3pp::detail::io_driver> host_;
   detail::pipeline_node* head_ = nullptr;
   unsigned live_ = 0;
+  // Started and not yet adopted by the loop: the one list another thread
+  // writes.
+  std::atomic<detail::pipeline_node*> pending_{nullptr};
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_{false};
 };
@@ -299,10 +339,11 @@ struct forward_stop {
 // context offers it a round at a time, and the round that finishes it
 // reports on the receiver instead of returning.
 //
-// Nothing completes inside start(). A failure there -- an open that
-// could not be made, a plan that cannot run -- is latched and reported
-// from the first round, which is the same rule every stage inside the
-// pipeline already obeys.
+// Nothing happens inside start() but joining the context: start() may
+// run on any thread, and the driver belongs to the running one. The
+// open, the plan and the first reads are the first round's, and a
+// failure there is latched and reported from the round after, which is
+// the same rule every stage inside the pipeline already obeys.
 // The cell store is a template parameter, not a member alias, for the
 // reason RULE 6 in detail/ex_compat.hpp gives: it carries provider
 // sender types, which have internal linkage, so naming it here keeps
@@ -351,6 +392,33 @@ class update_file_op final : public pipeline_node {
     // Installed before anything is opened, so a token already stopped
     // takes the same path as one stopped mid-file.
     watch_receiver_stop();
+    ctx_->link(this);
+  }
+
+  void round() noexcept override {
+    if (!opened_) {
+      opened_ = true;
+      open();
+    }
+    if (!live_) {
+      return;
+    }
+    try {
+      scope_->admit_round(*cells_);
+    } catch (...) {
+      // The round threw, so the cells cannot simply be destroyed: a
+      // window on the pool may be about to publish into one. Wait those
+      // out first, which also returns the windows this run held, then
+      // report from the next round.
+      scope_->abandon();
+      eptr_ = std::current_exception();
+      live_ = false;
+    }
+  }
+
+ private:
+  // The first round's work, on the running thread.
+  void open() noexcept {
     try {
       // The size decides the open mode and the window count, so it is
       // read before the open; a size the filesystem cannot give leaves
@@ -375,25 +443,9 @@ class update_file_op final : public pipeline_node {
       eptr_ = std::current_exception();
       live_ = false;
     }
-    ctx_->link(this);
   }
 
-  void round() noexcept override {
-    if (!live_) {
-      return;
-    }
-    try {
-      scope_->admit_round(*cells_);
-    } catch (...) {
-      // The round threw, so the cells cannot simply be destroyed: a
-      // window on the pool may be about to publish into one. Wait those
-      // out first, then report from the next round.
-      scope_->abandon();
-      eptr_ = std::current_exception();
-      live_ = false;
-    }
-  }
-
+ public:
   [[nodiscard]] bool finished() const noexcept override {
     return !live_ || scope_->status().done;
   }
@@ -466,6 +518,7 @@ class update_file_op final : public pipeline_node {
   }
 
   basic_io_context<Budget>* ctx_;
+  bool opened_ = false;
   // Declared before h_, which points into it when this operation owns
   // its hasher.
   std::optional<hasher> own_h_;
