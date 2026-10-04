@@ -471,6 +471,31 @@ int main(int argc, char** argv) {
     add_row(std::string{blake3pp::to_string(a)}, "",
             [&, a] { return hash_with(blake3pp::detail::resolve(a)); });
   }
+  // The same kernels on 8 KiB messages, one hasher per message: eight
+  // chunks, which is half a 16-lane batch and a whole 8-lane one. Where
+  // the long rows above amortise every remainder, this one is nothing
+  // but the remainder path -- padded, handed to a narrower kernel, or
+  // compressed one chunk at a time -- so it is where resolve()'s ladder
+  // and the kernels' own thresholds show.
+  for (const auto a : arches) {
+    if (!blake3pp::is_available(a)) {
+      continue;
+    }
+    add_row(std::format("{}_8k", blake3pp::to_string(a)),
+            "8 KiB messages, one hasher each", [&, a] {
+              const auto* ops = blake3pp::detail::resolve(a);
+              constexpr std::size_t msg = 8 * 1024;
+              blake3pp::hasher fold{ops};
+              const std::span<const std::byte> all{input};
+              for (std::size_t at = 0; at + msg <= all.size(); at += msg) {
+                blake3pp::hasher h{ops};
+                h.update(all.subspan(at, msg));
+                const blake3pp::digest d = h.finalize();
+                fold.update(std::span<const std::byte>{d.bytes});
+              }
+              return fold.finalize();
+            });
+  }
 
   // The width-16 transpose strategies, raced in-process (the dial is
   // runtime; no per-strategy binaries needed), plus what the tuner picks.
