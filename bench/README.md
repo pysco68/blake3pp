@@ -31,6 +31,41 @@ Two things follow, and neither is a defect:
   distinct bytes at every offset. The two numbers answer different
   questions and must not be put in one column.
 
+## --null-sink: the same for the write pipeline
+
+`blake3pp_bench_file --null-sink N` is the mirror image: the write
+pipeline generates N GiB into a sink that completes each write from
+`poll()` and stores nothing. What is left is the generator, the sender
+chain and the driver loop, with the device removed.
+
+The caveats above apply unchanged, and one more is specific to this
+side. **The number scales with the queue depth, not with the core
+count.** A window's fill is sequential -- the parallelism is the windows
+in flight, not a fan-out inside one -- so the useful reading is a sweep
+of `--qd` at a fixed `--window`, and the window size barely moves it.
+On a 16-thread Z13, 2 GiB, best of 3:
+
+| geometry | GiB/s | | geometry | GiB/s |
+|---|---|---|---|---|
+| 64 MiB x qd 2 | 8.56 | | 16 MiB x qd 8 | 16.2 |
+| 64 MiB x qd 4 | 14.6 | | 8 MiB x qd 16 | 17.1 |
+| 64 MiB x qd 8 | 16.8 | | 4 MiB x qd 16 | 18.5 |
+| 64 MiB x qd 16 | 16.9 | | | |
+
+## The flags
+
+`--help` is authoritative; this is the map.
+
+`blake3pp_bench_file`, over a real file: `--reps`, `--cooldown`,
+`--window` (MiB), `--qd`, `--no-direct`, `--inline-submit`, `--threads`,
+`--seq-only`, `--trace PATH` with `--trace-agents`, `--io-sweep` (the
+window x qd pacing matrix), and `--make <MiB>` to create a file and use
+it. Without a device: `--null-source <GiB>` and `--null-sink <GiB>`.
+
+`blake3pp_bench`, in memory: `--size` (MiB), `--reps`, `--cooldown`,
+`--pin`, `--threads`, `--t16-sweep`, and a list of SIMD variants to
+measure.
+
 ## file_throughput: where a window's time goes (`--trace`)
 
 `blake3pp_bench_file FILE --trace PATH` hands the pipeline a
