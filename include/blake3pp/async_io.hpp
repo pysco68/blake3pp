@@ -45,14 +45,18 @@
 /// The hasher an async_update_file names is the operation's alone until
 /// it completes.
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <span>
 #include <system_error>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -83,6 +87,11 @@ struct io_context_options {
   /// operation's worth; a context that runs several files at once wants
   /// more, at window_bytes each.
   unsigned windows = 0;
+  /// The arena as a byte budget instead: when non-zero, the window count
+  /// is this divided by the window size, at least queue_depth and at
+  /// most 32, and `windows` is ignored. The budget is what a caller
+  /// knows; how many windows it buys depends on the window size.
+  std::size_t arena_bytes = 0;
   /// Bypass the page cache where the platform supports it, per file.
   /// A file whose window grid is unaligned is opened buffered whatever
   /// this says, because every window after an unaligned one starts
@@ -178,6 +187,16 @@ class basic_io_context {
   /// nothing started returns immediately.
   void run_until_idle() { drive(/*until_idle=*/true); }
 
+  /// Runs until `done` reads true, which something completing on this
+  /// thread sets; other operations may still be in flight when it
+  /// returns. What sync_wait() drives.
+  void run_until(const bool& done) { drive(/*until_idle=*/false, &done); }
+
+  /// How many windows the arena holds.
+  [[nodiscard]] unsigned windows() const noexcept {
+    return pool_windows(opts_, plan_);
+  }
+
   /// Asks every started operation to stop and wakes the running thread.
   /// The only member another thread may call.
   void request_stop() noexcept {
@@ -226,10 +245,16 @@ class basic_io_context {
   static unsigned pool_windows(
       const io_context_options& opts,
       const blake3pp::detail::pipeline_plan& plan) noexcept {
+    if (opts.arena_bytes != 0) {
+      const std::size_t by_budget =
+          opts.arena_bytes / std::max<std::size_t>(1, plan.window_bytes);
+      return static_cast<unsigned>(std::clamp<std::size_t>(
+          by_budget, std::max(1u, plan.reads_in_flight), 32));
+    }
     return opts.windows != 0 ? opts.windows : plan.windows;
   }
 
-  void drive(bool until_idle) {
+  void drive(bool until_idle, const bool* until = nullptr) {
     const bool was_running = running_.exchange(true, std::memory_order_acq_rel);
     assert(!was_running &&
            "only one thread may run an io_context; the others may call "
@@ -291,9 +316,10 @@ class basic_io_context {
           // A report may have started another operation; it is pending,
           // not live, so the list is consulted too.
           status.done =
-              live_ == 0 &&
-              pending_.load(std::memory_order_acquire) == nullptr &&
-              (until_idle || stop_.load(std::memory_order_acquire));
+              (until != nullptr && *until) ||
+              (live_ == 0 &&
+               pending_.load(std::memory_order_acquire) == nullptr &&
+               (until_idle || stop_.load(std::memory_order_acquire)));
         },
         [&] {
           // Nothing owed, nothing to run, and nothing the driver can
@@ -628,7 +654,7 @@ class update_file_sender {
 ///               operation, and nothing else may touch it while this
 ///               runs; it keeps its mode, so keyed and derive_key
 ///               hashers work as they do everywhere else.
-/// @param path   The file to read. It must outlive the operation.
+/// @param path   The file to read; copied.
 /// @param sched  Where the subtree compressions run.
 /// @param opts   Per-call knobs. The window geometry is the context's;
 ///               what is left here is direct_io, which can only turn the
@@ -647,11 +673,10 @@ template <stack_budget Budget, class Sched>
 ///
 /// Completes with set_value(digest), set_error(std::error_code),
 /// set_error(std::exception_ptr) or set_stopped(), always on the thread
-/// running the context. The hasher is the operation's own, so nothing
-/// but the path has to outlive the call.
+/// running the context. The hasher is the operation's own.
 ///
 /// @param ctx    The context whose windows and driver this borrows.
-/// @param path   The file to read. It must outlive the operation.
+/// @param path   The file to read; copied.
 /// @param sched  Where the subtree compressions run.
 /// @param opts   Per-call knobs: the arch, a key, and direct_io.
 template <stack_budget Budget, class Sched>
@@ -662,6 +687,355 @@ template <stack_budget Budget, class Sched>
   return detail::update_file_sender<Budget, std::remove_cvref_t<Sched>, digest,
                                     hash_file_options>(
       ctx, nullptr, std::move(path), std::forward<Sched>(sched), opts);
+}
+
+/// How one file of a many-files operation ended. The outcome is reported
+/// to the caller's callback; the operation itself completes once, after
+/// every file has an outcome.
+struct file_outcome {
+  /// The error_code channel: an open or a read that failed.
+  std::error_code error{};
+  /// The exception channel: everything else that went wrong.
+  std::exception_ptr exception{};
+  /// The file was stopped, or never started because a stop came first.
+  bool stopped = false;
+  /// Whether the hasher holds the whole file.
+  [[nodiscard]] bool ok() const noexcept {
+    return !error && exception == nullptr && !stopped;
+  }
+};
+
+/// Knobs for async_update_files().
+struct many_files_options {
+  /// Files in flight at once. Zero means the context's windows divided
+  /// by its queue depth, which is as many as can each hold a full queue
+  /// of windows without starving one another.
+  unsigned in_flight = 0;
+  /// Per-file knobs, as for async_update_file().
+  file_io_options io{};
+};
+
+namespace detail {
+
+// Many files over one context, a bounded number in flight: a node that
+// owns up to `in_flight` child operations and refills a slot from its
+// own round once the child in it has reported. The child reports from
+// inside the loop's report phase and the slot is recycled in the next
+// round, so no operation state is destroyed inside its own completion.
+//
+// Each file's outcome goes to the callback with the hasher that
+// streamed it; the operation completes once, with set_value() after
+// the last outcome, or set_stopped() when a stop ended it. Per-file
+// failures are outcomes, not completions: one unreadable file does not
+// end the run.
+template <stack_budget Budget, class Sched, class MakeHasher, class OnDone,
+          class Receiver>
+class update_files_op final : public pipeline_node {
+ public:
+  using operation_state_concept =
+      blake3pp::detail::ex_compat::operation_state_tag;
+  using child_sender = update_file_sender<Budget, Sched, void, file_io_options>;
+
+  update_files_op(basic_io_context<Budget>& ctx,
+                  std::span<const std::filesystem::path> paths, Sched sched,
+                  const many_files_options& opts, MakeHasher make, OnDone done,
+                  Receiver r)
+      : ctx_(&ctx),
+        paths_(paths),
+        sched_(std::move(sched)),
+        opts_(opts),
+        make_(std::move(make)),
+        done_(std::move(done)),
+        rcvr_(std::move(r)) {}
+
+  update_files_op(const update_files_op&) = delete;
+  update_files_op& operator=(const update_files_op&) = delete;
+
+  void start() noexcept {
+    const unsigned width =
+        opts_.in_flight != 0
+            ? opts_.in_flight
+            : std::max(1u, ctx_->windows() /
+                               std::max(1u, ctx_->plan().reads_in_flight));
+    try {
+      // Slots hold operation states, which do not move: one allocation,
+      // sized once, never grown.
+      width_ = std::min<std::size_t>(width, paths_.size());
+      slots_ = std::make_unique<slot[]>(width_);
+    } catch (...) {
+      eptr_ = std::current_exception();
+    }
+    ctx_->link(this);
+  }
+
+  void round() noexcept override {
+    if (eptr_ != nullptr) {
+      return;
+    }
+    for (slot& s : std::span{slots_.get(), width_}) {
+      if (s.reported) {
+        s.op.reset();
+        s.h.reset();
+        s.reported = false;
+      }
+      if (!s.op && !stop_requested_ && next_ < paths_.size()) {
+        start_slot(s, next_++);
+      }
+    }
+    if (stop_requested_) {
+      // Files that never started are stopped outcomes, reported in order.
+      while (next_ < paths_.size()) {
+        done_(next_, spare_, file_outcome{.stopped = true});
+        ++next_;
+        ++reported_;
+      }
+    }
+  }
+
+  [[nodiscard]] bool finished() const noexcept override {
+    return eptr_ != nullptr || reported_ == paths_.size();
+  }
+
+  [[nodiscard]] unsigned outstanding() const noexcept override { return 0; }
+
+  void request_stop() noexcept override { stop_requested_ = true; }
+
+  void report() noexcept override {
+    if (eptr_ != nullptr) {
+      blake3pp::ex::set_error(std::move(rcvr_), std::move(eptr_));
+    } else if (stop_requested_) {
+      blake3pp::ex::set_stopped(std::move(rcvr_));
+    } else {
+      blake3pp::ex::set_value(std::move(rcvr_));
+    }
+  }
+
+ private:
+  struct slot;
+
+  // What a child completes into: the slot's outcome, through the parent.
+  struct child_receiver {
+    using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
+    child_receiver(update_files_op* op, slot* s) noexcept : op_(op), s_(s) {}
+    void set_value() const noexcept { op_->child_done(*s_, {}); }
+    void set_error(std::error_code ec) const noexcept {
+      op_->child_done(*s_, file_outcome{.error = ec});
+    }
+    void set_error(std::exception_ptr e) const noexcept {
+      op_->child_done(*s_, file_outcome{.exception = std::move(e)});
+    }
+    void set_stopped() const noexcept {
+      op_->child_done(*s_, file_outcome{.stopped = true});
+    }
+
+   private:
+    update_files_op* op_;
+    slot* s_;
+  };
+  using child_op = blake3pp::ex::connect_result_t<child_sender, child_receiver>;
+
+  struct slot {
+    std::size_t index = 0;
+    std::optional<hasher> h;
+    std::optional<child_op> op;
+    bool reported = false;
+  };
+
+  // Builds the child in place: an operation state is immovable, so the
+  // optional is given a conversion rather than a value.
+  struct child_connect {
+    update_files_op* op;
+    slot* s;
+    operator child_op() const {
+      return blake3pp::ex::connect(
+          child_sender(*op->ctx_, &*s->h, op->paths_[s->index], op->sched_,
+                       op->opts_.io),
+          child_receiver{op, s});
+    }
+  };
+
+  void start_slot(slot& s, std::size_t index) noexcept {
+    s.index = index;
+    try {
+      s.h.emplace(make_(index));
+      s.op.emplace(child_connect{this, &s});
+    } catch (...) {
+      // The file never started: its outcome is the exception, and the
+      // slot is free again.
+      s.h.reset();
+      s.op.reset();
+      done_(index, spare_, file_outcome{.exception = std::current_exception()});
+      ++reported_;
+      return;
+    }
+    blake3pp::ex::start(*s.op);
+  }
+
+  void child_done(slot& s, file_outcome o) noexcept {
+    done_(s.index, *s.h, o);
+    s.reported = true;
+    ++reported_;
+    // The slot is refilled in this node's next round, and the loop may
+    // be about to park with nothing owed: the nudge is what brings that
+    // round.
+    ctx_->driver().wake();
+  }
+
+  basic_io_context<Budget>* ctx_;
+  std::span<const std::filesystem::path> paths_;
+  Sched sched_;
+  many_files_options opts_;
+  MakeHasher make_;
+  OnDone done_;
+  Receiver rcvr_;
+  std::unique_ptr<slot[]> slots_;
+  std::size_t width_ = 0;
+  hasher spare_{};  // what a file that never started is reported with
+  std::size_t next_ = 0;
+  std::size_t reported_ = 0;
+  bool stop_requested_ = false;
+  std::exception_ptr eptr_;
+};
+
+template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
+class update_files_sender {
+ public:
+  using sender_concept = blake3pp::detail::ex_compat::sender_tag;
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(blake3pp::ex::set_value_t(),
+                                    blake3pp::ex::set_error_t(std::exception_ptr),
+                                    blake3pp::ex::set_stopped_t());
+
+  update_files_sender(basic_io_context<Budget>& ctx,
+                      std::span<const std::filesystem::path> paths,
+                      Sched sched, const many_files_options& opts,
+                      MakeHasher make, OnDone done)
+      : ctx_(&ctx),
+        paths_(paths),
+        sched_(std::move(sched)),
+        opts_(opts),
+        make_(std::move(make)),
+        done_(std::move(done)) {}
+
+  [[nodiscard]] sender_env get_env() const noexcept {
+    return {ctx_->scheduler()};
+  }
+
+  template <class Receiver>
+  [[nodiscard]] update_files_op<Budget, Sched, MakeHasher, OnDone, Receiver>
+  connect(Receiver r) const {
+    return {*ctx_, paths_, sched_, opts_, make_, done_, std::move(r)};
+  }
+
+ private:
+  basic_io_context<Budget>* ctx_;
+  std::span<const std::filesystem::path> paths_;
+  Sched sched_;
+  many_files_options opts_;
+  MakeHasher make_;
+  OnDone done_;
+};
+
+// Where sync_wait() parks a completion.
+template <class Tuple>
+struct sync_state {
+  std::optional<Tuple> value;
+  std::exception_ptr error;
+  bool stopped = false;
+  bool done = false;
+};
+
+template <class Tuple>
+struct sync_receiver {
+  using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
+  explicit sync_receiver(sync_state<Tuple>* s) noexcept : st_(s) {}
+  template <class... Ts>
+  void set_value(Ts&&... ts) const noexcept {
+    try {
+      st_->value.emplace(std::forward<Ts>(ts)...);
+    } catch (...) {
+      st_->error = std::current_exception();
+    }
+    st_->done = true;
+  }
+  void set_error(std::error_code ec) const noexcept {
+    st_->error = std::make_exception_ptr(std::system_error(ec));
+    st_->done = true;
+  }
+  void set_error(std::exception_ptr e) const noexcept {
+    st_->error = std::move(e);
+    st_->done = true;
+  }
+  void set_stopped() const noexcept {
+    st_->stopped = true;
+    st_->done = true;
+  }
+
+ private:
+  sync_state<Tuple>* st_;
+};
+
+}  // namespace detail
+
+/// Streams many files into hashers over a context, a bounded number at a
+/// time, as a sender. Each file's hasher comes from `make(index)`; when
+/// the file has been streamed, or has failed, `done(index, h, outcome)`
+/// is called on the context's thread with that hasher and the outcome,
+/// in whatever order the files finish. The sender completes once, with
+/// set_value() after the last outcome, set_error(exception_ptr) if its
+/// own bookkeeping failed, or set_stopped() when a stop ended the run,
+/// in which case files that never started are reported as stopped.
+///
+/// @param ctx    The context whose windows and driver this borrows.
+/// @param paths  The files; the span must outlive the operation.
+/// @param sched  Where the subtree compressions run.
+/// @param opts   How many files run at once, and the per-file knobs.
+/// @param make   `hasher(std::size_t index)`: the hasher for a file,
+///               with its mode (plain, keyed, derive_key) and variant.
+/// @param done   `void(std::size_t index, hasher& h, const
+///               file_outcome&) noexcept`: the file's end.
+template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
+  requires ex::scheduler<std::remove_cvref_t<Sched>> &&
+           std::is_invocable_r_v<hasher, MakeHasher&, std::size_t> &&
+           std::is_nothrow_invocable_v<OnDone&, std::size_t, hasher&,
+                                       const file_outcome&>
+[[nodiscard]] auto async_update_files(basic_io_context<Budget>& ctx,
+                                      std::span<const std::filesystem::path> paths,
+                                      Sched&& sched,
+                                      const many_files_options& opts,
+                                      MakeHasher make, OnDone done) {
+  return detail::update_files_sender<Budget, std::remove_cvref_t<Sched>,
+                                     MakeHasher, OnDone>(
+      ctx, paths, std::forward<Sched>(sched), opts, std::move(make),
+      std::move(done));
+}
+
+/// Starts `sndr` and drives the context on this thread until it
+/// completes. Returns the values as a tuple, an empty optional for
+/// set_stopped(), and rethrows an error (an error_code arrives as
+/// std::system_error). The sender must have exactly one value
+/// completion, as for ex::sync_wait; any sender over this context's
+/// operations qualifies, composed or not. Other operations started on
+/// the context keep running meanwhile and may still be in flight when
+/// this returns.
+template <stack_budget Budget, class Sender>
+auto sync_wait(basic_io_context<Budget>& ctx, Sender&& sndr) {
+  using env_t = decltype(blake3pp::ex::get_env(
+      std::declval<const detail::sync_receiver<std::tuple<>>&>()));
+  using tuple_t = blake3pp::ex::value_types_of_t<std::remove_cvref_t<Sender>,
+                                                 env_t, std::tuple,
+                                                 std::type_identity_t>;
+  detail::sync_state<tuple_t> st;
+  auto op = blake3pp::ex::connect(std::forward<Sender>(sndr),
+                                  detail::sync_receiver<tuple_t>{&st});
+  blake3pp::ex::start(op);
+  ctx.run_until(st.done);
+  if (st.error != nullptr) {
+    std::rethrow_exception(st.error);
+  }
+  if (st.stopped) {
+    return std::optional<tuple_t>{};
+  }
+  return std::move(st.value);
 }
 
 }  // namespace blake3pp::async

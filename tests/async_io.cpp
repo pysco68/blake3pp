@@ -325,6 +325,118 @@ TEST_CASE("operations started from another thread join a running context") {
   runner.join();
 }
 
+// sync_wait() drives the context on the calling thread until the one
+// operation it was given completes: no runner thread, no operation
+// storage, the values back as a tuple. A composed sender works too.
+TEST_CASE("sync_wait drives the context until its sender completes") {
+  const auto a = pattern(2 * 64 * 1024 + 11, 50);
+  const auto b = pattern(3 * 64 * 1024 + 5, 51);
+  const temp_file fa(a);
+  const temp_file fb(b);
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+
+  auto one = async::sync_wait(ctx, async::async_hash_file(ctx, fa.path(), sched));
+  REQUIRE(one.has_value());
+  CHECK(std::get<0>(*one) == blake3pp::hash(a));
+
+  auto both = async::sync_wait(
+      ctx, ex::when_all(async::async_hash_file(ctx, fa.path(), sched),
+                        async::async_hash_file(ctx, fb.path(), sched)));
+  REQUIRE(both.has_value());
+  const auto [da, db] = *both;
+  CHECK(da == blake3pp::hash(a));
+  CHECK(db == blake3pp::hash(b));
+
+  // An error_code completion arrives as a system_error.
+  CHECK_THROWS_AS(async::sync_wait(ctx, async::async_hash_file(
+                                            ctx, fa.path() / "nope", sched)),
+                  std::system_error);
+
+  // And the update form, whose value is nothing.
+  blake3pp::hasher h;
+  auto none = async::sync_wait(ctx, async::async_update_file(ctx, h, fb.path(), sched));
+  REQUIRE(none.has_value());
+  CHECK(h.finalize() == blake3pp::hash(b));
+}
+
+// Many files, a bounded number at a time, over a context with fewer
+// windows than files: every outcome is reported with its hasher, a
+// missing file is an outcome and not the end of the run, and the
+// operation completes once.
+TEST_CASE("async_update_files reports every file and completes once") {
+  constexpr std::size_t files = 6;
+  std::vector<std::vector<std::byte>> contents;
+  std::vector<std::unique_ptr<temp_file>> temps;
+  std::vector<fs::path> paths;
+  for (std::size_t i = 0; i < files; ++i) {
+    contents.push_back(pattern(64 * 1024 * (i + 1) + 7 * i, 60 + static_cast<std::uint32_t>(i)));
+    temps.push_back(std::make_unique<temp_file>(contents.back()));
+    paths.push_back(temps.back()->path());
+  }
+  paths.insert(paths.begin() + 2, temps[0]->path() / "missing");  // the third file does not exist
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+  std::vector<std::optional<blake3pp::digest>> got(paths.size());
+  std::vector<bool> failed(paths.size());
+  unsigned calls = 0;
+  unsigned made = 0;
+  auto work = async::async_update_files(
+      ctx, paths, sched, {.in_flight = 2},
+      [&](std::size_t) {
+        ++made;
+        return blake3pp::hasher{};
+      },
+      [&](std::size_t i, blake3pp::hasher& h, const async::file_outcome& o) noexcept {
+        ++calls;
+        if (o.ok()) {
+          got[i] = h.finalize();
+        } else {
+          failed[i] = true;
+        }
+      });
+  auto done = async::sync_wait(ctx, std::move(work));
+  REQUIRE(done.has_value());
+  CHECK(calls == paths.size());
+  CHECK(made == paths.size());
+  for (std::size_t i = 0, c = 0; i < paths.size(); ++i) {
+    CAPTURE(i);
+    if (i == 2) {
+      CHECK(!got[i].has_value());
+      CHECK(failed[i]);
+      continue;
+    }
+    CHECK(!failed[i]);
+    REQUIRE(got[i].has_value());
+    CHECK(*got[i] == blake3pp::hash(contents[c++]));
+  }
+
+  // Nothing to do completes too, with no callback.
+  calls = 0;
+  auto empty = async::sync_wait(
+      ctx, async::async_update_files(
+               ctx, std::span<const fs::path>{}, sched, {},
+               [](std::size_t) { return blake3pp::hasher{}; },
+               [&](std::size_t, blake3pp::hasher&, const async::file_outcome&) noexcept { ++calls; }));
+  REQUIRE(empty.has_value());
+  CHECK(calls == 0);
+}
+
+// A byte budget for the arena is the knob a caller actually has.
+TEST_CASE("arena_bytes sizes the window count") {
+  async::io_context by_bytes({.window_bytes = 64 * 1024,
+                              .queue_depth = 2,
+                              .arena_bytes = 8 * 64 * 1024,
+                              .direct_io = false});
+  CHECK(by_bytes.windows() == 8);
+  async::io_context floor({.window_bytes = 64 * 1024,
+                           .queue_depth = 4,
+                           .arena_bytes = 64 * 1024,
+                           .direct_io = false});
+  CHECK(floor.windows() == 4);  // never fewer than the queue depth
+}
+
 TEST_CASE("several files run on one context at once") {
   // Four files, two windows: the pool runs out, and a pipeline that
   // finds none resumes when another gives one back.

@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
@@ -121,39 +122,6 @@ struct result {
   std::string error;
 };
 
-// The hasher one file streams into, and where its result goes.
-struct slot {
-  blake3pp::hasher h;
-  result* out = nullptr;
-  std::size_t len = 0;
-};
-
-// Writes the result and nothing else: it runs inside the context's loop,
-// and starting the next file from there would destroy an operation state
-// from inside its own completion.
-struct file_receiver {
-  using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
-  slot* s;
-  void set_value() const noexcept {
-    std::vector<std::byte> out(s->len);
-    s->h.finalize(out);
-    s->out->hex = blake3pp::to_hex(out);
-  }
-  void set_error(std::error_code ec) const noexcept {
-    s->out->error = ec.message();
-  }
-  void set_error(std::exception_ptr e) const noexcept {
-    try {
-      std::rethrow_exception(e);
-    } catch (const std::exception& ex) {
-      s->out->error = ex.what();
-    } catch (...) {
-      s->out->error = "unknown failure";
-    }
-  }
-  void set_stopped() const noexcept { s->out->error = "cancelled"; }
-};
-
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
@@ -201,7 +169,8 @@ class engine {
                         [](const std::string& f) { return f == "-"; });
   }
 
-  // Several files over one context, a fixed few in flight at a time.
+  // Several files over one context, a bounded number in flight at a
+  // time, each line printed as its file completes and in input order.
   //
   // What this buys over calling hash_hex() per file is the arena: the
   // blocking path allocates and first-touches windows * window_bytes per
@@ -209,71 +178,63 @@ class engine {
   // every file and several are in flight at once. On a directory of
   // small files that allocation is most of the work.
   //
-  // Results come back in input order, which is what the output has to
-  // be, and a file that fails carries its message instead of a digest so
-  // one bad file does not end the run.
-  std::vector<result> hash_many(const std::vector<std::string>& files,
-                                std::size_t out_len) {
-    // The arena is a byte budget rather than a window count, because the
-    // window size is the caller's: at the 8 MiB default this is sixteen
-    // windows, and at 64 MiB it is two.
-    constexpr std::size_t arena_budget = 128u << 20;
-    const unsigned qd = std::max(1u, opts_.io.queue_depth);
-    const auto by_budget = static_cast<unsigned>(
-        std::max<std::size_t>(1, arena_budget / std::max<std::size_t>(
-                                                    1, opts_.io.window_bytes)));
-    const unsigned windows = std::clamp(by_budget, qd, 32u);
-    // One file may hold queue_depth windows, so this many keep the arena
-    // busy without any of them starving.
-    const unsigned in_flight = std::max(1u, windows / qd);
-
+  // A file that fails carries its message instead of a digest, so one
+  // bad file does not end the run. Returns how many failed.
+  int hash_many(const std::vector<std::string>& files, std::size_t out_len) {
     blake3pp::async::io_context ctx({.window_bytes = opts_.io.window_bytes,
-                                     .queue_depth = qd,
-                                     .windows = windows,
+                                     .queue_depth = opts_.io.queue_depth,
+                                     .arena_bytes = 128u << 20,
                                      .direct_io = opts_.io.direct_io,
                                      .offload_submit = opts_.io.offload_submit});
-
-    using sender_t = decltype(blake3pp::async::async_update_file(
-        ctx, std::declval<blake3pp::hasher&>(), std::string{},
-        pool_.scheduler(), opts_.io));
-    using op_t = blake3pp::ex::connect_result_t<sender_t, file_receiver>;
-    struct make_op {
-      blake3pp::async::io_context* ctx;
-      slot* s;
-      const std::string* path;
-      decltype(std::declval<b3tool::compute_pool&>().scheduler()) sched;
-      blake3pp::file_io_options io;
-      operator op_t() const {
-        return blake3pp::ex::connect(
-            blake3pp::async::async_update_file(*ctx, s->h, *path, sched, io),
-            file_receiver{s});
-      }
-    };
-
-    std::vector<result> out(files.size());
-    std::vector<slot> slots;
-    std::vector<std::optional<op_t>> ops(in_flight);
-    for (std::size_t base = 0; base < files.size(); base += in_flight) {
-      const std::size_t n = std::min<std::size_t>(in_flight, files.size() - base);
-      slots.clear();
-      slots.reserve(n);
-      for (std::size_t i = 0; i < n; ++i) {
-        slots.push_back({make_hasher(), &out[base + i], out_len});
-      }
-      for (std::size_t i = 0; i < n; ++i) {
-        ops[i].emplace(make_op{&ctx, &slots[i], &files[base + i],
-                               pool_.scheduler(), opts_.io});
-        blake3pp::ex::start(*ops[i]);
-      }
-      ctx.run_until_idle();
-      for (std::size_t i = 0; i < n; ++i) {
-        ops[i].reset();
-      }
-    }
-    return out;
+    const std::vector<std::filesystem::path> paths(files.begin(), files.end());
+    std::vector<std::optional<result>> out(files.size());
+    std::vector<std::byte> digest(out_len);
+    std::size_t next = 0;  // the next line to print
+    int failures = 0;
+    auto work = blake3pp::async::async_update_files(
+        ctx, paths, pool_.scheduler(), {.io = opts_.io},
+        [this](std::size_t) { return make_hasher(); },
+        [&](std::size_t i, blake3pp::hasher& h,
+            const blake3pp::async::file_outcome& o) noexcept {
+          out[i] = describe(o, h, digest);
+          for (; next < out.size() && out[next].has_value(); ++next) {
+            const result& r = *out[next];
+            if (r.error.empty()) {
+              println(stdout, "{}  {}", r.hex, files[next]);
+            } else {
+              println(stderr, "blake3ppsum: {}: {}", files[next], r.error);
+              failures++;
+            }
+          }
+        });
+    blake3pp::async::sync_wait(ctx, std::move(work));
+    return failures;
   }
 
  private:
+  static result describe(const blake3pp::async::file_outcome& o,
+                         blake3pp::hasher& h,
+                         std::span<std::byte> digest) noexcept {
+    result r;
+    try {
+      if (o.ok()) {
+        h.finalize(digest);
+        r.hex = blake3pp::to_hex(digest);
+      } else if (o.error) {
+        r.error = o.error.message();
+      } else if (o.stopped) {
+        r.error = "cancelled";
+      } else {
+        std::rethrow_exception(o.exception);
+      }
+    } catch (const std::exception& e) {
+      r.error = e.what();
+    } catch (...) {
+      r.error = "unknown failure";
+    }
+    return r;
+  }
+
   blake3pp::hasher make_hasher() const {
     if (!opts_.derive_context.empty()) {
       return blake3pp::hasher::derive_key(opts_.derive_context, opts_.io.a);
@@ -447,16 +408,8 @@ int main(int argc, char** argv) {
 
     if (eng.can_batch(o.files)) {
       // Several files over one context: one arena, several in flight,
-      // results in input order.
-      const auto results = eng.hash_many(o.files, o.out_len);
-      for (std::size_t i = 0; i < o.files.size(); ++i) {
-        if (results[i].error.empty()) {
-          println(stdout, "{}  {}", results[i].hex, o.files[i]);
-        } else {
-          println(stderr, "blake3ppsum: {}: {}", o.files[i], results[i].error);
-          failures++;
-        }
-      }
+      // lines printed as files complete, in input order.
+      failures += eng.hash_many(o.files, o.out_len);
     } else {
       for (const auto& f : o.files) {
         try {
