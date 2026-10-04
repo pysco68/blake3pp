@@ -513,6 +513,17 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
   }
 }
 
+// Smallest remainder hash_many pads out to a full-width batch instead of
+// finishing through the scalar compress, measured per lane count on the
+// one-block parent shape. At W=16 (Emerald Rapids, full-width AVX-512) a
+// padded batch beats three scalar blocks and loses to two; at W=8 and W=4
+// (Zen 3+) it already beats two, by 25% and 15%. Widths without a
+// measurement never pad.
+constexpr std::size_t pad_remainder_min = u32v::width >= 16  ? 3
+                                          : u32v::width == 8 ? 2
+                                          : u32v::width == 4 ? 2
+                                                             : u32v::width;
+
 void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
                std::size_t blocks, const std::uint32_t key[8],
                std::uint64_t counter, bool increment_counter,
@@ -524,6 +535,24 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
       hash_batch(inputs + i, blocks, key,
                  counter + (increment_counter ? i : 0), increment_counter,
                  flags, flags_start, flags_end, out + i * out_len);
+    }
+  }
+  // A remainder of at least pad_remainder_min inputs runs as one full-width
+  // batch, the unused lanes aimed at the last real input (every lane reads
+  // valid memory) and their outputs dropped. The wide batch costs the same
+  // whatever the lane count and the scalar loop a block per input, so the
+  // threshold is where one batch undercuts that many scalar blocks.
+  if constexpr (u32v::width > 1) {
+    if (const std::size_t rem = num_inputs - i; rem >= pad_remainder_min) {
+      const std::uint8_t* padded[u32v::width];
+      for (std::size_t l = 0; l < u32v::width; ++l) {
+        padded[l] = inputs[i + (l < rem ? l : rem - 1)];
+      }
+      std::uint8_t tmp[u32v::width * out_len];
+      hash_batch(padded, blocks, key, counter + (increment_counter ? i : 0),
+                 increment_counter, flags, flags_start, flags_end, tmp);
+      std::memcpy(out + i * out_len, tmp, rem * out_len);
+      i = num_inputs;
     }
   }
   for (; i < num_inputs; ++i) {
