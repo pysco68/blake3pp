@@ -283,7 +283,15 @@ class polled_writer_engine {
     st.ec = {};
     st.op.done = &on_done;
     st.op.owner = &st;
-    ctx_.submit_write(file_, offset_, {b.data, bytes}, st.op);
+    // A context may refuse the submission by throwing (the concept asks
+    // that of flush() only); the slot must not stay marked busy for a
+    // write that never existed, or wait_slot() polls for it for ever.
+    try {
+      ctx_.submit_write(file_, offset_, {b.data, bytes}, st.op);
+    } catch (...) {
+      st.busy = false;
+      throw;
+    }
     ctx_.flush();
     offset_ += bytes;
     written_ += bytes;
@@ -297,10 +305,12 @@ class polled_writer_engine {
       wait_slot(s);
     }
     throw_if_failed();
-    if (preallocated_ > written_) {
-      file_.set_size(written_);
-      preallocated_ = 0;
-    }
+    // Always, not only to cut a preallocation back: set_size() is also
+    // where a buffered backend lands what it still holds (stdio's is a
+    // flush), and "finish() lands" has to hold for every backend. On
+    // the others it is one truncate to the size the file already has.
+    file_.set_size(written_);
+    preallocated_ = 0;
   }
 
  private:

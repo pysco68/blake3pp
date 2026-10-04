@@ -28,9 +28,12 @@
 // at.
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <functional>
@@ -40,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__unix__) || defined(__APPLE__)

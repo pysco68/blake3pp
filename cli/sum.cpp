@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
@@ -25,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include <CLI/CLI.hpp>
@@ -114,6 +116,12 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
   throw std::runtime_error("key must be exactly 32 raw bytes or 64 hex characters");
 }
 
+// One file's outcome: a digest, or why there is none.
+struct result {
+  std::string hex;
+  std::string error;
+};
+
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
@@ -152,7 +160,81 @@ class engine {
     return finish(h);
   }
 
+  // Whether hash_many() would do anything the per-file loop does not.
+  // Standard input has no file to hand to a context, and one file needs
+  // no arena shared with anything.
+  [[nodiscard]] bool can_batch(const std::vector<std::string>& files) const {
+    return pool_.parallel() && files.size() > 1 &&
+           std::none_of(files.begin(), files.end(),
+                        [](const std::string& f) { return f == "-"; });
+  }
+
+  // Several files over one context, a bounded number in flight at a
+  // time, each line printed as its file completes and in input order.
+  //
+  // What this buys over calling hash_hex() per file is the arena: the
+  // blocking path allocates and first-touches windows * window_bytes per
+  // call and lets no two files overlap, while here one allocation serves
+  // every file and several are in flight at once. On a directory of
+  // small files that allocation is most of the work.
+  //
+  // A file that fails carries its message instead of a digest, so one
+  // bad file does not end the run. Returns how many failed.
+  int hash_many(const std::vector<std::string>& files, std::size_t out_len) {
+    blake3pp::async::io_context ctx({.window_bytes = opts_.io.window_bytes,
+                                     .queue_depth = opts_.io.queue_depth,
+                                     .arena_bytes = 128u << 20,
+                                     .direct_io = opts_.io.direct_io,
+                                     .offload_submit = opts_.io.offload_submit});
+    const std::vector<std::filesystem::path> paths(files.begin(), files.end());
+    std::vector<std::optional<result>> out(files.size());
+    std::vector<std::byte> digest(out_len);
+    std::size_t next = 0;  // the next line to print
+    int failures = 0;
+    auto work = blake3pp::async::async_update_files(
+        ctx, paths, pool_.scheduler(), {.io = opts_.io},
+        [this](std::size_t) { return make_hasher(); },
+        [&](std::size_t i, blake3pp::hasher& h,
+            const blake3pp::async::file_outcome& o) noexcept {
+          out[i] = describe(o, h, digest);
+          for (; next < out.size() && out[next].has_value(); ++next) {
+            const result& r = *out[next];
+            if (r.error.empty()) {
+              println(stdout, "{}  {}", r.hex, files[next]);
+            } else {
+              println(stderr, "blake3ppsum: {}: {}", files[next], r.error);
+              failures++;
+            }
+          }
+        });
+    blake3pp::async::sync_wait(ctx, std::move(work));
+    return failures;
+  }
+
  private:
+  static result describe(const blake3pp::async::file_outcome& o,
+                         blake3pp::hasher& h,
+                         std::span<std::byte> digest) noexcept {
+    result r;
+    try {
+      if (o.ok()) {
+        h.finalize(digest);
+        r.hex = blake3pp::to_hex(digest);
+      } else if (o.error) {
+        r.error = o.error.message();
+      } else if (o.stopped) {
+        r.error = "cancelled";
+      } else {
+        std::rethrow_exception(o.exception);
+      }
+    } catch (const std::exception& e) {
+      r.error = e.what();
+    } catch (...) {
+      r.error = "unknown failure";
+    }
+    return r;
+  }
+
   blake3pp::hasher make_hasher() const {
     if (!opts_.derive_context.empty()) {
       return blake3pp::hasher::derive_key(opts_.derive_context, opts_.io.a);
@@ -324,12 +406,18 @@ int main(int argc, char** argv) {
       return failures == 0 ? 0 : b3tool::exit_failure;
     }
 
-    for (const auto& f : o.files) {
-      try {
-        println(stdout, "{}  {}", eng.hash_hex(f, o.out_len), f);
-      } catch (const std::exception& e) {
-        println(stderr, "blake3ppsum: {}: {}", f, e.what());
-        failures++;
+    if (eng.can_batch(o.files)) {
+      // Several files over one context: one arena, several in flight,
+      // lines printed as files complete, in input order.
+      failures += eng.hash_many(o.files, o.out_len);
+    } else {
+      for (const auto& f : o.files) {
+        try {
+          println(stdout, "{}  {}", eng.hash_hex(f, o.out_len), f);
+        } catch (const std::exception& e) {
+          println(stderr, "blake3ppsum: {}: {}", f, e.what());
+          failures++;
+        }
       }
     }
   } catch (const std::exception& e) {

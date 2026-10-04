@@ -122,13 +122,14 @@ class io_driver {
   // destructor drains too, a no-op after this.
   void drain() noexcept;
 
-  // Takes the run's window memory: one direct-I/O-aligned arena of
+  // Takes the window memory: one direct-I/O-aligned arena of
   // windows * window_bytes, valid until the driver is destroyed -- which
   // drains first, so no read is ever in flight into freed memory.
-  // Exactly one call per driver, made by the pipeline scope at
-  // construction: the driver hosts one scope at a time today, and a
-  // second call is a contract violation that debug builds assert on
-  // rather than a reallocation. There is no free().
+  // Exactly one call per driver, made by the window pool at
+  // construction; a second call is a contract violation that debug
+  // builds assert on rather than a reallocation. There is no free().
+  // Several pipelines may run over one arena at once, each borrowing
+  // windows from that pool.
   void reserve(unsigned windows, std::size_t window_bytes);
 
   // The slice of that arena window `slot` reads into, and the same bytes

@@ -377,8 +377,8 @@ static_assert(blake3pp::ex::scheduler<stopping_scheduler>);
 
 }  // namespace
 
-// The compress stage the file pipeline starts per window: the same bulk
-// and the same fold hash_window_parallel runs, but as a sender whose
+// The compress stage the file pipeline starts per window: the bulk over
+// the window's parts and the fold that reduces them, as a sender whose
 // state lives in the window object rather than on the calling frame.
 // What it produces has to be the window's chaining value, or every
 // digest downstream of it is wrong.

@@ -20,6 +20,9 @@
 ///                            library only)
 /// <blake3pp/parallel_io.hpp> the same over a scheduler (io.hpp +
 ///                            parallel.hpp)
+/// <blake3pp/async_io.hpp>    EXPERIMENTAL: the same as senders over a
+///                            context the caller drives, for many files
+///                            on one arena
 /// <blake3pp/trace.hpp>       per-window timing records for update_file()
 ///                            (standard library only)
 /// @endcode
@@ -31,6 +34,7 @@
 #include <blake3pp/dispatch.hpp>
 #include <blake3pp/parallel.hpp>
 #if BLAKE3PP_WITH_IO
+#include <blake3pp/async_io.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel_io.hpp>
 #include <blake3pp/trace.hpp>

@@ -28,6 +28,7 @@
 #include <span>
 
 #include "kernel/kernel.hpp"
+#include "kernel/uninitialized.hpp"
 
 namespace blake3pp::core {
 
@@ -55,8 +56,7 @@ constexpr std::size_t subtree_fold_levels = 0;  // the recursion
 // generation of the parallel engine's window fold. memcpy of the whole
 // 32 bytes is the same bytes in two vector moves. The portable form stays
 // for the other byte order, where it is the only correct one.
-inline void store_cv_le(std::span<const std::uint32_t, 8> cv,
-                        std::uint8_t* out) noexcept {
+inline void store_cv_le(std::span<const std::uint32_t, 8> cv, std::uint8_t* out) noexcept {
   if constexpr (std::endian::native == std::endian::little) {
     std::memcpy(out, cv.data(), 8 * sizeof(std::uint32_t));
   } else {
@@ -69,8 +69,7 @@ inline void store_cv_le(std::span<const std::uint32_t, 8> cv,
   }
 }
 
-inline void load_cv_le(const std::uint8_t* in,
-                       std::span<std::uint32_t, 8> cv) noexcept {
+inline void load_cv_le(const std::uint8_t* in, std::span<std::uint32_t, 8> cv) noexcept {
   if constexpr (std::endian::native == std::endian::little) {
     std::memcpy(cv.data(), in, 8 * sizeof(std::uint32_t));
   } else {
@@ -95,7 +94,7 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
                                          std::uint32_t base_flags,
                                          std::uint8_t* out) noexcept {
   const std::size_t num_parents = num_children / 2;
-  const std::uint8_t* parent_blocks[2 * MaxDegree];
+  const std::uint8_t* parent_blocks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
   for (std::size_t i = 0; i < num_parents; ++i) {
     parent_blocks[i] = child_cvs + 2 * i * kern::out_len;
   }
@@ -131,7 +130,7 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
   // fits the max_batch_inputs CVs the callers provide.
   assert(std::has_single_bit(num_chunks));
   if (num_chunks <= 2 * k.simd_degree) {
-    const std::uint8_t* chunks[2 * MaxDegree];
+    const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
     for (std::size_t i = 0; i < num_chunks; ++i) {
       chunks[i] = input + i * kern::chunk_len;
     }
@@ -143,7 +142,7 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
   }
 
   const std::size_t half = num_chunks / 2;
-  std::uint8_t child_cvs[4 * MaxDegree * kern::out_len];
+  std::uint8_t child_cvs BLAKE3PP_CXXATTR_UNINITIALIZED [4 * MaxDegree * kern::out_len];
   const std::size_t nl = compress_subtree_wide<MaxDegree>(
       k, input, half, chunk_counter, key, base_flags, child_cvs);
   const std::size_t nr = compress_subtree_wide<MaxDegree>(
@@ -162,8 +161,8 @@ inline void compress_subtree_to_cv_recursive(
     std::size_t num_chunks, std::uint64_t chunk_counter,
     std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
     std::span<std::uint32_t, 8> out_cv) noexcept {
-  std::uint8_t cvs[2 * MaxDegree * kern::out_len];
-  std::uint8_t next[2 * MaxDegree * kern::out_len];
+  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
   std::size_t n = compress_subtree_wide<MaxDegree>(
       k, input, num_chunks, chunk_counter, key, base_flags, cvs);
   while (n > 1) {
@@ -209,9 +208,9 @@ inline void compress_subtree_to_cv_folded(
     std::size_t num_chunks, std::uint64_t chunk_counter,
     std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
     std::span<std::uint32_t, 8> out_cv) noexcept {
-  std::uint8_t cvs[2 * MaxDegree * kern::out_len];
-  std::uint8_t next[2 * MaxDegree * kern::out_len];
-  std::uint8_t stack[MaxStack * kern::out_len];
+  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+  std::uint8_t stack BLAKE3PP_CXXATTR_UNINITIALIZED [MaxStack * kern::out_len];
   std::size_t depth = 0;
 
   // Both are powers of two, so every group is a subtree-aligned unit and the
@@ -220,7 +219,7 @@ inline void compress_subtree_to_cv_folded(
   std::uint64_t groups = 0;
   for (std::size_t done = 0; done < num_chunks; done += group) {
     const std::size_t n = std::min(group, num_chunks - done);
-    const std::uint8_t* chunks[2 * MaxDegree];
+    const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
     for (std::size_t i = 0; i < n; ++i) {
       chunks[i] = input + (done + i) * kern::chunk_len;
     }
@@ -304,8 +303,8 @@ inline void fold_sibling_cvs_wide(const kern::kernel_ops& k,
                                   std::span<std::uint32_t, 8> out_cv) noexcept {
   assert(cvs.size() >= 2 && std::has_single_bit(cvs.size()));
   constexpr std::size_t batch_parents = 2 * MaxDegree;
-  std::uint8_t children[2 * batch_parents * kern::out_len];
-  std::uint8_t parents[batch_parents * kern::out_len];
+  std::uint8_t children BLAKE3PP_CXXATTR_UNINITIALIZED [2 * batch_parents * kern::out_len];
+  std::uint8_t parents BLAKE3PP_CXXATTR_UNINITIALIZED [batch_parents * kern::out_len];
 
   for (std::size_t n = cvs.size(); n > 1;) {
     std::size_t written = 0;

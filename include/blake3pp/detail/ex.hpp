@@ -43,6 +43,7 @@ using std::inplace_stop_source;
 using std::inplace_stop_token;
 using std::never_stop_token;
 using std::stop_callback_for_t;
+using std::unstoppable_token;
 #elif defined(BLAKE3PP_EXECUTION_BEMAN)
 using namespace beman::execution;
 #else

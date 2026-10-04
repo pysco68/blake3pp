@@ -23,6 +23,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -202,10 +204,17 @@ struct uring {
     return false;
   }
 
-  // Reaps every completion still owed. A failure of the wait itself,
-  // other than EINTR, ends the loop. Nothing more can be learned from
-  // that ring, and the caller's buffers are the only thing left to
-  // protect.
+  // Reaps every completion still owed. The caller frees the buffers
+  // those transfers target as soon as this returns, so it returns only
+  // when the kernel holds none of them.
+  //  - A wait interrupted or refused for a transient reason is retried:
+  //    EINTR, and EBUSY or EAGAIN, which a ring in overflow reports until
+  //    its queue is reaped.
+  //  - Any other failure is a ring this process has broken (a closed
+  //    descriptor, a bad argument) with transfers still in the kernel.
+  //    Nothing can make it release them, and continuing would let it
+  //    write into memory about to be reused, so the process ends with the
+  //    reason.
   void drain() noexcept {
     while (outstanding > 0 && cq_head != nullptr) {
       const unsigned head = *cq_head;
@@ -217,9 +226,15 @@ struct uring {
         outstanding -= std::min(tail - head, outstanding);
         continue;
       }
-      if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
-          errno != EINTR) {
-        break;
+      if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0) {
+        if (errno == EINTR || errno == EBUSY || errno == EAGAIN) {
+          continue;
+        }
+        std::fprintf(stderr,
+                     "blake3pp: io_uring_enter failed while %u read(s) were "
+                     "still owed (%s); their buffers cannot be released\n",
+                     outstanding, std::strerror(errno));
+        std::abort();
       }
     }
   }
@@ -388,29 +403,6 @@ struct uring {
     if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
         errno != EINTR) {
       throw_errno("io_uring_enter(wait)");
-    }
-  }
-
-  // Blocks for one completion and returns (user_data, result).
-  std::pair<std::uint64_t, int> wait_one() {
-    for (;;) {
-      const unsigned head = *cq_head;  // we are the only consumer
-      const unsigned tail =
-          std::atomic_ref<unsigned>(*cq_tail).load(std::memory_order_acquire);
-      if (head != tail) {
-        io_uring_cqe cqe{};
-        std::memcpy(&cqe, cqes + (head & *cq_mask) * sizeof(io_uring_cqe),
-                    sizeof(cqe));
-        const std::pair<std::uint64_t, int> out{cqe.user_data, cqe.res};
-        std::atomic_ref<unsigned>(*cq_head).store(head + 1,
-                                                  std::memory_order_release);
-        outstanding -= std::min(1u, outstanding);
-        return out;
-      }
-      if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
-          errno != EINTR) {
-        throw_errno("io_uring_enter(wait)");
-      }
     }
   }
 };
@@ -825,15 +817,27 @@ class uring_context {
       try {
         ring_.flush();
       } catch (const std::system_error&) {
-        // The arm will go out with the next read's flush; a wake in the
-        // meantime still breaks the sleep through the eventfd itself.
+        // The arm did not reach the kernel. It is withdrawn rather than
+        // left queued, so wake_armed_ says what is true: nothing watches
+        // the eventfd, and sleep_once() must not block on the completion
+        // queue for a wake that cannot arrive. The next blocking poll
+        // arms again.
+        ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
+          if (ud == wake_ud()) {
+            wake_armed_ = false;
+          }
+        });
       }
     }
     return woken;
   }
 
+  // Blocks until something can complete. With the wake poll armed, or
+  // reads in the kernel, that is the completion queue; with neither,
+  // the only event that can end the sleep is a wake() on the eventfd,
+  // so that is what is waited on.
   void sleep_once() {
-    if (use_uring_) {
+    if (use_uring_ && (wake_armed_ || in_flight_ > 0)) {
       ring_.wait_cq();
       return;
     }

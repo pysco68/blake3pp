@@ -43,7 +43,12 @@ add_executable(blake3pp_tests
 if(BLAKE3PP_WITH_IO)
   target_sources(blake3pp_tests PRIVATE
     io.cpp io_context.cpp io_no_provider.cpp file_pipeline.cpp
-    write_pipeline.cpp)
+    write_pipeline.cpp async_io.cpp
+    # Two translation units on purpose: see RULE 6 in
+    # detail/ex_compat.hpp. One drives the pipeline through the async
+    # senders and one through the blocking entry point, and only the
+    # pair reproduces the linkage defect they guard.
+    provider_linkage.cpp provider_linkage_tu2.cpp)
 endif()
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -55,11 +60,11 @@ target_include_directories(blake3pp_tests PRIVATE
 if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
   target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_REDUCED_CASES=1)
 endif()
-# The blocking update_file() has no stop parameter until Phase 7 exposes
-# one, so the seam in <blake3pp/parallel_io.hpp> that installs a stop is
-# compiled here and nowhere else. Every TU of this target gets it, which
-# is what keeps the inline function it guards one definition; the library
-# itself never includes that header.
+# The blocking update_file() takes no stop token (async_io.hpp is where a
+# caller brings one), so the seam in <blake3pp/parallel_io.hpp> that
+# installs a stop is compiled here and nowhere else. Every TU of this
+# target gets it, which keeps the inline function it guards one
+# definition; the library itself never includes that header.
 target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_PIPELINE_STOP=1)
 target_link_libraries(blake3pp_tests PRIVATE
   blake3pp::blake3pp

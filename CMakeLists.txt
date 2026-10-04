@@ -52,6 +52,33 @@ if(BLAKE3PP_TOOL_MIMALLOC AND CMAKE_CXX_FLAGS MATCHES "-fsanitize")
   set(BLAKE3PP_TOOL_MIMALLOC OFF)
 endif()
 
+# Every build type in the matrix defines NDEBUG, so assert() -- the way
+# this code states a precondition it cannot express in the type system
+# (a blocking poll with nothing owed, a file outliving its driver, a
+# reducer node index) -- is compiled out of every lane unless something
+# undefines it. The sanitizer lanes are where a violated precondition is
+# worth catching, and they already run at the matrix's optimisation
+# level, so they take the asserts too. The flag has to arrive as a
+# compile option rather than through the toolchain file: the
+# configuration's own -DNDEBUG comes after CMAKE_CXX_FLAGS, and target
+# options come after both.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+  set(_blake3pp_asserts_default ON)
+else()
+  set(_blake3pp_asserts_default OFF)
+endif()
+option(BLAKE3PP_ENABLE_ASSERTS
+  "Keep assert() live in optimised builds (default: on for sanitizer builds)"
+  ${_blake3pp_asserts_default})
+if(BLAKE3PP_ENABLE_ASSERTS)
+  if(MSVC)
+    add_compile_options(/UNDEBUG)
+  else()
+    add_compile_options(-UNDEBUG)
+  endif()
+  message(STATUS "blake3pp: assert() enabled (NDEBUG undefined)")
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(GNUInstallDirs)
 

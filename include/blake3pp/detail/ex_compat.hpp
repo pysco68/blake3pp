@@ -26,9 +26,13 @@ namespace blake3pp::detail::ex_compat {
 // `get_completion_signatures<Sndr, Env...>()` returning the signatures
 // as a value (beman/execution/detail/get_completion_signatures.hpp).
 // Declaring both satisfies either; a sender with only the typedef fails
-// on beman inside `let`/`then` with "constraints not satisfied for alias
-// template 'completion_signatures_of_t'", which does not mention the
-// sender at all.
+// on beman with "constraints not satisfied for alias template
+// 'completion_signatures_of_t'", which does not mention the sender at
+// all.
+//
+// Re-verified against the pinned providers: `let_value` still reproduces
+// it, `then` and `when_all` no longer do. One adaptor is enough, so the
+// rule stands as written.
 #define BLAKE3PP_EX_COMPLETION_SIGNATURES(...)                        \
   using completion_signatures = ::blake3pp::ex::completion_signatures<__VA_ARGS__>;  \
   template <class Sndr, class... Env>                                 \
@@ -96,6 +100,50 @@ using scheduler_tag = ::blake3pp::ex::scheduler_t;
 // receiver cannot pass through it there. The pipeline's receivers are
 // handles -- a window pointer and a scope pointer -- which is why this
 // costs nothing.
+
+// RULE 6 -- a namespace-scope template must not hold a provider sender
+// unless the operation types are in its own arguments.
+//
+// stdexec declares its sender expression template inside an anonymous
+// namespace (__basic_sender.hpp: `namespace { template <auto
+// _DescriptorFn> struct __sexpr ... }`), so every translation unit gets
+// its own sender types even for identical template arguments. That is
+// deliberate and normally invisible, because a sender type usually
+// appears in one place in one function.
+//
+// It stops being invisible for a class template at namespace scope
+// whose members are senders or operation states. Its mangled name comes
+// from its own arguments, so two translation units agree on the NAME
+// while disagreeing on the LAYOUT, the linker keeps one copy of each
+// member function, and one unit's destructor runs over the other
+// unit's object. UBSan's vptr check reports it as
+//
+//     member call on address 0x... which does not point to an object of
+//     type '__opstate'
+//     note: object is of type '*N7stdexec...__opstate...'
+//
+// -- the same type name twice, which is the signature of two typeinfos
+// for one name.
+//
+// Function-local types do not have the problem: they are instantiated
+// over the anonymous-namespace types and inherit their internal
+// linkage. Neither do templates that name the operation types among
+// their own arguments, for the same reason. So:
+//
+//     template <class Scope>                       // WRONG
+//     struct cells { std::optional<connect_result_t<...>> cell; };
+//
+//     template <class Scope, class Op>             // right
+//     struct cells { std::optional<Op> cell; };
+//     template <class Scope>
+//     using cells_for = cells<Scope, connect_result_t<...>>;
+//
+// The incident: detail::pipeline_cells (file_pipeline.hpp) was written
+// the first way so an asynchronous operation state could hold one as a
+// member, and the sanitizer lane failed on nine cases. A single
+// translation unit was clean either way; tests/provider_linkage.cpp and
+// its second translation unit are what reproduce it, and they are in
+// the suite so the next one is caught rather than noticed.
 
 // A receiver that accepts every completion, for the concept check each
 // custom sender and operation state ends with. An operation state is

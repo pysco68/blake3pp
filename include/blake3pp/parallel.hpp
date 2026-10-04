@@ -166,8 +166,16 @@ namespace detail {
 // flat enough that being wrong by a factor of two costs little.
 //
 // What sits below the crossover is the scope: window objects and a
-// reducer built per call. Once a context owns that storage across calls
-// the fixed cost mostly goes, and this number should come down with it.
+// reducer built per call.
+//
+// Re-measured once a context could own that storage across calls, and it
+// did not move: 512 KiB is still where the two paths meet (4.0-4.4
+// against 4.0-4.3 GiB/s over three runs, with the pipeline behind below
+// and ahead from 640 KiB). Nothing changed here because this function
+// takes no context and so still builds a pool for its one call. A
+// caller that already has one -- async_io.hpp's io_context -- pays no
+// such cost, and the threshold for that path would be lower; giving
+// hash_into a context is what would move this number.
 inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
 
 // The window a span already in memory is cut into.

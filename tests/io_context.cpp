@@ -457,6 +457,38 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
       expect);
 }
 
+#if defined(_WIN32)
+// A file closed with transfers it could not hand to the port (an
+// unaligned length under NO_BUFFERING, or no port at all) has to take
+// them with it: they name its handles and its share of the count. Left
+// queued, they would be performed through a closed handle, and a file
+// with a port would wait on it for completions that never arrive.
+TEST_CASE("an IOCP file closed with deferred transfers takes them with it") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const std::vector<std::byte> content(64 * 1024 + 100, std::byte{0x5c});
+  const temp_file f(content);
+  for (const bool async : {false, true}) {
+    CAPTURE(async);
+    io_impl::iocp_context ctx({.async = async}, 4);
+    std::array<std::byte, 4096 + 100> buf{};  // never a NO_BUFFERING granule
+    io_impl::iocp_context::read_op op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    {
+      io_impl::iocp_context::file file(
+          ctx, f.path, io_impl::file_open_options{.direct_io = true});
+      ctx.submit_read(file, 0, std::span{buf}, op);
+      ctx.flush();
+      CHECK(ctx.in_flight() == 1);
+    }
+    CHECK(ctx.in_flight() == 0);
+    CHECK(ctx.poll(false) == 0);
+    CHECK(p.calls == 0);
+  }
+}
+#endif
+
 TEST_CASE("a write reports only from poll, and lands what it was given") {
   // Every length in [0, 2 blocks] at the interesting boundaries: the
   // direct-I/O path can only take whole granules, so the rest go down

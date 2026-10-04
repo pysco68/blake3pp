@@ -72,6 +72,15 @@
     "CMAKE_GENERATOR": "Ninja",
     "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
 
+    // Empty, not unset: the base image sets it to Canonical's server, and
+    // an LLVM tool that cannot find debug info locally then tries to
+    // fetch it. The connect never completes here, so llvm-cov and
+    // llvm-profdata sit in poll(POLLOUT) on a one-second loop for ever,
+    // burning no CPU -- which reads as a slow tool rather than a stuck
+    // one. Anything hanging with flat CPU in an LLVM tool is this.
+    "DEBUGINFOD_URLS": "",
+
+
     // Sanitizer defaults. Harmless for uninstrumented binaries.
     // Symbolized traces need llvm-symbolizer on PATH or named explicitly.
     "ASAN_SYMBOLIZER_PATH": "/usr/local/bin/llvm-symbolizer",

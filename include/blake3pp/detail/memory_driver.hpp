@@ -170,12 +170,6 @@ class memory_driver {
    public:
     file(memory_driver&, std::span<const std::byte> bytes) noexcept
         : bytes_(bytes) {}
-    // A file the pipeline may write into; reads of it see what was
-    // written.
-    file(memory_driver&, std::span<std::byte> bytes) noexcept
-        : bytes_(bytes), writable_(bytes) {}
-
-    void set_size(std::uint64_t) noexcept {}  // a span has the size it has
 
     [[nodiscard]] std::uint64_t size() const noexcept {
       return static_cast<std::uint64_t>(bytes_.size());
@@ -185,7 +179,6 @@ class memory_driver {
    private:
     friend class memory_driver;
     std::span<const std::byte> bytes_;
-    std::span<std::byte> writable_{};
   };
 
   memory_driver() = default;
@@ -193,12 +186,12 @@ class memory_driver {
   memory_driver& operator=(const memory_driver&) = delete;
 
   // Nothing is owned, so there is nothing to size. The geometry is kept
-  // only to check that windows ask for slots the plan accounted for.
-  void reserve([[maybe_unused]] unsigned windows,
+  // only to check that windows ask for slots the plan accounted for;
+  // kept in every build, so the type has one layout whatever NDEBUG a
+  // translation unit was compiled with.
+  void reserve(unsigned windows,
                [[maybe_unused]] std::size_t window_bytes) noexcept {
-#ifndef NDEBUG
     windows_ = windows;
-#endif
   }
 
   // A window of a span is a subspan of it. Nothing to read into, because
@@ -216,17 +209,6 @@ class memory_driver {
     reads_.push(op);
   }
 
-  // A "file" in memory is written by copying into its span, which is the
-  // one place this driver moves bytes at all. The span has to be one the
-  // caller may write to, which is why the write side names it separately.
-  void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, io_read_op& op) noexcept {
-    assert(off + buf.size() <= f.writable_.size() &&
-           "a write past the end of the span this file is over");
-    std::copy_n(buf.data(), buf.size(),
-                f.writable_.data() + static_cast<std::size_t>(off));
-    reads_.push(op);
-  }
   void flush() noexcept {}
   std::size_t poll(bool block) { return reads_.poll(block); }
   void wake() noexcept { reads_.wake(); }
@@ -238,9 +220,7 @@ class memory_driver {
 
  private:
   queued_reads reads_;
-#ifndef NDEBUG
-  unsigned windows_ = 0;
-#endif
+  [[maybe_unused]] unsigned windows_ = 0;
 };
 
 static_assert(file_driver<memory_driver>);
