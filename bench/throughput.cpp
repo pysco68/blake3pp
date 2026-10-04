@@ -724,10 +724,25 @@ int main(int argc, char** argv) {
   // the feed size is what decides how much copying there is -- a feed of
   // one window copies all of it, a feed of eight copies an eighth.
   //
-  // It is below the one-shot rows for a structural reason worth seeing:
-  // each window flush is its own pipeline scope, so consecutive windows
-  // do not overlap, where the one-shot amortises one scope over the
-  // whole span.
+  // Every feed below is at most one window, so every byte is copied, on
+  // this thread, before its window is fanned out; and the pool parks
+  // while it is copied, so each window also pays a cold fan-out. The
+  // copy's own rate is printed first, because it is the ceiling of the
+  // rows under it, and it is a property of one core's store bandwidth,
+  // which is why the same binary streams at very different rates on
+  // machines whose pool rows agree.
+  {
+    const std::size_t window = std::min(
+        blake3pp::parallel_hasher_options{}.window_bytes, input.size());
+    std::vector<std::byte> copy(window);
+    const double s = b3tool::best_seconds(5, /*warmup=*/true, [&] {
+      std::memcpy(copy.data(), input.data(), window);
+      const volatile std::byte keep = copy[window - 1];  // the copy is observed
+      (void)keep;
+    });
+    println(stdout, "  {:<{}} {}   [one thread, one {} MiB window: what every stream row copies per window]",
+            "memcpy", 20, b3tool::rate(window, s), window >> 20);
+  }
   for (const std::size_t feed :
        {std::size_t{256} << 10, std::size_t{1} << 20, std::size_t{8} << 20}) {
     auto sched = engine_sched;
