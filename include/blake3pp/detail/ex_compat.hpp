@@ -26,9 +26,13 @@ namespace blake3pp::detail::ex_compat {
 // `get_completion_signatures<Sndr, Env...>()` returning the signatures
 // as a value (beman/execution/detail/get_completion_signatures.hpp).
 // Declaring both satisfies either; a sender with only the typedef fails
-// on beman inside `let`/`then` with "constraints not satisfied for alias
-// template 'completion_signatures_of_t'", which does not mention the
-// sender at all.
+// on beman with "constraints not satisfied for alias template
+// 'completion_signatures_of_t'", which does not mention the sender at
+// all.
+//
+// Re-verified against the pinned providers: `let_value` still reproduces
+// it, `then` and `when_all` no longer do. One adaptor is enough, so the
+// rule stands as written.
 #define BLAKE3PP_EX_COMPLETION_SIGNATURES(...)                        \
   using completion_signatures = ::blake3pp::ex::completion_signatures<__VA_ARGS__>;  \
   template <class Sndr, class... Env>                                 \
