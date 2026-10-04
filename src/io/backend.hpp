@@ -315,6 +315,29 @@ class deferred_ops {
   // to wait for, and none gets its callback.
   void clear() noexcept { head_ = tail_ = nullptr; }
 
+  // Forgets the queued ops `drop` accepts, on the same terms: for a file
+  // closing with transfers it could not issue, which name its handles
+  // and its share of the count. Returns how many were dropped.
+  template <class Pred>
+  std::size_t remove_if(Pred drop) noexcept {
+    std::size_t dropped = 0;
+    Op* prev = nullptr;
+    for (Op* op = head_; op != nullptr;) {
+      Op* const next = op->next_deferred;
+      if (drop(*op)) {
+        (prev == nullptr ? head_ : prev->next_deferred) = next;
+        if (tail_ == op) {
+          tail_ = prev;
+        }
+        ++dropped;
+      } else {
+        prev = op;
+      }
+      op = next;
+    }
+    return dropped;
+  }
+
  private:
   Op* head_ = nullptr;
   Op* tail_ = nullptr;

@@ -541,6 +541,15 @@ class iocp_context {
   // multi-file driver should idle a file before closing it.
   void forget(file& f) noexcept {
     unlink(f);
+    // What never reached the port goes first. A deferred transfer names
+    // this file's handles and this file's share of the count, and the
+    // next poll() would run it through both after they are gone; and
+    // the wait below is on the port, which will never hand back a
+    // transfer that was never given to it.
+    const std::size_t dropped = deferred_.remove_if(
+        [&f](const read_op& op) noexcept { return op.owner_file == &f; });
+    in_flight_ -= dropped;
+    f.inflight_ -= dropped;
     if (!f.f_.use_iocp || f.inflight_ == 0) {
       return;
     }
