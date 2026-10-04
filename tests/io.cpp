@@ -807,6 +807,36 @@ TEST_CASE("engine templates drive the off-platform backends") {
 #endif
 }
 
+// finish() promises that every accepted byte has landed, and a backend
+// that buffers in user space (stdio) can only keep that promise by
+// flushing inside it. The round trip above cannot tell: the writer is
+// destroyed, and fclose flushes, before anything reads the file. Here
+// the writer stays alive and the file is read by another handle, with
+// no preallocation, the configuration in which a skipped flush shows.
+TEST_CASE("finish() lands every byte on the stdio backend") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const auto content = make_input(100 * 1024 + 13);
+  const temp_file f({});  // placeholder path; the writer recreates it
+  io_impl::polled_writer_engine<io_impl::stdio_context> w(
+      f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
+  std::size_t pos = 0;
+  while (pos < content.size()) {
+    const auto b = w.acquire();
+    const std::size_t n = std::min(b.capacity, content.size() - pos);
+    std::memcpy(b.data, content.data() + pos, n);
+    w.submit(b, n);
+    pos += n;
+  }
+  w.finish();
+  // The writer is still open; the bytes must be visible regardless.
+  CHECK(std::filesystem::file_size(f.path) == content.size());
+  std::ifstream in(f.path, std::ios::binary);
+  std::vector<char> raw(content.size());
+  in.read(raw.data(), static_cast<std::streamsize>(raw.size()));
+  CHECK(static_cast<std::size_t>(in.gcount()) == content.size());
+  CHECK(std::memcmp(raw.data(), content.data(), content.size()) == 0);
+}
+
 // Stand-in for boost::filesystem::path: satisfies the foreign_path concept
 // structurally, which is exactly how a real boost path would enter.
 struct fake_boost_path {
