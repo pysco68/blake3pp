@@ -273,6 +273,21 @@ void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                                out_cv);
 }
 
+std::size_t compress_subtree_cvs(const kern::kernel_ops* ops,
+                                 const std::byte* data, std::size_t num_chunks,
+                                 std::uint64_t chunk_counter,
+                                 std::span<const std::uint32_t, 8> key,
+                                 std::uint32_t base_flags,
+                                 std::span<std::array<std::uint32_t, 8>> out_cvs) noexcept {
+  return core::compress_subtree_to_cvs(*ops, kern::kernel_bytes(data),
+                                       num_chunks, chunk_counter, key,
+                                       base_flags, out_cvs);
+}
+
+std::size_t simd_degree(const kern::kernel_ops* ops) noexcept {
+  return ops->simd_degree;
+}
+
 void fold_sibling_cvs(const kern::kernel_ops* ops,
                       std::span<std::array<std::uint32_t, 8>> cvs,
                       std::span<const std::uint32_t, 8> key,

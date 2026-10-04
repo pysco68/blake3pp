@@ -352,6 +352,23 @@ void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::uint32_t base_flags,
                          std::span<std::uint32_t, 8> out_cv) noexcept;
 
+// The same reduction stopped at its last lane-filling generation: writes
+// min(num_chunks, simd_degree(ops)) chaining values of equal-sized
+// adjacent subtrees to out_cvs, left to right, and returns the count. The
+// caller folds them with other parts' so the remaining generations run
+// lanes-wide too. Same contract as compress_subtree_cv otherwise.
+// @pre out_cvs.size() >= simd_degree(ops).
+std::size_t compress_subtree_cvs(const kern::kernel_ops* ops,
+                                 const std::byte* data, std::size_t num_chunks,
+                                 std::uint64_t chunk_counter,
+                                 std::span<const std::uint32_t, 8> key,
+                                 std::uint32_t base_flags,
+                                 std::span<std::array<std::uint32_t, 8>> out_cvs) noexcept;
+
+// How many inputs the table hashes per lane-filling hash_many step: 1 for
+// the scalar kernel, the SIMD width otherwise.
+[[nodiscard]] std::size_t simd_degree(const kern::kernel_ops* ops) noexcept;
+
 // Reduces cvs.size() chaining values of equal-sized, adjacent subtrees
 // (left to right) to the CV of their common ancestor, one generation at a
 // time, lanes-wide. Never the root, so no ROOT flag. cvs is scratch and is

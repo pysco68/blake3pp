@@ -388,27 +388,35 @@ TEST_CASE("the window compress stage produces the window's chaining value") {
   auto sched = get_parallel_scheduler();
   const auto* ops = detail::resolve(arch::auto_detect);
 
-  // A window of 512 chunks, with a tail after it so the window is not
-  // the root: the CV only means anything in that position.
-  constexpr std::size_t window_chunks = 512;
-  constexpr std::size_t window_bytes = window_chunks * chunk_size;
-  const auto input = make_input(window_bytes + 1024);
+  // Windows with a tail after them so the window is not the root: the
+  // CV only means anything in that position. The sizes span the grouped
+  // reduction's shapes at 16-chunk parts: fewer parts than a group (2),
+  // exactly one group (16), and several groups (32 and 256), the last
+  // through more than one fold batch.
+  for (const std::size_t window_chunks : {32u, 256u, 512u, 4096u}) {
+    CAPTURE(window_chunks);
+    const std::size_t window_bytes = window_chunks * chunk_size;
+    const auto input = make_input(window_bytes + 1024);
 
-  hasher via_stage;
-  detail::window_compress<default_stack_budget> w;
-  REQUIRE(w.prepare(ops, input.data(), window_chunks, 0, via_stage.key_words(),
-                    via_stage.mode_flags(), nullptr, 0));
-  CHECK(w.n_parts > 1);
-  auto result = ex::sync_wait(detail::compress_on<false>(sched, w));
-  REQUIRE(result.has_value());
-  const auto cv = std::get<0>(*result);
+    hasher via_stage;
+    detail::window_compress<default_stack_budget> w;
+    REQUIRE(w.prepare(ops, input.data(), window_chunks, 0,
+                      via_stage.key_words(), via_stage.mode_flags(), nullptr,
+                      0));
+    CHECK(w.n_parts > 1);
+    CHECK(w.group == std::min<std::size_t>(detail::fold_group_parts,
+                                           w.n_parts));
+    auto result = ex::sync_wait(detail::compress_on<false>(sched, w));
+    REQUIRE(result.has_value());
+    const auto cv = std::get<0>(*result);
 
-  via_stage.push_subtree_cv(cv, window_chunks);
-  via_stage.update(std::span(input).subspan(window_bytes));
+    via_stage.push_subtree_cv(cv, window_chunks);
+    via_stage.update(std::span(input).subspan(window_bytes));
 
-  hasher sequential;
-  sequential.update(input);
-  CHECK(via_stage.finalize() == sequential.finalize());
+    hasher sequential;
+    sequential.update(input);
+    CHECK(via_stage.finalize() == sequential.finalize());
+  }
 }
 
 // Tracing must not change what the stage computes, only what it records.

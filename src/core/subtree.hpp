@@ -178,6 +178,34 @@ inline void compress_subtree_to_cv_recursive(
   }
 }
 
+// The reduction stopped at its last wide level: the part's chaining
+// values are reduced only while a generation still fills the lanes, and
+// what is left, min(num_chunks, simd_degree) CVs of equal-sized adjacent
+// subtrees, goes to the caller for a wider fold. Every generation this
+// skips would run below full occupancy; folded across several parts they
+// run full. Returns how many CVs were written.
+template <std::size_t MaxDegree = kern::max_simd_degree>
+inline std::size_t compress_subtree_to_cvs(
+    const kern::kernel_ops& k, const std::uint8_t* input,
+    std::size_t num_chunks, std::uint64_t chunk_counter,
+    std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
+    std::span<std::array<std::uint32_t, 8>> out_cvs) noexcept {
+  assert(num_chunks > 0 && std::has_single_bit(num_chunks));
+  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+  std::size_t n = compress_subtree_wide<MaxDegree>(
+      k, input, num_chunks, chunk_counter, key, base_flags, cvs);
+  while (n > k.simd_degree) {
+    n = compress_parents_wide<MaxDegree>(k, cvs, n, key, base_flags, next);
+    std::copy_n(next, n * kern::out_len, cvs);
+  }
+  assert(n <= out_cvs.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    load_cv_le(cvs + i * kern::out_len, out_cvs[i]);
+  }
+  return n;
+}
+
 // The same reduction, folding as it goes instead of holding the tree. One
 // group of 2*simd_degree chunks goes through hash_many at a time, is reduced
 // to one CV by wide parent passes, then merges into a binary-counter stack

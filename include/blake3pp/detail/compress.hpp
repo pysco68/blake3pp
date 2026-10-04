@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <span>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <sched.h>  // sched_getcpu() for agent_record::cpu
@@ -67,6 +68,11 @@ void stack_budget_below_two_parts();
 /// larger, which makes the per-agent reduction deeper, so it moves stack
 /// from the caller to the agents rather than saving any. Nothing checks an
 /// agent thread's stack at run time.
+///
+/// @note A full window's grouped reduction keeps a second table of
+/// parts() x simd_degree chaining values, 512 KiB at most for the default
+/// budget on a 16-lane kernel; it lives on the heap with the window that
+/// owns it, allocated when the window first needs it and kept.
 ///
 /// @see docs/api.md for what the knob trades away, and
 /// docs/freestanding.md for the measured frames and a worked case.
@@ -119,11 +125,23 @@ template <stack_budget Budget>
       (num_chunks + Budget.parts() - 1) / Budget.parts(), min_part_chunks));
 }
 
-// One CV slot per part, on the caller's stack. The slots are unpadded:
-// each is written once per part-sized task, so neighbours sharing a cache
-// line cost nothing measurable.
+// One CV slot per part. The slots are unpadded: each is written once per
+// part-sized task, so neighbours sharing a cache line cost nothing
+// measurable.
 template <stack_budget Budget>
 using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
+
+// A full window's parts are reduced in groups of this many, by the agent
+// that finishes a group's last part, before the fold after the bulk sees
+// anything. A part reduced on its own ends in log2(part) parent
+// generations below full lane occupancy, a measured 15% of a 16-chunk
+// part's time on AVX2 and 22% on AVX-512; folded 16 parts at a time the
+// generations stay lane-filling down to the last log2(degree), 4% and 8%.
+// The reduction has to happen inside the bulk: moved whole into the fold
+// behind it, which one agent runs, it is a sixteenth of the window's
+// blocks on one thread, and from eight agents up that costs more wall
+// time than the parts saved.
+inline constexpr std::size_t fold_group_parts = 16;
 static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
 
 // What one bulk over a window's parts records when tracing: the agents' summed
@@ -297,10 +315,26 @@ struct window_compress {
   std::array<std::uint32_t, 8> key{};
   std::uint32_t flags = 0;
 
-  part_cvs<Budget> cvs;               // one CV per part
+  // One CV per part on the edge path, one per group on the grouped one;
+  // what the fold after the bulk reads.
+  part_cvs<Budget> cvs;
   std::atomic<std::size_t> next{0};   // the agents pull their parts from here
   std::array<std::uint32_t, 8> cv{};  // where the fold leaves the window's CV
   part_trace pt{nullptr, 0, 0};
+
+  // The grouped reduction of a full window (fold_group_parts). Each part
+  // leaves its `width` chaining values in lanes, at i * width; the agent
+  // whose part completes a group folds that group's slots into cvs[g].
+  // lanes holds n_parts * width CVs, grown on the first window that
+  // needs the size and kept, 512 KiB at most for the default budget on
+  // a 16-lane kernel; the rest of the window's state is fixed-size.
+  bool grouped = false;
+  std::size_t group = 0;  // parts per group
+  std::size_t width = 0;  // CVs per part: the kernel's simd_degree
+  std::vector<std::array<std::uint32_t, 8>> lanes;
+  std::array<std::atomic<std::uint32_t>,
+             std::max<std::size_t>(1, Budget.parts() / fold_group_parts)>
+      done;
 
   window_compress() = default;
   window_compress(const window_compress&) = delete;
@@ -332,6 +366,15 @@ struct window_compress {
     pt.part_chunks = static_cast<std::uint32_t>(p);
     pt.busy_ns.store(0, std::memory_order_relaxed);
     pt.active.store(0, std::memory_order_relaxed);
+    grouped = true;
+    group = std::min(fold_group_parts, n_parts);
+    width = simd_degree(o);
+    if (lanes.size() < n_parts * width) {
+      lanes.resize(n_parts * width);
+    }
+    for (auto& count : done) {
+      count.store(0, std::memory_order_relaxed);
+    }
     return true;
   }
 
@@ -358,11 +401,36 @@ struct window_compress {
     pt.part_chunks = static_cast<std::uint32_t>(part_chunks);
     pt.busy_ns.store(0, std::memory_order_relaxed);
     pt.active.store(0, std::memory_order_relaxed);
+    grouped = false;
+  }
+
+  // How many CVs the fold after the bulk reduces.
+  [[nodiscard]] std::size_t fold_inputs() const noexcept {
+    return grouped ? n_parts / group : n_parts;
   }
 
   void operator()(std::size_t i) noexcept {
-    compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                        chunk_counter + i * part, key, flags, cvs[i]);
+    const std::byte* d = data + i * part * chunk_size;
+    const std::uint64_t counter = chunk_counter + i * part;
+    if (!grouped) {
+      compress_subtree_cv(ops, d, part, counter, key, flags, cvs[i]);
+      return;
+    }
+    // A part is at least min_part_chunks chunks, never fewer than the
+    // kernel's lanes, so every part leaves exactly `width` CVs and the
+    // group's slots are contiguous.
+    [[maybe_unused]] const std::size_t n = compress_subtree_cvs(
+        ops, d, part, counter, key, flags,
+        std::span{lanes}.subspan(i * width, width));
+    assert(n == width);
+    // The count's release pairs with the completing agent's acquire, so
+    // the group's slots are visible to whoever folds them. The fold is
+    // charged to that agent's part in the trace.
+    const std::size_t g = i / group;
+    if (done[g].fetch_add(1, std::memory_order_acq_rel) + 1 == group) {
+      fold_sibling_cvs(ops, std::span{lanes}.subspan(g * group * width, group * width),
+                       key, flags, cvs[g]);
+    }
   }
 };
 
@@ -402,12 +470,17 @@ template <bool Traced, stack_budget Budget, class Scheduler,
            // the stop check behind this stage rather than branched
            // around here, on the path every window takes.
            //
-           // Every part pairs with a sibling all the way up: the window
-           // is a power-of-two number of chunks and part is a power of
-           // two, so n_parts is one too.
-           assert(std::has_single_bit(w.n_parts));
-           fold_sibling_cvs(w.ops, std::span{w.cvs}.first(w.n_parts), w.key,
-                            w.flags, w.cv);
+           // Every group pairs with a sibling all the way up: the window
+           // is a power-of-two number of chunks and part and group are
+           // powers of two, so the group count is one too.
+           const std::size_t n = w.fold_inputs();
+           assert(std::has_single_bit(n));
+           if (n == 1) {
+             w.cv = w.cvs[0];
+           } else {
+             fold_sibling_cvs(w.ops, std::span{w.cvs}.first(n), w.key,
+                              w.flags, w.cv);
+           }
            return w.cv;
          });
 }
