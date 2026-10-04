@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <iostream>
+#include <span>
 #include <vector>
 
 int main() {

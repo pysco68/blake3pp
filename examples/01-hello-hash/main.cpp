@@ -5,6 +5,7 @@
 
 #include <blake3pp/blake3pp.hpp>
 
+#include <array>
 #include <cstddef>
 #include <iostream>
 #include <optional>
