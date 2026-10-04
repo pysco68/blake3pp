@@ -52,19 +52,26 @@ auto work = stdexec::when_all(
     blake3pp::async::async_hash_file(ctx, "b.bin", sched),
     blake3pp::async::async_hash_file(ctx, "c.bin", sched));
 
-auto op = stdexec::connect(std::move(work), my_receiver{&results, stop.get_token()});
-stdexec::start(op);
-ctx.run_until_idle();      // the three files run here, on this thread
+auto [a, b, c] = blake3pp::async::sync_wait(ctx, std::move(work)).value();
 ```
 
-Two senders, matching the two blocking entry points:
+`sync_wait(ctx, sender)` starts the sender and drives the context on the
+calling thread until it completes: the values come back as a tuple, a
+stop as an empty optional, an error rethrown (an `error_code` as
+`std::system_error`). Any sender with one value completion works,
+composed or not. Connecting and starting by hand, then
+`ctx.run_until_idle()`, is the same thing with a receiver of your own.
+
+Two senders, matching the two blocking entry points, and a third over
+many files:
 
 | sender | completes with | the hasher |
 |---|---|---|
 | `async_hash_file(ctx, path, sched, opts)` | `set_value(digest)` | its own |
 | `async_update_file(ctx, h, path, sched, opts)` | `set_value()` | yours, streamed into |
+| `async_update_files(ctx, paths, sched, opts, make, done)` | `set_value()` once | one per file, from `make` |
 
-Both also complete with `set_error(std::error_code)`,
+The first two also complete with `set_error(std::error_code)`,
 `set_error(std::exception_ptr)` or `set_stopped()`, and never with more
 than one of the four.
 
@@ -72,15 +79,36 @@ than one of the four.
 keyed and `derive_key` hashers work exactly as they do everywhere else,
 and several files can go into one hasher in sequence.
 
+`async_update_files` runs a bounded number of files at once (the
+context's windows divided by its queue depth, or `opts.in_flight`) and
+refills a slot as each file ends. Every file's end goes to
+`done(index, hasher&, file_outcome)` on the context's thread, with the
+hasher that streamed it, so the caller finalizes to whatever length and
+mode it wants; a file that fails is an outcome, not the end of the run.
+The sender completes once, after the last outcome, or with
+`set_stopped()` when a stop ended it. This is what `blake3ppsum` runs
+over a list of files:
+
+```cpp
+auto work = blake3pp::async::async_update_files(
+    ctx, paths, sched, {.io = io_opts},
+    [&](std::size_t) { return make_hasher(); },
+    [&](std::size_t i, blake3pp::hasher& h, const blake3pp::async::file_outcome& o) noexcept {
+      if (o.ok()) print(i, h.finalize()); else report(i, o);
+    });
+blake3pp::async::sync_wait(ctx, std::move(work));
+```
+
 ## The run model
 
 One thread runs the context. It is the thread that touches the driver,
 runs every window's completion, and invokes every receiver.
 
 ```cpp
-void run();             // until request_stop() and nothing is owed
-void run_until_idle();  // until nothing is in flight
-void request_stop();    // from any thread
+void run();                        // until request_stop() and nothing is owed
+void run_until_idle();             // until nothing is in flight
+void run_until(const bool& done);  // until a completion on this thread sets it
+void request_stop();               // from any thread
 ```
 
 - `run()` with nothing started **blocks** until `request_stop()`. That is
@@ -89,7 +117,10 @@ void request_stop();    // from any thread
   nothing is in flight — including immediately, when nothing was.
 - Only one thread may run a context. A second is a contract violation
   and debug builds assert on it.
-- `request_stop()` is the only member another thread may call. It asks
+- Any thread may start an operation on the context: `start()` only joins
+  it, and the open and the first reads happen on the running thread in
+  the operation's first round.
+- `request_stop()` is the other member another thread may call. It asks
   every started operation to stop; each one then completes with
   `set_stopped()`, or with its value if it had already finished. The
   request clears when the run call returns, so a context is reusable.
@@ -147,8 +178,9 @@ Two things may still change:
   `set_error(std::error_code)` and anything thrown inside the pipeline as
   `set_error(std::exception_ptr)`. Collapsing those into one channel is
   still open.
-- **The context option names.** `windows` in particular describes the
-  arena in units the caller has to compute; a byte budget may replace it.
+- **The context option names.** `windows` describes the arena in units
+  the caller has to compute; `arena_bytes` is the byte budget that
+  derives it, and may become the only spelling.
 
 The sender signatures, the run model and the lifetime rules above are
 not expected to move.
