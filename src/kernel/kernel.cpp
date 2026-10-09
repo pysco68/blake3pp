@@ -4,6 +4,7 @@
 // instantiated with the simd facade's u32v it hashes width-many independent
 // inputs at once, one per lane (BLAKE3's hash_many strategy).
 
+#include "kernel/endian.hpp"
 #include "kernel/kernel.hpp"
 
 #include <algorithm>
@@ -44,14 +45,9 @@ static_assert(u32v::width <= max_simd_degree,
 // than __cplusplus-gated, and needed even though the call sits in a
 // discarded if-constexpr branch: non-dependent names in discarded
 // branches must still exist.
-BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept {
-#if defined(__cpp_lib_byteswap)
-  return std::byteswap(v);
-#else
-  return (v >> 24) | ((v >> 8) & 0x0000ff00u) | ((v << 8) & 0x00ff0000u) |
-         (v << 24);
-#endif
-}
+using endian::bswap32;
+using endian::load32;
+using endian::store32;
 
 // The clang that zig 0.16 bundles, 21.1.0, merges the byte-wise word
 // loads of the message below into element-width vector loads reading the
@@ -77,22 +73,6 @@ BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept 
 #else
 #define BLAKE3PP_ALIGN_MESSAGE_BLOCK 0
 #endif
-
-BLAKE3PP_FORCE_INLINE std::uint32_t load32(const std::uint8_t* p) noexcept {
-  std::uint32_t v;
-  std::memcpy(&v, p, sizeof v);
-  if constexpr (std::endian::native == std::endian::big) {
-    v = bswap32(v);
-  }
-  return v;
-}
-
-BLAKE3PP_FORCE_INLINE void store32(std::uint8_t* p, std::uint32_t v) noexcept {
-  if constexpr (std::endian::native == std::endian::big) {
-    v = bswap32(v);
-  }
-  std::memcpy(p, &v, sizeof v);
-}
 
 template <int N>
 BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {

@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstring>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -92,20 +94,59 @@ inline output chunk_output(const detail::chunk_state& cs,
 
 // Parent nodes always compress one full block (left CV || right CV) with
 // counter 0 (spec section 2.4).
+// The kernels carry chaining values as little-endian bytes while the
+// library's seams pass them as words. Both directions are spelled out
+// rather than punned: the word form is host-endian, so a cast would be a
+// different value on a big-endian target. Where the host is
+// little-endian the word array's object representation already is that
+// byte string and the move is two vector moves; the portable form stays
+// for the other byte order, where it is the only correct one.
+inline void store_cv_le(std::span<const std::uint32_t, 8> cv,
+                        std::uint8_t* out) noexcept {
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(out, cv.data(), 8 * sizeof(std::uint32_t));
+  } else {
+    for (std::size_t w = 0; w < 8; ++w) {
+      out[4 * w + 0] = static_cast<std::uint8_t>(cv[w]);
+      out[4 * w + 1] = static_cast<std::uint8_t>(cv[w] >> 8);
+      out[4 * w + 2] = static_cast<std::uint8_t>(cv[w] >> 16);
+      out[4 * w + 3] = static_cast<std::uint8_t>(cv[w] >> 24);
+    }
+  }
+}
+
+inline void load_cv_le(const std::uint8_t* in,
+                       std::span<std::uint32_t, 8> cv) noexcept {
+  if constexpr (std::endian::native == std::endian::little) {
+    std::memcpy(cv.data(), in, 8 * sizeof(std::uint32_t));
+  } else {
+    for (std::size_t w = 0; w < 8; ++w) {
+      const std::uint8_t* b = in + 4 * w;
+      cv[w] = static_cast<std::uint32_t>(b[0]) |
+              (static_cast<std::uint32_t>(b[1]) << 8) |
+              (static_cast<std::uint32_t>(b[2]) << 16) |
+              (static_cast<std::uint32_t>(b[3]) << 24);
+    }
+  }
+}
+
+// Eight words, as a counted loop: the extent is 8 and MSVC lowers the
+// algorithm to an out-of-line memmove call.
+inline void copy_cv(std::span<const std::uint32_t, 8> from,
+                    std::span<std::uint32_t, 8> to) noexcept {
+  for (std::size_t i = 0; i < 8; ++i) {
+    to[i] = from[i];
+  }
+}
+
 inline output parent_output(std::span<const std::uint32_t, 8> left_cv,
                             std::span<const std::uint32_t, 8> right_cv,
                             std::span<const std::uint32_t, 8> key,
                             std::uint32_t base_flags) noexcept {
   output o;
   std::ranges::copy(key, o.input_cv.begin());
-  for (std::size_t w = 0; w < 8; ++w) {
-    for (std::size_t byte = 0; byte < 4; ++byte) {
-      o.block[4 * w + byte] =
-          static_cast<std::uint8_t>(left_cv[w] >> (8 * byte));
-      o.block[32 + 4 * w + byte] =
-          static_cast<std::uint8_t>(right_cv[w] >> (8 * byte));
-    }
-  }
+  store_cv_le(left_cv, o.block.data());
+  store_cv_le(right_cv, o.block.data() + 32);
   o.block_len = kern::block_len;
   o.counter = 0;
   o.flags = kern::flag_parent | base_flags;

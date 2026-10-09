@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
+#include <span>
 #include <string_view>
 
 #include "kernel/kernel.hpp"
@@ -26,25 +27,27 @@ std::atomic<transpose16_mode> transpose16_active{
 }  // namespace kern
 
 void set_transpose16(transpose16 strategy) noexcept {
-  kern::transpose16_active.store(
-      static_cast<kern::transpose16_mode>(strategy),
-      std::memory_order_relaxed);
+  kern::transpose16_active.store(strategy, std::memory_order_relaxed);
 }
 
 transpose16 active_transpose16() noexcept {
-  return static_cast<transpose16>(
-      kern::transpose16_active.load(std::memory_order_relaxed));
+  return kern::transpose16_active.load(std::memory_order_relaxed);
 }
 
 std::optional<transpose16> transpose16_from_string(
     std::string_view name) noexcept {
-  for (const transpose16 t : {transpose16::staging, transpose16::tree,
-                              transpose16::quartered}) {
+  for (const transpose16 t : all_transpose16()) {
     if (name == to_string(t)) {
       return t;
     }
   }
   return std::nullopt;
+}
+
+std::span<const transpose16> all_transpose16() noexcept {
+  static constexpr transpose16 all[] = {transpose16::staging, transpose16::tree,
+                                        transpose16::quartered};
+  return all;
 }
 
 std::string_view to_string(transpose16 strategy) noexcept {
@@ -114,8 +117,8 @@ transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
   if (ops == nullptr) {
     return active_transpose16();  // dial is inert without a W=16 kernel
   }
-  static constexpr std::size_t chunk = 1024;  // BLAKE3 chunk
-  static constexpr std::size_t lanes = 16;    // the W=16 kernel's batch
+  static constexpr std::size_t chunk = kern::chunk_len;
+  static constexpr std::size_t lanes = 16;  // the W=16 kernel's batch
   static constexpr std::size_t batch = lanes * chunk;   // 16 KiB per step
   static constexpr std::size_t cap = 256u << 20;
 
@@ -137,9 +140,7 @@ transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
   for (std::size_t i = 0; i < bytes; ++i) {
     data[i] = static_cast<std::uint8_t>(i % 251);
   }
-  constexpr std::uint32_t key[8] = {0x6A09E667u, 0xBB67AE85u, 0x3C6EF372u,
-                                    0xA54FF53Au, 0x510E527Fu, 0x9B05688Cu,
-                                    0x1F83D9ABu, 0x5BE0CD19u};
+  const std::uint32_t* const key = kern::iv.data();
   std::array<std::uint8_t, lanes * 32> out;
 
   const transpose16 saved = active_transpose16();
@@ -160,10 +161,9 @@ transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
   // cloud neighbors) a sequential race hands later strategies a worse
   // environment, and has picked a strategy over one 37% faster that
   // raced last. Round-robin spreads the drift evenly; best-of per
-  // strategy still filters one-off stalls. (The bench's --t16-sweep guards against the same
-  // effect with its order-reversed 'rev' rows.)
-  constexpr transpose16 modes[] = {transpose16::staging, transpose16::tree,
-                                   transpose16::quartered};
+  // strategy still filters one-off stalls. (The bench's --t16-sweep
+  // guards against the same effect with its order-reversed 'rev' rows.)
+  const std::span<const transpose16> modes = all_transpose16();
   std::chrono::steady_clock::duration best[3] = {
       std::chrono::steady_clock::duration::max(),
       std::chrono::steady_clock::duration::max(),

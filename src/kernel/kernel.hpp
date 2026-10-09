@@ -28,11 +28,7 @@ namespace blake3pp::kern {
 // you MEASURE, not detect; see blake3pp::tune_transpose16(). Kernels
 // read this with one relaxed load per >=16 KiB batch; every value is
 // correct, so racing a change against running hashes is benign.
-enum class transpose16_mode : std::uint8_t {
-  staging = 0,    // scalar gather through a staging array
-  tree = 1,       // 4-stage radix-2 register shuffle network
-  quartered = 2,  // 128-bit insert-loads + in-lane unpacks (default)
-};
+using transpose16_mode = blake3pp::transpose16;
 extern std::atomic<transpose16_mode> transpose16_active;  // transpose16.cpp
 
 

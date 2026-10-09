@@ -23,13 +23,12 @@ namespace {
 std::array<std::uint32_t, 8> key_bytes_to_words(
     std::span<const std::byte, 32> key) noexcept {
   std::array<std::uint32_t, 8> words;
-  for (std::size_t w = 0; w < 8; ++w) {
-    const auto b = [&](std::size_t i) {
-      return std::to_integer<std::uint32_t>(key[4 * w + i]);
-    };
-    words[w] = b(0) | (b(1) << 8) | (b(2) << 16) | (b(3) << 24);
-  }
+  core::load_cv_le(kern::kernel_bytes(key.data()), words);
   return words;
+}
+
+std::span<const std::byte> bytes_of(std::string_view s) noexcept {
+  return std::as_bytes(std::span{s.data(), s.size()});
 }
 
 }  // namespace
@@ -99,11 +98,7 @@ void hasher::push_cv(std::span<const std::uint32_t, 8> cv,
   assert(subtree_chunks > 0 && std::has_single_bit(subtree_chunks));
   assert(total_chunks % subtree_chunks == 0);
   std::array<std::uint32_t, 8> new_cv;
-  // Counted loop rather than ranges::copy: the extent is 8 and MSVC still
-  // lowers the algorithm to an out-of-line memmove call here.
-  for (std::size_t i = 0; i < 8; ++i) {
-    new_cv[i] = cv[i];
-  }
+  core::copy_cv(cv, new_cv);
   std::uint64_t chunks = total_chunks / subtree_chunks;
   while ((chunks & 1) == 0) {
     assert(cv_stack_len_ > 0);  // a sibling must be waiting for each merge
@@ -308,9 +303,7 @@ void parent_cv(const kern::kernel_ops* ops,
   const core::output o = core::parent_output(left, right, key, base_flags);
   std::array<std::uint32_t, 8> cv;
   core::chaining_value(*ops, o, cv);
-  for (std::size_t i = 0; i < 8; ++i) {
-    out_cv[i] = cv[i];
-  }
+  core::copy_cv(cv, out_cv);
 }
 }  // namespace detail
 
@@ -320,11 +313,7 @@ digest hash(std::span<const std::byte> input) noexcept {
   return h.finalize();
 }
 
-digest hash(std::string_view input) noexcept {
-  hasher h;
-  h.update(input);
-  return h.finalize();
-}
+digest hash(std::string_view input) noexcept { return hash(bytes_of(input)); }
 
 digest keyed_hash(std::span<const std::byte, 32> key,
                   std::span<const std::byte> input) noexcept {
@@ -335,7 +324,7 @@ digest keyed_hash(std::span<const std::byte, 32> key,
 
 digest keyed_hash(std::span<const std::byte, 32> key,
                   std::string_view input) noexcept {
-  return keyed_hash(key, std::as_bytes(std::span{input.data(), input.size()}));
+  return keyed_hash(key, bytes_of(input));
 }
 
 digest derive_key(std::string_view context,
@@ -347,8 +336,7 @@ digest derive_key(std::string_view context,
 
 digest derive_key(std::string_view context,
                   std::string_view key_material) noexcept {
-  return derive_key(context, std::as_bytes(std::span{key_material.data(),
-                                                     key_material.size()}));
+  return derive_key(context, bytes_of(key_material));
 }
 
 std::optional<digest> digest::from_hex(std::string_view hex) noexcept {

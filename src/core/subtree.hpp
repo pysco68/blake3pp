@@ -26,6 +26,7 @@
 #include <cstring>
 #include <span>
 
+#include "core/core.hpp"
 #include "kernel/kernel.hpp"
 #include "kernel/uninitialized.hpp"
 
@@ -43,44 +44,6 @@ constexpr std::size_t subtree_fold_levels = BLAKE3PP_SUBTREE_FOLD;
 #else
 constexpr std::size_t subtree_fold_levels = 0;  // the recursion
 #endif
-
-// The kernels carry chaining values as little-endian bytes while the
-// library's seams pass them as words. Both directions are spelled out
-// rather than punned: the word form is host-endian, so a cast would be a
-// different value on a big-endian target.
-//
-// Where the host is little-endian the word array's object representation
-// already is that byte string, and the move is what costs: the shift-or
-// form compiles to word-at-a-time moves, which is half the cost of a
-// generation of the parallel engine's window fold. memcpy of the whole
-// 32 bytes is the same bytes in two vector moves. The portable form stays
-// for the other byte order, where it is the only correct one.
-inline void store_cv_le(std::span<const std::uint32_t, 8> cv, std::uint8_t* out) noexcept {
-  if constexpr (std::endian::native == std::endian::little) {
-    std::memcpy(out, cv.data(), 8 * sizeof(std::uint32_t));
-  } else {
-    for (std::size_t w = 0; w < 8; ++w) {
-      out[4 * w + 0] = static_cast<std::uint8_t>(cv[w]);
-      out[4 * w + 1] = static_cast<std::uint8_t>(cv[w] >> 8);
-      out[4 * w + 2] = static_cast<std::uint8_t>(cv[w] >> 16);
-      out[4 * w + 3] = static_cast<std::uint8_t>(cv[w] >> 24);
-    }
-  }
-}
-
-inline void load_cv_le(const std::uint8_t* in, std::span<std::uint32_t, 8> cv) noexcept {
-  if constexpr (std::endian::native == std::endian::little) {
-    std::memcpy(cv.data(), in, 8 * sizeof(std::uint32_t));
-  } else {
-    for (std::size_t w = 0; w < 8; ++w) {
-      const std::uint8_t* b = in + 4 * w;
-      cv[w] = static_cast<std::uint32_t>(b[0]) |
-              (static_cast<std::uint32_t>(b[1]) << 8) |
-              (static_cast<std::uint32_t>(b[2]) << 16) |
-              (static_cast<std::uint32_t>(b[3]) << 24);
-    }
-  }
-}
 
 // One generation of parents: pairs of child CVs (contiguous, LE bytes)
 // become one-block parent nodes, hashed lanes-wide. An odd trailing child
@@ -151,6 +114,59 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
                                           base_flags, out_cvs);
 }
 
+// Parent generations over n CVs in cvs (LE bytes), lanes-wide, until at
+// most stop_at remain; next is scratch of the same size. Returns the count.
+template <std::size_t MaxDegree = kern::max_simd_degree>
+inline std::size_t reduce_generations(const kern::kernel_ops& k,
+                                      std::uint8_t* cvs, std::uint8_t* next,
+                                      std::size_t n, std::size_t stop_at,
+                                      std::span<const std::uint32_t, 8> key,
+                                      std::uint32_t base_flags) noexcept {
+  while (n > stop_at) {
+    n = compress_parents_wide<MaxDegree>(k, cvs, n, key, base_flags, next);
+    std::copy_n(next, n * kern::out_len, cvs);
+  }
+  return n;
+}
+
+// The reduction of a power-of-2 subtree stopped at its last wide level:
+// the chaining values are reduced only while a generation still fills the
+// lanes, or to `stop_at` CVs when that is fewer, and what is left,
+// min(num_chunks, stop_at) CVs of equal-sized adjacent subtrees, goes to
+// the caller. With stop_at 1 this is the full reduction; the generations
+// it skips at the default run below full occupancy, and folded across
+// several parts they run full. Returns how many CVs were written.
+template <std::size_t MaxDegree = kern::max_simd_degree>
+inline std::size_t compress_subtree_to_cvs(
+    const kern::kernel_ops& k, const std::uint8_t* input,
+    std::size_t num_chunks, std::uint64_t chunk_counter,
+    std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
+    std::span<std::array<std::uint32_t, 8>> out_cvs,
+    std::size_t stop_at) noexcept {
+  assert(num_chunks > 0 && std::has_single_bit(num_chunks));
+  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+  std::size_t n = compress_subtree_wide<MaxDegree>(
+      k, input, num_chunks, chunk_counter, key, base_flags, cvs);
+  n = reduce_generations<MaxDegree>(k, cvs, next, n, stop_at, key, base_flags);
+  assert(n <= out_cvs.size());
+  for (std::size_t i = 0; i < n; ++i) {
+    load_cv_le(cvs + i * kern::out_len, out_cvs[i]);
+  }
+  return n;
+}
+
+template <std::size_t MaxDegree = kern::max_simd_degree>
+inline std::size_t compress_subtree_to_cvs(
+    const kern::kernel_ops& k, const std::uint8_t* input,
+    std::size_t num_chunks, std::uint64_t chunk_counter,
+    std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
+    std::span<std::array<std::uint32_t, 8>> out_cvs) noexcept {
+  return compress_subtree_to_cvs<MaxDegree>(k, input, num_chunks,
+                                            chunk_counter, key, base_flags,
+                                            out_cvs, k.simd_degree);
+}
+
 // Full reduction of a power-of-2 subtree (>= 2 chunks) to one CV. The final
 // log2(degree) generations run below full lane occupancy, but that tail is
 // O(log degree) blocks per subtree and amortizes to noise.
@@ -160,49 +176,10 @@ inline void compress_subtree_to_cv_recursive(
     std::size_t num_chunks, std::uint64_t chunk_counter,
     std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
     std::span<std::uint32_t, 8> out_cv) noexcept {
-  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
-  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
-  std::size_t n = compress_subtree_wide<MaxDegree>(
-      k, input, num_chunks, chunk_counter, key, base_flags, cvs);
-  while (n > 1) {
-    n = compress_parents_wide<MaxDegree>(k, cvs, n, key, base_flags, next);
-    std::copy_n(next, n * kern::out_len, cvs);
-  }
-  for (std::size_t w = 0; w < 8; ++w) {
-    const std::uint8_t* b = cvs + 4 * w;
-    out_cv[w] = static_cast<std::uint32_t>(b[0]) |
-                (static_cast<std::uint32_t>(b[1]) << 8) |
-                (static_cast<std::uint32_t>(b[2]) << 16) |
-                (static_cast<std::uint32_t>(b[3]) << 24);
-  }
-}
-
-// The reduction stopped at its last wide level: the part's chaining
-// values are reduced only while a generation still fills the lanes, and
-// what is left, min(num_chunks, simd_degree) CVs of equal-sized adjacent
-// subtrees, goes to the caller for a wider fold. Every generation this
-// skips would run below full occupancy; folded across several parts they
-// run full. Returns how many CVs were written.
-template <std::size_t MaxDegree = kern::max_simd_degree>
-inline std::size_t compress_subtree_to_cvs(
-    const kern::kernel_ops& k, const std::uint8_t* input,
-    std::size_t num_chunks, std::uint64_t chunk_counter,
-    std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
-    std::span<std::array<std::uint32_t, 8>> out_cvs) noexcept {
-  assert(num_chunks > 0 && std::has_single_bit(num_chunks));
-  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
-  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
-  std::size_t n = compress_subtree_wide<MaxDegree>(
-      k, input, num_chunks, chunk_counter, key, base_flags, cvs);
-  while (n > k.simd_degree) {
-    n = compress_parents_wide<MaxDegree>(k, cvs, n, key, base_flags, next);
-    std::copy_n(next, n * kern::out_len, cvs);
-  }
-  assert(n <= out_cvs.size());
-  for (std::size_t i = 0; i < n; ++i) {
-    load_cv_le(cvs + i * kern::out_len, out_cvs[i]);
-  }
-  return n;
+  std::array<std::uint32_t, 8> cv[1]{};
+  compress_subtree_to_cvs<MaxDegree>(k, input, num_chunks, chunk_counter, key,
+                                     base_flags, cv, /*stop_at=*/1);
+  copy_cv(cv[0], out_cv);
 }
 
 // The same reduction, folding as it goes instead of holding the tree. One
@@ -254,10 +231,7 @@ inline void compress_subtree_to_cv_folded(
                 chunk_counter + done, /*increment_counter=*/true, base_flags,
                 kern::flag_chunk_start, kern::flag_chunk_end, cvs);
     // The group's own parents, lanes-wide, down to its single root CV.
-    for (std::size_t m = n; m > 1;) {
-      m = compress_parents_wide<MaxDegree>(k, cvs, m, key, base_flags, next);
-      std::copy_n(next, m * kern::out_len, cvs);
-    }
+    reduce_generations<MaxDegree>(k, cvs, next, n, 1, key, base_flags);
     assert(depth < MaxStack);
     std::copy_n(cvs, kern::out_len, stack + depth * kern::out_len);
     depth++;
@@ -274,13 +248,7 @@ inline void compress_subtree_to_cv_folded(
     }
   }
   assert(depth == 1);
-  for (std::size_t w = 0; w < 8; ++w) {
-    const std::uint8_t* b = stack + 4 * w;
-    out_cv[w] = static_cast<std::uint32_t>(b[0]) |
-                (static_cast<std::uint32_t>(b[1]) << 8) |
-                (static_cast<std::uint32_t>(b[2]) << 16) |
-                (static_cast<std::uint32_t>(b[3]) << 24);
-  }
+  load_cv_le(stack, out_cv);
 }
 
 // Which of the two the library uses: the recursion unless a build opts into

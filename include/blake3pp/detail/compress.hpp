@@ -106,14 +106,6 @@ namespace detail {
 // tasks.
 inline constexpr std::size_t min_part_chunks = 16;
 
-// The same floor for a window of the file pipeline, where the trade is a
-// different one: a window is absorbed as one subtree, so fewer and larger
-// parts shrink the fold and the bulk's shape, while lengthening the
-// straggler tail that the window's join waits for. The engine cannot ask
-// a generic scheduler how many agents it has, so the floor is the only
-// lever on that balance.
-inline constexpr std::size_t window_min_part_chunks = min_part_chunks;
-
 // The part size in chunks for num_chunks: a power of two, so every part
 // starting at a multiple of it is subtree-aligned, and large enough that
 // num_chunks / part <= Budget.parts().
@@ -282,14 +274,6 @@ namespace detail {
 
 // The part size of a full window: the same arithmetic wherever a window
 // is compressed, so a window folds identically whichever path ran it.
-// A result at or above num_chunks means the window is too small to fan
-// out at all.
-template <stack_budget Budget>
-[[nodiscard]] constexpr std::size_t window_part_chunks(
-    std::size_t num_chunks) noexcept {
-  return std::max(part_chunks<Budget>(num_chunks), window_min_part_chunks);
-}
-
 // One window's compress stage, and everything it touches.
 //
 // A window's compress stage keeps the part table and the pull counter in its
@@ -345,24 +329,11 @@ struct window_compress {
                              std::span<const std::uint32_t, 8> k,
                              std::uint32_t f, trace_buffer* buf,
                              std::uint64_t window_id) noexcept {
-    const std::size_t p = window_part_chunks<Budget>(chunks);
+    const std::size_t p = part_chunks<Budget>(chunks);
     if (p >= chunks) {
       return false;
     }
-    ops = o;
-    data = d;
-    chunk_counter = counter;
-    num_chunks = chunks;
-    part = p;
-    n_parts = chunks / p;
-    std::ranges::copy(k, key.begin());
-    flags = f;
-    next.store(0, std::memory_order_relaxed);
-    pt.buf = buf;
-    pt.window = window_id;
-    pt.part_chunks = static_cast<std::uint32_t>(p);
-    pt.busy_ns.store(0, std::memory_order_relaxed);
-    pt.active.store(0, std::memory_order_relaxed);
+    set_window(o, d, counter, p, chunks / p, k, f, buf, window_id);
     grouped = true;
     group = std::min(fold_group_parts, n_parts);
     width = simd_degree(o);
@@ -384,6 +355,15 @@ struct window_compress {
                     std::span<const std::uint32_t, 8> k, std::uint32_t f,
                     trace_buffer* buf, std::uint64_t window_id) noexcept {
     assert(parts <= Budget.parts());
+    set_window(o, d, counter, part_chunks, parts, k, f, buf, window_id);
+    grouped = false;
+  }
+
+  void set_window(const kern::kernel_ops* o, const std::byte* d,
+                  std::uint64_t counter, std::size_t part_chunks,
+                  std::size_t parts, std::span<const std::uint32_t, 8> k,
+                  std::uint32_t f, trace_buffer* buf,
+                  std::uint64_t window_id) noexcept {
     ops = o;
     data = d;
     chunk_counter = counter;
@@ -398,7 +378,6 @@ struct window_compress {
     pt.part_chunks = static_cast<std::uint32_t>(part_chunks);
     pt.busy_ns.store(0, std::memory_order_relaxed);
     pt.active.store(0, std::memory_order_relaxed);
-    grouped = false;
   }
 
   // How many CVs the fold after the bulk reduces.

@@ -1946,7 +1946,7 @@ class window_scope {
       return 0;
     }
     const std::size_t p =
-        window_part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
+        part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
     const std::uint64_t k = (chunks_with_tail - 1) / p;
     return k < 2 ? 0 : static_cast<std::size_t>(k);
   }
@@ -1989,7 +1989,7 @@ class window_scope {
       p.head_bytes = bytes;
       return p;
     }
-    const std::size_t part = window_part_chunks<Budget>(chunks_left);
+    const std::size_t part = part_chunks<Budget>(chunks_left);
     const std::uint64_t chunk_at = (count + to_chunk) / chunk_size;
     const std::size_t to_part =
         static_cast<std::size_t>((part - chunk_at % part) % part) * chunk_size;
@@ -2037,7 +2037,7 @@ class window_scope {
     const std::uint64_t chunks_with_tail =
         (static_cast<std::uint64_t>(bytes) + chunk_size - 1) / chunk_size;
     p.part_chunks =
-        window_part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
+        part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
     p.parts = parts;
     p.tail_bytes = bytes - parts * p.part_chunks * chunk_size;
     p.node_cost = nodes_for(parts);

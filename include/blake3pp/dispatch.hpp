@@ -149,6 +149,8 @@ enum class transpose16 : std::uint8_t {
   tree = 1,       ///< Radix-2 register shuffle network.
   quartered = 2,  ///< 128-bit insert-loads plus in-lane unpacks (the default).
 };
+/// Every strategy, in enumerator order.
+[[nodiscard]] std::span<const transpose16> all_transpose16() noexcept;
 /// Pins the transpose strategy process-wide.
 /// @param strategy  The strategy every width-16 kernel uses from now on.
 void set_transpose16(transpose16 strategy) noexcept;

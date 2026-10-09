@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "kernel/endian.hpp"
 #include "kernel/force_inline.hpp"
 #include "kernel/shuffle.hpp"
 #include "kernel/simd_facade.hpp"
@@ -48,13 +49,6 @@ namespace transpose_detail {
 // deciding between them amortizes over a batch of 16 KiB or more.
 BLAKE3PP_FORCE_INLINE transpose16_mode t16_mode() noexcept {
   return transpose16_active.load(std::memory_order_relaxed);
-}
-
-BLAKE3PP_FORCE_INLINE std::uint32_t ld32(const std::uint8_t* p) noexcept {
-  return static_cast<std::uint32_t>(p[0]) |
-         (static_cast<std::uint32_t>(p[1]) << 8) |
-         (static_cast<std::uint32_t>(p[2]) << 16) |
-         (static_cast<std::uint32_t>(p[3]) << 24);
 }
 
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
@@ -200,7 +194,7 @@ BLAKE3PP_FORCE_INLINE void load_transposed(const std::uint8_t* const* inputs,
   std::uint32_t lanes[W];
   for (std::size_t j = 0; j < 16; ++j) {
     for (std::size_t lane = 0; lane < W; ++lane) {
-      lanes[lane] = td::ld32(inputs[lane] + offset + 4 * j);
+      lanes[lane] = endian::load32(inputs[lane] + offset + 4 * j);
     }
     m[j] = u32v::load(lanes);
   }
@@ -225,12 +219,7 @@ BLAKE3PP_FORCE_INLINE void store_transposed(const u32v (&w)[16],
   for (std::size_t j = 0; j < 16; ++j) {
     w[j].store(lanes);
     for (std::size_t lane = 0; lane < W; ++lane) {
-      const std::uint32_t v = lanes[lane];
-      std::uint8_t* p = out + lane * 64 + 4 * j;
-      p[0] = static_cast<std::uint8_t>(v);
-      p[1] = static_cast<std::uint8_t>(v >> 8);
-      p[2] = static_cast<std::uint8_t>(v >> 16);
-      p[3] = static_cast<std::uint8_t>(v >> 24);
+      endian::store32(out + lane * 64 + 4 * j, lanes[lane]);
     }
   }
 }
