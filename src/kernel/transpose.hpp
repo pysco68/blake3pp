@@ -22,7 +22,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 
 #include "kernel/endian.hpp"
 #include "kernel/force_inline.hpp"
@@ -69,12 +68,11 @@ BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
       for (std::size_t q = 0; q < 4; ++q) {
         V r[4];
         for (std::size_t k = 0; k < 4; ++k) {
-          std::uint8_t quad[64];
-          for (std::size_t l = 0; l < 4; ++l) {
-            std::memcpy(quad + 16 * l, inputs[4 * l + k] + offset + 16 * q,
-                        16);
-          }
-          r[k] = B::template load<W>(quad);
+          const std::uint8_t* const piece[4] = {
+              inputs[k] + offset + 16 * q, inputs[4 + k] + offset + 16 * q,
+              inputs[8 + k] + offset + 16 * q,
+              inputs[12 + k] + offset + 16 * q};
+          r[k] = B::template load_quad<W>(piece);
         }
         V t[4];
         shuffle_detail::inlane_4x4<B>(r, t);
@@ -133,11 +131,10 @@ BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
         V t[4];
         shuffle_detail::inlane_4x4<B>(r, t);
         for (std::size_t k = 0; k < 4; ++k) {
-          std::uint8_t quad[64];
-          B::template store<W>(quad, t[k]);
-          for (std::size_t l = 0; l < 4; ++l) {
-            std::memcpy(out + (4 * l + k) * 64 + 16 * q, quad + 16 * l, 16);
-          }
+          std::uint8_t* const piece[4] = {
+              out + k * 64 + 16 * q, out + (4 + k) * 64 + 16 * q,
+              out + (8 + k) * 64 + 16 * q, out + (12 + k) * 64 + 16 * q};
+          B::template store_quad<W>(piece, t[k]);
         }
       }
       return true;

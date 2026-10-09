@@ -86,6 +86,59 @@ struct xsimd_backend {
     std::memcpy(p, &v, sizeof(v));
   }
 
+  // The addressing step of the quartered W==16 transpose: one 64-byte
+  // register from four 16-byte pieces at four addresses, and the inverse.
+  // xsimd has no 128-bit insert or extract, so on AVX-512 the batch's
+  // native register goes through the intrinsics directly (the same
+  // vinserti32x4 / vextracti32x4 the vext backend gets from
+  // __builtin_shufflevector); anywhere else the pieces are staged through
+  // a byte array.
+  template <std::size_t W>
+  static BLAKE3PP_FORCE_INLINE reg<W> load_quad(
+      const std::uint8_t* const (&p)[4]) noexcept {
+    static_assert(W == 16, "four 16-byte pieces fill one 64-byte register");
+#if defined(__AVX512F__)
+    // A 16-byte memcpy into __m128i is a single unaligned load.
+    __m128i q[4];
+    for (std::size_t l = 0; l < 4; ++l) {
+      std::memcpy(&q[l], p[l], 16);
+    }
+    __m512i r = _mm512_castsi128_si512(q[0]);
+    r = _mm512_inserti32x4(r, q[1], 1);
+    r = _mm512_inserti32x4(r, q[2], 2);
+    r = _mm512_inserti32x4(r, q[3], 3);
+    return reg<W>(r);
+#else
+    std::uint8_t quad[64];
+    for (std::size_t l = 0; l < 4; ++l) {
+      std::memcpy(quad + 16 * l, p[l], 16);
+    }
+    return load<W>(quad);
+#endif
+  }
+
+  template <std::size_t W>
+  static BLAKE3PP_FORCE_INLINE void store_quad(std::uint8_t* const (&p)[4],
+                                               reg<W> v) noexcept {
+    static_assert(W == 16, "one 64-byte register splits into four pieces");
+#if defined(__AVX512F__)
+    const __m512i r = v;
+    const __m128i q[4] = {_mm512_castsi512_si128(r),
+                          _mm512_extracti32x4_epi32(r, 1),
+                          _mm512_extracti32x4_epi32(r, 2),
+                          _mm512_extracti32x4_epi32(r, 3)};
+    for (std::size_t l = 0; l < 4; ++l) {
+      std::memcpy(p[l], &q[l], 16);
+    }
+#else
+    std::uint8_t quad[64];
+    store<W>(quad, v);
+    for (std::size_t l = 0; l < 4; ++l) {
+      std::memcpy(p[l], quad + 16 * l, 16);
+    }
+#endif
+  }
+
   template <std::size_t W>
   static BLAKE3PP_FORCE_INLINE u32v to_word(reg<W> v) noexcept {
     return u32v{v};

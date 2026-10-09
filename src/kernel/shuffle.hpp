@@ -4,9 +4,10 @@
 // preprocessor conditional decides anything about shuffles.
 //
 // Two backends implement the same tiny interface (reg<W>, supports<W>,
-// shuf<I...>, load/store, to_word/from_word, rot_bytes<RB,W>), so the
-// networks in shuffle/networks.hpp and the transposes in transpose.hpp are
-// written exactly once and neither contains a backend conditional.
+// shuf<I...>, load/store, load_quad/store_quad, to_word/from_word,
+// rot_bytes<RB,W>), so the networks in shuffle/networks.hpp and the
+// transposes in transpose.hpp are written exactly once and neither
+// contains a backend conditional.
 //
 // Preference is vext-then-xsimd because vext works for EVERY provider (it
 // bit_casts the provider's register), whereas the xsimd backend needs the

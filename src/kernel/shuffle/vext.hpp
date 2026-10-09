@@ -94,6 +94,37 @@ struct vext_backend {
     std::memcpy(p, &v, sizeof(v));
   }
 
+  // The addressing step of the quartered W==16 transpose: one 64-byte
+  // register from four 16-byte pieces at four addresses, and the inverse.
+  //
+  // Widening through __builtin_shufflevector lowers to vinserti32x4 with a
+  // memory operand and narrowing to vextracti32x4; the stack is never
+  // touched. Staging the pieces through a byte array instead makes a
+  // 64-byte load span four 16-byte stores, which the store buffer cannot
+  // forward: 3.69 against 5.52 GiB/s on a 16x16 leaf batch (Emerald
+  // Rapids).
+  template <std::size_t W>
+  static BLAKE3PP_FORCE_INLINE reg<W> load_quad(
+      const std::uint8_t* const (&p)[4]) noexcept {
+    static_assert(W == 16, "four 16-byte pieces fill one 64-byte register");
+    const reg<8> lo = __builtin_shufflevector(load<4>(p[0]), load<4>(p[1]),
+                                              0, 1, 2, 3, 4, 5, 6, 7);
+    const reg<8> hi = __builtin_shufflevector(load<4>(p[2]), load<4>(p[3]),
+                                              0, 1, 2, 3, 4, 5, 6, 7);
+    return __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                   11, 12, 13, 14, 15);
+  }
+
+  template <std::size_t W>
+  static BLAKE3PP_FORCE_INLINE void store_quad(std::uint8_t* const (&p)[4],
+                                               reg<W> v) noexcept {
+    static_assert(W == 16, "one 64-byte register splits into four pieces");
+    store<4>(p[0], __builtin_shufflevector(v, v, 0, 1, 2, 3));
+    store<4>(p[1], __builtin_shufflevector(v, v, 4, 5, 6, 7));
+    store<4>(p[2], __builtin_shufflevector(v, v, 8, 9, 10, 11));
+    store<4>(p[3], __builtin_shufflevector(v, v, 12, 13, 14, 15));
+  }
+
   template <std::size_t W>
   static BLAKE3PP_FORCE_INLINE u32v to_word(reg<W> v) noexcept {
     return u32v{std::bit_cast<typename u32v::impl>(v)};
