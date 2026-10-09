@@ -137,6 +137,48 @@ TEST_CASE("xof_many matches repeated compress_xof on every arch") {
   }
 }
 
+// Every input count from one to past two batches, one block and a whole
+// chunk each, with and without the counter stepping: the remainder of a
+// batch takes a different path for every count -- padded on the wide
+// kernel, handed to a narrower one, or compressed one at a time -- and
+// resolve()'s ladder chooses by the count, so each count is its own case.
+TEST_CASE("hash_many agrees with the oracle for every remainder") {
+  constexpr std::size_t max_inputs = 2 * blake3pp::kern::max_simd_degree + 3;
+  constexpr std::size_t max_blocks = chunk_len / block_len;
+  std::vector<std::uint8_t> data(max_inputs * max_blocks * block_len);
+  for (std::size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<std::uint8_t>((i * 7 + 3) % 251);
+  }
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (const std::size_t blocks : {std::size_t{1}, max_blocks}) {
+      for (const bool step : {false, true}) {
+        for (std::size_t n = 1; n <= max_inputs; ++n) {
+          CAPTURE(blocks);
+          CAPTURE(step);
+          CAPTURE(n);
+          const std::uint8_t* inputs[max_inputs];
+          for (std::size_t i = 0; i < n; ++i) {
+            inputs[i] = data.data() + i * blocks * block_len;
+          }
+          std::vector<std::uint8_t> expected(n * out_len);
+          scalar::ops.hash_many(inputs, n, blocks, iv.data(), 7, step,
+                                flag_parent, 0, 0, expected.data());
+          std::vector<std::uint8_t> out(n * out_len, 0xee);
+          ops->hash_many(inputs, n, blocks, iv.data(), 7, step, flag_parent,
+                         0, 0, out.data());
+          CHECK(out == expected);
+        }
+      }
+    }
+  }
+}
+
 // Every variant's hash_many against the scalar oracle, on an input count
 // that exercises both the full-batch path and the serial remainder.
 TEST_CASE("hash_many agrees across all available arches") {
