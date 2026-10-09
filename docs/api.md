@@ -132,6 +132,16 @@ h.reset();                                  // reuse the instance
 the hasher's state, so a long stream can be checkpointed without giving
 up the hasher. How the input is chunked never changes the result.
 
+A caller that knows it is passing the last bytes says so with
+`update_last()` instead, after which only the finalize family may be
+called. BLAKE3 marks one node of the tree as the root, and which node that
+is depends on the message: the single chunk of a short message, or the top
+parent of anything longer. `update()` therefore has to keep the final
+chunk out of the wide batches in case the message ends there; told that it
+does end, that chunk goes through the batch with its neighbours, which is
+worth about 1.4x on messages of a few chunks. The one-shot `hash()`,
+`keyed_hash()` and `derive_key()` take this route already.
+
 ### From memory, or from a file
 
 Files are a first-class input, not a read loop the caller writes. The
