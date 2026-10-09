@@ -12,6 +12,13 @@
 // framework-free: pair it with hyperfine when process-level statistics are
 // wanted.
 //
+// Rows ending in _8k hash the same bytes as 8 KiB messages, one hasher
+// each, and fold the per-message digests. They exist per kernel and for
+// both implementations end-to-end (blake3pp_8k, reference_8k), which is
+// the short-message path by itself: eight chunks have no long run to
+// amortise a batch over. The Rust crate's harness in the talknotes
+// workspace prints the same row.
+//
 // The single-thread rows run INTERLEAVED instead of row-by-row: a pass is
 // one rep of every row, with the start row rotated per pass. Each row also
 // prints the CPUs it ran on.
@@ -323,6 +330,25 @@ int main(int argc, char** argv) {
     return h.finalize();
   };
 
+  // The whole input in 8 KiB messages, `one` hashing each, their digests
+  // folded into the row's digest so that every row of this shape is
+  // checked message by message and comparable to the others. The fold is
+  // a blake3pp hasher on fold_ops in all of them, including the rows that
+  // otherwise measure another implementation: it is 1/256 of the bytes and
+  // the same share everywhere, so a difference between two such rows is
+  // still a difference between what `one` does.
+  const auto hash_8k = [&](const blake3pp::kern::kernel_ops* fold_ops,
+                           auto one) {
+    constexpr std::size_t msg = 8 * 1024;
+    const std::span<const std::byte> all{input};
+    blake3pp::hasher fold{fold_ops};
+    for (std::size_t at = 0; at + msg <= all.size(); at += msg) {
+      const blake3pp::digest d = one(all.subspan(at, msg));
+      fold.update(std::span<const std::byte>{d.bytes});
+    }
+    return fold.finalize();
+  };
+
   // The single-thread rows are REGISTERED first and measured afterwards,
   // interleaved (see the file comment): sections exist for printing only
   // and say nothing about execution order.
@@ -382,16 +408,11 @@ int main(int argc, char** argv) {
     add_row(std::format("{}_8k", blake3pp::to_string(a)),
             "8 KiB messages, one hasher each", [&, a] {
               const auto* ops = blake3pp::detail::resolve(a);
-              constexpr std::size_t msg = 8 * 1024;
-              blake3pp::hasher fold{ops};
-              const std::span<const std::byte> all{input};
-              for (std::size_t at = 0; at + msg <= all.size(); at += msg) {
+              return hash_8k(ops, [ops](std::span<const std::byte> m) {
                 blake3pp::hasher h{ops};
-                h.update(all.subspan(at, msg));
-                const blake3pp::digest d = h.finalize();
-                fold.update(std::span<const std::byte>{d.bytes});
-              }
-              return fold.finalize();
+                h.update(m);
+                return h.finalize();
+              });
             });
   }
 
@@ -437,10 +458,10 @@ int main(int argc, char** argv) {
   // The reference implementation as shipped: its own runtime dispatch, same
   // input. The digest must match every row above.
   add_section("reference impl. end-to-end (single thread, own dispatch)");
-  add_row("reference", "", [&] {
+  const auto reference_hash = [](std::span<const std::byte> bytes) {
     blake3_hasher h;
     blake3_hasher_init(&h);
-    blake3_hasher_update(&h, input.data(), input.size());
+    blake3_hasher_update(&h, bytes.data(), bytes.size());
     blake3pp::digest d{};
     blake3_hasher_finalize(&h, blake3pp::kern::kernel_bytes(d.bytes.data()),
                            BLAKE3_OUT_LEN);
@@ -451,6 +472,14 @@ int main(int argc, char** argv) {
 #endif
 #endif
     return d;
+  };
+  add_row("reference", "",
+          [&] { return reference_hash(std::span<const std::byte>{input}); });
+  // The twin of the blake3pp_8k row below: both implementations' own
+  // short-message path, each with its own dispatch, on the same messages.
+  add_row("reference_8k", "8 KiB messages, one hasher each", [&] {
+    return hash_8k(blake3pp::detail::resolve(blake3pp::arch::auto_detect),
+                   reference_hash);
   });
 #endif
 
@@ -461,6 +490,12 @@ int main(int argc, char** argv) {
   add_section("blake3pp end-to-end (single thread)");
   add_row("blake3pp", "", [&] {
     return blake3pp::hash(std::span<const std::byte>{input});
+  });
+  add_row("blake3pp_8k", "8 KiB messages, one hasher each", [&] {
+    return hash_8k(blake3pp::detail::resolve(blake3pp::arch::auto_detect),
+                   [](std::span<const std::byte> m) {
+                     return blake3pp::hash(m);
+                   });
   });
 
   // --- measurement: rep-outer, row-inner, start row rotated per pass ---
