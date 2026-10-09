@@ -23,7 +23,6 @@
 #include <optional>
 #include <span>
 #include <string_view>
-#include <utility>
 
 #include "dispatch/cpu_detect.hpp"
 #include "kernel/kernel.hpp"
@@ -261,100 +260,6 @@ std::optional<arch> arch_from_string(std::string_view name) noexcept {
   return std::nullopt;
 }
 
-namespace {
-
-// The remainder ladder. A kernel's hash_many runs its inputs in batches
-// of simd_degree and finishes the rest below full occupancy: padded to
-// a full batch, or one block at a time. A narrower kernel that the CPU
-// can also run fills its lanes with that remainder instead -- eight
-// parents on an AVX-512 machine are one full AVX2 batch, not a 16-lane
-// batch half empty -- and hands what it cannot fill to the next one.
-//
-// So the table resolve() returns is a copy of the kernel's whose
-// hash_many is the rung below, and the rung knows the widest narrower
-// kernel this CPU runs (the SVE kernels are one vector length each, so
-// "narrower" is a question for the CPU, not the build). A remainder of
-// more than half the width stays with the wide kernel and its padding:
-// a one-block batch costs about the same whatever its width, so two
-// narrower batches cost more than one padded wide one. A remainder the
-// narrowest SIMD kernel cannot fill is left to its own threshold, since
-// a scalar block is never cheaper than the batch it would replace.
-//
-// Measured where it matters, one-block batches on Emerald Rapids: eight
-// inputs padded to sixteen lanes 2.02 GiB/s, the same eight on the AVX2
-// kernel 3.2; four inputs 1.01 against 1.8 on SSE4.2.
-struct ladder_entry {
-  kern::kernel_ops ops;
-  const kern::kernel_ops* narrower = nullptr;  // laddered too; null = none
-};
-
-ladder_entry g_ladder[num_kernels];
-
-template <std::size_t I>
-void hash_many_laddered(const std::uint8_t* const* inputs,
-                        std::size_t num_inputs, std::size_t blocks,
-                        const std::uint32_t key[8], std::uint64_t counter,
-                        bool increment_counter, std::uint32_t flags,
-                        std::uint32_t flags_start, std::uint32_t flags_end,
-                        std::uint8_t* out) noexcept {
-  const kern::kernel_ops& wide = *registry[I].ops;
-  const kern::kernel_ops* const narrow = g_ladder[I].narrower;
-  const std::size_t width = wide.simd_degree;
-  const std::size_t rem = num_inputs % width;
-  if (narrow == nullptr || rem == 0 || rem > width / 2) {
-    wide.hash_many(inputs, num_inputs, blocks, key, counter,
-                   increment_counter, flags, flags_start, flags_end, out);
-    return;
-  }
-  const std::size_t full = num_inputs - rem;
-  if (full > 0) {
-    wide.hash_many(inputs, full, blocks, key, counter, increment_counter,
-                   flags, flags_start, flags_end, out);
-  }
-  narrow->hash_many(inputs + full, rem, blocks, key,
-                    counter + (increment_counter ? full : 0),
-                    increment_counter, flags, flags_start, flags_end,
-                    out + full * kern::out_len);
-}
-
-// Built on first use, from the availability the CPU reports then. A
-// later upgrade through run_trap_probes() can only add variants, and a
-// rung that does not know a newly runnable kernel keeps working with the
-// one it has.
-const ladder_entry* ladder() noexcept {
-  static const bool built = [] {
-    [&]<std::size_t... I>(std::index_sequence<I...>) {
-      ((g_ladder[I].ops = *registry[I].ops,
-        g_ladder[I].ops.hash_many = &hash_many_laddered<I>),
-       ...);
-    }(std::make_index_sequence<num_kernels>{});
-    for (std::size_t i = 0; i < num_kernels; ++i) {
-      const std::size_t width = registry[i].ops->simd_degree;
-      std::size_t best = 1;
-      const ladder_entry* found = nullptr;
-      for (const arch b : available_impl()) {
-        for (std::size_t j = 0; j < num_kernels; ++j) {
-          const std::size_t w = registry[j].ops->simd_degree;
-          if (registry[j].a == b && w > best && w < width) {
-            best = w;
-            found = &g_ladder[j];
-          }
-        }
-      }
-      g_ladder[i].narrower = found != nullptr ? &found->ops : nullptr;
-    }
-    return true;
-  }();
-  (void)built;
-  return g_ladder;
-}
-
-const kern::kernel_ops* laddered(const registry_entry& e) noexcept {
-  return &ladder()[static_cast<std::size_t>(&e - registry)].ops;
-}
-
-}  // namespace
-
 namespace detail {
 
 const kern::kernel_ops* resolve(arch a) noexcept {
@@ -363,18 +268,18 @@ const kern::kernel_ops* resolve(arch a) noexcept {
   }
   for (const registry_entry& e : registry) {
     if (e.a == a) {
-      return laddered(e);
+      return e.ops;
     }
   }
   // Requested variant not compiled in: fall back to the best one that is.
   for (const arch b : available_impl()) {
     for (const registry_entry& e : registry) {
       if (e.a == b) {
-        return laddered(e);
+        return e.ops;
       }
     }
   }
-  return laddered(registry[0]);  // unreachable: scalar is always registered
+  return &kern::scalar::ops;  // unreachable: scalar is always registered
 }
 
 }  // namespace detail
