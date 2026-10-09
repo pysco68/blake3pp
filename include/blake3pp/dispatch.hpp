@@ -126,12 +126,11 @@ bool run_trap_probes() noexcept;
 /// Strix Halo puts staging 8% over quartered. On one machine the winner
 /// changes with the input: on Strix Halo, quartered for an 8 MiB input
 /// that fits in cache, staging for a 512 MiB one streaming from DRAM. All
-/// of these are AVX-512 measurements, the only width-16 hardware measured
-/// so far.
+/// of these are AVX-512 measurements.
 ///
 /// Three cost policies, none of them implicit:
-///   - Do nothing. quartered is the default. It measured best on most
-///     parts tested, and is never worse than about 10% off.
+///   - Do nothing. quartered is the default: fastest on most parts
+///     measured, and never worse than about 10% off.
 ///   - Tune per start. tune_transpose16(bytes) races the strategies on
 ///     this CPU over a working set the size of the typical input, applies
 ///     the winner process-wide, and returns it.

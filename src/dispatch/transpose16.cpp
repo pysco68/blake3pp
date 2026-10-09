@@ -66,10 +66,9 @@ std::string_view to_string(transpose16 strategy) noexcept {
 // much as on the CPU. Measured on a Ryzen AI Max 395: quartered wins by
 // 18% over staging when the input fits in last-level cache (8 MiB) and
 // LOSES to it by 8% when the input streams from DRAM (512 MiB), both
-// reproducible. An earlier version of this race hashed the same 16 KiB
-// ~800 times (L1-resident throughout) and duly picked the cache-resident
-// winner for every caller, including ones hashing gigabyte files, where it
-// selected the slowest of the three.
+// reproducible. A race over a small cache-resident buffer repeated many
+// times would pick the cache-resident winner for every caller, including
+// ones hashing gigabyte files, where it is the slowest of the three.
 //
 // This is a heuristic, not an oracle: it samples one size on one machine
 // while it is not doing the caller's real work. Callers who need the last
@@ -159,10 +158,9 @@ transpose16 tune_transpose16(std::size_t typical_input_bytes) noexcept {
   // INTERLEAVED repetitions, not per-strategy blocks: under drifting
   // conditions (laptop boost droop, a power-clamped OS profile, noisy
   // cloud neighbors) a sequential race hands later strategies a worse
-  // environment; a power-clamped Windows box measurably picked the
-  // second-raced strategy over a 37%-faster one that raced last. Round-
-  // robin spreads the drift evenly; best-of per strategy still filters
-  // one-off stalls. (The bench's --t16-sweep guards against the same
+  // environment, and has picked a strategy over one 37% faster that
+  // raced last. Round-robin spreads the drift evenly; best-of per
+  // strategy still filters one-off stalls. (The bench's --t16-sweep guards against the same
   // effect with its order-reversed 'rev' rows.)
   constexpr transpose16 modes[] = {transpose16::staging, transpose16::tree,
                                    transpose16::quartered};

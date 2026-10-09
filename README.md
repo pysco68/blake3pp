@@ -85,7 +85,7 @@ Files are a first-class input, not a loop you write.
 The binary release contains two [command-line tools](docs/tools.md) built on the library: `blake3ppsum` and `blake3ppgen`.
 
 `blake3ppsum` is a core-tool style hashing tool you can use just like `sha256sum` but
-exposes all the cool BLAKE3 modes with keyed hashing, XOF, etc.
+exposes every BLAKE3 mode: keyed hashing, derive_key and extended output.
 
 `blake3ppgen` uses BLAKE3's extended output mode to generate deterministic arbitrary
 length, seekable streams of data which is perfect for test data generation.
@@ -101,7 +101,7 @@ length, seekable streams of data which is perfect for test data generation.
 
 The drive column is the same reader with hashing switched off, on the
 same machine and the same file: the ceiling any tool on that box is
-working against. Note that it moves. Pacing is a property of the device,
+working against. Pacing is a property of the device,
 not a constant, and the wider window raises the ceiling as well as the
 result.
 </details>
@@ -182,7 +182,7 @@ All of this, rendered and searchable, with a version for every release:
 | [Integration](docs/integration.md) | vendoring, installing, and `find_package` |
 | [Building](docs/building.md) | presets, the toolchain images, cmake-re, and the kernel switches |
 | [Freestanding and RTOS builds](docs/freestanding.md) | no OS, no allocator and how to use `blake3pp` with only a few hundred bytes of stack |
-| [Static Linux binaries](docs/static-linux-binaries.md) | it should just run on any distro, really |
+| [Static Linux binaries](docs/static-linux-binaries.md) | one file per architecture that runs on any distro |
 | [Reference](https://pysco68.github.io/blake3pp/latest/reference/) | every declaration in the public headers, generated from their own doc comments |
 
 ## Using the library

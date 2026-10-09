@@ -37,13 +37,13 @@ static_assert(u32v::width <= max_simd_degree,
 // instructions per message word in the scalar kernel's block loop.
 //
 // The memcpy folds to one mov on every compiler, and the byteswap arm
-// keeps the endian independence the old spelling had.
+// keeps the endian independence of the shift-or spelling.
 //
 // std::byteswap is C++23; the C++20 presets get the shift-mask spelling,
 // which every compiler folds to a single bswap. Feature-tested rather
 // than __cplusplus-gated, and needed even though the call sits in a
 // discarded if-constexpr branch: non-dependent names in discarded
-// branches must still exist (found by the C++20 CI leg, not by review).
+// branches must still exist.
 BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept {
 #if defined(__cpp_lib_byteswap)
   return std::byteswap(v);
@@ -70,9 +70,8 @@ BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept 
 //   GCC 15                         none
 //
 // So a 21.1.x patch release, or zig's own build of it, is the dividing
-// line. The version bound below is conservative on purpose: it also covers
-// clang 21 builds that do not need it, and lifts itself when the musl
-// builds move to zig 0.17.
+// line. The version bound below is conservative: it also covers clang 21
+// builds that do not need it.
 #if defined(__riscv) && defined(__riscv_v) && defined(__clang__) && __clang_major__ < 22
 #define BLAKE3PP_ALIGN_MESSAGE_BLOCK 1
 #else
@@ -102,7 +101,7 @@ BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {
 
 // Scalar twin of the wide xor_rot in transpose.hpp: the rounds are written
 // against the fused form so SVE2's XAR can claim it; everywhere else the
-// compilers fold this back to exactly the old eor + ror pair.
+// compilers fold this back to the eor + ror pair.
 template <int N>
 BLAKE3PP_FORCE_INLINE std::uint32_t xor_rot(std::uint32_t x,
                                             std::uint32_t y) noexcept {
@@ -143,18 +142,17 @@ constexpr auto msg_schedule = make_msg_schedule();
 
 // The quarter-round (spec section 2.2), generic over the word type.
 //
-// Scheduling note, all measured on znver3. This plain sequential-g
-// spelling is the best of three schedules tried. llvm-mca shows it
-// latency-bound, at 459 cycles per block against a 196 port floor, and IPC
-// 2.56 where upstream's hand-scheduled asm reaches 3.50. Every attempt to
-// expose more ILP in source made things worse:
+// Scheduling, measured on znver3. This plain sequential-g spelling is the
+// fastest of three schedules. llvm-mca shows it latency-bound, at 459
+// cycles per block against a 196 port floor, and IPC 2.56 where upstream's
+// hand-scheduled asm reaches 3.50. Exposing more ILP in source is slower:
 //
-//   - Interleaving two independent batches doubled live state past the 16
+//   - Interleaving two independent batches doubles live state past the 16
 //     architectural registers, 2.66 -> 1.83 GiB/s.
-//   - Staging the four quartets' micro-steps helped narrow widths but
-//     pessimized AVX2 spill placement on both compilers, ratio against
+//   - Staging the four quartets' micro-steps helps narrow widths but
+//     pessimizes AVX2 spill placement on both compilers, ratio against
 //     upstream 0.85 -> 0.71.
-//   - Staging via index arrays defeated SROA entirely, Clang 0.77 GiB/s.
+//   - Staging via index arrays defeats SROA entirely, Clang 0.77 GiB/s.
 //
 // The residual against hand-written assembly is scheduler quality, and
 // source-level reordering cannot reliably buy it back.
@@ -197,10 +195,10 @@ BLAKE3PP_FORCE_INLINE void round_fn(W v[16], const W m[16]) noexcept {
 // flight at once. On x86's 16 architectural registers that loses (measured;
 // see the scheduling note on g); aarch64's 32 vector registers hold the
 // whole working set, and the spelling measured a small consistent win there
-// (Apple M2, clang 22: 1.61 vs 1.59 GiB/s sequential). The difference only
-// exists at all because the round core is register-resident (see the
-// always_inline note in simd_facade.hpp); when it was outlined-to-memory,
-// both spellings compiled identically.
+// (Apple M2, clang 22: 1.61 vs 1.59 GiB/s sequential). The difference
+// exists only because the round core is register-resident (see the
+// always_inline note in simd_facade.hpp); with the core outlined to
+// memory, both spellings compile identically.
 template <std::size_t R, class W>
 BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
   constexpr const std::array<std::uint8_t, 16>& s = msg_schedule[R];
@@ -280,7 +278,7 @@ BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
 //
 // Set by cmake/ArchKernels.cmake from -DBLAKE3PP_KERNEL_STAGED_ROUNDS=
 // auto|on|off; the fallback repeats that default. Off restores the
-// sequential round for re-measurement on a core with a clock.
+// sequential round for re-measurement.
 #ifndef BLAKE3PP_KERNEL_STAGED_ROUNDS
 #define BLAKE3PP_KERNEL_STAGED_ROUNDS 1
 #endif

@@ -675,9 +675,8 @@ class driver_loop {
   // windows reaches the OS in one call rather than one each.
   // The state that cannot resolve itself: about to sleep with no read
   // owed, nothing to run and nothing outstanding. Callers that know why
-  // it happened pass their own; this one at least names the state, and
-  // is the default for the overloads below that take none -- which is
-  // why it has no coverage: the cases using them never reach the state.
+  // it happened pass their own report; this one names the state and is
+  // the default for the overloads below that take none.
   [[noreturn]] static void stall() {
     throw std::logic_error(
         "blake3pp: the driver loop would block with no read in flight, an "
@@ -883,10 +882,9 @@ inline constexpr std::size_t reducer_nodes = 256;
 
 // Buffer memory the pipeline spends on windows beyond the reads the
 // device sees, so that a pool has windows to work on while the device
-// serves the next ones. Provisional: at 8 MiB windows this is 16 of
-// them, twice what a 16-thread pool needed on a source with no device
-// under it, and the same 256 MiB a caller of 64 MiB x qd 4 already
-// spends; a wider pool and a real device will move it.
+// serves the next ones. At 8 MiB windows this is 16 of them, twice
+// what a 16-thread pool needs with no device under it, and the same
+// 256 MiB a caller of 64 MiB x qd 4 spends.
 inline constexpr std::size_t default_window_budget_bytes = std::size_t{128} << 20;
 
 // The geometry of one update_file() call, decided once from the hasher's
@@ -1066,8 +1064,8 @@ struct pipeline_window {
   }
   // The read's operation, alive for as long as the window object: the
   // driver may still owe this read after the chain's cell is gone, and
-  // the stop sweep names it from here. Last, so that adding it left
-  // the offsets of everything the agents touch where they were.
+  // the stop sweep names it from here. Last, so the fields the agents
+  // touch keep their offsets.
   io_read_op op{};
 };
 
@@ -1685,9 +1683,8 @@ class window_scope {
   // builders' return types, which cannot be named until the class is
   // complete.
 
-  // What every stage below the scope reads the scope's stop from. The
-  // adaptors forward it down the chain, which the conformance cases in
-  // tests/file_pipeline.cpp check on both providers.
+  // What every stage below the scope reads the scope's stop from; the
+  // adaptors forward it down the chain.
   struct scope_env {
     ex::inplace_stop_token token;
     [[nodiscard]] ex::inplace_stop_token query(

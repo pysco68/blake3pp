@@ -1,6 +1,6 @@
 // MIPS capability probe, Linux-only. MSA arrived with MIPS32r5/MIPS64r5,
 // well after the r2-era cores most MIPS Linux systems run, so unlike the
-// POWER case the answer here is usually no and the check earns its keep.
+// POWER case the answer here is usually no.
 //
 // One auxv bit settles it. The constant carries an #ifndef fallback
 // because a cross sysroot's asm/hwcap.h is not guaranteed to be on the

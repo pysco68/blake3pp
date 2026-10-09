@@ -2,9 +2,9 @@
 
 [← blake3pp](../README.md)
 
-The library core runs on targets with no filesystem and no OS threads.
-What drove it was a Zephyr SMP port running blake3pp on the RP2350 in
-both of its personalities, Cortex-M33 and Hazard3 RISC-V.
+The library core runs on targets with no filesystem and no OS threads;
+the reference port is Zephyr SMP on the RP2350 in both of its
+personalities, Cortex-M33 and Hazard3 RISC-V.
 
 Two build-time switches make it fit:
 
@@ -15,12 +15,12 @@ Two build-time switches make it fit:
   umbrella header follows the option, and tests, tools and the file
   bench gate themselves on it (the in-memory bench and the non-I/O
   test suite still build).
-- Toolchains without OS threads are detected, not fought: where
+- Toolchains without OS threads are detected: where
   `<thread>`/`<mutex>` are empty (the Zephyr SDK's libstdc++ is built
   without gthreads), the `BLAKE3PP_HAS_STD_THREAD` probe comes back
   negative and `get_parallel_scheduler()` does not exist.
   Nothing else is lost: the scheduler-taking `hash()` overloads are
-  the primary API anyway, and a freestanding caller brings its own
+  the primary API, and a freestanding caller brings its own
   scheduler because only it knows what its execution agents should be
   (on Zephyr SMP, for instance, one per core).
 - The multi-core entry points spend stack on two sides, the calling

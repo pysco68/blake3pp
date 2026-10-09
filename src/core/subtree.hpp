@@ -15,8 +15,7 @@
 // that runs, and it stops at twice the RUNNING variant's degree, so a
 // scalar kernel recurses deepest: a 2^54-chunk maximum-size subtree would
 // take over 100 KiB of stack. The parallel engine's stack_budget bounds its
-// own part table, not this. M3's parallel engine reuses these pieces per
-// subtree.
+// own part table, not this; the engine reuses these pieces per subtree.
 
 #include <algorithm>
 #include <array>

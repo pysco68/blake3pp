@@ -4,12 +4,10 @@
 // callers spend on a part table, how an input is cut into parts, and one
 // window's compress stage as a sender.
 //
-// They live below <blake3pp/parallel.hpp> rather than inside it because
-// the file pipeline needs them and the parallel API needs the file
-// pipeline. Keeping them here is what makes that a line rather than a
-// cycle; the public names they define (stack_budget and its default) are
-// unchanged, and <blake3pp/parallel.hpp> is still the header that
-// supplies them.
+// They live below <blake3pp/parallel.hpp> because the file pipeline
+// needs them and the parallel API needs the file pipeline; the public
+// names defined here (stack_budget and its default) are supplied to
+// users by <blake3pp/parallel.hpp>.
 //
 // Internal to the library. Names an execution provider.
 
@@ -158,8 +156,8 @@ struct part_trace {
 };
 
 // The schedule-and-bulk sender that runs body(i) for every i in [0, n).
-// The file pipeline starts one per window
-// and lets the driver loop carry on.
+// The file pipeline starts one per window and lets the driver loop
+// carry on.
 //
 // The bulk shape only provides the agents: each call pulls indices from
 // `next` until none are left, so the split follows each agent's actual
@@ -167,14 +165,13 @@ struct part_trace {
 // Every index runs exactly once however the implementation distributes
 // the calls.
 //
-// `body` and `next` are the caller's and must outlive the sender --
-// the pipeline keeps them in the window
-// object.
+// `body` and `next` are the caller's and must outlive the sender; the
+// pipeline keeps them in the window object.
 //
-// Traced is a template parameter and not a null check inside the body
-// for two reasons: the untraced body is the hot one and stays exactly as
-// it was, and a pipeline that connects one sender per window needs the
-// type settled before the run starts.
+// Traced is a template parameter and not a null check inside the body:
+// the untraced body is the hot one and carries no branch, and a pipeline
+// that connects one sender per window needs the type settled before the
+// run starts.
 //
 // The traced body reads the clock once before its first part and, when
 // agent records are wanted, once after every part (the end of one is the
@@ -438,7 +435,7 @@ struct window_compress {
 // parts, then the fold that turns their CVs into the window's own. Value:
 // the window CV.
 //
-// Where this runs, which is the whole point of it being a sender:
+// Where this runs, which is why it is a sender:
 //
 // The file pipeline starts this sender from inside the read's
 // completion, which is on its driver thread, inside poll(). Starting it

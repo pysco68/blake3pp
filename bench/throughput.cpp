@@ -16,11 +16,10 @@
 // one rep of every row, with the start row rotated per pass. Each row also
 // prints the CPUs it ran on.
 //
-// Both are scar tissue from one incident. On a heterogeneous phone, an
-// Exynos 2600, the row-by-row order let EAS upmigrate the run onto the
-// prime core over time. Whichever rows ran LAST won a core class, not a
-// comparison, which produced a 21% phantom that looked exactly like a
-// microarchitecture finding.
+// Both exist for heterogeneous machines. On a phone (an Exynos 2600),
+// row-by-row order lets EAS upmigrate the run onto the prime core over
+// time, so whichever rows run LAST win a core class, not a comparison:
+// a 21% phantom indistinguishable from a microarchitecture finding.
 //
 // Interleaving makes placement and thermal history symmetric across rows.
 // --pin removes the variable entirely. The per-row CPU report is how a
@@ -197,17 +196,16 @@ bool stderr_is_tty() {
 #endif
 }
 
-// Why the t16 tuner can disagree with the table above, settled by
-// measurement rather than argument. tune_transpose16() races the three
-// strategies over a 16 KiB working set reused hundreds of times (L1
-// resident throughout), while the benchmark rows stream 512 MiB out of
-// DRAM. If the strategies rank differently in those two regimes, the tuner
-// is calibrated for the wrong one.
+// The t16 strategies ranked across working-set sizes. The winner depends
+// on where the input lives (cache-resident and streaming inputs rank the
+// strategies differently), so a tuner asked about one size can disagree
+// with a table measured at another.
 //
 // This sweeps the SAME comparison across working-set sizes, and runs each
 // size in both strategy orders. A ranking that flips with size is a regime
-// mismatch. A ranking that flips with ORDER is thermal or frequency drift
-// contaminating the measurement instead.
+// difference. A ranking that flips with ORDER is thermal or frequency
+// drift contaminating the measurement instead.
+
 // The width-16 kernel this machine would dispatch to (avx512 on x86,
 // sve512/sve2_512 elsewhere), if any: the t16 dial rows and the sweep race
 // whichever it is.
@@ -278,9 +276,6 @@ void t16_sweep(int reps, double cooldown_s) {
   }
   blake3pp::set_transpose16(saved);
   cooldown();
-  // This line once claimed "its own race uses a 16 KiB working set",
-  // which was only true of an old tuner revision. Print facts, not
-  // memories: the race sizes itself to the tuned-for bytes (capped).
   println(stdout,
           "\n  tune_transpose16() picks: {}   (raced at its default "
           "{} MiB working set, interleaved best-of-3)",
@@ -288,10 +283,11 @@ void t16_sweep(int reps, double cooldown_s) {
           blake3pp::default_tune_bytes >> 20);
   blake3pp::set_transpose16(saved);
 }
-// The parallel engine's split before its agents pulled parts from a
-// counter, kept as the reference/static control row: at most 256
-// power-of-two parts in one bulk call, so a provider that hands out fixed
-// shares (stdexec's static_thread_pool does) joins on its slowest agent.
+
+// A static split, the control row for the engine's counter-pulled parts:
+// at most 256 power-of-two parts in one bulk call, so a provider that
+// hands out fixed shares (stdexec's static_thread_pool does) joins on its
+// slowest agent.
 template <class Scheduler>
 blake3pp::digest static_split_hash(std::span<const std::byte> input,
                                    Scheduler sched,
@@ -589,12 +585,10 @@ int main(int argc, char** argv) {
   });
 #endif
 
-  // The blake3pp full pipeline on a single thread. It discriminates
-  // between "the pool scales badly" and "the subtree and CV machinery
-  // costs more than the raw kernel loop at this width".
-  //
-  // The reference end-to-end row above has had this mirror all along.
-  // This row was the blind spot while chasing the width-16 pool anomaly.
+  // The blake3pp full pipeline on a single thread, the mirror of the
+  // reference end-to-end row. It discriminates between "the pool scales
+  // badly" and "the subtree and CV machinery costs more than the raw
+  // kernel loop at this width".
   add_section("blake3pp end-to-end (single thread)");
   add_row("blake3pp", "", [&] {
     return blake3pp::hash(std::span<const std::byte>{input});
@@ -602,9 +596,9 @@ int main(int argc, char** argv) {
 
   // --- measurement: rep-outer, row-inner, start row rotated per pass ---
   // Pass -1 is the uncounted warmup. Cooldown idles between PASSES, not
-  // rows: an idle gap between rows is exactly what let EAS reset its
-  // upmigration on the Exynos, handing the post-gap row a different core
-  // class than its neighbors. Rotation gives every row every position in
+  // rows: an idle gap between rows lets EAS reset its upmigration on a
+  // heterogeneous core, handing the post-gap row a different core class
+  // than its neighbors. Rotation gives every row every position in
   // the pass order across reps, so whatever thermal/placement drift a
   // position carries is spread evenly before best-of picks the ceiling.
   std::vector<bench_row*> flat;
@@ -813,8 +807,8 @@ int main(int argc, char** argv) {
                                 &asm_ops);
         },
         15);
-    // The same kernel and pool under the engine's former split, as the
-    // control for the counter-pulled parts in the row above.
+    // The same kernel and pool under a static split, the control for the
+    // counter-pulled parts in the row above.
     row("reference/static",
         std::format("{} kernel, 256 parts, fixed shares", asm_row),
         [&] {

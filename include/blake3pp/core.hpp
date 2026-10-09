@@ -73,8 +73,8 @@ struct digest {
   std::array<std::byte, digest_size> bytes;
 
   /// Constant-time equality (matching the Rust reference): the safe
-  /// default for a value that is compared in security-sensitive contexts,
-  /// at a cost that is irrelevant.
+  /// default for a value compared in security-sensitive contexts, at
+  /// negligible cost.
   friend bool operator==(const digest& lhs, const digest& rhs) noexcept;
 
   /// Returns the digest as 64 lowercase hex characters.

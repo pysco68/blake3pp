@@ -24,9 +24,9 @@
 // must not even be NAMED.
 
 // Testing override: -DBLAKE3PP_SHUFFLE_FORCE_XSIMD picks the xsimd backend
-// on a GNU frontend too, so the path MSVC actually takes can be compiled
-// and run anywhere. Worth the three lines: twice already, kernel bugs have
-// hidden in a platform path nobody could execute locally.
+// on a GNU frontend too, so the path MSVC takes can be compiled and run
+// anywhere; a platform path that cannot be executed locally is where
+// kernel bugs hide.
 
 #include "kernel/simd_facade.hpp"
 

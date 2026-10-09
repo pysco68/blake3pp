@@ -1,5 +1,5 @@
-// End-to-end file hashing throughput: the number the whole project is
-// about. First measures the RAW device read speed through the identical
+// End-to-end file hashing throughput, the library's headline number.
+// First measures the RAW device read speed through the identical
 // windowed pipeline (same backend, window, queue depth; data delivered
 // and discarded, no hashing), then hashes for real, sequential and
 // parallel. The utilization column relates the two: 100% means the drive,
@@ -27,10 +27,9 @@
 // details and the pairing with perf record.
 //
 // --io-sweep exists because the right window/qd is a property of the
-// DEVICE (bandwidth x latency), not the CPU: the 8 MiB x qd4 defaults
-// were tuned on low-latency NVMe and measured 23-25% slow on GCP pd-class
-// volumes, where 32x16 recovered it. The sweep is
-// the stopwatch that settles it per machine.
+// DEVICE (bandwidth x latency), not the CPU: the 8 MiB x qd4 defaults,
+// tuned on low-latency NVMe, measure 23-25% slow on GCP pd-class volumes,
+// where 32x16 recovers it. The sweep settles it per machine.
 
 #include <algorithm>
 #include <array>

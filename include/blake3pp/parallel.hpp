@@ -19,7 +19,7 @@
 /// The provider is a build-time choice, BLAKE3PP_EXECUTION_PROVIDER:
 /// std::execution where the standard library ships it, beman.execution as
 /// the conformance-first polyfill, NVIDIA stdexec as the performance
-/// workhorse. Same source and same story as the simd providers.
+/// workhorse. The same source compiles against all three, as with the simd providers.
 ///
 /// Nothing here touches the heap. The CV table lives on the caller's stack
 /// and sender operation states live inside sync_wait's frame.
@@ -59,14 +59,6 @@
 
 namespace blake3pp {
 
-// The process-wide parallel scheduler, in P2079's shape: the same call
-// C++26 application code makes. Calling it is the explicit opt-in that may
-// create the process pool (provider-dependent). The scheduler-taking hash
-// overloads below stay the primary, caller-controlled API, and anyone who
-// needs a sized or bounded pool constructs their provider's pool directly.
-//
-// parallel_scheduler_t is a per-build concrete type, not type-erased: the
-// provider is fixed at configure time, so dispatch stays fully inlinable.
 #if defined(BLAKE3PP_EXECUTION_STD)
 
 /// The type of the process-wide scheduler: a per-build concrete type, not
@@ -151,8 +143,8 @@ namespace detail {
 // window objects and its reducer before the first byte is compressed,
 // and the sequential hasher beats all of it.
 //
-// Measured on the Z13 (Ryzen 7 PRO 6860Z, 16 threads), best of 81, this
-// build's sequential path against the same build's pipeline forced on:
+// Measured on a Ryzen 7 PRO 6860Z (16 threads), best of 81, the
+// sequential path against the pipeline forced on:
 //
 //     320 KiB   3.9-4.1  against  2.6-2.9 GiB/s
 //     384 KiB   3.5-4.0  against  2.6-3.3
@@ -161,21 +153,9 @@ namespace detail {
 //     640 KiB   3.5-3.6  against  4.0-4.7
 //
 // So the crossover is 512 KiB, and from 640 KiB the pipeline is ahead by
-// a fifth and climbing. The figure is one machine's; it is a threshold
-// rather than a tuned constant because the shape either side of it is
-// flat enough that being wrong by a factor of two costs little.
+// a fifth and climbing. The figure is one machine's; the curve either
+// side of it is flat enough that a factor of two costs little.
 //
-// What sits below the crossover is the scope: window objects and a
-// reducer built per call.
-//
-// Re-measured once a context could own that storage across calls, and it
-// did not move: 512 KiB is still where the two paths meet (4.0-4.4
-// against 4.0-4.3 GiB/s over three runs, with the pipeline behind below
-// and ahead from 640 KiB). Nothing changed here because this function
-// takes no context and so still builds a pool for its one call. A
-// caller that already has one -- async_io.hpp's io_context -- pays no
-// such cost, and the threshold for that path would be lower; giving
-// hash_into a context is what would move this number.
 inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
 
 // The window a span already in memory is cut into.
@@ -187,17 +167,11 @@ inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
 // there is a ceiling at all rather than one window per span always.
 //
 // So the answer is the FEWEST windows the budget allows, not a round of
-// them in flight. Measured on the Z13 against the engine this replaced
-// (16 threads, ABBA, eight samples a side, medians):
-//
-//                    8 MiB fixed   span/32, 8-64 MiB   one window
-//      8 MiB             +2.0 %          +7.5 %          +10.2 %
-//     64 MiB             -8.1 %          -9.6 %           +5.7 %
-//      1 GiB            -23.0 %         -10.9 %          +17.7 %
-//
-// The first column is 128 narrow fan-outs where the old engine did one
-// wide one; the last is one fan-out of the same width, through the
-// pipeline. Below max_window_bytes that is a single window.
+// them in flight. One window per span against fixed 8 MiB windows, 16
+// threads, ABBA, eight samples a side, medians: +8% at 8 MiB, +15% at
+// 64 MiB, +53% at 1 GiB, where the fixed windows are 128 narrow
+// fan-outs against one wide one. Below max_window_bytes that is a
+// single window.
 [[nodiscard]] constexpr std::size_t memory_window_bytes(
     std::uint64_t span_bytes) noexcept {
   constexpr std::size_t floor_bytes = 8 * 1024 * 1024;
@@ -210,9 +184,8 @@ inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
 //
 // Every full window folds to one chaining value and the ends go through
 // the canonical decomposition, so the reducer takes them in any order
-// and the hasher sees them in message order. That is what lets the part
-// count stop being a power of two, which one bulk over the whole span
-// had to be. Plain, keyed and derive_key hashers all work.
+// and the hasher sees them in message order, so the part count need not
+// be a power of two. Plain, keyed and derive_key hashers all work.
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched,

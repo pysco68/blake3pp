@@ -230,8 +230,7 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // Queues one read of exactly buf.size() bytes at off. No syscall, no
   // callback. A window the file cannot take asynchronously (an unaligned
   // length under O_DIRECT, or no ring at all) goes on the context's
-  // deferred list and is read synchronously inside poll(), which is where
-  // the old contract's "lazy at delivery" ended up.
+  // deferred list and is read synchronously inside poll().
   { c.submit_read(f, off, buf, op) };
   // Queues one write of exactly cbuf.size() bytes at off. Same rules as
   // submit_read: no syscall, no callback, and a write the file cannot
@@ -398,8 +397,8 @@ class sync_context {
     queued_++;
   }
 
-  // Queued like a read and performed in poll(), which is the whole point:
-  // nothing this context does is allowed to happen inside submit.
+  // Queued like a read and performed in poll(): nothing this context does
+  // is allowed to happen inside submit.
   void submit_write(file& f, std::uint64_t off,
                     std::span<const std::byte> buf, read_op& op) {
     op.buf = {};

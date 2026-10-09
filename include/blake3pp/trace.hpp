@@ -96,7 +96,7 @@ struct agent_record {
 
 /// What the thread driving the pipeline spent its own time on.
 ///
-/// The stage shares of a window no longer sum to the wall clock once
+/// The stage shares of a window do not sum to the wall clock once
 /// several windows are in flight, so this is the number that says
 /// whether the driver is the bottleneck: busy against parked is the
 /// thread's own split, and the loop counters say what it was doing when
@@ -151,8 +151,7 @@ static_assert(std::is_trivially_copyable_v<driver_stats>);
 /// beyond that is counted as a drop. Window records are claimed by the
 /// thread driving the pipeline; agent records by any thread, through one
 /// atomic increment. A claimed record has exactly one writer, and nothing
-/// reads the records until the update_file() call has returned. That is
-/// the whole concurrency contract.
+/// reads the records until the update_file() call has returned.
 ///
 /// @code
 /// std::vector<blake3pp::window_record> windows(file_bytes / window_bytes + 1);
@@ -236,8 +235,8 @@ class trace_buffer {
   }
 
   /// Where the driver thread's own time went. Only the pipeline path
-  /// fills this in; the sequential window loop leaves it zeroed, since
-  /// there is no driver thread to speak of.
+  /// fills this in; the sequential window loop, which has no driver
+  /// thread, leaves it zeroed.
   [[nodiscard]] const driver_stats& driver() const noexcept {
     return driver_;
   }

@@ -23,9 +23,9 @@ namespace blake3pp::kern::BLAKE3PP_ARCH_NS::shuffle_detail {
 namespace {
 
 // GCC raises -Wpsabi for vector types wider than the TU's -m flags allow
-// natively. These types never appear in any cross-TU signature (that is the
-// entire point of the kernel's design), so the ABI concern is moot; GCC's
-// own <simd> internals suppress the warning on the same reasoning.
+// natively. These types never appear in any cross-TU signature, so the
+// ABI concern is moot; GCC's own <simd> internals suppress the warning on
+// the same reasoning.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpsabi"
 

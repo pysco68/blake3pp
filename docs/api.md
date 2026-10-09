@@ -333,7 +333,7 @@ VLEN=512) the 16-lane message transpose has three implementation
 strategies, and which is fastest cannot be read off the CPU. It depends
 on whether the vector datapath is full-width or double-pumped, which no
 CPUID bit reports, and on the same machine it depends on whether the
-input fits in cache. Measured, across all AVX-512 parts so far:
+input fits in cache. Measured on AVX-512 parts:
 
 | machine | input | fastest | margin |
 |---------|-------|---------|--------|
@@ -359,8 +359,8 @@ blake3pp::set_transpose16(
         blake3pp::transpose16::quartered));
 ```
 
-If you need to live at the edge, trust none of that and measure your own
-workload. `blake3pp_bench` times all three (`t16-*` rows), and
+Workloads at the edge should measure themselves: `blake3pp_bench` times
+all three (`t16-*` rows), and
 `blake3pp_bench --t16-sweep` ranks them across input sizes so you can see
 where your workload sits; then pin the winner with `set_transpose16()`.
 The tuner samples one size on an otherwise idle machine, which is not the
@@ -405,7 +405,7 @@ kernel, since the buffer is sized for the widest variant compiled rather
 than the one that runs, and as many levels as halving the part takes to
 reach twice the running variant's degree in chunks.
 
-#### What turning it down actually does
+#### What turning it down does
 
 **It moves stack, it does not save it.** A smaller budget shrinks the
 table on the calling thread and enlarges the frame on every agent,

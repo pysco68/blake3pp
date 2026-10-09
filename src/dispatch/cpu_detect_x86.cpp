@@ -1,9 +1,9 @@
 // x86 capability probe: one manual cpuid/xgetbv sequence for ALL x86
-// toolchains. The tempting alternative, __builtin_cpu_supports, references
-// compiler-rt/libgcc's __cpu_model support machinery, a link-time
-// dependency that has failed twice here (clang-cl with lld-link on Windows;
-// zig/musl static linking): the builtin is only as portable as the runtime
-// library du jour. The manual probe is self-contained and does the same
+// toolchains. __builtin_cpu_supports references compiler-rt/libgcc's
+// __cpu_model support machinery, a link-time dependency that is not
+// reliably present (clang-cl with lld-link on Windows; zig/musl static
+// linking): the builtin is only as portable as the runtime library. The
+// manual probe is self-contained and does the same
 // OSXSAVE/XCR0 dance: "avx2" is only reported when the OS actually saves
 // YMM state, not merely when the CPU has the silicon.
 

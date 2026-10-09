@@ -9,7 +9,7 @@
 // all.
 //
 // So the naive route stages through a scalar array, and that costs about
-// 40% of the whole hash. It is why upstream's SSE4.1 assembly matches this
+// 40% of the whole hash: with it, upstream's SSE4.1 assembly matches an
 // AVX2 kernel.
 //
 // The bypass is a radix-2 shuffle tree whose index patterns ARE hardware
@@ -60,8 +60,8 @@ BLAKE3PP_FORCE_INLINE std::uint32_t ld32(const std::uint8_t* p) noexcept {
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
 
 // Gathers the block's 16 message words across W lanes through the shuffle
-// networks. Returns false only for the W==16 `staging` dial setting, whose
-// whole point is to use the scalar gather instead.
+// networks. Returns false only for the W==16 `staging` setting, which
+// uses the scalar gather.
 template <class B, std::size_t W>
 BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
                                         std::size_t offset, u32v m[16],
