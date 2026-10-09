@@ -503,13 +503,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     }
   }
 
-  std::uint32_t lanes BLAKE3PP_CXXATTR_UNINITIALIZED [W];
-  for (std::size_t j = 0; j < 8; ++j) {
-    cv[j].store(lanes);
-    for (std::size_t lane = 0; lane < W; ++lane) {
-      store32(out + lane * out_len + 4 * j, lanes[lane]);
-    }
-  }
+  store_cvs_transposed<W>(cv, out);
 }
 
 // Smallest remainder hash_many pads out to a full-width batch instead of
