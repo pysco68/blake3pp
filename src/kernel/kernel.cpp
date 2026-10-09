@@ -263,6 +263,12 @@ BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
 #define BLAKE3PP_KERNEL_STAGED_ROUNDS 1
 #endif
 
+// Set by cmake/ArchKernels.cmake like the other switches; off restores the
+// register-held message for the A/B (see all_rounds below).
+#ifndef BLAKE3PP_KERNEL_PIN_MESSAGE
+#define BLAKE3PP_KERNEL_PIN_MESSAGE 1
+#endif
+
 #if defined(__aarch64__) && BLAKE3PP_KERNEL_STAGED_ROUNDS
 constexpr bool staged_rounds = (u32v::width == 4);
 #else
@@ -271,6 +277,27 @@ constexpr bool staged_rounds = false;
 
 template <class W>
 BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
+  // The message array's address escapes once, so it must live in memory and
+  // the round body reads it through memory operands instead of holding 16
+  // vectors of it in registers. At full AVX-512 width the state alone is 16
+  // of the 32 zmm, so the message cannot fit beside it and what the compiler
+  // keeps there it pays for twice over; freeing those registers is worth
+  // 3-6% on the chunk shape (Zen 5, clang 22, 32 inputs per call). An empty
+  // asm with an input-only constraint, so nothing is clobbered and the state
+  // stays register-resident: a memory clobber here forces the state out too
+  // and loses 4%.
+  //
+  // Narrower widths do not want it: measured +0.8% and -1.8% on avx2 and
+  // -0.1% on sse42, all inside the noise, because at eight lanes and 16
+  // registers there is room for both. Hence the width gate, and x86 because
+  // that is where it is measured; a wide SVE or RVV target would have to
+  // measure its own.
+#if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__)) && \
+    BLAKE3PP_KERNEL_PIN_MESSAGE
+  if constexpr (u32v::width >= 16) {
+    asm volatile("" : : "r"(m));
+  }
+#endif
   [&]<std::size_t... R>(std::index_sequence<R...>)
       BLAKE3PP_LAMBDA_FORCE_INLINE {
     // The gate is wide-word-only: the scalar compress in this same TU keeps

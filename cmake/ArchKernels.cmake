@@ -113,6 +113,13 @@ blake3pp_kernel_switch(SHUFFLE_TREE 1
 blake3pp_kernel_switch(VEXT_W8_GATHER 1
   "GCC with a vector-extension register at eight lanes and AVX-512 available transposes through the staging gather, not the shuffle network")
 
+# At full AVX-512 width the state occupies half the register file and the
+# message cannot fit beside it: letting its address escape once keeps it in
+# memory operands instead. Off holds it in registers again, for the A/B.
+# See all_rounds in src/kernel/kernel.cpp.
+blake3pp_kernel_switch(PIN_MESSAGE 1
+  "AVX-512 width reads the message through memory operands instead of holding it in registers")
+
 # x86 clang: spell rot16 as the generic shift-or, which LLVM canonicalises to
 # one pshufb, where every other compiler gets that instruction from the
 # explicit byte shuffle (which LLVM lowers to pshuflw+pshufhw instead). Off
