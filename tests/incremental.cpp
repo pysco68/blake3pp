@@ -140,6 +140,96 @@ TEST_CASE("the wide path agrees when it starts at a misaligned counter") {
   }
 }
 
+// update_last() states that the message ends, which lets its final chunk
+// join a wide batch: the root is then the top parent rather than that
+// chunk. The digest must not notice, at any length, on any kernel.
+TEST_CASE("update_last agrees with update for every length") {
+  constexpr std::size_t max_chunks = 4 * blake3pp::kern::max_simd_degree + 3;
+  const auto input = make_input(max_chunks * 1024 + 1024);
+
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (std::size_t len = 0; len <= 3 * 1024 + 7; ++len) {
+      CAPTURE(len);
+      const auto bytes = std::span{input}.first(len);
+      blake3pp::hasher streamed{ops};
+      streamed.update(bytes);
+      blake3pp::hasher last{ops};
+      last.update_last(bytes);
+      CHECK(last.finalize() == streamed.finalize());
+      CHECK(last.count() == len);
+    }
+    // Past the sweep, every whole chunk count: these are the lengths that
+    // take the new path, one subtree emission per step of the ladder.
+    for (std::size_t chunks = 1; chunks <= max_chunks; ++chunks) {
+      CAPTURE(chunks);
+      const auto bytes = std::span{input}.first(chunks * 1024);
+      blake3pp::hasher streamed{ops};
+      streamed.update(bytes);
+      blake3pp::hasher last{ops};
+      last.update_last(bytes);
+      CHECK(last.finalize() == streamed.finalize());
+      CHECK(last.count() == chunks * 1024);
+    }
+  }
+}
+
+// The extended output stream comes off the same root node, so a reader
+// taken after update_last() must match one taken after update().
+TEST_CASE("update_last leaves the same XOF stream") {
+  const auto input = make_input(8 * 1024);
+  blake3pp::hasher streamed;
+  streamed.update(std::span{input});
+  blake3pp::hasher last;
+  last.update_last(std::span{input});
+
+  std::array<std::byte, 200> a{};
+  std::array<std::byte, 200> b{};
+  streamed.finalize_xof().fill(a);
+  last.finalize_xof().fill(b);
+  CHECK(a == b);
+  CHECK(last.finalize<64>() == streamed.finalize<64>());
+}
+
+// It is the tail of a message whose earlier bytes went through update(),
+// which is how a streaming caller that learns of the end uses it: at a
+// chunk boundary, mid-chunk, and after a pushed subtree.
+TEST_CASE("update_last ends a message that update() began") {
+  const auto input = make_input(40 * 1024 + 11);
+  const auto expected = blake3pp::hash(input);
+
+  for (const std::size_t split :
+       {std::size_t{0}, std::size_t{1}, std::size_t{1024},
+        std::size_t{3 * 1024}, std::size_t{3 * 1024 + 5},
+        std::size_t{32 * 1024}, std::size_t{40 * 1024 + 11}}) {
+    CAPTURE(split);
+    blake3pp::hasher h;
+    h.update(std::span{input}.first(split));
+    h.update_last(std::span{input}.subspan(split));
+    CHECK(h.finalize() == expected);
+    CHECK(h.count() == input.size());
+  }
+}
+
+// reset() has to drop the held subtree with everything else, or the next
+// message finalizes off the previous one's root.
+TEST_CASE("reset clears what update_last held") {
+  const auto input = make_input(8 * 1024);
+  blake3pp::hasher h;
+  h.update_last(std::span{input});
+  const auto first = h.finalize();
+  h.reset();
+  CHECK(h.count() == 0);
+  h.update_last(std::span{input}.first(4 * 1024));
+  CHECK(h.finalize() == blake3pp::hash(std::span{input}.first(4 * 1024)));
+  CHECK(h.finalize() != first);
+}
+
 // Deep subtree recursion (8 MiB = 8192 chunks, 13 tree levels) with splits
 // that force subtree offloads at misaligned counters.
 TEST_CASE("multi-megabyte splits cross deep subtrees") {

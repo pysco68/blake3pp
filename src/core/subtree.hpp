@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 
 #include "core/core.hpp"
@@ -290,16 +291,25 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
 // with a full-width batch, and is bounded to that many chunks. Such a run is
 // trimmed to the next 2*simd_degree boundary while chunks follow it, so a
 // misaligned start costs one batch instead of a ladder of narrow subtrees.
+//
+// max_subtree caps a single emission in chunks, rounded down to a power of
+// two, which a caller that needs more than one emission uses: a complete
+// message's root is the parent of its last subtree and that subtree's left
+// sibling, so the last emission must not be the whole run.
 template <class Sink, std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_chunks(const kern::kernel_ops& k,
                             const std::uint8_t* input, std::size_t num_chunks,
                             std::uint64_t chunk_counter,
                             std::span<const std::uint32_t, 8> key,
-                            std::uint32_t base_flags, Sink&& sink) noexcept {
+                            std::uint32_t base_flags, Sink&& sink,
+                            std::size_t max_subtree =
+                                std::numeric_limits<std::size_t>::max()) noexcept {
+  assert(max_subtree > 0);
   const std::size_t wide = 2 * k.simd_degree;
+  const std::size_t cap = std::bit_floor(max_subtree);
   while (num_chunks > 0) {
     if (num_chunks >= wide) {
-      std::size_t subtree = std::bit_floor(num_chunks);
+      std::size_t subtree = std::min(std::bit_floor(num_chunks), cap);
       // A subtree merged as one CV must sit on a subtree-aligned position
       // in the overall tree.
       while (((subtree - 1) & chunk_counter) != 0) {
@@ -331,6 +341,19 @@ inline void compress_chunks(const kern::kernel_ops& k,
     k.hash_many(chunks, take, kern::chunk_len / kern::block_len, key.data(),
                 chunk_counter, /*increment_counter=*/true, base_flags,
                 kern::flag_chunk_start, kern::flag_chunk_end, cvs);
+    // One chaining value per chunk, which leaves the caller one scalar
+    // parent block per chunk: six for an 8 KiB message, around a sixth
+    // of its time. Compressing those parents here as generations, one
+    // hash_many call each, is slower as soon as the input is larger than
+    // the cache. An 8 KiB message's generations are 4 and 2 lanes wide,
+    // which at 16 lanes is one padded batch and two scalar blocks, and
+    // 8 KiB messages over 512 MiB go 4.66 -> 3.68 GiB/s on Zen 5 at
+    // avx512 while the same binary measures unchanged over 2 MiB. The
+    // bookkeeping is not what costs: compressing those generations
+    // scalar instead measures as this does. What a parent batch could
+    // win is bounded anyway, since one 16-lane one-block batch is 532
+    // cycles against a 285-cycle port bound (llvm-mca, znver5), a
+    // dependency chain one batch cannot fill.
     for (std::size_t i = 0; i < take; ++i) {
       std::array<std::uint32_t, 8> cv;
       load_cv_le(cvs + i * kern::out_len, cv);

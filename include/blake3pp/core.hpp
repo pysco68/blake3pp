@@ -227,6 +227,24 @@ class hasher {
   /// @param input  The bytes of the string, not including any terminator.
   void update(std::string_view input) noexcept;
 
+  /// Absorbs the rest of the message: the caller states that nothing
+  /// follows these bytes.
+  ///
+  /// update() has to hold the message's final chunk back, because the node
+  /// that carries BLAKE3's ROOT flag is the final chunk for a one-chunk
+  /// message and the top parent for any longer one, and only the caller
+  /// knows which it will be. Told that the message ends here, the final
+  /// chunk joins a wide batch instead of being compressed a block at a
+  /// time, which is worth about 1.7x on messages of a few chunks.
+  ///
+  /// Only the finalize family may be called afterwards; a further update()
+  /// would contradict the statement this call makes (checked by assert()).
+  /// @param input  Any length, including zero.
+  void update_last(std::span<const std::byte> input) noexcept;
+  /// Absorbs the rest of the message, given as text (see update_last()).
+  /// @param input  The bytes of the string, not including any terminator.
+  void update_last(std::string_view input) noexcept;
+
   /// The digest of everything absorbed so far; the hasher stays usable.
   [[nodiscard]] digest finalize() const noexcept;
 
@@ -309,6 +327,12 @@ class hasher {
   detail::chunk_state chunk_;
   std::array<std::array<std::uint32_t, 8>, 54> cv_stack_;
   std::uint8_t cv_stack_len_;
+  // update_last() leaves the message's rightmost subtree here instead of
+  // on the stack: it is the right child of the root parent, the node the
+  // ROOT flag belongs to. While it is held, the chunk state is spent and
+  // finalization starts from this CV rather than from an open chunk.
+  bool right_held_;
+  std::array<std::uint32_t, 8> right_cv_;
 };
 
 /// One-shot hash of a byte sequence on the best available variant.

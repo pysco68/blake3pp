@@ -41,7 +41,8 @@ hasher::hasher(const kern::kernel_ops* custom_ops) noexcept
 hasher::hasher(const kern::kernel_ops* ops,
                std::span<const std::uint32_t, 8> key,
                std::uint32_t base_flags) noexcept
-    : ops_(ops), base_flags_(base_flags), cv_stack_len_(0) {
+    : ops_(ops), base_flags_(base_flags), cv_stack_len_(0),
+      right_held_(false) {
   std::ranges::copy(key, key_words_.begin());
   core::chunk_init(chunk_, key_words_, 0);
 }
@@ -73,6 +74,7 @@ hasher hasher::derive_key(std::string_view context,
 void hasher::reset() noexcept {
   core::chunk_init(chunk_, key_words_, 0);
   cv_stack_len_ = 0;
+  right_held_ = false;
 }
 
 arch hasher::selected_arch() const noexcept { return ops_->variant; }
@@ -131,6 +133,7 @@ void hasher::close_full_chunk() noexcept {
 }
 
 void hasher::update(std::span<const std::byte> input) noexcept {
+  assert(!right_held_);  // update_last() said the message ended
   const auto* p = kern::kernel_bytes(input.data());
   std::size_t len = input.size();
 
@@ -168,13 +171,72 @@ void hasher::update(std::string_view input) noexcept {
   update(std::as_bytes(std::span{input.data(), input.size()}));
 }
 
+void hasher::update_last(std::span<const std::byte> input) noexcept {
+  assert(!right_held_);
+  close_full_chunk();
+  const std::size_t len = input.size();
+  // Only a message ending on a chunk boundary has a final chunk that could
+  // have been batched. Anything else ends inside a chunk, which is serial
+  // in any implementation, and update() already batches every full chunk
+  // ahead of it.
+  if (core::chunk_len(chunk_) != 0 || len < 2 * kern::chunk_len ||
+      len % kern::chunk_len != 0) {
+    update(input);
+    return;
+  }
+
+  const std::size_t num_chunks = len / kern::chunk_len;
+  const std::uint64_t first = chunk_.chunk_counter;
+  // Emission by emission, one behind: everything but the last subtree goes
+  // on the stack, and the last stays in right_cv_ as the root parent's
+  // right child. Capping an emission below the run guarantees there is a
+  // last one to hold and a sibling for it.
+  std::array<std::uint32_t, 8> held;
+  std::uint64_t held_chunks = 0;
+  std::uint64_t pushed = 0;
+  core::compress_chunks(
+      *ops_, kern::kernel_bytes(input.data()), num_chunks, first, key_words_,
+      base_flags_,
+      [&](std::span<const std::uint32_t, 8> cv,
+          std::uint64_t subtree_chunks) noexcept {
+        if (held_chunks != 0) {
+          pushed += held_chunks;
+          push_cv(held, first + pushed, held_chunks);
+        }
+        core::copy_cv(cv, held);
+        held_chunks = subtree_chunks;
+      },
+      std::bit_floor(num_chunks - 1));
+  assert(held_chunks != 0 && cv_stack_len_ > 0);
+  core::copy_cv(held, right_cv_);
+  right_held_ = true;
+  // The chunk state is spent, but count() still owes every absorbed byte.
+  chunk_.chunk_counter = first + num_chunks;
+}
+
+void hasher::update_last(std::string_view input) noexcept {
+  update_last(std::as_bytes(std::span{input.data(), input.size()}));
+}
+
 output_reader hasher::finalize_xof() const noexcept {
   // Collapse the stack from the top down, then capture the ROOT node
   // instead of compressing it: the reader re-compresses it with varying
   // output counters. No member state is modified, so finalization can
   // happen at any point and hashing may continue afterwards.
-  core::output o = core::chunk_output(chunk_, base_flags_);
+  //
+  // The rightmost node is the open chunk, or the subtree update_last() kept
+  // off the stack once the message is known to have ended on a chunk
+  // boundary. Both reach the same spine; what differs is which node the
+  // message's last bytes sit in.
   std::size_t parents = cv_stack_len_;
+  core::output o{};
+  if (right_held_) {
+    parents--;
+    o = core::parent_output(cv_stack_[parents], right_cv_, key_words_,
+                            base_flags_);
+  } else {
+    o = core::chunk_output(chunk_, base_flags_);
+  }
   while (parents > 0) {
     parents--;
     std::array<std::uint32_t, 8> right_cv;
@@ -243,6 +305,7 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
 
 void hasher::push_subtree_cv(std::span<const std::uint32_t, 8> cv,
                              std::uint64_t subtree_chunks) noexcept {
+  assert(!right_held_);  // update_last() said the message ended
   close_full_chunk();
   push_cv(cv, chunk_.chunk_counter + subtree_chunks, subtree_chunks);
   chunk_.chunk_counter += subtree_chunks;
@@ -301,7 +364,7 @@ void parent_cv(const kern::kernel_ops* ops,
 
 digest hash(std::span<const std::byte> input) noexcept {
   hasher h;
-  h.update(input);
+  h.update_last(input);
   return h.finalize();
 }
 
@@ -310,7 +373,7 @@ digest hash(std::string_view input) noexcept { return hash(bytes_of(input)); }
 digest keyed_hash(std::span<const std::byte, 32> key,
                   std::span<const std::byte> input) noexcept {
   hasher h = hasher::keyed(key);
-  h.update(input);
+  h.update_last(input);
   return h.finalize();
 }
 
@@ -322,7 +385,7 @@ digest keyed_hash(std::span<const std::byte, 32> key,
 digest derive_key(std::string_view context,
                   std::span<const std::byte> key_material) noexcept {
   hasher h = hasher::derive_key(context);
-  h.update(key_material);
+  h.update_last(key_material);
   return h.finalize();
 }
 

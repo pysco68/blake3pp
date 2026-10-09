@@ -191,7 +191,8 @@ template <stack_budget Budget, class Scheduler>
                                Scheduler&& sched,
                                const kern::kernel_ops* ops) {
   if (input.size() < min_pipeline_bytes) {
-    h.update(input);
+    // The call finalizes, so these bytes end the message.
+    h.update_last(input);
     return h.finalize();
   }
   const std::size_t window =
@@ -528,7 +529,7 @@ class parallel_hasher {
     hasher h = h_;
     const std::span<const std::byte> tail{remainder_.data(), filled_};
     if (filled_ < detail::min_pipeline_bytes) {
-      h.update(tail);
+      h.update_last(tail);
       return h;
     }
     detail::memory_driver drv;
