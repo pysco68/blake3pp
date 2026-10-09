@@ -30,7 +30,6 @@
 // call is predicted.
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -50,15 +49,6 @@
 // The kernel, instantiated here for the variant the build chose
 // (BLAKE3PP_ARCH_NS and the matching -m flags come from CMake).
 #include "kernel/kernel.cpp"
-
-// The kernel TU reads the transpose16 dial and nothing else from the
-// library; this bench links no library (the library's own copy of this
-// kernel would collide with the one compiled here), so the dial is
-// defined here at its measured-best default, as src/dispatch/
-// transpose16.cpp defines it.
-namespace blake3pp::kern {
-std::atomic<transpose16_mode> transpose16_active{transpose16_mode::quartered};
-}
 
 #define BLAKE3PP_DC_STR_(x) #x
 #define BLAKE3PP_DC_STR(x) BLAKE3PP_DC_STR_(x)

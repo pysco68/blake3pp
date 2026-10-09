@@ -12,7 +12,6 @@
 // across TUs compiled with different flags is undefined behavior in practice.
 
 #include <array>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -20,17 +19,6 @@
 #include <blake3pp/dispatch.hpp>  // arch: each table names its variant
 
 namespace blake3pp::kern {
-
-// Strategy for the width-16 (AVX-512) message transpose. The dial is
-// process-wide and set at runtime, because CPUID cannot express
-// "double-pumped datapath" (Strix Point and full-width Zen 5 report
-// identical AVX-512 feature bits), so the right strategy is a property
-// you MEASURE, not detect; see blake3pp::tune_transpose16(). Kernels
-// read this with one relaxed load per >=16 KiB batch; every value is
-// correct, so racing a change against running hashes is benign.
-using transpose16_mode = blake3pp::transpose16;
-extern std::atomic<transpose16_mode> transpose16_active;  // transpose16.cpp
-
 
 inline constexpr std::uint32_t block_len = 64;
 inline constexpr std::size_t chunk_len = 1024;

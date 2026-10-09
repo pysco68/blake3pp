@@ -19,6 +19,13 @@
 // from where, and where their transposed results go. Widths other than
 // 4/8/16, and TUs with no shuffle backend at all, fall back to the scalar
 // staging gather at the bottom of each function.
+//
+// At width 16 the register tree is not the fastest form. The quartered one
+// is: 128-bit pieces land block-transposed by ADDRESSING, through one
+// insert-load each, and the registers run only the two in-lane stages. It
+// wins on both full-width and double-pumped AVX-512 datapaths, from an
+// input that fits in cache to one streaming from DRAM, which is why the
+// width-16 path has no alternative to choose between.
 
 #include <cstddef>
 #include <cstdint>
@@ -36,65 +43,33 @@ namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
 namespace {
 namespace transpose_detail {
 
-// The W==16 strategy is a RUNTIME dial: kern::transpose16_active, set
-// through blake3pp::set_transpose16 or tune_transpose16.
-//
-// On double-pumped AVX-512, meaning Strix Point, the register tree measured
-// 20% slower than the scalar staging gather while the quartered form
-// measured 17% faster. No CPUID bit distinguishes those
-// microarchitectures, so the winner is raced rather than detected.
-//
-// All three paths compile into the W==16 kernel, and the relaxed load
-// deciding between them amortizes over a batch of 16 KiB or more.
-BLAKE3PP_FORCE_INLINE transpose16_mode t16_mode() noexcept {
-  return transpose16_active.load(std::memory_order_relaxed);
-}
-
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
 
 // Gathers the block's 16 message words across W lanes through the shuffle
-// networks. Returns false only for the W==16 `staging` setting, which
-// uses the scalar gather.
+// networks.
 template <class B, std::size_t W>
-BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
-                                        std::size_t offset, u32v m[16],
-                                        [[maybe_unused]]
-                                        transpose16_mode mode) noexcept {
+BLAKE3PP_FORCE_INLINE void shuffle_load(const std::uint8_t* const* inputs,
+                                        std::size_t offset,
+                                        u32v m[16]) noexcept {
   using V = typename B::template reg<W>;
   if constexpr (W == 16) {
-    if (mode == transpose16_mode::quartered) {
-      // Quartered: 128-bit pieces land block-transposed by ADDRESSING;
-      // registers only run the two in-lane stages.
-      for (std::size_t q = 0; q < 4; ++q) {
-        V r[4];
-        for (std::size_t k = 0; k < 4; ++k) {
-          const std::uint8_t* const piece[4] = {
-              inputs[k] + offset + 16 * q, inputs[4 + k] + offset + 16 * q,
-              inputs[8 + k] + offset + 16 * q,
-              inputs[12 + k] + offset + 16 * q};
-          r[k] = B::template load_quad<W>(piece);
-        }
-        V t[4];
-        shuffle_detail::inlane_4x4<B>(r, t);
-        for (std::size_t j = 0; j < 4; ++j) {
-          m[4 * q + j] = B::template to_word<W>(t[j]);
-        }
+    // Quartered: 128-bit pieces land block-transposed by ADDRESSING;
+    // registers only run the two in-lane stages.
+    for (std::size_t q = 0; q < 4; ++q) {
+      V r[4];
+      for (std::size_t k = 0; k < 4; ++k) {
+        const std::uint8_t* const piece[4] = {
+            inputs[k] + offset + 16 * q, inputs[4 + k] + offset + 16 * q,
+            inputs[8 + k] + offset + 16 * q,
+            inputs[12 + k] + offset + 16 * q};
+        r[k] = B::template load_quad<W>(piece);
       }
-      return true;
+      V t[4];
+      shuffle_detail::inlane_4x4<B>(r, t);
+      for (std::size_t j = 0; j < 4; ++j) {
+        m[4 * q + j] = B::template to_word<W>(t[j]);
+      }
     }
-    if (mode == transpose16_mode::tree) {
-      V r[16];
-      for (std::size_t lane = 0; lane < 16; ++lane) {
-        r[lane] = B::template load<W>(inputs[lane] + offset);
-      }
-      V t[16];
-      shuffle_detail::transpose_net<B>(r, t);
-      for (std::size_t j = 0; j < 16; ++j) {
-        m[j] = B::template to_word<W>(t[j]);
-      }
-      return true;
-    }
-    return false;  // staging
   } else {
     constexpr std::size_t groups = 16 / W;
     for (std::size_t g = 0; g < groups; ++g) {
@@ -108,50 +83,31 @@ BLAKE3PP_FORCE_INLINE bool shuffle_load(const std::uint8_t* const* inputs,
         m[g * W + j] = B::template to_word<W>(t[j]);
       }
     }
-    return true;
   }
 }
 
 // The mirror image: 16 wide words out to W lane-major 64-byte blocks.
 template <class B, std::size_t W>
-BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
-                                         std::uint8_t* out,
-                                         [[maybe_unused]]
-                                         transpose16_mode mode) noexcept {
+BLAKE3PP_FORCE_INLINE void shuffle_store(const u32v (&w)[16],
+                                         std::uint8_t* out) noexcept {
   using V = typename B::template reg<W>;
   if constexpr (W == 16) {
-    if (mode == transpose16_mode::quartered) {
-      // Quartered mirror: two in-lane stages, then 128-bit pieces go to
-      // their destinations by addressing (extract-stores).
-      for (std::size_t q = 0; q < 4; ++q) {
-        V r[4];
-        for (std::size_t j = 0; j < 4; ++j) {
-          r[j] = B::template from_word<W>(w[4 * q + j]);
-        }
-        V t[4];
-        shuffle_detail::inlane_4x4<B>(r, t);
-        for (std::size_t k = 0; k < 4; ++k) {
-          std::uint8_t* const piece[4] = {
-              out + k * 64 + 16 * q, out + (4 + k) * 64 + 16 * q,
-              out + (8 + k) * 64 + 16 * q, out + (12 + k) * 64 + 16 * q};
-          B::template store_quad<W>(piece, t[k]);
-        }
+    // Quartered mirror: two in-lane stages, then 128-bit pieces go to
+    // their destinations by addressing (extract-stores).
+    for (std::size_t q = 0; q < 4; ++q) {
+      V r[4];
+      for (std::size_t j = 0; j < 4; ++j) {
+        r[j] = B::template from_word<W>(w[4 * q + j]);
       }
-      return true;
+      V t[4];
+      shuffle_detail::inlane_4x4<B>(r, t);
+      for (std::size_t k = 0; k < 4; ++k) {
+        std::uint8_t* const piece[4] = {
+            out + k * 64 + 16 * q, out + (4 + k) * 64 + 16 * q,
+            out + (8 + k) * 64 + 16 * q, out + (12 + k) * 64 + 16 * q};
+        B::template store_quad<W>(piece, t[k]);
+      }
     }
-    if (mode == transpose16_mode::tree) {
-      V r[16];
-      for (std::size_t j = 0; j < 16; ++j) {
-        r[j] = B::template from_word<W>(w[j]);
-      }
-      V t[16];
-      shuffle_detail::transpose_net<B>(r, t);
-      for (std::size_t lane = 0; lane < 16; ++lane) {
-        B::template store<W>(out + lane * 64, t[lane]);
-      }
-      return true;
-    }
-    return false;  // staging
   } else {
     constexpr std::size_t groups = 16 / W;
     for (std::size_t g = 0; g < groups; ++g) {
@@ -165,7 +121,6 @@ BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
         B::template store<W>(out + lane * 64 + g * W * 4, t[lane]);
       }
     }
-    return true;
   }
 }
 
@@ -177,15 +132,12 @@ BLAKE3PP_FORCE_INLINE bool shuffle_store(const u32v (&w)[16],
 // m[j][lane] = word j of inputs[lane] at byte offset `offset`.
 template <std::size_t W = u32v::width>
 BLAKE3PP_FORCE_INLINE void load_transposed(const std::uint8_t* const* inputs,
-                                           std::size_t offset, u32v m[16],
-                                           [[maybe_unused]]
-                                           transpose16_mode mode) noexcept {
-  namespace td = transpose_detail;
+                                           std::size_t offset,
+                                           u32v m[16]) noexcept {
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
   if constexpr (shuffle_backend::supports<W>) {
-    if (td::shuffle_load<shuffle_backend, W>(inputs, offset, m, mode)) {
-      return;
-    }
+    transpose_detail::shuffle_load<shuffle_backend, W>(inputs, offset, m);
+    return;
   }
 #endif
   std::uint32_t lanes[W];
@@ -201,15 +153,11 @@ BLAKE3PP_FORCE_INLINE void load_transposed(const std::uint8_t* const* inputs,
 // 64 little-endian bytes at out + l*64, the mirror of load_transposed.
 template <std::size_t W = u32v::width>
 BLAKE3PP_FORCE_INLINE void store_transposed(const u32v (&w)[16],
-                                            std::uint8_t* out,
-                                            [[maybe_unused]]
-                                            transpose16_mode mode) noexcept {
-  namespace td = transpose_detail;
+                                            std::uint8_t* out) noexcept {
 #if defined(BLAKE3PP_HAVE_SHUFFLE)
   if constexpr (shuffle_backend::supports<W>) {
-    if (td::shuffle_store<shuffle_backend, W>(w, out, mode)) {
-      return;
-    }
+    transpose_detail::shuffle_store<shuffle_backend, W>(w, out);
+    return;
   }
 #endif
   std::uint32_t lanes[W];

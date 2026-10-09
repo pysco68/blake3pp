@@ -326,46 +326,6 @@ std::cout << std::format("blake3pp {} (simd: {}, execution: {})\n",
 // e.g. "blake3pp 0.1.0 (simd: std::simd, execution: stdexec)"
 ```
 
-#### One dial that is not predictable
-
-On machines with a width-16 kernel (AVX-512; SVE-512 on ARM; RVV at
-VLEN=512) the 16-lane message transpose has three implementation
-strategies, and which is fastest cannot be read off the CPU. It depends
-on whether the vector datapath is full-width or double-pumped, which no
-CPUID bit reports, and on the same machine it depends on whether the
-input fits in cache. Measured on AVX-512 parts:
-
-| machine | input | fastest | margin |
-|---------|-------|---------|--------|
-| Skylake-SP, Strix Point | streaming | `quartered` | 13-17% |
-| Ryzen AI Max 395 | 8 MiB (in cache) | `quartered` | 18% over `staging` |
-| Ryzen AI Max 395 | 512 MiB (streaming) | `staging` | 8% over `quartered` |
-
-Two AMD parts with identical feature flags, opposite rankings. The whole
-spread is about 10%, so the default is never a disaster, but there is no
-setting that is right everywhere. Pick your cost:
-
-```cpp
-// 1. Do nothing. The default (quartered) won on most parts measured.
-
-// 2. Tune at startup for the size you actually hash; the answer depends
-//    on it. One streaming pass per strategy; allocates that buffer.
-blake3pp::transpose16 best = blake3pp::tune_transpose16(512u << 20);
-
-// 3. Tune once ever: persist the name, restore it on later starts.
-save(std::string{blake3pp::to_string(best)});
-blake3pp::set_transpose16(
-    blake3pp::transpose16_from_string(load()).value_or(
-        blake3pp::transpose16::quartered));
-```
-
-Workloads at the edge should measure themselves: `blake3pp_bench` times
-all three (`t16-*` rows), and
-`blake3pp_bench --t16-sweep` ranks them across input sizes so you can see
-where your workload sits; then pin the winner with `set_transpose16()`.
-The tuner samples one size on an otherwise idle machine, which is not the
-same thing as your program under load.
-
 ## What it costs you
 
 ### Allocation

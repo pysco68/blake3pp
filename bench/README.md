@@ -63,7 +63,7 @@ window x qd pacing matrix), and `--make <MiB>` to create a file and use
 it. Without a device: `--null-source <GiB>` and `--null-sink <GiB>`.
 
 `blake3pp_bench`, in memory: `--size` (MiB), `--reps`, `--cooldown`,
-`--pin`, `--threads`, `--t16-sweep`, and a list of SIMD variants to
+`--pin`, `--threads`, and a list of SIMD variants to
 measure.
 
 ## file_throughput: where a window's time goes (`--trace`)

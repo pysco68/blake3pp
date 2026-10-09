@@ -52,7 +52,7 @@ SELECT = """
 #endif
 """
 SUPPORT = ["src/blake3pp.cpp", "src/dispatch/dispatch.cpp",
-           "src/dispatch/transpose16.cpp", "src/dispatch/cpu_detect_x86.cpp",
+           "src/dispatch/cpu_detect_x86.cpp",
            "src/io/file_reader.cpp", "src/io_hash.cpp"]
 PUBLIC = ["include/blake3pp/dispatch.hpp", "include/blake3pp/core.hpp",
           "include/blake3pp/detail/file_reader.hpp",

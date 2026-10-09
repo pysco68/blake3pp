@@ -196,94 +196,6 @@ bool stderr_is_tty() {
 #endif
 }
 
-// The t16 strategies ranked across working-set sizes. The winner depends
-// on where the input lives (cache-resident and streaming inputs rank the
-// strategies differently), so a tuner asked about one size can disagree
-// with a table measured at another.
-//
-// This sweeps the SAME comparison across working-set sizes, and runs each
-// size in both strategy orders. A ranking that flips with size is a regime
-// difference. A ranking that flips with ORDER is thermal or frequency
-// drift contaminating the measurement instead.
-
-// The width-16 kernel this machine would dispatch to (avx512 on x86,
-// sve512/sve2_512 elsewhere), if any: the t16 dial rows and the sweep race
-// whichever it is.
-std::optional<blake3pp::arch> first_w16_arch() {
-  for (const auto a : blake3pp::available_arches()) {
-    if (blake3pp::detail::resolve(a)->simd_degree == 16) {
-      return a;
-    }
-  }
-  return std::nullopt;
-}
-
-void t16_sweep(int reps, double cooldown_s) {
-  const auto w16 = first_w16_arch();
-  if (!w16.has_value()) {
-    println(stdout, "t16 sweep needs a width-16 kernel; none available here");
-    return;
-  }
-  constexpr std::size_t work = 128u << 20;  // hashed bytes per timed rep
-  const std::size_t sizes[] = {16u << 10,  128u << 10, 1u << 20,
-                               8u << 20,   64u << 20,  512u << 20};
-  const blake3pp::transpose16 order[] = {blake3pp::transpose16::staging,
-                                         blake3pp::transpose16::tree,
-                                         blake3pp::transpose16::quartered};
-
-  std::vector<std::byte> buf(sizes[std::size(sizes) - 1]);
-  for (std::size_t i = 0; i < buf.size(); ++i) {
-    buf[i] = static_cast<std::byte>(i % 251);
-  }
-  const auto saved = blake3pp::active_transpose16();
-  b3tool::cooldown cooldown(cooldown_s);
-
-  println(stdout,
-          "t16 strategy vs working-set size ({}, {} MiB hashed per rep,\n"
-          "best of {}; 'rev' repeats the size with the strategy order "
-          "reversed)\n",
-          blake3pp::to_string(*w16), work >> 20, reps);
-  println(stdout, "  {:>10}  {:>10} {:>10} {:>10}   winner", "working set",
-          "staging", "tree", "quartered");
-
-  for (const std::size_t size : sizes) {
-    for (const bool reverse : {false, true}) {
-      const std::size_t iters = std::max<std::size_t>(1, work / size);
-      double best[3] = {0, 0, 0};
-      for (int k = 0; k < 3; ++k) {
-        const int idx = reverse ? 2 - k : k;
-        cooldown();
-        blake3pp::set_transpose16(order[idx]);
-        const double s = b3tool::best_seconds(reps, /*warmup=*/true, [&] {
-          for (std::size_t it = 0; it < iters; ++it) {
-            blake3pp::hasher h{*w16};
-            h.update(std::span<const std::byte>{buf.data(), size});
-            (void)h.finalize();
-          }
-        });
-        best[idx] = b3tool::gib_per_s(size * iters, s);
-      }
-      const int win = static_cast<int>(
-          std::max_element(best, best + 3) - best);
-      const std::string label =
-          size >= (1u << 20)
-              ? std::format("{} MiB", size >> 20)
-              : std::format("{} KiB", size >> 10);
-      println(stdout, "  {:>10}  {:10.2f} {:10.2f} {:10.2f}   {}{}", label,
-              best[0], best[1], best[2],
-              blake3pp::to_string(order[win]), reverse ? "  (rev)" : "");
-    }
-  }
-  blake3pp::set_transpose16(saved);
-  cooldown();
-  println(stdout,
-          "\n  tune_transpose16() picks: {}   (raced at its default "
-          "{} MiB working set, interleaved best-of-3)",
-          blake3pp::to_string(blake3pp::tune_transpose16()),
-          blake3pp::default_tune_bytes >> 20);
-  blake3pp::set_transpose16(saved);
-}
-
 // A static split, the control row for the engine's counter-pulled parts:
 // at most 256 power-of-two parts in one bulk call, so a provider that
 // hands out fixed shares (stdexec's static_thread_pool does) joins on its
@@ -336,7 +248,6 @@ int main(int argc, char** argv) {
   double cooldown_s = 5.0;
   int pin_cpu = -1;
   unsigned pool_threads = b3tool::default_threads();
-  bool sweep_t16 = false;
   std::vector<blake3pp::arch> arches;
 
   CLI::App app{
@@ -359,10 +270,6 @@ int main(int argc, char** argv) {
                  "parallel-engine threads (1 = a one-thread pool; default: all)")
       ->check(b3tool::at_least_one_thread)
       ->capture_default_str();
-  app.add_flag("--t16-sweep", sweep_t16,
-               "diagnose the AVX-512 transpose tuner: rank the three "
-               "strategies across working-set sizes and strategy orders");
-
   app.add_option("arch", arches, "SIMD variants to measure")
       ->transform(b3tool::arch_transformer());
   CLI11_PARSE(app, argc, argv);
@@ -383,11 +290,6 @@ int main(int argc, char** argv) {
               pin_cpu);
       return b3tool::exit_usage;
     }
-  }
-
-  if (sweep_t16) {
-    t16_sweep(reps, cooldown_s);  // single-threaded throughout: --pin holds
-    return 0;
   }
 
   if (arches.empty()) {
@@ -491,39 +393,6 @@ int main(int argc, char** argv) {
               }
               return fold.finalize();
             });
-  }
-
-  // The width-16 transpose strategies, raced in-process (the dial is
-  // runtime; no per-strategy binaries needed), plus what the tuner picks.
-  // Interleaved execution means the dial must be set per REP, inside fn,
-  // and put back so the neighboring rows see the default.
-  if (const auto w16 = first_w16_arch(); w16.has_value()) {
-    const auto saved = blake3pp::active_transpose16();
-    for (const auto strat :
-         {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
-          blake3pp::transpose16::quartered}) {
-      add_row(
-          std::format("  t16-{}", blake3pp::to_string(strat)), "",
-          [&, w16, strat, saved] {
-            blake3pp::set_transpose16(strat);
-            const auto d = hash_with(blake3pp::detail::resolve(*w16));
-            blake3pp::set_transpose16(saved);
-            return d;
-          },
-          14);
-    }
-    sections.back().footer = [&, saved] {
-      cooldown();
-      // Tuned for THIS run's input size, so the verdict is comparable to
-      // the three rows above it. The winner depends on the size
-      // (cache-resident inputs rank the strategies differently from
-      // streaming ones), so a tuner asked about a different size than the
-      // table measures has every right to disagree with it.
-      println(stdout, "    t16 tuner picks: {} (tuned for {} MiB)",
-              blake3pp::to_string(blake3pp::tune_transpose16(input.size())),
-              mib);
-      blake3pp::set_transpose16(saved);
-    };
   }
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
