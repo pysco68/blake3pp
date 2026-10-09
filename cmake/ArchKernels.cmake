@@ -106,6 +106,18 @@ blake3pp_kernel_switch(VROR_ROTATE 1
 blake3pp_kernel_switch(SHUFFLE_TREE 1
   "transposes and byte rotates through the constexpr shuffle networks instead of the scalar staging gather")
 
+# The eight-lane transpose escape: GCC with a raw vector-extension register
+# and AVX-512 available takes the staging gather there, because it lowers
+# the network's cross-lane stage to an index-register permute per stage.
+# Off restores the network for the A/B. See src/kernel/transpose.hpp.
+blake3pp_kernel_switch(VEXT_W8_GATHER 1
+  "GCC with a vector-extension register at eight lanes and AVX-512 available transposes through the staging gather, not the shuffle network")
+
+# x86 clang: spell rot16 as the generic shift-or, which LLVM canonicalises to
+# one pshufb, where every other compiler gets that instruction from the
+# explicit byte shuffle (which LLVM lowers to pshuflw+pshufhw instead). Off
+# gives clang the byte shuffle like everyone else. See prefer_byte_rot in
+# src/kernel/rotate.hpp.
 blake3pp_kernel_switch(ROT16_PER_COMPILER 1
   "x86 clang: rot16 as the shift-or LLVM folds to one pshufb, not the byte shuffle it lowers to two")
 
