@@ -137,31 +137,23 @@ void hasher::update(std::span<const std::byte> input) noexcept {
   while (len > 0) {
     close_full_chunk();
 
-    // Subtree fast path: aligned on a chunk boundary with more than one
-    // whole chunk ahead, reduce the largest power-of-2, position-aligned
-    // subtree in one wide pass (chunks AND parents lanes-parallel). The
-    // strict > keeps at least one byte in reserve, so no offloaded chunk
-    // can turn out to be the message's last (which would need
-    // CHUNK_END-with-ROOT handling).
+    // Wide path: aligned on a chunk boundary with more than one whole chunk
+    // ahead, every chunk but the one holding the last byte is reduced away.
+    // The strict > keeps that byte in reserve, so no offloaded chunk can turn
+    // out to be the message's last (which would need CHUNK_END-with-ROOT
+    // handling). How the run is batched is compress_chunks' business.
     if (core::chunk_len(chunk_) == 0 && len > kern::chunk_len) {
-      const std::size_t safe_chunks = (len - 1) / kern::chunk_len;
-      std::size_t subtree = std::bit_floor(safe_chunks);
-      // A subtree merged as one CV must sit on a subtree-aligned position
-      // in the overall tree.
-      while (((subtree - 1) & chunk_.chunk_counter) != 0) {
-        subtree /= 2;
-      }
-      if (subtree >= 2) {
-        std::array<std::uint32_t, 8> cv;
-        core::compress_subtree_to_cv(*ops_, p, subtree, chunk_.chunk_counter,
-                                     key_words_, base_flags_, cv);
-        push_cv(cv, chunk_.chunk_counter + subtree, subtree);
-        chunk_.chunk_counter += subtree;
-        p += subtree * kern::chunk_len;
-        len -= subtree * kern::chunk_len;
-        continue;
-      }
-      // A single (or misaligned) chunk falls through to the buffered path.
+      const std::size_t offload = (len - 1) / kern::chunk_len;
+      core::compress_chunks(
+          *ops_, p, offload, chunk_.chunk_counter, key_words_, base_flags_,
+          [this](std::span<const std::uint32_t, 8> cv,
+                 std::uint64_t subtree_chunks) noexcept {
+            push_cv(cv, chunk_.chunk_counter + subtree_chunks, subtree_chunks);
+            chunk_.chunk_counter += subtree_chunks;
+          });
+      p += offload * kern::chunk_len;
+      len -= offload * kern::chunk_len;
+      continue;
     }
 
     const std::size_t room = kern::chunk_len - core::chunk_len(chunk_);

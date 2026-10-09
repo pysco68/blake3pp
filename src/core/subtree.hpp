@@ -274,6 +274,74 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
   }
 }
 
+// An arbitrary run of complete chunks, reduced to the subtree CVs the spec's
+// tree has at that position and handed to sink left to right as (cv,
+// subtree_chunks) pairs, ready for a binary-counter stack. The caller decides
+// only how many chunks it may give away, which at a message's end means
+// holding back the chunk that could carry ROOT; which batches that run splits
+// into is decided here.
+//
+// Two shapes, chosen per step. While a position-aligned power-of-2 subtree of
+// at least 2*simd_degree chunks is available, that subtree is reduced whole,
+// so its parent generations stay batched across lanes. Otherwise up to
+// 2*simd_degree chunks go through one hash_many and are emitted as one CV
+// each, which costs the caller one parent block per chunk (the drag noted at
+// the top of this file) but replaces a chunk-at-a-time serial compression
+// with a full-width batch, and is bounded to that many chunks. Such a run is
+// trimmed to the next 2*simd_degree boundary while chunks follow it, so a
+// misaligned start costs one batch instead of a ladder of narrow subtrees.
+template <class Sink, std::size_t MaxDegree = kern::max_simd_degree>
+inline void compress_chunks(const kern::kernel_ops& k,
+                            const std::uint8_t* input, std::size_t num_chunks,
+                            std::uint64_t chunk_counter,
+                            std::span<const std::uint32_t, 8> key,
+                            std::uint32_t base_flags, Sink&& sink) noexcept {
+  const std::size_t wide = 2 * k.simd_degree;
+  while (num_chunks > 0) {
+    if (num_chunks >= wide) {
+      std::size_t subtree = std::bit_floor(num_chunks);
+      // A subtree merged as one CV must sit on a subtree-aligned position
+      // in the overall tree.
+      while (((subtree - 1) & chunk_counter) != 0) {
+        subtree /= 2;
+      }
+      if (subtree >= wide) {
+        std::array<std::uint32_t, 8> cv;
+        compress_subtree_to_cv<subtree_fold_levels, MaxDegree>(
+            k, input, subtree, chunk_counter, key, base_flags, cv);
+        sink(std::span<const std::uint32_t, 8>{cv},
+             static_cast<std::uint64_t>(subtree));
+        input += subtree * kern::chunk_len;
+        chunk_counter += subtree;
+        num_chunks -= subtree;
+        continue;
+      }
+    }
+
+    std::size_t take = std::min(num_chunks, wide);
+    if (num_chunks > take) {
+      take = std::min(
+          take, wide - static_cast<std::size_t>(chunk_counter % wide));
+    }
+    const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
+    for (std::size_t i = 0; i < take; ++i) {
+      chunks[i] = input + i * kern::chunk_len;
+    }
+    std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
+    k.hash_many(chunks, take, kern::chunk_len / kern::block_len, key.data(),
+                chunk_counter, /*increment_counter=*/true, base_flags,
+                kern::flag_chunk_start, kern::flag_chunk_end, cvs);
+    for (std::size_t i = 0; i < take; ++i) {
+      std::array<std::uint32_t, 8> cv;
+      load_cv_le(cvs + i * kern::out_len, cv);
+      sink(std::span<const std::uint32_t, 8>{cv}, std::uint64_t{1});
+    }
+    input += take * kern::chunk_len;
+    chunk_counter += take;
+    num_chunks -= take;
+  }
+}
+
 // Reduces sibling CVs of equal-sized adjacent subtrees, left to right, to
 // the CV of their common ancestor: one generation at a time, lanes-wide.
 // cvs is the working array and is clobbered, each generation writing its

@@ -11,7 +11,15 @@
 #include <blake3pp/blake3pp.hpp>
 #include <doctest/doctest.h>
 
+#include "kernel/kernel.hpp"
+
 namespace {
+
+// doctest stringifies a `const char*` as its ADDRESS, so an arch name has to
+// reach CAPTURE as a string_view to be readable.
+[[nodiscard]] std::string_view arch_name(blake3pp::arch a) noexcept {
+  return blake3pp::to_string(a);
+}
 
 std::vector<std::byte> make_input(std::size_t len) {
   std::vector<std::byte> v(len);
@@ -58,6 +66,77 @@ TEST_CASE("large input splits cross the batch fast path") {
     h.update(std::span{input}.first(split));
     h.update(std::span{input}.subspan(split));
     CHECK(h.finalize() == expected);
+  }
+}
+
+// The wide path in update() reduces every chunk but the one holding the last
+// byte, choosing per step between a whole aligned subtree and a batch of
+// single-chunk CVs. Which shape a length takes is a property of that length
+// and of the running kernel's lane count, so every chunk count from one to
+// past four batches is its own case, against a reference that cannot take
+// the path at all: updating a chunk at a time never leaves more than one
+// whole chunk ahead, so it compresses block by block through chunk_update.
+TEST_CASE("the wide path agrees with chunk-at-a-time for every length") {
+  constexpr std::size_t max_chunks = 4 * blake3pp::kern::max_simd_degree + 3;
+  const auto input = make_input(max_chunks * 1024 + 1024);
+
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (std::size_t chunks = 1; chunks <= max_chunks; ++chunks) {
+      for (const std::size_t tail :
+           {std::size_t{0}, std::size_t{1}, std::size_t{64},
+            std::size_t{1023}}) {
+        const std::size_t len = chunks * 1024 + tail;
+        CAPTURE(chunks);
+        CAPTURE(tail);
+        const auto bytes = std::span{input}.first(len);
+
+        blake3pp::hasher serial{ops};
+        for (std::size_t at = 0; at < len; at += 1024) {
+          serial.update(bytes.subspan(at, std::min<std::size_t>(1024, len - at)));
+        }
+        blake3pp::hasher wide{ops};
+        wide.update(bytes);
+        CHECK(wide.finalize() == serial.finalize());
+      }
+    }
+  }
+}
+
+// The same, entered at a chunk counter that is not subtree-aligned, which is
+// where the batch is trimmed to reach an aligned position: three chunk-sized
+// updates leave the counter at three, and the update that follows must still
+// build the tree the chunk-at-a-time reference builds.
+TEST_CASE("the wide path agrees when it starts at a misaligned counter") {
+  constexpr std::size_t prefix = 3 * 1024;
+  constexpr std::size_t max_chunks = 4 * blake3pp::kern::max_simd_degree + 3;
+  const auto input = make_input(prefix + max_chunks * 1024 + 7);
+
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    const std::span<const std::byte> bytes{input};
+
+    blake3pp::hasher serial{ops};
+    for (std::size_t at = 0; at < bytes.size(); at += 1024) {
+      serial.update(
+          bytes.subspan(at, std::min<std::size_t>(1024, bytes.size() - at)));
+    }
+    blake3pp::hasher wide{ops};
+    for (std::size_t at = 0; at < prefix; at += 1024) {
+      wide.update(bytes.subspan(at, 1024));
+    }
+    wide.update(bytes.subspan(prefix));
+    CHECK(wide.finalize() == serial.finalize());
   }
 }
 
