@@ -43,8 +43,26 @@ namespace blake3pp::core {
 #if defined(BLAKE3PP_SUBTREE_FOLD)
 constexpr std::size_t subtree_fold_levels = BLAKE3PP_SUBTREE_FOLD;
 #else
-constexpr std::size_t subtree_fold_levels = 0;  // the recursion
+constexpr std::size_t subtree_fold_levels = 0;  // the grouped sweep
 #endif
+
+// How many chunk batches the grouped sweep hashes before it reduces their
+// parents, in leaves of 2*simd_degree chunks. A kernel pays for alternating
+// between the 16-block chunk shape and the 1-block parent shape -- measured
+// on Zen 5, one parent call per leaf holds AVX-512 to 6.7 GiB/s where the
+// chunk batch alone runs at 8.5, and bursting the parents over 8 leaves
+// reaches 7.6, over 32 leaves 7.8. The staging buffers are 1.5 *
+// Leaves * 2 * MaxDegree chaining values, 12 KiB at the default and a
+// 16-lane build, which is why the count is a parameter: a small-device
+// target lowers it, the recursion it replaces spent 2 KiB per level.
+#if defined(BLAKE3PP_SUBTREE_GROUP)
+constexpr std::size_t subtree_group_leaves = BLAKE3PP_SUBTREE_GROUP;
+#else
+constexpr std::size_t subtree_group_leaves = 8;
+#endif
+static_assert(std::has_single_bit(subtree_group_leaves),
+              "BLAKE3PP_SUBTREE_GROUP must be a power of two: the binary "
+              "counter merges groups of equal size");
 
 // One generation of parents: pairs of child CVs (contiguous, LE bytes)
 // become one-block parent nodes, hashed lanes-wide. An odd trailing child
@@ -115,17 +133,29 @@ inline std::size_t compress_subtree_wide(const kern::kernel_ops& k,
                                           base_flags, out_cvs);
 }
 
-// Parent generations over n CVs in cvs (LE bytes), lanes-wide, until at
-// most stop_at remain; next is scratch of the same size. Returns the count.
+// Parent generations over n CVs in cvs (LE bytes), lanes-wide, until at most
+// stop_at remain; next is scratch for n/2 CVs. Returns the count.
+//
+// A generation wider than one call's pointer staging (4*MaxDegree children,
+// which is 2*MaxDegree parents) is split across calls, so n is not bounded
+// by the batch.
 template <std::size_t MaxDegree = kern::max_simd_degree>
 inline std::size_t reduce_generations(const kern::kernel_ops& k,
                                       std::uint8_t* cvs, std::uint8_t* next,
                                       std::size_t n, std::size_t stop_at,
                                       std::span<const std::uint32_t, 8> key,
                                       std::uint32_t base_flags) noexcept {
+  constexpr std::size_t batch_children = 4 * MaxDegree;
   while (n > stop_at) {
-    n = compress_parents_wide<MaxDegree>(k, cvs, n, key, base_flags, next);
-    std::copy_n(next, n * kern::out_len, cvs);
+    std::size_t written = 0;
+    for (std::size_t at = 0; at < n; at += batch_children) {
+      const std::size_t take = std::min(batch_children, n - at);
+      written += compress_parents_wide<MaxDegree>(
+          k, cvs + at * kern::out_len, take, key, base_flags,
+          next + written * kern::out_len);
+    }
+    std::copy_n(next, written * kern::out_len, cvs);
+    n = written;
   }
   return n;
 }
@@ -252,10 +282,85 @@ inline void compress_subtree_to_cv_folded(
   load_cv_le(stack, out_cv);
 }
 
-// Which of the two the library uses: the recursion unless a build opts into
-// the fold, which only narrow targets should (Fold is then the stack bound
-// in levels; see ArchKernels.cmake). Both stay compiled so the tests can
-// compare them on every machine.
+// The sweep: Leaves chunk batches go through hash_many back to back, then
+// that whole group's parent generations run in one burst, and the group's
+// single CV merges into a binary-counter stack (the shape hasher::push_cv
+// uses). This is the library's default path.
+//
+// It exists because of what the burst is worth, not because of the tree
+// shape, which is the recursion's. A kernel body at full width is large
+// enough that the 16-block chunk loop and the 1-block parent call do not
+// stay hot together, so compressing a node's parents as soon as its children
+// exist -- what the recursion does, once per two leaves -- pays for the
+// switch every time. Measured on Zen 5 with the parent work unchanged and
+// only its grouping varied: avx512 6.7 GiB/s at one leaf per burst, 7.6 at
+// eight, 7.8 at thirty-two, against 8.5 for the chunk batches alone; avx2
+// 3.1, 3.5, 3.8 against 4.0.
+//
+// The working set is two staging buffers plus the stack and does not grow
+// with the subtree's depth, where the recursion holds one buffer per level.
+// MaxStack bounds the stack in CVs and so the subtree this can reduce:
+// log2(num_chunks / group) + 1 entries, 54 covering the largest subtree
+// BLAKE3 defines.
+template <std::size_t Leaves = subtree_group_leaves, std::size_t MaxStack = 54,
+          std::size_t MaxDegree = kern::max_simd_degree>
+inline void compress_subtree_to_cv_grouped(
+    const kern::kernel_ops& k, const std::uint8_t* input,
+    std::size_t num_chunks, std::uint64_t chunk_counter,
+    std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
+    std::span<std::uint32_t, 8> out_cv) noexcept {
+  assert(num_chunks > 0 && std::has_single_bit(num_chunks));
+  constexpr std::size_t max_group = Leaves * 2 * MaxDegree;
+  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [max_group * kern::out_len];
+  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [max_group / 2 * kern::out_len];
+  std::uint8_t stack BLAKE3PP_CXXATTR_UNINITIALIZED [MaxStack * kern::out_len];
+  std::size_t depth = 0;
+
+  // Both are powers of two, so every group but a lone short one is full and
+  // the binary counter below only ever merges equal sizes.
+  const std::size_t leaf = 2 * k.simd_degree;
+  const std::size_t group = Leaves * leaf;
+  std::uint64_t groups = 0;
+  for (std::size_t done = 0; done < num_chunks; done += group) {
+    const std::size_t n = std::min(group, num_chunks - done);
+    for (std::size_t at = 0; at < n; at += leaf) {
+      const std::size_t take = std::min(leaf, n - at);
+      const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
+      for (std::size_t i = 0; i < take; ++i) {
+        chunks[i] = input + (done + at + i) * kern::chunk_len;
+      }
+      k.hash_many(chunks, take, kern::chunk_len / kern::block_len, key.data(),
+                  chunk_counter + done + at, /*increment_counter=*/true,
+                  base_flags, kern::flag_chunk_start, kern::flag_chunk_end,
+                  cvs + at * kern::out_len);
+    }
+    // The group's own parents, lanes-wide, down to its single root CV: the
+    // burst this shape exists for.
+    reduce_generations<MaxDegree>(k, cvs, next, n, 1, key, base_flags);
+    assert(depth < MaxStack);
+    std::copy_n(cvs, kern::out_len, stack + depth * kern::out_len);
+    depth++;
+    // Two subtrees of equal size on top merge; as many times as the group
+    // count has trailing zeros, which is the binary counter's carry.
+    ++groups;
+    for (int carries = std::countr_zero(groups); carries > 0; --carries) {
+      assert(depth >= 2);
+      depth -= 2;
+      compress_parents_wide<MaxDegree>(k, stack + depth * kern::out_len, 2, key,
+                                       base_flags, next);
+      std::copy_n(next, kern::out_len, stack + depth * kern::out_len);
+      depth++;
+    }
+  }
+  assert(depth == 1);
+  load_cv_le(stack, out_cv);
+}
+
+// Which of the three the library uses: the grouped sweep, unless a build
+// opts into the single-leaf fold, which only a target that cannot spare the
+// sweep's staging buffers should (Fold is then the stack bound in levels;
+// see ArchKernels.cmake). All three stay compiled so the tests can compare
+// them on every machine.
 template <std::size_t Fold = subtree_fold_levels,
           std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_subtree_to_cv(const kern::kernel_ops& k,
@@ -270,7 +375,7 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
     compress_subtree_to_cv_folded<Fold, MaxDegree>(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
   } else {
-    compress_subtree_to_cv_recursive<MaxDegree>(
+    compress_subtree_to_cv_grouped<subtree_group_leaves, 54, MaxDegree>(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
   }
 }

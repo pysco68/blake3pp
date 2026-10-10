@@ -1,9 +1,9 @@
-// The two subtree reductions must be computationally identical: the
-// recursion that holds a CV buffer per level, and the fold that walks groups
-// of 2*simd_degree chunks into a binary-counter stack (src/core/subtree.hpp).
-// Every compiled kernel runs both over every subtree size the engine can
-// hand them, since the group size follows the kernel's simd_degree and the
-// interesting sizes are the ones around it.
+// The three subtree reductions must be computationally identical: the
+// recursion that holds a CV buffer per level, the grouped sweep the library
+// uses by default, and the single-leaf fold a tight target opts into
+// (src/core/subtree.hpp). Every compiled kernel runs all three over every
+// subtree size the engine can hand them, since the group size follows the
+// kernel's simd_degree and the interesting sizes are the ones around it.
 //
 // The same file covers detail::fold_sibling_cvs, which takes the other way
 // in: the parallel engine hashes a window's parts separately, and the fold
@@ -115,7 +115,7 @@ void check_fold(const blake3pp::kern::kernel_ops* ops, std::size_t part,
 
 TEST_SUITE("subtree_fold") {
 
-TEST_CASE("the fold and the recursion agree on every kernel and size") {
+TEST_CASE("the three reductions agree on every kernel and size") {
   const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
   // available_arches(), not compiled_arches(): resolve() hands back a
   // fallback table for a variant this CPU cannot run, so iterating the
@@ -137,12 +137,47 @@ TEST_CASE("the fold and the recursion agree on every kernel and size") {
         CAPTURE(counter);
         std::array<std::uint32_t, 8> from_recursion{};
         std::array<std::uint32_t, 8> from_fold{};
+        std::array<std::uint32_t, 8> from_group{};
         blake3pp::core::compress_subtree_to_cv_recursive(
             *ops, data.data(), chunks, counter, key, 0, from_recursion);
         blake3pp::core::compress_subtree_to_cv_folded<>(
             *ops, data.data(), chunks, counter, key, 0, from_fold);
+        blake3pp::core::compress_subtree_to_cv_grouped<>(
+            *ops, data.data(), chunks, counter, key, 0, from_group);
         CHECK(from_fold == from_recursion);
+        CHECK(from_group == from_recursion);
       }
+    }
+  }
+}
+
+// The burst size is a tuning parameter, so every value of it has to produce
+// the same tree: one leaf per group is the fold's shape, and a group wider
+// than the whole subtree is the degenerate single-group case.
+TEST_CASE("every group size reduces to the same CV") {
+  const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
+  for (const auto a : blake3pp::available_arches()) {
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (std::size_t chunks = 2; chunks <= 512; chunks *= 2) {
+      CAPTURE(chunks);
+      const auto data = pattern(chunks * blake3pp::chunk_size);
+      std::array<std::uint32_t, 8> expected{};
+      blake3pp::core::compress_subtree_to_cv_recursive(
+          *ops, data.data(), chunks, 7, key, 0, expected);
+      std::array<std::uint32_t, 8> g1{};
+      std::array<std::uint32_t, 8> g4{};
+      std::array<std::uint32_t, 8> g64{};
+      blake3pp::core::compress_subtree_to_cv_grouped<1>(
+          *ops, data.data(), chunks, 7, key, 0, g1);
+      blake3pp::core::compress_subtree_to_cv_grouped<4>(
+          *ops, data.data(), chunks, 7, key, 0, g4);
+      blake3pp::core::compress_subtree_to_cv_grouped<64>(
+          *ops, data.data(), chunks, 7, key, 0, g64);
+      CHECK(g1 == expected);
+      CHECK(g4 == expected);
+      CHECK(g64 == expected);
     }
   }
 }
