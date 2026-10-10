@@ -145,7 +145,19 @@ class gcd_context {
         f_.set_direct();
       }
       name_ = ctx.name_for(f_.direct(), write_);
+      ctx_ = &ctx;
     }
+
+    // The descriptor closes with this object, and a dispatch worker may
+    // be inside a transfer on it: the context waits those out and forgets
+    // what this file left behind first.
+    ~file() {
+      if (ctx_ != nullptr) {
+        ctx_->forget(*this);
+      }
+    }
+    file(const file&) = delete;
+    file& operator=(const file&) = delete;
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
@@ -162,6 +174,7 @@ class gcd_context {
    private:
     friend class gcd_context;
     posix_file f_;
+    gcd_context* ctx_ = nullptr;
     std::uint64_t size_ = 0;
     std::uint64_t prealloc_ = 0;
     bool write_ = false;
@@ -278,6 +291,39 @@ class gcd_context {
   }
 
  private:
+  // A file about to close takes its transfers with it. The descriptor is
+  // the hazard: a worker inside pread() on it would, once the number is
+  // recycled by another thread's open(), read a different file's bytes
+  // into the engine's buffer and report success. So every worker is
+  // waited out before the close, and what this file finished or never
+  // started is dropped rather than reported, which is the contract's
+  // teardown drain for one file.
+  //
+  // The group is the context's, so the wait covers sibling files too.
+  // That is longer than necessary and harmless: a sibling's finished
+  // transfer stays on the done list for a later poll() to report.
+  void forget(file& f) noexcept {
+    const std::size_t never_started = deferred_.remove_if(
+        [&f](const read_op& op) noexcept { return op.sync_file == &f.f_; });
+    in_flight_ -= never_started;
+    if (!use_gcd_) {
+      return;  // nothing is in a worker: the deferred list is poll()'s
+    }
+    dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
+    const std::lock_guard<std::mutex> lk(done_m_);
+    read_op** link = &done_head_;
+    while (*link != nullptr) {
+      read_op* const op = *link;
+      if (op->sync_file == &f.f_) {
+        *link = op->next_done;
+        op->next_done = nullptr;
+        in_flight_--;
+      } else {
+        link = &op->next_done;
+      }
+    }
+  }
+
   // Runs on a GCD worker: one positional read or write loop over the
   // caller's buffer, then the op goes on the done list. noexcept: the
   // error travels in the op to whoever calls poll().
