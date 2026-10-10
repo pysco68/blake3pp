@@ -111,6 +111,46 @@ template <class T>
 static_assert(std::atomic_ref<unsigned>::is_always_lock_free,
               "the io_uring head/tail contract needs lock-free 32-bit atomics");
 
+// One mmap, unmapped when it goes, with MAP_FAILED folded into the empty
+// state. The ring's are the only mappings in the library.
+class unique_mmap {
+ public:
+  unique_mmap() noexcept = default;
+  unique_mmap(void* p, std::size_t n) noexcept
+      : p_(p == MAP_FAILED ? nullptr : p), n_(p == MAP_FAILED ? 0 : n) {}
+  unique_mmap(unique_mmap&& o) noexcept
+      : p_(std::exchange(o.p_, nullptr)), n_(std::exchange(o.n_, 0)) {}
+  unique_mmap& operator=(unique_mmap&& o) noexcept {
+    if (this != &o) {
+      reset();
+      p_ = std::exchange(o.p_, nullptr);
+      n_ = std::exchange(o.n_, 0);
+    }
+    return *this;
+  }
+  unique_mmap(const unique_mmap&) = delete;
+  unique_mmap& operator=(const unique_mmap&) = delete;
+  ~unique_mmap() { reset(); }
+
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return p_ != nullptr;
+  }
+  [[nodiscard]] unsigned char* bytes() const noexcept {
+    return static_cast<unsigned char*>(p_);
+  }
+  void reset() noexcept {
+    if (p_ != nullptr) {
+      ::munmap(p_, n_);
+      p_ = nullptr;
+      n_ = 0;
+    }
+  }
+
+ private:
+  void* p_ = nullptr;
+  std::size_t n_ = 0;
+};
+
 // The mapped rings, reduced to what this pipeline needs. Kernel-shared
 // integers are accessed through atomic_ref with acquire/release, per the
 // io_uring memory-ordering contract.
@@ -123,12 +163,14 @@ struct uring {
   int setup_errno = 0;
   unsigned sq_entries = 0;
   unsigned cq_entries = 0;
-  void* sq_ring = nullptr;
-  std::size_t sq_ring_sz = 0;
-  void* cq_ring = nullptr;
-  std::size_t cq_ring_sz = 0;
+  // Two or three mappings, owned here; the pointers below are views into
+  // them. With IORING_FEAT_SINGLE_MMAP the completion ring IS the
+  // submission ring, and then cq_map stays empty: ownership says how many
+  // mappings exist, so unmapping never has to compare two addresses.
+  unique_mmap sq_map;
+  unique_mmap cq_map;
+  unique_mmap sqes_map;
   unsigned char* sqes = nullptr;
-  std::size_t sqes_sz = 0;
   unsigned* sq_head = nullptr;
   unsigned* sq_tail = nullptr;
   unsigned* sq_mask = nullptr;
@@ -159,35 +201,39 @@ struct uring {
     }
     sq_entries = p.sq_entries;
     cq_entries = p.cq_entries;
-    sq_ring_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
-    cq_ring_sz = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
-    if (p.features & IORING_FEAT_SINGLE_MMAP) {
-      sq_ring_sz = cq_ring_sz = std::max(sq_ring_sz, cq_ring_sz);
+    const bool single = (p.features & IORING_FEAT_SINGLE_MMAP) != 0;
+    std::size_t sq_sz = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+    const std::size_t cq_sz = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
+    if (single) {
+      sq_sz = std::max(sq_sz, cq_sz);
     }
-    sq_ring = ::mmap(nullptr, sq_ring_sz, PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_POPULATE, fd.get(), IORING_OFF_SQ_RING);
-    if (sq_ring == MAP_FAILED) {
-      sq_ring = nullptr;  // destroy() tests for null, and MAP_FAILED is -1
+    sq_map = unique_mmap(::mmap(nullptr, sq_sz, PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_POPULATE, fd.get(),
+                                IORING_OFF_SQ_RING),
+                         sq_sz);
+    if (!sq_map) {
       return fail();
     }
-    cq_ring = (p.features & IORING_FEAT_SINGLE_MMAP)
-                  ? sq_ring
-                  : ::mmap(nullptr, cq_ring_sz, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_POPULATE, fd.get(), IORING_OFF_CQ_RING);
-    if (cq_ring == MAP_FAILED) {
-      cq_ring = nullptr;
+    if (!single) {
+      cq_map = unique_mmap(::mmap(nullptr, cq_sz, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED | MAP_POPULATE, fd.get(),
+                                  IORING_OFF_CQ_RING),
+                           cq_sz);
+      if (!cq_map) {
+        return fail();
+      }
+    }
+    const std::size_t sqes_sz = p.sq_entries * sizeof(io_uring_sqe);
+    sqes_map = unique_mmap(::mmap(nullptr, sqes_sz, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED | MAP_POPULATE, fd.get(),
+                                  IORING_OFF_SQES),
+                           sqes_sz);
+    if (!sqes_map) {
       return fail();
     }
-    sqes_sz = p.sq_entries * sizeof(io_uring_sqe);
-    sqes = static_cast<unsigned char*>(
-        ::mmap(nullptr, sqes_sz, PROT_READ | PROT_WRITE,
-               MAP_SHARED | MAP_POPULATE, fd.get(), IORING_OFF_SQES));
-    if (sqes == MAP_FAILED) {
-      sqes = nullptr;
-      return fail();
-    }
-    auto* sqb = static_cast<unsigned char*>(sq_ring);
-    auto* cqb = static_cast<unsigned char*>(cq_ring);
+    sqes = sqes_map.bytes();
+    unsigned char* const sqb = sq_map.bytes();
+    unsigned char* const cqb = single ? sqb : cq_map.bytes();
     sq_head = ring_at<unsigned>(sqb, p.sq_off.head);
     sq_tail = ring_at<unsigned>(sqb, p.sq_off.tail);
     sq_mask = ring_at<unsigned>(sqb, p.sq_off.ring_mask);
@@ -241,18 +287,14 @@ struct uring {
 
   void destroy() noexcept {
     drain();
-    if (sqes != nullptr) {
-      ::munmap(sqes, sqes_sz);
-      sqes = nullptr;
-    }
-    if (cq_ring != nullptr && cq_ring != sq_ring) {
-      ::munmap(cq_ring, cq_ring_sz);
-    }
-    cq_ring = nullptr;
-    if (sq_ring != nullptr) {
-      ::munmap(sq_ring, sq_ring_sz);
-      sq_ring = nullptr;
-    }
+    // The views first: nothing may name a mapping that is going away, and
+    // a failed init() runs this with only some of them set.
+    sqes = nullptr;
+    sq_head = sq_tail = sq_mask = cq_head = cq_tail = cq_mask = nullptr;
+    sq_array = cqes = nullptr;
+    sqes_map.reset();
+    cq_map.reset();
+    sq_map.reset();
     fd.reset();
   }
 
