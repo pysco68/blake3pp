@@ -127,6 +127,17 @@ extern "C" void blake3_hash_many_avx512(
     std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
     bool increment_counter, std::uint8_t flags, std::uint8_t flags_start,
     std::uint8_t flags_end, std::uint8_t* out);
+// The one extended-output kernel the reference ships as assembly -- in
+// its Unix and windows_gnu sources; the MASM sources MSVC assembles have
+// none, and the build says so (bench/CMakeLists.txt).
+#if !defined(BLAKE3PP_BENCH_NO_XOF_ASM)
+extern "C" void blake3_xof_many_avx512(const std::uint32_t cv[8],
+                                       const std::uint8_t block[64],
+                                       std::uint8_t block_len,
+                                       std::uint64_t counter,
+                                       std::uint8_t flags, std::uint8_t* out,
+                                       std::size_t outblocks);
+#endif
 #else
 extern "C" void blake3_hash_many_neon(
     const std::uint8_t* const* inputs, std::size_t num_inputs,
@@ -158,6 +169,23 @@ void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
 #endif
 }
 
+// The same for the reference's extended-output kernel: one wrapper, the
+// same widening of the flag arguments.
+template <auto ReferenceFn>
+void asm_xof_many(const std::uint32_t cv[8],
+                  const std::uint8_t block[blake3pp::kern::block_len],
+                  std::uint32_t len, std::uint64_t counter,
+                  std::uint32_t flags, std::uint8_t* out,
+                  std::size_t num_blocks) noexcept {
+  ReferenceFn(cv, block, static_cast<std::uint8_t>(len), counter,
+              static_cast<std::uint8_t>(flags), out, num_blocks);
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+  __msan_unpoison(out, num_blocks * blake3pp::kern::block_len);
+#endif
+#endif
+}
+
 // Everything that varies by host architecture, decided once: which wide
 // kernels exist, which blake3pp variant each pairs with, and how the rows
 // read. Narrowest first, so the widest AVAILABLE entry is the last match.
@@ -168,19 +196,25 @@ struct asm_kernel {
   const char* row;
   const char* note;
   decltype(blake3pp::kern::kernel_ops::hash_many) hash_many;
+  decltype(blake3pp::kern::kernel_ops::xof_many) xof_many;
 };
 
 #if defined(__x86_64__) || defined(_M_X64)
 constexpr asm_kernel asm_kernels[] = {
     {blake3pp::arch::avx2, "avx2", "hand-written asm",
-     &asm_hash_many<&blake3_hash_many_avx2>},
+     &asm_hash_many<&blake3_hash_many_avx2>, nullptr},
     {blake3pp::arch::avx512, "avx512", "hand-written asm",
-     &asm_hash_many<&blake3_hash_many_avx512>},
+     &asm_hash_many<&blake3_hash_many_avx512>,
+#if defined(BLAKE3PP_BENCH_NO_XOF_ASM)
+     nullptr},
+#else
+     &asm_xof_many<&blake3_xof_many_avx512>},
+#endif
 };
 #else
 constexpr asm_kernel asm_kernels[] = {
     {blake3pp::arch::neon, "neon", "hand-tuned intrinsics",
-     &asm_hash_many<&blake3_hash_many_neon>},
+     &asm_hash_many<&blake3_hash_many_neon>, nullptr},
 };
 #endif
 }  // namespace
@@ -370,6 +404,41 @@ int main(int argc, char** argv) {
     return d;
   };
 
+  // Extended output: one root node's stream, filled through the kernel's
+  // xof_many in the batches the reader uses. Lanes map to output counters
+  // here, the mirror of hash_many, and the rate is bytes of OUTPUT. The
+  // digest folds the stream, so every kernel must agree on it.
+  //
+  // The stream goes to its own buffer, one reader-sized fill at a time, and
+  // the row produces as many bytes as the input has so the rate column means
+  // the same thing as everywhere else. Correctness is checked by XOR-folding
+  // the first 32 bytes of every 64th block: a kernel that got a lane or a
+  // counter wrong changes those, and the sampling keeps the check at 1/64 of
+  // the traffic instead of doubling the row's memory work.
+  std::vector<std::byte> xof_out(std::min<std::size_t>(8u << 20, input.size()));
+  const auto xof_with = [&](const blake3pp::kern::kernel_ops* ops) {
+    std::array<std::uint32_t, 8> cv{};
+    std::ranges::copy(blake3pp::kern::iv, cv.begin());
+    const std::uint8_t block[blake3pp::kern::block_len] = {};
+    const std::size_t total = input.size() / blake3pp::kern::block_len;
+    const std::size_t per = xof_out.size() / blake3pp::kern::block_len;
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < total; at += per) {
+      const std::size_t n = std::min(per, total - at);
+      ops->xof_many(cv.data(), block, blake3pp::kern::block_len, at,
+                    blake3pp::kern::flag_root,
+                    blake3pp::kern::kernel_bytes(xof_out.data()), n);
+      for (std::size_t b = 0; b < n; b += 64) {
+        for (std::size_t k = 0; k < 32; ++k) {
+          acc[k] ^= xof_out[b * blake3pp::kern::block_len + k];
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
+  };
+
   // The whole input in 8 KiB messages, `one` hashing each, their digests
   // folded into the row's digest so that every row of this shape is
   // checked message by message and comparable to the others. The fold is
@@ -480,6 +549,9 @@ int main(int argc, char** argv) {
               return hash_batches(blake3pp::detail::resolve(a), 2,
                                   /*parent_shape=*/true);
             });
+    add_row(std::format("{}_xof", blake3pp::to_string(a)),
+            "xof_many alone: bytes of extended output",
+            [&, a] { return xof_with(blake3pp::detail::resolve(a)); });
   }
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
@@ -535,6 +607,18 @@ int main(int argc, char** argv) {
               ops.hash_many = k.hash_many;
               return hash_batches(&ops, 2, /*parent_shape=*/true);
             });
+    // Only the AVX-512 assembly has an extended-output kernel; the others
+    // reach xof_many through the portable C, which is not a comparison.
+    if (k.xof_many != nullptr) {
+      add_row(std::format("{}_xof", k.row),
+              "xof_many alone: bytes of extended output, hand-written asm",
+              [&, k] {
+                blake3pp::kern::kernel_ops ops =
+                    *blake3pp::detail::resolve(k.variant);
+                ops.xof_many = k.xof_many;
+                return xof_with(&ops);
+              });
+    }
     // The twin of blake3pp_8k with only hash_many swapped: what separates
     // the kernel's share of the short-message gap from the tree code's.
     add_row(std::format("{}_8k", k.row), "8 KiB messages, hand-written asm",
@@ -580,6 +664,32 @@ int main(int argc, char** argv) {
     return hash_8k(blake3pp::detail::resolve(blake3pp::arch::auto_detect),
                    reference_hash);
   });
+  // Extended output end to end, each implementation through its own seek
+  // API, in the same reader-sized fills as the kernel rows above.
+  add_row("reference_xof", "bytes of extended output, own dispatch", [&] {
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, input.data(), 1);
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < input.size(); at += xof_out.size()) {
+      const std::size_t n = std::min(xof_out.size(), input.size() - at);
+      blake3_hasher_finalize_seek(
+          &h, at, blake3pp::kern::kernel_bytes(xof_out.data()), n);
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+      __msan_unpoison(xof_out.data(), n);
+#endif
+#endif
+      for (std::size_t b = 0; b * 64 < n; b += 64) {
+        for (std::size_t k = 0; k < 32; ++k) {
+          acc[k] ^= xof_out[b * 64 + k];
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
+  });
 #endif
 
   // The blake3pp full pipeline on a single thread, the mirror of the
@@ -595,6 +705,24 @@ int main(int argc, char** argv) {
                    [](std::span<const std::byte> m) {
                      return blake3pp::hash(m);
                    });
+  });
+  add_row("blake3pp_xof", "bytes of extended output, own dispatch", [&] {
+    blake3pp::hasher h;
+    h.update_last(std::span<const std::byte>{input}.first(1));
+    blake3pp::output_reader r = h.finalize_xof();
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < input.size(); at += xof_out.size()) {
+      const std::size_t n = std::min(xof_out.size(), input.size() - at);
+      r.fill(std::span<std::byte>{xof_out}.first(n));
+      for (std::size_t b = 0; b * 64 < n; b += 64) {
+        for (std::size_t k = 0; k < 32; ++k) {
+          acc[k] ^= xof_out[b * 64 + k];
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
   });
 
   // --- measurement: rep-outer, row-inner, start row rotated per pass ---
