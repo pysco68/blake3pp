@@ -58,10 +58,9 @@ inline bool preallocate(int fd, std::uint64_t len) noexcept {
   return ::ftruncate(fd, static_cast<off_t>(len)) == 0;
 }
 
-// The submission and completion machinery, playing the role the uring and
-// the completion port play elsewhere. submit() is fire-and-forget onto
-// GCD's global pool, workers publish per-slot completion under m and signal
-// cv, and the pipeline thread blocks on cv for the slot it needs next.
+// The submission half of the machinery: submit() queues a transfer onto
+// GCD's global pool inside a dispatch group. The context's done list and
+// waiter carry the completion back.
 //
 // The group exists for teardown. In-flight workers touch the engine's
 // buffer pool, so destroy() must wait them out before the pool is freed.
@@ -90,10 +89,13 @@ struct gcd_pump {
     }
   }
 
-  void submit(void (*fn)(void*), void* ctx) noexcept {
+  // GCD takes a C callback and a cookie, so the cast back to the caller's
+  // type lives here, in the one place the boundary forces it.
+  template <class T, void (*Run)(T&) noexcept>
+  void submit(T& ctx) noexcept {
     dispatch_group_async_f(
-        group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ctx,
-        fn);
+        group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &ctx,
+        +[](void* p) noexcept { Run(*static_cast<T*>(p)); });
   }
 };
 
@@ -212,7 +214,7 @@ class gcd_context {
     op.next_done = nullptr;
     in_flight_++;
     if (use_gcd_) {
-      pump_.submit(&gcd_context::run_transfer, &op);
+      pump_.submit<read_op, &gcd_context::run_transfer>(op);
     } else {
       deferred_.push(op);
     }
@@ -236,7 +238,7 @@ class gcd_context {
     op.next_done = nullptr;
     in_flight_++;
     if (use_gcd_) {
-      pump_.submit(&gcd_context::run_transfer, &op);
+      pump_.submit<read_op, &gcd_context::run_transfer>(op);
     } else {
       deferred_.push(op);
     }
@@ -282,10 +284,7 @@ class gcd_context {
     if (use_gcd_) {
       dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
     }
-    {
-      const std::lock_guard<std::mutex> lk(done_m_);
-      done_head_ = nullptr;
-    }
+    done_.clear();
     deferred_.clear();
     in_flight_ = 0;
   }
@@ -310,25 +309,14 @@ class gcd_context {
       return;  // nothing is in a worker: the deferred list is poll()'s
     }
     dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
-    const std::lock_guard<std::mutex> lk(done_m_);
-    read_op** link = &done_head_;
-    while (*link != nullptr) {
-      read_op* const op = *link;
-      if (op->sync_file == &f.f_) {
-        *link = op->next_done;
-        op->next_done = nullptr;
-        in_flight_--;
-      } else {
-        link = &op->next_done;
-      }
-    }
+    in_flight_ -= done_.remove_if(
+        [&f](const read_op& op) noexcept { return op.sync_file == &f.f_; });
   }
 
   // Runs on a GCD worker: one positional read or write loop over the
   // caller's buffer, then the op goes on the done list. noexcept: the
   // error travels in the op to whoever calls poll().
-  static void run_transfer(void* p) noexcept {
-    auto& op = *static_cast<read_op*>(p);
+  static void run_transfer(read_op& op) noexcept {
     gcd_context& c = *op.ctx;
     int err = 0;
     std::size_t got = 0;
@@ -356,11 +344,7 @@ class gcd_context {
     }
     op.filled = got;
     op.error = err;
-    {
-      const std::lock_guard<std::mutex> lk(c.done_m_);
-      op.next_done = c.done_head_;
-      c.done_head_ = &op;
-    }
+    c.done_.push(op);
     c.waiter_.wake();
   }
 
@@ -368,11 +352,7 @@ class gcd_context {
   // caller's thread. The list is LIFO, which the contract permits: the
   // engine matches a completion to its window by the op, not by order.
   std::size_t drain_done() noexcept {
-    read_op* head = nullptr;
-    {
-      const std::lock_guard<std::mutex> lk(done_m_);
-      head = std::exchange(done_head_, nullptr);
-    }
+    read_op* head = done_.take_all();
     std::size_t ran = 0;
     while (head != nullptr) {
       read_op* const next = head->next_done;
@@ -421,11 +401,59 @@ class gcd_context {
     return n;
   }
 
+  // Finished transfers, pushed by GCD workers and drained by poll(). The
+  // link is the op's own next_done, so nothing allocates, and the head is
+  // reachable only through these members, each under the lock.
+  class done_list {
+   public:
+    void push(read_op& op) noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      op.next_done = head_;
+      head_ = &op;
+    }
+
+    // The whole list, LIFO, which the contract permits: the engine matches
+    // a completion to its window by the op, not by order.
+    [[nodiscard]] read_op* take_all() noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      return std::exchange(head_, nullptr);
+    }
+
+    // Forgets everything on the list: nothing here gets its callback.
+    void clear() noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      head_ = nullptr;
+    }
+
+    // Unlinks and forgets the ops `drop` accepts, for a file closing with
+    // transfers that finished but were never reported. Returns how many.
+    template <class Pred>
+    std::size_t remove_if(Pred drop) noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      std::size_t dropped = 0;
+      read_op** link = &head_;
+      while (*link != nullptr) {
+        read_op* const op = *link;
+        if (drop(*op)) {
+          *link = op->next_done;
+          op->next_done = nullptr;
+          ++dropped;
+        } else {
+          link = &op->next_done;
+        }
+      }
+      return dropped;
+    }
+
+   private:
+    std::mutex m_;
+    read_op* head_ = nullptr;
+  };
+
   gcd_pump pump_;
   poll_waiter waiter_;
   deferred_ops<read_op> deferred_;
-  std::mutex done_m_;
-  read_op* done_head_ = nullptr;
+  done_list done_;
   std::size_t in_flight_ = 0;
   bool use_gcd_ = false;
 };
