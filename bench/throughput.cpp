@@ -449,6 +449,19 @@ int main(int argc, char** argv) {
       ops.hash_many = k.hash_many;  // compress_in_place stays portable
       return hash_with(&ops);
     });
+    // The twin of blake3pp_8k with only hash_many swapped: what separates
+    // the kernel's share of the short-message gap from the tree code's.
+    add_row(std::format("{}_8k", k.row), "8 KiB messages, hand-written asm",
+            [&, k] {
+              blake3pp::kern::kernel_ops ops =
+                  *blake3pp::detail::resolve(k.variant);
+              ops.hash_many = k.hash_many;
+              return hash_8k(&ops, [&ops](std::span<const std::byte> m) {
+                blake3pp::hasher h{&ops};
+                h.update_last(m);
+                return h.finalize();
+              });
+            });
     asm_ops = *blake3pp::detail::resolve(k.variant);
     asm_ops.hash_many = k.hash_many;
     asm_row = k.row;
