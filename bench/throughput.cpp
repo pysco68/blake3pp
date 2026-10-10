@@ -395,12 +395,14 @@ int main(int argc, char** argv) {
     add_row(std::string{blake3pp::to_string(a)}, "",
             [&, a] { return hash_with(blake3pp::detail::resolve(a)); });
   }
-  // The same kernels on 8 KiB messages, one hasher per message: eight
-  // chunks, which is half a 16-lane batch and a whole 8-lane one. Where
-  // the long rows above amortise every remainder, this one is nothing
-  // but the remainder path -- padded, handed to a narrower kernel, or
-  // compressed one chunk at a time -- so it is where resolve()'s ladder
-  // and the kernels' own thresholds show.
+  // The same kernels on 8 KiB messages, one hasher per message, each told
+  // the message ends there (update_last, which is what a one-shot does).
+  // Eight chunks is half a 16-lane batch and a whole 8-lane one, so where
+  // the long rows above amortise every remainder, this row is the
+  // remainder path itself -- padded out, or handed to a narrower kernel --
+  // and it is where the kernels' own thresholds show. Every 8 KiB row in
+  // this bench hashes a complete message this way, so they compare
+  // directly, here and across implementations.
   for (const auto a : arches) {
     if (!blake3pp::is_available(a)) {
       continue;
@@ -410,7 +412,7 @@ int main(int argc, char** argv) {
               const auto* ops = blake3pp::detail::resolve(a);
               return hash_8k(ops, [ops](std::span<const std::byte> m) {
                 blake3pp::hasher h{ops};
-                h.update(m);
+                h.update_last(m);
                 return h.finalize();
               });
             });
