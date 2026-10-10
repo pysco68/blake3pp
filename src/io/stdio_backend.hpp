@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <span>
 #include <system_error>
 
@@ -48,26 +49,21 @@ class stdio_source {
  public:
   stdio_source(const std::filesystem::path& path,
                const file_open_options& how) {
-    stream_ = std::fopen(path.string().c_str(), how.write ? "wb" : "rb");
-    if (stream_ == nullptr) {
+    stream_.reset(std::fopen(path.string().c_str(), how.write ? "wb" : "rb"));
+    if (!stream_) {
       throw_errno("fopen");
     }
     if (how.write) {
       return;  // created empty; there is no size to learn
     }
-    if (std::fseek(stream_, 0, SEEK_END) != 0) {
+    if (std::fseek(stream_.get(), 0, SEEK_END) != 0) {
       throw_errno("fseek(end)");
     }
-    const std::int64_t end = tell64(stream_);
+    const std::int64_t end = tell64(stream_.get());
     if (end < 0) {
       throw_errno("ftell");
     }
     size_ = static_cast<std::uint64_t>(end);
-  }
-  ~stdio_source() {
-    if (stream_ != nullptr) {
-      std::fclose(stream_);
-    }
   }
   stdio_source(const stdio_source&) = delete;
   stdio_source& operator=(const stdio_source&) = delete;
@@ -76,19 +72,19 @@ class stdio_source {
   [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
 
   void read_at(std::uint64_t off, std::span<std::byte> buf) {
-    if (seek64(stream_, off) != 0) {
+    if (seek64(stream_.get(), off) != 0) {
       throw_errno("fseek");
     }
-    if (std::fread(buf.data(), 1, buf.size(), stream_) != buf.size()) {
+    if (std::fread(buf.data(), 1, buf.size(), stream_.get()) != buf.size()) {
       throw std::system_error(EIO, std::generic_category(), "fread");
     }
   }
 
   void write_at(std::uint64_t off, std::span<const std::byte> buf) {
-    if (seek64(stream_, off) != 0) {
+    if (seek64(stream_.get(), off) != 0) {
       throw_errno("fseek");
     }
-    if (std::fwrite(buf.data(), 1, buf.size(), stream_) != buf.size()) {
+    if (std::fwrite(buf.data(), 1, buf.size(), stream_.get()) != buf.size()) {
       throw std::system_error(EIO, std::generic_category(), "fwrite");
     }
   }
@@ -96,13 +92,16 @@ class stdio_source {
   // stdio has no truncate; flushing is the most it can promise, and the
   // writer above it only ever asks for a size it has actually written.
   void set_size(std::uint64_t) {
-    if (std::fflush(stream_) != 0) {
+    if (std::fflush(stream_.get()) != 0) {
       throw_errno("fflush");
     }
   }
 
  private:
-  std::FILE* stream_ = nullptr;
+  struct closer {
+    void operator()(std::FILE* f) const noexcept { std::fclose(f); }
+  };
+  std::unique_ptr<std::FILE, closer> stream_;
   std::uint64_t size_ = 0;
 };
 

@@ -115,7 +115,7 @@ static_assert(std::atomic_ref<unsigned>::is_always_lock_free,
 // integers are accessed through atomic_ref with acquire/release, per the
 // io_uring memory-ordering contract.
 struct uring {
-  int fd = -1;
+  unique_fd fd;
   // errno from a failed io_uring_setup. EPERM (a seccomp policy forbids
   // the syscall; Android does) and ENOSYS (kernel predates io_uring) are
   // the same observable with entirely different causes, so the fallback
@@ -152,8 +152,8 @@ struct uring {
   bool init(unsigned entries) noexcept {
     io_uring_params p;
     std::memset(&p, 0, sizeof(p));
-    fd = sys_io_uring_setup(entries, &p);
-    if (fd < 0) {
+    fd.reset(sys_io_uring_setup(entries, &p));
+    if (!fd) {
       setup_errno = errno;
       return false;
     }
@@ -165,7 +165,7 @@ struct uring {
       sq_ring_sz = cq_ring_sz = std::max(sq_ring_sz, cq_ring_sz);
     }
     sq_ring = ::mmap(nullptr, sq_ring_sz, PROT_READ | PROT_WRITE,
-                     MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+                     MAP_SHARED | MAP_POPULATE, fd.get(), IORING_OFF_SQ_RING);
     if (sq_ring == MAP_FAILED) {
       sq_ring = nullptr;  // destroy() tests for null, and MAP_FAILED is -1
       return fail();
@@ -173,7 +173,7 @@ struct uring {
     cq_ring = (p.features & IORING_FEAT_SINGLE_MMAP)
                   ? sq_ring
                   : ::mmap(nullptr, cq_ring_sz, PROT_READ | PROT_WRITE,
-                           MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+                           MAP_SHARED | MAP_POPULATE, fd.get(), IORING_OFF_CQ_RING);
     if (cq_ring == MAP_FAILED) {
       cq_ring = nullptr;
       return fail();
@@ -181,7 +181,7 @@ struct uring {
     sqes_sz = p.sq_entries * sizeof(io_uring_sqe);
     sqes = static_cast<unsigned char*>(
         ::mmap(nullptr, sqes_sz, PROT_READ | PROT_WRITE,
-               MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES));
+               MAP_SHARED | MAP_POPULATE, fd.get(), IORING_OFF_SQES));
     if (sqes == MAP_FAILED) {
       sqes = nullptr;
       return fail();
@@ -226,7 +226,7 @@ struct uring {
         outstanding -= std::min(tail - head, outstanding);
         continue;
       }
-      if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0) {
+      if (sys_io_uring_enter(fd.get(), 0, 1, IORING_ENTER_GETEVENTS) < 0) {
         if (errno == EINTR || errno == EBUSY || errno == EAGAIN) {
           continue;
         }
@@ -253,10 +253,7 @@ struct uring {
       ::munmap(sq_ring, sq_ring_sz);
       sq_ring = nullptr;
     }
-    if (fd >= 0) {
-      ::close(fd);
-      fd = -1;
-    }
+    fd.reset();
   }
 
   // Queues one READ or WRITE without entering the kernel; the sole
@@ -264,8 +261,6 @@ struct uring {
   void fill_rw(std::uint8_t opcode, int file_fd, const void* buf,
                unsigned len, std::uint64_t off, std::uint64_t user_data,
                bool offload = false) noexcept {
-    const unsigned tail = *sq_tail;  // we are the only writer
-    const unsigned idx = tail & *sq_mask;
     io_uring_sqe sqe{};
     std::memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = opcode;
@@ -283,10 +278,7 @@ struct uring {
     sqe.len = len;
     sqe.off = off;
     sqe.user_data = user_data;
-    std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
-    std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
-    std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
-                                              std::memory_order_release);
+    push_sqe(sqe);
   }
 
   // Queues a cancel for the request carrying `target`. With no matching
@@ -298,30 +290,32 @@ struct uring {
   // it rides a user_data of its own and the reaper drops it; what
   // matters is the target's completion, which arrives either way.
   void fill_cancel(std::uint64_t target, std::uint64_t user_data) noexcept {
-    const unsigned tail = *sq_tail;
-    const unsigned idx = tail & *sq_mask;
     io_uring_sqe sqe{};
     std::memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = IORING_OP_ASYNC_CANCEL;
     sqe.fd = -1;
     sqe.addr = target;
     sqe.user_data = user_data;
-    std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
-    std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
-    std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
-                                              std::memory_order_release);
+    push_sqe(sqe);
   }
 
   // Queues a one-shot poll on `poll_fd`, the wake path's arming step.
   void fill_poll_add(int poll_fd, std::uint64_t user_data) noexcept {
-    const unsigned tail = *sq_tail;
-    const unsigned idx = tail & *sq_mask;
     io_uring_sqe sqe{};
     std::memset(&sqe, 0, sizeof(sqe));
     sqe.opcode = IORING_OP_POLL_ADD;
     sqe.fd = poll_fd;
     sqe.poll_events = POLLIN;
     sqe.user_data = user_data;
+    push_sqe(sqe);
+  }
+
+  // The one place the submission tail moves: the entry goes into the
+  // next slot and the tail is published with release semantics, which
+  // is what the kernel's acquire pairs with.
+  void push_sqe(const io_uring_sqe& sqe) noexcept {
+    const unsigned tail = *sq_tail;
+    const unsigned idx = tail & *sq_mask;
     std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
     std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
     std::atomic_ref<unsigned>(*sq_tail).store(tail + 1,
@@ -340,7 +334,7 @@ struct uring {
       if (tail == head) {
         return;
       }
-      const int n = sys_io_uring_enter(fd, tail - head, 0, 0);
+      const int n = sys_io_uring_enter(fd.get(), tail - head, 0, 0);
       if (n >= 0) {
         outstanding += static_cast<unsigned>(n);
         return;
@@ -400,7 +394,7 @@ struct uring {
 
   // Sleeps until the ring has at least one completion.
   void wait_cq() {
-    if (sys_io_uring_enter(fd, 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
+    if (sys_io_uring_enter(fd.get(), 0, 1, IORING_ENTER_GETEVENTS) < 0 &&
         errno != EINTR) {
       throw_errno("io_uring_enter(wait)");
     }
@@ -447,7 +441,7 @@ class uring_context {
       // async direct I/O that collapses the whole queue to one stalled
       // write at a time. set_size() trims back afterwards.
       if (write_ && how.preallocate_bytes > 0 &&
-          ::fallocate(f_.fd_plain, 0, 0,
+          ::fallocate(f_.fd_plain(), 0, 0,
                       static_cast<off_t>(how.preallocate_bytes)) == 0) {
         prealloc_ = how.preallocate_bytes;
       }
@@ -456,7 +450,7 @@ class uring_context {
         // a plain fd.
         f_.try_odirect(path.c_str(), (write_ ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
       }
-      name_ = ctx.name_for(f_.direct, write_);
+      name_ = ctx.name_for(f_.direct(), write_);
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
@@ -465,7 +459,7 @@ class uring_context {
     // Trims a preallocation back to what was written. Harmless when
     // nothing was preallocated, which is what a reader's file is.
     void set_size(std::uint64_t bytes) {
-      if (::ftruncate(f_.fd_plain, static_cast<off_t>(bytes)) != 0) {
+      if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
       prealloc_ = 0;
@@ -508,7 +502,7 @@ class uring_context {
     op.buf = buf;
     op.off = off;
     op.filled = 0;
-    op.fd = f.f_.fd;
+    op.fd = f.f_.fd();
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.wbuf = {};
@@ -539,7 +533,7 @@ class uring_context {
     op.wbuf = buf;
     op.off = off;
     op.filled = 0;
-    op.fd = f.f_.fd;
+    op.fd = f.f_.fd();
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.on_ring = false;

@@ -218,6 +218,8 @@ struct win_file {
 // buys one path: every read, fast or slow, reports from poll().
 class iocp_context {
  public:
+  class file;
+
   struct read_op : read_op_base {
     OVERLAPPED ov{};
     std::byte* dst = nullptr;         // reads fill this
@@ -228,7 +230,7 @@ class iocp_context {
     bool is_write = false;
     HANDLE h = INVALID_HANDLE_VALUE;
     win_file* sync_file = nullptr;  // the deferred path needs the handles
-    void* owner_file = nullptr;     // which file's drain owes this op
+    file* owner_file = nullptr;     // which file's drain owes this op
     read_op* next_deferred = nullptr;
     bool on_port = false;   // the port owes a completion, so cancel is CancelIoEx
     bool cancelled = false;  // a cancel was asked for; one is enough
@@ -623,7 +625,7 @@ class iocp_context {
   void complete(read_op& op, std::error_code ec) noexcept {
     in_flight_--;
     if (op.owner_file != nullptr) {
-      static_cast<file*>(op.owner_file)->inflight_--;
+      op.owner_file->inflight_--;
     }
     op.done(&op, ec);
   }

@@ -24,11 +24,13 @@
 #if defined(__linux__)
 #include <poll.h>
 #include <sys/eventfd.h>
-#include <unistd.h>
 #else
 #include <condition_variable>
 #include <mutex>
 #include <utility>
+#endif
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
 #endif
 #include <concepts>
 #include <cstddef>
@@ -97,47 +99,77 @@ struct reader_context_options {
 // Linux gets an eventfd because io_uring can poll it: the uring context
 // arms an IORING_OP_POLL_ADD on fd() so one enter() waits for reads and
 // wakes alike. Elsewhere a condition variable says the same thing.
+#if defined(__unix__) || defined(__APPLE__)
+// A file descriptor that closes itself. Moves, does not copy; -1 is
+// empty. The borrowed int goes where a system call takes one.
+class unique_fd {
+ public:
+  unique_fd() noexcept = default;
+  explicit unique_fd(int fd) noexcept : fd_(fd) {}
+  unique_fd(unique_fd&& o) noexcept : fd_(o.release()) {}
+  unique_fd& operator=(unique_fd&& o) noexcept {
+    if (this != &o) {
+      reset(o.release());
+    }
+    return *this;
+  }
+  unique_fd(const unique_fd&) = delete;
+  unique_fd& operator=(const unique_fd&) = delete;
+  ~unique_fd() { reset(); }
+
+  [[nodiscard]] int get() const noexcept { return fd_; }
+  [[nodiscard]] explicit operator bool() const noexcept { return fd_ >= 0; }
+  [[nodiscard]] int release() noexcept {
+    const int fd = fd_;
+    fd_ = -1;
+    return fd;
+  }
+  void reset(int fd = -1) noexcept {
+    if (fd_ >= 0) {
+      ::close(fd_);
+    }
+    fd_ = fd;
+  }
+
+ private:
+  int fd_ = -1;
+};
+#endif  // __unix__ || __APPLE__
+
 class poll_waiter {
  public:
 #if defined(__linux__)
   poll_waiter() noexcept : fd_(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {}
   poll_waiter(const poll_waiter&) = delete;
   poll_waiter& operator=(const poll_waiter&) = delete;
-  ~poll_waiter() {
-    if (fd_ >= 0) {
-      ::close(fd_);
-    }
-  }
 
   // Pollable by anything that takes a descriptor; -1 if the eventfd
-  // could not be created, which leaves sleep() an error rather than a
-  // silent hang.
-  [[nodiscard]] int fd() const noexcept { return fd_; }
+  // could not be created, and sleep() then throws.
+  [[nodiscard]] int fd() const noexcept { return fd_.get(); }
 
   void wake() noexcept {
     const std::uint64_t one = 1;
-    // EAGAIN is the counter already saturated: a wake is pending either
-    // way, which is exactly what the caller asked for. The result is
-    // bound rather than cast away, which is what silences the
-    // warn_unused_result on write().
-    const ssize_t n = ::write(fd_, &one, sizeof one);
+    // EAGAIN is the counter already saturated, and a wake is pending
+    // either way. The result is bound to a variable because a cast to
+    // void does not silence warn_unused_result on write().
+    const ssize_t n = ::write(fd_.get(), &one, sizeof one);
     (void)n;
   }
 
   [[nodiscard]] bool take() noexcept {
     std::uint64_t v = 0;
-    return ::read(fd_, &v, sizeof v) == static_cast<ssize_t>(sizeof v);
+    return ::read(fd_.get(), &v, sizeof v) == static_cast<ssize_t>(sizeof v);
   }
 
   void sleep() {
-    if (fd_ < 0) {
+    if (!fd_) {
       // poll() ignores a negative descriptor and would wait on nothing,
       // forever. A context whose eventfd could not be created throws
       // instead.
       throw std::system_error(EBADF, std::generic_category(),
                               "blake3pp: no wake descriptor to sleep on");
     }
-    ::pollfd p{fd_, POLLIN, 0};
+    ::pollfd p{fd_.get(), POLLIN, 0};
     while (::poll(&p, 1, -1) < 0) {
       if (errno != EINTR) {
         throw_errno("poll(wake)");
@@ -146,7 +178,7 @@ class poll_waiter {
   }
 
  private:
-  int fd_ = -1;
+  unique_fd fd_;
 #else
   void wake() noexcept {
     {

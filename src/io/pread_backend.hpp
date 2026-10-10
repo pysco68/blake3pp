@@ -40,9 +40,9 @@ class pread_source {
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
   [[nodiscard]] std::string_view name() const noexcept {
     if (write_) {
-      return f_.direct ? "pwrite+direct" : "pwrite";
+      return f_.direct() ? "pwrite+direct" : "pwrite";
     }
-    return f_.direct ? "pread+direct" : "pread";
+    return f_.direct() ? "pread+direct" : "pread";
   }
 
   void read_at(std::uint64_t off, std::span<std::byte> buf) {
@@ -54,7 +54,7 @@ class pread_source {
   }
 
   void set_size(std::uint64_t bytes) {
-    if (::ftruncate(f_.fd_plain, static_cast<off_t>(bytes)) != 0) {
+    if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
       throw_errno("ftruncate");
     }
   }

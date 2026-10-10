@@ -610,7 +610,7 @@ TEST_CASE("io_uring destroy reaps in-flight reads before the ring goes") {
   file.try_odirect(f.path.c_str(), O_RDONLY | O_CLOEXEC);
   const aligned_buffer buf = make_aligned_buffer(content.size());
   std::memset(buf.get(), 0, content.size());
-  ring.submit_rw(IORING_OP_READ, file.fd, buf.get(),
+  ring.submit_rw(IORING_OP_READ, file.fd(), buf.get(),
                  static_cast<unsigned>(content.size()), 0, 0, true);
   ring.destroy();
   CHECK(ring.outstanding == 0);

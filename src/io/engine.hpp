@@ -107,7 +107,7 @@ class polled_reader_engine {
     }
     st.held = true;
     next_deliver_++;
-    return window{buf(s), st.target, want * window_,
+    return window{buf(s).data(), st.target, want * window_,
                   want + 1 == num_windows_, s};
   }
 
@@ -183,8 +183,8 @@ class polled_reader_engine {
     return rest < window_ ? static_cast<std::size_t>(rest) : window_;
   }
 
-  std::byte* buf(unsigned slot) const noexcept {
-    return pool_.get() + static_cast<std::size_t>(slot) * window_;
+  [[nodiscard]] std::span<std::byte> buf(unsigned slot) const noexcept {
+    return {pool_.get() + static_cast<std::size_t>(slot) * window_, window_};
   }
 
   void assign(unsigned s) {
@@ -197,7 +197,7 @@ class polled_reader_engine {
     st.ec = {};
     st.op.done = &on_done;
     st.op.owner = &st;
-    ctx_.submit_read(file_, st.win * window_, {buf(s), st.target}, st.op);
+    ctx_.submit_read(file_, st.win * window_, buf(s).first(st.target), st.op);
   }
 
   std::size_t window_;
@@ -259,7 +259,7 @@ class polled_writer_engine {
     const unsigned s = next_slot_;
     wait_slot(s);
     throw_if_failed();
-    return buffer{buf(s), buffer_, s};
+    return buffer{buf(s).data(), buffer_, s};
   }
 
   void submit(const buffer& b, std::size_t bytes) {
@@ -357,8 +357,8 @@ class polled_writer_engine {
     return (bytes + direct_align - 1) / direct_align * direct_align;
   }
 
-  std::byte* buf(unsigned slot) const noexcept {
-    return pool_.get() + static_cast<std::size_t>(slot) * buffer_;
+  [[nodiscard]] std::span<std::byte> buf(unsigned slot) const noexcept {
+    return {pool_.get() + static_cast<std::size_t>(slot) * buffer_, buffer_};
   }
 
   std::size_t buffer_;

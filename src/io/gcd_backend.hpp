@@ -136,15 +136,15 @@ class gcd_context {
       // an async queue to one write at a time. F_PREALLOCATE is
       // best-effort, and set_size() trims back afterwards.
       if (write_ && how.preallocate_bytes > 0 &&
-          preallocate(f_.fd_plain, how.preallocate_bytes)) {
+          preallocate(f_.fd_plain(), how.preallocate_bytes)) {
         prealloc_ = how.preallocate_bytes;
       }
       // Darwin's cache bypass is per-fd, not per-open, and tolerates any
       // alignment, so one fd serves every window, tail included.
-      if (how.direct_io && set_nocache(f_.fd_plain)) {
-        f_.direct = true;
+      if (how.direct_io && set_nocache(f_.fd_plain())) {
+        f_.set_direct();
       }
-      name_ = ctx.name_for(f_.direct, write_);
+      name_ = ctx.name_for(f_.direct(), write_);
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
@@ -153,7 +153,7 @@ class gcd_context {
     // Trims a preallocation back to what was written. Harmless when
     // nothing was preallocated, which is what a reader's file is.
     void set_size(std::uint64_t bytes) {
-      if (::ftruncate(f_.fd_plain, static_cast<off_t>(bytes)) != 0) {
+      if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
       prealloc_ = 0;
@@ -193,7 +193,7 @@ class gcd_context {
     op.error = 0;
     op.src = nullptr;
     op.is_write = false;
-    op.fd = f.f_.fd_plain;
+    op.fd = f.f_.fd_plain();
     op.sync_file = &f.f_;
     op.ctx = this;
     op.next_done = nullptr;
@@ -217,7 +217,7 @@ class gcd_context {
     op.off = off;
     op.filled = 0;
     op.error = 0;
-    op.fd = f.f_.fd_plain;
+    op.fd = f.f_.fd_plain();
     op.sync_file = &f.f_;
     op.ctx = this;
     op.next_done = nullptr;

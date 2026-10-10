@@ -633,7 +633,7 @@ struct loop_status {
 template <file_driver D>
 class driver_loop {
  public:
-  explicit driver_loop(D& drv) noexcept : drv_(&drv) {}
+  explicit driver_loop(D& drv) noexcept : drv_(drv) {}
   driver_loop(const driver_loop&) = delete;
   driver_loop& operator=(const driver_loop&) = delete;
 
@@ -656,7 +656,7 @@ class driver_loop {
     return driver_scheduler<D>{this};
   }
 
-  [[nodiscard]] D& driver() noexcept { return *drv_; }
+  [[nodiscard]] D& driver() noexcept { return drv_; }
 
   // Where to record what this thread spends its time on; null records
   // nothing, which is the default and costs one branch per poll.
@@ -677,7 +677,7 @@ class driver_loop {
   void publish(run_node* n) noexcept {
     publishers_.fetch_add(1, std::memory_order_relaxed);
     queue_.push(n);
-    drv_->wake();
+    drv_.wake();
     publishers_.fetch_sub(1, std::memory_order_release);
   }
 
@@ -723,7 +723,7 @@ class driver_loop {
         }
         return;
       }
-      drv_->flush();
+      drv_.flush();
       const bool block = queue_.empty();
       // What in_flight() exists for. Sleeping with no
       // read owed by the driver, nothing to run and nothing outstanding
@@ -732,16 +732,16 @@ class driver_loop {
       // because the shapes that reach it are configurations, not bugs a
       // sanitizer lane would find. Nothing is in flight at this point,
       // which is what makes unwinding from here safe.
-      if (block && drv_->in_flight() == 0 && status.outstanding == 0) {
+      if (block && drv_.in_flight() == 0 && status.outstanding == 0) {
         on_stall();
       }
       if (stats_ == nullptr) {
-        drv_->poll(block);
+        drv_.poll(block);
         continue;
       }
       const std::int64_t t_poll = trace_->now();
       stats_->busy_ns += static_cast<std::uint64_t>(t_poll - t);
-      const std::size_t ran = drv_->poll(block);
+      const std::size_t ran = drv_.poll(block);
       t = trace_->now();
       ++stats_->polls;
       if (block) {
@@ -797,12 +797,12 @@ class driver_loop {
   }
 
   void poll_once() {
-    drv_->flush();
-    drv_->poll(true);
+    drv_.flush();
+    drv_.poll(true);
   }
 
  private:
-  D* drv_;
+  D& drv_;
   run_queue queue_;
   std::atomic<unsigned> publishers_{0};
   trace_buffer* trace_ = nullptr;
@@ -1182,17 +1182,17 @@ template <stack_budget Budget, file_driver D>
 class pipeline_host {
  public:
   pipeline_host(D& drv, unsigned windows, std::size_t window_bytes)
-      : drv_(&drv), loop_(drv), pool_(drv, windows, window_bytes) {}
+      : drv_(drv), loop_(drv), pool_(drv, windows, window_bytes) {}
 
   pipeline_host(const pipeline_host&) = delete;
   pipeline_host& operator=(const pipeline_host&) = delete;
 
-  [[nodiscard]] D& driver() noexcept { return *drv_; }
+  [[nodiscard]] D& driver() noexcept { return drv_; }
   [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
   [[nodiscard]] window_pool<Budget>& pool() noexcept { return pool_; }
 
  private:
-  D* drv_;
+  D& drv_;
   driver_loop<D> loop_;
   window_pool<Budget> pool_;
 };
