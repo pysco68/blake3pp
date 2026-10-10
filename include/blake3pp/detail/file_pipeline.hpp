@@ -299,8 +299,7 @@ class read_op_state : public run_node {
       loop_->publish(this);
       return;
     }
-    op_->done = &on_read_done;
-    op_->owner = this;
+    bind_completion<&read_op_state::on_read_done>(*op_, *this);
     try {
       loop_->driver().submit_read(*file_, off_, buf_, *op_);
     } catch (const std::system_error& e) {
@@ -334,21 +333,19 @@ class read_op_state : public run_node {
   // backends report the outcome, not the cause: operation_canceled from
   // a device nobody asked to cancel is a read error like any other, and
   // a cancel that lost the race brings data, which is used.
-  static void on_read_done(io_read_op* op, std::error_code ec) noexcept {
-    auto* const self = static_cast<read_op_state*>(op->owner);
+  void on_read_done(std::error_code ec) noexcept {
     if (ec) {
       if (ec == std::errc::operation_canceled &&
-          self->stop_token().stop_requested()) {
-        ex::set_stopped(std::move(self->rcvr_));
+          stop_token().stop_requested()) {
+        ex::set_stopped(std::move(rcvr_));
         return;
       }
-      ex::set_error(std::move(self->rcvr_), ec);
+      ex::set_error(std::move(rcvr_), ec);
       return;
     }
     // The backend reads exactly what was asked for or reports an
     // error, so the whole window is there.
-    ex::set_value(std::move(self->rcvr_),
-                  std::span<const std::byte>(self->buf_));
+    ex::set_value(std::move(rcvr_), std::span<const std::byte>(buf_));
   }
 
   Receiver rcvr_;
@@ -421,8 +418,7 @@ class write_op_state : public run_node {
       loop_->publish(this);
       return;
     }
-    op_->done = &on_write_done;
-    op_->owner = this;
+    bind_completion<&write_op_state::on_write_done>(*op_, *this);
     try {
       loop_->driver().submit_write(*file_, off_, buf_, *op_);
     } catch (const std::system_error& e) {
@@ -452,18 +448,17 @@ class write_op_state : public run_node {
     }
   }
 
-  static void on_write_done(io_read_op* op, std::error_code ec) noexcept {
-    auto* const self = static_cast<write_op_state*>(op->owner);
+  void on_write_done(std::error_code ec) noexcept {
     if (ec) {
       if (ec == std::errc::operation_canceled &&
-          self->stop_token().stop_requested()) {
-        ex::set_stopped(std::move(self->rcvr_));
+          stop_token().stop_requested()) {
+        ex::set_stopped(std::move(rcvr_));
         return;
       }
-      ex::set_error(std::move(self->rcvr_), ec);
+      ex::set_error(std::move(rcvr_), ec);
       return;
     }
-    ex::set_value(std::move(self->rcvr_));
+    ex::set_value(std::move(rcvr_));
   }
 
   Receiver rcvr_;

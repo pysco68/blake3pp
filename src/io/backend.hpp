@@ -42,6 +42,7 @@
 #include <string>
 #include <system_error>
 
+#include <blake3pp/detail/driver.hpp>
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/detail/file_writer.hpp>
 

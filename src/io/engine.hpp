@@ -142,6 +142,14 @@ class polled_reader_engine {
     bool assigned = false;
     bool ready = false;  // the callback has run for this window
     bool held = false;   // delivered, not yet released
+
+    // The one place a context hands control back. Marking the slot is all
+    // it may do: the engine is not reentrant, and the contract's promise
+    // is that this runs on the thread inside poll().
+    void complete(std::error_code e) noexcept {
+      ec = e;
+      ready = true;
+    }
   };
 
   // The engine behind both public constructors: the file is whatever the
@@ -168,14 +176,7 @@ class polled_reader_engine {
     ctx_.flush();
   }
 
-  // The one place a context hands control back. Marking the slot is all
-  // it may do: the engine is not reentrant, and the contract's promise is
-  // that this runs on the thread inside poll().
-  static void on_done(read_op_base* base, std::error_code ec) noexcept {
-    auto* const st = static_cast<slot_state*>(base->owner);
-    st->ec = ec;
-    st->ready = true;
-  }
+
 
   std::size_t window_len(std::uint64_t w) const noexcept {
     const std::uint64_t off = w * window_;
@@ -195,8 +196,7 @@ class polled_reader_engine {
     st.held = false;
     st.ready = false;
     st.ec = {};
-    st.op.done = &on_done;
-    st.op.owner = &st;
+    bind_completion<&slot_state::complete>(st.op, st);
     ctx_.submit_read(file_, st.win * window_, buf(s).first(st.target), st.op);
   }
 
@@ -281,8 +281,7 @@ class polled_writer_engine {
     slot_state& st = slots_[b.slot];
     st.busy = true;
     st.ec = {};
-    st.op.done = &on_done;
-    st.op.owner = &st;
+    bind_completion<&slot_state::complete>(st.op, st);
     // A context may refuse the submission by throwing (the concept asks
     // that of flush() only); the slot must not stay marked busy for a
     // write that never existed, or wait_slot() polls for it for ever.
@@ -318,15 +317,14 @@ class polled_writer_engine {
     typename C::read_op op{};
     std::error_code ec{};
     bool busy = false;
-  };
 
-  // The one place the context hands control back. Marking the slot is all
-  // it may do: the engine is not reentrant.
-  static void on_done(read_op_base* base, std::error_code ec) noexcept {
-    auto* const st = static_cast<slot_state*>(base->owner);
-    st->ec = ec;
-    st->busy = false;
-  }
+    // The one place the context hands control back. Marking the slot is
+    // all it may do: the engine is not reentrant.
+    void complete(std::error_code e) noexcept {
+      ec = e;
+      busy = false;
+    }
+  };
 
   void wait_slot(unsigned s) {
     while (slots_[s].busy) {
