@@ -805,6 +805,128 @@ class driver_loop {
 };
 
 // --------------------------------------------------------------------
+// What both scopes do with a stop and a failure.
+
+// The read and the write pipeline agree on everything about stopping: one
+// stop source for the run, a latch that decides which failure the caller
+// hears about, a count of the ones it drops, and a teardown that cannot
+// trust the loop. They disagree about what a cancel sweep names and about
+// when a run is done, which is why this is a base they derive from rather
+// than a member they hold: the parts that differ stay in the scope, and
+// the members below are protected so the scope keeps naming them directly.
+//
+// Derived must provide loop() and sweep_cancels().
+template <class Derived, class D>
+class pipeline_scope_base {
+ protected:
+  [[nodiscard]] bool stop_requested() const noexcept {
+    return stop_source_.stop_requested();
+  }
+
+  // Requesting is what reaches the stages: a receiver's environment hands
+  // this source's token down its chain.
+  void request_stop() noexcept { stop_source_.request_stop(); }
+
+  // The first failure is the one the caller hears about. Stop and error
+  // race by construction -- requesting stop is what makes the other
+  // windows finish, and one of them may fail on the way out -- so the
+  // latch decides: whatever was latched first wins, and a failure latched
+  // at any point outranks the stop it caused.
+  void latch_error(std::error_code ec) noexcept {
+    if (!ec_ && !eptr_) {
+      ec_ = ec;
+    } else {
+      ++dropped_failures_;
+    }
+  }
+  void latch_exception(std::exception_ptr e) noexcept {
+    if (!ec_ && !eptr_) {
+      eptr_ = std::move(e);
+    } else {
+      ++dropped_failures_;
+    }
+  }
+
+  // The stop's own completion, for the blocking entry points: they have
+  // no receiver to report set_stopped to, and an error_code is the only
+  // channel they have.
+  void throw_if_stopped(const char* what) const {
+    if (stopped_ || stop_requested()) {
+      throw std::system_error(
+          std::make_error_code(std::errc::operation_canceled), what);
+    }
+  }
+
+  // The stop path for a loop that can no longer be trusted to run.
+  //
+  // Reached when an exception has left the run, so the normal round --
+  // request, sweep, let the completions arrive -- cannot simply be
+  // continued: the poll that threw may throw again. The first two steps
+  // are the same as any stop's; what differs is the wait behind them.
+  // Nothing on the pool may publish into an operation cell once the cells
+  // are destroyed, so every transfer in flight is waited out here, with
+  // the cells still alive.
+  //
+  // The error the caller is already unwinding with is the one it keeps:
+  // whatever a poll throws here is dropped, and after max_failed_polls of
+  // them the driver is not asked again. From then on the run queue alone
+  // is watched, since a window on the pool publishes without the driver's
+  // help, and the transfers the driver still owes are drained through it,
+  // which runs no callback and leaves no operation referenced.
+  static constexpr unsigned max_failed_polls = 8;
+
+  void quiesce() noexcept {
+    Derived& self = static_cast<Derived&>(*this);
+    request_stop();
+    // Same sweep as a normal round's: the transfers still owed are what
+    // this is waiting for, and asking the device to give them back is what
+    // shortens the wait. Advisory, so a backend that cannot is no worse
+    // off than before.
+    self.sweep_cancels();
+    unsigned failed_polls = 0;
+    for (;;) {
+      self.loop().drain();
+      if (in_flight_ == 0) {
+        break;
+      }
+      if (failed_polls < max_failed_polls) {
+        try {
+          self.loop().poll_once();
+        } catch (...) {
+          ++failed_polls;
+        }
+        continue;
+      }
+      // Every chain the driver does not owe as a transfer is on the pool
+      // or on the run queue, and comes back on its own. Once only
+      // transfers are left the driver drains them itself, running no
+      // callback, so no context still references an op once the cells are
+      // gone.
+      if (in_flight_ <= self.loop().driver().in_flight()) {
+        self.loop().driver().drain();
+        break;
+      }
+      std::this_thread::yield();
+    }
+    self.loop().settle_publishers();
+  }
+
+  loop_status status_{};
+  unsigned in_flight_ = 0;
+  // The one stop of the run. Every window receiver's environment answers
+  // with its token, and the scope's own admission, sweep and settle read
+  // it: there is no second flag that could disagree with it.
+  ex::inplace_stop_source stop_source_;
+  bool stopped_ = false;
+  // Failures after the first. They are dropped rather than reported --
+  // the first one is the cause and the rest are usually what stopping did
+  // -- and counted so a run can say how many there were.
+  std::uint64_t dropped_failures_ = 0;
+  std::error_code ec_{};
+  std::exception_ptr eptr_{};
+};
+
+// --------------------------------------------------------------------
 // The bounded scope.
 
 // What the scope needs that the public options do not already say.
@@ -1212,7 +1334,29 @@ using pipeline_cells_for = pipeline_cells<
                          typename Scope::scope_receiver>>;
 
 template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
-class window_scope {
+class window_scope
+    : public pipeline_scope_base<window_scope<Traced, Budget, D, Scheduler>,
+                                 D> {
+  // The base drives this scope's loop and sweep, both of which are its
+  // own business and nobody else's.
+  friend class pipeline_scope_base<window_scope, D>;
+
+  // The base holds the stop source, the failure latch and the in-flight
+  // count; these bring them in unqualified.
+  using base = pipeline_scope_base<window_scope, D>;
+  using base::dropped_failures_;
+  using base::ec_;
+  using base::eptr_;
+  using base::in_flight_;
+  using base::latch_error;
+  using base::latch_exception;
+  using base::quiesce;
+  using base::request_stop;
+  using base::status_;
+  using base::stop_requested;
+  using base::stop_source_;
+  using base::stopped_;
+
   // The cell store is built outside this class, because the cell types
   // are the return types of the chain builders below and those are only
   // nameable once the class is complete.
@@ -1503,15 +1647,8 @@ class window_scope {
   }
 
  private:
-  // The stop's own completion, for the blocking entry points: they have
-  // no receiver to report set_stopped to, and an error_code is the only
-  // channel they have.
   void throw_if_stopped() const {
-    if (stopped_ || stop_requested()) {
-      throw std::system_error(
-          std::make_error_code(std::errc::operation_canceled),
-          "blake3pp: the file pipeline was stopped");
-    }
+    base::throw_if_stopped("blake3pp: the file pipeline was stopped");
   }
 
  public:
@@ -1594,58 +1731,8 @@ class window_scope {
 
  private:
 
-  // The stop path for a loop that can no longer be trusted to run.
-  //
-  // Reached when an exception has left run_until, so the normal round --
-  // request, sweep, let the completions arrive -- cannot simply be
-  // continued: the poll that threw may throw again. The first two steps
-  // are the same as any stop's; what differs is the wait behind them.
-  // Nothing on the pool may publish into an operation cell once the
-  // cells are destroyed, so every window in flight is waited out here,
-  // with the cells still alive.
-  //
-  // The error the caller is already unwinding with is the one it keeps:
-  // whatever a poll throws here is dropped, and after max_failed_polls
-  // of them the driver is not asked again. From then on the run queue
-  // alone is watched, since a window on the pool publishes without the
-  // driver's help, and the reads the driver still owes are drained
-  // through it, which runs no callback and leaves no operation
-  // referenced.
-  static constexpr unsigned max_failed_polls = 8;
-
-  void quiesce() noexcept {
-    request_stop();
-    // Same sweep as a normal round's: the reads still owed are what this
-    // is waiting for, and asking the device to give them back is what
-    // shortens the wait. Advisory, so a backend that cannot is no worse
-    // off than before.
-    sweep_cancels();
-    unsigned failed_polls = 0;
-    for (;;) {
-      loop_.drain();
-      if (in_flight_ == 0) {
-        break;
-      }
-      if (failed_polls < max_failed_polls) {
-        try {
-          loop_.poll_once();
-        } catch (...) {
-          ++failed_polls;
-        }
-        continue;
-      }
-      // Every chain the driver does not owe as a read is on the pool or
-      // on the run queue, and comes back on its own. Once only reads are
-      // left the driver drains them itself, running no callback, so no
-      // context still references an op once the cells are gone.
-      if (in_flight_ <= loop_.driver().in_flight()) {
-        loop_.driver().drain();
-        break;
-      }
-      std::this_thread::yield();
-    }
-    loop_.settle_publishers();
-  }
+  // The loop the base's quiesce drives, which is the host's.
+  [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
 
   // Where the next window sits in the file: what take_next() hands out,
   // computed from the scope's cursor alone so a window can be planned
@@ -2059,27 +2146,14 @@ class window_scope {
 
   void on_done(window& w) noexcept { finish_window(w); }
 
-  // The first failure is the one the caller hears about. Stop and error
-  // race by construction -- requesting stop is what makes the other
-  // windows finish, and one of them may fail on the way out -- so the
-  // latch decides: whatever was latched first wins, and a failure
-  // latched at any point outranks the stop it caused.
   void on_error(window& w, std::error_code ec) noexcept {
-    if (!ec_ && !eptr_) {
-      ec_ = ec;
-    } else {
-      ++dropped_failures_;
-    }
+    latch_error(ec);
     request_stop();
     finish_window(w);
   }
 
   void on_exception(window& w, std::exception_ptr e) noexcept {
-    if (!ec_ && !eptr_) {
-      eptr_ = std::move(e);
-    } else {
-      ++dropped_failures_;
-    }
+    latch_exception(std::move(e));
     request_stop();
     finish_window(w);
   }
@@ -2116,14 +2190,6 @@ class window_scope {
       status_.done = true;
     }
   }
-
-  [[nodiscard]] bool stop_requested() const noexcept {
-    return stop_source_.stop_requested();
-  }
-
-  // Requesting is what reaches the stages: every window receiver's
-  // environment hands this source's token down its chain.
-  void request_stop() noexcept { stop_source_.request_stop(); }
 
   // Asks the device to abandon the reads that have not landed. On the
   // driver thread, once per read: the sweep runs every round while stop
@@ -2255,7 +2321,6 @@ class window_scope {
   // both in flight at once.
   std::array<std::array<tree_reducer::node, edge_node_cap>, 2> edge_nodes_{};
 
-  loop_status status_{};
   // What this scope currently holds, so the cancel sweep names its own
   // reads and not another pipeline's sharing the same pool.
   window* taken_ = nullptr;
@@ -2264,24 +2329,12 @@ class window_scope {
   window* last_window_ = nullptr;
   std::uint64_t next_offset_ = 0;
   std::uint64_t index_ = 0;
-  unsigned in_flight_ = 0;
   unsigned reading_ = 0;  // windows whose read has not landed
   unsigned max_reading_ = 0;
   unsigned max_windows_ = 0;
   std::size_t in_flight_nodes_ = 0;
   std::uint64_t admission_stalls_ = 0;
   std::size_t max_pending_ = 0;
-  // The one stop of the run. Every window receiver's environment answers
-  // with its token, and the scope's own admission, sweep and settle read
-  // it: there is no second flag that could disagree with it.
-  ex::inplace_stop_source stop_source_;
-  bool stopped_ = false;
-  // Failures after the first. They are dropped rather than reported --
-  // the first one is the cause and the rest are usually what stopping
-  // did -- and counted so a run can say how many there were.
-  std::uint64_t dropped_failures_ = 0;
-  std::error_code ec_{};
-  std::exception_ptr eptr_{};
 };
 
 // The connected chains of one run: one cell per window the scope may

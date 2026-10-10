@@ -140,7 +140,26 @@ inline constexpr unsigned default_write_queue_depth = 2;
 // time; a chain may only start while a buffer is free and fewer than the
 // plan's writes are in flight.
 template <file_driver D, class Scheduler, class Fill>
-class write_scope {
+class write_scope
+    : public pipeline_scope_base<write_scope<D, Scheduler, Fill>, D> {
+  // The base drives this scope's loop and sweep, and holds the state the
+  // read scope shares.
+  friend class pipeline_scope_base<write_scope, D>;
+
+  using base = pipeline_scope_base<write_scope, D>;
+  using base::dropped_failures_;
+  using base::ec_;
+  using base::eptr_;
+  using base::in_flight_;
+  using base::latch_error;
+  using base::latch_exception;
+  using base::quiesce;
+  using base::request_stop;
+  using base::status_;
+  using base::stop_requested;
+  using base::stop_source_;
+  using base::stopped_;
+
  public:
   write_scope(D& drv, typename D::file& file, Scheduler sched, Fill fill,
               std::uint64_t total, const write_options& opts)
@@ -358,21 +377,13 @@ class write_scope {
   void on_done(window& w) noexcept { finish_window(w); }
 
   void on_error(window& w, std::error_code ec) noexcept {
-    if (!ec_ && !eptr_) {
-      ec_ = ec;
-    } else {
-      ++dropped_failures_;
-    }
+    latch_error(ec);
     request_stop();
     finish_window(w);
   }
 
   void on_exception(window& w, std::exception_ptr e) noexcept {
-    if (!ec_ && !eptr_) {
-      eptr_ = std::move(e);
-    } else {
-      ++dropped_failures_;
-    }
+    latch_exception(std::move(e));
     request_stop();
     finish_window(w);
   }
@@ -400,46 +411,12 @@ class write_scope {
     }
   }
 
-  [[nodiscard]] bool stop_requested() const noexcept {
-    return stop_source_.stop_requested();
-  }
-  void request_stop() noexcept { stop_source_.request_stop(); }
-
   void throw_if_stopped() const {
-    if (stopped_ || stop_requested()) {
-      throw std::system_error(
-          std::make_error_code(std::errc::operation_canceled),
-          "blake3pp: the write pipeline was stopped");
-    }
+    base::throw_if_stopped("blake3pp: the write pipeline was stopped");
   }
 
-  static constexpr unsigned max_failed_polls = 8;
-
-  void quiesce() noexcept {
-    request_stop();
-    sweep_cancels();
-    unsigned failed_polls = 0;
-    for (;;) {
-      loop_.drain();
-      if (in_flight_ == 0) {
-        break;
-      }
-      if (failed_polls < max_failed_polls) {
-        try {
-          loop_.poll_once();
-        } catch (...) {
-          ++failed_polls;
-        }
-        continue;
-      }
-      if (in_flight_ <= loop_.driver().in_flight()) {
-        loop_.driver().drain();
-        break;
-      }
-      std::this_thread::yield();
-    }
-    loop_.settle_publishers();
-  }
+  // The loop the base's quiesce drives, which this scope owns.
+  [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
 
   void push_free(window* w) noexcept {
     w->next_free = free_;
@@ -457,15 +434,10 @@ class write_scope {
   ex::inplace_stop_token opts_stop_token_;
   std::unique_ptr<window[]> windows_;
 
-  loop_status status_{};
+
   window* free_ = nullptr;
   std::uint64_t next_offset_ = 0;
-  unsigned in_flight_ = 0;
-  ex::inplace_stop_source stop_source_;
-  bool stopped_ = false;
-  std::uint64_t dropped_failures_ = 0;
-  std::error_code ec_{};
-  std::exception_ptr eptr_{};
+
 };
 
 // Generates one file on this thread, fanning the fills out over sched.
