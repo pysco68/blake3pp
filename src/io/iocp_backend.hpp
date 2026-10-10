@@ -343,39 +343,11 @@ class iocp_context {
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
+    arm(op, f, off, buf.size());
     op.dst = buf.data();
     op.src = nullptr;
     op.is_write = false;
-    op.len = buf.size();
-    op.off = off;
-    op.filled = 0;
-    op.h = f.f_.h();
-    op.sync_file = &f.f_;
-    op.next_deferred = nullptr;
-    op.owner_file = &f;
-    op.on_port = false;
-    op.cancelled = false;
-    // NO_BUFFERING rejects an unaligned length, so only whole granules
-    // ride the port; the tail is read synchronously inside poll().
-    bool queued = f.f_.use_iocp && buf.size() % direct_align == 0;
-    if (queued) {
-      try {
-        issue(op);
-      } catch (const std::system_error&) {
-        // ReadFile refused it outright, so the port owes no completion
-        // and nothing will ever take this read off in_flight(). It goes
-        // down the ladder an unalignable read already takes: read
-        // synchronously inside poll(), where a second failure reaches
-        // the caller as every other read error does.
-        queued = false;
-      }
-    }
-    op.on_port = queued;
-    in_flight_++;
-    f.inflight_++;
-    if (!queued) {
-      deferred_.push(op);
-    }
+    place(op, f);
   }
 
   // The write half of the same contract, and the same ladder: a length
@@ -389,20 +361,39 @@ class iocp_context {
   // shape as a short transfer and cannot be told apart from one.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
                     read_op& op) {
+    arm(op, f, off, buf.size());
     op.dst = nullptr;
     op.src = buf.data();
-    op.len = buf.size();
+    op.is_write = true;
+    place(op, f);
+  }
+
+ private:
+  // What a transfer needs that does not depend on its direction.
+  void arm(read_op& op, file& f, std::uint64_t off, std::size_t len) noexcept {
+    op.len = len;
     op.off = off;
     op.filled = 0;
-    op.is_write = true;
     op.h = f.f_.h();
     op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.owner_file = &f;
     op.on_port = false;
     op.cancelled = false;
-    bool queued = f.f_.use_iocp && buf.size() > 0 &&
-                  buf.size() % direct_align == 0;
+  }
+
+  // The ladder, asked once for both directions. NO_BUFFERING rejects an
+  // unaligned length, so only whole granules ride the port and the tail
+  // goes through the synchronous path inside poll(). A zero-length
+  // transfer takes that path too: it would post a completion carrying
+  // zero bytes, which is the same shape as a short transfer and cannot be
+  // told apart from one. And a ReadFile or WriteFile refused outright owes
+  // no completion, so nothing would ever take it off in_flight(): it goes
+  // down the same ladder, where a second failure reaches the caller as
+  // every other transfer error does.
+  void place(read_op& op, file& f) {
+    bool queued =
+        f.f_.use_iocp && op.len != 0 && op.len % direct_align == 0;
     if (queued) {
       try {
         issue(op);
@@ -417,6 +408,8 @@ class iocp_context {
       deferred_.push(op);
     }
   }
+
+ public:
 
   // CancelIoEx names one request by its OVERLAPPED, so a sibling read on
   // the same handle is untouched. It fails with ERROR_NOT_FOUND for a
