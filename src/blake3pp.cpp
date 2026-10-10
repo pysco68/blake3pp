@@ -307,6 +307,12 @@ void hasher::push_subtree_cv(std::span<const std::uint32_t, 8> cv,
                              std::uint64_t subtree_chunks) noexcept {
   assert(!right_held_);  // update_last() said the message ended
   close_full_chunk();
+  // The documented chunk-boundary precondition. close_full_chunk() ends a
+  // chunk that is complete and leaves a partial one alone, so bytes left
+  // in the chunk state here would be hashed as the head of a chunk past
+  // the subtree: a wrong digest with nothing to see.
+  assert(core::chunk_len(chunk_) == 0 &&
+         "push_subtree_cv() needs the hasher on a chunk boundary");
   push_cv(cv, chunk_.chunk_counter + subtree_chunks, subtree_chunks);
   chunk_.chunk_counter += subtree_chunks;
 }
