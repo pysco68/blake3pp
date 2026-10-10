@@ -541,28 +541,11 @@ class uring_context {
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
+    arm(op, f, off);
     op.buf = buf;
-    op.off = off;
-    op.filled = 0;
-    op.fd = f.f_.fd();
-    op.sync_file = &f.f_;
-    op.next_deferred = nullptr;
     op.wbuf = {};
-    op.on_ring = false;
-    op.cancelled = false;
     op.is_write = false;
-    in_flight_++;
-    // O_DIRECT rejects an unaligned length, so only whole granules may
-    // ride the ring; the tail is read synchronously inside poll(). This
-    // is the whole runtime-degradation question, asked in one place.
-    if (use_uring_ && !buf.empty() && buf.size() % direct_align == 0) {
-      op.on_ring = true;
-      ring_.fill_rw(IORING_OP_READ, op.fd, buf.data(),
-                    static_cast<unsigned>(buf.size()), off, op_ud(&op),
-                    offload_);
-    } else {
-      deferred_.push(op);
-    }
+    issue(op, IORING_OP_READ, buf.data(), buf.size());
   }
 
   // Same rules as submit_read, and the same ladder: a length O_DIRECT
@@ -571,8 +554,16 @@ class uring_context {
   // the difference.
   void submit_write(file& f, std::uint64_t off,
                     std::span<const std::byte> buf, read_op& op) {
+    arm(op, f, off);
     op.buf = {};
     op.wbuf = buf;
+    op.is_write = true;
+    issue(op, IORING_OP_WRITE, buf.data(), buf.size());
+  }
+
+ private:
+  // What a transfer needs that does not depend on its direction.
+  void arm(read_op& op, file& f, std::uint64_t off) noexcept {
     op.off = off;
     op.filled = 0;
     op.fd = f.f_.fd();
@@ -580,21 +571,28 @@ class uring_context {
     op.next_deferred = nullptr;
     op.on_ring = false;
     op.cancelled = false;
-    op.is_write = true;
     in_flight_++;
-    // A zero-length transfer never goes to the kernel: io_uring reports
-    // it as res == 0, which is the signature of a short transfer with
-    // nothing left to give. It is a no-op, and the deferred path is
-    // where no-ops belong -- still completed from poll(), like the rest.
-    if (use_uring_ && !buf.empty() && buf.size() % direct_align == 0) {
+  }
+
+  // The ladder, asked once for both directions: only whole granules may
+  // ride the ring, because O_DIRECT rejects an unaligned length, and the
+  // tail goes through the synchronous path inside poll(). A zero-length
+  // transfer takes that path too: io_uring would report it as res == 0,
+  // which is the signature of a short transfer with nothing left to give,
+  // so a no-op never reaches the kernel. This is the whole
+  // runtime-degradation question.
+  void issue(read_op& op, std::uint8_t opcode, const void* data,
+             std::size_t len) noexcept {
+    if (use_uring_ && len != 0 && len % direct_align == 0) {
       op.on_ring = true;
-      ring_.fill_rw(IORING_OP_WRITE, op.fd, buf.data(),
-                    static_cast<unsigned>(buf.size()), off, op_ud(&op),
-                    offload_);
+      ring_.fill_rw(opcode, op.fd, data, static_cast<unsigned>(len), op.off,
+                    op_ud(&op), offload_);
     } else {
       deferred_.push(op);
     }
   }
+
+ public:
 
   // The kernel is asked once; a second ask would only add a CQE to drop.
   // A read on the deferred list has not been issued to anything, so the
