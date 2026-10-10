@@ -201,47 +201,24 @@ class gcd_context {
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
+    arm(op, f, off, buf.size());
     op.dst = buf.data();
-    op.len = buf.size();
-    op.off = off;
-    op.filled = 0;
-    op.error = 0;
     op.src = nullptr;
     op.is_write = false;
-    op.fd = f.f_.fd_plain();
-    op.sync_file = &f.f_;
-    op.ctx = this;
-    op.next_done = nullptr;
-    in_flight_++;
-    if (use_gcd_) {
-      pump_.submit<read_op, &gcd_context::run_transfer>(op);
-    } else {
-      deferred_.push(op);
-    }
+    issue(op);
   }
 
   // The write half of the same contract. Darwin's F_NOCACHE tolerates any
   // alignment, so unlike O_DIRECT there is no length a write cannot take:
-  // the deferred list here is only the no-GCD rung.
+  // the deferred list here is only the no-GCD rung, which is why issue()
+  // asks about the engine and nothing else.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
                     read_op& op) {
+    arm(op, f, off, buf.size());
     op.dst = nullptr;
     op.src = buf.data();
     op.is_write = true;
-    op.len = buf.size();
-    op.off = off;
-    op.filled = 0;
-    op.error = 0;
-    op.fd = f.f_.fd_plain();
-    op.sync_file = &f.f_;
-    op.ctx = this;
-    op.next_done = nullptr;
-    in_flight_++;
-    if (use_gcd_) {
-      pump_.submit<read_op, &gcd_context::run_transfer>(op);
-    } else {
-      deferred_.push(op);
-    }
+    issue(op);
   }
 
   // dispatch_group_async_f queues the work itself, so there is nothing
@@ -311,6 +288,29 @@ class gcd_context {
     dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
     in_flight_ -= done_.remove_if(
         [&f](const read_op& op) noexcept { return op.sync_file == &f.f_; });
+  }
+
+  // What a transfer needs that does not depend on its direction.
+  void arm(read_op& op, file& f, std::uint64_t off, std::size_t len) noexcept {
+    op.len = len;
+    op.off = off;
+    op.filled = 0;
+    op.error = 0;
+    op.fd = f.f_.fd_plain();
+    op.sync_file = &f.f_;
+    op.ctx = this;
+    op.next_done = nullptr;
+    in_flight_++;
+  }
+
+  // The only rung: a worker if there is a dispatch group, otherwise the
+  // deferred list that poll() serves on the calling thread.
+  void issue(read_op& op) noexcept {
+    if (use_gcd_) {
+      pump_.submit<read_op, &gcd_context::run_transfer>(op);
+    } else {
+      deferred_.push(op);
+    }
   }
 
   // Runs on a GCD worker: one positional read or write loop over the
