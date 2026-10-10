@@ -330,6 +330,46 @@ int main(int argc, char** argv) {
     return h.finalize();
   };
 
+  // hash_many and nothing else: the whole input in batches of mul*degree
+  // complete chunks, no tree and no parents. The chaining values are
+  // XOR-folded, which every kernel must agree on; that fold is not a
+  // BLAKE3 digest of the input, it only has to match across these rows.
+  // parent_shape swaps the chunk workload (16 blocks per input, the
+  // counter stepping) for the parent one (a single block per input, no
+  // counter), which is the other call the tree makes.
+  const auto hash_batches = [&](const blake3pp::kern::kernel_ops* ops,
+                                std::size_t mul, bool parent_shape = false) {
+    const std::size_t per = mul * ops->simd_degree;
+    const std::size_t blocks =
+        parent_shape ? 1 : blake3pp::kern::chunk_len / blake3pp::kern::block_len;
+    const std::size_t stride = blocks * blake3pp::kern::block_len;
+    const std::size_t chunks = input.size() / stride;
+    const std::uint8_t* ptrs[2 * blake3pp::kern::max_simd_degree];
+    std::uint8_t cvs[2 * blake3pp::kern::max_simd_degree * blake3pp::kern::out_len];
+    const auto* p = blake3pp::kern::kernel_bytes(input.data());
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < chunks; at += per) {
+      const std::size_t n = std::min(per, chunks - at);
+      for (std::size_t i = 0; i < n; ++i) {
+        ptrs[i] = p + (at + i) * stride;
+      }
+      ops->hash_many(ptrs, n, blocks, blake3pp::kern::iv.data(),
+                     parent_shape ? 0 : at,
+                     /*increment_counter=*/!parent_shape,
+                     parent_shape ? blake3pp::kern::flag_parent : 0,
+                     parent_shape ? 0 : blake3pp::kern::flag_chunk_start,
+                     parent_shape ? 0 : blake3pp::kern::flag_chunk_end, cvs);
+      for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < blake3pp::kern::out_len; ++j) {
+          acc[j] ^= static_cast<std::byte>(cvs[i * blake3pp::kern::out_len + j]);
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
+  };
+
   // The whole input in 8 KiB messages, `one` hashing each, their digests
   // folded into the row's digest so that every row of this shape is
   // checked message by message and comparable to the others. The fold is
@@ -418,6 +458,30 @@ int main(int argc, char** argv) {
             });
   }
 
+  // The kernel ceiling: the batch the subtree leaf uses (2*degree chunks
+  // per call, the shape that lets a kernel interleave two batches) and a
+  // single batch. The distance to the variant's own row above is what the
+  // tree costs it, and the reference section repeats both rows, so a
+  // kernel comparison and a tree comparison stay separable.
+  for (const auto a : arches) {
+    if (!blake3pp::is_available(a)) {
+      continue;
+    }
+    for (const std::size_t mul : {std::size_t{1}, std::size_t{2}}) {
+      add_row(std::format("{}_batch{}", blake3pp::to_string(a), mul),
+              std::format("hash_many alone, {} x degree inputs per call", mul),
+              [&, a, mul] {
+                return hash_batches(blake3pp::detail::resolve(a), mul);
+              });
+    }
+    add_row(std::format("{}_parent", blake3pp::to_string(a)),
+            "hash_many alone, the parent shape: one block per input",
+            [&, a] {
+              return hash_batches(blake3pp::detail::resolve(a), 2,
+                                  /*parent_shape=*/true);
+            });
+  }
+
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
   // The reference kernels behind the blake3pp kernel_ops seam. Identical
   // pipeline, only hash_many swapped, so any difference to the section
@@ -451,6 +515,26 @@ int main(int argc, char** argv) {
       ops.hash_many = k.hash_many;  // compress_in_place stays portable
       return hash_with(&ops);
     });
+    for (const std::size_t mul : {std::size_t{1}, std::size_t{2}}) {
+      add_row(std::format("{}_batch{}", k.row, mul),
+              std::format("hash_many alone, {} x degree inputs per call, "
+                          "hand-written asm", mul),
+              [&, k, mul] {
+                blake3pp::kern::kernel_ops ops =
+                    *blake3pp::detail::resolve(k.variant);
+                ops.hash_many = k.hash_many;
+                return hash_batches(&ops, mul);
+              });
+    }
+    add_row(std::format("{}_parent", k.row),
+            "hash_many alone, the parent shape: one block per input, "
+            "hand-written asm",
+            [&, k] {
+              blake3pp::kern::kernel_ops ops =
+                  *blake3pp::detail::resolve(k.variant);
+              ops.hash_many = k.hash_many;
+              return hash_batches(&ops, 2, /*parent_shape=*/true);
+            });
     // The twin of blake3pp_8k with only hash_many swapped: what separates
     // the kernel's share of the short-message gap from the tree code's.
     add_row(std::format("{}_8k", k.row), "8 KiB messages, hand-written asm",
