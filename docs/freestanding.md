@@ -24,9 +24,9 @@ Two build-time switches make it fit:
   scheduler because only it knows what its execution agents should be
   (on Zephyr SMP, for instance, one per core).
 - The multi-core entry points spend stack on two sides, the calling
-  thread and the scheduler's agents, and three switches size it:
-  `stack_budget`, `BLAKE3PP_MAX_SIMD_DEGREE` and
-  `BLAKE3PP_SUBTREE_FOLD`. See the next section.
+  thread and the scheduler's agents, and four switches size it:
+  `stack_budget`, `BLAKE3PP_MAX_SIMD_DEGREE`, `BLAKE3PP_SUBTREE_GROUP`
+  and `BLAKE3PP_SUBTREE_FOLD`. See the next section.
 
 Everything else adapts by the existing probes: 32-bit targets are
 supported, and the SIMD/execution polyfills select exactly as on
@@ -43,43 +43,46 @@ per part, which is exactly what the `stack_budget` template argument
 bounds: `budget.bytes`, 32 KiB by default. Nothing else about the input
 adds to it.
 
-**Each agent** reduces one part to a chaining value, and that is where
-the rest lives. The default reduction recurses, holding one buffer per
-level; the depth is how often the part halves before reaching twice the
-running kernel's `simd_degree` in chunks:
+**Each agent** reduces one part to its chaining values, and that is where
+the rest lives. The reduction stages a group of chunk batches, then
+compresses their parents in one burst, so its working set is two staging
+buffers and a bounded chaining-value stack. None of that depends on the
+part's size: an agent's frame is a constant of the build, not of the
+input.
 
-```
-part chunks = bit_ceil(max(input chunks / budget.parts(), 16))
-depth       = log2(part chunks / (2 * simd_degree))
-agent stack = entry frame + depth * per-level frame
-```
+Three build settings size it. `BLAKE3PP_MAX_SIMD_DEGREE` sets how wide
+the staging buffers are, since they are sized for the widest kernel the
+build may contain rather than the one that runs.
+`BLAKE3PP_SUBTREE_GROUP` is how many chunk batches one burst stages, 8 by
+default. `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
+single-leaf fold, whose staging is one batch and whose stack is the levels
+asked for. Measured with g++ 16 at `-O2` on x86-64, bytes per agent:
 
-The frames follow `BLAKE3PP_MAX_SIMD_DEGREE`, since the buffers are sized
-for the widest kernel the build may contain, at `128 + 144 * degree`bytes
-per level. Measured with g++ 16 at `-O2` on x86-64:
-
-| `BLAKE3PP_MAX_SIMD_DEGREE` | entry frame | per level | opt-in fold, 12 levels | fold, 54 levels |
+| `BLAKE3PP_MAX_SIMD_DEGREE` | default (group 8) | group 1 | fold, 12 levels | fold, 54 levels |
 |---|---|---|---|---|
-| 16 (default) | 5536 | 2432 | 3120 | 4464 |
-| 8 | 2832 | 1280 | 1856 | 3200 |
-| 1 | 480 | 272 | 720 | 2064 |
+| 16 (default) | 12800 | 2016 | 3152 | 4496 |
+| 8 | 6528 | 1120 | 1872 | 3216 |
+| 1 | 1056 | 1056 | 768 | 2112 |
 
-Two consequences follow when sizing a thread. A smaller budget
-does not only shrink the table: fewer parts make each part larger, which
-makes the recursion deeper, so it moves stack from the caller to the
-agents. And `BLAKE3PP_SUBTREE_FOLD=<levels>` removes the depth term
-altogether, at 32 bytes per level of its own, which is why its figures
-above do not depend on the input.
+A thread that hashes **sequentially** pays the same kind of frame, for the
+whole-subtree form of the reduction rather than the part form: 14496 bytes
+at degree 16, 8224 at 8, and 2752 on a scalar build, falling to 768 with
+`BLAKE3PP_SUBTREE_FOLD=12`.
 
-A worked case, a Zephyr port: a scalar-only
-build (`BLAKE3PP_MAX_SIMD_DEGREE=1`) hashing 1 MiB with
-`stack_budget{1024}`, so 32 parts of 32 chunks and a depth of 4. The
-caller needs 1 KiB for the table, each agent 480 + 4 * 272 = 1568 bytes,
-or 720 bytes flat with `BLAKE3PP_SUBTREE_FOLD=12`.
+Two consequences follow when sizing a thread. `stack_budget` moves no
+stack between the two sides: it bounds the caller's part table, and the
+agents' frames are what the table above says whatever the parts' size. And
+the cheapest agent on a small device is the fold, which is what it exists
+for.
+
+A worked case, a Zephyr port: a scalar-only build
+(`BLAKE3PP_MAX_SIMD_DEGREE=1`) hashing 1 MiB with `stack_budget{1024}`, so
+32 parts of 32 chunks. The caller needs 1 KiB for the table and each agent
+1056 bytes, or 768 with `BLAKE3PP_SUBTREE_FOLD=12`.
 
 These are one toolchain's frames; another compiler, ABI or optimization
 level will differ. Measure yours the same way, by building the library
 with `-fstack-usage` and reading the `.su` entries for
-`compress_subtree_wide` and `compress_subtree_to_cv_recursive` (or
-`compress_subtree_to_cv_folded` with the fold on), and leave the thread
-its own headroom on top.
+`compress_subtree_to_cvs_grouped` and `compress_subtree_to_cv_grouped`
+(or the `_folded` pair with the fold on), and leave the thread its own
+headroom on top.

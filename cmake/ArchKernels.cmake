@@ -159,6 +159,27 @@ target_compile_definitions(blake3pp_features
 # compressions for a working set that does not grow with the subtree's
 # depth, which costs 11% on sse42 and avx2 and nothing measurable on a
 # scalar kernel, where there are no lanes to leave idle.
+# How many chunk batches a subtree reduction hashes before it compresses
+# their parents (src/core/subtree.hpp). A kernel body at full width is
+# large enough that the chunk loop and the one-block parent call do not
+# stay hot together, so the burst is worth more than the locality it gives
+# up: on Zen 5 AVX-512, 6.7 GiB/s at one batch per burst, 7.6 at eight,
+# 7.8 at thirty-two, against 8.5 for the chunk batches alone. Eight is the
+# default; a power of two, since the groups merge through a binary
+# counter.
+set(BLAKE3PP_SUBTREE_GROUP "" CACHE STRING
+  "Chunk batches per parent burst in the subtree reduction [<power of two>]")
+if(BLAKE3PP_SUBTREE_GROUP)
+  if(NOT BLAKE3PP_SUBTREE_GROUP MATCHES "^[0-9]+$")
+    message(FATAL_ERROR
+      "BLAKE3PP_SUBTREE_GROUP must be a power of two, got '${BLAKE3PP_SUBTREE_GROUP}'")
+  endif()
+  target_compile_definitions(blake3pp_features
+    INTERFACE "BLAKE3PP_SUBTREE_GROUP=${BLAKE3PP_SUBTREE_GROUP}")
+  message(STATUS "blake3pp: BLAKE3PP_SUBTREE_GROUP=${BLAKE3PP_SUBTREE_GROUP} "
+    "(default is 8); non-default kernel tuning")
+endif()
+
 set(BLAKE3PP_SUBTREE_FOLD OFF CACHE STRING
   "Fold subtrees through a bounded CV stack instead of per-level buffers [OFF|ON|<levels>]")
 if(BLAKE3PP_SUBTREE_FOLD)

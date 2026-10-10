@@ -61,8 +61,9 @@ and nudges the driver awake rather than reaching into it.
 
 Writes run the same chain backwards -- generate on the pool, write on
 the driver -- with no reducer, because a window's bytes depend on its
-offset and nothing else. That is `write_file()`, and `blake3ppgen
---output` is built on it.
+offset and nothing else. That is `write_file()`, which also comes in
+forms that need no scheduler and in one whose generator decides the
+file's length; `blake3ppgen --output` is built on them.
 
 The storage is a window arena the driver owns, so a read is never in
 flight into memory that has already been freed. The blocking entry
@@ -211,7 +212,7 @@ consumers can pick granular headers instead:
 | `<blake3pp/blake3pp.hpp>`    | umbrella: everything below | yes |
 | `<blake3pp/dispatch.hpp>`    | `arch` introspection, SIMD variant selection | no |
 | `<blake3pp/core.hpp>`        | `digest`, `hasher`, one-shot `hash()` | no |
-| `<blake3pp/io.hpp>`          | `update_file()` and `hash_file()`, the async direct-I/O pipeline | no |
+| `<blake3pp/io.hpp>`          | `update_file()`, `hash_file()` and sequential `write_file()`, the async direct-I/O pipeline | no |
 | `<blake3pp/parallel.hpp>`    | multi-core `hash()`, `parallel_hasher`, multi-core XOF `fill()` | yes |
 | `<blake3pp/parallel_io.hpp>` | `update_file()`, `hash_file()` and `write_file()` over a scheduler (the two combined) | yes |
 | `<blake3pp/async_io.hpp>`    | EXPERIMENTAL: the same as senders over a context you drive, for many files on one arena | yes |

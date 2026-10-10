@@ -369,19 +369,20 @@ static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
 ```
 
 The budget covers that table and nothing else. Each part is reduced on
-the agent that took it, by a recursion that holds one chaining-value
-buffer per level: 2 KiB per level while the build contains a 16-wide
-kernel, since the buffer is sized for the widest variant compiled rather
-than the one that runs, and as many levels as halving the part takes to
-reach twice the running variant's degree in chunks.
+the agent that took it, by a sweep that stages a group of chunk batches
+and then compresses their parents: two staging buffers and a small
+chaining-value stack, 12.5 KiB while the build contains a 16-wide kernel,
+since the buffers are sized for the widest variant compiled rather than
+the one that runs. That frame does not grow with the part, so an agent's
+stack does not depend on the input size.
 
 #### What turning it down does
 
-**It moves stack, it does not save it.** A smaller budget shrinks the
-table on the calling thread and enlarges the frame on every agent,
-because the parts get bigger and that recursion goes deeper. The total
-across the program does not fall; it relocates from one thread to
-several.
+**It shrinks the table, and nothing else.** A smaller budget means fewer,
+larger parts, and the sweep that reduces a part has the same frame
+whatever the part's size, so the agents' stacks stay where they are. What
+changes is the calling thread's table and how many parts there are to
+balance across agents.
 
 **Nothing catches an undersized thread.** The checks on `stack_budget`
 are `consteval` and reject a malformed budget — not a multiple of 32
@@ -396,10 +397,12 @@ counter, so parts are also the unit of load balancing. A budget that
 yields fewer parts than the scheduler has agents leaves agents with
 nothing to take, and the slowest part sets the finish time.
 
-If the depth is the problem, `BLAKE3PP_SUBTREE_FOLD=<levels>` removes
-that term altogether at 32 bytes per level, which makes an agent's stack
-independent of the input size. The measured frames, the formulas and a
-worked Zephyr case are in
+If the agents' frames are the problem, two build settings cut them:
+`BLAKE3PP_SUBTREE_GROUP=1` stages one chunk batch per burst instead of
+eight, and `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
+single-leaf fold at 32 bytes per level. Both cost throughput, and
+`BLAKE3PP_MAX_SIMD_DEGREE` scales every figure with the widest kernel the
+build carries. The measured frames and a worked Zephyr case are in
 [Freestanding and RTOS builds](freestanding.md#stack-requirements).
 
 `keyed_hash`, `derive_key`, `update_file` and `hash_file` take the same
