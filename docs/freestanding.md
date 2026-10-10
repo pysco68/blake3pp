@@ -56,7 +56,9 @@ build may contain rather than the one that runs.
 `BLAKE3PP_SUBTREE_GROUP` is how many chunk batches one burst stages, 8 by
 default. `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
 single-leaf fold, whose staging is one batch and whose stack is the levels
-asked for. Measured with g++ 16 at `-O2` on x86-64, bytes per agent:
+asked for. It applies to both forms of the reduction, the part form the
+agents run and the whole-subtree form a sequential caller runs; neither
+reaches the recursion, whose frame grows with the subtree's depth. Measured with g++ 16 at `-O2` on x86-64, bytes per agent:
 
 | `BLAKE3PP_MAX_SIMD_DEGREE` | default (group 8) | group 1 | fold, 12 levels | fold, 54 levels |
 |---|---|---|---|---|
@@ -84,5 +86,6 @@ These are one toolchain's frames; another compiler, ABI or optimization
 level will differ. Measure yours the same way, by building the library
 with `-fstack-usage` and reading the `.su` entries for
 `compress_subtree_to_cvs_grouped` and `compress_subtree_to_cv_grouped`
-(or the `_folded` pair with the fold on), and leave the thread its own
-headroom on top.
+(with the fold on, the first is the same function with one leaf per burst
+and the second is `compress_subtree_to_cv_folded`), and leave the thread
+its own headroom on top.

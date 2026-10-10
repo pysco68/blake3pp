@@ -428,6 +428,13 @@ inline std::size_t compress_subtree_to_cvs_grouped(
 // point is a working set that does not grow with the subtree -- the sweep
 // stages a whole group of leaves, which is what such a target cannot
 // spare. Both stay compiled so the tests can compare them.
+//
+// The fold is the sweep with one leaf per burst and Fold as its stack
+// bound, which is the same frame the whole-subtree fold has: one leaf's
+// chaining values, half of that for their parents, and Fold CVs of stack.
+// Nothing here may reach the recursion, whose frame grows one buffer per
+// level -- the agents of a pool sized from this switch's figures are
+// exactly the callers that cannot afford that.
 template <std::size_t Fold = subtree_fold_levels,
           std::size_t MaxDegree = kern::max_simd_degree>
 inline std::size_t compress_subtree_to_cvs(
@@ -437,7 +444,7 @@ inline std::size_t compress_subtree_to_cvs(
     std::span<std::array<std::uint32_t, 8>> out_cvs,
     std::size_t stop_at) noexcept {
   if constexpr (Fold > 0) {
-    return compress_subtree_to_cvs_recursive<MaxDegree>(
+    return compress_subtree_to_cvs_grouped<1, Fold, MaxDegree>(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cvs,
         stop_at);
   } else {

@@ -222,18 +222,29 @@ TEST_CASE("the part reductions agree at every stop") {
         // are compared with each other, not with a formula.
         std::vector<std::array<std::uint32_t, 8>> recursive(64);
         std::vector<std::array<std::uint32_t, 8>> grouped(64);
+        // The third shape is what a BLAKE3PP_SUBTREE_FOLD build selects:
+        // the sweep with one leaf per burst and the switch's level count
+        // as its stack bound. It has to agree too, since a part's CVs
+        // reach the same tree whichever build produced them.
+        std::vector<std::array<std::uint32_t, 8>> folded(64);
         const std::size_t n_rec =
             blake3pp::core::compress_subtree_to_cvs_recursive(
                 *ops, data.data(), chunks, 11, key, 0, recursive, stop);
         const std::size_t n_grp =
             blake3pp::core::compress_subtree_to_cvs_grouped<>(
                 *ops, data.data(), chunks, 11, key, 0, grouped, stop);
+        const std::size_t n_fold =
+            blake3pp::core::compress_subtree_to_cvs<12>(
+                *ops, data.data(), chunks, 11, key, 0, folded, stop);
         REQUIRE(n_grp == n_rec);
+        REQUIRE(n_fold == n_rec);
         CHECK(n_rec >= 1);
         CHECK(n_rec <= std::min(chunks, stop));
         recursive.resize(n_rec);
         grouped.resize(n_grp);
+        folded.resize(n_fold);
         CHECK(grouped == recursive);
+        CHECK(folded == recursive);
       }
     }
   }
