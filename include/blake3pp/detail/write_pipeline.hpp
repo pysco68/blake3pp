@@ -262,14 +262,7 @@ class write_scope {
 
   static_assert(std::copy_constructible<scope_receiver>);
 
-  struct request_scope_stop {
-    ex::inplace_stop_source* source;
-    D* drv;
-    void operator()() const noexcept {
-      source->request_stop();
-      drv->wake();
-    }
-  };
+  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
   using outer_stop_callback =
       ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
 

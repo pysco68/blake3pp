@@ -97,6 +97,25 @@
 
 namespace blake3pp::detail {
 
+// What the caller's stop does, from whichever thread requested it.
+// Both halves are safe from any thread: requesting is atomic, and
+// wake() is the one member of a driver another thread may call.
+template <class D>
+struct request_scope_stop {
+  ex::inplace_stop_source* source;
+  D* drv;
+  void operator()() const noexcept {
+    source->request_stop();
+    drv->wake();
+  }
+};
+
+// A type each translation unit has its own of; see window_scope's chain
+// builders.
+namespace {
+struct tu_tag {};
+}  // namespace
+
 // A node on the driver's run queue. Intrusive, so the queue allocates
 // nothing: the operation states that carry one are allocated once with
 // their window and reused for the whole file.
@@ -228,7 +247,6 @@ class driver_scheduler : public ex_compat::weakly_parallel_scheduler {
  public:
   using scheduler_concept = ex_compat::scheduler_tag;
 
-  driver_scheduler() noexcept = default;
   explicit driver_scheduler(driver_loop<D>* loop) noexcept : loop_(loop) {}
 
   [[nodiscard]] schedule_sender<D> schedule() const noexcept {
@@ -295,8 +313,7 @@ class read_op_state : public run_node {
   }
 
  private:
-  using token_type = decltype(ex::get_stop_token(
-      ex::get_env(std::declval<const Receiver&>())));
+  using token_type = ex::stop_token_of_t<ex::env_of_t<Receiver>>;
 
   [[nodiscard]] token_type stop_token() const noexcept {
     return ex::get_stop_token(ex::get_env(rcvr_));
@@ -418,8 +435,7 @@ class write_op_state : public run_node {
   }
 
  private:
-  using token_type = decltype(ex::get_stop_token(
-      ex::get_env(std::declval<const Receiver&>())));
+  using token_type = ex::stop_token_of_t<ex::env_of_t<Receiver>>;
 
   [[nodiscard]] token_type stop_token() const noexcept {
     return ex::get_stop_token(ex::get_env(rcvr_));
@@ -740,11 +756,6 @@ class driver_loop {
         stats_->busy_ns += static_cast<std::uint64_t>(t - t_poll);
       }
     }
-  }
-
-  template <class BeforeFlush>
-  void run_until(const loop_status& status, BeforeFlush&& before_flush) {
-    run_until(status, std::forward<BeforeFlush>(before_flush), &stall);
   }
 
   void run_until(const loop_status& status) {
@@ -1214,22 +1225,11 @@ class window_scope {
   friend struct pipeline_cells;
 
  public:
- public:
   using cv_type = std::array<std::uint32_t, 8>;
   // The window objects are the pool's; the scope only borrows them.
   using window = pipeline_window<Budget>;
 
-  // What the caller's stop does, from whichever thread requested it.
-  // Both halves are safe from any thread: requesting is atomic, and
-  // wake() is the one member of a driver another thread may call.
-  struct request_scope_stop {
-    ex::inplace_stop_source* source;
-    D* drv;
-    void operator()() const noexcept {
-      source->request_stop();
-      drv->wake();
-    }
-  };
+  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
   using outer_stop_callback =
       ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
 
@@ -1450,9 +1450,6 @@ class window_scope {
     give_back_all();
   }
 
-  // Asks this run to stop, from the driver thread.
-  void stop() noexcept { request_stop(); }
-
   // Whether a stop has taken this run, for a caller reporting a run that
   // never started.
   [[nodiscard]] bool stopped() const noexcept {
@@ -1508,11 +1505,6 @@ class window_scope {
   // whose capacity is the default; the admission test is what reads it.
   [[nodiscard]] std::uint64_t admission_stalls() const noexcept {
     return admission_stalls_;
-  }
-
-  // Failures after the one the caller was told about.
-  [[nodiscard]] std::uint64_t dropped_failures() const noexcept {
-    return dropped_failures_;
   }
 
  private:
@@ -1720,6 +1712,14 @@ class window_scope {
 
   // One window, start to finish. The middle line is the compress stage;
   // everything around it is the same for every window.
+  // The three chain builders are templates on a tag that is a different
+  // type in every translation unit (an anonymous namespace), for the
+  // reason RULE 6 in ex_compat.hpp gives one layer down: their return
+  // types carry a provider's internal-linkage sender types, while a
+  // non-template member's mangled name does not, so without the tag two
+  // units' builders have one name and the linker keeps one body for
+  // layouts that may differ.
+  template <class Tag = tu_tag>
   [[nodiscard]] auto window_chain(window& w) {
     return ex::then(
         ex::continues_on(
@@ -1735,6 +1735,7 @@ class window_scope {
   // An edge window with nothing worth fanning out: read it, hold it, and
   // let the hasher take the whole thing at the end. Small last windows
   // land here, and so does a file below one window.
+  template <class Tag = tu_tag>
   [[nodiscard]] auto read_only_chain(window& w) {
     return ex::then(loop_.read(file_, w.offset, w.read_into, w.op),
                     [this, &w](std::span<const std::byte>) noexcept {
@@ -1757,6 +1758,7 @@ class window_scope {
   // exists separately because its value type is a node count, and
   // generalising the full window's chain to carry either would put a
   // branch on the path every window takes.
+  template <class Tag = tu_tag>
   [[nodiscard]] auto edge_chain(window& w) {
     return ex::then(
         ex::continues_on(
@@ -1793,17 +1795,8 @@ class window_scope {
                             h_.key_words(), h_.mode_flags(), trace_, w.index);
     const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
     const ex::inplace_stop_token tok = stop_source_.get_token();
-    if constexpr (Traced) {
-      return stopped_if<std::size_t>(
-          tok, ex::then(compress_edge_on<true>(sched_, w.compress, out, tok),
-                        [this, &w](std::size_t nodes) noexcept {
-                          stamp_agents(w);
-                          return nodes;
-                        }));
-    } else {
-      return stopped_if<std::size_t>(
-          tok, compress_edge_on<false>(sched_, w.compress, out, tok));
-    }
+    return stamped<std::size_t>(
+        w, tok, compress_edge_on<Traced>(sched_, w.compress, out, tok));
   }
 
   // On the driver, like every other insert.
@@ -1825,25 +1818,23 @@ class window_scope {
   [[nodiscard]] auto compress_stage(window& w) {
     read_landed(w);
     const ex::inplace_stop_token tok = stop_source_.get_token();
+    return stamped<cv_type>(w, tok, compress_on<Traced>(sched_, w.compress, tok));
+  }
+
+  // A compress stage's tail: stopped if the run was, and, when tracing,
+  // the agents' record stamped on the way through.
+  template <class Value, class Stage>
+  [[nodiscard]] auto stamped(window& w, ex::inplace_stop_token tok,
+                             Stage&& stage) {
     if constexpr (Traced) {
-      return stopped_if<cv_type>(
-          tok, ex::then(compress_on<true>(sched_, w.compress, tok),
-                        [this, &w](const cv_type& cv) noexcept {
-                          if (w.rec != nullptr) {
-                            w.rec->t_joined = trace_->now();
-                            w.rec->agent_busy_ns =
-                                w.compress.pt.busy_ns.load(
-                                    std::memory_order_relaxed);
-                            w.rec->agents_active =
-                                w.compress.pt.active.load(
-                                    std::memory_order_relaxed);
-                            w.rec->flags |= window_record::flag_parallel;
-                          }
-                          return cv;
+      return stopped_if<Value>(
+          tok, ex::then(std::forward<Stage>(stage),
+                        [this, &w](Value v) noexcept {
+                          stamp_agents(w);
+                          return v;
                         }));
     } else {
-      return stopped_if<cv_type>(tok,
-                                 compress_on<false>(sched_, w.compress, tok));
+      return stopped_if<Value>(tok, std::forward<Stage>(stage));
     }
   }
 
@@ -2071,16 +2062,7 @@ class window_scope {
     }
   }
 
-  void on_done(window& w) noexcept {
-    --in_flight_;
-    // Whatever this window reserved in the reducer is now either in it
-    // or never coming.
-    in_flight_nodes_ -= w.plan.node_cost;
-    if (&w != last_window_) {
-      release(w);
-    }
-    settle();
-  }
+  void on_done(window& w) noexcept { finish_window(w); }
 
   // The first failure is the one the caller hears about. Stop and error
   // race by construction -- requesting stop is what makes the other
@@ -2342,27 +2324,20 @@ struct pipeline_cells {
   pipeline_cells(const pipeline_cells&) = delete;
   pipeline_cells& operator=(const pipeline_cells&) = delete;
 
-  struct connect_full {
+  // Builds a cell's operation state in place: an operation state does
+  // not move, so the optional is given a conversion rather than a value.
+  template <class Op, auto Chain>
+  struct connect_as {
     Scope* scope;
     window* w;
-    operator full_op() const {
-      return ex::connect(scope->window_chain(*w), receiver{scope, w});
+    operator Op() const {
+      return ex::connect((scope->*Chain)(*w), receiver{scope, w});
     }
   };
-  struct connect_read {
-    Scope* scope;
-    window* w;
-    operator read_only_op() const {
-      return ex::connect(scope->read_only_chain(*w), receiver{scope, w});
-    }
-  };
-  struct connect_edge {
-    Scope* scope;
-    window* w;
-    operator edge_op() const {
-      return ex::connect(scope->edge_chain(*w), receiver{scope, w});
-    }
-  };
+  using connect_full = connect_as<full_op, &Scope::template window_chain<>>;
+  using connect_read =
+      connect_as<read_only_op, &Scope::template read_only_chain<>>;
+  using connect_edge = connect_as<edge_op, &Scope::template edge_chain<>>;
 
   std::unique_ptr<std::optional<full_op>[]> full;
   // One cell of each shape per edge window: the first and the last can
