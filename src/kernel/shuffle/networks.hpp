@@ -12,10 +12,9 @@
 // in the integer domain, and on Clang 22, which builds the same network in
 // the float domain: vunpcklps/vunpcklpd/vperm2f128.
 //
-// The index lists below are the whole point here: they are hardware
-// macro-ops spelled as permutations, they were derived by simulation, and
-// they must never drift between backends. Op::shuf<I...> is the only thing
-// a backend has to provide to run them.
+// The index lists below are hardware macro-ops spelled as permutations,
+// derived by simulation, and must never drift between backends.
+// Op::shuf<I...> is the only thing a backend has to provide to run them.
 
 #include <cstddef>
 

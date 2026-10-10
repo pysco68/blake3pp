@@ -144,7 +144,7 @@ choosing `--host` or `--host --distributed`).
 
 ## Kernel tuning switches
 
-Five cache variables turn measured kernel optimizations on or off. Each
+Nine cache variables turn measured kernel optimizations on or off. Each
 is `auto|on|off` and defaults to `auto`, which is the fastest setting on
 every machine it has been measured on. **These are not performance
 options to tune, they are measurement controls**, and turning one off
@@ -158,18 +158,33 @@ reported at configure time when it is not the default.
 | `BLAKE3PP_KERNEL_SRI_ROTATE` | on, aarch64 | Spell rot12/rot7 as the generic shift-or, which selects `shl`+`usra` instead of `shl`+`sri`. `sri` is worth ~6% on Apple M2 (clang 22), 12% on Neoverse V2 and 8% on Neoverse N1 (clang 21, static build), measured as alternating A/B pairs. |
 | `BLAKE3PP_KERNEL_STAGED_ROUNDS` | on, aarch64 | Run each round as sequential `g` calls instead of quartet-staged. A small win on Apple M2 / clang 22, and provably inert on GCC 15 (same schedule, different register names). Loses on x86, where it is off regardless. |
 | `BLAKE3PP_KERNEL_XAR_ROTATE` | on, SVE2 variants | Spell `rot(x ^ y)` as `eor` + rotate instead of one fused `XAR`. Off costs the SVE2 kernels their entire margin over NEON: measured 1.89 vs 1.61 GiB/s on Neoverse V2 (GCP Axion). |
-| `BLAKE3PP_KERNEL_SHUFFLE_TREE` | on, all SIMD targets | Stage every transpose through a scalar array and spell the byte rotates as shift-or, the code before the shuffle-tree bypass. Off costs SSE4.2 about half its throughput on clang; see the kernel section of the talk notes. |
+| `BLAKE3PP_KERNEL_SHUFFLE_TREE` | on, all SIMD targets | Stage every transpose through a scalar array and spell the byte rotates as shift-or, the code before the shuffle-tree bypass. Off costs SSE4.2 about half its throughput on clang. |
 | `BLAKE3PP_KERNEL_ROT16_PER_COMPILER` | on, x86 clang | Spell rot16 as the byte shuffle on clang too, which LLVM lowers to `pshuflw`+`pshufhw` where the shift-or folds to one `pshufb`. The pre-split spelling, kept for the A/B. |
-| `BLAKE3PP_KERNEL_VROR_ROTATE` | on, RVV Zvbb variants | Spell the rotate as the 4-op shift-or (base RVV has no rotate) instead of `vxor`+`vror`. The XAR playbook on RISC-V; unmeasured on real Zvbb silicon so far (this switch is how it will be). |
+| `BLAKE3PP_KERNEL_VROR_ROTATE` | on, RVV Zvbb variants | Spell the rotate as the 4-op shift-or (base RVV has no rotate) instead of `vxor`+`vror`. The RISC-V counterpart of the XAR switch; not yet measured on Zvbb silicon, which this switch makes possible. |
+| `BLAKE3PP_KERNEL_VEXT_W8_GATHER` | on, GCC at eight lanes with AVX-512 available | Transpose through the shuffle network there too. GCC lowers the network's cross-lane stage to an index-register permute per stage when the register is a raw vector extension and AVX-512 is in reach, so the staging gather is faster in exactly that corner; the switch is the A/B, and in AVX2-only builds the network wins by 19%. |
+| `BLAKE3PP_KERNEL_PIN_MESSAGE` | on, AVX-512 width on GCC and clang | Hold the message block in registers. At sixteen lanes the state takes half the register file and the message cannot fit beside it, so letting its address escape once makes the compiler read it through memory operands: worth 7.8% on the kernel and 8.5% end-to-end on Zen 5, and 2-4% at 32 threads. |
 
 ```bash
-# Re-run the inlining A/B on a machine this project has never measured:
+# Re-run the inlining A/B on a new machine:
 cmake --preset macos-clang22-cxx26 -DBLAKE3PP_KERNEL_INLINE_ENFORCEMENT=off
 ```
 
 `BLAKE3PP_KERNEL_EXTRA_FLAGS` (a semicolon-separated list) appends raw
 compiler flags to the kernel TUs only, for one-off flag trials that have
 not earned a switch.
+
+Two more cache variables shape the tree reduction rather than the kernel.
+
+`BLAKE3PP_SUBTREE_GROUP=<power of two>` sets how many chunk batches a
+reduction hashes before it compresses their parents; 8 is the default. The
+kernel's chunk loop and its one-block parent call do not stay hot
+together, so the burst pays for the locality it gives up. Measured on Zen 5
+AVX-512 with the parent work unchanged and only its grouping varied:
+6.7 GiB/s at one batch per burst, 7.6 at eight, 7.8 at thirty-two.
+
+`BLAKE3PP_SUBTREE_FOLD=<levels>` goes the other way, for targets that
+cannot spare the burst's staging buffers. The frames are in
+[Freestanding and RTOS builds](freestanding.md#stack-requirements).
 
 Layout:
 

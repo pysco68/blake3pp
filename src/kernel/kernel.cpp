@@ -4,6 +4,7 @@
 // instantiated with the simd facade's u32v it hashes width-many independent
 // inputs at once, one per lane (BLAKE3's hash_many strategy).
 
+#include "kernel/endian.hpp"
 #include "kernel/kernel.hpp"
 
 #include <algorithm>
@@ -37,21 +38,16 @@ static_assert(u32v::width <= max_simd_degree,
 // instructions per message word in the scalar kernel's block loop.
 //
 // The memcpy folds to one mov on every compiler, and the byteswap arm
-// keeps the endian independence the old spelling had.
+// keeps the endian independence of the shift-or spelling.
 //
 // std::byteswap is C++23; the C++20 presets get the shift-mask spelling,
 // which every compiler folds to a single bswap. Feature-tested rather
 // than __cplusplus-gated, and needed even though the call sits in a
 // discarded if-constexpr branch: non-dependent names in discarded
-// branches must still exist (found by the C++20 CI leg, not by review).
-BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept {
-#if defined(__cpp_lib_byteswap)
-  return std::byteswap(v);
-#else
-  return (v >> 24) | ((v >> 8) & 0x0000ff00u) | ((v << 8) & 0x00ff0000u) |
-         (v << 24);
-#endif
-}
+// branches must still exist.
+using endian::bswap32;
+using endian::load32;
+using endian::store32;
 
 // The clang that zig 0.16 bundles, 21.1.0, merges the byte-wise word
 // loads of the message below into element-width vector loads reading the
@@ -70,30 +66,13 @@ BLAKE3PP_FORCE_INLINE constexpr std::uint32_t bswap32(std::uint32_t v) noexcept 
 //   GCC 15                         none
 //
 // So a 21.1.x patch release, or zig's own build of it, is the dividing
-// line. The version bound below is conservative on purpose: it also covers
-// clang 21 builds that do not need it, and lifts itself when the musl
-// builds move to zig 0.17.
+// line. The version bound below is conservative: it also covers clang 21
+// builds that do not need it.
 #if defined(__riscv) && defined(__riscv_v) && defined(__clang__) && __clang_major__ < 22
 #define BLAKE3PP_ALIGN_MESSAGE_BLOCK 1
 #else
 #define BLAKE3PP_ALIGN_MESSAGE_BLOCK 0
 #endif
-
-BLAKE3PP_FORCE_INLINE std::uint32_t load32(const std::uint8_t* p) noexcept {
-  std::uint32_t v;
-  std::memcpy(&v, p, sizeof v);
-  if constexpr (std::endian::native == std::endian::big) {
-    v = bswap32(v);
-  }
-  return v;
-}
-
-BLAKE3PP_FORCE_INLINE void store32(std::uint8_t* p, std::uint32_t v) noexcept {
-  if constexpr (std::endian::native == std::endian::big) {
-    v = bswap32(v);
-  }
-  std::memcpy(p, &v, sizeof v);
-}
 
 template <int N>
 BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {
@@ -102,7 +81,7 @@ BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {
 
 // Scalar twin of the wide xor_rot in transpose.hpp: the rounds are written
 // against the fused form so SVE2's XAR can claim it; everywhere else the
-// compilers fold this back to exactly the old eor + ror pair.
+// compilers fold this back to the eor + ror pair.
 template <int N>
 BLAKE3PP_FORCE_INLINE std::uint32_t xor_rot(std::uint32_t x,
                                             std::uint32_t y) noexcept {
@@ -143,18 +122,17 @@ constexpr auto msg_schedule = make_msg_schedule();
 
 // The quarter-round (spec section 2.2), generic over the word type.
 //
-// Scheduling note, all measured on znver3. This plain sequential-g
-// spelling is the best of three schedules tried. llvm-mca shows it
-// latency-bound, at 459 cycles per block against a 196 port floor, and IPC
-// 2.56 where upstream's hand-scheduled asm reaches 3.50. Every attempt to
-// expose more ILP in source made things worse:
+// Scheduling, measured on znver3. This plain sequential-g spelling is the
+// fastest of three schedules. llvm-mca shows it latency-bound, at 459
+// cycles per block against a 196 port floor, and IPC 2.56 where upstream's
+// hand-scheduled asm reaches 3.50. Exposing more ILP in source is slower:
 //
-//   - Interleaving two independent batches doubled live state past the 16
+//   - Interleaving two independent batches doubles live state past the 16
 //     architectural registers, 2.66 -> 1.83 GiB/s.
-//   - Staging the four quartets' micro-steps helped narrow widths but
-//     pessimized AVX2 spill placement on both compilers, ratio against
+//   - Staging the four quartets' micro-steps helps narrow widths but
+//     pessimizes AVX2 spill placement on both compilers, ratio against
 //     upstream 0.85 -> 0.71.
-//   - Staging via index arrays defeated SROA entirely, Clang 0.77 GiB/s.
+//   - Staging via index arrays defeats SROA entirely, Clang 0.77 GiB/s.
 //
 // The residual against hand-written assembly is scheduler quality, and
 // source-level reordering cannot reliably buy it back.
@@ -197,10 +175,10 @@ BLAKE3PP_FORCE_INLINE void round_fn(W v[16], const W m[16]) noexcept {
 // flight at once. On x86's 16 architectural registers that loses (measured;
 // see the scheduling note on g); aarch64's 32 vector registers hold the
 // whole working set, and the spelling measured a small consistent win there
-// (Apple M2, clang 22: 1.61 vs 1.59 GiB/s sequential). The difference only
-// exists at all because the round core is register-resident (see the
-// always_inline note in simd_facade.hpp); when it was outlined-to-memory,
-// both spellings compiled identically.
+// (Apple M2, clang 22: 1.61 vs 1.59 GiB/s sequential). The difference
+// exists only because the round core is register-resident (see the
+// always_inline note in simd_facade.hpp); with the core outlined to
+// memory, both spellings compile identically.
 template <std::size_t R, class W>
 BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
   constexpr const std::array<std::uint8_t, 16>& s = msg_schedule[R];
@@ -280,9 +258,15 @@ BLAKE3PP_FORCE_INLINE void round_fn_staged(W v[16], const W m[16]) noexcept {
 //
 // Set by cmake/ArchKernels.cmake from -DBLAKE3PP_KERNEL_STAGED_ROUNDS=
 // auto|on|off; the fallback repeats that default. Off restores the
-// sequential round for re-measurement on a core with a clock.
+// sequential round for re-measurement.
 #ifndef BLAKE3PP_KERNEL_STAGED_ROUNDS
 #define BLAKE3PP_KERNEL_STAGED_ROUNDS 1
+#endif
+
+// Set by cmake/ArchKernels.cmake like the other switches; off restores the
+// register-held message for the A/B (see all_rounds below).
+#ifndef BLAKE3PP_KERNEL_PIN_MESSAGE
+#define BLAKE3PP_KERNEL_PIN_MESSAGE 1
 #endif
 
 #if defined(__aarch64__) && BLAKE3PP_KERNEL_STAGED_ROUNDS
@@ -293,6 +277,27 @@ constexpr bool staged_rounds = false;
 
 template <class W>
 BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
+  // The message array's address escapes once, so it must live in memory and
+  // the round body reads it through memory operands instead of holding 16
+  // vectors of it in registers. At full AVX-512 width the state alone is 16
+  // of the 32 zmm, so the message cannot fit beside it and what the compiler
+  // keeps there it pays for twice over; freeing those registers is worth
+  // 3-6% on the chunk shape (Zen 5, clang 22, 32 inputs per call). An empty
+  // asm with an input-only constraint, so nothing is clobbered and the state
+  // stays register-resident: a memory clobber here forces the state out too
+  // and loses 4%.
+  //
+  // Narrower widths do not want it: measured +0.8% and -1.8% on avx2 and
+  // -0.1% on sse42, all inside the noise, because at eight lanes and 16
+  // registers there is room for both. Hence the width gate, and x86 because
+  // that is where it is measured; a wide SVE or RVV target would have to
+  // measure its own.
+#if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__)) && \
+    BLAKE3PP_KERNEL_PIN_MESSAGE
+  if constexpr (u32v::width >= 16) {
+    asm volatile("" : : "r"(m));
+  }
+#endif
   [&]<std::size_t... R>(std::index_sequence<R...>)
       BLAKE3PP_LAMBDA_FORCE_INLINE {
     // The gate is wide-word-only: the scalar compress in this same TU keeps
@@ -432,7 +437,7 @@ void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
     wide[j] = v[j] ^ v[j + 8];
     wide[j + 8] = v[j + 8] ^ u32v::broadcast(cv[j]);
   }
-  store_transposed(wide, out, transpose_detail::t16_mode());
+  store_transposed(wide, out);
 }
 
 void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
@@ -467,12 +472,6 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
 
   const auto [ctr_lo, ctr_hi] = counter_lanes(counter, increment_counter);
 
-  // Read the W==16 transpose dial ONCE per batch, not once per block. MSVC
-  // emits std::atomic<transpose16_mode>::load out of line, and a call in
-  // the block loop is an optimisation barrier that spills the whole wide
-  // state every iteration, measured as the entire AVX-512 width advantage.
-  const transpose16_mode t16 = transpose_detail::t16_mode();
-
   for (std::size_t b = 0; b < blocks; ++b) {
     std::uint32_t block_flags = flags;
     if (b == 0) {
@@ -483,7 +482,7 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     }
 
     u32v m[16];
-    load_transposed(inputs, b * block_len, m, t16);
+    load_transposed(inputs, b * block_len, m);
 
     u32v v[16];
     for (std::size_t j = 0; j < 8; ++j) {
@@ -504,14 +503,19 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
     }
   }
 
-  std::uint32_t lanes BLAKE3PP_CXXATTR_UNINITIALIZED [W];
-  for (std::size_t j = 0; j < 8; ++j) {
-    cv[j].store(lanes);
-    for (std::size_t lane = 0; lane < W; ++lane) {
-      store32(out + lane * out_len + 4 * j, lanes[lane]);
-    }
-  }
+  store_cvs_transposed<W>(cv, out);
 }
+
+// Smallest remainder hash_many pads out to a full-width batch instead of
+// finishing through the scalar compress, measured per lane count on the
+// one-block parent shape. At W=16 (Emerald Rapids, full-width AVX-512) a
+// padded batch beats three scalar blocks and loses to two; at W=8 and W=4
+// (Zen 3+) it already beats two, by 25% and 15%. Widths without a
+// measurement never pad.
+constexpr std::size_t pad_remainder_min = u32v::width >= 16  ? 3
+                                          : u32v::width == 8 ? 2
+                                          : u32v::width == 4 ? 2
+                                                             : u32v::width;
 
 void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
                std::size_t blocks, const std::uint32_t key[8],
@@ -524,6 +528,24 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
       hash_batch(inputs + i, blocks, key,
                  counter + (increment_counter ? i : 0), increment_counter,
                  flags, flags_start, flags_end, out + i * out_len);
+    }
+  }
+  // A remainder of at least pad_remainder_min inputs runs as one full-width
+  // batch, the unused lanes aimed at the last real input (every lane reads
+  // valid memory) and their outputs dropped. The wide batch costs the same
+  // whatever the lane count and the scalar loop a block per input, so the
+  // threshold is where one batch undercuts that many scalar blocks.
+  if constexpr (u32v::width > 1) {
+    if (const std::size_t rem = num_inputs - i; rem >= pad_remainder_min) {
+      const std::uint8_t* padded[u32v::width];
+      for (std::size_t l = 0; l < u32v::width; ++l) {
+        padded[l] = inputs[i + (l < rem ? l : rem - 1)];
+      }
+      std::uint8_t tmp[u32v::width * out_len];
+      hash_batch(padded, blocks, key, counter + (increment_counter ? i : 0),
+                 increment_counter, flags, flags_start, flags_end, tmp);
+      std::memcpy(out + i * out_len, tmp, rem * out_len);
+      i = num_inputs;
     }
   }
   for (; i < num_inputs; ++i) {

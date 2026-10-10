@@ -61,6 +61,13 @@ if(BLAKE3PP_BENCH_UPSTREAM)
   HermeticFetchContent_MakeAvailableAtBuildTime(blake3_upstream)
   target_link_libraries(blake3pp_bench PRIVATE BLAKE3::blake3)
   target_compile_definitions(blake3pp_bench PRIVATE BLAKE3PP_BENCH_UPSTREAM=1)
+  # Upstream assembles its MASM sources under MSVC (clang-cl included), and
+  # those carry no blake3_xof_many_avx512: only the Unix and windows_gnu
+  # sources do. The bench's avx512 extended-output row needs that symbol,
+  # so it is left out where the reference does not provide it.
+  if(MSVC)
+    target_compile_definitions(blake3pp_bench PRIVATE BLAKE3PP_BENCH_NO_XOF_ASM=1)
+  endif()
 endif()
 
 # The sized parallel scheduler is one definition per program; the benches

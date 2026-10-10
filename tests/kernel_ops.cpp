@@ -137,6 +137,48 @@ TEST_CASE("xof_many matches repeated compress_xof on every arch") {
   }
 }
 
+// Every input count from one to past two batches, one block and a whole
+// chunk each, with and without the counter stepping: the remainder of a
+// batch takes a different path for every count -- padded on the wide
+// kernel, handed to a narrower one, or compressed one at a time -- and
+// resolve()'s ladder chooses by the count, so each count is its own case.
+TEST_CASE("hash_many agrees with the oracle for every remainder") {
+  constexpr std::size_t max_inputs = 2 * blake3pp::kern::max_simd_degree + 3;
+  constexpr std::size_t max_blocks = chunk_len / block_len;
+  std::vector<std::uint8_t> data(max_inputs * max_blocks * block_len);
+  for (std::size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<std::uint8_t>((i * 7 + 3) % 251);
+  }
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (const std::size_t blocks : {std::size_t{1}, max_blocks}) {
+      for (const bool step : {false, true}) {
+        for (std::size_t n = 1; n <= max_inputs; ++n) {
+          CAPTURE(blocks);
+          CAPTURE(step);
+          CAPTURE(n);
+          const std::uint8_t* inputs[max_inputs];
+          for (std::size_t i = 0; i < n; ++i) {
+            inputs[i] = data.data() + i * blocks * block_len;
+          }
+          std::vector<std::uint8_t> expected(n * out_len);
+          scalar::ops.hash_many(inputs, n, blocks, iv.data(), 7, step,
+                                flag_parent, 0, 0, expected.data());
+          std::vector<std::uint8_t> out(n * out_len, 0xee);
+          ops->hash_many(inputs, n, blocks, iv.data(), 7, step, flag_parent,
+                         0, 0, out.data());
+          CHECK(out == expected);
+        }
+      }
+    }
+  }
+}
+
 // Every variant's hash_many against the scalar oracle, on an input count
 // that exercises both the full-batch path and the serial remainder.
 TEST_CASE("hash_many agrees across all available arches") {
@@ -213,74 +255,6 @@ TEST_CASE("hash_many matches a per-input compress loop") {
     }
     CHECK(std::memcmp(out + i * out_len, expected, out_len) == 0);
   }
-}
-
-TEST_CASE("transpose16 dial: set/get roundtrip, all strategies correct") {
-  const auto saved = blake3pp::active_transpose16();
-  for (const auto strat :
-       {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
-        blake3pp::transpose16::quartered}) {
-    blake3pp::set_transpose16(strat);
-    CHECK(blake3pp::active_transpose16() == strat);
-    // Real coverage only where a width-16 kernel runs (AVX-512 CPUs or
-    // Intel SDE on x86; SVE-512 under qemu): every strategy must
-    // reproduce the scalar reference byte-for-byte.
-    std::optional<blake3pp::arch> w16;
-    for (const auto a : blake3pp::available_arches()) {
-      if (blake3pp::detail::resolve(a)->simd_degree == 16) {
-        w16 = a;
-        break;
-      }
-    }
-    if (w16.has_value()) {
-      std::vector<std::byte> input(31745);  // spec pattern, odd length
-      for (std::size_t i = 0; i < input.size(); ++i) {
-        input[i] = static_cast<std::byte>(i % 251);
-      }
-      blake3pp::hasher h{*w16};
-      h.update(input);
-      blake3pp::hasher ref{blake3pp::arch::scalar};
-      ref.update(input);
-      CHECK(h.finalize() == ref.finalize());
-      // XOF path exercises store_transposed through the same dial.
-      std::vector<std::byte> wide(64 * 64 + 32);
-      std::vector<std::byte> wide_ref(wide.size());
-      h.finalize_xof().fill(wide);
-      ref.finalize_xof().fill(wide_ref);
-      CHECK(wide == wide_ref);
-    }
-  }
-  // String round-trip: the persistence contract for tune-once-ever.
-  for (const auto strat :
-       {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
-        blake3pp::transpose16::quartered}) {
-    CHECK(blake3pp::transpose16_from_string(blake3pp::to_string(strat)) ==
-          strat);
-  }
-  CHECK(blake3pp::transpose16_from_string("bogus") == std::nullopt);
-  blake3pp::set_transpose16(saved);
-  // The tuner applies and reports a strategy, falling back to a no-op
-  // without a width-16 kernel. Either way its result must be the active
-  // one afterwards.
-  //
-  // The input is tiny on purpose. The postcondition is what is under test,
-  // and the no-argument overload would race a 128 MiB working set on every
-  // AVX-512 machine in the matrix to prove the same thing.
-  const auto picked = blake3pp::tune_transpose16(64u << 10);
-  CHECK(blake3pp::active_transpose16() == picked);
-  blake3pp::set_transpose16(saved);
-
-  // Two tuners at once serialize. Each returns a strategy, and the one
-  // in effect afterwards is the winner of whichever finished last.
-  blake3pp::transpose16 a{};
-  blake3pp::transpose16 b{};
-  std::thread ta([&] { a = blake3pp::tune_transpose16(64u << 10); });
-  std::thread tb([&] { b = blake3pp::tune_transpose16(64u << 10); });
-  ta.join();
-  tb.join();
-  const auto after = blake3pp::active_transpose16();
-  CHECK((after == a || after == b));
-  blake3pp::set_transpose16(saved);
 }
 
 }  // TEST_SUITE

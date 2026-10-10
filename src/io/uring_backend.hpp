@@ -6,6 +6,10 @@
 // this class: O_DIRECT refused by the filesystem -> buffered io_uring;
 // io_uring refused (seccomp, old kernel) -> synchronous pread. Internal
 // to src/io/, never installed.
+//
+// Registered buffers (IORING_REGISTER_BUFFERS + IORING_OP_READ_FIXED)
+// are not used: they measured 28-38% slower than plain reads in every
+// round of a four-round alternating run on Linux 6.8 over virtio-scsi.
 
 #if defined(__linux__)
 
@@ -64,13 +68,9 @@ inline int sys_io_uring_enter(int ring_fd, unsigned to_submit,
 }
 
 // Names the reason the ring is absent, for the fallback backend name the
-// tools print. Without it, "blocked by policy" (Android's seccomp filter,
-// EPERM) and "kernel too old" (ENOSYS) are indistinguishable in bench
+// tools print: "blocked by policy" (Android's seccomp filter, EPERM) and
+// "kernel too old" (ENOSYS) are otherwise indistinguishable in bench
 // output.
-//
-// That would be a fourth kind of quiet degradation the backend line does
-// not otherwise confess to, in the same spirit as --version's "cpu also
-// supports X (not compiled in)".
 inline std::string no_uring_suffix(int err) {
   switch (err) {
     case EPERM:
@@ -370,7 +370,7 @@ struct uring {
   }
 
   // Queues one READ or WRITE and submits immediately: the writer engine's
-  // one-at-a-time shape, unchanged.
+  // one-at-a-time shape.
   void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
                  unsigned len, std::uint64_t off, std::uint64_t user_data,
                  bool offload = false) {
@@ -672,9 +672,6 @@ class uring_context {
   // tools print it, so the spellings, their order and the suffixes are
   // observable API.
   [[nodiscard]] std::string name_for(bool direct, bool write) const {
-    // The degradation strings are observable API -- tools print them and
-    // a run is read differently depending on which rung it names -- so
-    // the write side keeps the spellings the writer used before.
     const char* const sync_name = write ? "pwrite" : "pread";
     std::string n = use_uring_
                         ? (direct ? "io_uring+direct" : "io_uring")

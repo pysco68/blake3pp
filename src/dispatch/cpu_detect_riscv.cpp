@@ -395,9 +395,9 @@ bool platform_run_trap_probes() noexcept {
       if (vlenb == 0) {
         up.xthead = true;  // no vlenb CSR at all: draft 0.7.1
       } else {
-        // A readable vlenb does not settle the dialect after all: the
-        // C906 under its 5.10 vendor kernel (LicheeRV Nano, 2026-09-08)
-        // reads it fine and speaks 0.7.1. The vtype layout does settle it.
+        // A readable vlenb does not settle the dialect: the C906 under
+        // its 5.10 vendor kernel (LicheeRV Nano) reads it fine and speaks
+        // 0.7.1. The vtype layout does settle it.
         const unsigned long lanes = guarded_vsetvli_lanes(vlenb);
         if (lanes == vlenb / 2) {
           up.rvv = true;

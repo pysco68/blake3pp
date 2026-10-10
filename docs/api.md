@@ -132,6 +132,16 @@ h.reset();                                  // reuse the instance
 the hasher's state, so a long stream can be checkpointed without giving
 up the hasher. How the input is chunked never changes the result.
 
+A caller that knows it is passing the last bytes says so with
+`update_last()` instead, after which only the finalize family may be
+called. BLAKE3 marks one node of the tree as the root, and which node that
+is depends on the message: the single chunk of a short message, or the top
+parent of anything longer. `update()` therefore has to keep the final
+chunk out of the wide batches in case the message ends there; told that it
+does end, that chunk goes through the batch with its neighbours, which is
+worth about 1.4x on messages of a few chunks. The one-shot `hash()`,
+`keyed_hash()` and `derive_key()` take this route already.
+
 ### From memory, or from a file
 
 Files are a first-class input, not a read loop the caller writes. The
@@ -326,46 +336,6 @@ std::cout << std::format("blake3pp {} (simd: {}, execution: {})\n",
 // e.g. "blake3pp 0.1.0 (simd: std::simd, execution: stdexec)"
 ```
 
-#### One dial that is not predictable
-
-On machines with a width-16 kernel (AVX-512; SVE-512 on ARM; RVV at
-VLEN=512) the 16-lane message transpose has three implementation
-strategies, and which is fastest cannot be read off the CPU. It depends
-on whether the vector datapath is full-width or double-pumped, which no
-CPUID bit reports, and on the same machine it depends on whether the
-input fits in cache. Measured, across all AVX-512 parts so far:
-
-| machine | input | fastest | margin |
-|---------|-------|---------|--------|
-| Skylake-SP, Strix Point | streaming | `quartered` | 13-17% |
-| Ryzen AI Max 395 | 8 MiB (in cache) | `quartered` | 18% over `staging` |
-| Ryzen AI Max 395 | 512 MiB (streaming) | `staging` | 8% over `quartered` |
-
-Two AMD parts with identical feature flags, opposite rankings. The whole
-spread is about 10%, so the default is never a disaster, but there is no
-setting that is right everywhere. Pick your cost:
-
-```cpp
-// 1. Do nothing. The default (quartered) won on most parts measured.
-
-// 2. Tune at startup for the size you actually hash; the answer depends
-//    on it. One streaming pass per strategy; allocates that buffer.
-blake3pp::transpose16 best = blake3pp::tune_transpose16(512u << 20);
-
-// 3. Tune once ever: persist the name, restore it on later starts.
-save(std::string{blake3pp::to_string(best)});
-blake3pp::set_transpose16(
-    blake3pp::transpose16_from_string(load()).value_or(
-        blake3pp::transpose16::quartered));
-```
-
-If you need to live at the edge, trust none of that and measure your own
-workload. `blake3pp_bench` times all three (`t16-*` rows), and
-`blake3pp_bench --t16-sweep` ranks them across input sizes so you can see
-where your workload sits; then pin the winner with `set_transpose16()`.
-The tuner samples one size on an otherwise idle machine, which is not the
-same thing as your program under load.
-
 ## What it costs you
 
 ### Allocation
@@ -399,19 +369,20 @@ static_assert(budget.bytes <= CONFIG_MAIN_STACK_SIZE / 4);   // e.g. on Zephyr
 ```
 
 The budget covers that table and nothing else. Each part is reduced on
-the agent that took it, by a recursion that holds one chaining-value
-buffer per level: 2 KiB per level while the build contains a 16-wide
-kernel, since the buffer is sized for the widest variant compiled rather
-than the one that runs, and as many levels as halving the part takes to
-reach twice the running variant's degree in chunks.
+the agent that took it, by a sweep that stages a group of chunk batches
+and then compresses their parents: two staging buffers and a small
+chaining-value stack, 12.5 KiB while the build contains a 16-wide kernel,
+since the buffers are sized for the widest variant compiled rather than
+the one that runs. That frame does not grow with the part, so an agent's
+stack does not depend on the input size.
 
-#### What turning it down actually does
+#### What turning it down does
 
-**It moves stack, it does not save it.** A smaller budget shrinks the
-table on the calling thread and enlarges the frame on every agent,
-because the parts get bigger and that recursion goes deeper. The total
-across the program does not fall; it relocates from one thread to
-several.
+**It shrinks the table, and nothing else.** A smaller budget means fewer,
+larger parts, and the sweep that reduces a part has the same frame
+whatever the part's size, so the agents' stacks stay where they are. What
+changes is the calling thread's table and how many parts there are to
+balance across agents.
 
 **Nothing catches an undersized thread.** The checks on `stack_budget`
 are `consteval` and reject a malformed budget — not a multiple of 32
@@ -426,10 +397,12 @@ counter, so parts are also the unit of load balancing. A budget that
 yields fewer parts than the scheduler has agents leaves agents with
 nothing to take, and the slowest part sets the finish time.
 
-If the depth is the problem, `BLAKE3PP_SUBTREE_FOLD=<levels>` removes
-that term altogether at 32 bytes per level, which makes an agent's stack
-independent of the input size. The measured frames, the formulas and a
-worked Zephyr case are in
+If the agents' frames are the problem, two build settings cut them:
+`BLAKE3PP_SUBTREE_GROUP=1` stages one chunk batch per burst instead of
+eight, and `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
+single-leaf fold at 32 bytes per level. Both cost throughput, and
+`BLAKE3PP_MAX_SIMD_DEGREE` scales every figure with the widest kernel the
+build carries. The measured frames and a worked Zephyr case are in
 [Freestanding and RTOS builds](freestanding.md#stack-requirements).
 
 `keyed_hash`, `derive_key`, `update_file` and `hash_file` take the same

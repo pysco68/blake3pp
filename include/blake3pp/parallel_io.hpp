@@ -149,14 +149,11 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void update_file(hasher& h, const std::filesystem::path& path,
                  Scheduler&& sched, const file_io_options& opts = {}) {
-  // Every file goes through the pipeline. A hasher already part-way
-  // through a message is brought back onto a window boundary by one
-  // short first window rather than by hashing the whole file
-  // sequentially, so there is no second path left to choose. The plan
-  // is made once here and is the only geometry the driver, the file and
-  // the scope see; its direct_io is the caller's wish only where the
-  // grid is aligned, since an unaligned head misaligns every window
-  // after it and would degrade each read to the synchronous path.
+  // The plan is made once here and is the only geometry the driver, the
+  // file and the scope see. Its direct_io is the caller's wish only where
+  // the grid is aligned: an unaligned head misaligns every window after
+  // it and would send each read to the synchronous rung.
+  //
   // The size is read before the open because the plan decides the open
   // mode and sizes the window objects to the file; a size the filesystem
   // cannot give leaves the count to the budget, and the open reports why.

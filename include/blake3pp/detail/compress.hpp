@@ -4,12 +4,10 @@
 // callers spend on a part table, how an input is cut into parts, and one
 // window's compress stage as a sender.
 //
-// They live below <blake3pp/parallel.hpp> rather than inside it because
-// the file pipeline needs them and the parallel API needs the file
-// pipeline. Keeping them here is what makes that a line rather than a
-// cycle; the public names they define (stack_budget and its default) are
-// unchanged, and <blake3pp/parallel.hpp> is still the header that
-// supplies them.
+// They live below <blake3pp/parallel.hpp> because the file pipeline
+// needs them and the parallel API needs the file pipeline; the public
+// names defined here (stack_budget and its default) are supplied to
+// users by <blake3pp/parallel.hpp>.
 //
 // Internal to the library. Names an execution provider.
 
@@ -22,6 +20,7 @@
 #include <cstdint>
 #include <span>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <sched.h>  // sched_getcpu() for agent_record::cpu
@@ -68,6 +67,11 @@ void stack_budget_below_two_parts();
 /// from the caller to the agents rather than saving any. Nothing checks an
 /// agent thread's stack at run time.
 ///
+/// @note A full window's grouped reduction keeps a second table of
+/// parts() x simd_degree chaining values, 512 KiB at most for the default
+/// budget on a 16-lane kernel; it lives on the heap with the window that
+/// owns it, allocated when the window first needs it and kept.
+///
 /// @see docs/api.md for what the knob trades away, and
 /// docs/freestanding.md for the measured frames and a worked case.
 struct stack_budget {
@@ -102,14 +106,6 @@ namespace detail {
 // tasks.
 inline constexpr std::size_t min_part_chunks = 16;
 
-// The same floor for a window of the file pipeline, where the trade is a
-// different one: a window is absorbed as one subtree, so fewer and larger
-// parts shrink the fold and the bulk's shape, while lengthening the
-// straggler tail that the window's join waits for. The engine cannot ask
-// a generic scheduler how many agents it has, so the floor is the only
-// lever on that balance.
-inline constexpr std::size_t window_min_part_chunks = min_part_chunks;
-
 // The part size in chunks for num_chunks: a power of two, so every part
 // starting at a multiple of it is subtree-aligned, and large enough that
 // num_chunks / part <= Budget.parts().
@@ -119,11 +115,23 @@ template <stack_budget Budget>
       (num_chunks + Budget.parts() - 1) / Budget.parts(), min_part_chunks));
 }
 
-// One CV slot per part, on the caller's stack. The slots are unpadded:
-// each is written once per part-sized task, so neighbours sharing a cache
-// line cost nothing measurable.
+// One CV slot per part. The slots are unpadded: each is written once per
+// part-sized task, so neighbours sharing a cache line cost nothing
+// measurable.
 template <stack_budget Budget>
 using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
+
+// A full window's parts are reduced in groups of this many, by the agent
+// that finishes a group's last part, before the fold after the bulk sees
+// anything. A part reduced on its own ends in log2(part) parent
+// generations below full lane occupancy, a measured 15% of a 16-chunk
+// part's time on AVX2 and 22% on AVX-512; folded 16 parts at a time the
+// generations stay lane-filling down to the last log2(degree), 4% and 8%.
+// The reduction has to happen inside the bulk: moved whole into the fold
+// behind it, which one agent runs, it is a sixteenth of the window's
+// blocks on one thread, and from eight agents up that costs more wall
+// time than the parts saved.
+inline constexpr std::size_t fold_group_parts = 16;
 static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
 
 // What one bulk over a window's parts records when tracing: the agents' summed
@@ -140,8 +148,8 @@ struct part_trace {
 };
 
 // The schedule-and-bulk sender that runs body(i) for every i in [0, n).
-// The file pipeline starts one per window
-// and lets the driver loop carry on.
+// The file pipeline starts one per window and lets the driver loop
+// carry on.
 //
 // The bulk shape only provides the agents: each call pulls indices from
 // `next` until none are left, so the split follows each agent's actual
@@ -149,14 +157,13 @@ struct part_trace {
 // Every index runs exactly once however the implementation distributes
 // the calls.
 //
-// `body` and `next` are the caller's and must outlive the sender --
-// the pipeline keeps them in the window
-// object.
+// `body` and `next` are the caller's and must outlive the sender; the
+// pipeline keeps them in the window object.
 //
-// Traced is a template parameter and not a null check inside the body
-// for two reasons: the untraced body is the hot one and stays exactly as
-// it was, and a pipeline that connects one sender per window needs the
-// type settled before the run starts.
+// Traced is a template parameter and not a null check inside the body:
+// the untraced body is the hot one and carries no branch, and a pipeline
+// that connects one sender per window needs the type settled before the
+// run starts.
 //
 // The traced body reads the clock once before its first part and, when
 // agent records are wanted, once after every part (the end of one is the
@@ -267,14 +274,6 @@ namespace detail {
 
 // The part size of a full window: the same arithmetic wherever a window
 // is compressed, so a window folds identically whichever path ran it.
-// A result at or above num_chunks means the window is too small to fan
-// out at all.
-template <stack_budget Budget>
-[[nodiscard]] constexpr std::size_t window_part_chunks(
-    std::size_t num_chunks) noexcept {
-  return std::max(part_chunks<Budget>(num_chunks), window_min_part_chunks);
-}
-
 // One window's compress stage, and everything it touches.
 //
 // A window's compress stage keeps the part table and the pull counter in its
@@ -297,10 +296,26 @@ struct window_compress {
   std::array<std::uint32_t, 8> key{};
   std::uint32_t flags = 0;
 
-  part_cvs<Budget> cvs;               // one CV per part
+  // One CV per part on the edge path, one per group on the grouped one;
+  // what the fold after the bulk reads.
+  part_cvs<Budget> cvs;
   std::atomic<std::size_t> next{0};   // the agents pull their parts from here
   std::array<std::uint32_t, 8> cv{};  // where the fold leaves the window's CV
   part_trace pt{nullptr, 0, 0};
+
+  // The grouped reduction of a full window (fold_group_parts). Each part
+  // leaves its `width` chaining values in lanes, at i * width; the agent
+  // whose part completes a group folds that group's slots into cvs[g].
+  // lanes holds n_parts * width CVs, grown on the first window that
+  // needs the size and kept, 512 KiB at most for the default budget on
+  // a 16-lane kernel; the rest of the window's state is fixed-size.
+  bool grouped = false;
+  std::size_t group = 0;  // parts per group
+  std::size_t width = 0;  // CVs per part: the kernel's simd_degree
+  std::vector<std::array<std::uint32_t, 8>> lanes;
+  std::array<std::atomic<std::uint32_t>,
+             std::max<std::size_t>(1, Budget.parts() / fold_group_parts)>
+      done;
 
   window_compress() = default;
   window_compress(const window_compress&) = delete;
@@ -314,24 +329,20 @@ struct window_compress {
                              std::span<const std::uint32_t, 8> k,
                              std::uint32_t f, trace_buffer* buf,
                              std::uint64_t window_id) noexcept {
-    const std::size_t p = window_part_chunks<Budget>(chunks);
+    const std::size_t p = part_chunks<Budget>(chunks);
     if (p >= chunks) {
       return false;
     }
-    ops = o;
-    data = d;
-    chunk_counter = counter;
-    num_chunks = chunks;
-    part = p;
-    n_parts = chunks / p;
-    std::ranges::copy(k, key.begin());
-    flags = f;
-    next.store(0, std::memory_order_relaxed);
-    pt.buf = buf;
-    pt.window = window_id;
-    pt.part_chunks = static_cast<std::uint32_t>(p);
-    pt.busy_ns.store(0, std::memory_order_relaxed);
-    pt.active.store(0, std::memory_order_relaxed);
+    set_window(o, d, counter, p, chunks / p, k, f, buf, window_id);
+    grouped = true;
+    group = std::min(fold_group_parts, n_parts);
+    width = simd_degree(o);
+    if (lanes.size() < n_parts * width) {
+      lanes.resize(n_parts * width);
+    }
+    for (auto& count : done) {
+      count.store(0, std::memory_order_relaxed);
+    }
     return true;
   }
 
@@ -344,6 +355,15 @@ struct window_compress {
                     std::span<const std::uint32_t, 8> k, std::uint32_t f,
                     trace_buffer* buf, std::uint64_t window_id) noexcept {
     assert(parts <= Budget.parts());
+    set_window(o, d, counter, part_chunks, parts, k, f, buf, window_id);
+    grouped = false;
+  }
+
+  void set_window(const kern::kernel_ops* o, const std::byte* d,
+                  std::uint64_t counter, std::size_t part_chunks,
+                  std::size_t parts, std::span<const std::uint32_t, 8> k,
+                  std::uint32_t f, trace_buffer* buf,
+                  std::uint64_t window_id) noexcept {
     ops = o;
     data = d;
     chunk_counter = counter;
@@ -360,9 +380,33 @@ struct window_compress {
     pt.active.store(0, std::memory_order_relaxed);
   }
 
+  // How many CVs the fold after the bulk reduces.
+  [[nodiscard]] std::size_t fold_inputs() const noexcept {
+    return grouped ? n_parts / group : n_parts;
+  }
+
   void operator()(std::size_t i) noexcept {
-    compress_subtree_cv(ops, data + i * part * chunk_size, part,
-                        chunk_counter + i * part, key, flags, cvs[i]);
+    const std::byte* d = data + i * part * chunk_size;
+    const std::uint64_t counter = chunk_counter + i * part;
+    if (!grouped) {
+      compress_subtree_cv(ops, d, part, counter, key, flags, cvs[i]);
+      return;
+    }
+    // A part is at least min_part_chunks chunks, never fewer than the
+    // kernel's lanes, so every part leaves exactly `width` CVs and the
+    // group's slots are contiguous.
+    [[maybe_unused]] const std::size_t n = compress_subtree_cvs(
+        ops, d, part, counter, key, flags,
+        std::span{lanes}.subspan(i * width, width));
+    assert(n == width);
+    // The count's release pairs with the completing agent's acquire, so
+    // the group's slots are visible to whoever folds them. The fold is
+    // charged to that agent's part in the trace.
+    const std::size_t g = i / group;
+    if (done[g].fetch_add(1, std::memory_order_acq_rel) + 1 == group) {
+      fold_sibling_cvs(ops, std::span{lanes}.subspan(g * group * width, group * width),
+                       key, flags, cvs[g]);
+    }
   }
 };
 
@@ -370,7 +414,7 @@ struct window_compress {
 // parts, then the fold that turns their CVs into the window's own. Value:
 // the window CV.
 //
-// Where this runs, which is the whole point of it being a sender:
+// Where this runs, which is why it is a sender:
 //
 // The file pipeline starts this sender from inside the read's
 // completion, which is on its driver thread, inside poll(). Starting it
@@ -402,12 +446,17 @@ template <bool Traced, stack_budget Budget, class Scheduler,
            // the stop check behind this stage rather than branched
            // around here, on the path every window takes.
            //
-           // Every part pairs with a sibling all the way up: the window
-           // is a power-of-two number of chunks and part is a power of
-           // two, so n_parts is one too.
-           assert(std::has_single_bit(w.n_parts));
-           fold_sibling_cvs(w.ops, std::span{w.cvs}.first(w.n_parts), w.key,
-                            w.flags, w.cv);
+           // Every group pairs with a sibling all the way up: the window
+           // is a power-of-two number of chunks and part and group are
+           // powers of two, so the group count is one too.
+           const std::size_t n = w.fold_inputs();
+           assert(std::has_single_bit(n));
+           if (n == 1) {
+             w.cv = w.cvs[0];
+           } else {
+             fold_sibling_cvs(w.ops, std::span{w.cvs}.first(n), w.key,
+                              w.flags, w.cv);
+           }
            return w.cv;
          });
 }

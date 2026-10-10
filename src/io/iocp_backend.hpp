@@ -495,9 +495,9 @@ class iocp_context {
  private:
   static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
 
-  // The degradation strings are observable API -- tools print them and a
-  // run is read differently depending on which rung it names -- so the
-  // write side keeps the spellings the writer used before.
+  // The degradation strings are observable API: tools print them and a
+  // run is read differently depending on which rung it names, so the
+  // spellings and suffixes are fixed.
   [[nodiscard]] std::string name_for(bool direct, bool use_iocp,
                                      bool write) const {
     const char* const sync_name = write ? "writefile" : "readfile";

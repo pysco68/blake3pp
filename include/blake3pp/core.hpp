@@ -73,8 +73,8 @@ struct digest {
   std::array<std::byte, digest_size> bytes;
 
   /// Constant-time equality (matching the Rust reference): the safe
-  /// default for a value that is compared in security-sensitive contexts,
-  /// at a cost that is irrelevant.
+  /// default for a value compared in security-sensitive contexts, at
+  /// negligible cost.
   friend bool operator==(const digest& lhs, const digest& rhs) noexcept;
 
   /// Returns the digest as 64 lowercase hex characters.
@@ -227,6 +227,24 @@ class hasher {
   /// @param input  The bytes of the string, not including any terminator.
   void update(std::string_view input) noexcept;
 
+  /// Absorbs the rest of the message: the caller states that nothing
+  /// follows these bytes.
+  ///
+  /// update() has to hold the message's final chunk back, because the node
+  /// that carries BLAKE3's ROOT flag is the final chunk for a one-chunk
+  /// message and the top parent for any longer one, and only the caller
+  /// knows which it will be. Told that the message ends here, the final
+  /// chunk joins a wide batch instead of being compressed a block at a
+  /// time, which is worth about 1.7x on messages of a few chunks.
+  ///
+  /// Only the finalize family may be called afterwards; a further update()
+  /// would contradict the statement this call makes (checked by assert()).
+  /// @param input  Any length, including zero.
+  void update_last(std::span<const std::byte> input) noexcept;
+  /// Absorbs the rest of the message, given as text (see update_last()).
+  /// @param input  The bytes of the string, not including any terminator.
+  void update_last(std::string_view input) noexcept;
+
   /// The digest of everything absorbed so far; the hasher stays usable.
   [[nodiscard]] digest finalize() const noexcept;
 
@@ -309,6 +327,12 @@ class hasher {
   detail::chunk_state chunk_;
   std::array<std::array<std::uint32_t, 8>, 54> cv_stack_;
   std::uint8_t cv_stack_len_;
+  // update_last() leaves the message's rightmost subtree here instead of
+  // on the stack: it is the right child of the root parent, the node the
+  // ROOT flag belongs to. While it is held, the chunk state is spent and
+  // finalization starts from this CV rather than from an open chunk.
+  bool right_held_;
+  std::array<std::uint32_t, 8> right_cv_;
 };
 
 /// One-shot hash of a byte sequence on the best available variant.
@@ -351,6 +375,23 @@ void compress_subtree_cv(const kern::kernel_ops* ops, const std::byte* data,
                          std::span<const std::uint32_t, 8> key,
                          std::uint32_t base_flags,
                          std::span<std::uint32_t, 8> out_cv) noexcept;
+
+// The same reduction stopped at its last lane-filling generation: writes
+// min(num_chunks, simd_degree(ops)) chaining values of equal-sized
+// adjacent subtrees to out_cvs, left to right, and returns the count. The
+// caller folds them with other parts' so the remaining generations run
+// lanes-wide too. Same contract as compress_subtree_cv otherwise.
+// @pre out_cvs.size() >= simd_degree(ops).
+std::size_t compress_subtree_cvs(const kern::kernel_ops* ops,
+                                 const std::byte* data, std::size_t num_chunks,
+                                 std::uint64_t chunk_counter,
+                                 std::span<const std::uint32_t, 8> key,
+                                 std::uint32_t base_flags,
+                                 std::span<std::array<std::uint32_t, 8>> out_cvs) noexcept;
+
+// How many inputs the table hashes per lane-filling hash_many step: 1 for
+// the scalar kernel, the SIMD width otherwise.
+[[nodiscard]] std::size_t simd_degree(const kern::kernel_ops* ops) noexcept;
 
 // Reduces cvs.size() chaining values of equal-sized, adjacent subtrees
 // (left to right) to the CV of their common ancestor, one generation at a

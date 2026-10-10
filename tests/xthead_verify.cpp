@@ -38,10 +38,6 @@
 namespace kern = blake3pp::kern;
 
 namespace blake3pp::kern {
-// Normally defined in dispatch.cpp, which this harness does not link,
-// because that would drag in hosted-libc surface. The scalar kernel reads
-// it once per batch, and any valid value works for width 1.
-std::atomic<transpose16_mode> transpose16_active{transpose16_mode::staging};
 namespace xthead {
 extern const kernel_ops ops;
 }

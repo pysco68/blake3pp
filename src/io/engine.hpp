@@ -208,10 +208,10 @@ class polled_reader_engine {
   std::exception_ptr submit_failed_;
   std::vector<slot_state> slots_;
 
-  // Declaration order is the teardown contract, one link longer than the
-  // old engine's: the file closes first, then the context drains every
-  // read still owed (running no callback), and only then is the pool it
-  // was reading into freed. Do not reorder these three members.
+  // Declaration order is the teardown contract: the file closes first,
+  // then the context drains every read still owed (running no callback),
+  // and only then is the pool it was reading into freed. Do not reorder
+  // these three members.
   aligned_buffer pool_;
   C ctx_;
   typename C::file file_;
@@ -220,12 +220,12 @@ class polled_reader_engine {
 // The write-side slot engine, the reader's inverse, over the same
 // io_context: the producer fills buffers ahead of the device, and
 // acquire() blocking on a slot whose write is still in flight is the
-// entire backpressure story.
+// backpressure.
 //
 // Every submit queues; the context decides how the bytes travel, and a
 // length the platform cannot take asynchronously rides the backend's
 // deferred list and lands inside poll(), exactly as such a read does.
-// Hence the timing both paths now share:
+// Hence the timing both paths share:
 //
 //   submit() ACCEPTS bytes. finish() LANDS them.
 //   Errors surface from acquire() or finish(), never from submit().
@@ -254,7 +254,7 @@ class polled_writer_engine {
     return file_.name();
   }
 
-  // Round-robin, as before: the next slot in order, waited out.
+  // Round-robin: the next slot in order, waited out.
   buffer acquire() {
     const unsigned s = next_slot_;
     wait_slot(s);

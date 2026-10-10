@@ -106,6 +106,25 @@ blake3pp_kernel_switch(VROR_ROTATE 1
 blake3pp_kernel_switch(SHUFFLE_TREE 1
   "transposes and byte rotates through the constexpr shuffle networks instead of the scalar staging gather")
 
+# The eight-lane transpose escape: GCC with a raw vector-extension register
+# and AVX-512 available takes the staging gather there, because it lowers
+# the network's cross-lane stage to an index-register permute per stage.
+# Off restores the network for the A/B. See src/kernel/transpose.hpp.
+blake3pp_kernel_switch(VEXT_W8_GATHER 1
+  "GCC with a vector-extension register at eight lanes and AVX-512 available transposes through the staging gather, not the shuffle network")
+
+# At full AVX-512 width the state occupies half the register file and the
+# message cannot fit beside it: letting its address escape once keeps it in
+# memory operands instead. Off holds it in registers again, for the A/B.
+# See all_rounds in src/kernel/kernel.cpp.
+blake3pp_kernel_switch(PIN_MESSAGE 1
+  "AVX-512 width reads the message through memory operands instead of holding it in registers")
+
+# x86 clang: spell rot16 as the generic shift-or, which LLVM canonicalises to
+# one pshufb, where every other compiler gets that instruction from the
+# explicit byte shuffle (which LLVM lowers to pshuflw+pshufhw instead). Off
+# gives clang the byte shuffle like everyone else. See prefer_byte_rot in
+# src/kernel/rotate.hpp.
 blake3pp_kernel_switch(ROT16_PER_COMPILER 1
   "x86 clang: rot16 as the shift-or LLVM folds to one pshufb, not the byte shuffle it lowers to two")
 
@@ -140,6 +159,27 @@ target_compile_definitions(blake3pp_features
 # compressions for a working set that does not grow with the subtree's
 # depth, which costs 11% on sse42 and avx2 and nothing measurable on a
 # scalar kernel, where there are no lanes to leave idle.
+# How many chunk batches a subtree reduction hashes before it compresses
+# their parents (src/core/subtree.hpp). A kernel body at full width is
+# large enough that the chunk loop and the one-block parent call do not
+# stay hot together, so the burst is worth more than the locality it gives
+# up: on Zen 5 AVX-512, 6.7 GiB/s at one batch per burst, 7.6 at eight,
+# 7.8 at thirty-two, against 8.5 for the chunk batches alone. Eight is the
+# default; a power of two, since the groups merge through a binary
+# counter.
+set(BLAKE3PP_SUBTREE_GROUP "" CACHE STRING
+  "Chunk batches per parent burst in the subtree reduction [<power of two>]")
+if(BLAKE3PP_SUBTREE_GROUP)
+  if(NOT BLAKE3PP_SUBTREE_GROUP MATCHES "^[0-9]+$")
+    message(FATAL_ERROR
+      "BLAKE3PP_SUBTREE_GROUP must be a power of two, got '${BLAKE3PP_SUBTREE_GROUP}'")
+  endif()
+  target_compile_definitions(blake3pp_features
+    INTERFACE "BLAKE3PP_SUBTREE_GROUP=${BLAKE3PP_SUBTREE_GROUP}")
+  message(STATUS "blake3pp: BLAKE3PP_SUBTREE_GROUP=${BLAKE3PP_SUBTREE_GROUP} "
+    "(default is 8); non-default kernel tuning")
+endif()
+
 set(BLAKE3PP_SUBTREE_FOLD OFF CACHE STRING
   "Fold subtrees through a bounded CV stack instead of per-level buffers [OFF|ON|<levels>]")
 if(BLAKE3PP_SUBTREE_FOLD)

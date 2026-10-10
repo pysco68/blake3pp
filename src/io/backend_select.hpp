@@ -7,13 +7,12 @@
 // aliases, so a backend drifting from the contract fails loudly at this
 // seam, not somewhere inside the engine.
 //
-// The reader side names a whole engine rather than a backend, which is
-// what lets a platform bring its own: every one of them now runs
-// polled_reader_engine over a io_context, and the alias is the seam
-// where a future engine could differ again. The context is named
-// alongside it because detail::io_driver (the file pipeline's compiled
-// seam) drives one directly, without an engine over it. Internal to
-// src/io/, never installed.
+// The reader side names a whole engine, so a platform can bring its own.
+// Every platform runs polled_reader_engine over an io_context today, and
+// the alias is the seam where an engine could differ. The context is
+// named alongside it because detail::io_driver (the file pipeline's
+// compiled seam) drives one directly, without an engine over it.
+// Internal to src/io/, never installed.
 
 #include "io/engine.hpp"
 

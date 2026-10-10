@@ -1,15 +1,16 @@
-// The two subtree reductions must be computationally identical: the
-// recursion that holds a CV buffer per level, and the fold that walks groups
-// of 2*simd_degree chunks into a binary-counter stack (src/core/subtree.hpp).
-// Every compiled kernel runs both over every subtree size the engine can
-// hand them, since the group size follows the kernel's simd_degree and the
-// interesting sizes are the ones around it.
+// The three subtree reductions must be computationally identical: the
+// recursion that holds a CV buffer per level, the grouped sweep the library
+// uses by default, and the single-leaf fold a tight target opts into
+// (src/core/subtree.hpp). Every compiled kernel runs all three over every
+// subtree size the engine can hand them, since the group size follows the
+// kernel's simd_degree and the interesting sizes are the ones around it.
 //
 // The same file covers detail::fold_sibling_cvs, which takes the other way
 // in: the parallel engine hashes a window's parts separately, and the fold
 // joins their chaining values into the one the window would have had if a
 // single core had hashed it.
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -111,11 +112,26 @@ void check_fold(const blake3pp::kern::kernel_ops* ops, std::size_t part,
   CHECK(folded == whole);
 }
 
+// One part reduction at a chosen burst size, trimmed to the CV count the
+// recursion produced for the same stop.
+template <std::size_t Leaves>
+[[nodiscard]] std::vector<std::array<std::uint32_t, 8>> reduce_part(
+    const blake3pp::kern::kernel_ops& ops,
+    const std::vector<std::uint8_t>& data, std::size_t chunks,
+    std::size_t stop, std::span<const std::uint32_t, 8> key, std::size_t n) {
+  std::vector<std::array<std::uint32_t, 8>> cvs(64);
+  const std::size_t got = blake3pp::core::compress_subtree_to_cvs_grouped<Leaves>(
+      ops, data.data(), chunks, 3, key, 0, cvs, stop);
+  CHECK(got == n);
+  cvs.resize(got);
+  return cvs;
+}
+
 }  // namespace
 
 TEST_SUITE("subtree_fold") {
 
-TEST_CASE("the fold and the recursion agree on every kernel and size") {
+TEST_CASE("the three reductions agree on every kernel and size") {
   const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
   // available_arches(), not compiled_arches(): resolve() hands back a
   // fallback table for a variant this CPU cannot run, so iterating the
@@ -137,11 +153,127 @@ TEST_CASE("the fold and the recursion agree on every kernel and size") {
         CAPTURE(counter);
         std::array<std::uint32_t, 8> from_recursion{};
         std::array<std::uint32_t, 8> from_fold{};
+        std::array<std::uint32_t, 8> from_group{};
         blake3pp::core::compress_subtree_to_cv_recursive(
             *ops, data.data(), chunks, counter, key, 0, from_recursion);
         blake3pp::core::compress_subtree_to_cv_folded<>(
             *ops, data.data(), chunks, counter, key, 0, from_fold);
+        blake3pp::core::compress_subtree_to_cv_grouped<>(
+            *ops, data.data(), chunks, counter, key, 0, from_group);
         CHECK(from_fold == from_recursion);
+        CHECK(from_group == from_recursion);
+      }
+    }
+  }
+}
+
+// The burst size is a tuning parameter, so every value of it has to produce
+// the same tree: one leaf per group is the fold's shape, and a group wider
+// than the whole subtree is the degenerate single-group case.
+TEST_CASE("every group size reduces to the same CV") {
+  const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
+  for (const auto a : blake3pp::available_arches()) {
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (std::size_t chunks = 2; chunks <= 512; chunks *= 2) {
+      CAPTURE(chunks);
+      const auto data = pattern(chunks * blake3pp::chunk_size);
+      std::array<std::uint32_t, 8> expected{};
+      blake3pp::core::compress_subtree_to_cv_recursive(
+          *ops, data.data(), chunks, 7, key, 0, expected);
+      std::array<std::uint32_t, 8> g1{};
+      std::array<std::uint32_t, 8> g4{};
+      std::array<std::uint32_t, 8> g64{};
+      blake3pp::core::compress_subtree_to_cv_grouped<1>(
+          *ops, data.data(), chunks, 7, key, 0, g1);
+      blake3pp::core::compress_subtree_to_cv_grouped<4>(
+          *ops, data.data(), chunks, 7, key, 0, g4);
+      blake3pp::core::compress_subtree_to_cv_grouped<64>(
+          *ops, data.data(), chunks, 7, key, 0, g64);
+      CHECK(g1 == expected);
+      CHECK(g4 == expected);
+      CHECK(g64 == expected);
+    }
+  }
+}
+
+// The part-shaped reduction, which stops several CVs short of the root:
+// the sweep and the recursion have to agree CV for CV at every stop, since
+// the engine folds those CVs across parts afterwards and a different split
+// of the same tree would still hash to the same root while handing the fold
+// something else.
+TEST_CASE("the part reductions agree at every stop") {
+  const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
+  for (const auto a : blake3pp::available_arches()) {
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (std::size_t chunks = 1; chunks <= 2048; chunks *= 2) {
+      CAPTURE(chunks);
+      const auto data = pattern(chunks * blake3pp::chunk_size);
+      // Every stop the engine can ask for, from the whole subtree as one
+      // CV to one CV per chunk, which is what a part narrower than the
+      // kernel's lanes leaves.
+      for (std::size_t stop = 1; stop <= 64; stop *= 2) {
+        CAPTURE(stop);
+        // How many CVs a stop leaves is the reduction's own business (a
+        // stop past the last wide level gets that level), so the counts
+        // are compared with each other, not with a formula.
+        std::vector<std::array<std::uint32_t, 8>> recursive(64);
+        std::vector<std::array<std::uint32_t, 8>> grouped(64);
+        // The third shape is what a BLAKE3PP_SUBTREE_FOLD build selects:
+        // the sweep with one leaf per burst and the switch's level count
+        // as its stack bound. It has to agree too, since a part's CVs
+        // reach the same tree whichever build produced them.
+        std::vector<std::array<std::uint32_t, 8>> folded(64);
+        const std::size_t n_rec =
+            blake3pp::core::compress_subtree_to_cvs_recursive(
+                *ops, data.data(), chunks, 11, key, 0, recursive, stop);
+        const std::size_t n_grp =
+            blake3pp::core::compress_subtree_to_cvs_grouped<>(
+                *ops, data.data(), chunks, 11, key, 0, grouped, stop);
+        const std::size_t n_fold =
+            blake3pp::core::compress_subtree_to_cvs<12>(
+                *ops, data.data(), chunks, 11, key, 0, folded, stop);
+        REQUIRE(n_grp == n_rec);
+        REQUIRE(n_fold == n_rec);
+        CHECK(n_rec >= 1);
+        CHECK(n_rec <= std::min(chunks, stop));
+        recursive.resize(n_rec);
+        grouped.resize(n_grp);
+        folded.resize(n_fold);
+        CHECK(grouped == recursive);
+        CHECK(folded == recursive);
+      }
+    }
+  }
+}
+
+// The burst size is a tuning parameter here too, and a part's stop makes
+// the two cases of the sweep differ: a group wider than one output CV's
+// chunks emits several CVs at once, a narrower one sweeps per CV.
+TEST_CASE("every group size reduces a part the same way") {
+  const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
+  for (const auto a : blake3pp::available_arches()) {
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (std::size_t chunks = 2; chunks <= 1024; chunks *= 2) {
+      CAPTURE(chunks);
+      const auto data = pattern(chunks * blake3pp::chunk_size);
+      for (const std::size_t stop : {std::size_t{2}, std::size_t{16}}) {
+        CAPTURE(stop);
+        std::vector<std::array<std::uint32_t, 8>> expected(64);
+        const std::size_t n = blake3pp::core::compress_subtree_to_cvs_recursive(
+            *ops, data.data(), chunks, 3, key, 0, expected, stop);
+        expected.resize(n);
+        for (const auto& got : {reduce_part<1>(*ops, data, chunks, stop, key, n),
+                                reduce_part<4>(*ops, data, chunks, stop, key, n),
+                                reduce_part<64>(*ops, data, chunks, stop, key,
+                                                n)}) {
+          CHECK(got == expected);
+        }
       }
     }
   }

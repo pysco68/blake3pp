@@ -12,15 +12,21 @@
 // framework-free: pair it with hyperfine when process-level statistics are
 // wanted.
 //
+// Rows ending in _8k hash the same bytes as 8 KiB messages, one hasher
+// each, and fold the per-message digests. They exist per kernel and for
+// both implementations end-to-end (blake3pp_8k, reference_8k), which is
+// the short-message path by itself: eight chunks have no long run to
+// amortise a batch over. The Rust crate's harness in the talknotes
+// workspace prints the same row.
+//
 // The single-thread rows run INTERLEAVED instead of row-by-row: a pass is
 // one rep of every row, with the start row rotated per pass. Each row also
 // prints the CPUs it ran on.
 //
-// Both are scar tissue from one incident. On a heterogeneous phone, an
-// Exynos 2600, the row-by-row order let EAS upmigrate the run onto the
-// prime core over time. Whichever rows ran LAST won a core class, not a
-// comparison, which produced a 21% phantom that looked exactly like a
-// microarchitecture finding.
+// Both exist for heterogeneous machines. On a phone (an Exynos 2600),
+// row-by-row order lets EAS upmigrate the run onto the prime core over
+// time, so whichever rows run LAST win a core class, not a comparison:
+// a 21% phantom indistinguishable from a microarchitecture finding.
 //
 // Interleaving makes placement and thermal history symmetric across rows.
 // --pin removes the variable entirely. The per-row CPU report is how a
@@ -121,6 +127,17 @@ extern "C" void blake3_hash_many_avx512(
     std::size_t blocks, const std::uint32_t key[8], std::uint64_t counter,
     bool increment_counter, std::uint8_t flags, std::uint8_t flags_start,
     std::uint8_t flags_end, std::uint8_t* out);
+// The one extended-output kernel the reference ships as assembly -- in
+// its Unix and windows_gnu sources; the MASM sources MSVC assembles have
+// none, and the build says so (bench/CMakeLists.txt).
+#if !defined(BLAKE3PP_BENCH_NO_XOF_ASM)
+extern "C" void blake3_xof_many_avx512(const std::uint32_t cv[8],
+                                       const std::uint8_t block[64],
+                                       std::uint8_t block_len,
+                                       std::uint64_t counter,
+                                       std::uint8_t flags, std::uint8_t* out,
+                                       std::size_t outblocks);
+#endif
 #else
 extern "C" void blake3_hash_many_neon(
     const std::uint8_t* const* inputs, std::size_t num_inputs,
@@ -152,6 +169,23 @@ void asm_hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
 #endif
 }
 
+// The same for the reference's extended-output kernel: one wrapper, the
+// same widening of the flag arguments.
+template <auto ReferenceFn>
+void asm_xof_many(const std::uint32_t cv[8],
+                  const std::uint8_t block[blake3pp::kern::block_len],
+                  std::uint32_t len, std::uint64_t counter,
+                  std::uint32_t flags, std::uint8_t* out,
+                  std::size_t num_blocks) noexcept {
+  ReferenceFn(cv, block, static_cast<std::uint8_t>(len), counter,
+              static_cast<std::uint8_t>(flags), out, num_blocks);
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+  __msan_unpoison(out, num_blocks * blake3pp::kern::block_len);
+#endif
+#endif
+}
+
 // Everything that varies by host architecture, decided once: which wide
 // kernels exist, which blake3pp variant each pairs with, and how the rows
 // read. Narrowest first, so the widest AVAILABLE entry is the last match.
@@ -162,19 +196,25 @@ struct asm_kernel {
   const char* row;
   const char* note;
   decltype(blake3pp::kern::kernel_ops::hash_many) hash_many;
+  decltype(blake3pp::kern::kernel_ops::xof_many) xof_many;
 };
 
 #if defined(__x86_64__) || defined(_M_X64)
 constexpr asm_kernel asm_kernels[] = {
     {blake3pp::arch::avx2, "avx2", "hand-written asm",
-     &asm_hash_many<&blake3_hash_many_avx2>},
+     &asm_hash_many<&blake3_hash_many_avx2>, nullptr},
     {blake3pp::arch::avx512, "avx512", "hand-written asm",
-     &asm_hash_many<&blake3_hash_many_avx512>},
+     &asm_hash_many<&blake3_hash_many_avx512>,
+#if defined(BLAKE3PP_BENCH_NO_XOF_ASM)
+     nullptr},
+#else
+     &asm_xof_many<&blake3_xof_many_avx512>},
+#endif
 };
 #else
 constexpr asm_kernel asm_kernels[] = {
     {blake3pp::arch::neon, "neon", "hand-tuned intrinsics",
-     &asm_hash_many<&blake3_hash_many_neon>},
+     &asm_hash_many<&blake3_hash_many_neon>, nullptr},
 };
 #endif
 }  // namespace
@@ -197,101 +237,10 @@ bool stderr_is_tty() {
 #endif
 }
 
-// Why the t16 tuner can disagree with the table above, settled by
-// measurement rather than argument. tune_transpose16() races the three
-// strategies over a 16 KiB working set reused hundreds of times (L1
-// resident throughout), while the benchmark rows stream 512 MiB out of
-// DRAM. If the strategies rank differently in those two regimes, the tuner
-// is calibrated for the wrong one.
-//
-// This sweeps the SAME comparison across working-set sizes, and runs each
-// size in both strategy orders. A ranking that flips with size is a regime
-// mismatch. A ranking that flips with ORDER is thermal or frequency drift
-// contaminating the measurement instead.
-// The width-16 kernel this machine would dispatch to (avx512 on x86,
-// sve512/sve2_512 elsewhere), if any: the t16 dial rows and the sweep race
-// whichever it is.
-std::optional<blake3pp::arch> first_w16_arch() {
-  for (const auto a : blake3pp::available_arches()) {
-    if (blake3pp::detail::resolve(a)->simd_degree == 16) {
-      return a;
-    }
-  }
-  return std::nullopt;
-}
-
-void t16_sweep(int reps, double cooldown_s) {
-  const auto w16 = first_w16_arch();
-  if (!w16.has_value()) {
-    println(stdout, "t16 sweep needs a width-16 kernel; none available here");
-    return;
-  }
-  constexpr std::size_t work = 128u << 20;  // hashed bytes per timed rep
-  const std::size_t sizes[] = {16u << 10,  128u << 10, 1u << 20,
-                               8u << 20,   64u << 20,  512u << 20};
-  const blake3pp::transpose16 order[] = {blake3pp::transpose16::staging,
-                                         blake3pp::transpose16::tree,
-                                         blake3pp::transpose16::quartered};
-
-  std::vector<std::byte> buf(sizes[std::size(sizes) - 1]);
-  for (std::size_t i = 0; i < buf.size(); ++i) {
-    buf[i] = static_cast<std::byte>(i % 251);
-  }
-  const auto saved = blake3pp::active_transpose16();
-  b3tool::cooldown cooldown(cooldown_s);
-
-  println(stdout,
-          "t16 strategy vs working-set size ({}, {} MiB hashed per rep,\n"
-          "best of {}; 'rev' repeats the size with the strategy order "
-          "reversed)\n",
-          blake3pp::to_string(*w16), work >> 20, reps);
-  println(stdout, "  {:>10}  {:>10} {:>10} {:>10}   winner", "working set",
-          "staging", "tree", "quartered");
-
-  for (const std::size_t size : sizes) {
-    for (const bool reverse : {false, true}) {
-      const std::size_t iters = std::max<std::size_t>(1, work / size);
-      double best[3] = {0, 0, 0};
-      for (int k = 0; k < 3; ++k) {
-        const int idx = reverse ? 2 - k : k;
-        cooldown();
-        blake3pp::set_transpose16(order[idx]);
-        const double s = b3tool::best_seconds(reps, /*warmup=*/true, [&] {
-          for (std::size_t it = 0; it < iters; ++it) {
-            blake3pp::hasher h{*w16};
-            h.update(std::span<const std::byte>{buf.data(), size});
-            (void)h.finalize();
-          }
-        });
-        best[idx] = b3tool::gib_per_s(size * iters, s);
-      }
-      const int win = static_cast<int>(
-          std::max_element(best, best + 3) - best);
-      const std::string label =
-          size >= (1u << 20)
-              ? std::format("{} MiB", size >> 20)
-              : std::format("{} KiB", size >> 10);
-      println(stdout, "  {:>10}  {:10.2f} {:10.2f} {:10.2f}   {}{}", label,
-              best[0], best[1], best[2],
-              blake3pp::to_string(order[win]), reverse ? "  (rev)" : "");
-    }
-  }
-  blake3pp::set_transpose16(saved);
-  cooldown();
-  // This line once claimed "its own race uses a 16 KiB working set",
-  // which was only true of an old tuner revision. Print facts, not
-  // memories: the race sizes itself to the tuned-for bytes (capped).
-  println(stdout,
-          "\n  tune_transpose16() picks: {}   (raced at its default "
-          "{} MiB working set, interleaved best-of-3)",
-          blake3pp::to_string(blake3pp::tune_transpose16()),
-          blake3pp::default_tune_bytes >> 20);
-  blake3pp::set_transpose16(saved);
-}
-// The parallel engine's split before its agents pulled parts from a
-// counter, kept as the reference/static control row: at most 256
-// power-of-two parts in one bulk call, so a provider that hands out fixed
-// shares (stdexec's static_thread_pool does) joins on its slowest agent.
+// A static split, the control row for the engine's counter-pulled parts:
+// at most 256 power-of-two parts in one bulk call, so a provider that
+// hands out fixed shares (stdexec's static_thread_pool does) joins on its
+// slowest agent.
 template <class Scheduler>
 blake3pp::digest static_split_hash(std::span<const std::byte> input,
                                    Scheduler sched,
@@ -340,7 +289,6 @@ int main(int argc, char** argv) {
   double cooldown_s = 5.0;
   int pin_cpu = -1;
   unsigned pool_threads = b3tool::default_threads();
-  bool sweep_t16 = false;
   std::vector<blake3pp::arch> arches;
 
   CLI::App app{
@@ -363,10 +311,6 @@ int main(int argc, char** argv) {
                  "parallel-engine threads (1 = a one-thread pool; default: all)")
       ->check(b3tool::at_least_one_thread)
       ->capture_default_str();
-  app.add_flag("--t16-sweep", sweep_t16,
-               "diagnose the AVX-512 transpose tuner: rank the three "
-               "strategies across working-set sizes and strategy orders");
-
   app.add_option("arch", arches, "SIMD variants to measure")
       ->transform(b3tool::arch_transformer());
   CLI11_PARSE(app, argc, argv);
@@ -387,11 +331,6 @@ int main(int argc, char** argv) {
               pin_cpu);
       return b3tool::exit_usage;
     }
-  }
-
-  if (sweep_t16) {
-    t16_sweep(reps, cooldown_s);  // single-threaded throughout: --pin holds
-    return 0;
   }
 
   if (arches.empty()) {
@@ -423,6 +362,100 @@ int main(int argc, char** argv) {
     blake3pp::hasher h{ops};
     h.update(std::span<const std::byte>{input});
     return h.finalize();
+  };
+
+  // hash_many and nothing else: the whole input in batches of mul*degree
+  // complete chunks, no tree and no parents. The chaining values are
+  // XOR-folded, which every kernel must agree on; that fold is not a
+  // BLAKE3 digest of the input, it only has to match across these rows.
+  // parent_shape swaps the chunk workload (16 blocks per input, the
+  // counter stepping) for the parent one (a single block per input, no
+  // counter), which is the other call the tree makes.
+  const auto hash_batches = [&](const blake3pp::kern::kernel_ops* ops,
+                                std::size_t mul, bool parent_shape = false) {
+    const std::size_t per = mul * ops->simd_degree;
+    const std::size_t blocks =
+        parent_shape ? 1 : blake3pp::kern::chunk_len / blake3pp::kern::block_len;
+    const std::size_t stride = blocks * blake3pp::kern::block_len;
+    const std::size_t chunks = input.size() / stride;
+    const std::uint8_t* ptrs[2 * blake3pp::kern::max_simd_degree];
+    std::uint8_t cvs[2 * blake3pp::kern::max_simd_degree * blake3pp::kern::out_len];
+    const auto* p = blake3pp::kern::kernel_bytes(input.data());
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < chunks; at += per) {
+      const std::size_t n = std::min(per, chunks - at);
+      for (std::size_t i = 0; i < n; ++i) {
+        ptrs[i] = p + (at + i) * stride;
+      }
+      ops->hash_many(ptrs, n, blocks, blake3pp::kern::iv.data(),
+                     parent_shape ? 0 : at,
+                     /*increment_counter=*/!parent_shape,
+                     parent_shape ? blake3pp::kern::flag_parent : 0,
+                     parent_shape ? 0 : blake3pp::kern::flag_chunk_start,
+                     parent_shape ? 0 : blake3pp::kern::flag_chunk_end, cvs);
+      for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < blake3pp::kern::out_len; ++j) {
+          acc[j] ^= static_cast<std::byte>(cvs[i * blake3pp::kern::out_len + j]);
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
+  };
+
+  // Extended output: one root node's stream, filled through the kernel's
+  // xof_many in the batches the reader uses. Lanes map to output counters
+  // here, the mirror of hash_many, and the rate is bytes of OUTPUT. The
+  // digest folds the stream, so every kernel must agree on it.
+  //
+  // The stream goes to its own buffer, one reader-sized fill at a time, and
+  // the row produces as many bytes as the input has so the rate column means
+  // the same thing as everywhere else. Correctness is checked by XOR-folding
+  // the first 32 bytes of every 64th block: a kernel that got a lane or a
+  // counter wrong changes those, and the sampling keeps the check at 1/64 of
+  // the traffic instead of doubling the row's memory work.
+  std::vector<std::byte> xof_out(std::min<std::size_t>(8u << 20, input.size()));
+  const auto xof_with = [&](const blake3pp::kern::kernel_ops* ops) {
+    std::array<std::uint32_t, 8> cv{};
+    std::ranges::copy(blake3pp::kern::iv, cv.begin());
+    const std::uint8_t block[blake3pp::kern::block_len] = {};
+    const std::size_t total = input.size() / blake3pp::kern::block_len;
+    const std::size_t per = xof_out.size() / blake3pp::kern::block_len;
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < total; at += per) {
+      const std::size_t n = std::min(per, total - at);
+      ops->xof_many(cv.data(), block, blake3pp::kern::block_len, at,
+                    blake3pp::kern::flag_root,
+                    blake3pp::kern::kernel_bytes(xof_out.data()), n);
+      for (std::size_t b = 0; b < n; b += 64) {
+        for (std::size_t k = 0; k < 32; ++k) {
+          acc[k] ^= xof_out[b * blake3pp::kern::block_len + k];
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
+  };
+
+  // The whole input in 8 KiB messages, `one` hashing each, their digests
+  // folded into the row's digest so that every row of this shape is
+  // checked message by message and comparable to the others. The fold is
+  // a blake3pp hasher on fold_ops in all of them, including the rows that
+  // otherwise measure another implementation: it is 1/256 of the bytes and
+  // the same share everywhere, so a difference between two such rows is
+  // still a difference between what `one` does.
+  const auto hash_8k = [&](const blake3pp::kern::kernel_ops* fold_ops,
+                           auto one) {
+    constexpr std::size_t msg = 8 * 1024;
+    const std::span<const std::byte> all{input};
+    blake3pp::hasher fold{fold_ops};
+    for (std::size_t at = 0; at + msg <= all.size(); at += msg) {
+      const blake3pp::digest d = one(all.subspan(at, msg));
+      fold.update(std::span<const std::byte>{d.bytes});
+    }
+    return fold.finalize();
   };
 
   // The single-thread rows are REGISTERED first and measured afterwards,
@@ -471,38 +504,54 @@ int main(int argc, char** argv) {
     add_row(std::string{blake3pp::to_string(a)}, "",
             [&, a] { return hash_with(blake3pp::detail::resolve(a)); });
   }
-
-  // The width-16 transpose strategies, raced in-process (the dial is
-  // runtime; no per-strategy binaries needed), plus what the tuner picks.
-  // Interleaved execution means the dial must be set per REP, inside fn,
-  // and put back so the neighboring rows see the default.
-  if (const auto w16 = first_w16_arch(); w16.has_value()) {
-    const auto saved = blake3pp::active_transpose16();
-    for (const auto strat :
-         {blake3pp::transpose16::staging, blake3pp::transpose16::tree,
-          blake3pp::transpose16::quartered}) {
-      add_row(
-          std::format("  t16-{}", blake3pp::to_string(strat)), "",
-          [&, w16, strat, saved] {
-            blake3pp::set_transpose16(strat);
-            const auto d = hash_with(blake3pp::detail::resolve(*w16));
-            blake3pp::set_transpose16(saved);
-            return d;
-          },
-          14);
+  // The same kernels on 8 KiB messages, one hasher per message, each told
+  // the message ends there (update_last, which is what a one-shot does).
+  // Eight chunks is half a 16-lane batch and a whole 8-lane one, so where
+  // the long rows above amortise every remainder, this row is the
+  // remainder path itself -- padded out, or handed to a narrower kernel --
+  // and it is where the kernels' own thresholds show. Every 8 KiB row in
+  // this bench hashes a complete message this way, so they compare
+  // directly, here and across implementations.
+  for (const auto a : arches) {
+    if (!blake3pp::is_available(a)) {
+      continue;
     }
-    sections.back().footer = [&, saved] {
-      cooldown();
-      // Tuned for THIS run's input size, so the verdict is comparable to
-      // the three rows above it. The winner depends on the size
-      // (cache-resident inputs rank the strategies differently from
-      // streaming ones), so a tuner asked about a different size than the
-      // table measures has every right to disagree with it.
-      println(stdout, "    t16 tuner picks: {} (tuned for {} MiB)",
-              blake3pp::to_string(blake3pp::tune_transpose16(input.size())),
-              mib);
-      blake3pp::set_transpose16(saved);
-    };
+    add_row(std::format("{}_8k", blake3pp::to_string(a)),
+            "8 KiB messages, one hasher each", [&, a] {
+              const auto* ops = blake3pp::detail::resolve(a);
+              return hash_8k(ops, [ops](std::span<const std::byte> m) {
+                blake3pp::hasher h{ops};
+                h.update_last(m);
+                return h.finalize();
+              });
+            });
+  }
+
+  // The kernel ceiling: the batch the subtree leaf uses (2*degree chunks
+  // per call, the shape that lets a kernel interleave two batches) and a
+  // single batch. The distance to the variant's own row above is what the
+  // tree costs it, and the reference section repeats both rows, so a
+  // kernel comparison and a tree comparison stay separable.
+  for (const auto a : arches) {
+    if (!blake3pp::is_available(a)) {
+      continue;
+    }
+    for (const std::size_t mul : {std::size_t{1}, std::size_t{2}}) {
+      add_row(std::format("{}_batch{}", blake3pp::to_string(a), mul),
+              std::format("hash_many alone, {} x degree inputs per call", mul),
+              [&, a, mul] {
+                return hash_batches(blake3pp::detail::resolve(a), mul);
+              });
+    }
+    add_row(std::format("{}_parent", blake3pp::to_string(a)),
+            "hash_many alone, the parent shape: one block per input",
+            [&, a] {
+              return hash_batches(blake3pp::detail::resolve(a), 2,
+                                  /*parent_shape=*/true);
+            });
+    add_row(std::format("{}_xof", blake3pp::to_string(a)),
+            "xof_many alone: bytes of extended output",
+            [&, a] { return xof_with(blake3pp::detail::resolve(a)); });
   }
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM)
@@ -538,6 +587,51 @@ int main(int argc, char** argv) {
       ops.hash_many = k.hash_many;  // compress_in_place stays portable
       return hash_with(&ops);
     });
+    for (const std::size_t mul : {std::size_t{1}, std::size_t{2}}) {
+      add_row(std::format("{}_batch{}", k.row, mul),
+              std::format("hash_many alone, {} x degree inputs per call, "
+                          "hand-written asm", mul),
+              [&, k, mul] {
+                blake3pp::kern::kernel_ops ops =
+                    *blake3pp::detail::resolve(k.variant);
+                ops.hash_many = k.hash_many;
+                return hash_batches(&ops, mul);
+              });
+    }
+    add_row(std::format("{}_parent", k.row),
+            "hash_many alone, the parent shape: one block per input, "
+            "hand-written asm",
+            [&, k] {
+              blake3pp::kern::kernel_ops ops =
+                  *blake3pp::detail::resolve(k.variant);
+              ops.hash_many = k.hash_many;
+              return hash_batches(&ops, 2, /*parent_shape=*/true);
+            });
+    // Only the AVX-512 assembly has an extended-output kernel; the others
+    // reach xof_many through the portable C, which is not a comparison.
+    if (k.xof_many != nullptr) {
+      add_row(std::format("{}_xof", k.row),
+              "xof_many alone: bytes of extended output, hand-written asm",
+              [&, k] {
+                blake3pp::kern::kernel_ops ops =
+                    *blake3pp::detail::resolve(k.variant);
+                ops.xof_many = k.xof_many;
+                return xof_with(&ops);
+              });
+    }
+    // The twin of blake3pp_8k with only hash_many swapped: what separates
+    // the kernel's share of the short-message gap from the tree code's.
+    add_row(std::format("{}_8k", k.row), "8 KiB messages, hand-written asm",
+            [&, k] {
+              blake3pp::kern::kernel_ops ops =
+                  *blake3pp::detail::resolve(k.variant);
+              ops.hash_many = k.hash_many;
+              return hash_8k(&ops, [&ops](std::span<const std::byte> m) {
+                blake3pp::hasher h{&ops};
+                h.update_last(m);
+                return h.finalize();
+              });
+            });
     asm_ops = *blake3pp::detail::resolve(k.variant);
     asm_ops.hash_many = k.hash_many;
     asm_row = k.row;
@@ -547,10 +641,10 @@ int main(int argc, char** argv) {
   // The reference implementation as shipped: its own runtime dispatch, same
   // input. The digest must match every row above.
   add_section("reference impl. end-to-end (single thread, own dispatch)");
-  add_row("reference", "", [&] {
+  const auto reference_hash = [](std::span<const std::byte> bytes) {
     blake3_hasher h;
     blake3_hasher_init(&h);
-    blake3_hasher_update(&h, input.data(), input.size());
+    blake3_hasher_update(&h, bytes.data(), bytes.size());
     blake3pp::digest d{};
     blake3_hasher_finalize(&h, blake3pp::kern::kernel_bytes(d.bytes.data()),
                            BLAKE3_OUT_LEN);
@@ -561,25 +655,81 @@ int main(int argc, char** argv) {
 #endif
 #endif
     return d;
+  };
+  add_row("reference", "",
+          [&] { return reference_hash(std::span<const std::byte>{input}); });
+  // The twin of the blake3pp_8k row below: both implementations' own
+  // short-message path, each with its own dispatch, on the same messages.
+  add_row("reference_8k", "8 KiB messages, one hasher each", [&] {
+    return hash_8k(blake3pp::detail::resolve(blake3pp::arch::auto_detect),
+                   reference_hash);
+  });
+  // Extended output end to end, each implementation through its own seek
+  // API, in the same reader-sized fills as the kernel rows above.
+  add_row("reference_xof", "bytes of extended output, own dispatch", [&] {
+    blake3_hasher h;
+    blake3_hasher_init(&h);
+    blake3_hasher_update(&h, input.data(), 1);
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < input.size(); at += xof_out.size()) {
+      const std::size_t n = std::min(xof_out.size(), input.size() - at);
+      blake3_hasher_finalize_seek(
+          &h, at, blake3pp::kern::kernel_bytes(xof_out.data()), n);
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+      __msan_unpoison(xof_out.data(), n);
+#endif
+#endif
+      for (std::size_t b = 0; b * 64 < n; b += 64) {
+        for (std::size_t k = 0; k < 32; ++k) {
+          acc[k] ^= xof_out[b * 64 + k];
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
   });
 #endif
 
-  // The blake3pp full pipeline on a single thread. It discriminates
-  // between "the pool scales badly" and "the subtree and CV machinery
-  // costs more than the raw kernel loop at this width".
-  //
-  // The reference end-to-end row above has had this mirror all along.
-  // This row was the blind spot while chasing the width-16 pool anomaly.
+  // The blake3pp full pipeline on a single thread, the mirror of the
+  // reference end-to-end row. It discriminates between "the pool scales
+  // badly" and "the subtree and CV machinery costs more than the raw
+  // kernel loop at this width".
   add_section("blake3pp end-to-end (single thread)");
   add_row("blake3pp", "", [&] {
     return blake3pp::hash(std::span<const std::byte>{input});
   });
+  add_row("blake3pp_8k", "8 KiB messages, one hasher each", [&] {
+    return hash_8k(blake3pp::detail::resolve(blake3pp::arch::auto_detect),
+                   [](std::span<const std::byte> m) {
+                     return blake3pp::hash(m);
+                   });
+  });
+  add_row("blake3pp_xof", "bytes of extended output, own dispatch", [&] {
+    blake3pp::hasher h;
+    h.update_last(std::span<const std::byte>{input}.first(1));
+    blake3pp::output_reader r = h.finalize_xof();
+    std::array<std::byte, 32> acc{};
+    for (std::size_t at = 0; at < input.size(); at += xof_out.size()) {
+      const std::size_t n = std::min(xof_out.size(), input.size() - at);
+      r.fill(std::span<std::byte>{xof_out}.first(n));
+      for (std::size_t b = 0; b * 64 < n; b += 64) {
+        for (std::size_t k = 0; k < 32; ++k) {
+          acc[k] ^= xof_out[b * 64 + k];
+        }
+      }
+    }
+    blake3pp::digest d{};
+    d.bytes = acc;
+    return d;
+  });
 
   // --- measurement: rep-outer, row-inner, start row rotated per pass ---
   // Pass -1 is the uncounted warmup. Cooldown idles between PASSES, not
-  // rows: an idle gap between rows is exactly what let EAS reset its
-  // upmigration on the Exynos, handing the post-gap row a different core
-  // class than its neighbors. Rotation gives every row every position in
+  // rows: an idle gap between rows lets EAS reset its upmigration on a
+  // heterogeneous core, handing the post-gap row a different core class
+  // than its neighbors. Rotation gives every row every position in
   // the pass order across reps, so whatever thermal/placement drift a
   // position carries is spread evenly before best-of picks the ceiling.
   std::vector<bench_row*> flat;
@@ -724,10 +874,25 @@ int main(int argc, char** argv) {
   // the feed size is what decides how much copying there is -- a feed of
   // one window copies all of it, a feed of eight copies an eighth.
   //
-  // It is below the one-shot rows for a structural reason worth seeing:
-  // each window flush is its own pipeline scope, so consecutive windows
-  // do not overlap, where the one-shot amortises one scope over the
-  // whole span.
+  // Every feed below is at most one window, so every byte is copied, on
+  // this thread, before its window is fanned out; and the pool parks
+  // while it is copied, so each window also pays a cold fan-out. The
+  // copy's own rate is printed first, because it is the ceiling of the
+  // rows under it, and it is a property of one core's store bandwidth,
+  // which is why the same binary streams at very different rates on
+  // machines whose pool rows agree.
+  {
+    const std::size_t window = std::min(
+        blake3pp::parallel_hasher_options{}.window_bytes, input.size());
+    std::vector<std::byte> copy(window);
+    const double s = b3tool::best_seconds(5, /*warmup=*/true, [&] {
+      std::memcpy(copy.data(), input.data(), window);
+      const volatile std::byte keep = copy[window - 1];  // the copy is observed
+      (void)keep;
+    });
+    println(stdout, "  {:<{}} {}   [one thread, one {} MiB window: what every stream row copies per window]",
+            "memcpy", 20, b3tool::rate(window, s), window >> 20);
+  }
   for (const std::size_t feed :
        {std::size_t{256} << 10, std::size_t{1} << 20, std::size_t{8} << 20}) {
     auto sched = engine_sched;
@@ -773,8 +938,8 @@ int main(int argc, char** argv) {
                                 &asm_ops);
         },
         15);
-    // The same kernel and pool under the engine's former split, as the
-    // control for the counter-pulled parts in the row above.
+    // The same kernel and pool under a static split, the control for the
+    // counter-pulled parts in the row above.
     row("reference/static",
         std::format("{} kernel, 256 parts, fixed shares", asm_row),
         [&] {

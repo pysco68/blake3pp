@@ -484,10 +484,7 @@ def cmd_disasm(args):
 HOT = r"::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof)\("
 ALLOW = (r"^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck"
          r"|__asan_\w+|__hwasan_\w+|__ubsan_\w+|__tsan_\w+|__msan_\w+|__sanitizer_\w+|__gcov\w*|__llvm_\w+)$"
-         r"|kern::\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\("
-         # MSVC keeps std::atomic<T>::load out of line; the kernels read the
-         # transpose16 dial once per batch through it.
-         r"|std::_Atomic_storage<.*>::load\(")
+         r"|kern::\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\(")
 
 # The runtimes instrumented code calls (sanitizers, gcov, llvm profiling),
 # plus the internals of a statically linked libgcov as they appear in a

@@ -61,8 +61,9 @@ and nudges the driver awake rather than reaching into it.
 
 Writes run the same chain backwards -- generate on the pool, write on
 the driver -- with no reducer, because a window's bytes depend on its
-offset and nothing else. That is `write_file()`, and `blake3ppgen
---output` is built on it.
+offset and nothing else. That is `write_file()`, which also comes in
+forms that need no scheduler and in one whose generator decides the
+file's length; `blake3ppgen --output` is built on them.
 
 The storage is a window arena the driver owns, so a read is never in
 flight into memory that has already been freed. The blocking entry
@@ -85,7 +86,7 @@ Files are a first-class input, not a loop you write.
 The binary release contains two [command-line tools](docs/tools.md) built on the library: `blake3ppsum` and `blake3ppgen`.
 
 `blake3ppsum` is a core-tool style hashing tool you can use just like `sha256sum` but
-exposes all the cool BLAKE3 modes with keyed hashing, XOF, etc.
+exposes every BLAKE3 mode: keyed hashing, derive_key and extended output.
 
 `blake3ppgen` uses BLAKE3's extended output mode to generate deterministic arbitrary
 length, seekable streams of data which is perfect for test data generation.
@@ -101,7 +102,7 @@ length, seekable streams of data which is perfect for test data generation.
 
 The drive column is the same reader with hashing switched off, on the
 same machine and the same file: the ceiling any tool on that box is
-working against. Note that it moves. Pacing is a property of the device,
+working against. Pacing is a property of the device,
 not a constant, and the wider window raises the ceiling as well as the
 result.
 </details>
@@ -182,7 +183,7 @@ All of this, rendered and searchable, with a version for every release:
 | [Integration](docs/integration.md) | vendoring, installing, and `find_package` |
 | [Building](docs/building.md) | presets, the toolchain images, cmake-re, and the kernel switches |
 | [Freestanding and RTOS builds](docs/freestanding.md) | no OS, no allocator and how to use `blake3pp` with only a few hundred bytes of stack |
-| [Static Linux binaries](docs/static-linux-binaries.md) | it should just run on any distro, really |
+| [Static Linux binaries](docs/static-linux-binaries.md) | one file per architecture that runs on any distro |
 | [Reference](https://pysco68.github.io/blake3pp/latest/reference/) | every declaration in the public headers, generated from their own doc comments |
 
 ## Using the library
@@ -211,7 +212,7 @@ consumers can pick granular headers instead:
 | `<blake3pp/blake3pp.hpp>`    | umbrella: everything below | yes |
 | `<blake3pp/dispatch.hpp>`    | `arch` introspection, SIMD variant selection | no |
 | `<blake3pp/core.hpp>`        | `digest`, `hasher`, one-shot `hash()` | no |
-| `<blake3pp/io.hpp>`          | `update_file()` and `hash_file()`, the async direct-I/O pipeline | no |
+| `<blake3pp/io.hpp>`          | `update_file()`, `hash_file()` and sequential `write_file()`, the async direct-I/O pipeline | no |
 | `<blake3pp/parallel.hpp>`    | multi-core `hash()`, `parallel_hasher`, multi-core XOF `fill()` | yes |
 | `<blake3pp/parallel_io.hpp>` | `update_file()`, `hash_file()` and `write_file()` over a scheduler (the two combined) | yes |
 | `<blake3pp/async_io.hpp>`    | EXPERIMENTAL: the same as senders over a context you drive, for many files on one arena | yes |

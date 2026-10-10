@@ -43,7 +43,7 @@ side. **The number scales with the queue depth, not with the core
 count.** A window's fill is sequential -- the parallelism is the windows
 in flight, not a fan-out inside one -- so the useful reading is a sweep
 of `--qd` at a fixed `--window`, and the window size barely moves it.
-On a 16-thread Z13, 2 GiB, best of 3:
+On a Ryzen 7 PRO 6860Z (16 threads), 2 GiB, best of 3:
 
 | geometry | GiB/s | | geometry | GiB/s |
 |---|---|---|---|---|
@@ -63,7 +63,7 @@ window x qd pacing matrix), and `--make <MiB>` to create a file and use
 it. Without a device: `--null-source <GiB>` and `--null-sink <GiB>`.
 
 `blake3pp_bench`, in memory: `--size` (MiB), `--reps`, `--cooldown`,
-`--pin`, `--threads`, `--t16-sweep`, and a list of SIMD variants to
+`--pin`, `--threads`, and a list of SIMD variants to
 measure.
 
 ## file_throughput: where a window's time goes (`--trace`)
@@ -204,7 +204,7 @@ host; on bare metal the whole ladder is about a microsecond.
 
 ### Other compilers and ISAs
 
-The call site is the whole question, and the disassembly answers it
+The call site is the only thing that differs, and the disassembly shows it
 without running anything: under GCC the dispatched call is a register
 load plus an indirect call on x86-64 (`mov; call *%r10`), AArch64
 (`ldr; blr`) and RISC-V (`ld; jalr`), one instruction more than the
@@ -215,7 +215,7 @@ it also measures natively. qemu-user is no help here: the toolchain
 images' qemu has no TCG plugins (no guest instruction count), and TCG
 timings say nothing about a CPU's indirect branches.
 
-### Result on the machine it was written on
+### Result on a Zen 3
 
 Zen 3 (Ryzen 7 PRO 6860Z), gcc 16: the dispatch is one instruction,
 the load of the function pointer; the indirect call replaces a direct

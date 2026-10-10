@@ -6,10 +6,10 @@
 // are silently served through the cache instead of being rejected, so the
 // dual-fd tail trick the O_DIRECT and NO_BUFFERING backends need
 // disappears here. The backend runs positional pread/pwrite loops on GCD's
-// global concurrent pool, straight into the engine's buffer ring
-// (dispatch_io was considered and rejected: it delivers dispatch_data_t
-// chunks it allocated itself, an extra copy the zero-copy pipeline exists
-// to avoid). A dispatch_group is the teardown drain and a mutex/condvar
+// global concurrent pool, straight into the engine's buffer ring;
+// dispatch_io is not used because it delivers dispatch_data_t chunks it
+// allocated itself, an extra copy the zero-copy pipeline exists to
+// avoid. A dispatch_group is the teardown drain and a mutex/condvar
 // pair the completion queue. Internal to src/io/, never installed.
 
 #if defined(__APPLE__)

@@ -4,8 +4,8 @@ Every release ships five fully static Linux archives, one per
 architecture: x86_64, aarch64, riscv64, ppc64le and s390x. A sixth
 target, mips64el, is built the same way in CI but not released: GCC
 against a static glibc rather than zig against musl, equally standalone
-and equally free of a glibc floor, but emulator-tested only (see the
-MSA note in the README). Each released archive
+and equally free of a glibc floor, but emulator-tested only (see
+[Architectures and kernels](architectures.md#msa-has-never-run-on-hardware)). Each released archive
 carries the tools and benchmarks (`blake3ppsum`, `blake3ppgen`,
 `blake3pp_bench`, `blake3pp_bench_file`); the library itself is meant to
 be built from source.
@@ -125,8 +125,8 @@ zig's clang cannot produce two of the kernels the fat binary wants:
 | riscv64 | `xthead` (draft RVV 0.7.1) | LLVM never merged the XTheadVector extension | `riscv64-linux-gnu-g++` |
 | s390x   | `vxe` (z14 vector) | LLVM's SystemZ backend compiles the code but scalarizes the vector ops: about 10 vector instructions in the whole binary versus GCC's thousands, including the single-instruction `verllf` rotate | `s390x-linux-gnu-g++` |
 
-The s390x case is the treacherous one. The clang-built kernel is
-correct. It passes every test and reports itself as a vector variant,
+The s390x case is the one no build check can catch. The clang-built
+kernel is correct. It passes every test and reports itself as a vector variant,
 while performing like the scalar one. No compile probe detects that, so
 the build policy is explicit: under a non-GNU primary compiler, the vxe
 kernel comes from GCC, or it is not registered at all.

@@ -124,14 +124,16 @@ constexpr std::array<arch, num_kernels> compiled_sorted = [] {
 static_assert(compiled_sorted.back() == arch::scalar,
               "the scalar fallback must always be registered");
 
-bool compiled_in(arch a) noexcept {
+const registry_entry* find_registry(arch a) noexcept {
   for (const registry_entry& e : registry) {
     if (e.a == a) {
-      return true;
+      return &e;
     }
   }
-  return false;
+  return nullptr;
 }
+
+bool compiled_in(arch a) noexcept { return find_registry(a) != nullptr; }
 
 bool cpu_supports_impl(arch a) noexcept {
   switch (a) {
@@ -266,20 +268,16 @@ const kern::kernel_ops* resolve(arch a) noexcept {
   if (a == arch::auto_detect || !cpu_supports_impl(a)) {
     a = best_available();
   }
-  for (const registry_entry& e : registry) {
-    if (e.a == a) {
-      return e.ops;
-    }
+  if (const registry_entry* e = find_registry(a); e != nullptr) {
+    return e->ops;
   }
   // Requested variant not compiled in: fall back to the best one that is.
   for (const arch b : available_impl()) {
-    for (const registry_entry& e : registry) {
-      if (e.a == b) {
-        return e.ops;
-      }
+    if (const registry_entry* e = find_registry(b); e != nullptr) {
+      return e->ops;
     }
   }
-  return &kern::scalar::ops;  // unreachable: scalar is always registered
+  return registry[0].ops;  // unreachable: scalar is always registered
 }
 
 }  // namespace detail
