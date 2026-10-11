@@ -9,6 +9,14 @@ with `BLAKE3PP_BUILD_BENCH` and are documented by their `--help`.
 The third, `blake3pp_dispatch_cost_<variant>`, answers one question and
 is off by default (`-DBLAKE3PP_BENCH_DISPATCH_COST=ON`).
 
+`compare/` holds the reference implementation's own bench, the blake3
+crate over rayon, in its own Cargo project: `-DBLAKE3PP_BENCH_COMPARE=ON`
+builds one binary per compile-time SIMD cap into `<build>/bench/compare/`
+when cargo is on PATH. See [compare/README.md](compare/README.md) for the
+caps, the two measurements and the protocol. The upstream C library's
+kernels are a different comparison and need no Rust: they build into
+`blake3pp_bench` itself (`BLAKE3PP_BENCH_UPSTREAM`, on by default).
+
 ## --null-source: a ceiling, not a working set
 
 `blake3pp_bench_file --null-source N` runs the pipeline over a file that

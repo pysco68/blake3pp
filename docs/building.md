@@ -169,6 +169,14 @@ reported at configure time when it is not the default.
 cmake --preset macos-clang22-cxx26 -DBLAKE3PP_KERNEL_INLINE_ENFORCEMENT=off
 ```
 
+Two benchmark comparisons are build options of their own.
+`BLAKE3PP_BENCH_UPSTREAM` (on) builds the upstream BLAKE3 C library, so
+every run shows blake3pp's variants against the hand-written assembly on
+the same machine. `BLAKE3PP_BENCH_COMPARE` (off, needs cargo) builds the
+reference implementation's own rayon bench from `bench/compare/`, one
+binary per compile-time SIMD cap, which is the comparison against the
+implementation as its users get it.
+
 `BLAKE3PP_KERNEL_EXTRA_FLAGS` (a semicolon-separated list) appends raw
 compiler flags to the kernel TUs only, for one-off flag trials that have
 not earned a switch.
