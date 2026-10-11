@@ -95,8 +95,18 @@ struct hash_file_options {
   bool offload_submit = true;
   /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
   std::optional<std::array<std::byte, key_size>> key = std::nullopt;
-  /// Key-derivation mode with this context string when set; the string must
-  /// outlive the call. At most one of key and derive_context.
+  /// Key-derivation mode with this context string when set.
+  ///
+  /// A view, not a copy: the string has to outlive every operation these
+  /// options start. For the blocking entry points that is the call; for the
+  /// senders in <blake3pp/async_io.hpp>, which hold a copy of the options,
+  /// it is until the operation completes. The key above is stored by value
+  /// because a key is 32 bytes; a context string is a literal in every use
+  /// the spec intends.
+  ///
+  /// Setting this and `key` together is a precondition violation (a hash
+  /// cannot be both keyed and derived): debug builds assert, and release
+  /// builds take the key.
   ///
   /// Extended output has no shortcut here, since hash_file() returns a
   /// 32-byte digest: take the hasher these options describe (make_hasher()),
@@ -155,6 +165,7 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
 
 /// The hasher these options describe: its SIMD variant, and the mode
 /// (plain, keyed or key-derivation) that key and derive_context select.
+/// Setting both of those is a precondition violation; see the field.
 ///
 /// hash_file() builds this internally; it is public so a caller that needs
 /// a finalize form hash_file() does not have -- extended output, the

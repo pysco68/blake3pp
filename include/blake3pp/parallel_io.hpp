@@ -105,6 +105,29 @@ void write_file(const std::filesystem::path& path, std::uint64_t size,
                               .queue_depth = opts.queue_depth});
 }
 
+/// write_file() over a scheduler, reporting failure through ec instead of
+/// throwing.
+///
+/// An I/O failure arrives as its own error code. An allocation failure,
+/// an exception from the generator and whatever the execution provider
+/// raises all read as not_enough_memory, as in every ec overload here.
+/// @param path   The file to create or truncate.
+/// @param size   How many bytes to generate.
+/// @param fill   The generator, called per window on the pool.
+/// @param sched  Where the fills run.
+/// @param ec     Cleared on success; the failure otherwise.
+/// @param opts   The geometry.
+template <class Scheduler, class Fill>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void write_file(const std::filesystem::path& path, std::uint64_t size,
+                Fill&& fill, Scheduler&& sched, std::error_code& ec,
+                const file_write_options& opts = {}) noexcept {
+  detail::with_error_code(ec, [&] {
+    write_file(path, size, std::forward<Fill>(fill),
+               std::forward<Scheduler>(sched), opts);
+  });
+}
+
 /// Streams a file into a hasher with every complete window fanned out
 /// over a scheduler; the final window is absorbed by h itself.
 ///

@@ -337,6 +337,28 @@ TEST_CASE("an unbounded write_file ends where the generator does") {
   }
 }
 
+// The scheduler-taking form has the same pair, so a caller that reports
+// through ec does not have to drop to the sequential path for it.
+TEST_CASE("write_file over a scheduler reports failure through ec") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::uint64_t size = 2 * win + 15;
+  {
+    const temp_path out;
+    std::error_code ec;
+    blake3pp::write_file(out.path, size, fill_from_offset, sched, ec,
+                         {.window_bytes = win});
+    CHECK(!ec);
+    CHECK(size_of(out.path) == size);
+    CHECK(hash_of(out.path) == expected_digest(size));
+  }
+  std::error_code ec;
+  blake3pp::write_file(fs::path("/nonexistent/blake3pp/no/such/dir") / "f",
+                       size, fill_from_offset, sched, ec,
+                       {.window_bytes = win});
+  CHECK(ec);
+}
+
 // The ec forms report what the throwing ones raise: a path that cannot be
 // created is an error_code, not an exception.
 TEST_CASE("sequential write_file reports failure through ec") {
