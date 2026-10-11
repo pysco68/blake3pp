@@ -416,7 +416,7 @@ class sync_context {
   sync_context(const sync_context&) = delete;
   sync_context& operator=(const sync_context&) = delete;
   // Nothing is in flight by construction, so there is nothing to drain
-  // and no callback to suppress: the queued ops simply never complete.
+  // and no callback to suppress: the queued ops never complete.
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
@@ -488,7 +488,7 @@ class sync_context {
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
 
-  // Nothing was ever issued: the queued reads are simply forgotten.
+  // Nothing was ever issued: the queued reads are forgotten.
   void drain() noexcept {
     queue_.clear();
     queued_ = 0;

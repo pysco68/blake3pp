@@ -200,7 +200,7 @@ class fake_context {
   }
   void drain() noexcept { queue_.clear(); }
 
-  // The engine deliberately gives no way to reach its context, so the
+  // The engine gives no way to reach its context, so the
   // window to fail is named before the engine is built. A static on a
   // type that exists only in this file is the smallest thing that can
   // say it.
@@ -612,7 +612,7 @@ TEST_CASE("an empty transfer completes from poll, not as an error") {
 
 #if defined(__linux__)
 // Preallocation is a hint. A filesystem that refuses it must leave a
-// usable file behind, not a failed open: the writes simply extend the
+// usable file behind, not a failed open: the writes extend the
 // file as they land, which is what every backend without fallocate does
 // anyway. Forced here by asking for more than the filesystem holds.
 TEST_CASE("a refused preallocation degrades to an ordinary writable open") {

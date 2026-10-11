@@ -158,7 +158,7 @@ several: an operation may hold up to `queue_depth` windows, so a context
 meant to keep *n* files moving wants around `n * queue_depth`.
 
 Fewer windows than that is not a deadlock — an operation that finds none
-free simply waits, and resumes when any other gives one back — but it
+free waits, and resumes when any other gives one back — but it
 does serialise the files.
 
 The part-table budget is the context's rather than the call's, because

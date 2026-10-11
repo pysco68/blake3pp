@@ -341,7 +341,7 @@ kernel_deltas kernel_delta(const kernel_counters& before,
 // so what this measures is the engine, the fan-out and the fold, with
 // the device removed -- the ceiling a real one is measured against.
 //
-// That is deliberately NOT the same benchmark as hashing a real span:
+// That is NOT the same benchmark as hashing a real span:
 // the bytes here are a handful of resident windows, not a working set.
 // See bench/README.md.
 //

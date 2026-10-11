@@ -19,9 +19,8 @@
 // What it does NOT have is a reducer. Writes are order-free in a way
 // reads are not: a window's bytes depend on its offset and nothing else,
 // so there is no tree to rebuild and no last window to keep for the end.
-// So this is a separate, smaller scope rather than a mode of
-// window_scope: the loop, the plan, the stop source, the error latch and
-// quiesce are shared; the reducer bookkeeping is absent.
+// A write run shares the loop, the plan, the stop source, the error latch
+// and quiesce with a read run; the reducer bookkeeping is absent.
 //
 // Internal to the library. Names an execution provider.
 

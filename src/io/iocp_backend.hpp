@@ -211,7 +211,7 @@ struct win_file {
 // out of poll(). The port is the context's; each file associates its
 // overlapped handle with it at construction.
 //
-// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is deliberately NOT set. With it, a
+// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is NOT set. With it, a
 // read that completes synchronously returns without posting, and its
 // callback would have to run inside submit_read() -- exactly what the
 // contract forbids. Leaving it unset costs a post per fast completion and

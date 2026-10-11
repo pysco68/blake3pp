@@ -55,7 +55,7 @@ namespace blake3pp::detail::ex_compat {
 // RULE 3 -- a scheduler must answer get_forward_progress_guarantee.
 //
 // beman's scheduler concept requires it and supplies no default; a
-// scheduler without it is simply not a scheduler, and the symptom is
+// scheduler without it is not a scheduler, and the symptom is
 // `continues_on` failing to match with no mention of the query. Inherit
 // this into any scheduler the library defines. weakly_parallel is the
 // honest answer for a run loop: it advances only while its owner drives

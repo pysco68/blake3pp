@@ -432,7 +432,7 @@ class update_file_op final : public pipeline_node {
     try {
       scope_->admit_round(*cells_);
     } catch (...) {
-      // The round threw, so the cells cannot simply be destroyed: a
+      // The round threw, so the cells cannot be destroyed yet: a
       // window on the pool may be about to publish into one. Wait those
       // out first, which also returns the windows this run held, then
       // report from the next round.
@@ -844,7 +844,7 @@ class update_files_op final : public pipeline_node {
   };
 
   // Builds the child in place: an operation state is immovable, so the
-  // optional is given a conversion rather than a value.
+  // optional takes a conversion that constructs it where it will live.
   struct child_connect {
     update_files_op* op;
     slot* s;

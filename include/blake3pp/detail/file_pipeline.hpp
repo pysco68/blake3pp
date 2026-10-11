@@ -744,9 +744,8 @@ class driver_loop {
 // stop source for the run, a latch that decides which failure the caller
 // hears about, a count of the ones it drops, and a teardown that cannot
 // trust the loop. They disagree about what a cancel sweep names and about
-// when a run is done, which is why this is a base they derive from rather
-// than a member they hold: the parts that differ stay in the scope, and
-// the members below are protected so the scope keeps naming them directly.
+// when a run is done, so those two stay in the scope. The members below
+// are protected, which is how the scope keeps naming them directly.
 //
 // Derived must provide loop() and sweep_cancels().
 template <class Derived, class D>
@@ -793,8 +792,8 @@ class pipeline_scope_base {
   // The stop path for a loop that can no longer be trusted to run.
   //
   // Reached when an exception has left the run, so the normal round --
-  // request, sweep, let the completions arrive -- cannot simply be
-  // continued: the poll that threw may throw again. The first two steps
+  // request, sweep, let the completions arrive -- cannot be continued:
+  // the poll that threw may throw again. The first two steps
   // are the same as any stop's; what differs is the wait behind them.
   // Nothing on the pool may publish into an operation cell once the cells
   // are destroyed, so every transfer in flight is waited out here, with
@@ -1159,11 +1158,11 @@ class window_pool {
     // window before any constructor runs, and the table has no
     // initialiser of its own to replace that fill with.
     //
-    // The check is the outcome rather than a trait: what the guarantee
-    // actually rests on is a default constructor that is neither
-    // user-provided nor deleted, and no standard trait spells that --
-    // is_trivially_default_constructible is already false here, for the
-    // members that do carry initialisers.
+    // What the guarantee rests on is a default constructor that is
+    // neither user-provided nor deleted, and no standard trait spells
+    // that -- is_trivially_default_constructible is already false here,
+    // for the members that do carry initialisers -- so the check is the
+    // outcome itself.
     static_assert(
         [] {
           const window probe{};
@@ -1653,7 +1652,7 @@ class window_scope
       }
       // A stop that arrives with nothing in flight ends the run here.
       // Without this the loop would reach the stall report, which exists
-      // for a pipeline nobody can wake -- and this one is simply over.
+      // for a pipeline nobody can wake, and this one is over.
       settle();
     }
   }
@@ -2306,7 +2305,8 @@ struct pipeline_cells {
   pipeline_cells& operator=(const pipeline_cells&) = delete;
 
   // Builds a cell's operation state in place: an operation state does
-  // not move, so the optional is given a conversion rather than a value.
+  // not move, so the optional takes a conversion that constructs it
+  // where it will live.
   template <class Op, auto Chain>
   struct connect_as {
     Scope* scope;

@@ -3,7 +3,7 @@
 // memory_driver is a file_driver like io_driver is, so the first suite
 // below is the driver contract: callbacks only from poll(), a wake that
 // releases a blocked one, an advisory cancel, and two "files" sharing a
-// driver. It is deliberately NOT in tests/io_context.cpp -- that suite
+// driver. It is NOT in tests/io_context.cpp -- that suite
 // is about the platform backends and only builds with the file I/O
 // layer, and the whole point of this driver is that the in-memory path
 // does not need that layer.
