@@ -111,7 +111,8 @@ class file_writer {
   [[nodiscard]] std::uint64_t bytes_written() const noexcept;
 
   // Which mechanism was actually engaged, e.g. "io_uring+direct",
-  // "iocp+direct+vdl", "gcd+nocache", "pwrite", "writefile", "stdio".
+  // "iocp+direct", "gcd-write+nocache", "pwrite", "writefile", "stdio".
+  // A view of the writer's own name: copy it to outlive the writer.
   [[nodiscard]] std::string_view backend() const noexcept;
 
  private:

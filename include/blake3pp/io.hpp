@@ -116,31 +116,18 @@ class hash_mode {
   /// hardcoded, globally unique and application-specific (see the BLAKE3
   /// spec); it is not a secret.
   ///
-  /// The context is a view, not a copy, so the string has to outlive every
-  /// operation these options start. That is the call for the blocking entry
-  /// points, and the whole operation for the senders in
-  /// <blake3pp/async_io.hpp>, which hold a copy of the options.
-  ///
-  /// A key is stored by value instead: 32 bytes cost nothing to carry, while
-  /// a context string is a literal in every use the spec intends.
+  /// The context is copied, like the key: a mode outlives the expression
+  /// that built it -- an options object holds one, and the senders in
+  /// <blake3pp/async_io.hpp> hold a copy of the options for the whole
+  /// operation -- so a borrowed string would have to outlive all of that,
+  /// and nothing at the call site says it does.
   /// @param context  The domain-separation string.
-  [[nodiscard]] static constexpr hash_mode derive_key(
-      std::string_view context) noexcept {
+  [[nodiscard]] static hash_mode derive_key(std::string_view context) {
     hash_mode m;
     m.kind_ = kind::derive_key;
-    m.context_ = context;
+    m.context_.assign(context);
     return m;
   }
-  /// The one call the type refuses: a std::string that dies at the end of the
-  /// expression cannot be viewed. Name the string, or pass a literal.
-  ///
-  /// Only rvalues are rejected, since an lvalue outlives the call, and only
-  /// std::string is recognised: no trait tells another type's ownership from
-  /// its conversion.
-  template <class S>
-    requires std::same_as<std::remove_cvref_t<S>, std::string> &&
-             std::is_rvalue_reference_v<S&&>
-  static hash_mode derive_key(S&&) = delete;
 
   /// Which mode this is.
   [[nodiscard]] constexpr kind which() const noexcept { return kind_; }
@@ -149,14 +136,13 @@ class hash_mode {
       const noexcept {
     return key_;
   }
-  /// The context string, when which() is derive_key.
-  [[nodiscard]] constexpr std::string_view context() const noexcept {
-    return context_;
-  }
+  /// The context string, when which() is derive_key. A view of this mode's
+  /// own copy, valid as long as the mode is.
+  [[nodiscard]] std::string_view context() const noexcept { return context_; }
 
  private:
   std::array<std::byte, key_size> key_{};
-  std::string_view context_{};
+  std::string context_;
   kind kind_ = kind::plain;
 };
 
@@ -313,10 +299,12 @@ struct write_report {
   /// Bytes written: the size that was asked for, or what the generator
   /// produced before it stopped.
   std::uint64_t bytes = 0;
-  /// Which mechanism carried them: "io_uring+direct", "iocp+direct+vdl",
-  /// "gcd+nocache", "pwrite", "writefile" or "stdio". Static storage, so
-  /// it stays valid after the call.
-  std::string_view backend;
+  /// Which mechanism carried them, as the writer names it:
+  /// "io_uring+direct", "iocp+direct", "gcd-write+nocache", "pwrite",
+  /// "writefile" or "stdio", each with the reason appended where an
+  /// asynchronous rung was asked for and refused. Owned by the report,
+  /// because the writer that composed it is gone by then.
+  std::string backend;
 };
 
 namespace detail {
@@ -350,7 +338,7 @@ write_report write_sequential(const std::filesystem::path& path,
     }
   }
   writer.finish();
-  return {done, writer.backend()};
+  return {done, std::string(writer.backend())};
 }
 
 }  // namespace detail

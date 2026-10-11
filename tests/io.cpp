@@ -191,14 +191,16 @@ static_assert(!converts_to_mode<const char*>);
 static_assert(!converts_to_mode<std::array<std::byte, blake3pp::key_size>>);
 static_assert(!converts_to_mode<std::span<const std::byte, blake3pp::key_size>>);
 
-// A context the options would outlive is refused: the mode views the string,
-// so an owning temporary cannot be the thing it views.
+// The mode owns its context, like its key, so every spelling of the string
+// is accepted: the mode is what has to outlive the operation, and it does
+// that on its own.
 template <class S>
 concept names_context = requires(S s) {
   blake3pp::hash_mode::derive_key(std::move(s));
 };
 static_assert(names_context<std::string_view>);
-static_assert(!names_context<std::string>);
+static_assert(names_context<std::string>);
+static_assert(names_context<const char*>);
 
 static_assert(blake3pp::hash_mode::plain().which() ==
               blake3pp::hash_mode::kind::plain);
@@ -206,12 +208,48 @@ static_assert(blake3pp::hash_file_options{}.mode.which() ==
               blake3pp::hash_mode::kind::plain);
 static_assert(
     blake3pp::hash_file_options{
-        .mode = blake3pp::hash_mode::derive_key("context")}
-        .mode.which() == blake3pp::hash_mode::kind::derive_key);
-static_assert(
-    blake3pp::hash_file_options{
         .mode = blake3pp::hash_mode::keyed(std::array<std::byte, 32>{})}
         .mode.which() == blake3pp::hash_mode::kind::keyed);
+
+// A context borrowed from the string that named it would dangle: the
+// string is gone by the time the options are used, which the mode cannot
+// notice and the digest cannot survive. Every way of producing one is
+// here, because a named lvalue dangles exactly as a temporary does once
+// the options outlive its scope.
+TEST_CASE("a mode's context outlives the string it was built from") {
+  const auto content = make_input(4096);
+  const temp_file f(content);
+  constexpr std::string_view context = "blake3pp 2026-10-03 lifetime";
+
+  blake3pp::hasher expect_h = blake3pp::hasher::derive_key(context);
+  expect_h.update(content);
+  const blake3pp::digest expect = expect_h.finalize();
+
+  const auto from_local_string = [&] {
+    const std::string owned(context);
+    return blake3pp::hash_file_options{
+        .mode = blake3pp::hash_mode::derive_key(owned)};
+  };
+  const auto from_temporary = [&] {
+    return blake3pp::hash_file_options{
+        .mode = blake3pp::hash_mode::derive_key(std::string(context))};
+  };
+  const auto from_scratch_buffer = [&] {
+    std::vector<char> buf(context.begin(), context.end());
+    blake3pp::hash_file_options opts{
+        .mode = blake3pp::hash_mode::derive_key(
+            std::string_view(buf.data(), buf.size()))};
+    std::fill(buf.begin(), buf.end(), '!');  // the view's bytes, overwritten
+    return opts;
+  };
+
+  for (const auto& opts :
+       {from_local_string(), from_temporary(), from_scratch_buffer()}) {
+    CHECK(opts.mode.which() == blake3pp::hash_mode::kind::derive_key);
+    CHECK(opts.mode.context() == context);
+    CHECK(blake3pp::hash_file(f.path, opts) == expect);
+  }
+}
 
 // The options object carries the mode, so hash_file() reaches all three
 // and make_hasher() hands the same hasher to a caller that needs a
