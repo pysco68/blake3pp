@@ -97,6 +97,25 @@
 
 namespace blake3pp::detail {
 
+// What the caller's stop does, from whichever thread requested it.
+// Both halves are safe from any thread: requesting is atomic, and
+// wake() is the one member of a driver another thread may call.
+template <class D>
+struct request_scope_stop {
+  ex::inplace_stop_source* source;
+  D* drv;
+  void operator()() const noexcept {
+    source->request_stop();
+    drv->wake();
+  }
+};
+
+// A type each translation unit has its own of; see window_scope's chain
+// builders.
+namespace {
+struct tu_tag {};
+}  // namespace
+
 // A node on the driver's run queue. Intrusive, so the queue allocates
 // nothing: the operation states that carry one are allocated once with
 // their window and reused for the whole file.
@@ -228,7 +247,6 @@ class driver_scheduler : public ex_compat::weakly_parallel_scheduler {
  public:
   using scheduler_concept = ex_compat::scheduler_tag;
 
-  driver_scheduler() noexcept = default;
   explicit driver_scheduler(driver_loop<D>* loop) noexcept : loop_(loop) {}
 
   [[nodiscard]] schedule_sender<D> schedule() const noexcept {
@@ -248,29 +266,42 @@ driver_scheduler<D> schedule_env<D>::query(
 }
 
 // --------------------------------------------------------------------
-// read_sender: one window's read.
+// io_sender: one window's read or write.
+//
+// One shape serves both directions, because from the pipeline's side the
+// two are the same operation: queue it, do not complete inside start(),
+// and take whatever poll() reports. The direction decides the buffer's
+// constness, which driver call submits it and whether the value
+// completion carries the bytes back; the rest only the driver knows.
 
-template <file_driver D, class Receiver>
-class read_op_state : public run_node {
+enum class io_dir { read, write };
+
+template <io_dir Dir>
+using io_buffer_t = std::conditional_t<Dir == io_dir::read,
+                                       std::span<std::byte>,
+                                       std::span<const std::byte>>;
+
+template <file_driver D, class Receiver, io_dir Dir>
+class io_op_state : public run_node {
  public:
   using operation_state_concept = ex_compat::operation_state_tag;
 
-  read_op_state(Receiver r, driver_loop<D>* loop, typename D::file* f,
-                std::uint64_t off, std::span<std::byte> buf, io_read_op* op)
+  io_op_state(Receiver r, driver_loop<D>* loop, typename D::file* f,
+              std::uint64_t off, io_buffer_t<Dir> buf, io_read_op* op)
       : rcvr_(std::move(r)), loop_(loop), file_(f), off_(off), buf_(buf),
         op_(op) {
     run = &deliver_parked;
   }
 
-  read_op_state(const read_op_state&) = delete;
-  read_op_state& operator=(const read_op_state&) = delete;
+  io_op_state(const io_op_state&) = delete;
+  io_op_state& operator=(const io_op_state&) = delete;
 
-  // Queues the read and returns: no flush, because the loop flushes once
-  // for every read it started this round, and no completion, because the
-  // backend only ever calls back from inside poll().
+  // Queues the transfer and returns: no flush, because the loop flushes
+  // once for every operation it started this round, and no completion,
+  // because the backend only ever calls back from inside poll().
   //
-  // A read that could not be queued owes no callback, and neither does
-  // one that was never submitted because stop had already been
+  // A transfer that could not be queued owes no callback, and neither
+  // does one that was never submitted because stop had already been
   // requested. Completing the receiver from start() would run the rest
   // of the window chain inside whatever started this one, so both park
   // on the run queue and arrive like every other completion: a
@@ -281,10 +312,13 @@ class read_op_state : public run_node {
       loop_->publish(this);
       return;
     }
-    op_->done = &on_read_done;
-    op_->owner = this;
+    bind_completion<&io_op_state::on_transfer_done>(*op_, *this);
     try {
-      loop_->driver().submit_read(*file_, off_, buf_, *op_);
+      if constexpr (Dir == io_dir::read) {
+        loop_->driver().submit_read(*file_, off_, buf_, *op_);
+      } else {
+        loop_->driver().submit_write(*file_, off_, buf_, *op_);
+      }
     } catch (const std::system_error& e) {
       ec_ = e.code();
       loop_->publish(this);
@@ -295,15 +329,14 @@ class read_op_state : public run_node {
   }
 
  private:
-  using token_type = decltype(ex::get_stop_token(
-      ex::get_env(std::declval<const Receiver&>())));
+  using token_type = ex::stop_token_of_t<ex::env_of_t<Receiver>>;
 
   [[nodiscard]] token_type stop_token() const noexcept {
     return ex::get_stop_token(ex::get_env(rcvr_));
   }
 
   static void deliver_parked(run_node* n) noexcept {
-    auto* const self = static_cast<read_op_state*>(n);
+    auto* const self = static_cast<io_op_state*>(n);
     if (self->stopped_) {
       ex::set_stopped(std::move(self->rcvr_));
     } else if (self->eptr_) {
@@ -313,169 +346,64 @@ class read_op_state : public run_node {
     }
   }
 
-  // A cancelled read is only a stop if this chain's token says so. The
-  // backends report the outcome, not the cause: operation_canceled from
-  // a device nobody asked to cancel is a read error like any other, and
-  // a cancel that lost the race brings data, which is used.
-  static void on_read_done(io_read_op* op, std::error_code ec) noexcept {
-    auto* const self = static_cast<read_op_state*>(op->owner);
+  // A cancelled transfer is only a stop if this chain's token says so.
+  // The backends report the outcome, not the cause: operation_canceled
+  // from a device nobody asked to cancel is an I/O error like any other,
+  // and a cancel that lost the race brings data, which is used.
+  void on_transfer_done(std::error_code ec) noexcept {
     if (ec) {
       if (ec == std::errc::operation_canceled &&
-          self->stop_token().stop_requested()) {
-        ex::set_stopped(std::move(self->rcvr_));
+          stop_token().stop_requested()) {
+        ex::set_stopped(std::move(rcvr_));
         return;
       }
-      ex::set_error(std::move(self->rcvr_), ec);
+      ex::set_error(std::move(rcvr_), ec);
       return;
     }
-    // The backend reads exactly what was asked for or reports an
-    // error, so the whole window is there.
-    ex::set_value(std::move(self->rcvr_),
-                  std::span<const std::byte>(self->buf_));
-  }
-
-  Receiver rcvr_;
-  driver_loop<D>* loop_;
-  typename D::file* file_;
-  std::uint64_t off_;
-  std::span<std::byte> buf_;
-  // The caller's, and outliving this state: the read is still owed when
-  // a stopped chain's cell is re-emplaced, and the scope has to be able
-  // to name it to cancel it.
-  io_read_op* op_;
-  std::error_code ec_{};
-  std::exception_ptr eptr_{};
-  bool stopped_ = false;
-};
-
-template <file_driver D>
-class read_sender {
- public:
-  using sender_concept = ex_compat::sender_tag;
-  BLAKE3PP_EX_COMPLETION_SIGNATURES(
-      ex::set_value_t(std::span<const std::byte>),
-      ex::set_error_t(std::error_code),
-      ex::set_error_t(std::exception_ptr),
-      ex::set_stopped_t());
-
-  read_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
-              std::span<std::byte> buf, io_read_op* op) noexcept
-      : loop_(loop), file_(f), off_(off), buf_(buf), op_(op) {}
-
-  template <class Receiver>
-  [[nodiscard]] read_op_state<D, Receiver> connect(Receiver r) const {
-    return {std::move(r), loop_, file_, off_, buf_, op_};
-  }
-
- private:
-  driver_loop<D>* loop_;
-  typename D::file* file_;
-  std::uint64_t off_;
-  std::span<std::byte> buf_;
-  io_read_op* op_;
-};
-
-// --------------------------------------------------------------------
-// write_sender: one window's write.
-//
-// The same operation state as a read, because from the pipeline's side
-// the two are one shape: queue it, do not complete inside start(), and
-// take whatever poll() reports. Only the direction differs, and only
-// the driver knows it.
-template <file_driver D, class Receiver>
-class write_op_state : public run_node {
- public:
-  using operation_state_concept = ex_compat::operation_state_tag;
-
-  write_op_state(Receiver r, driver_loop<D>* loop, typename D::file* f,
-                 std::uint64_t off, std::span<const std::byte> buf,
-                 io_read_op* op)
-      : rcvr_(std::move(r)), loop_(loop), file_(f), off_(off), buf_(buf),
-        op_(op) {
-    run = &deliver_parked;
-  }
-
-  write_op_state(const write_op_state&) = delete;
-  write_op_state& operator=(const write_op_state&) = delete;
-
-  void start() & noexcept {
-    if (stop_token().stop_requested()) {
-      stopped_ = true;
-      loop_->publish(this);
-      return;
-    }
-    op_->done = &on_write_done;
-    op_->owner = this;
-    try {
-      loop_->driver().submit_write(*file_, off_, buf_, *op_);
-    } catch (const std::system_error& e) {
-      ec_ = e.code();
-      loop_->publish(this);
-    } catch (...) {
-      eptr_ = std::current_exception();
-      loop_->publish(this);
-    }
-  }
-
- private:
-  using token_type = decltype(ex::get_stop_token(
-      ex::get_env(std::declval<const Receiver&>())));
-
-  [[nodiscard]] token_type stop_token() const noexcept {
-    return ex::get_stop_token(ex::get_env(rcvr_));
-  }
-
-  static void deliver_parked(run_node* n) noexcept {
-    auto* const self = static_cast<write_op_state*>(n);
-    if (self->stopped_) {
-      ex::set_stopped(std::move(self->rcvr_));
-    } else if (self->eptr_) {
-      ex::set_error(std::move(self->rcvr_), std::move(self->eptr_));
+    if constexpr (Dir == io_dir::read) {
+      // The backend reads exactly what was asked for or reports an
+      // error, so the whole window is there.
+      ex::set_value(std::move(rcvr_), std::span<const std::byte>(buf_));
     } else {
-      ex::set_error(std::move(self->rcvr_), self->ec_);
+      ex::set_value(std::move(rcvr_));
     }
-  }
-
-  static void on_write_done(io_read_op* op, std::error_code ec) noexcept {
-    auto* const self = static_cast<write_op_state*>(op->owner);
-    if (ec) {
-      if (ec == std::errc::operation_canceled &&
-          self->stop_token().stop_requested()) {
-        ex::set_stopped(std::move(self->rcvr_));
-        return;
-      }
-      ex::set_error(std::move(self->rcvr_), ec);
-      return;
-    }
-    ex::set_value(std::move(self->rcvr_));
   }
 
   Receiver rcvr_;
   driver_loop<D>* loop_;
   typename D::file* file_;
   std::uint64_t off_;
-  std::span<const std::byte> buf_;
+  io_buffer_t<Dir> buf_;
+  // The caller's, and outliving this state: the transfer is still owed
+  // when a stopped chain's cell is re-emplaced, and the scope has to be
+  // able to name it to cancel it.
   io_read_op* op_;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
   bool stopped_ = false;
 };
 
-template <file_driver D>
-class write_sender {
+template <file_driver D, io_dir Dir>
+class io_sender {
+  // A read hands its window on, a write has nothing left to say.
+  using value_signature =
+      std::conditional_t<Dir == io_dir::read,
+                         ex::set_value_t(std::span<const std::byte>),
+                         ex::set_value_t()>;
+
  public:
   using sender_concept = ex_compat::sender_tag;
-  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(),
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(value_signature,
                                     ex::set_error_t(std::error_code),
                                     ex::set_error_t(std::exception_ptr),
                                     ex::set_stopped_t());
 
-  write_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
-               std::span<const std::byte> buf, io_read_op* op) noexcept
+  io_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
+            io_buffer_t<Dir> buf, io_read_op* op) noexcept
       : loop_(loop), file_(f), off_(off), buf_(buf), op_(op) {}
 
   template <class Receiver>
-  [[nodiscard]] write_op_state<D, Receiver> connect(Receiver r) const {
+  [[nodiscard]] io_op_state<D, Receiver, Dir> connect(Receiver r) const {
     return {std::move(r), loop_, file_, off_, buf_, op_};
   }
 
@@ -483,77 +411,84 @@ class write_sender {
   driver_loop<D>* loop_;
   typename D::file* file_;
   std::uint64_t off_;
-  std::span<const std::byte> buf_;
+  io_buffer_t<Dir> buf_;
   io_read_op* op_;
 };
 
+template <file_driver D>
+using read_sender = io_sender<D, io_dir::read>;
+template <file_driver D>
+using write_sender = io_sender<D, io_dir::write>;
+
 // --------------------------------------------------------------------
-// stopped_if: the point in a stage where a value becomes a stop.
+// declared: an adaptor that states its completions instead of asking its
+// child, and gates its value on a stop token.
 //
-// ex::then cannot produce set_stopped, and a stage whose agents stopped
-// part-way must not hand its value on: the reducer would take a
-// chaining value folded from parts that were never compressed. So the
-// value channel is intercepted, and only that one -- an error still
-// reaches the scope as an error, which is what lets a failure outrank
-// the stop it caused.
-//
-// The token is read when the value arrives, after the stage's own work
-// has finished, so a stop requested while the agents were running is
-// still seen here.
-//
-// Its completions are DECLARED rather than derived from the child, which
-// is the point of it being written out rather than assembled from
-// let_value: stdexec's bulk cannot say how it completes without an
-// environment, and an adaptor that asks its child for signatures would
-// be asked in turn, with none, and fail to compile. Connecting asks with
-// the real environment, which is where the child is happy to answer.
-// The declared set is what a scheduler and a bulk of noexcept bodies can
-// produce; a channel listed here that the child never sends costs
+// let_value has to know how its child completes, and asks without an
+// environment; stdexec's bulk, and a chain containing schedule() on a
+// pool, cannot answer that -- they would be asked in turn, with no
+// environment, and fail to compile. Connecting asks with the real
+// environment, which is where the child is happy to answer. So the
+// completions here are DECLARED: what a scheduler and a bulk of noexcept
+// bodies can produce, with a channel the child never sends costing
 // nothing.
+//
+// The token turns an arriving value into a stop, which is what a stage
+// whose agents stopped part-way needs: the reducer must not take a
+// chaining value folded from parts that were never compressed. Only the
+// value channel is intercepted -- an error still reaches the scope as an
+// error, which is what lets a failure outrank the stop it caused -- and
+// the token is read when the value arrives, after the stage's own work
+// has finished, so a stop requested while the agents were running is
+// still seen. A default token never stops, which is how a chain that
+// only needs the declared signatures asks for a plain forward.
+//
 // Env is named rather than deduced from Op: the operation state holds
-// this receiver's operation by value, so it is still incomplete when
-// its type is worked out, and a deduced get_env() would need it whole.
-template <class Value, class Env, class Op>
-struct stopped_if_receiver {
+// this receiver's operation by value, so it is still incomplete when its
+// type is worked out, and a deduced get_env() would need it whole.
+template <class Env, class Op, class... Values>
+struct declared_receiver {
   using receiver_concept = ex_compat::receiver_tag;
   // RULE 5: a real constructor, and copyable.
-  explicit stopped_if_receiver(Op* o) noexcept : op(o) {}
+  explicit declared_receiver(Op* o) noexcept : op(o) {}
   Op* op;
 
   // Forwarded, not replaced: the stage below this reads its stop token
   // out of the scope's environment through here.
   [[nodiscard]] Env get_env() const noexcept { return op->downstream_env(); }
-  void set_value(Value v) && noexcept { op->value_arrived(std::move(v)); }
+  void set_value(Values... v) && noexcept {
+    op->value_arrived(std::move(v)...);
+  }
   void set_error(std::exception_ptr e) && noexcept {
     op->error_arrived(std::move(e));
   }
   void set_stopped() && noexcept { op->stop_arrived(); }
 };
 
-template <class Value, class Sender, class Receiver>
-class stopped_if_op {
+template <class Sender, class Receiver, class... Values>
+class declared_op {
  public:
   using operation_state_concept = ex_compat::operation_state_tag;
   using inner_receiver =
-      stopped_if_receiver<Value, ex::env_of_t<Receiver>, stopped_if_op>;
+      declared_receiver<ex::env_of_t<Receiver>, declared_op, Values...>;
 
-  stopped_if_op(Sender s, Receiver r, ex::inplace_stop_token t)
+  declared_op(Sender s, Receiver r, ex::inplace_stop_token t)
       : rcvr_(std::move(r)), token_(t),
         inner_(ex::connect(std::move(s), inner_receiver{this})) {}
 
-  stopped_if_op(const stopped_if_op&) = delete;
-  stopped_if_op& operator=(const stopped_if_op&) = delete;
+  declared_op(const declared_op&) = delete;
+  declared_op& operator=(const declared_op&) = delete;
 
   void start() & noexcept { ex::start(inner_); }
 
   [[nodiscard]] ex::env_of_t<Receiver> downstream_env() const noexcept {
     return ex::get_env(rcvr_);
   }
-  void value_arrived(Value v) noexcept {
+  void value_arrived(Values... v) noexcept {
     if (token_.stop_requested()) {
       ex::set_stopped(std::move(rcvr_));
     } else {
-      ex::set_value(std::move(rcvr_), std::move(v));
+      ex::set_value(std::move(rcvr_), std::move(v)...);
     }
   }
   void error_arrived(std::exception_ptr e) noexcept {
@@ -567,19 +502,19 @@ class stopped_if_op {
   ex::connect_result_t<Sender, inner_receiver> inner_;
 };
 
-template <class Value, class Sender>
-class stopped_if_sender {
+template <class Sender, class... Values>
+class declared_sender {
  public:
   using sender_concept = ex_compat::sender_tag;
-  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(Value),
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(Values...),
                                     ex::set_error_t(std::exception_ptr),
                                     ex::set_stopped_t());
 
-  stopped_if_sender(Sender s, ex::inplace_stop_token t)
+  declared_sender(Sender s, ex::inplace_stop_token t)
       : sndr_(std::move(s)), token_(t) {}
 
   template <class Receiver>
-  [[nodiscard]] stopped_if_op<Value, Sender, Receiver> connect(
+  [[nodiscard]] declared_op<Sender, Receiver, Values...> connect(
       Receiver r) const {
     return {sndr_, std::move(r), token_};
   }
@@ -589,11 +524,20 @@ class stopped_if_sender {
   ex::inplace_stop_token token_;
 };
 
-// Value is named rather than deduced: deducing it would mean asking the
-// child how it completes, which is the one thing this must not do.
-template <class Value, class Sender>
+// The value types are named rather than deduced: deducing them would
+// mean asking the child how it completes, which is the one thing this
+// must not do.
+template <class... Values, class Sender>
+[[nodiscard]] auto declared(Sender&& s) {
+  return declared_sender<std::remove_cvref_t<Sender>, Values...>{
+      std::forward<Sender>(s), {}};
+}
+
+// The same adaptor with a token: the point in a stage where a value
+// becomes a stop.
+template <class... Values, class Sender>
 [[nodiscard]] auto stopped_if(ex::inplace_stop_token token, Sender&& s) {
-  return stopped_if_sender<Value, std::remove_cvref_t<Sender>>{
+  return declared_sender<std::remove_cvref_t<Sender>, Values...>{
       std::forward<Sender>(s), token};
 }
 
@@ -617,7 +561,7 @@ struct loop_status {
 template <file_driver D>
 class driver_loop {
  public:
-  explicit driver_loop(D& drv) noexcept : drv_(&drv) {}
+  explicit driver_loop(D& drv) noexcept : drv_(drv) {}
   driver_loop(const driver_loop&) = delete;
   driver_loop& operator=(const driver_loop&) = delete;
 
@@ -640,7 +584,7 @@ class driver_loop {
     return driver_scheduler<D>{this};
   }
 
-  [[nodiscard]] D& driver() noexcept { return *drv_; }
+  [[nodiscard]] D& driver() noexcept { return drv_; }
 
   // Where to record what this thread spends its time on; null records
   // nothing, which is the default and costs one branch per poll.
@@ -661,7 +605,7 @@ class driver_loop {
   void publish(run_node* n) noexcept {
     publishers_.fetch_add(1, std::memory_order_relaxed);
     queue_.push(n);
-    drv_->wake();
+    drv_.wake();
     publishers_.fetch_sub(1, std::memory_order_release);
   }
 
@@ -707,7 +651,7 @@ class driver_loop {
         }
         return;
       }
-      drv_->flush();
+      drv_.flush();
       const bool block = queue_.empty();
       // What in_flight() exists for. Sleeping with no
       // read owed by the driver, nothing to run and nothing outstanding
@@ -716,16 +660,16 @@ class driver_loop {
       // because the shapes that reach it are configurations, not bugs a
       // sanitizer lane would find. Nothing is in flight at this point,
       // which is what makes unwinding from here safe.
-      if (block && drv_->in_flight() == 0 && status.outstanding == 0) {
+      if (block && drv_.in_flight() == 0 && status.outstanding == 0) {
         on_stall();
       }
       if (stats_ == nullptr) {
-        drv_->poll(block);
+        drv_.poll(block);
         continue;
       }
       const std::int64_t t_poll = trace_->now();
       stats_->busy_ns += static_cast<std::uint64_t>(t_poll - t);
-      const std::size_t ran = drv_->poll(block);
+      const std::size_t ran = drv_.poll(block);
       t = trace_->now();
       ++stats_->polls;
       if (block) {
@@ -740,11 +684,6 @@ class driver_loop {
         stats_->busy_ns += static_cast<std::uint64_t>(t - t_poll);
       }
     }
-  }
-
-  template <class BeforeFlush>
-  void run_until(const loop_status& status, BeforeFlush&& before_flush) {
-    run_until(status, std::forward<BeforeFlush>(before_flush), &stall);
   }
 
   void run_until(const loop_status& status) {
@@ -786,16 +725,138 @@ class driver_loop {
   }
 
   void poll_once() {
-    drv_->flush();
-    drv_->poll(true);
+    drv_.flush();
+    drv_.poll(true);
   }
 
  private:
-  D* drv_;
+  D& drv_;
   run_queue queue_;
   std::atomic<unsigned> publishers_{0};
   trace_buffer* trace_ = nullptr;
   driver_stats* stats_ = nullptr;
+};
+
+// --------------------------------------------------------------------
+// What both scopes do with a stop and a failure.
+
+// The read and the write pipeline agree on everything about stopping: one
+// stop source for the run, a latch that decides which failure the caller
+// hears about, a count of the ones it drops, and a teardown that cannot
+// trust the loop. They disagree about what a cancel sweep names and about
+// when a run is done, which is why this is a base they derive from rather
+// than a member they hold: the parts that differ stay in the scope, and
+// the members below are protected so the scope keeps naming them directly.
+//
+// Derived must provide loop() and sweep_cancels().
+template <class Derived, class D>
+class pipeline_scope_base {
+ protected:
+  [[nodiscard]] bool stop_requested() const noexcept {
+    return stop_source_.stop_requested();
+  }
+
+  // Requesting is what reaches the stages: a receiver's environment hands
+  // this source's token down its chain.
+  void request_stop() noexcept { stop_source_.request_stop(); }
+
+  // The first failure is the one the caller hears about. Stop and error
+  // race by construction -- requesting stop is what makes the other
+  // windows finish, and one of them may fail on the way out -- so the
+  // latch decides: whatever was latched first wins, and a failure latched
+  // at any point outranks the stop it caused.
+  void latch_error(std::error_code ec) noexcept {
+    if (!ec_ && !eptr_) {
+      ec_ = ec;
+    } else {
+      ++dropped_failures_;
+    }
+  }
+  void latch_exception(std::exception_ptr e) noexcept {
+    if (!ec_ && !eptr_) {
+      eptr_ = std::move(e);
+    } else {
+      ++dropped_failures_;
+    }
+  }
+
+  // The stop's own completion, for the blocking entry points: they have
+  // no receiver to report set_stopped to, and an error_code is the only
+  // channel they have.
+  void throw_if_stopped(const char* what) const {
+    if (stopped_ || stop_requested()) {
+      throw std::system_error(
+          std::make_error_code(std::errc::operation_canceled), what);
+    }
+  }
+
+  // The stop path for a loop that can no longer be trusted to run.
+  //
+  // Reached when an exception has left the run, so the normal round --
+  // request, sweep, let the completions arrive -- cannot simply be
+  // continued: the poll that threw may throw again. The first two steps
+  // are the same as any stop's; what differs is the wait behind them.
+  // Nothing on the pool may publish into an operation cell once the cells
+  // are destroyed, so every transfer in flight is waited out here, with
+  // the cells still alive.
+  //
+  // The error the caller is already unwinding with is the one it keeps:
+  // whatever a poll throws here is dropped, and after max_failed_polls of
+  // them the driver is not asked again. From then on the run queue alone
+  // is watched, since a window on the pool publishes without the driver's
+  // help, and the transfers the driver still owes are drained through it,
+  // which runs no callback and leaves no operation referenced.
+  static constexpr unsigned max_failed_polls = 8;
+
+  void quiesce() noexcept {
+    Derived& self = static_cast<Derived&>(*this);
+    request_stop();
+    // Same sweep as a normal round's: the transfers still owed are what
+    // this is waiting for, and asking the device to give them back is what
+    // shortens the wait. Advisory, so a backend that cannot is no worse
+    // off than before.
+    self.sweep_cancels();
+    unsigned failed_polls = 0;
+    for (;;) {
+      self.loop().drain();
+      if (in_flight_ == 0) {
+        break;
+      }
+      if (failed_polls < max_failed_polls) {
+        try {
+          self.loop().poll_once();
+        } catch (...) {
+          ++failed_polls;
+        }
+        continue;
+      }
+      // Every chain the driver does not owe as a transfer is on the pool
+      // or on the run queue, and comes back on its own. Once only
+      // transfers are left the driver drains them itself, running no
+      // callback, so no context still references an op once the cells are
+      // gone.
+      if (in_flight_ <= self.loop().driver().in_flight()) {
+        self.loop().driver().drain();
+        break;
+      }
+      std::this_thread::yield();
+    }
+    self.loop().settle_publishers();
+  }
+
+  loop_status status_{};
+  unsigned in_flight_ = 0;
+  // The one stop of the run. Every window receiver's environment answers
+  // with its token, and the scope's own admission, sweep and settle read
+  // it: there is no second flag that could disagree with it.
+  ex::inplace_stop_source stop_source_;
+  bool stopped_ = false;
+  // Failures after the first. They are dropped rather than reported --
+  // the first one is the cause and the rest are usually what stopping did
+  // -- and counted so a run can say how many there were.
+  std::uint64_t dropped_failures_ = 0;
+  std::error_code ec_{};
+  std::exception_ptr eptr_{};
 };
 
 // --------------------------------------------------------------------
@@ -1171,17 +1232,17 @@ template <stack_budget Budget, file_driver D>
 class pipeline_host {
  public:
   pipeline_host(D& drv, unsigned windows, std::size_t window_bytes)
-      : drv_(&drv), loop_(drv), pool_(drv, windows, window_bytes) {}
+      : drv_(drv), loop_(drv), pool_(drv, windows, window_bytes) {}
 
   pipeline_host(const pipeline_host&) = delete;
   pipeline_host& operator=(const pipeline_host&) = delete;
 
-  [[nodiscard]] D& driver() noexcept { return *drv_; }
+  [[nodiscard]] D& driver() noexcept { return drv_; }
   [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
   [[nodiscard]] window_pool<Budget>& pool() noexcept { return pool_; }
 
  private:
-  D* drv_;
+  D& drv_;
   driver_loop<D> loop_;
   window_pool<Budget> pool_;
 };
@@ -1206,7 +1267,29 @@ using pipeline_cells_for = pipeline_cells<
                          typename Scope::scope_receiver>>;
 
 template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
-class window_scope {
+class window_scope
+    : public pipeline_scope_base<window_scope<Traced, Budget, D, Scheduler>,
+                                 D> {
+  // The base drives this scope's loop and sweep, both of which are its
+  // own business and nobody else's.
+  friend class pipeline_scope_base<window_scope, D>;
+
+  // The base holds the stop source, the failure latch and the in-flight
+  // count; these bring them in unqualified.
+  using base = pipeline_scope_base<window_scope, D>;
+  using base::dropped_failures_;
+  using base::ec_;
+  using base::eptr_;
+  using base::in_flight_;
+  using base::latch_error;
+  using base::latch_exception;
+  using base::quiesce;
+  using base::request_stop;
+  using base::status_;
+  using base::stop_requested;
+  using base::stop_source_;
+  using base::stopped_;
+
   // The cell store is built outside this class, because the cell types
   // are the return types of the chain builders below and those are only
   // nameable once the class is complete.
@@ -1214,22 +1297,11 @@ class window_scope {
   friend struct pipeline_cells;
 
  public:
- public:
   using cv_type = std::array<std::uint32_t, 8>;
   // The window objects are the pool's; the scope only borrows them.
   using window = pipeline_window<Budget>;
 
-  // What the caller's stop does, from whichever thread requested it.
-  // Both halves are safe from any thread: requesting is atomic, and
-  // wake() is the one member of a driver another thread may call.
-  struct request_scope_stop {
-    ex::inplace_stop_source* source;
-    D* drv;
-    void operator()() const noexcept {
-      source->request_stop();
-      drv->wake();
-    }
-  };
+  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
   using outer_stop_callback =
       ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
 
@@ -1450,9 +1522,6 @@ class window_scope {
     give_back_all();
   }
 
-  // Asks this run to stop, from the driver thread.
-  void stop() noexcept { request_stop(); }
-
   // Whether a stop has taken this run, for a caller reporting a run that
   // never started.
   [[nodiscard]] bool stopped() const noexcept {
@@ -1510,21 +1579,9 @@ class window_scope {
     return admission_stalls_;
   }
 
-  // Failures after the one the caller was told about.
-  [[nodiscard]] std::uint64_t dropped_failures() const noexcept {
-    return dropped_failures_;
-  }
-
  private:
-  // The stop's own completion, for the blocking entry points: they have
-  // no receiver to report set_stopped to, and an error_code is the only
-  // channel they have.
   void throw_if_stopped() const {
-    if (stopped_ || stop_requested()) {
-      throw std::system_error(
-          std::make_error_code(std::errc::operation_canceled),
-          "blake3pp: the file pipeline was stopped");
-    }
+    base::throw_if_stopped("blake3pp: the file pipeline was stopped");
   }
 
  public:
@@ -1607,58 +1664,8 @@ class window_scope {
 
  private:
 
-  // The stop path for a loop that can no longer be trusted to run.
-  //
-  // Reached when an exception has left run_until, so the normal round --
-  // request, sweep, let the completions arrive -- cannot simply be
-  // continued: the poll that threw may throw again. The first two steps
-  // are the same as any stop's; what differs is the wait behind them.
-  // Nothing on the pool may publish into an operation cell once the
-  // cells are destroyed, so every window in flight is waited out here,
-  // with the cells still alive.
-  //
-  // The error the caller is already unwinding with is the one it keeps:
-  // whatever a poll throws here is dropped, and after max_failed_polls
-  // of them the driver is not asked again. From then on the run queue
-  // alone is watched, since a window on the pool publishes without the
-  // driver's help, and the reads the driver still owes are drained
-  // through it, which runs no callback and leaves no operation
-  // referenced.
-  static constexpr unsigned max_failed_polls = 8;
-
-  void quiesce() noexcept {
-    request_stop();
-    // Same sweep as a normal round's: the reads still owed are what this
-    // is waiting for, and asking the device to give them back is what
-    // shortens the wait. Advisory, so a backend that cannot is no worse
-    // off than before.
-    sweep_cancels();
-    unsigned failed_polls = 0;
-    for (;;) {
-      loop_.drain();
-      if (in_flight_ == 0) {
-        break;
-      }
-      if (failed_polls < max_failed_polls) {
-        try {
-          loop_.poll_once();
-        } catch (...) {
-          ++failed_polls;
-        }
-        continue;
-      }
-      // Every chain the driver does not owe as a read is on the pool or
-      // on the run queue, and comes back on its own. Once only reads are
-      // left the driver drains them itself, running no callback, so no
-      // context still references an op once the cells are gone.
-      if (in_flight_ <= loop_.driver().in_flight()) {
-        loop_.driver().drain();
-        break;
-      }
-      std::this_thread::yield();
-    }
-    loop_.settle_publishers();
-  }
+  // The loop the base's quiesce drives, which is the host's.
+  [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
 
   // Where the next window sits in the file: what take_next() hands out,
   // computed from the scope's cursor alone so a window can be planned
@@ -1720,6 +1727,14 @@ class window_scope {
 
   // One window, start to finish. The middle line is the compress stage;
   // everything around it is the same for every window.
+  // The three chain builders are templates on a tag that is a different
+  // type in every translation unit (an anonymous namespace), for the
+  // reason RULE 6 in ex_compat.hpp gives one layer down: their return
+  // types carry a provider's internal-linkage sender types, while a
+  // non-template member's mangled name does not, so without the tag two
+  // units' builders have one name and the linker keeps one body for
+  // layouts that may differ.
+  template <class Tag = tu_tag>
   [[nodiscard]] auto window_chain(window& w) {
     return ex::then(
         ex::continues_on(
@@ -1735,6 +1750,7 @@ class window_scope {
   // An edge window with nothing worth fanning out: read it, hold it, and
   // let the hasher take the whole thing at the end. Small last windows
   // land here, and so does a file below one window.
+  template <class Tag = tu_tag>
   [[nodiscard]] auto read_only_chain(window& w) {
     return ex::then(loop_.read(file_, w.offset, w.read_into, w.op),
                     [this, &w](std::span<const std::byte>) noexcept {
@@ -1757,6 +1773,7 @@ class window_scope {
   // exists separately because its value type is a node count, and
   // generalising the full window's chain to carry either would put a
   // branch on the path every window takes.
+  template <class Tag = tu_tag>
   [[nodiscard]] auto edge_chain(window& w) {
     return ex::then(
         ex::continues_on(
@@ -1793,17 +1810,8 @@ class window_scope {
                             h_.key_words(), h_.mode_flags(), trace_, w.index);
     const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
     const ex::inplace_stop_token tok = stop_source_.get_token();
-    if constexpr (Traced) {
-      return stopped_if<std::size_t>(
-          tok, ex::then(compress_edge_on<true>(sched_, w.compress, out, tok),
-                        [this, &w](std::size_t nodes) noexcept {
-                          stamp_agents(w);
-                          return nodes;
-                        }));
-    } else {
-      return stopped_if<std::size_t>(
-          tok, compress_edge_on<false>(sched_, w.compress, out, tok));
-    }
+    return stamped<std::size_t>(
+        w, tok, compress_edge_on<Traced>(sched_, w.compress, out, tok));
   }
 
   // On the driver, like every other insert.
@@ -1825,25 +1833,23 @@ class window_scope {
   [[nodiscard]] auto compress_stage(window& w) {
     read_landed(w);
     const ex::inplace_stop_token tok = stop_source_.get_token();
+    return stamped<cv_type>(w, tok, compress_on<Traced>(sched_, w.compress, tok));
+  }
+
+  // A compress stage's tail: stopped if the run was, and, when tracing,
+  // the agents' record stamped on the way through.
+  template <class Value, class Stage>
+  [[nodiscard]] auto stamped(window& w, ex::inplace_stop_token tok,
+                             Stage&& stage) {
     if constexpr (Traced) {
-      return stopped_if<cv_type>(
-          tok, ex::then(compress_on<true>(sched_, w.compress, tok),
-                        [this, &w](const cv_type& cv) noexcept {
-                          if (w.rec != nullptr) {
-                            w.rec->t_joined = trace_->now();
-                            w.rec->agent_busy_ns =
-                                w.compress.pt.busy_ns.load(
-                                    std::memory_order_relaxed);
-                            w.rec->agents_active =
-                                w.compress.pt.active.load(
-                                    std::memory_order_relaxed);
-                            w.rec->flags |= window_record::flag_parallel;
-                          }
-                          return cv;
+      return stopped_if<Value>(
+          tok, ex::then(std::forward<Stage>(stage),
+                        [this, &w](Value v) noexcept {
+                          stamp_agents(w);
+                          return v;
                         }));
     } else {
-      return stopped_if<cv_type>(tok,
-                                 compress_on<false>(sched_, w.compress, tok));
+      return stopped_if<Value>(tok, std::forward<Stage>(stage));
     }
   }
 
@@ -2071,38 +2077,16 @@ class window_scope {
     }
   }
 
-  void on_done(window& w) noexcept {
-    --in_flight_;
-    // Whatever this window reserved in the reducer is now either in it
-    // or never coming.
-    in_flight_nodes_ -= w.plan.node_cost;
-    if (&w != last_window_) {
-      release(w);
-    }
-    settle();
-  }
+  void on_done(window& w) noexcept { finish_window(w); }
 
-  // The first failure is the one the caller hears about. Stop and error
-  // race by construction -- requesting stop is what makes the other
-  // windows finish, and one of them may fail on the way out -- so the
-  // latch decides: whatever was latched first wins, and a failure
-  // latched at any point outranks the stop it caused.
   void on_error(window& w, std::error_code ec) noexcept {
-    if (!ec_ && !eptr_) {
-      ec_ = ec;
-    } else {
-      ++dropped_failures_;
-    }
+    latch_error(ec);
     request_stop();
     finish_window(w);
   }
 
   void on_exception(window& w, std::exception_ptr e) noexcept {
-    if (!ec_ && !eptr_) {
-      eptr_ = std::move(e);
-    } else {
-      ++dropped_failures_;
-    }
+    latch_exception(std::move(e));
     request_stop();
     finish_window(w);
   }
@@ -2139,14 +2123,6 @@ class window_scope {
       status_.done = true;
     }
   }
-
-  [[nodiscard]] bool stop_requested() const noexcept {
-    return stop_source_.stop_requested();
-  }
-
-  // Requesting is what reaches the stages: every window receiver's
-  // environment hands this source's token down its chain.
-  void request_stop() noexcept { stop_source_.request_stop(); }
 
   // Asks the device to abandon the reads that have not landed. On the
   // driver thread, once per read: the sweep runs every round while stop
@@ -2278,7 +2254,6 @@ class window_scope {
   // both in flight at once.
   std::array<std::array<tree_reducer::node, edge_node_cap>, 2> edge_nodes_{};
 
-  loop_status status_{};
   // What this scope currently holds, so the cancel sweep names its own
   // reads and not another pipeline's sharing the same pool.
   window* taken_ = nullptr;
@@ -2287,24 +2262,12 @@ class window_scope {
   window* last_window_ = nullptr;
   std::uint64_t next_offset_ = 0;
   std::uint64_t index_ = 0;
-  unsigned in_flight_ = 0;
   unsigned reading_ = 0;  // windows whose read has not landed
   unsigned max_reading_ = 0;
   unsigned max_windows_ = 0;
   std::size_t in_flight_nodes_ = 0;
   std::uint64_t admission_stalls_ = 0;
   std::size_t max_pending_ = 0;
-  // The one stop of the run. Every window receiver's environment answers
-  // with its token, and the scope's own admission, sweep and settle read
-  // it: there is no second flag that could disagree with it.
-  ex::inplace_stop_source stop_source_;
-  bool stopped_ = false;
-  // Failures after the first. They are dropped rather than reported --
-  // the first one is the cause and the rest are usually what stopping
-  // did -- and counted so a run can say how many there were.
-  std::uint64_t dropped_failures_ = 0;
-  std::error_code ec_{};
-  std::exception_ptr eptr_{};
 };
 
 // The connected chains of one run: one cell per window the scope may
@@ -2342,27 +2305,20 @@ struct pipeline_cells {
   pipeline_cells(const pipeline_cells&) = delete;
   pipeline_cells& operator=(const pipeline_cells&) = delete;
 
-  struct connect_full {
+  // Builds a cell's operation state in place: an operation state does
+  // not move, so the optional is given a conversion rather than a value.
+  template <class Op, auto Chain>
+  struct connect_as {
     Scope* scope;
     window* w;
-    operator full_op() const {
-      return ex::connect(scope->window_chain(*w), receiver{scope, w});
+    operator Op() const {
+      return ex::connect((scope->*Chain)(*w), receiver{scope, w});
     }
   };
-  struct connect_read {
-    Scope* scope;
-    window* w;
-    operator read_only_op() const {
-      return ex::connect(scope->read_only_chain(*w), receiver{scope, w});
-    }
-  };
-  struct connect_edge {
-    Scope* scope;
-    window* w;
-    operator edge_op() const {
-      return ex::connect(scope->edge_chain(*w), receiver{scope, w});
-    }
-  };
+  using connect_full = connect_as<full_op, &Scope::template window_chain<>>;
+  using connect_read =
+      connect_as<read_only_op, &Scope::template read_only_chain<>>;
+  using connect_edge = connect_as<edge_op, &Scope::template edge_chain<>>;
 
   std::unique_ptr<std::optional<full_op>[]> full;
   // One cell of each shape per edge window: the first and the last can
@@ -2429,22 +2385,27 @@ namespace pipeline_conformance {
 using probe = ex_compat::probe_receiver;
 
 static_assert(ex::sender<read_sender<io_driver>>);
-static_assert(ex::operation_state<read_op_state<io_driver, probe>>);
+static_assert(ex::operation_state<io_op_state<io_driver, probe, io_dir::read>>);
 static_assert(ex::sender<write_sender<io_driver>>);
-static_assert(ex::operation_state<write_op_state<io_driver, probe>>);
-// stopped_if over a sender with no surprises of its own, so the asserts
-// are about the adaptor and not about whatever it happens to wrap.
-using stopped_cv_child = decltype(ex::just(std::array<std::uint32_t, 8>{}));
-using stopped_cv =
-    stopped_if_sender<std::array<std::uint32_t, 8>, stopped_cv_child>;
-static_assert(ex::sender<stopped_cv>);
+static_assert(ex::operation_state<io_op_state<io_driver, probe, io_dir::write>>);
+// The declared adaptor over senders with no surprises of their own, so
+// the asserts are about the adaptor and not about whatever it happens to
+// wrap: the two value shapes the pipeline gates, and the valueless one
+// the write side forwards.
+using declared_cv_child = decltype(ex::just(std::array<std::uint32_t, 8>{}));
+using declared_cv =
+    declared_sender<declared_cv_child, std::array<std::uint32_t, 8>>;
+static_assert(ex::sender<declared_cv>);
 static_assert(ex::operation_state<
-              stopped_if_op<std::array<std::uint32_t, 8>, stopped_cv_child,
-                            probe>>);
-using stopped_n_child = decltype(ex::just(std::size_t{}));
-static_assert(ex::sender<stopped_if_sender<std::size_t, stopped_n_child>>);
+              declared_op<declared_cv_child, probe,
+                          std::array<std::uint32_t, 8>>>);
+using declared_n_child = decltype(ex::just(std::size_t{}));
+static_assert(ex::sender<declared_sender<declared_n_child, std::size_t>>);
 static_assert(
-    ex::operation_state<stopped_if_op<std::size_t, stopped_n_child, probe>>);
+    ex::operation_state<declared_op<declared_n_child, probe, std::size_t>>);
+using declared_void_child = decltype(ex::just());
+static_assert(ex::sender<declared_sender<declared_void_child>>);
+static_assert(ex::operation_state<declared_op<declared_void_child, probe>>);
 static_assert(ex::sender<schedule_sender<io_driver>>);
 static_assert(ex::operation_state<schedule_op<io_driver, probe>>);
 static_assert(ex::scheduler<driver_scheduler<io_driver>>);

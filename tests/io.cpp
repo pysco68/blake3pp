@@ -160,10 +160,133 @@ TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
   const auto expected =
       blake3pp::keyed_hash(std::span<const std::byte, 32>{key}, content);
 
-  CHECK(blake3pp::hash_file(f.path, {.key = key}) == expected);
+  const blake3pp::hash_mode mode = blake3pp::hash_mode::keyed(key);
+  CHECK(blake3pp::hash_file(f.path, {.mode = mode}) == expected);
   CHECK(blake3pp::hash_file(f.path, blake3pp::get_parallel_scheduler(),
-                            {.window_bytes = 1024 * 1024, .key = key}) ==
+                            {.window_bytes = 1024 * 1024, .mode = mode}) ==
         expected);
+}
+
+// One mode per options object, by construction: there is one member, named
+// the way hasher names the same choice, so no call can ask for two modes.
+// These pin the shape that makes it true -- a field per mode would put the
+// contradiction back.
+static_assert(std::is_same_v<decltype(blake3pp::hash_file_options{}.mode),
+                             blake3pp::hash_mode>);
+// Through concepts, because a member access on a concrete type is a hard
+// error rather than a substitution failure.
+template <class T>
+concept has_key_field = requires(T o) { o.key; };
+template <class T>
+concept has_context_field = requires(T o) { o.derive_context; };
+static_assert(!has_key_field<blake3pp::hash_file_options>);
+static_assert(!has_context_field<blake3pp::hash_file_options>);
+
+// And no mode arrives by conversion: a key or a string reaches it through
+// the named functions, never by being assigned to the member.
+template <class T>
+concept converts_to_mode = std::convertible_to<T, blake3pp::hash_mode>;
+static_assert(!converts_to_mode<std::string_view>);
+static_assert(!converts_to_mode<const char*>);
+static_assert(!converts_to_mode<std::array<std::byte, blake3pp::key_size>>);
+static_assert(!converts_to_mode<std::span<const std::byte, blake3pp::key_size>>);
+
+// The mode owns its context, like its key, so every spelling of the string
+// is accepted: the mode is what has to outlive the operation, and it does
+// that on its own.
+template <class S>
+concept names_context = requires(S s) {
+  blake3pp::hash_mode::derive_key(std::move(s));
+};
+static_assert(names_context<std::string_view>);
+static_assert(names_context<std::string>);
+static_assert(names_context<const char*>);
+
+static_assert(blake3pp::hash_mode::plain().which() ==
+              blake3pp::hash_mode::kind::plain);
+static_assert(blake3pp::hash_file_options{}.mode.which() ==
+              blake3pp::hash_mode::kind::plain);
+static_assert(
+    blake3pp::hash_file_options{
+        .mode = blake3pp::hash_mode::keyed(std::array<std::byte, 32>{})}
+        .mode.which() == blake3pp::hash_mode::kind::keyed);
+
+// A context borrowed from the string that named it would dangle: the
+// string is gone by the time the options are used, which the mode cannot
+// notice and the digest cannot survive. Every way of producing one is
+// here, because a named lvalue dangles exactly as a temporary does once
+// the options outlive its scope.
+TEST_CASE("a mode's context outlives the string it was built from") {
+  const auto content = make_input(4096);
+  const temp_file f(content);
+  constexpr std::string_view context = "blake3pp 2026-10-03 lifetime";
+
+  blake3pp::hasher expect_h = blake3pp::hasher::derive_key(context);
+  expect_h.update(content);
+  const blake3pp::digest expect = expect_h.finalize();
+
+  const auto from_local_string = [&] {
+    const std::string owned(context);
+    return blake3pp::hash_file_options{
+        .mode = blake3pp::hash_mode::derive_key(owned)};
+  };
+  const auto from_temporary = [&] {
+    return blake3pp::hash_file_options{
+        .mode = blake3pp::hash_mode::derive_key(std::string(context))};
+  };
+  const auto from_scratch_buffer = [&] {
+    std::vector<char> buf(context.begin(), context.end());
+    blake3pp::hash_file_options opts{
+        .mode = blake3pp::hash_mode::derive_key(
+            std::string_view(buf.data(), buf.size()))};
+    std::fill(buf.begin(), buf.end(), '!');  // the view's bytes, overwritten
+    return opts;
+  };
+
+  for (const auto& opts :
+       {from_local_string(), from_temporary(), from_scratch_buffer()}) {
+    CHECK(opts.mode.which() == blake3pp::hash_mode::kind::derive_key);
+    CHECK(opts.mode.context() == context);
+    CHECK(blake3pp::hash_file(f.path, opts) == expect);
+  }
+}
+
+// The options object carries the mode, so hash_file() reaches all three
+// and make_hasher() hands the same hasher to a caller that needs a
+// finalize form hash_file() does not have.
+TEST_CASE("hash_file_options carries the mode") {
+  std::array<std::byte, 32> key{};
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<std::byte>(7 * i + 1);
+  }
+  constexpr std::string_view context = "blake3pp 2026-10-02 options test";
+  const auto content = make_input(1024 * 1024 + 7);
+  const temp_file f(content);
+
+  blake3pp::hasher derived = blake3pp::hasher::derive_key(context);
+  derived.update(content);
+
+  const blake3pp::hash_file_options opts{.window_bytes = 256 * 1024,
+                                         .mode = blake3pp::hash_mode::derive_key(context)};
+  CHECK(blake3pp::hash_file(f.path, opts) == derived.finalize());
+  CHECK(blake3pp::hash_file(f.path, blake3pp::get_parallel_scheduler(),
+                            opts) == derived.finalize());
+
+  // make_hasher() is the same hasher hash_file() builds internally, which
+  // is what gets extended output out of an options object.
+  blake3pp::hasher h = blake3pp::make_hasher(opts);
+  blake3pp::update_file(h, f.path, opts);
+  std::vector<std::byte> got(96);
+  std::vector<std::byte> expected(96);
+  h.finalize(got);
+  derived.finalize(expected);
+  CHECK(got == expected);
+
+  // The other two modes, through the same entry point.
+  CHECK(blake3pp::make_hasher({.mode = blake3pp::hash_mode::keyed(key)}).finalize() ==
+        blake3pp::hasher::keyed(std::span<const std::byte, 32>{key})
+            .finalize());
+  CHECK(blake3pp::make_hasher({}).finalize() == blake3pp::hasher{}.finalize());
 }
 
 // update_file() is hasher::update() with a file as the source, so every
@@ -610,7 +733,7 @@ TEST_CASE("io_uring destroy reaps in-flight reads before the ring goes") {
   file.try_odirect(f.path.c_str(), O_RDONLY | O_CLOEXEC);
   const aligned_buffer buf = make_aligned_buffer(content.size());
   std::memset(buf.get(), 0, content.size());
-  ring.submit_rw(IORING_OP_READ, file.fd, buf.get(),
+  ring.submit_rw(IORING_OP_READ, file.fd(), buf.get(),
                  static_cast<unsigned>(content.size()), 0, 0, true);
   ring.destroy();
   CHECK(ring.outstanding == 0);

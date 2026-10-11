@@ -52,7 +52,8 @@ composes with everything else:
 ```cpp
 blake3pp::hasher h = blake3pp::hasher::keyed(key);   // incremental MAC
 blake3pp::update_file(h, path);                      // ...over a file
-auto tag = blake3pp::hash_file(path, sched, {.key = key});   // ...and cores
+auto tag = blake3pp::hash_file(path, sched,
+                               {.mode = blake3pp::hash_mode::keyed(key)});
 ```
 
 ### Output: 32 bytes, or a stream
@@ -193,8 +194,12 @@ blake3pp knowing Boost exists, and without lossy transcoding on Windows.
 #### Inside the pipeline
 
 The knobs are `file_io_options`, and `hash_file_options` — which adds the
-SIMD variant and an optional key for the hasher it builds — converts to
-them, so one options object can drive both:
+SIMD variant and the mode for the hasher it builds — converts to them, so
+one options object can drive both. The mode is one value a key or a context
+string names (`hash_mode::keyed(key)`, `hash_mode::derive_key("context")`),
+so a request cannot be keyed and derived at once. It copies both, so the
+options may outlive whatever named them. `make_hasher(opts)` hands back that
+hasher, for the finalize forms `hash_file()` does not have:
 
 ```cpp
 #include <blake3pp/parallel_io.hpp>   // io.hpp + parallel.hpp
@@ -217,6 +222,34 @@ which halved the pipeline there, 22 against 41 GiB/s. The
 `offload_submit` option turns the hand-off off for callers who want the
 submit inline (`--inline-submit` in the tools), and the writer behind
 `blake3ppgen --output` takes the same option.
+
+### Writing a file
+
+The reverse direction is `write_file()`: a generator fills windows, the
+library writes them through the same per-OS mechanism the reader uses
+(io_uring + `O_DIRECT`, IOCP + `FILE_FLAG_NO_BUFFERING`, GCD + `F_NOCACHE`,
+or synchronous `pwrite`). Three forms, one generator shape
+`fill(std::span<std::byte> out, std::uint64_t offset)`:
+
+```cpp
+// A known length, generated on the calling thread.
+auto wrote = blake3pp::write_file("seed.bin", 1 << 30, fill);
+wrote.backend;   // "io_uring+direct", "pwrite", ...
+
+// A length the generator decides: it returns how many bytes it produced,
+// and anything short of a whole window ends the file.
+auto all = blake3pp::write_file("stream.bin", produce);
+
+// The windows filled over a scheduler, written while the next fills
+// (<blake3pp/parallel_io.hpp>).
+blake3pp::write_file("seed.bin", 1 << 30, fill, pool.get_scheduler());
+```
+
+The generator must depend on its offset and nothing else in the scheduler
+form, where windows are filled concurrently and in no particular order; it
+must not throw in any of them. On failure the file is left as far as it
+got and is not truncated, because a length invented for bytes that were
+never produced would hide the failure.
 
 For many files rather than one large one, there is a third layer:
 `<blake3pp/async_io.hpp>` turns the same pipeline into senders over a

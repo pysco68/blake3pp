@@ -7,7 +7,7 @@ of the key can produce or trust.
 [Try it on Compiler Explorer](https://pysco68.github.io/blake3pp/try/10-authenticated-manifest/)
 
 ```cpp
-auto tag = blake3pp::hash_file(path, {.key = key});   // one line of the manifest
+auto tag = blake3pp::hash_file(path, {.mode = blake3pp::hash_mode::keyed(key)});
 ...
 if (!recomputed.matches(expected_hex)) { /* reject */ }
 ```
@@ -41,10 +41,14 @@ one comes from a key store or a key-derivation step — see
 [03-keyed-and-derive-key](../03-keyed-and-derive-key/) for `derive_key`,
 which turns one master secret into purpose-bound subkeys.
 
-Note that `hash_file_options` carries a key but not a context string:
-`derive_key` and extended output have no shortcut there. Build the hasher
-yourself and feed it with `update_file()`, as
-[05-hash-a-file](../05-hash-a-file/) does.
+`hash_file_options` carries one mode, named as `hasher` names the same
+choice: `hash_mode::keyed(key)` or `hash_mode::derive_key(context)`. All
+three modes are therefore `hash_file()`'s, and no options object can ask for
+two at once.
+
+Extended output has no shortcut there, since the digest it returns is 32
+bytes. Take the hasher the options describe with `make_hasher()` and stream
+it with `update_file()`, as [05-hash-a-file](../05-hash-a-file/) does.
 
 ## Running it
 

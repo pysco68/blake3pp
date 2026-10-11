@@ -22,33 +22,33 @@
 namespace blake3pp::detail::io_impl {
 
 struct posix_file {
-  int fd_plain = -1;  // always-buffered fd (unaligned tails, fallback)
-  int fd = -1;        // == fd_plain unless the O_DIRECT reopen engaged
-  bool direct = false;
-
   posix_file() = default;
   posix_file(const posix_file&) = delete;
   posix_file& operator=(const posix_file&) = delete;
-  ~posix_file() {
-    if (fd != fd_plain && fd >= 0) {
-      ::close(fd);
-    }
-    if (fd_plain >= 0) {
-      ::close(fd_plain);
-    }
+
+  // The always-buffered descriptor: unaligned tails and the fallback.
+  [[nodiscard]] int fd_plain() const noexcept { return plain_.get(); }
+  // The fast one: the O_DIRECT reopen when it engaged, else the plain.
+  [[nodiscard]] int fd() const noexcept {
+    return direct_ ? direct_.get() : plain_.get();
   }
+  // Whether the fast descriptor bypasses the page cache: a second
+  // O_DIRECT descriptor, or the plain one with caching switched off.
+  [[nodiscard]] bool direct() const noexcept {
+    return bool(direct_) || nocache_;
+  }
+  void set_direct() noexcept { nocache_ = true; }
 
   void open(const char* path, int flags, ::mode_t mode = 0) {
-    fd_plain = ::open(path, flags, mode);
-    if (fd_plain < 0) {
+    plain_.reset(::open(path, flags, mode));
+    if (!plain_) {
       throw_errno("open");
     }
-    fd = fd_plain;
   }
 
   [[nodiscard]] std::uint64_t stat_size() const {
     struct stat st;
-    if (::fstat(fd_plain, &st) != 0) {
+    if (::fstat(fd_plain(), &st) != 0) {
       throw_errno("fstat");
     }
     return static_cast<std::uint64_t>(st.st_size);
@@ -59,11 +59,7 @@ struct posix_file {
   // lacks the flag or the filesystem refuses it.
   void try_odirect(const char* path, int flags) noexcept {
 #if defined(O_DIRECT)
-    const int dfd = ::open(path, flags | O_DIRECT);
-    if (dfd >= 0) {
-      fd = dfd;
-      direct = true;
-    }
+    direct_.reset(::open(path, flags | O_DIRECT));
 #else
     (void)path;
     (void)flags;
@@ -73,7 +69,7 @@ struct posix_file {
   // Picks the fd for a synchronous positional transfer: direct only when
   // engaged AND the length keeps O_DIRECT's alignment contract.
   [[nodiscard]] int sync_fd(std::size_t len) const noexcept {
-    return direct && len % direct_align == 0 ? fd : fd_plain;
+    return direct() && len % direct_align == 0 ? fd() : fd_plain();
   }
 
   void pread_all(int use_fd, std::byte* dst, std::size_t len,
@@ -111,6 +107,11 @@ struct posix_file {
       put += static_cast<std::size_t>(n);
     }
   }
+
+ private:
+  unique_fd plain_;
+  unique_fd direct_;
+  bool nocache_ = false;
 };
 
 }  // namespace blake3pp::detail::io_impl

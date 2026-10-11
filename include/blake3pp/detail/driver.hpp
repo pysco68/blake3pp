@@ -30,6 +30,35 @@ namespace blake3pp::detail {
 // against this one.
 inline constexpr std::size_t direct_alignment = 4096;
 
+// Binds an operation's completion to a member of the object that owns it:
+//
+//   bind_completion<&slot::complete>(slot.op, slot);
+//
+// The OS hands a backend nothing but an address, so one cast back to the
+// owner's type is unavoidable; this is where it lives, instead of a static
+// trampoline and a cast at every call site. Works for any operation with
+// the `done` and `owner` pair, which is both of them.
+//
+// A backend's own operation derives from the one the callback is declared
+// over, so the callback's parameter type comes from the field rather than
+// from the argument: binding a derived op must still produce the base's
+// signature.
+template <class F>
+struct completion_param;
+template <class Base>
+struct completion_param<void (*)(Base*, std::error_code) noexcept> {
+  using type = Base;
+};
+
+template <auto Member, class Op, class Owner>
+void bind_completion(Op& op, Owner& owner) noexcept {
+  using base = typename completion_param<decltype(Op::done)>::type;
+  op.owner = &owner;
+  op.done = +[](base* b, std::error_code ec) noexcept {
+    (static_cast<Owner*>(b->owner)->*Member)(ec);
+  };
+}
+
 // A read in flight. Caller-owned and at a fixed address from submit_read
 // until its callback has run.
 //

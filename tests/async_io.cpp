@@ -628,7 +628,7 @@ TEST_CASE("a keyed async hash matches the keyed in-memory one") {
   auto sched = blake3pp::get_parallel_scheduler();
   record rec;
   auto op = ex::connect(
-      async::async_hash_file(ctx, f.path(), sched, {.key = key}),
+      async::async_hash_file(ctx, f.path(), sched, {.mode = blake3pp::hash_mode::keyed(key)}),
       move_only_receiver{&rec});
   ex::start(op);
   ctx.run_until_idle();

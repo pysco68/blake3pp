@@ -63,24 +63,6 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 #endif
 }  // namespace detail
 
-/// Knobs for write_file(): the geometry of a generated file.
-///
-/// The defaults are blake3ppgen's measured shape, not the reader's:
-/// 64 MiB windows, two in flight. On four PCIe 5 drives in RAID 0 with
-/// 32 threads that measured 24.2 GiB/s, against 20.7 at 128 MiB x 4 and
-/// 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
-/// volume slows down.
-struct file_write_options {
-  /// Bytes per window; rounded to a power of two in the reader's range.
-  std::size_t window_bytes = detail::default_write_window_bytes;
-  /// Windows in flight, clamped to [2, 32].
-  unsigned queue_depth = detail::default_write_queue_depth;
-  /// Bypass the page cache where the platform can.
-  bool direct_io = true;
-  /// io_uring: issue on io-wq rather than inline in the submit call.
-  bool offload_submit = true;
-};
-
 /// Generates a file of exactly `size` bytes, filling each window over a
 /// scheduler and writing it through the platform's fastest path.
 ///
@@ -110,7 +92,7 @@ template <class Scheduler, class Fill>
 void write_file(const std::filesystem::path& path, std::uint64_t size,
                 Fill&& fill, Scheduler&& sched,
                 const file_write_options& opts = {}) {
-  detail::io_driver drv({/*async=*/true, opts.offload_submit},
+  detail::io_driver drv({opts.async, opts.offload_submit},
                         detail::clamp_queue_depth(opts.queue_depth));
   detail::io_driver::file file(
       drv, path,
@@ -121,6 +103,29 @@ void write_file(const std::filesystem::path& path, std::uint64_t size,
                              std::forward<Fill>(fill), size,
                              {.window_bytes = opts.window_bytes,
                               .queue_depth = opts.queue_depth});
+}
+
+/// write_file() over a scheduler, reporting failure through ec instead of
+/// throwing.
+///
+/// An I/O failure arrives as its own error code. An allocation failure,
+/// an exception from the generator and whatever the execution provider
+/// raises all read as not_enough_memory, as in every ec overload here.
+/// @param path   The file to create or truncate.
+/// @param size   How many bytes to generate.
+/// @param fill   The generator, called per window on the pool.
+/// @param sched  Where the fills run.
+/// @param ec     Cleared on success; the failure otherwise.
+/// @param opts   The geometry.
+template <class Scheduler, class Fill>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+void write_file(const std::filesystem::path& path, std::uint64_t size,
+                Fill&& fill, Scheduler&& sched, std::error_code& ec,
+                const file_write_options& opts = {}) noexcept {
+  detail::with_error_code(ec, [&] {
+    write_file(path, size, std::forward<Fill>(fill),
+               std::forward<Scheduler>(sched), opts);
+  });
 }
 
 /// Streams a file into a hasher with every complete window fanned out
@@ -194,14 +199,14 @@ void update_file(hasher& h, const std::filesystem::path& path,
 }
 
 /// One-shot digest of a file over the full pipeline: a hasher shaped by
-/// opts (SIMD variant, optional key), the file streamed through it
-/// multi-core, finalized.
+/// opts (SIMD variant, and plain, keyed or key-derivation mode), the file
+/// streamed through it multi-core, finalized.
 /// @tparam Budget     The stack a window's part table may take; see
 ///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 /// @throws std::system_error on I/O failure, and whatever the execution
 ///         provider raises.
 ///
@@ -228,7 +233,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
 /// @param ec     Cleared on success; the error otherwise.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
 template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
@@ -276,7 +281,7 @@ void update_file(hasher& h, const P& path, Scheduler&& sched,
 /// hash_file() over a scheduler for a foreign path type.
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
           class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
@@ -291,7 +296,7 @@ template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
 /// @param ec     Cleared on success; the error otherwise.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
 template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
           class Scheduler>

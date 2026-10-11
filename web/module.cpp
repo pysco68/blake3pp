@@ -69,7 +69,10 @@ class thread_pool {
 using pooled_hasher = parallel_hasher<parallel_scheduler_t>;
 
 // hasher
-hasher make_hasher(const std::string& variant) { return hasher{arch_named(variant)}; }
+// Not named make_hasher: blake3pp::make_hasher is visible through the
+// using-directive, and &make_hasher would then name an overload set that
+// embind's constructor() cannot deduce.
+hasher new_hasher(const std::string& variant) { return hasher{arch_named(variant)}; }
 void hasher_update(hasher& h, std::uintptr_t ptr, std::size_t len) { h.update(in(ptr, len)); }
 void hasher_update_text(hasher& h, const std::string& text) { h.update(text); }
 std::string hasher_finalize(const hasher& h) { return h.finalize().to_hex(); }
@@ -125,7 +128,7 @@ std::string best_available_() { return to_string(best_available()); }
 EMSCRIPTEN_BINDINGS(blake3pp) {
   using namespace emscripten;
   class_<hasher>("hasher")
-      .constructor(&make_hasher)
+      .constructor(&new_hasher)
       .function("update", &hasher_update)
       .function("update", &hasher_update_text)
       .function("finalize", &hasher_finalize)

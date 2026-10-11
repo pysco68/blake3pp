@@ -39,82 +39,9 @@
 #include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/file_writer.hpp>
 
 namespace blake3pp::detail {
-
-// A barrier with DECLARED completions.
-//
-// let_value has to know how its child completes, and asks without an
-// environment; a chain containing schedule() on a pool cannot answer
-// that -- the same limitation stopped_if works around on the read side.
-// This forwards every completion unchanged and states its own
-// signatures, so nothing downstream ever asks the fill chain.
-template <class Env, class Op>
-struct barrier_receiver {
-  using receiver_concept = ex_compat::receiver_tag;
-  explicit barrier_receiver(Op* o) noexcept : op(o) {}
-  Op* op;
-
-  [[nodiscard]] Env get_env() const noexcept { return op->downstream_env(); }
-  void set_value() && noexcept { op->value_arrived(); }
-  void set_error(std::exception_ptr e) && noexcept {
-    op->error_arrived(std::move(e));
-  }
-  void set_stopped() && noexcept { op->stop_arrived(); }
-};
-
-template <class Sender, class Receiver>
-class barrier_op {
- public:
-  using operation_state_concept = ex_compat::operation_state_tag;
-  using inner_receiver = barrier_receiver<ex::env_of_t<Receiver>, barrier_op>;
-
-  barrier_op(Sender s, Receiver r)
-      : rcvr_(std::move(r)),
-        inner_(ex::connect(std::move(s), inner_receiver{this})) {}
-
-  barrier_op(const barrier_op&) = delete;
-  barrier_op& operator=(const barrier_op&) = delete;
-
-  void start() & noexcept { ex::start(inner_); }
-
-  [[nodiscard]] ex::env_of_t<Receiver> downstream_env() const noexcept {
-    return ex::get_env(rcvr_);
-  }
-  void value_arrived() noexcept { ex::set_value(std::move(rcvr_)); }
-  void error_arrived(std::exception_ptr e) noexcept {
-    ex::set_error(std::move(rcvr_), std::move(e));
-  }
-  void stop_arrived() noexcept { ex::set_stopped(std::move(rcvr_)); }
-
- private:
-  Receiver rcvr_;
-  ex::connect_result_t<Sender, inner_receiver> inner_;
-};
-
-template <class Sender>
-class barrier_sender {
- public:
-  using sender_concept = ex_compat::sender_tag;
-  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(),
-                                    ex::set_error_t(std::exception_ptr),
-                                    ex::set_stopped_t());
-
-  explicit barrier_sender(Sender s) : sndr_(std::move(s)) {}
-
-  template <class Receiver>
-  [[nodiscard]] barrier_op<Sender, Receiver> connect(Receiver r) const {
-    return {sndr_, std::move(r)};
-  }
-
- private:
-  Sender sndr_;
-};
-
-template <class Sender>
-[[nodiscard]] auto declared(Sender&& s) {
-  return barrier_sender<std::remove_cvref_t<Sender>>{std::forward<Sender>(s)};
-}
 
 // What a write run needs beyond the plan.
 struct write_options {
@@ -122,15 +49,6 @@ struct write_options {
   unsigned queue_depth = 2;
   ex::inplace_stop_token stop_token{};
 };
-
-// The default geometry for a generated file: 64 MiB windows, two in
-// flight. Not the reader's budget -- this is blake3ppgen's measured
-// shape, from four PCIe 5 drives in RAID 0, 32 threads, 32 GiB written:
-// 24.2 GiB/s at 64 MiB x 2 and 23.8 at 64 MiB x 4, against 20.7 at the
-// uncapped 128 MiB x 4 and 14.8 at 256 MiB x 8. Past a few hundred MiB
-// in flight a striped NVMe volume slows down.
-inline constexpr std::size_t default_write_window_bytes = 64 * 1024 * 1024;
-inline constexpr unsigned default_write_queue_depth = 2;
 
 // Several write chains in flight over one file, all on the caller's
 // thread.
@@ -140,7 +58,26 @@ inline constexpr unsigned default_write_queue_depth = 2;
 // time; a chain may only start while a buffer is free and fewer than the
 // plan's writes are in flight.
 template <file_driver D, class Scheduler, class Fill>
-class write_scope {
+class write_scope
+    : public pipeline_scope_base<write_scope<D, Scheduler, Fill>, D> {
+  // The base drives this scope's loop and sweep, and holds the state the
+  // read scope shares.
+  friend class pipeline_scope_base<write_scope, D>;
+
+  using base = pipeline_scope_base<write_scope, D>;
+  using base::dropped_failures_;
+  using base::ec_;
+  using base::eptr_;
+  using base::in_flight_;
+  using base::latch_error;
+  using base::latch_exception;
+  using base::quiesce;
+  using base::request_stop;
+  using base::status_;
+  using base::stop_requested;
+  using base::stop_source_;
+  using base::stopped_;
+
  public:
   write_scope(D& drv, typename D::file& file, Scheduler sched, Fill fill,
               std::uint64_t total, const write_options& opts)
@@ -262,14 +199,7 @@ class write_scope {
 
   static_assert(std::copy_constructible<scope_receiver>);
 
-  struct request_scope_stop {
-    ex::inplace_stop_source* source;
-    D* drv;
-    void operator()() const noexcept {
-      source->request_stop();
-      drv->wake();
-    }
-  };
+  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
   using outer_stop_callback =
       ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
 
@@ -365,21 +295,13 @@ class write_scope {
   void on_done(window& w) noexcept { finish_window(w); }
 
   void on_error(window& w, std::error_code ec) noexcept {
-    if (!ec_ && !eptr_) {
-      ec_ = ec;
-    } else {
-      ++dropped_failures_;
-    }
+    latch_error(ec);
     request_stop();
     finish_window(w);
   }
 
   void on_exception(window& w, std::exception_ptr e) noexcept {
-    if (!ec_ && !eptr_) {
-      eptr_ = std::move(e);
-    } else {
-      ++dropped_failures_;
-    }
+    latch_exception(std::move(e));
     request_stop();
     finish_window(w);
   }
@@ -407,46 +329,12 @@ class write_scope {
     }
   }
 
-  [[nodiscard]] bool stop_requested() const noexcept {
-    return stop_source_.stop_requested();
-  }
-  void request_stop() noexcept { stop_source_.request_stop(); }
-
   void throw_if_stopped() const {
-    if (stopped_ || stop_requested()) {
-      throw std::system_error(
-          std::make_error_code(std::errc::operation_canceled),
-          "blake3pp: the write pipeline was stopped");
-    }
+    base::throw_if_stopped("blake3pp: the write pipeline was stopped");
   }
 
-  static constexpr unsigned max_failed_polls = 8;
-
-  void quiesce() noexcept {
-    request_stop();
-    sweep_cancels();
-    unsigned failed_polls = 0;
-    for (;;) {
-      loop_.drain();
-      if (in_flight_ == 0) {
-        break;
-      }
-      if (failed_polls < max_failed_polls) {
-        try {
-          loop_.poll_once();
-        } catch (...) {
-          ++failed_polls;
-        }
-        continue;
-      }
-      if (in_flight_ <= loop_.driver().in_flight()) {
-        loop_.driver().drain();
-        break;
-      }
-      std::this_thread::yield();
-    }
-    loop_.settle_publishers();
-  }
+  // The loop the base's quiesce drives, which this scope owns.
+  [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
 
   void push_free(window* w) noexcept {
     w->next_free = free_;
@@ -464,15 +352,10 @@ class write_scope {
   ex::inplace_stop_token opts_stop_token_;
   std::unique_ptr<window[]> windows_;
 
-  loop_status status_{};
+
   window* free_ = nullptr;
   std::uint64_t next_offset_ = 0;
-  unsigned in_flight_ = 0;
-  ex::inplace_stop_source stop_source_;
-  bool stopped_ = false;
-  std::uint64_t dropped_failures_ = 0;
-  std::error_code ec_{};
-  std::exception_ptr eptr_{};
+
 };
 
 // Generates one file on this thread, fanning the fills out over sched.

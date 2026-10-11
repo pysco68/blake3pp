@@ -183,11 +183,17 @@ template <class Token>
   }
 }
 
-template <bool Traced, class Scheduler, class Body,
+template <stack_budget Budget>
+struct window_compress;
+
+template <bool Traced, class Scheduler, stack_budget Budget,
           class Token = ex::never_stop_token>
-[[nodiscard]] auto part_bulk_sender(Scheduler& sched, std::size_t n,
-                                    Body& body, std::atomic<std::size_t>& next,
-                                    part_trace* pt, Token tok = {}) {
+[[nodiscard]] auto part_bulk_sender(Scheduler& sched,
+                                    window_compress<Budget>& body,
+                                    Token tok = {}) {
+  const std::size_t n = body.n_parts;
+  std::atomic<std::size_t>& next = body.next;
+  part_trace* const pt = &body.pt;
   if constexpr (Traced) {
     return ex::schedule(sched) |
            ex::bulk(ex::par, n, [n, &body, &next, pt,
@@ -438,7 +444,7 @@ template <bool Traced, stack_budget Budget, class Scheduler,
           class Token = ex::never_stop_token>
 [[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w,
                                Token tok = {}) {
-  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt, tok) |
+  return part_bulk_sender<Traced>(sched, w, tok) |
          ex::then([&w]() noexcept {
            // The fold runs even when the agents stopped early: the part
            // table is zeroed with the window it lives in, so this reads
@@ -479,7 +485,7 @@ template <bool Traced, stack_budget Budget, class Scheduler,
                                     window_compress<Budget>& w,
                                     std::span<tree_reducer::node> out,
                                     Token tok = {}) {
-  return part_bulk_sender<Traced>(sched, w.n_parts, w, w.next, &w.pt, tok) |
+  return part_bulk_sender<Traced>(sched, w, tok) |
          ex::then([&w, out]() noexcept {
            return fold_aligned_runs(
                w.ops, w.key, w.flags,

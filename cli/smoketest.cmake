@@ -88,6 +88,46 @@ elseif(CASE STREQUAL "check_roundtrip")
     message(FATAL_ERROR "--check accepted a corrupted checksum")
   endif()
 
+elseif(CASE STREQUAL "check_batched")
+  # Several files verify over one context (the batched path), and the
+  # lines come back in list order with one bad digest among them. Each
+  # file is written at a different size so the windows differ.
+  file(WRITE "${WORK}/one" "first file")
+  string(REPEAT "second file " 4000 bulk)
+  file(WRITE "${WORK}/two" "${bulk}")
+  file(WRITE "${WORK}/three" "third file")
+  run_sum(sums res ARGS one two three)
+  if(NOT res EQUAL 0)
+    message(FATAL_ERROR "hashing failed (rc=${res})")
+  endif()
+  file(WRITE "${WORK}/sums" "${sums}")
+  run_sum(out res ARGS --check sums)
+  if(NOT res EQUAL 0 OR NOT out MATCHES "one: OK.*two: OK.*three: OK")
+    message(FATAL_ERROR "batched --check lost files or their order (rc=${res}): ${out}")
+  endif()
+
+  # The middle line's digest is corrupted: that file alone must FAIL, and
+  # the two around it must still be reported, in order.
+  string(REPLACE "\n" ";" lines "${sums}")
+  set(bad "")
+  foreach(line ${lines})
+    if(line MATCHES "two$")
+      string(SUBSTRING "${line}" 1 -1 rest)
+      string(SUBSTRING "${line}" 0 1 first)
+      if(first STREQUAL "0")
+        set(line "1${rest}")
+      else()
+        set(line "0${rest}")
+      endif()
+    endif()
+    string(APPEND bad "${line}\n")
+  endforeach()
+  file(WRITE "${WORK}/bad_sums" "${bad}")
+  run_sum(out res ARGS --check bad_sums)
+  if(res EQUAL 0 OR NOT out MATCHES "one: OK.*two: FAILED.*three: OK")
+    message(FATAL_ERROR "batched --check mislabelled the corrupted file (rc=${res}): ${out}")
+  endif()
+
 elseif(CASE STREQUAL "length_prefix")
   # Extended output: the 32-byte digest is the prefix of any longer output.
   file(WRITE "${WORK}/f" "extended output prefix property")

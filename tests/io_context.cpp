@@ -489,6 +489,42 @@ TEST_CASE("an IOCP file closed with deferred transfers takes them with it") {
 }
 #endif
 
+#if defined(__APPLE__)
+// Closing a file's descriptor does not wait for the dispatch workers
+// reading through it, so a file destroyed with a transfer in flight lets
+// a worker read into memory its owner has released -- or, once the
+// number is recycled, read a different file through it and report
+// success. The per-file drain has to wait them out first, so after the
+// destructor the transfer has completed into the buffer and none of it
+// is reported. The read is large enough that it cannot have finished in
+// the microseconds the destructor itself takes, so a missing drain fails
+// here rather than by luck.
+TEST_CASE("a GCD file waits out its workers before its descriptor closes") {
+  const auto content = pattern(32 * 1024 * 1024, 71);
+  const temp_file f(content);
+  io_impl::gcd_context ctx({}, 4);
+  std::vector<std::byte> buf(content.size());
+  io_impl::gcd_context::read_op op{};
+  probe p;
+  op.done = &probe::on_done;
+  op.owner = &p;
+  {
+    io_impl::gcd_context::file file(ctx, f.path, io_impl::file_open_options{});
+    ctx.submit_read(file, 0, std::span{buf}, op);
+    ctx.flush();
+    CHECK(ctx.in_flight() == 1);
+  }
+  // The worker ran to completion through a descriptor that was still
+  // open, and its result was dropped rather than delivered.
+  CHECK(op.filled == content.size());
+  CHECK(op.error == 0);
+  CHECK(buf == content);
+  CHECK(ctx.in_flight() == 0);
+  CHECK(ctx.poll(false) == 0);
+  CHECK(p.calls == 0);
+}
+#endif
+
 TEST_CASE("a write reports only from poll, and lands what it was given") {
   // Every length in [0, 2 blocks] at the interesting boundaries: the
   // direct-I/O path can only take whole granules, so the rest go down

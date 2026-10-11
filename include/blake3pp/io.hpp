@@ -38,11 +38,14 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <utility>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/file_writer.hpp>
 
 namespace blake3pp {
 
@@ -71,6 +74,78 @@ struct file_io_options {
   trace_buffer* trace = nullptr;
 };
 
+/// Which BLAKE3 mode a hasher built from options runs in: plain, keyed
+/// (MAC/PRF), or key derivation.
+///
+/// One value rather than one field per mode: a hash is keyed or derived or
+/// neither, and asking for two of those does not compile. The mode is named
+/// the way hasher spells the same choice, so the two read alike:
+///
+/// @code
+/// blake3pp::hash_file_options plain{};
+/// blake3pp::hash_file_options mac{
+///     .mode = blake3pp::hash_mode::keyed(my_key)};
+/// blake3pp::hash_file_options kdf{
+///     .mode = blake3pp::hash_mode::derive_key("fixture v3 2026-09")};
+/// @endcode
+class hash_mode {
+ public:
+  /// Which of the three a mode value holds.
+  enum class kind { plain, keyed, derive_key };
+
+  /// Plain hashing.
+  constexpr hash_mode() noexcept = default;
+  /// Plain hashing, named: what a default-constructed mode is.
+  [[nodiscard]] static constexpr hash_mode plain() noexcept { return {}; }
+
+  /// Keyed (MAC/PRF) mode: BLAKE3's replacement for HMAC, as
+  /// hasher::keyed().
+  /// @param key  Exactly key_size bytes, enforced by the span extent.
+  [[nodiscard]] static constexpr hash_mode keyed(
+      std::span<const std::byte, key_size> key) noexcept {
+    hash_mode m;
+    m.kind_ = kind::keyed;
+    for (std::size_t i = 0; i < key_size; ++i) {
+      m.key_[i] = key[i];
+    }
+    return m;
+  }
+
+  /// Key-derivation mode, as hasher::derive_key(): the input is key material
+  /// and the output a subkey bound to the context, which should be
+  /// hardcoded, globally unique and application-specific (see the BLAKE3
+  /// spec); it is not a secret.
+  ///
+  /// The context is copied, like the key: a mode outlives the expression
+  /// that built it -- an options object holds one, and the senders in
+  /// <blake3pp/async_io.hpp> hold a copy of the options for the whole
+  /// operation -- so a borrowed string would have to outlive all of that,
+  /// and nothing at the call site says it does.
+  /// @param context  The domain-separation string.
+  [[nodiscard]] static hash_mode derive_key(std::string_view context) {
+    hash_mode m;
+    m.kind_ = kind::derive_key;
+    m.context_.assign(context);
+    return m;
+  }
+
+  /// Which mode this is.
+  [[nodiscard]] constexpr kind which() const noexcept { return kind_; }
+  /// The key, when which() is keyed.
+  [[nodiscard]] constexpr std::span<const std::byte, key_size> key()
+      const noexcept {
+    return key_;
+  }
+  /// The context string, when which() is derive_key. A view of this mode's
+  /// own copy, valid as long as the mode is.
+  [[nodiscard]] std::string_view context() const noexcept { return context_; }
+
+ private:
+  std::array<std::byte, key_size> key_{};
+  std::string context_;
+  kind kind_ = kind::plain;
+};
+
 /// hash_file()'s knobs: the pipeline's, plus what shapes the hasher it
 /// constructs internally.
 ///
@@ -90,10 +165,13 @@ struct hash_file_options {
   bool direct_io = true;
   /// Issue reads on the kernel's I/O worker threads; see file_io_options.
   bool offload_submit = true;
-  /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
-  /// derive_key and extended output have no shortcut here: build the
-  /// hasher yourself and use update_file().
-  std::optional<std::array<std::byte, key_size>> key = std::nullopt;
+  /// Plain, keyed or key-derivation mode: `hash_mode::keyed(key)` or
+  /// `hash_mode::derive_key(context)`, named as hasher spells them.
+  ///
+  /// Extended output has no shortcut here, since hash_file() returns a
+  /// 32-byte digest: take the hasher these options describe (make_hasher()),
+  /// stream it with update_file() and finalize it to any length.
+  hash_mode mode{};
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing.
   trace_buffer* trace = nullptr;
@@ -109,9 +187,13 @@ namespace detail {
 
 inline hasher make_hasher(const hash_file_options& opts,
                           const kern::kernel_ops* ops) noexcept {
-  if (opts.key.has_value()) {
-    return hasher::keyed(std::span<const std::byte, key_size>{opts.key.value()},
-                         ops);
+  switch (opts.mode.which()) {
+    case hash_mode::kind::keyed:
+      return hasher::keyed(opts.mode.key(), ops);
+    case hash_mode::kind::derive_key:
+      return hasher::derive_key(opts.mode.context(), ops);
+    case hash_mode::kind::plain:
+      break;
   }
   return hasher{ops};
 }
@@ -139,6 +221,26 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
 }
 
 }  // namespace detail
+
+/// The hasher these options describe: its SIMD variant and its mode.
+///
+/// hash_file() builds this internally; it is public so a caller that needs
+/// a finalize form hash_file() does not have -- extended output, the
+/// seekable reader -- can stream the same options through update_file()
+/// without respelling the mode selection.
+/// @param opts  The variant and mode; the pipeline knobs are ignored here.
+///
+/// @code
+/// blake3pp::hash_file_options opts{
+///     .mode = blake3pp::hash_mode::derive_key("fixture v3 2026-09")};
+/// blake3pp::hasher h = blake3pp::make_hasher(opts);
+/// blake3pp::update_file(h, "seed.bin", opts);
+/// auto stream = h.finalize_xof();
+/// @endcode
+[[nodiscard]] inline hasher make_hasher(
+    const hash_file_options& opts) noexcept {
+  return detail::make_hasher(opts, detail::resolve(opts.a));
+}
 
 /// Streams a file's bytes into a hasher, as `h.update()` would, and returns
 /// with h open for more input or any finalize form.
@@ -169,6 +271,185 @@ void update_file(hasher& h, const std::filesystem::path& path,
 void update_file(hasher& h, const std::filesystem::path& path,
                  std::error_code& ec,
                  const file_io_options& opts = {}) noexcept;
+
+/// Knobs for write_file(): the geometry of a generated file.
+///
+/// The defaults are blake3ppgen's measured shape, not the reader's:
+/// 64 MiB windows, two in flight. On four PCIe 5 drives in RAID 0 with
+/// 32 threads that measured 24.2 GiB/s, against 20.7 at 128 MiB x 4 and
+/// 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
+/// volume slows down.
+struct file_write_options {
+  /// Bytes per window; rounded to a power of two in the reader's range.
+  std::size_t window_bytes = detail::default_write_window_bytes;
+  /// Windows in flight, clamped to [2, 32].
+  unsigned queue_depth = detail::default_write_queue_depth;
+  /// Bypass the page cache where the platform can.
+  bool direct_io = true;
+  /// Queue writes asynchronously (io_uring, IOCP, GCD) where the platform
+  /// offers it; off writes synchronously, as a platform that offers none
+  /// does anyway.
+  bool async = true;
+  /// io_uring: issue on io-wq rather than inline in the submit call.
+  bool offload_submit = true;
+};
+
+/// What a write_file() run did.
+struct write_report {
+  /// Bytes written: the size that was asked for, or what the generator
+  /// produced before it stopped.
+  std::uint64_t bytes = 0;
+  /// Which mechanism carried them, as the writer names it:
+  /// "io_uring+direct", "iocp+direct", "gcd-write+nocache", "pwrite",
+  /// "writefile" or "stdio", each with the reason appended where an
+  /// asynchronous rung was asked for and refused. Owned by the report,
+  /// because the writer that composed it is gone by then.
+  std::string backend;
+};
+
+namespace detail {
+
+// Both sequential write_file() forms: fill one buffer at a time, submit
+// it and move on, so the producer fills the next while the device drains
+// this one. take(buffer) says how many bytes the generator put in it;
+// fewer than the buffer holds ends the file, which is also the only
+// position where a direct-I/O write may be unaligned.
+template <class Take>
+write_report write_sequential(const std::filesystem::path& path,
+                              std::uint64_t preallocate, Take take,
+                              const file_write_options& opts) {
+  file_writer writer(path,
+                     {.buffer_bytes = opts.window_bytes,
+                      .queue_depth = opts.queue_depth,
+                      .direct_io = opts.direct_io,
+                      .async = opts.async,
+                      .offload_submit = opts.offload_submit,
+                      .preallocate_bytes = preallocate});
+  std::uint64_t done = 0;
+  for (;;) {
+    file_writer::buffer b = writer.acquire();
+    const std::size_t n = take(b, done);
+    if (n > 0) {
+      writer.submit(b, n);
+      done += n;
+    }
+    if (n < b.capacity) {
+      break;
+    }
+  }
+  writer.finish();
+  return {done, std::string(writer.backend())};
+}
+
+}  // namespace detail
+
+/// Generates a file of exactly `size` bytes on the calling thread, writing
+/// it through the platform's fastest path.
+///
+/// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
+/// offset)`, once per window and in file order, and must fill every byte
+/// of `out`. It must not throw: an exception from it leaves the file as
+/// far as it got. The parallel_io.hpp overload takes the same generator
+/// and runs the windows over a scheduler instead.
+///
+/// On success the file is exactly `size` bytes. On failure the file is
+/// left as far as it got: what lies past the last landed window is
+/// unspecified, and it is NOT truncated, because a length invented for
+/// bytes that were never produced would hide the failure.
+/// @param path  The file to create or truncate.
+/// @param size  How many bytes to generate.
+/// @param fill  The generator, called per window.
+/// @param opts  The geometry.
+/// @return The bytes written and the mechanism that carried them.
+/// @throws std::system_error on I/O failure.
+///
+/// @code
+/// blake3pp::write_file("seed.bin", 1 << 30,
+///                      [&](std::span<std::byte> out, std::uint64_t off) {
+///                        auto r = stream;
+///                        r.seek(off);
+///                        blake3pp::fill(r, out);
+///                      });
+/// @endcode
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t>
+write_report write_file(const std::filesystem::path& path, std::uint64_t size,
+                        Fill&& fill, const file_write_options& opts = {}) {
+  return detail::write_sequential(
+      path, size,
+      [&](const detail::file_writer::buffer& b, std::uint64_t off) {
+        const std::size_t n = static_cast<std::size_t>(
+            std::min<std::uint64_t>(b.capacity, size - off));
+        fill(std::span{b.data, n}, off);
+        return n;
+      },
+      opts);
+}
+
+/// Generates a file whose length the generator decides, on the calling
+/// thread.
+///
+/// `fill` is called as `std::size_t fill(std::span<std::byte> out,
+/// std::uint64_t offset)`, once per window and in file order, and returns
+/// how many bytes of `out` it produced. Anything short of the whole
+/// buffer, zero included, ends the file. It must not throw.
+/// @param path  The file to create or truncate.
+/// @param fill  The generator; its return value is the file's length.
+/// @param opts  The geometry.
+/// @return The bytes written and the mechanism that carried them.
+/// @throws std::system_error on I/O failure.
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t> &&
+           std::convertible_to<
+               std::invoke_result_t<Fill&, std::span<std::byte>, std::uint64_t>,
+               std::size_t>
+write_report write_file(const std::filesystem::path& path, Fill&& fill,
+                        const file_write_options& opts = {}) {
+  return detail::write_sequential(
+      path, 0,
+      [&](const detail::file_writer::buffer& b, std::uint64_t off) {
+        return static_cast<std::size_t>(
+            fill(std::span{b.data, b.capacity}, off));
+      },
+      opts);
+}
+
+/// write_file() of a known size, reporting failure through ec.
+/// @param path  The file to create or truncate.
+/// @param size  How many bytes to generate.
+/// @param fill  The generator, called per window.
+/// @param ec    Cleared on success; the I/O error otherwise.
+/// @param opts  The geometry.
+/// @return What was written; `bytes` is 0 and `backend` empty when ec is
+///         set at setup, otherwise what got out before the failure.
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t>
+write_report write_file(const std::filesystem::path& path, std::uint64_t size,
+                        Fill&& fill, std::error_code& ec,
+                        const file_write_options& opts = {}) noexcept {
+  return detail::with_error_code(ec, [&] {
+    return write_file(path, size, std::forward<Fill>(fill), opts);
+  });
+}
+
+/// write_file() of a generator-decided length, reporting failure through ec.
+/// @param path  The file to create or truncate.
+/// @param fill  The generator; its return value is the file's length.
+/// @param ec    Cleared on success; the I/O error otherwise.
+/// @param opts  The geometry.
+/// @return What was written; `bytes` is 0 and `backend` empty when ec is
+///         set at setup, otherwise what got out before the failure.
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t> &&
+           std::convertible_to<
+               std::invoke_result_t<Fill&, std::span<std::byte>, std::uint64_t>,
+               std::size_t>
+write_report write_file(const std::filesystem::path& path, Fill&& fill,
+                        std::error_code& ec,
+                        const file_write_options& opts = {}) noexcept {
+  return detail::with_error_code(
+      ec, [&] { return write_file(path, std::forward<Fill>(fill), opts); });
+}
 
 /// One-shot digest of a file: a hasher shaped by opts (SIMD variant,
 /// optional key), the file streamed through it, finalized.

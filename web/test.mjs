@@ -1,7 +1,8 @@
-// The module's node check: the empty-input vector, then one message
-// whose digest every path must reproduce: the one-shots and the two
-// hashers, sequential and pooled, streamed in uneven pieces, each
-// compiled variant pinned; and the extended output round trip.
+// The module's node check. It hashes the empty-input and "abc" vectors,
+// then one message whose digest every path must reproduce: the one-shots
+// and the two hashers, sequential and pooled, streamed in uneven pieces,
+// each compiled variant pinned. It ends with the extended output round
+// trip.
 import { pathToFileURL } from 'node:url';
 
 const modulePath = process.argv[2];
@@ -27,6 +28,15 @@ console.log(`blake3pp ${b3pp.version()}, ${b3pp.simd_provider()}, ${b3pp.executi
 
 check('empty input', b3pp.hash(0, 0, 'auto'), EMPTY);
 check('empty text', (() => { const h = new b3pp.hasher('auto'); h.update(''); const d = h.finalize(); h.delete(); return d; })(), EMPTY);
+// "abc" as text and as bytes written into the module's memory.
+const ABC = '6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85';
+check('abc text', (() => { const h = new b3pp.hasher('auto'); h.update('abc'); const d = h.finalize(); h.delete(); return d; })(), ABC);
+check('abc bytes', (() => {
+  const p = b3pp._malloc(3);
+  b3pp.HEAPU8.set([0x61, 0x62, 0x63], p);
+  const h = new b3pp.hasher('auto'); h.update(p, 3); const d = h.finalize(); h.delete(); b3pp._free(p);
+  return d;
+})(), ABC);
 
 // The message: 4 MiB + a partial chunk of extended output, written into
 // the module's memory the way an embedder does.

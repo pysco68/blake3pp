@@ -58,10 +58,9 @@ inline bool preallocate(int fd, std::uint64_t len) noexcept {
   return ::ftruncate(fd, static_cast<off_t>(len)) == 0;
 }
 
-// The submission and completion machinery, playing the role the uring and
-// the completion port play elsewhere. submit() is fire-and-forget onto
-// GCD's global pool, workers publish per-slot completion under m and signal
-// cv, and the pipeline thread blocks on cv for the slot it needs next.
+// The submission half of the machinery: submit() queues a transfer onto
+// GCD's global pool inside a dispatch group. The context's done list and
+// waiter carry the completion back.
 //
 // The group exists for teardown. In-flight workers touch the engine's
 // buffer pool, so destroy() must wait them out before the pool is freed.
@@ -90,10 +89,13 @@ struct gcd_pump {
     }
   }
 
-  void submit(void (*fn)(void*), void* ctx) noexcept {
+  // GCD takes a C callback and a cookie, so the cast back to the caller's
+  // type lives here, in the one place the boundary forces it.
+  template <class T, void (*Run)(T&) noexcept>
+  void submit(T& ctx) noexcept {
     dispatch_group_async_f(
-        group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ctx,
-        fn);
+        group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &ctx,
+        +[](void* p) noexcept { Run(*static_cast<T*>(p)); });
   }
 };
 
@@ -136,16 +138,28 @@ class gcd_context {
       // an async queue to one write at a time. F_PREALLOCATE is
       // best-effort, and set_size() trims back afterwards.
       if (write_ && how.preallocate_bytes > 0 &&
-          preallocate(f_.fd_plain, how.preallocate_bytes)) {
+          preallocate(f_.fd_plain(), how.preallocate_bytes)) {
         prealloc_ = how.preallocate_bytes;
       }
       // Darwin's cache bypass is per-fd, not per-open, and tolerates any
       // alignment, so one fd serves every window, tail included.
-      if (how.direct_io && set_nocache(f_.fd_plain)) {
-        f_.direct = true;
+      if (how.direct_io && set_nocache(f_.fd_plain())) {
+        f_.set_direct();
       }
-      name_ = ctx.name_for(f_.direct, write_);
+      name_ = ctx.name_for(f_.direct(), write_);
+      ctx_ = &ctx;
     }
+
+    // The descriptor closes with this object, and a dispatch worker may
+    // be inside a transfer on it: the context waits those out and forgets
+    // what this file left behind first.
+    ~file() {
+      if (ctx_ != nullptr) {
+        ctx_->forget(*this);
+      }
+    }
+    file(const file&) = delete;
+    file& operator=(const file&) = delete;
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
@@ -153,7 +167,7 @@ class gcd_context {
     // Trims a preallocation back to what was written. Harmless when
     // nothing was preallocated, which is what a reader's file is.
     void set_size(std::uint64_t bytes) {
-      if (::ftruncate(f_.fd_plain, static_cast<off_t>(bytes)) != 0) {
+      if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
       prealloc_ = 0;
@@ -162,6 +176,7 @@ class gcd_context {
    private:
     friend class gcd_context;
     posix_file f_;
+    gcd_context* ctx_ = nullptr;
     std::uint64_t size_ = 0;
     std::uint64_t prealloc_ = 0;
     bool write_ = false;
@@ -186,47 +201,24 @@ class gcd_context {
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    read_op& op) {
+    arm(op, f, off, buf.size());
     op.dst = buf.data();
-    op.len = buf.size();
-    op.off = off;
-    op.filled = 0;
-    op.error = 0;
     op.src = nullptr;
     op.is_write = false;
-    op.fd = f.f_.fd_plain;
-    op.sync_file = &f.f_;
-    op.ctx = this;
-    op.next_done = nullptr;
-    in_flight_++;
-    if (use_gcd_) {
-      pump_.submit(&gcd_context::run_transfer, &op);
-    } else {
-      deferred_.push(op);
-    }
+    issue(op);
   }
 
   // The write half of the same contract. Darwin's F_NOCACHE tolerates any
   // alignment, so unlike O_DIRECT there is no length a write cannot take:
-  // the deferred list here is only the no-GCD rung.
+  // the deferred list here is only the no-GCD rung, which is why issue()
+  // asks about the engine and nothing else.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
                     read_op& op) {
+    arm(op, f, off, buf.size());
     op.dst = nullptr;
     op.src = buf.data();
     op.is_write = true;
-    op.len = buf.size();
-    op.off = off;
-    op.filled = 0;
-    op.error = 0;
-    op.fd = f.f_.fd_plain;
-    op.sync_file = &f.f_;
-    op.ctx = this;
-    op.next_done = nullptr;
-    in_flight_++;
-    if (use_gcd_) {
-      pump_.submit(&gcd_context::run_transfer, &op);
-    } else {
-      deferred_.push(op);
-    }
+    issue(op);
   }
 
   // dispatch_group_async_f queues the work itself, so there is nothing
@@ -269,20 +261,62 @@ class gcd_context {
     if (use_gcd_) {
       dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
     }
-    {
-      const std::lock_guard<std::mutex> lk(done_m_);
-      done_head_ = nullptr;
-    }
+    done_.clear();
     deferred_.clear();
     in_flight_ = 0;
   }
 
  private:
+  // A file about to close takes its transfers with it. The descriptor is
+  // the hazard: a worker inside pread() on it would, once the number is
+  // recycled by another thread's open(), read a different file's bytes
+  // into the engine's buffer and report success. So every worker is
+  // waited out before the close, and what this file finished or never
+  // started is dropped rather than reported, which is the contract's
+  // teardown drain for one file.
+  //
+  // The group is the context's, so the wait covers sibling files too.
+  // That is longer than necessary and harmless: a sibling's finished
+  // transfer stays on the done list for a later poll() to report.
+  void forget(file& f) noexcept {
+    const std::size_t never_started = deferred_.remove_if(
+        [&f](const read_op& op) noexcept { return op.sync_file == &f.f_; });
+    in_flight_ -= never_started;
+    if (!use_gcd_) {
+      return;  // nothing is in a worker: the deferred list is poll()'s
+    }
+    dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
+    in_flight_ -= done_.remove_if(
+        [&f](const read_op& op) noexcept { return op.sync_file == &f.f_; });
+  }
+
+  // What a transfer needs that does not depend on its direction.
+  void arm(read_op& op, file& f, std::uint64_t off, std::size_t len) noexcept {
+    op.len = len;
+    op.off = off;
+    op.filled = 0;
+    op.error = 0;
+    op.fd = f.f_.fd_plain();
+    op.sync_file = &f.f_;
+    op.ctx = this;
+    op.next_done = nullptr;
+    in_flight_++;
+  }
+
+  // The only rung: a worker if there is a dispatch group, otherwise the
+  // deferred list that poll() serves on the calling thread.
+  void issue(read_op& op) noexcept {
+    if (use_gcd_) {
+      pump_.submit<read_op, &gcd_context::run_transfer>(op);
+    } else {
+      deferred_.push(op);
+    }
+  }
+
   // Runs on a GCD worker: one positional read or write loop over the
   // caller's buffer, then the op goes on the done list. noexcept: the
   // error travels in the op to whoever calls poll().
-  static void run_transfer(void* p) noexcept {
-    auto& op = *static_cast<read_op*>(p);
+  static void run_transfer(read_op& op) noexcept {
     gcd_context& c = *op.ctx;
     int err = 0;
     std::size_t got = 0;
@@ -310,11 +344,7 @@ class gcd_context {
     }
     op.filled = got;
     op.error = err;
-    {
-      const std::lock_guard<std::mutex> lk(c.done_m_);
-      op.next_done = c.done_head_;
-      c.done_head_ = &op;
-    }
+    c.done_.push(op);
     c.waiter_.wake();
   }
 
@@ -322,11 +352,7 @@ class gcd_context {
   // caller's thread. The list is LIFO, which the contract permits: the
   // engine matches a completion to its window by the op, not by order.
   std::size_t drain_done() noexcept {
-    read_op* head = nullptr;
-    {
-      const std::lock_guard<std::mutex> lk(done_m_);
-      head = std::exchange(done_head_, nullptr);
-    }
+    read_op* head = done_.take_all();
     std::size_t ran = 0;
     while (head != nullptr) {
       read_op* const next = head->next_done;
@@ -375,11 +401,59 @@ class gcd_context {
     return n;
   }
 
+  // Finished transfers, pushed by GCD workers and drained by poll(). The
+  // link is the op's own next_done, so nothing allocates, and the head is
+  // reachable only through these members, each under the lock.
+  class done_list {
+   public:
+    void push(read_op& op) noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      op.next_done = head_;
+      head_ = &op;
+    }
+
+    // The whole list, LIFO, which the contract permits: the engine matches
+    // a completion to its window by the op, not by order.
+    [[nodiscard]] read_op* take_all() noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      return std::exchange(head_, nullptr);
+    }
+
+    // Forgets everything on the list: nothing here gets its callback.
+    void clear() noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      head_ = nullptr;
+    }
+
+    // Unlinks and forgets the ops `drop` accepts, for a file closing with
+    // transfers that finished but were never reported. Returns how many.
+    template <class Pred>
+    std::size_t remove_if(Pred drop) noexcept {
+      const std::lock_guard<std::mutex> lk(m_);
+      std::size_t dropped = 0;
+      read_op** link = &head_;
+      while (*link != nullptr) {
+        read_op* const op = *link;
+        if (drop(*op)) {
+          *link = op->next_done;
+          op->next_done = nullptr;
+          ++dropped;
+        } else {
+          link = &op->next_done;
+        }
+      }
+      return dropped;
+    }
+
+   private:
+    std::mutex m_;
+    read_op* head_ = nullptr;
+  };
+
   gcd_pump pump_;
   poll_waiter waiter_;
   deferred_ops<read_op> deferred_;
-  std::mutex done_m_;
-  read_op* done_head_ = nullptr;
+  done_list done_;
   std::size_t in_flight_ = 0;
   bool use_gcd_ = false;
 };
