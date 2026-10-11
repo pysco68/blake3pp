@@ -125,14 +125,15 @@ struct result {
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
-    // The mode goes into the options object, which is what every library
-    // entry point here takes; the context string's view points into this
-    // copy of the options and lives as long as the engine.
+    // The mode goes into the options, which every library entry point
+    // here takes; the parser makes --keyed and --derive-key exclusive. The
+    // mode copies the key's 32 bytes. The context string is a view into
+    // opts_, this engine's own copy, so it lives as long as the engine.
     if (!opts_.key_file.empty()) {
-      opts_.io.key = load_key(opts_.key_file);
-    }
-    if (!opts_.derive_context.empty()) {
-      opts_.io.derive_context = opts_.derive_context;
+      opts_.io.mode = blake3pp::hash_mode::keyed(load_key(opts_.key_file));
+    } else if (!opts_.derive_context.empty()) {
+      opts_.io.mode =
+          blake3pp::hash_mode::derive_key(std::string_view{opts_.derive_context});
     }
   }
 
@@ -279,15 +280,17 @@ class engine {
   blake3pp::parallel_hasher<blake3pp::parallel_scheduler_t>
   make_parallel_hasher() {
     const blake3pp::parallel_hasher_options popts{.a = opts_.io.a};
-    if (!opts_.derive_context.empty()) {
-      return blake3pp::parallel_hasher{pool_.scheduler(),
-                                       std::string_view{opts_.derive_context},
-                                       popts};
-    }
-    if (opts_.io.key) {
-      return blake3pp::parallel_hasher{
-          pool_.scheduler(),
-          std::span<const std::byte, blake3pp::key_size>{*opts_.io.key}, popts};
+    // parallel_hasher takes its mode through a constructor, so the options'
+    // mode is read back rather than handed over.
+    switch (opts_.io.mode.which()) {
+      case blake3pp::hash_mode::kind::derive_key:
+        return blake3pp::parallel_hasher{pool_.scheduler(),
+                                         opts_.io.mode.context(), popts};
+      case blake3pp::hash_mode::kind::keyed:
+        return blake3pp::parallel_hasher{pool_.scheduler(),
+                                         opts_.io.mode.key(), popts};
+      case blake3pp::hash_mode::kind::plain:
+        break;
     }
     return blake3pp::parallel_hasher{pool_.scheduler(), popts};
   }

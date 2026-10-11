@@ -48,7 +48,7 @@ int main() {
   std::vector<std::pair<std::string, std::string>> manifest;
   std::cout << "manifest\n";
   for (const auto& name : names) {
-    const auto tag = blake3pp::hash_file(dir / name, {.key = key});
+    const auto tag = blake3pp::hash_file(dir / name, {.mode = blake3pp::hash_mode::keyed(key)});
     manifest.emplace_back(name, tag.to_hex());
     std::cout << "  " << tag.to_hex() << "  " << name << '\n';
   }
@@ -58,14 +58,14 @@ int main() {
   // an error.
   std::cout << "\nverifying\n";
   for (const auto& [name, expected] : manifest) {
-    const auto actual = blake3pp::hash_file(dir / name, {.key = key});
+    const auto actual = blake3pp::hash_file(dir / name, {.mode = blake3pp::hash_mode::keyed(key)});
     std::cout << "  " << name << ": "
               << (actual.matches(expected) ? "ok" : "FAILED") << '\n';
   }
 
   // A modified file fails, which a plain checksum would also catch...
   write_file(dir / "beta.txt", "the second payload, tampered with");
-  const auto tampered = blake3pp::hash_file(dir / "beta.txt", {.key = key});
+  const auto tampered = blake3pp::hash_file(dir / "beta.txt", {.mode = blake3pp::hash_mode::keyed(key)});
   std::cout << "\nafter editing beta.txt: "
             << (tampered.matches(manifest[1].second) ? "ok" : "FAILED") << '\n';
 

@@ -133,7 +133,7 @@ blake3pp::digest full = h.finalize();
 // keyed mode.
 std::array<std::byte, 32> key = load_secret_key();
 auto tag = blake3pp::hash_file(path, blake3pp::get_parallel_scheduler(),
-                               {.key = key});
+                               {.mode = blake3pp::hash_mode::keyed(key)});
 
 // Purpose-bound subkeys from one master secret, separated by context.
 auto session = blake3pp::derive_key("example.com 2026 tls session", master);

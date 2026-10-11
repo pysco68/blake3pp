@@ -160,11 +160,58 @@ TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
   const auto expected =
       blake3pp::keyed_hash(std::span<const std::byte, 32>{key}, content);
 
-  CHECK(blake3pp::hash_file(f.path, {.key = key}) == expected);
+  const blake3pp::hash_mode mode = blake3pp::hash_mode::keyed(key);
+  CHECK(blake3pp::hash_file(f.path, {.mode = mode}) == expected);
   CHECK(blake3pp::hash_file(f.path, blake3pp::get_parallel_scheduler(),
-                            {.window_bytes = 1024 * 1024, .key = key}) ==
+                            {.window_bytes = 1024 * 1024, .mode = mode}) ==
         expected);
 }
+
+// One mode per options object, by construction: there is one member, named
+// the way hasher names the same choice, so no call can ask for two modes.
+// These pin the shape that makes it true -- a field per mode would put the
+// contradiction back.
+static_assert(std::is_same_v<decltype(blake3pp::hash_file_options{}.mode),
+                             blake3pp::hash_mode>);
+// Through concepts, because a member access on a concrete type is a hard
+// error rather than a substitution failure.
+template <class T>
+concept has_key_field = requires(T o) { o.key; };
+template <class T>
+concept has_context_field = requires(T o) { o.derive_context; };
+static_assert(!has_key_field<blake3pp::hash_file_options>);
+static_assert(!has_context_field<blake3pp::hash_file_options>);
+
+// And no mode arrives by conversion: a key or a string reaches it through
+// the named functions, never by being assigned to the member.
+template <class T>
+concept converts_to_mode = std::convertible_to<T, blake3pp::hash_mode>;
+static_assert(!converts_to_mode<std::string_view>);
+static_assert(!converts_to_mode<const char*>);
+static_assert(!converts_to_mode<std::array<std::byte, blake3pp::key_size>>);
+static_assert(!converts_to_mode<std::span<const std::byte, blake3pp::key_size>>);
+
+// A context the options would outlive is refused: the mode views the string,
+// so an owning temporary cannot be the thing it views.
+template <class S>
+concept names_context = requires(S s) {
+  blake3pp::hash_mode::derive_key(std::move(s));
+};
+static_assert(names_context<std::string_view>);
+static_assert(!names_context<std::string>);
+
+static_assert(blake3pp::hash_mode::plain().which() ==
+              blake3pp::hash_mode::kind::plain);
+static_assert(blake3pp::hash_file_options{}.mode.which() ==
+              blake3pp::hash_mode::kind::plain);
+static_assert(
+    blake3pp::hash_file_options{
+        .mode = blake3pp::hash_mode::derive_key("context")}
+        .mode.which() == blake3pp::hash_mode::kind::derive_key);
+static_assert(
+    blake3pp::hash_file_options{
+        .mode = blake3pp::hash_mode::keyed(std::array<std::byte, 32>{})}
+        .mode.which() == blake3pp::hash_mode::kind::keyed);
 
 // The options object carries the mode, so hash_file() reaches all three
 // and make_hasher() hands the same hasher to a caller that needs a
@@ -182,7 +229,7 @@ TEST_CASE("hash_file_options carries the mode") {
   derived.update(content);
 
   const blake3pp::hash_file_options opts{.window_bytes = 256 * 1024,
-                                         .derive_context = context};
+                                         .mode = blake3pp::hash_mode::derive_key(context)};
   CHECK(blake3pp::hash_file(f.path, opts) == derived.finalize());
   CHECK(blake3pp::hash_file(f.path, blake3pp::get_parallel_scheduler(),
                             opts) == derived.finalize());
@@ -198,7 +245,7 @@ TEST_CASE("hash_file_options carries the mode") {
   CHECK(got == expected);
 
   // The other two modes, through the same entry point.
-  CHECK(blake3pp::make_hasher({.key = key}).finalize() ==
+  CHECK(blake3pp::make_hasher({.mode = blake3pp::hash_mode::keyed(key)}).finalize() ==
         blake3pp::hasher::keyed(std::span<const std::byte, 32>{key})
             .finalize());
   CHECK(blake3pp::make_hasher({}).finalize() == blake3pp::hasher{}.finalize());

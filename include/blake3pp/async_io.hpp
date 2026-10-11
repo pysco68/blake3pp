@@ -679,8 +679,8 @@ template <stack_budget Budget, class Sched>
 /// @param path   The file to read; copied.
 /// @param sched  Where the subtree compressions run.
 /// @param opts   Per-call knobs: the arch, the mode, and direct_io. Copied
-///               into the operation, so a `derive_context` in it must
-///               outlive the operation, not just this call.
+///               into the operation, so a key-derivation context in the
+///               mode must outlive the operation, not just this call.
 template <stack_budget Budget, class Sched>
   requires ex::scheduler<std::remove_cvref_t<Sched>>
 [[nodiscard]] auto async_hash_file(basic_io_context<Budget>& ctx,

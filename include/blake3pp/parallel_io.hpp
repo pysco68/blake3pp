@@ -199,14 +199,14 @@ void update_file(hasher& h, const std::filesystem::path& path,
 }
 
 /// One-shot digest of a file over the full pipeline: a hasher shaped by
-/// opts (SIMD variant, optional key), the file streamed through it
-/// multi-core, finalized.
+/// opts (SIMD variant, and plain, keyed or key-derivation mode), the file
+/// streamed through it multi-core, finalized.
 /// @tparam Budget     The stack a window's part table may take; see
 ///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 /// @throws std::system_error on I/O failure, and whatever the execution
 ///         provider raises.
 ///
@@ -233,7 +233,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
 /// @param ec     Cleared on success; the error otherwise.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
 template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
@@ -281,7 +281,7 @@ void update_file(hasher& h, const P& path, Scheduler&& sched,
 /// hash_file() over a scheduler for a foreign path type.
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
           class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
@@ -296,7 +296,7 @@ template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
 /// @param path   The file to hash.
 /// @param sched  Where the subtree reductions run.
 /// @param ec     Cleared on success; the error otherwise.
-/// @param opts   The hasher's variant and key, and the pipeline knobs.
+/// @param opts   The hasher's variant and mode, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
 template <stack_budget Budget = default_stack_budget, detail::foreign_path P,
           class Scheduler>

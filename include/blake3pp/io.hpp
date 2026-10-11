@@ -33,12 +33,12 @@
 /// through ec instead.
 
 #include <array>
-#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
@@ -74,6 +74,92 @@ struct file_io_options {
   trace_buffer* trace = nullptr;
 };
 
+/// Which BLAKE3 mode a hasher built from options runs in: plain, keyed
+/// (MAC/PRF), or key derivation.
+///
+/// One value rather than one field per mode: a hash is keyed or derived or
+/// neither, and asking for two of those does not compile. The mode is named
+/// the way hasher spells the same choice, so the two read alike:
+///
+/// @code
+/// blake3pp::hash_file_options plain{};
+/// blake3pp::hash_file_options mac{
+///     .mode = blake3pp::hash_mode::keyed(my_key)};
+/// blake3pp::hash_file_options kdf{
+///     .mode = blake3pp::hash_mode::derive_key("fixture v3 2026-09")};
+/// @endcode
+class hash_mode {
+ public:
+  /// Which of the three a mode value holds.
+  enum class kind { plain, keyed, derive_key };
+
+  /// Plain hashing.
+  constexpr hash_mode() noexcept = default;
+  /// Plain hashing, named: what a default-constructed mode is.
+  [[nodiscard]] static constexpr hash_mode plain() noexcept { return {}; }
+
+  /// Keyed (MAC/PRF) mode: BLAKE3's replacement for HMAC, as
+  /// hasher::keyed().
+  /// @param key  Exactly key_size bytes, enforced by the span extent.
+  [[nodiscard]] static constexpr hash_mode keyed(
+      std::span<const std::byte, key_size> key) noexcept {
+    hash_mode m;
+    m.kind_ = kind::keyed;
+    for (std::size_t i = 0; i < key_size; ++i) {
+      m.key_[i] = key[i];
+    }
+    return m;
+  }
+
+  /// Key-derivation mode, as hasher::derive_key(): the input is key material
+  /// and the output a subkey bound to the context, which should be
+  /// hardcoded, globally unique and application-specific (see the BLAKE3
+  /// spec); it is not a secret.
+  ///
+  /// The context is a view, not a copy, so the string has to outlive every
+  /// operation these options start. That is the call for the blocking entry
+  /// points, and the whole operation for the senders in
+  /// <blake3pp/async_io.hpp>, which hold a copy of the options.
+  ///
+  /// A key is stored by value instead: 32 bytes cost nothing to carry, while
+  /// a context string is a literal in every use the spec intends.
+  /// @param context  The domain-separation string.
+  [[nodiscard]] static constexpr hash_mode derive_key(
+      std::string_view context) noexcept {
+    hash_mode m;
+    m.kind_ = kind::derive_key;
+    m.context_ = context;
+    return m;
+  }
+  /// The one call the type refuses: a std::string that dies at the end of the
+  /// expression cannot be viewed. Name the string, or pass a literal.
+  ///
+  /// Only rvalues are rejected, since an lvalue outlives the call, and only
+  /// std::string is recognised: no trait tells another type's ownership from
+  /// its conversion.
+  template <class S>
+    requires std::same_as<std::remove_cvref_t<S>, std::string> &&
+             std::is_rvalue_reference_v<S&&>
+  static hash_mode derive_key(S&&) = delete;
+
+  /// Which mode this is.
+  [[nodiscard]] constexpr kind which() const noexcept { return kind_; }
+  /// The key, when which() is keyed.
+  [[nodiscard]] constexpr std::span<const std::byte, key_size> key()
+      const noexcept {
+    return key_;
+  }
+  /// The context string, when which() is derive_key.
+  [[nodiscard]] constexpr std::string_view context() const noexcept {
+    return context_;
+  }
+
+ private:
+  std::array<std::byte, key_size> key_{};
+  std::string_view context_{};
+  kind kind_ = kind::plain;
+};
+
 /// hash_file()'s knobs: the pipeline's, plus what shapes the hasher it
 /// constructs internally.
 ///
@@ -93,25 +179,13 @@ struct hash_file_options {
   bool direct_io = true;
   /// Issue reads on the kernel's I/O worker threads; see file_io_options.
   bool offload_submit = true;
-  /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
-  std::optional<std::array<std::byte, key_size>> key = std::nullopt;
-  /// Key-derivation mode with this context string when set.
-  ///
-  /// A view, not a copy: the string has to outlive every operation these
-  /// options start. For the blocking entry points that is the call; for the
-  /// senders in <blake3pp/async_io.hpp>, which hold a copy of the options,
-  /// it is until the operation completes. The key above is stored by value
-  /// because a key is 32 bytes; a context string is a literal in every use
-  /// the spec intends.
-  ///
-  /// Setting this and `key` together is a precondition violation (a hash
-  /// cannot be both keyed and derived): debug builds assert, and release
-  /// builds take the key.
+  /// Plain, keyed or key-derivation mode: `hash_mode::keyed(key)` or
+  /// `hash_mode::derive_key(context)`, named as hasher spells them.
   ///
   /// Extended output has no shortcut here, since hash_file() returns a
   /// 32-byte digest: take the hasher these options describe (make_hasher()),
   /// stream it with update_file() and finalize it to any length.
-  std::optional<std::string_view> derive_context = std::nullopt;
+  hash_mode mode{};
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing.
   trace_buffer* trace = nullptr;
@@ -127,14 +201,13 @@ namespace detail {
 
 inline hasher make_hasher(const hash_file_options& opts,
                           const kern::kernel_ops* ops) noexcept {
-  assert(!(opts.key.has_value() && opts.derive_context.has_value()) &&
-         "hash_file_options: key and derive_context are two different modes");
-  if (opts.key.has_value()) {
-    return hasher::keyed(std::span<const std::byte, key_size>{opts.key.value()},
-                         ops);
-  }
-  if (opts.derive_context.has_value()) {
-    return hasher::derive_key(opts.derive_context.value(), ops);
+  switch (opts.mode.which()) {
+    case hash_mode::kind::keyed:
+      return hasher::keyed(opts.mode.key(), ops);
+    case hash_mode::kind::derive_key:
+      return hasher::derive_key(opts.mode.context(), ops);
+    case hash_mode::kind::plain:
+      break;
   }
   return hasher{ops};
 }
@@ -163,9 +236,7 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
 
 }  // namespace detail
 
-/// The hasher these options describe: its SIMD variant, and the mode
-/// (plain, keyed or key-derivation) that key and derive_context select.
-/// Setting both of those is a precondition violation; see the field.
+/// The hasher these options describe: its SIMD variant and its mode.
 ///
 /// hash_file() builds this internally; it is public so a caller that needs
 /// a finalize form hash_file() does not have -- extended output, the
@@ -174,7 +245,8 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
 /// @param opts  The variant and mode; the pipeline knobs are ignored here.
 ///
 /// @code
-/// blake3pp::hash_file_options opts{.derive_context = "fixture v3 2026-09"};
+/// blake3pp::hash_file_options opts{
+///     .mode = blake3pp::hash_mode::derive_key("fixture v3 2026-09")};
 /// blake3pp::hasher h = blake3pp::make_hasher(opts);
 /// blake3pp::update_file(h, "seed.bin", opts);
 /// auto stream = h.finalize_xof();

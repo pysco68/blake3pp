@@ -52,7 +52,8 @@ composes with everything else:
 ```cpp
 blake3pp::hasher h = blake3pp::hasher::keyed(key);   // incremental MAC
 blake3pp::update_file(h, path);                      // ...over a file
-auto tag = blake3pp::hash_file(path, sched, {.key = key});   // ...and cores
+auto tag = blake3pp::hash_file(path, sched,
+                               {.mode = blake3pp::hash_mode::keyed(key)});
 ```
 
 ### Output: 32 bytes, or a stream
@@ -193,10 +194,11 @@ blake3pp knowing Boost exists, and without lossy transcoding on Windows.
 #### Inside the pipeline
 
 The knobs are `file_io_options`, and `hash_file_options` — which adds the
-SIMD variant and the mode (a key, or a key-derivation context) for the
-hasher it builds — converts to them, so one options object can drive both.
-`make_hasher(opts)` hands back that hasher, for the finalize forms
-`hash_file()` does not have:
+SIMD variant and the mode for the hasher it builds — converts to them, so
+one options object can drive both. The mode is one value a key or a context
+string names (`hash_mode::keyed(key)`, `hash_mode::derive_key("context")`),
+so a request cannot be keyed and derived at once. `make_hasher(opts)` hands back that
+hasher, for the finalize forms `hash_file()` does not have:
 
 ```cpp
 #include <blake3pp/parallel_io.hpp>   // io.hpp + parallel.hpp
