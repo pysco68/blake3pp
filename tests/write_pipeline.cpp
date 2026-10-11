@@ -283,6 +283,80 @@ TEST_CASE("a generated file is exactly what the generator described") {
   }
 }
 
+// The sequential forms take the same generator without a scheduler: the
+// bounded one writes exactly what it was asked for, the unbounded one
+// stops where the generator stops, and both name the mechanism that
+// carried the bytes.
+TEST_CASE("sequential write_file writes the same file as the pipeline") {
+  constexpr std::size_t win = 64 * 1024;
+  const std::vector<std::uint64_t> sizes{0, 1, win, 2 * win + 4321};
+  for (const bool direct : {false, true}) {
+    for (const bool async : {false, true}) {
+      for (const std::uint64_t size : sizes) {
+        CAPTURE(direct);
+        CAPTURE(async);
+        CAPTURE(size);
+        const temp_path out;
+        const blake3pp::write_report wrote = blake3pp::write_file(
+            out.path, size, fill_from_offset,
+            {.window_bytes = win, .direct_io = direct, .async = async});
+        CHECK(wrote.bytes == size);
+        CHECK(!wrote.backend.empty());
+        CHECK(size_of(out.path) == size);
+        if (size > 0) {
+          CHECK(hash_of(out.path) == expected_digest(size));
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("an unbounded write_file ends where the generator does") {
+  constexpr std::size_t win = 64 * 1024;
+  for (const std::uint64_t size : {std::uint64_t{0}, std::uint64_t{win - 7},
+                                   std::uint64_t{2 * win},
+                                   std::uint64_t{2 * win + 11}}) {
+    CAPTURE(size);
+    const temp_path out;
+    std::uint64_t left = size;
+    const blake3pp::write_report wrote = blake3pp::write_file(
+        out.path,
+        [&](std::span<std::byte> buf, std::uint64_t off) -> std::size_t {
+          const std::size_t take = static_cast<std::size_t>(
+              std::min<std::uint64_t>(buf.size(), left));
+          fill_from_offset(buf.first(take), off);
+          left -= take;
+          return take;
+        },
+        {.window_bytes = win});
+    CHECK(wrote.bytes == size);
+    CHECK(size_of(out.path) == size);
+    if (size > 0) {
+      CHECK(hash_of(out.path) == expected_digest(size));
+    }
+  }
+}
+
+// The ec forms report what the throwing ones raise: a path that cannot be
+// created is an error_code, not an exception.
+TEST_CASE("sequential write_file reports failure through ec") {
+  const fs::path bad = fs::path("/nonexistent/blake3pp/no/such/dir") / "f";
+  std::error_code ec;
+  const blake3pp::write_report wrote =
+      blake3pp::write_file(bad, 4096, fill_from_offset, ec);
+  CHECK(ec);
+  CHECK(wrote.bytes == 0);
+  CHECK_THROWS_AS(blake3pp::write_file(bad, 4096, fill_from_offset),
+                  std::system_error);
+
+  ec.clear();
+  const blake3pp::write_report none = blake3pp::write_file(
+      bad,
+      [](std::span<std::byte>, std::uint64_t) -> std::size_t { return 0; }, ec);
+  CHECK(ec);
+  CHECK(none.bytes == 0);
+}
+
 TEST_CASE("the write pipeline runs on an inline scheduler and on one thread") {
   constexpr std::size_t win = 64 * 1024;
   const std::uint64_t size = 3 * win + 77;

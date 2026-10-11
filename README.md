@@ -59,11 +59,11 @@ once a stage has published work to the run queue it touches only the
 loop. A pool thread that finishes a window parks a node on the run queue
 and nudges the driver awake rather than reaching into it.
 
-Writes run the same chain backwards -- generate on the pool, write on
-the driver -- with no reducer, because a window's bytes depend on its
-offset and nothing else. That is `write_file()`, which also comes in
-forms that need no scheduler and in one whose generator decides the
-file's length; `blake3ppgen --output` is built on them.
+Writes run the same chain backwards: generate on the pool, write on the
+driver, with no reducer, because a window's bytes depend on its offset and
+nothing else. That is `write_file()`. It also comes in a form that needs
+no scheduler, and in one whose generator decides the file's length.
+`blake3ppgen --output` is built on them.
 
 The storage is a window arena the driver owns, so a read is never in
 flight into memory that has already been freed. The blocking entry

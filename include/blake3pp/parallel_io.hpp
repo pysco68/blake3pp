@@ -63,24 +63,6 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 #endif
 }  // namespace detail
 
-/// Knobs for write_file(): the geometry of a generated file.
-///
-/// The defaults are blake3ppgen's measured shape, not the reader's:
-/// 64 MiB windows, two in flight. On four PCIe 5 drives in RAID 0 with
-/// 32 threads that measured 24.2 GiB/s, against 20.7 at 128 MiB x 4 and
-/// 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
-/// volume slows down.
-struct file_write_options {
-  /// Bytes per window; rounded to a power of two in the reader's range.
-  std::size_t window_bytes = detail::default_write_window_bytes;
-  /// Windows in flight, clamped to [2, 32].
-  unsigned queue_depth = detail::default_write_queue_depth;
-  /// Bypass the page cache where the platform can.
-  bool direct_io = true;
-  /// io_uring: issue on io-wq rather than inline in the submit call.
-  bool offload_submit = true;
-};
-
 /// Generates a file of exactly `size` bytes, filling each window over a
 /// scheduler and writing it through the platform's fastest path.
 ///
@@ -110,7 +92,7 @@ template <class Scheduler, class Fill>
 void write_file(const std::filesystem::path& path, std::uint64_t size,
                 Fill&& fill, Scheduler&& sched,
                 const file_write_options& opts = {}) {
-  detail::io_driver drv({/*async=*/true, opts.offload_submit},
+  detail::io_driver drv({opts.async, opts.offload_submit},
                         detail::clamp_queue_depth(opts.queue_depth));
   detail::io_driver::file file(
       drv, path,

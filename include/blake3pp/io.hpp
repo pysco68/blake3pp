@@ -45,6 +45,7 @@
 #include <utility>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/file_writer.hpp>
 
 namespace blake3pp {
 
@@ -201,6 +202,183 @@ void update_file(hasher& h, const std::filesystem::path& path,
 void update_file(hasher& h, const std::filesystem::path& path,
                  std::error_code& ec,
                  const file_io_options& opts = {}) noexcept;
+
+/// Knobs for write_file(): the geometry of a generated file.
+///
+/// The defaults are blake3ppgen's measured shape, not the reader's:
+/// 64 MiB windows, two in flight. On four PCIe 5 drives in RAID 0 with
+/// 32 threads that measured 24.2 GiB/s, against 20.7 at 128 MiB x 4 and
+/// 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
+/// volume slows down.
+struct file_write_options {
+  /// Bytes per window; rounded to a power of two in the reader's range.
+  std::size_t window_bytes = detail::default_write_window_bytes;
+  /// Windows in flight, clamped to [2, 32].
+  unsigned queue_depth = detail::default_write_queue_depth;
+  /// Bypass the page cache where the platform can.
+  bool direct_io = true;
+  /// Queue writes asynchronously (io_uring, IOCP, GCD) where the platform
+  /// offers it; off writes synchronously, as a platform that offers none
+  /// does anyway.
+  bool async = true;
+  /// io_uring: issue on io-wq rather than inline in the submit call.
+  bool offload_submit = true;
+};
+
+/// What a write_file() run did.
+struct write_report {
+  /// Bytes written: the size that was asked for, or what the generator
+  /// produced before it stopped.
+  std::uint64_t bytes = 0;
+  /// Which mechanism carried them: "io_uring+direct", "iocp+direct+vdl",
+  /// "gcd+nocache", "pwrite", "writefile" or "stdio". Static storage, so
+  /// it stays valid after the call.
+  std::string_view backend;
+};
+
+namespace detail {
+
+// Both sequential write_file() forms: fill one buffer at a time, submit
+// it and move on, so the producer fills the next while the device drains
+// this one. take(buffer) says how many bytes the generator put in it;
+// fewer than the buffer holds ends the file, which is also the only
+// position where a direct-I/O write may be unaligned.
+template <class Take>
+write_report write_sequential(const std::filesystem::path& path,
+                              std::uint64_t preallocate, Take take,
+                              const file_write_options& opts) {
+  file_writer writer(path,
+                     {.buffer_bytes = opts.window_bytes,
+                      .queue_depth = opts.queue_depth,
+                      .direct_io = opts.direct_io,
+                      .async = opts.async,
+                      .offload_submit = opts.offload_submit,
+                      .preallocate_bytes = preallocate});
+  std::uint64_t done = 0;
+  for (;;) {
+    file_writer::buffer b = writer.acquire();
+    const std::size_t n = take(b, done);
+    if (n > 0) {
+      writer.submit(b, n);
+      done += n;
+    }
+    if (n < b.capacity) {
+      break;
+    }
+  }
+  writer.finish();
+  return {done, writer.backend()};
+}
+
+}  // namespace detail
+
+/// Generates a file of exactly `size` bytes on the calling thread, writing
+/// it through the platform's fastest path.
+///
+/// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
+/// offset)`, once per window and in file order, and must fill every byte
+/// of `out`. It must not throw: an exception from it leaves the file as
+/// far as it got. The parallel_io.hpp overload takes the same generator
+/// and runs the windows over a scheduler instead.
+///
+/// On success the file is exactly `size` bytes. On failure the file is
+/// left as far as it got: what lies past the last landed window is
+/// unspecified, and it is NOT truncated, because a length invented for
+/// bytes that were never produced would hide the failure.
+/// @param path  The file to create or truncate.
+/// @param size  How many bytes to generate.
+/// @param fill  The generator, called per window.
+/// @param opts  The geometry.
+/// @return The bytes written and the mechanism that carried them.
+/// @throws std::system_error on I/O failure.
+///
+/// @code
+/// blake3pp::write_file("seed.bin", 1 << 30,
+///                      [&](std::span<std::byte> out, std::uint64_t off) {
+///                        auto r = stream;
+///                        r.seek(off);
+///                        blake3pp::fill(r, out);
+///                      });
+/// @endcode
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t>
+write_report write_file(const std::filesystem::path& path, std::uint64_t size,
+                        Fill&& fill, const file_write_options& opts = {}) {
+  return detail::write_sequential(
+      path, size,
+      [&](const detail::file_writer::buffer& b, std::uint64_t off) {
+        const std::size_t n = static_cast<std::size_t>(
+            std::min<std::uint64_t>(b.capacity, size - off));
+        fill(std::span{b.data, n}, off);
+        return n;
+      },
+      opts);
+}
+
+/// Generates a file whose length the generator decides, on the calling
+/// thread.
+///
+/// `fill` is called as `std::size_t fill(std::span<std::byte> out,
+/// std::uint64_t offset)`, once per window and in file order, and returns
+/// how many bytes of `out` it produced. Anything short of the whole
+/// buffer, zero included, ends the file. It must not throw.
+/// @param path  The file to create or truncate.
+/// @param fill  The generator; its return value is the file's length.
+/// @param opts  The geometry.
+/// @return The bytes written and the mechanism that carried them.
+/// @throws std::system_error on I/O failure.
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t> &&
+           std::convertible_to<
+               std::invoke_result_t<Fill&, std::span<std::byte>, std::uint64_t>,
+               std::size_t>
+write_report write_file(const std::filesystem::path& path, Fill&& fill,
+                        const file_write_options& opts = {}) {
+  return detail::write_sequential(
+      path, 0,
+      [&](const detail::file_writer::buffer& b, std::uint64_t off) {
+        return static_cast<std::size_t>(
+            fill(std::span{b.data, b.capacity}, off));
+      },
+      opts);
+}
+
+/// write_file() of a known size, reporting failure through ec.
+/// @param path  The file to create or truncate.
+/// @param size  How many bytes to generate.
+/// @param fill  The generator, called per window.
+/// @param ec    Cleared on success; the I/O error otherwise.
+/// @param opts  The geometry.
+/// @return What was written; `bytes` is 0 and `backend` empty when ec is
+///         set at setup, otherwise what got out before the failure.
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t>
+write_report write_file(const std::filesystem::path& path, std::uint64_t size,
+                        Fill&& fill, std::error_code& ec,
+                        const file_write_options& opts = {}) noexcept {
+  return detail::with_error_code(ec, [&] {
+    return write_file(path, size, std::forward<Fill>(fill), opts);
+  });
+}
+
+/// write_file() of a generator-decided length, reporting failure through ec.
+/// @param path  The file to create or truncate.
+/// @param fill  The generator; its return value is the file's length.
+/// @param ec    Cleared on success; the I/O error otherwise.
+/// @param opts  The geometry.
+/// @return What was written; `bytes` is 0 and `backend` empty when ec is
+///         set at setup, otherwise what got out before the failure.
+template <class Fill>
+  requires std::invocable<Fill&, std::span<std::byte>, std::uint64_t> &&
+           std::convertible_to<
+               std::invoke_result_t<Fill&, std::span<std::byte>, std::uint64_t>,
+               std::size_t>
+write_report write_file(const std::filesystem::path& path, Fill&& fill,
+                        std::error_code& ec,
+                        const file_write_options& opts = {}) noexcept {
+  return detail::with_error_code(
+      ec, [&] { return write_file(path, std::forward<Fill>(fill), opts); });
+}
 
 /// One-shot digest of a file: a hasher shaped by opts (SIMD variant,
 /// optional key), the file streamed through it, finalized.

@@ -39,6 +39,7 @@
 #include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/file_writer.hpp>
 
 namespace blake3pp::detail {
 
@@ -48,15 +49,6 @@ struct write_options {
   unsigned queue_depth = 2;
   ex::inplace_stop_token stop_token{};
 };
-
-// The default geometry for a generated file: 64 MiB windows, two in
-// flight. Not the reader's budget -- this is blake3ppgen's measured
-// shape, from four PCIe 5 drives in RAID 0, 32 threads, 32 GiB written:
-// 24.2 GiB/s at 64 MiB x 2 and 23.8 at 64 MiB x 4, against 20.7 at the
-// uncapped 128 MiB x 4 and 14.8 at 256 MiB x 8. Past a few hundred MiB
-// in flight a striped NVMe volume slows down.
-inline constexpr std::size_t default_write_window_bytes = 64 * 1024 * 1024;
-inline constexpr unsigned default_write_queue_depth = 2;
 
 // Several write chains in flight over one file, all on the caller's
 // thread.

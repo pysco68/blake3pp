@@ -28,7 +28,6 @@
 #include <vector>
 
 #include <CLI/CLI.hpp>
-#include <blake3pp/detail/file_writer.hpp>
 #include <blake3pp/parallel_io.hpp>
 
 #include "tool_common.hpp"
@@ -227,42 +226,51 @@ int main(int argc, char** argv) {
   }
 
   if (output != "-") {
-    // File sink: generate straight into the writer's O_DIRECT-aligned
-    // buffers; submit() returns immediately, so the next buffer fills
-    // while the device drains this one.
+    // File sink, sequential: the generator fills one of the writer's
+    // O_DIRECT-aligned buffers at a time and the next fills while the
+    // device drains this one. This is the path for a one-thread pool, and
+    // the only one for a length the generator decides (--size omitted),
+    // which the pipelined form cannot preallocate.
     try {
-      blake3pp::detail::file_writer_options wopts;
+      blake3pp::file_write_options wopts;
       wopts.direct_io = !no_direct;
       wopts.async = !no_async;
       wopts.offload_submit = !inline_submit;
       if (window_mib > 0) {
-        wopts.buffer_bytes = window_mib * 1024 * 1024;
+        wopts.window_bytes = window_mib * 1024 * 1024;
       } else if (pool.parallel()) {
-        // One segment per thread so every fill fans out, but capped: past
-        // a few hundred MiB in flight (buffer x queue depth) a striped
-        // NVMe volume slows down. Measured on four PCIe 5 drives in RAID 0,
-        // 32 threads, 32 GiB written: 24.2 GiB/s at 64 MiB x 2 and 23.8 at
-        // 64 MiB x 4, against 20.7 at the uncapped 128 MiB x 4 and 14.8 at
-        // 256 MiB x 8.
-        wopts.buffer_bytes = std::min<std::size_t>(threads * segment, max_buffer);
+        // One segment per thread so every fill fans out, capped at
+        // max_buffer: on a 32-thread machine writing to a striped NVMe
+        // volume, the uncapped default put half a gigabyte in flight and
+        // cost 17%.
+        wopts.window_bytes = std::min<std::size_t>(threads * segment, max_buffer);
       }
-      wopts.queue_depth = qd;
-      if (const auto total = remaining.total()) {
-        wopts.preallocate_bytes = *total;
+      if (qd > 0) {
+        wopts.queue_depth = qd;
       }
-      blake3pp::detail::file_writer writer(output, wopts);
-      if (verbose) {
-        println(stderr, "blake3ppgen: write backend: {}",
-                writer.backend());
-      }
-      while (!remaining.exhausted()) {
-        auto b = writer.acquire();
-        const std::size_t take = remaining.take(b.capacity);
-        fill(std::span{b.data, take});
-        writer.submit(b, take);
+      // The generator walks the stream in file order, so it takes the
+      // bytes the remaining budget allows and ends the file by filling
+      // less than a whole buffer.
+      const auto produce = [&](std::span<std::byte> out,
+                               std::uint64_t) -> std::size_t {
+        if (remaining.exhausted()) {
+          return 0;
+        }
+        const std::size_t take = remaining.take(out.size());
+        fill(out.first(take));
         remaining.consume(take);
+        return take;
+      };
+      const blake3pp::write_report wrote =
+          remaining.total()
+              ? blake3pp::write_file(output, *remaining.total(),
+                                    [&](std::span<std::byte> out,
+                                        std::uint64_t off) { produce(out, off); },
+                                    wopts)
+              : blake3pp::write_file(output, produce, wopts);
+      if (verbose) {
+        println(stderr, "blake3ppgen: write backend: {}", wrote.backend);
       }
-      writer.finish();
     } catch (const std::exception& e) {
       println(stderr, "blake3ppgen: {}", e.what());
       return b3tool::exit_failure;
