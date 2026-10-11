@@ -421,72 +421,74 @@ template <file_driver D>
 using write_sender = io_sender<D, io_dir::write>;
 
 // --------------------------------------------------------------------
-// stopped_if: the point in a stage where a value becomes a stop.
+// declared: an adaptor that states its completions instead of asking its
+// child, and gates its value on a stop token.
 //
-// ex::then cannot produce set_stopped, and a stage whose agents stopped
-// part-way must not hand its value on: the reducer would take a
-// chaining value folded from parts that were never compressed. So the
-// value channel is intercepted, and only that one -- an error still
-// reaches the scope as an error, which is what lets a failure outrank
-// the stop it caused.
-//
-// The token is read when the value arrives, after the stage's own work
-// has finished, so a stop requested while the agents were running is
-// still seen here.
-//
-// Its completions are DECLARED rather than derived from the child, which
-// is the point of it being written out rather than assembled from
-// let_value: stdexec's bulk cannot say how it completes without an
-// environment, and an adaptor that asks its child for signatures would
-// be asked in turn, with none, and fail to compile. Connecting asks with
-// the real environment, which is where the child is happy to answer.
-// The declared set is what a scheduler and a bulk of noexcept bodies can
-// produce; a channel listed here that the child never sends costs
+// let_value has to know how its child completes, and asks without an
+// environment; stdexec's bulk, and a chain containing schedule() on a
+// pool, cannot answer that -- they would be asked in turn, with no
+// environment, and fail to compile. Connecting asks with the real
+// environment, which is where the child is happy to answer. So the
+// completions here are DECLARED: what a scheduler and a bulk of noexcept
+// bodies can produce, with a channel the child never sends costing
 // nothing.
+//
+// The token turns an arriving value into a stop, which is what a stage
+// whose agents stopped part-way needs: the reducer must not take a
+// chaining value folded from parts that were never compressed. Only the
+// value channel is intercepted -- an error still reaches the scope as an
+// error, which is what lets a failure outrank the stop it caused -- and
+// the token is read when the value arrives, after the stage's own work
+// has finished, so a stop requested while the agents were running is
+// still seen. A default token never stops, which is how a chain that
+// only needs the declared signatures asks for a plain forward.
+//
 // Env is named rather than deduced from Op: the operation state holds
-// this receiver's operation by value, so it is still incomplete when
-// its type is worked out, and a deduced get_env() would need it whole.
-template <class Value, class Env, class Op>
-struct stopped_if_receiver {
+// this receiver's operation by value, so it is still incomplete when its
+// type is worked out, and a deduced get_env() would need it whole.
+template <class Env, class Op, class... Values>
+struct declared_receiver {
   using receiver_concept = ex_compat::receiver_tag;
   // RULE 5: a real constructor, and copyable.
-  explicit stopped_if_receiver(Op* o) noexcept : op(o) {}
+  explicit declared_receiver(Op* o) noexcept : op(o) {}
   Op* op;
 
   // Forwarded, not replaced: the stage below this reads its stop token
   // out of the scope's environment through here.
   [[nodiscard]] Env get_env() const noexcept { return op->downstream_env(); }
-  void set_value(Value v) && noexcept { op->value_arrived(std::move(v)); }
+  void set_value(Values... v) && noexcept {
+    op->value_arrived(std::move(v)...);
+  }
   void set_error(std::exception_ptr e) && noexcept {
     op->error_arrived(std::move(e));
   }
   void set_stopped() && noexcept { op->stop_arrived(); }
 };
 
-template <class Value, class Sender, class Receiver>
-class stopped_if_op {
+template <class Sender, class Receiver, class... Values>
+class declared_op {
  public:
   using operation_state_concept = ex_compat::operation_state_tag;
   using inner_receiver =
-      stopped_if_receiver<Value, ex::env_of_t<Receiver>, stopped_if_op>;
+      declared_receiver<ex::env_of_t<Receiver>, declared_op, Values...>;
 
-  stopped_if_op(Sender s, Receiver r, ex::inplace_stop_token t)
+  declared_op(Sender s, Receiver r, ex::inplace_stop_token t)
       : rcvr_(std::move(r)), token_(t),
         inner_(ex::connect(std::move(s), inner_receiver{this})) {}
 
-  stopped_if_op(const stopped_if_op&) = delete;
-  stopped_if_op& operator=(const stopped_if_op&) = delete;
+  declared_op(const declared_op&) = delete;
+  declared_op& operator=(const declared_op&) = delete;
 
   void start() & noexcept { ex::start(inner_); }
 
   [[nodiscard]] ex::env_of_t<Receiver> downstream_env() const noexcept {
     return ex::get_env(rcvr_);
   }
-  void value_arrived(Value v) noexcept {
+  void value_arrived(Values... v) noexcept {
     if (token_.stop_requested()) {
       ex::set_stopped(std::move(rcvr_));
     } else {
-      ex::set_value(std::move(rcvr_), std::move(v));
+      ex::set_value(std::move(rcvr_), std::move(v)...);
     }
   }
   void error_arrived(std::exception_ptr e) noexcept {
@@ -500,19 +502,19 @@ class stopped_if_op {
   ex::connect_result_t<Sender, inner_receiver> inner_;
 };
 
-template <class Value, class Sender>
-class stopped_if_sender {
+template <class Sender, class... Values>
+class declared_sender {
  public:
   using sender_concept = ex_compat::sender_tag;
-  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(Value),
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(Values...),
                                     ex::set_error_t(std::exception_ptr),
                                     ex::set_stopped_t());
 
-  stopped_if_sender(Sender s, ex::inplace_stop_token t)
+  declared_sender(Sender s, ex::inplace_stop_token t)
       : sndr_(std::move(s)), token_(t) {}
 
   template <class Receiver>
-  [[nodiscard]] stopped_if_op<Value, Sender, Receiver> connect(
+  [[nodiscard]] declared_op<Sender, Receiver, Values...> connect(
       Receiver r) const {
     return {sndr_, std::move(r), token_};
   }
@@ -522,11 +524,20 @@ class stopped_if_sender {
   ex::inplace_stop_token token_;
 };
 
-// Value is named rather than deduced: deducing it would mean asking the
-// child how it completes, which is the one thing this must not do.
-template <class Value, class Sender>
+// The value types are named rather than deduced: deducing them would
+// mean asking the child how it completes, which is the one thing this
+// must not do.
+template <class... Values, class Sender>
+[[nodiscard]] auto declared(Sender&& s) {
+  return declared_sender<std::remove_cvref_t<Sender>, Values...>{
+      std::forward<Sender>(s), {}};
+}
+
+// The same adaptor with a token: the point in a stage where a value
+// becomes a stop.
+template <class... Values, class Sender>
 [[nodiscard]] auto stopped_if(ex::inplace_stop_token token, Sender&& s) {
-  return stopped_if_sender<Value, std::remove_cvref_t<Sender>>{
+  return declared_sender<std::remove_cvref_t<Sender>, Values...>{
       std::forward<Sender>(s), token};
 }
 
@@ -2377,19 +2388,24 @@ static_assert(ex::sender<read_sender<io_driver>>);
 static_assert(ex::operation_state<io_op_state<io_driver, probe, io_dir::read>>);
 static_assert(ex::sender<write_sender<io_driver>>);
 static_assert(ex::operation_state<io_op_state<io_driver, probe, io_dir::write>>);
-// stopped_if over a sender with no surprises of its own, so the asserts
-// are about the adaptor and not about whatever it happens to wrap.
-using stopped_cv_child = decltype(ex::just(std::array<std::uint32_t, 8>{}));
-using stopped_cv =
-    stopped_if_sender<std::array<std::uint32_t, 8>, stopped_cv_child>;
-static_assert(ex::sender<stopped_cv>);
+// The declared adaptor over senders with no surprises of their own, so
+// the asserts are about the adaptor and not about whatever it happens to
+// wrap: the two value shapes the pipeline gates, and the valueless one
+// the write side forwards.
+using declared_cv_child = decltype(ex::just(std::array<std::uint32_t, 8>{}));
+using declared_cv =
+    declared_sender<declared_cv_child, std::array<std::uint32_t, 8>>;
+static_assert(ex::sender<declared_cv>);
 static_assert(ex::operation_state<
-              stopped_if_op<std::array<std::uint32_t, 8>, stopped_cv_child,
-                            probe>>);
-using stopped_n_child = decltype(ex::just(std::size_t{}));
-static_assert(ex::sender<stopped_if_sender<std::size_t, stopped_n_child>>);
+              declared_op<declared_cv_child, probe,
+                          std::array<std::uint32_t, 8>>>);
+using declared_n_child = decltype(ex::just(std::size_t{}));
+static_assert(ex::sender<declared_sender<declared_n_child, std::size_t>>);
 static_assert(
-    ex::operation_state<stopped_if_op<std::size_t, stopped_n_child, probe>>);
+    ex::operation_state<declared_op<declared_n_child, probe, std::size_t>>);
+using declared_void_child = decltype(ex::just());
+static_assert(ex::sender<declared_sender<declared_void_child>>);
+static_assert(ex::operation_state<declared_op<declared_void_child, probe>>);
 static_assert(ex::sender<schedule_sender<io_driver>>);
 static_assert(ex::operation_state<schedule_op<io_driver, probe>>);
 static_assert(ex::scheduler<driver_scheduler<io_driver>>);
