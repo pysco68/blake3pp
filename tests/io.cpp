@@ -166,6 +166,44 @@ TEST_CASE("keyed hash_file matches keyed in-memory hashing") {
         expected);
 }
 
+// The options object carries the mode, so hash_file() reaches all three
+// and make_hasher() hands the same hasher to a caller that needs a
+// finalize form hash_file() does not have.
+TEST_CASE("hash_file_options carries the mode") {
+  std::array<std::byte, 32> key{};
+  for (std::size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<std::byte>(7 * i + 1);
+  }
+  constexpr std::string_view context = "blake3pp 2026-10-02 options test";
+  const auto content = make_input(1024 * 1024 + 7);
+  const temp_file f(content);
+
+  blake3pp::hasher derived = blake3pp::hasher::derive_key(context);
+  derived.update(content);
+
+  const blake3pp::hash_file_options opts{.window_bytes = 256 * 1024,
+                                         .derive_context = context};
+  CHECK(blake3pp::hash_file(f.path, opts) == derived.finalize());
+  CHECK(blake3pp::hash_file(f.path, blake3pp::get_parallel_scheduler(),
+                            opts) == derived.finalize());
+
+  // make_hasher() is the same hasher hash_file() builds internally, which
+  // is what gets extended output out of an options object.
+  blake3pp::hasher h = blake3pp::make_hasher(opts);
+  blake3pp::update_file(h, f.path, opts);
+  std::vector<std::byte> got(96);
+  std::vector<std::byte> expected(96);
+  h.finalize(got);
+  derived.finalize(expected);
+  CHECK(got == expected);
+
+  // The other two modes, through the same entry point.
+  CHECK(blake3pp::make_hasher({.key = key}).finalize() ==
+        blake3pp::hasher::keyed(std::span<const std::byte, 32>{key})
+            .finalize());
+  CHECK(blake3pp::make_hasher({}).finalize() == blake3pp::hasher{}.finalize());
+}
+
 // update_file() is hasher::update() with a file as the source, so every
 // mode and every finalize form must compose with it: here derive_key
 // with extended output, sequential and over a scheduler, against the

@@ -125,8 +125,14 @@ struct result {
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
-    if (!o.key_file.empty()) {
-      key_ = load_key(o.key_file);
+    // The mode goes into the options object, which is what every library
+    // entry point here takes; the context string's view points into this
+    // copy of the options and lives as long as the engine.
+    if (!opts_.key_file.empty()) {
+      opts_.io.key = load_key(opts_.key_file);
+    }
+    if (!opts_.derive_context.empty()) {
+      opts_.io.derive_context = opts_.derive_context;
     }
   }
 
@@ -147,11 +153,11 @@ class engine {
         read_stdin_into(ph);
         return finish(ph);
       }
-      blake3pp::hasher h = make_hasher();
+      blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
       read_stdin_into(h);
       return finish(h);
     }
-    blake3pp::hasher h = make_hasher();
+    blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
     if (pool_.parallel()) {
       blake3pp::update_file(h, path, pool_.scheduler(), opts_.io);
     } else {
@@ -170,7 +176,7 @@ class engine {
   }
 
   // Several files over one context, a bounded number in flight at a
-  // time, each line printed as its file completes and in input order.
+  // time, each outcome reported as its file completes and in input order.
   //
   // What this buys over calling hash_hex() per file is the arena: the
   // blocking path allocates and first-touches windows * window_bytes per
@@ -178,9 +184,12 @@ class engine {
   // every file and several are in flight at once. On a directory of
   // small files that allocation is most of the work.
   //
-  // A file that fails carries its message instead of a digest, so one
-  // bad file does not end the run. Returns how many failed.
-  int hash_many(const std::vector<std::string>& files, std::size_t out_len) {
+  // A file that fails carries its message instead of a digest, so one bad
+  // file does not end the run. report(index, result) says whether that
+  // file passed; the count of the ones that did not is returned.
+  template <class Report>
+  int run_batch(const std::vector<std::string>& files,
+                const std::vector<std::size_t>& out_lens, Report report) {
     blake3pp::async::io_context ctx({.window_bytes = opts_.io.window_bytes,
                                      .queue_depth = opts_.io.queue_depth,
                                      .arena_bytes = 128u << 20,
@@ -188,21 +197,16 @@ class engine {
                                      .offload_submit = opts_.io.offload_submit});
     const std::vector<std::filesystem::path> paths(files.begin(), files.end());
     std::vector<std::optional<result>> out(files.size());
-    std::vector<std::byte> digest(out_len);
-    std::size_t next = 0;  // the next line to print
+    std::size_t next = 0;  // the next outcome to report
     int failures = 0;
     auto work = blake3pp::async::async_update_files(
         ctx, paths, pool_.scheduler(), {.io = opts_.io},
-        [this](std::size_t) { return make_hasher(); },
+        [this](std::size_t) { return blake3pp::make_hasher(opts_.io); },
         [&](std::size_t i, blake3pp::hasher& h,
             const blake3pp::async::file_outcome& o) noexcept {
-          out[i] = describe(o, h, digest);
+          out[i] = describe(o, h, out_lens[i]);
           for (; next < out.size() && out[next].has_value(); ++next) {
-            const result& r = *out[next];
-            if (r.error.empty()) {
-              println(stdout, "{}  {}", r.hex, files[next]);
-            } else {
-              println(stderr, "blake3ppsum: {}: {}", files[next], r.error);
+            if (!report(next, *out[next])) {
               failures++;
             }
           }
@@ -211,13 +215,50 @@ class engine {
     return failures;
   }
 
+  // The batch behind the printing path: one line per file.
+  int hash_many(const std::vector<std::string>& files, std::size_t out_len) {
+    return run_batch(files, std::vector<std::size_t>(files.size(), out_len),
+                     [&](std::size_t i, const result& r) noexcept {
+                       if (!r.error.empty()) {
+                         println(stderr, "blake3ppsum: {}: {}", files[i],
+                                 r.error);
+                         return false;
+                       }
+                       println(stdout, "{}  {}", r.hex, files[i]);
+                       return true;
+                     });
+  }
+
+  // The batch behind --check: each file's digest taken to the length of
+  // the hex it is compared against.
+  int verify_many(const std::vector<std::string>& files,
+                  const std::vector<std::string>& expected) {
+    std::vector<std::size_t> out_lens(files.size());
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      out_lens[i] = expected[i].size() / 2;
+    }
+    return run_batch(files, out_lens,
+                     [&](std::size_t i, const result& r) noexcept {
+                       if (!r.error.empty()) {
+                         println(stderr, "blake3ppsum: {}: {}", files[i],
+                                 r.error);
+                         println(stdout, "{}: FAILED open or read", files[i]);
+                         return false;
+                       }
+                       const bool ok = r.hex == expected[i];
+                       println(stdout, "{}: {}", files[i],
+                               ok ? "OK" : "FAILED");
+                       return ok;
+                     });
+  }
+
  private:
   static result describe(const blake3pp::async::file_outcome& o,
-                         blake3pp::hasher& h,
-                         std::span<std::byte> digest) noexcept {
+                         blake3pp::hasher& h, std::size_t out_len) noexcept {
     result r;
     try {
       if (o.ok()) {
+        std::vector<std::byte> digest(out_len);
         h.finalize(digest);
         r.hex = blake3pp::to_hex(digest);
       } else if (o.error) {
@@ -235,16 +276,6 @@ class engine {
     return r;
   }
 
-  blake3pp::hasher make_hasher() const {
-    if (!opts_.derive_context.empty()) {
-      return blake3pp::hasher::derive_key(opts_.derive_context, opts_.io.a);
-    }
-    if (key_) {
-      return blake3pp::hasher::keyed(*key_, opts_.io.a);
-    }
-    return blake3pp::hasher{opts_.io.a};
-  }
-
   blake3pp::parallel_hasher<blake3pp::parallel_scheduler_t>
   make_parallel_hasher() {
     const blake3pp::parallel_hasher_options popts{.a = opts_.io.a};
@@ -253,10 +284,10 @@ class engine {
                                        std::string_view{opts_.derive_context},
                                        popts};
     }
-    if (key_) {
+    if (opts_.io.key) {
       return blake3pp::parallel_hasher{
-          pool_.scheduler(), std::span<const std::byte, blake3pp::key_size>{*key_},
-          popts};
+          pool_.scheduler(),
+          std::span<const std::byte, blake3pp::key_size>{*opts_.io.key}, popts};
     }
     return blake3pp::parallel_hasher{pool_.scheduler(), popts};
   }
@@ -275,14 +306,20 @@ class engine {
   }
 
   options opts_;
-  std::optional<std::array<std::byte, blake3pp::key_size>> key_;
   b3tool::compute_pool pool_;
 };
 
 // Verifies "<hex>  <name>" lines of any (even) digest length; also accepts
 // the '*' binary marker.
+//
+// The list is read first, then the files are hashed: with a compute pool
+// and more than one file they go through one context together, as on the
+// printing path. Malformed lines are reported as the list is read, so
+// they print before the results.
 int run_check(engine& eng, std::istream& in, std::string_view list_name) {
   int failures = 0;
+  std::vector<std::string> names;
+  std::vector<std::string> expected;
   std::string line;
   for (int line_no = 1; std::getline(in, line); ++line_no) {
     const std::string_view sv{line};
@@ -301,13 +338,21 @@ int run_check(engine& eng, std::istream& in, std::string_view list_name) {
     if (rest.starts_with('*')) {
       rest.remove_prefix(1);
     }
-    const std::string name{rest};
+    names.emplace_back(rest);
+    expected.emplace_back(hex);
+    for (char& c : expected.back()) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+  }
+
+  if (eng.can_batch(names)) {
+    return failures + eng.verify_many(names, expected);
+  }
+
+  for (std::size_t i = 0; i < names.size(); ++i) {
+    const std::string& name = names[i];
     try {
-      std::string expected{hex};
-      for (char& c : expected) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-      }
-      if (eng.hash_hex(name, hex.size() / 2) == expected) {
+      if (eng.hash_hex(name, expected[i].size() / 2) == expected[i]) {
         println(stdout, "{}: OK", name);
       } else {
         println(stdout, "{}: FAILED", name);

@@ -193,8 +193,10 @@ blake3pp knowing Boost exists, and without lossy transcoding on Windows.
 #### Inside the pipeline
 
 The knobs are `file_io_options`, and `hash_file_options` — which adds the
-SIMD variant and an optional key for the hasher it builds — converts to
-them, so one options object can drive both:
+SIMD variant and the mode (a key, or a key-derivation context) for the
+hasher it builds — converts to them, so one options object can drive both.
+`make_hasher(opts)` hands back that hasher, for the finalize forms
+`hash_file()` does not have:
 
 ```cpp
 #include <blake3pp/parallel_io.hpp>   // io.hpp + parallel.hpp

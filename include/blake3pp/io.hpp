@@ -33,11 +33,13 @@
 /// through ec instead.
 
 #include <array>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -91,9 +93,14 @@ struct hash_file_options {
   /// Issue reads on the kernel's I/O worker threads; see file_io_options.
   bool offload_submit = true;
   /// Keyed (MAC/PRF) mode when set, e.g. for authenticated file manifests.
-  /// derive_key and extended output have no shortcut here: build the
-  /// hasher yourself and use update_file().
   std::optional<std::array<std::byte, key_size>> key = std::nullopt;
+  /// Key-derivation mode with this context string when set; the string must
+  /// outlive the call. At most one of key and derive_context.
+  ///
+  /// Extended output has no shortcut here, since hash_file() returns a
+  /// 32-byte digest: take the hasher these options describe (make_hasher()),
+  /// stream it with update_file() and finalize it to any length.
+  std::optional<std::string_view> derive_context = std::nullopt;
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing.
   trace_buffer* trace = nullptr;
@@ -109,9 +116,14 @@ namespace detail {
 
 inline hasher make_hasher(const hash_file_options& opts,
                           const kern::kernel_ops* ops) noexcept {
+  assert(!(opts.key.has_value() && opts.derive_context.has_value()) &&
+         "hash_file_options: key and derive_context are two different modes");
   if (opts.key.has_value()) {
     return hasher::keyed(std::span<const std::byte, key_size>{opts.key.value()},
                          ops);
+  }
+  if (opts.derive_context.has_value()) {
+    return hasher::derive_key(opts.derive_context.value(), ops);
   }
   return hasher{ops};
 }
@@ -139,6 +151,26 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
 }
 
 }  // namespace detail
+
+/// The hasher these options describe: its SIMD variant, and the mode
+/// (plain, keyed or key-derivation) that key and derive_context select.
+///
+/// hash_file() builds this internally; it is public so a caller that needs
+/// a finalize form hash_file() does not have -- extended output, the
+/// seekable reader -- can stream the same options through update_file()
+/// without respelling the mode selection.
+/// @param opts  The variant and mode; the pipeline knobs are ignored here.
+///
+/// @code
+/// blake3pp::hash_file_options opts{.derive_context = "fixture v3 2026-09"};
+/// blake3pp::hasher h = blake3pp::make_hasher(opts);
+/// blake3pp::update_file(h, "seed.bin", opts);
+/// auto stream = h.finalize_xof();
+/// @endcode
+[[nodiscard]] inline hasher make_hasher(
+    const hash_file_options& opts) noexcept {
+  return detail::make_hasher(opts, detail::resolve(opts.a));
+}
 
 /// Streams a file's bytes into a hasher, as `h.update()` would, and returns
 /// with h open for more input or any finalize form.

@@ -92,7 +92,7 @@ over a list of files:
 ```cpp
 auto work = blake3pp::async::async_update_files(
     ctx, paths, sched, {.io = io_opts},
-    [&](std::size_t) { return make_hasher(); },
+    [&](std::size_t) { return blake3pp::make_hasher(io_opts); },
     [&](std::size_t i, blake3pp::hasher& h, const blake3pp::async::file_outcome& o) noexcept {
       if (o.ok()) print(i, h.finalize()); else report(i, o);
     });
