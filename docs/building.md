@@ -18,6 +18,12 @@ Any name from `cmake/toolchains/` works as a preset (see
 - `linux-gcc16-cxx26` and `linux-clang22-cxx26`
 - `linux-clang18-cxx20-libstdcxx`: the C++20 polyfill path
 - the two `-asan` variants
+- `linux-clang22-cxx23-fuzzer`: the differential fuzz harness
+  (`tests/fuzz_paths.cpp`), which feeds the same bytes through every path
+  the library has and compares them. Its ctest leg is a few thousand
+  inputs; a campaign is `blake3pp_fuzz_paths -max_total_time=<s> <corpus>`.
+  libFuzzer's runtime is built against libstdc++, which is why this lane
+  is not a libc++ one.
 
 On a Mac:
 

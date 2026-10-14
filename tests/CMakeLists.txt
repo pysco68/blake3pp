@@ -129,3 +129,23 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" AND CMAKE_SYSTEM_NAME STREQUAL "Linu
     add_test(NAME riscv_probe_${shape} COMMAND blake3pp_riscv_probe_shapes ${shape})
   endforeach()
 endif()
+
+# The libFuzzer harness, where the toolchain instruments for it
+# (linux-clang22-cxx23-fuzzer sets BLAKE3PP_TOOLCHAIN_FUZZER; the runtime
+# carries its own main(), so only this target links it). The harness
+# compares the library's paths against each other rather than against a
+# known answer -- see tests/fuzz_paths.cpp.
+#
+# ctest runs a short pass of it on every build of this lane: a few
+# thousand inputs take under a second and cover the lengths around every
+# boundary. A real campaign is `blake3pp_fuzz_paths -max_total_time=...`
+# with a corpus directory, which is a job rather than a test.
+if(BLAKE3PP_TOOLCHAIN_FUZZER)
+  add_executable(blake3pp_fuzz_paths fuzz_paths.cpp)
+  target_compile_options(blake3pp_fuzz_paths PRIVATE -fsanitize=fuzzer)
+  target_link_options(blake3pp_fuzz_paths PRIVATE -fsanitize=fuzzer)
+  target_link_libraries(blake3pp_fuzz_paths PRIVATE
+    blake3pp::blake3pp blake3pp_warnings)
+  add_test(NAME fuzz_paths_smoke
+    COMMAND blake3pp_fuzz_paths -runs=4000 -max_len=70000 -rss_limit_mb=4096)
+endif()

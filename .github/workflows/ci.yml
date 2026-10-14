@@ -296,6 +296,10 @@ jobs:
           - { preset: linux-clang22-cxx26-asan, image: clang22 }
           - { preset: linux-clang22-cxx26-msan, image: clang22 }
           - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
+          # The differential fuzz harness, whose ctest leg is a short pass
+          # of it. Its lane is the libstdc++ C++23 one, which is what
+          # libFuzzer's runtime links against.
+          - { preset: linux-clang22-cxx23-fuzzer, image: clang22 }
           # Coverage: LLVM source-based, the report (summary, lcov, html)
           # is written by tools/ci-test.sh and uploaded below. The SDE
           # pass runs instrumented too, so the AVX-512 kernel counts.

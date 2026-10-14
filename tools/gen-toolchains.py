@@ -204,6 +204,11 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
         for inst, spec in INSTRUMENTATIONS.items():
             if spec.get("clang_only") and not is_clang:
                 continue
+            if inst == "fuzzer" and "CXX_STANDARD" not in tc:
+                # The fuzzer lane is pinned to C++23 (below), so a base
+                # that differs only in a raw -std flag would be the C++23
+                # fuzzer over again.
+                continue
             new = dict(tc)
             if "sanitizers" in spec:
                 new["SANITIZERS"] = spec["sanitizers"]
@@ -211,6 +216,24 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
                 new["COVERAGE"] = "llvm" if is_clang else "gcov"
             if "build_type" in spec:
                 new["DEFAULT_BUILD_TYPE"] = spec["build_type"]
+            inst_name = f"{name}-{inst}"
+            if inst == "fuzzer":
+                # Two forced choices, both libFuzzer's. Its runtime ships
+                # built against libstdc++, and its own std::string and
+                # iostream references have to resolve, which a libc++ link
+                # leaves undefined; the harness passes raw bytes across the
+                # boundary, so the standard library only ever shows in the
+                # library under test. And libstdc++ 16's
+                # basic_format_string trips clang 22's consteval checking at
+                # C++26 -- every std::format call in the tools fails to
+                # compile -- so this lane is the C++23 one.
+                new["STDLIB"] = "libstdc++"
+                new["GCC_INSTALL_DIR"] = (
+                    f"/usr/lib/gcc/{GCC_TRIPLE}/"
+                    f"{CLANG_TO_GCC[int(tc['CXX_COMPILER'].rsplit('-', 1)[1])]}")
+                new["CXX_STANDARD"] = "23"
+                inst_name = inst_name.replace(f"-cxx{tc['CXX_STANDARD']}-",
+                                              "-cxx23-")
             if inst == "msan":
                 # An uninstrumented libc++ makes MSan report other people's
                 # uninitialised memory, so point it at the instrumented build.
@@ -232,7 +255,14 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
                 new["EXTRA_CXX_FLAGS"] = [
                     "-fno-sanitize=null,nonnull-attribute,returns-nonnull-attribute"
                 ]
-            out.append((f"{name}-{inst}", f"{desc} + {inst}", new))
+            inst_desc = desc
+            if inst == "fuzzer":
+                # Neither the standard library nor the standard is the
+                # base's, so the description must not claim they are.
+                inst_desc = (desc.replace("with libc++ (system)",
+                                          "against libstdc++")
+                                 .replace(f"C++{tc['CXX_STANDARD']}", "C++23"))
+            out.append((inst_name, f"{inst_desc} + {inst}", new))
     return out
 
 
