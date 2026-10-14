@@ -99,6 +99,7 @@ the type does not own, a scheduler or a file, and each comes as a pair
 so call sites read alike with and without cores:
 `hash(data)` and `hash(data, sched)`,
 `update_file(h, path)` and `update_file(h, path, sched)`,
+`write_file(path, n, fill)` and `write_file(path, n, fill, sched)`,
 `fill(r, out)` and `fill(r, out, sched)`. The scheduler-taking
 half of each pair lives in the header that owns the dependency.
 The two I/O headers exist only when the library is built with

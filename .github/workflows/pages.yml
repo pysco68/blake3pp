@@ -57,18 +57,25 @@ jobs:
         run: website/build.sh --all
 
       # The amalgamation is what the try links run, and it is generated
-      # rather than kept in the repository, so this is where it gets
-      # compiled. The runner has a new enough GCC only sometimes, so it
-      # warns rather than gates.
-      - name: Compile the amalgamation, if this runner can
-        continue-on-error: true
+      # rather than kept in the repository, so this is where it gets built.
+      # Linked and run, not syntax-checked: a header the generator forgot
+      # to paste shows up at link time, and the demo prints the official
+      # vector for "abc", so running it is the answer check. A runner
+      # without the compiler skips; one that has it gates, because a
+      # published link that does not compile is a broken page.
+      - name: Compile and run the amalgamation
         run: |
           python3 website/amalgamate.py -o "${RUNNER_TEMP}/single-file.cpp"
-          if g++-16 --version > /dev/null 2>&1; then
-            g++-16 -std=c++26 -O2 -msse4.2 -fsyntax-only "${RUNNER_TEMP}/single-file.cpp"
-          else
+          if ! g++-16 --version > /dev/null 2>&1; then
             echo "::warning::no g++-16 on this runner; published unverified"
+            exit 0
           fi
+          g++-16 -std=c++26 -O2 -msse4.2 "${RUNNER_TEMP}/single-file.cpp" \
+            -o "${RUNNER_TEMP}/single-file"
+          out=$("${RUNNER_TEMP}/single-file")
+          echo "${out}"
+          echo "${out}" | grep -q \
+            6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

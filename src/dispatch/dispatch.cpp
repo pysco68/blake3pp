@@ -227,8 +227,12 @@ std::string_view simd_provider() noexcept {
   return "std::simd";
 #elif defined(BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
   return "std::experimental::simd";
-#else
+#elif defined(BLAKE3PP_HAS_XSIMD)
   return "xsimd";
+#else
+  // No provider at all: a build whose only kernel is the scalar one, which
+  // needs none. The single-file amalgamation lands here below C++26.
+  return "none (scalar only)";
 #endif
 }
 
