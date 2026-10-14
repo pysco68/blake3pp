@@ -175,6 +175,12 @@ inline void tool_startup() noexcept {
   blake3pp::run_trap_probes();
 }
 
+// Whether a count of one still gets a scheduler. A tool takes the
+// sequential path there, where the pool would only add a hand-off; a
+// benchmark wants the pool machinery measured at zero parallelism, and the
+// file bench sweeps counts around the core count on purpose.
+enum class one_thread { sequential, pooled };
+
 // --threads, resolved to a scheduler. Both tools share the convention:
 // the default is default_threads(), 1 means sequential, 0 is rejected
 // by the parser.
@@ -189,22 +195,31 @@ inline void tool_startup() noexcept {
 // owned pool and the process-wide one return the same type here.
 class compute_pool {
  public:
-  explicit compute_pool(unsigned threads) : threads_(threads) {
+  // A count of 0 means "as many as the machine has", which is what a
+  // benchmark sweeping thread counts passes for its default.
+  explicit compute_pool(unsigned threads,
+                        one_thread at_one = one_thread::sequential)
+      : threads_(threads != 0 ? threads : default_threads()), at_one_(at_one) {
 #if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
     // One sized scheduler per process, whatever the provider: the tool
     // fixes it here, before anything can have used it.
-    if (threads > 1) {
-      blake3pp::size_parallel_scheduler(threads);
+    if (parallel()) {
+      blake3pp::size_parallel_scheduler(threads_);
     }
 #elif defined(BLAKE3PP_EXECUTION_STDEXEC)
-    if (threads > 1) {
-      pool_.emplace(threads);
+    if (parallel()) {
+      pool_.emplace(threads_);
     }
 #endif
   }
 
+  // The count in force, after a 0 resolved to the machine's.
+  [[nodiscard]] unsigned count() const noexcept { return threads_; }
+
   // Whether work should be offloaded at all.
-  [[nodiscard]] bool parallel() const noexcept { return threads_ > 1; }
+  [[nodiscard]] bool parallel() const noexcept {
+    return threads_ > 1 || at_one_ == one_thread::pooled;
+  }
 
   // Precondition: parallel(). With the sized backend this is the process
   // scheduler at the size the constructor fixed; under stdexec without it,
@@ -222,6 +237,7 @@ class compute_pool {
 
  private:
   unsigned threads_;
+  one_thread at_one_;
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
   std::optional<exec::static_thread_pool> pool_;
 #endif

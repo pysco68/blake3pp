@@ -842,24 +842,11 @@ int main(int argc, char** argv) {
             b3tool::rate(input.size(), best), d.to_hex().substr(0, 16), note);
   };
 
-  // An OWNED pool at exactly nthreads, not b3tool::compute_pool, whose
-  // scheduler() has a threads>1 precondition (--threads 1 is a valid and
-  // interesting measurement here: pool machinery at zero parallelism).
-#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-  // The process scheduler, sized here for every provider, which is what
-  // makes --threads mean the same thing in a stdexec and a beman build.
-  blake3pp::size_parallel_scheduler(nthreads);
-#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
-  exec::static_thread_pool engine_pool{nthreads};
-#endif
-  auto engine_sched =
-#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-      blake3pp::get_parallel_scheduler();
-#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
-      engine_pool.get_scheduler();
-#else
-      blake3pp::get_parallel_scheduler();
-#endif
+  // A pool at exactly nthreads, one included: --threads 1 is a valid and
+  // interesting measurement here, the pool machinery at zero parallelism,
+  // where a tool would take the sequential path instead.
+  b3tool::compute_pool engine_pool{nthreads, b3tool::one_thread::pooled};
+  auto engine_sched = engine_pool.scheduler();
   {
     auto sched = engine_sched;
     row("blake3pp/pool",

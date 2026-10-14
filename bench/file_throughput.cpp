@@ -707,46 +707,17 @@ std::string trace_file_name(const std::string& path, const char* label,
 // claims to have read.
 constexpr std::byte null_filler{0xa5};
 
-// --threads resolved to a scheduler: an owned pool of exactly that size
-// under stdexec, the process-wide scheduler elsewhere.
+// --threads resolved to a scheduler (b3tool::compute_pool, one_thread::pooled:
+// a pool at exactly that size, one included, since a count of one is a
+// measurement here rather than the sequential path).
 //
 // The option exists as a DIAGNOSTIC for the sync-tier oversubscription
 // question. The pread fallback's reader is an implicit extra thread the
 // pool does not know about, so 11 runnable threads on a 10-core phone.
 // Sweep N-1/N/N+1 to separate reader starvation from other shortfalls.
-class engine_threads {
- public:
-  explicit engine_threads(unsigned threads)
-      : threads_(threads != 0 ? threads : std::thread::hardware_concurrency())
-#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-        ,
-        pool_(threads_)
-#endif
-  {
-#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-    // The process scheduler, sized for every provider alike.
-    blake3pp::size_parallel_scheduler(threads_);
-#endif
-  }
-
-  [[nodiscard]] unsigned count() const noexcept { return threads_; }
-
-  [[nodiscard]] blake3pp::parallel_scheduler_t scheduler() {
-#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-    return blake3pp::get_parallel_scheduler();
-#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
-    return pool_.get_scheduler();
-#else
-    return blake3pp::get_parallel_scheduler();
-#endif
-  }
-
- private:
-  unsigned threads_;
-#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-  exec::static_thread_pool pool_;
-#endif
-};
+[[nodiscard]] inline b3tool::compute_pool engine_threads(unsigned threads) {
+  return b3tool::compute_pool{threads, b3tool::one_thread::pooled};
+}
 
 // The window x qd pacing matrix: same measurement as the main rows, swept.
 void io_sweep(const std::string& path, std::uint64_t bytes,
@@ -774,7 +745,7 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
   std::printf("\n");
 
   b3tool::cooldown cooldown(cooldown_s);
-  engine_threads engine(pool_threads);
+  auto engine = engine_threads(pool_threads);
   auto sched = engine.scheduler();
   double best_gibs = 0.0;
   double default_gibs = 0.0;
@@ -933,7 +904,7 @@ int main(int argc, char** argv) {
     }
     const blake3pp::digest want = expect.finalize();
 
-    engine_threads engine(threads);
+    auto engine = engine_threads(threads);
     auto sched = engine.scheduler();
     b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
     double best = 1e30;
@@ -1005,7 +976,7 @@ int main(int argc, char** argv) {
     seed.update(std::span<const std::byte>{&null_filler, 1});
     const blake3pp::output_reader stream = seed.finalize_xof();
 
-    engine_threads engine(threads);
+    auto engine = engine_threads(threads);
     auto sched = engine.scheduler();
     b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
     double best = 1e30;
@@ -1166,7 +1137,7 @@ int main(int argc, char** argv) {
   run("seq", [&] { return blake3pp::hash_file(path.c_str(), opts); });
 
   if (!seq_only) {
-    engine_threads engine(pool_threads);
+    auto engine = engine_threads(pool_threads);
     auto sched = engine.scheduler();
     println(stdout, "parallel:   {} threads, affinity mask: {}",
             engine.count(),
