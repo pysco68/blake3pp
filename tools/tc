@@ -7,7 +7,8 @@
 #   tools/tc --pull                 pull/refresh all toolchain images
 #   tools/tc --list                 show the preset -> image mapping
 #
-# The devcontainer talks to the HOST docker daemon (docker-outside-of-docker),
+# The devcontainer talks to the HOST docker daemon (docker-outside-of-docker;
+# BLAKE3PP_TC_RUNTIME=podman for a host that has podman instead),
 # so every -v below must be a HOST path. devcontainer.json passes it in as
 # LOCAL_WORKSPACE_FOLDER; outside a container we fall back
 # to the current checkout. The workspace mounts at /workspaces/blake3pp in
@@ -18,6 +19,10 @@ set -euo pipefail
 REGISTRY="${BLAKE3PP_TC_REGISTRY:-ghcr.io/pysco68/blake3pp}"
 TAG="${BLAKE3PP_TC_TAG:-latest}"
 WORKDIR=/workspaces/blake3pp
+# The container runtime. podman is CLI-compatible for pull and run, and is
+# what a machine with no docker daemon has: BLAKE3PP_TC_RUNTIME=podman is how
+# a build box that is not the devcontainer runs the same images.
+RUNTIME="${BLAKE3PP_TC_RUNTIME:-docker}"
 
 ALL_IMAGES=(gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 riscv64-gcc15 ppc64le-gcc15 s390x-gcc15
             mips64el-gcc14 zig emscripten)
@@ -76,9 +81,14 @@ run_in_image() {
   local image="$1"; shift
   local -a tty_args=()
   if [ -t 0 ] && [ -t 1 ]; then tty_args=(-it); fi
-  docker run --rm "${tty_args[@]}" --init \
+  # Who the build runs as. Under docker the images' own 1000:1000 matches the
+  # workspace's owner; rootless podman maps the caller into the container
+  # instead, and keep-id is what makes the mounted tree writable there.
+  local -a user_args=(-u 1000:1000 --group-add 1001)
+  if [ "${RUNTIME##*/}" = podman ]; then user_args=(--userns=keep-id); fi
+  "${RUNTIME}" run --rm "${tty_args[@]}" --init \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ulimit core=0 \
-    -u 1000:1000 --group-add 1001 \
+    "${user_args[@]}" \
     -v "$(host_workspace):${WORKDIR}" \
     -w "$(container_workdir)" \
     -e CMAKE_GENERATOR=Ninja \
@@ -91,8 +101,8 @@ run_in_image() {
     "${REGISTRY}/toolchain-${image}:${TAG}" \
     "$@" \
   || { rc=$?; \
-       echo "tc: if the image failed to pull, log the HOST daemon in to GHCR:" >&2; \
-       echo "tc:   gh auth token | docker login ghcr.io -u pysco68 --password-stdin" >&2; \
+       echo "tc: if the image failed to pull, log the runtime in to GHCR:" >&2; \
+       echo "tc:   gh auth token | ${RUNTIME} login ghcr.io -u pysco68 --password-stdin" >&2; \
        exit "$rc"; }
 }
 
@@ -115,7 +125,7 @@ case "$1" in
     exit 0 ;;
   --pull)
     for img in "${ALL_IMAGES[@]}"; do
-      docker pull "${REGISTRY}/toolchain-${img}:${TAG}"
+      "${RUNTIME}" pull "${REGISTRY}/toolchain-${img}:${TAG}"
     done
     exit 0 ;;
   --shell)
