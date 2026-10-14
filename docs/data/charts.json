@@ -1,0 +1,61 @@
+{
+  "comment": [
+    "The rows behind docs/performance.md. Each group names the run it came",
+    "from: the machine, the commit the binaries were built at and the day.",
+    "tools/bench-charts.py --extract <report> prints these out of a bench",
+    "report; the reports themselves live with the measurement workspace."
+  ],
+  "charts": {
+    "one-core": {
+      "kind": "grouped-bars",
+      "title": "One core, a long message",
+      "subtitle": "512 MiB in memory, best of 5, both implementations in the same run",
+      "unit": "GiB/s, higher is better",
+      "series": ["blake3pp", "reference implementation"],
+      "groups": [
+        {"name": "Zen 5, AVX-512", "values": [9.31, 8.08],
+         "source": "Ryzen AI MAX+ 395, WSL2, zig/musl, fd432eb, 2026-10-03"},
+        {"name": "Sapphire Rapids, AVX-512", "values": [4.06, 4.66],
+         "source": "Xeon 8481C (GCP c3-standard-22), 582226e, 2026-10-02"},
+        {"name": "Zen 3+, AVX2", "values": [3.32, 3.99],
+         "source": "Ryzen 7 PRO 6860Z laptop, zig/musl, fd432eb, 2026-10-03"},
+        {"name": "Neoverse V2", "values": [1.89, 1.61],
+         "source": "GCP Axion c4a-standard-16, 582226e, 2026-10-02"},
+        {"name": "Apple M2", "values": [1.88, 1.87],
+         "source": "M2 MacBook Air (fanless), appleclang, 582226e, 2026-10-02"}
+      ]
+    },
+    "threads": {
+      "kind": "lines",
+      "title": "Every core: throughput against thread count",
+      "subtitle": "Ryzen AI MAX+ 395 (16 cores, 32 threads), 512 MiB in memory, fd432eb, 2026-10-03",
+      "unit": "GiB/s against threads, higher is better",
+      "series": ["blake3pp pool", "reference kernel, same pool", "crate rayon"],
+      "points": [
+        {"x": 1, "values": [8.47, 9.9, 7.73]},
+        {"x": 2, "values": [16.7, 19.1, 14.96]},
+        {"x": 4, "values": [34.0, 36.8, 29.52]},
+        {"x": 8, "values": [45.6, 50.7, 40.49]},
+        {"x": 16, "values": [74.3, 84.5, 72.93]},
+        {"x": 32, "values": [76.6, 81.5, 69.44]}
+      ]
+    },
+    "short-messages": {
+      "kind": "grouped-bars",
+      "title": "Short messages: 8 KiB per hasher",
+      "subtitle": "one hasher per message, same runs as the long-message chart",
+      "unit": "GiB/s, higher is better",
+      "series": ["blake3pp", "reference implementation"],
+      "groups": [
+        {"name": "Zen 5, AVX-512", "values": [4.39, 5.14],
+         "source": "Ryzen AI MAX+ 395, WSL2, fd432eb, 2026-10-03"},
+        {"name": "Sapphire Rapids, AVX-512", "values": [2.10, 3.39],
+         "source": "Xeon 8481C (GCP c3-standard-22), 582226e, 2026-10-02"},
+        {"name": "Zen 3+, AVX2", "values": [2.57, 3.63],
+         "source": "Ryzen 7 PRO 6860Z laptop, fd432eb, 2026-10-03"},
+        {"name": "Apple M2", "values": [1.76, 1.81],
+         "source": "M2 MacBook Air (fanless), 582226e, 2026-10-02"}
+      ]
+    }
+  }
+}

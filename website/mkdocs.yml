@@ -61,6 +61,7 @@ nav:
   - Guide:
       - The API: api.md
       - Architectures and kernels: architectures.md
+      - Performance: performance.md
       - Command-line tools: tools.md
   - Examples:
       - Overview: examples/index.md

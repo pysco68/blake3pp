@@ -91,6 +91,7 @@ BLAKE3 is more than a 32-byte digest, and all of it is available:
 | [Reference](reference/index.md) | every declaration on its own terms, generated from the headers' doc comments |
 | [Many files at once](async.md) | EXPERIMENTAL: file hashing as senders over a context you drive |
 | [Architectures and kernels](architectures.md) | which SIMD variants a build carries, and how dispatch picks one |
+| [Performance](performance.md) | this library against the reference implementation, per machine, with the runs behind the charts |
 | [Command-line tools](tools.md) | `blake3ppsum` and `blake3ppgen` |
 | [Building](building.md) | presets, toolchain images, and the kernel switches |
 | [Integration](integration.md) | vendoring, installing, and `find_package` |
