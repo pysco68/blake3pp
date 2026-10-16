@@ -57,6 +57,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <system_error>
 #include <tuple>
 #include <type_traits>
@@ -263,11 +264,17 @@ class basic_io_context {
   }
 
   void drive(bool until_idle, const std::atomic<bool>* until = nullptr) {
-    const bool was_running = running_.exchange(true, std::memory_order_acq_rel);
-    assert(!was_running &&
-           "only one thread may run an io_context; the others may call "
-           "request_stop() and start operations, nothing else");
-    (void)was_running;
+    // Reported in every build, like the pipeline's own stall report and for
+    // the same reason: two threads inside one context is a shape a caller
+    // configured, not a bug a sanitizer lane would find, and under NDEBUG
+    // the second one would walk the operation list the first is mutating.
+    // run() is not noexcept, so this one can be thrown.
+    if (running_.exchange(true, std::memory_order_acq_rel)) {
+      throw std::logic_error(
+          "blake3pp: a second thread called run() on an io_context; only one "
+          "may run it, and the others may call request_stop() and start "
+          "operations");
+    }
     // Whatever leaves this frame, the context is runnable again: an
     // exception out of the driver's poll leaves the started operations
     // linked and unfinished, and the next run() continues them.

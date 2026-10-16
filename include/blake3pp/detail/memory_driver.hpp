@@ -32,6 +32,7 @@
 #include <mutex>
 #include <utility>
 
+#include <blake3pp/detail/contract.hpp>
 #include <blake3pp/detail/driver.hpp>
 
 namespace blake3pp::detail {
@@ -206,8 +207,14 @@ class memory_driver {
   [[nodiscard]] window_storage window_storage_for(
       file& f, [[maybe_unused]] unsigned slot, std::uint64_t off,
       std::size_t bytes) noexcept {
-    assert(slot < windows_ && "a window outside the reserved geometry");
-    assert(off + bytes <= f.bytes_.size() && "a window past the span's end");
+    // Checked in every build: the subspan below is a view into the
+    // caller's own memory, and a window past its end is a read of whatever
+    // follows it -- which on this driver is the caller's address space
+    // rather than an arena of ours.
+    require(slot < windows_, "a window outside the reserved geometry");
+    require(off + bytes <= f.bytes_.size(),
+            "window_storage_for(): a window past the end of the span being "
+            "hashed");
     return {{}, f.bytes_.subspan(static_cast<std::size_t>(off), bytes)};
   }
 

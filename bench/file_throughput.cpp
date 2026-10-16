@@ -995,7 +995,7 @@ int main(int argc, char** argv) {
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_write_pipeline(
           drv, nf, sched,
-          [&stream](std::span<std::byte> out, std::uint64_t off) {
+          [&stream](std::span<std::byte> out, std::uint64_t off) noexcept {
             blake3pp::output_reader rd = stream;
             rd.seek(off);
             blake3pp::fill(rd, out);

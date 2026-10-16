@@ -70,10 +70,13 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 /// offset)` on the scheduler's agents, once per window, and must fill
 /// every byte of `out`; windows are filled and written concurrently, in
 /// no particular order, so a generator must depend on its offset and
-/// nothing else. It must also not throw: the fill runs inside a noexcept
-/// stage, so an exception escaping it terminates. A generator that can
-/// fail should record the failure and fill the window, leaving the
-/// caller to check afterwards.
+/// nothing else. It must also be `noexcept`, and say so: the fill runs on
+/// a pool thread inside a window already counted in flight, where an
+/// exception has nowhere to go, so a generator that is not declared
+/// noexcept does not compile. A generator that can fail should record the
+/// failure and fill the window, leaving the caller to check afterwards.
+/// The sequential forms in <blake3pp/io.hpp> take a throwing generator,
+/// because there the fill runs on the calling thread.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is

@@ -30,6 +30,8 @@
 #include <limits>
 #include <span>
 
+#include <blake3pp/detail/contract.hpp>
+
 #include "core/core.hpp"
 #include "kernel/kernel.hpp"
 #include "kernel/uninitialized.hpp"
@@ -609,7 +611,13 @@ inline void fold_sibling_cvs_wide(const kern::kernel_ops& k,
                                   std::span<const std::uint32_t, 8> key,
                                   std::uint32_t base_flags,
                                   std::span<std::uint32_t, 8> out_cv) noexcept {
-  assert(cvs.size() >= 2 && std::has_single_bit(cvs.size()));
+  // Checked in every build: the loop below writes back take / 2 parents
+  // per batch, so an odd count silently drops the chaining value that had
+  // no sibling -- a digest over fewer subtrees than it was given, which
+  // nothing afterwards can notice.
+  detail::require(cvs.size() >= 2 && std::has_single_bit(cvs.size()),
+          "fold_sibling_cvs(): a count of chaining values that is not a "
+          "power of two");
   constexpr std::size_t batch_parents = 2 * MaxDegree;
   std::uint8_t children BLAKE3PP_CXXATTR_UNINITIALIZED [2 * batch_parents * kern::out_len];
   std::uint8_t parents BLAKE3PP_CXXATTR_UNINITIALIZED [batch_parents * kern::out_len];

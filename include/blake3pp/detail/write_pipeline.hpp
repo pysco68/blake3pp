@@ -245,8 +245,16 @@ class write_scope
   // Marked noexcept, which is the caller's contract too: an exception
   // escaping the generator terminates rather than unwinding through a
   // stage whose window is already counted in flight. write_file's
-  // documentation says so.
+  // documentation says so, and the static_assert makes a generator that
+  // can throw a compile error rather than a crash under load -- the
+  // sequential forms of write_file() take one that may throw, and this is
+  // the path that cannot.
   void fill_window(window& w) noexcept {
+    static_assert(
+        std::is_nothrow_invocable_v<Fill&, std::span<std::byte>, std::uint64_t>,
+        "the scheduler-taking write_file() needs a noexcept generator: it "
+        "runs on a pool thread inside a window already counted in flight, "
+        "where an exception has nowhere to go");
     fill_(w.buffer.first(w.bytes), w.offset);
   }
 
@@ -280,10 +288,12 @@ class write_scope
         std::min<std::uint64_t>(window_bytes_, total_ - next_offset_));
     const window_storage storage =
         loop_.driver().window_storage_for(file_, w.slot, w.offset, w.bytes);
-    // A write needs somewhere to generate INTO, so a driver that hands
-    // out views rather than buffers cannot serve this scope.
-    assert(!storage.read_into.empty() &&
-           "the write pipeline needs a driver that owns window buffers");
+    // A write needs somewhere to generate INTO, so a driver that hands out
+    // views rather than buffers cannot serve this scope. Checked in every
+    // build: past it the window's buffer is an empty span and the chain
+    // hands the generator {nullptr, w.bytes} to fill.
+    require(!storage.read_into.empty(),
+            "the write pipeline needs a driver that owns window buffers");
     w.buffer = storage.read_into;
     next_offset_ += w.bytes;
   }

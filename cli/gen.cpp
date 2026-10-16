@@ -212,7 +212,8 @@ int main(int argc, char** argv) {
       const std::uint64_t total = *remaining.total();
       blake3pp::write_file(
           output, total,
-          [&stream, seek](std::span<std::byte> out, std::uint64_t off) {
+          [&stream, seek](std::span<std::byte> out,
+                          std::uint64_t off) noexcept {
             blake3pp::output_reader r = stream;
             r.seek(seek + off);
             blake3pp::fill(r, out);

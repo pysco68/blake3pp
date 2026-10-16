@@ -16,6 +16,8 @@
 #include <atomic>
 #include <bit>
 #include <cassert>
+
+#include <blake3pp/detail/contract.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -305,8 +307,11 @@ struct window_compress {
   std::uint32_t flags = 0;
 
   // One CV per part on the edge path, one per group on the grouped one;
-  // what the fold after the bulk reads.
-  part_cvs<Budget> cvs;
+  // what the fold after the bulk reads. Zero-initialised here rather than
+  // by whoever owns the window: a stopped run's fold reads the slots no
+  // agent reached, and a window_compress declared directly (as the tests
+  // do) has no container to do it for it.
+  part_cvs<Budget> cvs{};
   std::atomic<std::size_t> next{0};   // the agents pull their parts from here
   std::array<std::uint32_t, 8> cv{};  // where the fold leaves the window's CV
   part_trace pt{nullptr, 0, 0};
@@ -332,11 +337,17 @@ struct window_compress {
   // Takes a full, counter-aligned window. False means it is too small to
   // fan out and belongs on the sequential path, the same verdict
   // a window's compress stage reaches.
+  //
+  // @pre chunks is a power of two. The parts have to divide the window
+  //      exactly: a remainder would be chunks this never compresses, and
+  //      the grouped fold below needs a power-of-two group. Every caller
+  //      gets it from rounded_window_bytes(), which bit_floors.
   [[nodiscard]] bool prepare(const kern::kernel_ops* o, const std::byte* d,
                              std::size_t chunks, std::uint64_t counter,
                              std::span<const std::uint32_t, 8> k,
                              std::uint32_t f, trace_buffer* buf,
                              std::uint64_t window_id) noexcept {
+    assert(chunks > 0 && std::has_single_bit(chunks));
     const std::size_t p = part_chunks<Budget>(chunks);
     if (p >= chunks) {
       return false;
@@ -362,7 +373,14 @@ struct window_compress {
                     std::uint64_t counter,
                     std::span<const std::uint32_t, 8> k, std::uint32_t f,
                     trace_buffer* buf, std::uint64_t window_id) noexcept {
-    assert(parts <= Budget.parts());
+    // Checked in every build: the table is a fixed Budget.parts() entries
+    // inside this object, and a part past the end writes through the
+    // members that follow it. The two callers derive `parts` from the
+    // window's own geometry, so a violation is arithmetic that disagrees
+    // with the budget rather than a caller's mistake.
+    require(parts <= Budget.parts(),
+            "window_compress::prepare_edge(): more parts than the stack "
+            "budget's table holds");
     set_window(o, d, counter, part_chunks, parts, k, f, buf, window_id);
     grouped = false;
   }

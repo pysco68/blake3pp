@@ -26,6 +26,7 @@
 #include <span>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/contract.hpp>
 
 namespace blake3pp::detail {
 
@@ -65,16 +66,24 @@ class tree_reducer {
   // [first_chunk, first_chunk + chunks) and merges upward while a sibling
   // is pending.
   // @pre chunks is a power of two; first_chunk % chunks == 0.
-  // @pre The range is disjoint from every range inserted before.
-  // @pre The range does not contain the message's final chunk.
-  // These are checked by assert() only, and the last one not at all: the
-  // caller knows where the message ends and this does not.
+  // @pre The range is disjoint from every range inserted before. Checked in
+  //      every build, because inserting one twice is a digest that is
+  //      wrong and reports nothing: the chunks inserted can never exceed
+  //      the span they cover, which holds whatever has already merged away.
+  // @pre The range does not contain the message's final chunk. Not checked
+  //      at all: the caller knows where the message ends and this does not.
   // @return false, with the reducer unchanged, if storage is full.
   [[nodiscard]] bool insert(std::uint64_t first_chunk, std::uint64_t chunks,
                             std::span<const std::uint32_t, 8> cv) noexcept {
     assert(chunks > 0 && std::has_single_bit(chunks));
     assert(first_chunk % chunks == 0);
-    assert(!overlaps_pending(first_chunk, chunks));
+    const std::uint64_t low = count_ == 0 && inserted_ == 0
+                                  ? first_chunk
+                                  : std::min(lowest_, first_chunk);
+    const std::uint64_t high = std::max(highest_end_, first_chunk + chunks);
+    require(inserted_ + chunks <= high - low,
+            "tree_reducer::insert(): a range overlapping one already "
+            "inserted, which would absorb the same chunks twice");
     node merged;
     merged.first_chunk = first_chunk;
     merged.chunks = chunks;
@@ -115,6 +124,9 @@ class tree_reducer {
     storage_[count_] = merged;
     count_++;
     sorted_ = false;
+    inserted_ += chunks;
+    lowest_ = low;
+    highest_end_ = high;
     return true;
   }
 
@@ -141,16 +153,24 @@ class tree_reducer {
 
   // Pushes every pending node into h in order, then clears.
   // @pre The pending ranges are contiguous and start at
-  //      h.count() / chunk_size; h sits on a chunk boundary.
-  // @pre h has the key and flags this reducer was built with.
+  //      h.count() / chunk_size; h sits on a chunk boundary. Checked in
+  //      every build: a hole between two of them puts the node after it at
+  //      the wrong position in the tree, which is a wrong digest and
+  //      nothing else.
+  // @pre h has the key and flags this reducer was built with. Not checked:
+  //      nothing here can see them.
   void drain_into(hasher& h) noexcept {
     const std::span<const node> nodes = sorted();
-    assert(h.count() % chunk_size == 0);
-    assert(nodes.empty() ||
-           nodes.front().first_chunk == h.count() / chunk_size);
+    require(h.count() % chunk_size == 0,
+            "tree_reducer::drain_into(): a hasher part-way through a chunk");
+    require(nodes.empty() || nodes.front().first_chunk == h.count() / chunk_size,
+            "tree_reducer::drain_into(): the pending run does not start "
+            "where the hasher stands");
     for (std::size_t i = 0; i < nodes.size(); ++i) {
-      assert(i == 0 || nodes[i].first_chunk ==
-                           nodes[i - 1].first_chunk + nodes[i - 1].chunks);
+      require(i == 0 || nodes[i].first_chunk ==
+                            nodes[i - 1].first_chunk + nodes[i - 1].chunks,
+              "tree_reducer::drain_into(): a hole in the pending run, which "
+              "would absorb the nodes after it at the wrong position");
       h.push_subtree_cv(nodes[i].cv, nodes[i].chunks);
     }
     clear();
@@ -159,6 +179,9 @@ class tree_reducer {
   void clear() noexcept {
     count_ = 0;
     sorted_ = true;
+    inserted_ = 0;
+    lowest_ = 0;
+    highest_end_ = 0;
   }
 
  private:
@@ -177,24 +200,18 @@ class tree_reducer {
     return npos;
   }
 
-  // Only what is still pending can be checked; a range that was already
-  // merged away is gone. Enough to catch a caller inserting twice.
-  [[nodiscard]] bool overlaps_pending(std::uint64_t first_chunk,
-                                      std::uint64_t chunks) const noexcept {
-    for (std::size_t i = 0; i < count_; ++i) {
-      if (first_chunk < storage_[i].first_chunk + storage_[i].chunks &&
-          storage_[i].first_chunk < first_chunk + chunks) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   const kern::kernel_ops* ops_;
   cv_type key_;
   std::uint32_t base_flags_;
   std::span<node> storage_;
   std::size_t count_ = 0;
+  // What insert() checks disjointness with, in three numbers rather than a
+  // scan of what is still pending: the chunks inserted since the last
+  // clear(), and the span they cover. Disjoint ranges keep the first at or
+  // below the second whatever has merged away in between.
+  std::uint64_t inserted_ = 0;
+  std::uint64_t lowest_ = 0;
+  std::uint64_t highest_end_ = 0;
   bool sorted_ = true;
 };
 
@@ -242,8 +259,13 @@ struct cv_run {
     while (parts * 2 <= run.last - i && first_part % (2 * parts) == 0) {
       parts *= 2;
     }
-    assert(count < out.size() &&
-           "fold_aligned_runs needs 2 * 54 nodes for the worst run");
+    // Checked in every build: past the end this writes 48 bytes into
+    // whatever follows the caller's array. The bound it needs is
+    // 2 * bit_width(parts), which nodes_for() states and the pipeline
+    // reserves, so a short span is a caller that computed it differently.
+    require(count < out.size(),
+            "fold_aligned_runs(): an output span shorter than the run's "
+            "decomposition (2 * 54 nodes covers any run)");
     tree_reducer::node& node = out[count++];
     node.first_chunk =
         run.base_chunk + static_cast<std::uint64_t>(i) * run.part_chunks;

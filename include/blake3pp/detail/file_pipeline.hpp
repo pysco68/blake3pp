@@ -1388,8 +1388,12 @@ class window_scope
     assert((ends_message_ || file_bytes_ % window_bytes_ == 0) &&
            "a span that does not end the message must be a whole number "
            "of windows: a partial one cannot be absorbed as a subtree");
-    assert(host.pool().window_bytes() >= window_bytes_ &&
-           "the pool's windows are smaller than this run plans to read");
+    // Checked in every build: a read of window_bytes_ into a slot the pool
+    // sized smaller runs off the end of the arena, which the driver hands
+    // out by slot without a length of its own.
+    require(host.pool().window_bytes() >= window_bytes_,
+            "update_file(): a host whose windows are smaller than this run "
+            "plans to read");
     loop_.record_into(trace_);
     // One operation cell per window this run may hold at once. The cells
     // are the scope's; the windows are not, so a borrowed window carries
@@ -1883,13 +1887,20 @@ class window_scope
 
   // On the driver, like every other insert.
   void insert_edge_nodes(window& w, std::size_t nodes) noexcept {
+    // fold_aligned_runs() wrote these, bounded by the span it was given;
+    // reading more than that span holds would walk off the array.
+    require(nodes <= edge_node_cap,
+            "an edge window produced more nodes than its slot holds");
     w.nodes = nodes;
     for (std::size_t i = 0; i < nodes; ++i) {
       const tree_reducer::node& n = edge_nodes_[w.plan.edge_slot][i];
-      const bool inserted = reducer_.insert(n.first_chunk, n.chunks, n.cv);
-      // Admission reserved a whole decomposition for this window.
-      assert(inserted && "the reducer refused an edge window's node");
-      (void)inserted;
+      // Admission reserved a whole decomposition for this window, so a
+      // refusal is capacity arithmetic that disagrees with itself. Checked
+      // in every build: dropping the node silently is a subtree missing
+      // from the tree, which is a wrong digest and no error.
+      require(reducer_.insert(n.first_chunk, n.chunks, n.cv),
+              "the reducer refused an edge window's node, which admission "
+              "had reserved room for");
     }
     max_pending_ = std::max(max_pending_, reducer_.pending());
     if (w.rec != nullptr) {
@@ -2134,10 +2145,12 @@ class window_scope
   }
 
   void reduce_into_tree(window& w, const cv_type& cv) noexcept {
-    const bool inserted = reducer_.insert(w.plan.first_chunk, w.chunks, cv);
-    // Admission reserved this node before the window started.
-    assert(inserted && "the reducer refused a window admission had room for");
-    (void)inserted;
+    // Admission reserved this node before the window started; the same
+    // reasoning as the edge path's, and the same consequence if it is
+    // wrong.
+    require(reducer_.insert(w.plan.first_chunk, w.chunks, cv),
+            "the reducer refused a window's node, which admission had "
+            "reserved room for");
     max_pending_ = std::max(max_pending_, reducer_.pending());
     if (w.rec != nullptr) {
       w.rec->t_absorbed = trace_->now();
