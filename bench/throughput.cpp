@@ -49,6 +49,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <ranges>
 #include <utility>
 #include <vector>
 
@@ -467,6 +468,7 @@ int main(int argc, char** argv) {
     int width = 10;
     std::function<blake3pp::digest()> fn;  // null: info-only line
     std::string info;
+    std::string family;  // rows that must agree on d; see digest_family
     double best = 1e100;
     blake3pp::digest d{};
     std::set<int> cpus;  // every CPU any rep of this row ended on
@@ -481,10 +483,30 @@ int main(int argc, char** argv) {
     sections.emplace_back();
     sections.back().title = std::move(title);
   };
+  // Which rows must agree on their digest. Every row of a family hashes
+  // the same bytes the same way -- the whole input, or it in 8 KiB
+  // messages, or one batch shape, or as extended output -- so a
+  // disagreement inside a family is a kernel or a tree that is wrong, and
+  // a bench that prints it without saying so is a bench that cannot fail.
+  // The suffix names the family because the labels are built from it.
+  const auto digest_family = [](std::string_view label) -> std::string {
+    const std::size_t cut = label.rfind('_');
+    if (cut == std::string_view::npos) {
+      return "whole input";
+    }
+    const std::string_view suffix = label.substr(cut + 1);
+    if (suffix == "8k" || suffix == "parent" || suffix == "xof" ||
+        suffix.starts_with("batch")) {
+      return std::string{suffix};
+    }
+    return "whole input";
+  };
+
   const auto add_row = [&](std::string label, std::string note,
                            std::function<blake3pp::digest()> fn,
-                           int width = 10) {
+                           int width = 10, std::string family = {}) {
     bench_row r;
+    r.family = family.empty() ? digest_family(label) : std::move(family);
     r.label = std::move(label);
     r.note = std::move(note);
     r.width = width;
@@ -689,7 +711,7 @@ int main(int argc, char** argv) {
     blake3pp::digest d{};
     d.bytes = acc;
     return d;
-  });
+  }, 10, "message xof");
 #endif
 
   // The blake3pp full pipeline on a single thread, the mirror of the
@@ -723,7 +745,7 @@ int main(int argc, char** argv) {
     blake3pp::digest d{};
     d.bytes = acc;
     return d;
-  });
+  }, 10, "message xof");
 
   // --- measurement: rep-outer, row-inner, start row rotated per pass ---
   // Pass -1 is the uncounted warmup. Cooldown idles between PASSES, not
@@ -810,6 +832,39 @@ int main(int argc, char** argv) {
             "({}). On machines with more than one core class such rows "
             "are not comparable; rerun with --pin <cpu>.",
             cpus_seen.size(), join_cpus(cpus_seen));
+  }
+
+  // The rows of a family hashed the same bytes, so their digests are one
+  // answer and the bench says so. Reported after the numbers, because the
+  // numbers are what a reader came for, and as a non-zero exit, because
+  // the smoke run in ctest is the only reader that cannot see the screen.
+  bool digests_agree = true;
+  {
+    std::vector<std::pair<std::string, const bench_row*>> firsts;
+    for (const auto& sec : sections) {
+      for (const auto& r : sec.rows) {
+        if (!r.fn) {
+          continue;
+        }
+        const auto at = std::ranges::find_if(
+            firsts, [&r](const auto& e) { return e.first == r.family; });
+        if (at == firsts.end()) {
+          firsts.emplace_back(r.family, &r);
+          continue;
+        }
+        if (r.d == at->second->d) {
+          continue;
+        }
+        if (digests_agree) {
+          println(stdout,
+                  "\n  DIGEST MISMATCH: rows that hashed the same bytes do "
+                  "not agree. The rates above measured different work.");
+          digests_agree = false;
+        }
+        println(stdout, "    {} ({}) {}  against {} {}", r.label, r.family,
+                r.d.to_hex(), at->second->label, at->second->d.to_hex());
+      }
+    }
   }
 
   // The sender-based parallel engine over the whole tree: the numbers that
@@ -936,5 +991,5 @@ int main(int argc, char** argv) {
         15);
   }
 #endif
-  return 0;
+  return digests_agree ? 0 : 1;
 }

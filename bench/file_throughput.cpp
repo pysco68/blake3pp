@@ -1096,6 +1096,13 @@ int main(int argc, char** argv) {
   // Each row: best of reps. When tracing, every rep starts from an empty
   // buffer and the io-wq workers are read before and after it, so what is
   // summarized and exported is the last rep alone.
+  // Every row hashes the same file, so their digests are one answer: the
+  // first row's is what the rest are held to, and a disagreement makes the
+  // run fail rather than print two hexes and a rate. Without it a wrong
+  // parallel digest reads as a successful benchmark.
+  blake3pp::digest expect{};
+  bool have_expect = false;
+  bool digests_agree = true;
   const auto run = [&](const char* label, auto&& fn) {
     cooldown();
     blake3pp::digest d{};
@@ -1121,6 +1128,16 @@ int main(int argc, char** argv) {
     println(stdout, "{:<10} {}   ({}...)  [{:3.0f}% of raw]", label,
             b3tool::rate(static_cast<std::size_t>(bytes), best),
             d.to_hex().substr(0, 16), 100.0 * raw_s / best);
+    if (!have_expect) {
+      expect = d;
+      have_expect = true;
+    } else if (d != expect) {
+      digests_agree = false;
+      println(stdout,
+              "  DIGEST MISMATCH: {} hashed the same file as the row above "
+              "and got {} instead of {}",
+              label, d.to_hex(), expect.to_hex());
+    }
     if (trace) {
       print_trace_summary(
           *trace, threads_for_trace, iowq_cpu_s,
@@ -1149,5 +1166,5 @@ int main(int argc, char** argv) {
     run("parallel",
         [&] { return blake3pp::hash_file(path.c_str(), sched, opts); });
   }
-  return 0;
+  return digests_agree ? 0 : 1;
 }
