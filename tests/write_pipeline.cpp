@@ -129,6 +129,7 @@ class fake_write_driver {
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
                     detail::io_op& op) {
     queued_.push_back(write{&op, off, buf, 0});
+    op.live = true;  // the driver owes this one a callback now
   }
 
   void flush() noexcept {}
@@ -154,6 +155,7 @@ class fake_write_driver {
     if (w.cancelled) {
       auto* const op = w.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      op->live = false;
       op->done(op, std::make_error_code(std::errc::operation_canceled));
       return 1;
     }
@@ -161,6 +163,7 @@ class fake_write_driver {
         index == static_cast<unsigned>(script_.fail_at_window)) {
       auto* const op = w.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      op->live = false;
       op->done(op, std::make_error_code(std::errc::io_error));
       return 1;
     }
@@ -175,6 +178,7 @@ class fake_write_driver {
     }
     auto* const op = w.op;
     queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+    op->live = false;
     op->done(op, std::error_code{});
     return 1;
   }

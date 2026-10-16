@@ -2200,7 +2200,11 @@ class window_scope
   // still holds its buffer, and only poll() can deliver either.
   void sweep_cancels() noexcept {
     for (window* w = taken_; w != nullptr; w = w->next_taken) {
-      if (w->reading && !w->cancel_asked) {
+      // Only a window whose read the driver actually has: a window
+      // admitted in the same round that a stop arrived may have parked
+      // without submitting, and latching it here would stop the sweep
+      // asking for the read that follows.
+      if (w->reading && w->op.live && !w->cancel_asked) {
         w->cancel_asked = true;
         loop_.driver().cancel(w->op);
       }

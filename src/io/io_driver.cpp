@@ -42,6 +42,10 @@ static_assert(io_driver::direct_alignment == io_impl::direct_align,
 // caller's, which is the only one the pipeline knows about.
 void trampoline(io_impl::transfer_base* base, std::error_code ec) noexcept {
   auto* const outer = static_cast<io_op*>(base->owner);
+  // The transfer is settled before the callback runs, so a callback that
+  // resubmits this operation -- or a sweep that runs after it -- sees the
+  // storage as what it is: nothing the driver owes.
+  outer->live = false;
   outer->done(outer, ec);
 }
 }  // namespace
@@ -136,6 +140,8 @@ void io_driver::submit_read(file& f, std::uint64_t off,
   inner.done = &trampoline;
   inner.owner = &op;
   impl_->ctx.submit_read(f.impl_->f, off, buf, inner);
+  // Taken: from here the context owes this operation a callback.
+  op.live = true;
 }
 
 void io_driver::submit_write(file& f, std::uint64_t off,
@@ -144,6 +150,8 @@ void io_driver::submit_write(file& f, std::uint64_t off,
   inner.done = &trampoline;
   inner.owner = &op;
   impl_->ctx.submit_write(f.impl_->f, off, buf, inner);
+  // Taken: from here the context owes this operation a callback.
+  op.live = true;
 }
 
 void io_driver::flush() noexcept { impl_->ctx.flush(); }
@@ -153,6 +161,16 @@ std::size_t io_driver::poll(bool block) { return impl_->ctx.poll(block); }
 void io_driver::wake() noexcept { impl_->ctx.wake(); }
 
 void io_driver::cancel(io_op& op) noexcept {
+  // Only an operation this driver owes can be cancelled. A caller's sweep
+  // sees windows, not submits: a window is counted in flight from the
+  // moment it is admitted, and its write is submitted only after the fill
+  // that feeds it has run. So an op that was never taken, or whose
+  // callback has already run, can reach here. Its storage holds no backend
+  // operation, or the previous transfer's with a stale ring flag, and
+  // must not be handed to the device.
+  if (!op.live) {
+    return;
+  }
   // The backend's own op is the one the context knows, and it lives in
   // the storage this read's submit constructed it in.
   impl_->ctx.cancel(op.native<native_op>());

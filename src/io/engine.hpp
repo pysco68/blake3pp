@@ -111,12 +111,21 @@ class polled_reader_engine {
                   want + 1 == num_windows_, s};
   }
 
+  // The slot AND the window in it: a window object names a slot, and a
+  // slot is reassigned the moment it is released, so the index alone
+  // cannot tell the window being handed back from one this engine already
+  // recycled. Releasing a stale window twice would hand its buffer to the
+  // next read while the caller is still hashing the window that came
+  // after it -- a wrong digest with nothing to see. The offset is the
+  // window's identity, and the slot remembers which window it holds.
   void release(const window& w) noexcept {
-    if (w.slot >= qd_ || !slots_[w.slot].held) {
+    if (w.slot >= qd_ || !slots_[w.slot].held ||
+        slots_[w.slot].win * window_ != w.offset) {
       if (!submit_failed_) {
         submit_failed_ = std::make_exception_ptr(std::system_error(
             EINVAL, std::generic_category(),
-            "release() of a window this reader did not hand out"));
+            "release() of a window this reader did not hand out, or of one "
+            "it has already taken back"));
       }
       return;
     }
@@ -254,22 +263,40 @@ class polled_writer_engine {
     return file_.name();
   }
 
-  // Round-robin: the next slot in order, waited out.
+  // Round-robin: the next slot in order, waited out. The slot is claimed
+  // here rather than at submit, so two buffers in hand are two slots: with
+  // the index alone deciding, a second acquire() before the first submit
+  // handed out the same buffer twice, both writes rode one busy flag, and
+  // the producer refilled bytes the device was still reading.
   buffer acquire() {
     const unsigned s = next_slot_;
+    if (slots_[s].acquired) {
+      throw std::system_error(EINVAL, std::generic_category(),
+                              "acquire() with every buffer slot already held");
+    }
     wait_slot(s);
     throw_if_failed();
+    slots_[s].acquired = true;
+    next_slot_ = (s + 1) % qd_;
     return buffer{buf(s).data(), buffer_, s};
   }
 
   void submit(const buffer& b, std::size_t bytes) {
     if (bytes == 0) {
+      // Nothing to write, so the slot goes back to the front of the ring
+      // rather than being skipped: a generator that produces nothing on its
+      // last call must not cost a buffer.
+      if (b.slot < qd_ && slots_[b.slot].acquired) {
+        slots_[b.slot].acquired = false;
+        next_slot_ = b.slot;
+      }
       return;
     }
-    if (b.slot >= qd_ || bytes > buffer_) {
+    if (b.slot >= qd_ || bytes > buffer_ || !slots_[b.slot].acquired) {
       throw std::system_error(EINVAL, std::generic_category(),
                               "submit() of a buffer this writer did not "
-                              "hand out, or of more bytes than it holds");
+                              "hand out, or has already taken back, or of "
+                              "more bytes than it holds");
     }
     if (tail_submitted_) {
       throw std::system_error(EINVAL, std::generic_category(),
@@ -279,6 +306,7 @@ class polled_writer_engine {
       tail_submitted_ = true;
     }
     slot_state& st = slots_[b.slot];
+    st.acquired = false;
     st.busy = true;
     st.ec = {};
     bind_completion<&slot_state::complete>(st.op, st);
@@ -294,7 +322,6 @@ class polled_writer_engine {
     ctx_.flush();
     offset_ += bytes;
     written_ += bytes;
-    next_slot_ = (b.slot + 1) % qd_;
   }
 
   // Lands everything accepted, then reports the first error any of it
@@ -316,7 +343,8 @@ class polled_writer_engine {
   struct slot_state {
     typename C::transfer op{};
     std::error_code ec{};
-    bool busy = false;
+    bool busy = false;      // a write is in flight in this slot
+    bool acquired = false;  // handed out, not yet submitted
 
     // The one place the context hands control back. Marking the slot is
     // all it may do: the engine is not reentrant.

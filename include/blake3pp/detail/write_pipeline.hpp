@@ -297,7 +297,11 @@ class write_scope
   void sweep_cancels() noexcept {
     for (unsigned i = 0; i < count_; ++i) {
       window& w = windows_[i];
-      if (w.writing && !w.cancel_asked) {
+      // Only a window whose write the driver actually has. One that is
+      // admitted but still being filled on the pool has nothing to
+      // cancel, and latching it here would also stop the sweep asking
+      // once its write really is in flight.
+      if (w.writing && w.op.live && !w.cancel_asked) {
         w.cancel_asked = true;
         loop_.driver().cancel(w.op);
       }

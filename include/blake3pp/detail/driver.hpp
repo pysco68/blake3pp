@@ -12,6 +12,7 @@
 // Internal to the library. Standard library only, and no execution
 // provider: the concept is about reads, not about senders.
 
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -72,6 +73,14 @@ void bind_completion(Op& op, Owner& owner) noexcept {
 struct io_op {
   void (*done)(io_op*, std::error_code) noexcept = nullptr;
   void* owner = nullptr;
+  // Whether a driver currently owes this operation a callback, which is
+  // also whether `storage` holds a backend operation. Raised by the driver
+  // once a submit has been taken and lowered before the callback runs, so
+  // a cancel sweep can tell an operation the device has from one that is
+  // only admitted: the two are indistinguishable from the window's own
+  // state, and cancelling the second reads storage holding no object, or
+  // the previous transfer left in it.
+  bool live = false;
 
   static constexpr std::size_t storage_size = 160;
   static constexpr std::size_t storage_align = 16;
@@ -96,10 +105,11 @@ struct io_op {
   // The operation emplace_native() left in the storage. Only the driver
   // that submitted this read may ask, and only while the read is owed:
   // the bytes hold that op until the next submit builds another over
-  // them. The hop through void* is what keeps this out of
-  // reinterpret_cast, as it does in the kernel tables.
+  // them, and `live` is that window. The hop through void* is what keeps
+  // this out of reinterpret_cast, as it does in the kernel tables.
   template <class Op>
   [[nodiscard]] Op& native() noexcept {
+    assert(live && "io_op::native() on an operation no driver owes");
     return *std::launder(static_cast<Op*>(static_cast<void*>(storage)));
   }
 };
@@ -139,6 +149,9 @@ concept file_driver =
       typename D::file;
       { f.size() } noexcept -> std::same_as<std::uint64_t>;
       { f.name() } noexcept -> std::same_as<std::string_view>;
+      // Queues one transfer. A driver that takes it raises op.live and
+      // lowers it before the callback runs: that is how a caller's cancel
+      // sweep tells a transfer the device has from one only admitted.
       { d.submit_read(f, off, buf, op) };
       { d.flush() } noexcept;
       { d.poll(block) } -> std::same_as<std::size_t>;

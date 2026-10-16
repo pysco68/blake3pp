@@ -445,6 +445,7 @@ class fake_driver {
       throw std::bad_alloc();
     }
     queued_.push_back(read{&op, off, buf, 0, false, 0});
+    op.live = true;  // the driver owes this one a callback now
   }
 
   void flush() noexcept {}
@@ -481,6 +482,7 @@ class fake_driver {
       blake3pp::detail::io_op* const op = r.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
       ++callbacks_;
+      op->live = false;
       op->done(op, std::make_error_code(std::errc::operation_canceled));
       return 1;
     }
@@ -490,6 +492,7 @@ class fake_driver {
       blake3pp::detail::io_op* const op = r.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
       ++callbacks_;
+      op->live = false;
       op->done(op, std::make_error_code(std::errc::io_error));
       return 1;
     }
@@ -505,6 +508,7 @@ class fake_driver {
     blake3pp::detail::io_op* const op = r.op;
     queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
     ++callbacks_;
+    op->live = false;
     op->done(op, std::error_code{});
     return 1;
   }

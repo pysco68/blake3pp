@@ -67,11 +67,17 @@ class queued_reads {
       tail_ = &op;
     }
     ++queued_;
+    op.live = true;  // queued: this source owes the callback
   }
 
   // The bytes are already there, so a cancel always wins: nothing has
-  // been done that a completion could prefer over it.
-  void cancel(io_op& op) noexcept { node_of(op).cancelled = true; }
+  // been done that a completion could prefer over it. An op this source
+  // does not owe is not one to cancel -- its storage holds no node.
+  void cancel(io_op& op) noexcept {
+    if (op.live) {
+      node_of(op).cancelled = true;
+    }
+  }
 
   // Everything queued, in submission order. There is no work to pace,
   // and pacing it would only add this source's own cost to a
@@ -92,6 +98,7 @@ class queued_reads {
     while (op != nullptr) {
       io_op* const next = node_of(*op).next;
       const bool cancelled = node_of(*op).cancelled;
+      op->live = false;
       op->done(op, cancelled
                        ? std::make_error_code(std::errc::operation_canceled)
                        : std::error_code{});
