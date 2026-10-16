@@ -50,6 +50,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -187,10 +189,14 @@ class basic_io_context {
   /// nothing started returns immediately.
   void run_until_idle() { drive(/*until_idle=*/true); }
 
-  /// Runs until `done` reads true, which something completing on this
-  /// thread sets; other operations may still be in flight when it
-  /// returns. What sync_wait() drives.
-  void run_until(const bool& done) { drive(/*until_idle=*/false, &done); }
+  /// Runs until `done` reads true, whichever thread sets it; other
+  /// operations may still be in flight when it returns. What sync_wait()
+  /// drives. The flag is atomic because a composed sender's last stage
+  /// may complete off this thread, and whoever sets it must then wake
+  /// this context -- which is what sync_wait()'s receiver does.
+  void run_until(const std::atomic<bool>& done) {
+    drive(/*until_idle=*/false, &done);
+  }
 
   /// How many windows the arena holds.
   [[nodiscard]] unsigned windows() const noexcept {
@@ -254,7 +260,7 @@ class basic_io_context {
     return opts.windows != 0 ? opts.windows : plan.windows;
   }
 
-  void drive(bool until_idle, const bool* until = nullptr) {
+  void drive(bool until_idle, const std::atomic<bool>* until = nullptr) {
     const bool was_running = running_.exchange(true, std::memory_order_acq_rel);
     assert(!was_running &&
            "only one thread may run an io_context; the others may call "
@@ -316,7 +322,7 @@ class basic_io_context {
           // A report may have started another operation; it is pending,
           // not live, so the list is consulted too.
           status.done =
-              (until != nullptr && *until) ||
+              (until != nullptr && until->load(std::memory_order_acquire)) ||
               (live_ == 0 &&
                pending_.load(std::memory_order_acquire) == nullptr &&
                (until_idle || stop_.load(std::memory_order_acquire)));
@@ -938,18 +944,25 @@ class update_files_sender {
 };
 
 // Where sync_wait() parks a completion.
+// Where sync_wait() parks a completion. `done` is atomic and the
+// waiting thread is woken through the driver, because the last stage of
+// a composed sender need not run on the context's thread: a
+// continues_on() to a pool scheduler finishes this chain somewhere else,
+// and a plain flag read by a thread parked in poll() would never be
+// seen.
 template <class Tuple>
 struct sync_state {
   std::optional<Tuple> value;
   std::exception_ptr error;
   bool stopped = false;
-  bool done = false;
+  std::atomic<bool> done{false};
 };
 
-template <class Tuple>
+template <class Tuple, class Wake>
 struct sync_receiver {
   using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
-  explicit sync_receiver(sync_state<Tuple>* s) noexcept : st_(s) {}
+  sync_receiver(sync_state<Tuple>* s, Wake wake) noexcept
+      : st_(s), wake_(wake) {}
   template <class... Ts>
   void set_value(Ts&&... ts) const noexcept {
     try {
@@ -957,23 +970,31 @@ struct sync_receiver {
     } catch (...) {
       st_->error = std::current_exception();
     }
-    st_->done = true;
+    finish();
   }
   void set_error(std::error_code ec) const noexcept {
     st_->error = std::make_exception_ptr(std::system_error(ec));
-    st_->done = true;
+    finish();
   }
   void set_error(std::exception_ptr e) const noexcept {
     st_->error = std::move(e);
-    st_->done = true;
+    finish();
   }
   void set_stopped() const noexcept {
     st_->stopped = true;
-    st_->done = true;
+    finish();
   }
 
  private:
+  // The flag last, after everything the waiting thread will read, and the
+  // wake after the flag.
+  void finish() const noexcept {
+    st_->done.store(true, std::memory_order_release);
+    wake_();
+  }
+
   sync_state<Tuple>* st_;
+  Wake wake_;
 };
 
 }  // namespace detail
@@ -1021,16 +1042,49 @@ template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
 /// this returns.
 template <stack_budget Budget, class Sender>
 auto sync_wait(basic_io_context<Budget>& ctx, Sender&& sndr) {
+  // The environment every sync_receiver has, which is the default one:
+  // the wake it carries is not part of it.
+  using probe_receiver =
+      detail::sync_receiver<std::tuple<>, void (*)() noexcept>;
   using env_t = decltype(blake3pp::ex::get_env(
-      std::declval<const detail::sync_receiver<std::tuple<>>&>()));
+      std::declval<const probe_receiver&>()));
   using tuple_t = blake3pp::ex::value_types_of_t<std::remove_cvref_t<Sender>,
                                                  env_t, std::tuple,
                                                  std::type_identity_t>;
   detail::sync_state<tuple_t> st;
-  auto op = blake3pp::ex::connect(std::forward<Sender>(sndr),
-                                  detail::sync_receiver<tuple_t>{&st});
+  const auto wake = [&ctx]() noexcept { ctx.driver().wake(); };
+  auto op = blake3pp::ex::connect(
+      std::forward<Sender>(sndr),
+      detail::sync_receiver<tuple_t, decltype(wake)>{&st, wake});
   blake3pp::ex::start(op);
-  ctx.run_until(st.done);
+  try {
+    ctx.run_until(st.done);
+  } catch (...) {
+    // `op` is started and unfinished, and the context still has it
+    // linked: destroying it on the way out of this frame would leave the
+    // loop walking a dead node. So the run is stopped and wound down
+    // first, the same way a failing round winds its own scope down.
+    ctx.request_stop();
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+      if (st.done.load(std::memory_order_acquire)) {
+        break;
+      }
+      try {
+        ctx.run_until_idle();
+      } catch (...) {
+        // Whatever the driver is doing, it is not getting better by
+        // being asked differently; the loop below decides.
+      }
+    }
+    if (!st.done.load(std::memory_order_acquire)) {
+      std::fprintf(stderr,
+                   "blake3pp: an io_context could not be wound down while a "
+                   "sync_wait() operation was still in flight; it cannot be "
+                   "destroyed without leaving the context a dead node\n");
+      std::abort();
+    }
+    throw;
+  }
   if (st.error != nullptr) {
     std::rethrow_exception(st.error);
   }
