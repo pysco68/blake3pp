@@ -274,13 +274,18 @@ void update_file(hasher& h, const std::filesystem::path& path,
 
 /// Knobs for write_file(): the geometry of a generated file.
 ///
-/// The defaults are blake3ppgen's measured shape, not the reader's:
-/// 64 MiB windows, two in flight. On four PCIe 5 drives in RAID 0 with
-/// 32 threads that measured 24.2 GiB/s, against 20.7 at 128 MiB x 4 and
-/// 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
-/// volume slows down.
+/// The defaults are a writer's shape rather than a reader's: 64 MiB
+/// windows, two in flight. On four PCIe 5 drives in RAID 0 with 32
+/// threads that geometry measured 24.2 GiB/s, against 20.7 at 128 MiB x 4
+/// and 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
+/// volume slows down. blake3ppgen sets its own from --window and
+/// --threads and does not take these.
 struct file_write_options {
-  /// Bytes per window; rounded to a power of two in the reader's range.
+  /// Bytes per window. The sequential forms round up to a multiple of
+  /// 4 KiB (minimum 64 KiB, maximum 1 GiB); the forms that take a
+  /// scheduler round down to a power-of-2 multiple of chunk_size, as
+  /// reading does, so one options object asking for an odd size can mean
+  /// two geometries.
   std::size_t window_bytes = detail::default_write_window_bytes;
   /// Windows in flight, clamped to [2, 32].
   unsigned queue_depth = detail::default_write_queue_depth;
@@ -451,10 +456,11 @@ write_report write_file(const std::filesystem::path& path, Fill&& fill,
       ec, [&] { return write_file(path, std::forward<Fill>(fill), opts); });
 }
 
-/// One-shot digest of a file: a hasher shaped by opts (SIMD variant,
-/// optional key), the file streamed through it, finalized.
+/// One-shot digest of a file: a hasher shaped by opts (SIMD variant, and
+/// plain, keyed or key-derivation mode), the file streamed through it,
+/// finalized.
 /// @param path  The file to hash.
-/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @param opts  The hasher's variant and mode, and the pipeline knobs.
 /// @throws std::system_error on I/O failure.
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                const hash_file_options& opts = {});
@@ -462,7 +468,7 @@ write_report write_file(const std::filesystem::path& path, Fill&& fill,
 /// throwing.
 /// @param path  The file to hash.
 /// @param ec    Cleared on success; the I/O error otherwise.
-/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @param opts  The hasher's variant and mode, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
 [[nodiscard]] digest hash_file(const std::filesystem::path& path,
                                std::error_code& ec,
@@ -510,7 +516,7 @@ void update_file(hasher& h, const P& path, std::error_code& ec,
 
 /// hash_file() for a foreign path type.
 /// @param path  The file to hash.
-/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @param opts  The hasher's variant and mode, and the pipeline knobs.
 template <detail::foreign_path P>
 [[nodiscard]] digest hash_file(const P& path,
                                const hash_file_options& opts = {}) {
@@ -520,7 +526,7 @@ template <detail::foreign_path P>
 /// hash_file() for a foreign path type, reporting through ec.
 /// @param path  The file to hash.
 /// @param ec    Cleared on success; the error otherwise.
-/// @param opts  The hasher's variant and key, and the pipeline knobs.
+/// @param opts  The hasher's variant and mode, and the pipeline knobs.
 /// @return The digest, or an all-zero digest when ec is set.
 template <detail::foreign_path P>
 [[nodiscard]] digest hash_file(const P& path, std::error_code& ec,

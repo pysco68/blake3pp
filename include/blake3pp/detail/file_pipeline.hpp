@@ -981,9 +981,9 @@ inline constexpr std::size_t reducer_nodes = 256;
 
 // Buffer memory the pipeline spends on windows beyond the reads the
 // device sees, so that a pool has windows to work on while the device
-// serves the next ones. At 8 MiB windows this is 16 of them, twice
-// what a 16-thread pool needs with no device under it, and the same
-// 256 MiB a caller of 64 MiB x qd 4 spends.
+// serves the next ones. At 8 MiB windows this is 16 of them, twice what a
+// 16-thread pool needs with no device under it, and half of what a caller
+// asking for 64 MiB windows at queue depth 4 spends on its reads alone.
 inline constexpr std::size_t default_window_budget_bytes = std::size_t{128} << 20;
 
 // The geometry of one update_file() call, decided once from the hasher's

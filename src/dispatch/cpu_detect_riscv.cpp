@@ -40,9 +40,12 @@
 // 0.7.1, and every fact the detection needs is available through auxv,
 // hwprobe, or the guarded read.
 //
-// The BLAKE3PP_ASSUME_XTHEADVECTOR=1 env hook exists for emulator testing,
-// because T-Head's qemu fork predates the hwprobe key and qemu-user does
-// not model the vlenb trap. It is honored for arch::xthead only.
+// The BLAKE3PP_ASSUME_XTHEADVECTOR=1 env hook is for the machines where no
+// probe can answer: a board whose kernel hides the extension, and the
+// emulator, since T-Head's qemu fork predates the hwprobe key and
+// qemu-user does not model the vlenb trap. Either way the owner is
+// asserting what the CPU has, and a wrong assertion is a SIGILL on the
+// first hash. Honored for arch::xthead only.
 //
 // Zvbb has no single-letter HWCAP bit; the hwprobe IMA_EXT_0 key
 // carries it, so on pre-hwprobe kernels it reads as "absent". The

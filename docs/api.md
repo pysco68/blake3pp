@@ -156,8 +156,13 @@ hashing:
 | Windows | IOCP | `FILE_FLAG_NO_BUFFERING` |
 | macOS | GCD (libdispatch) | `F_NOCACHE` |
 
-Each feature degrades independently at runtime: no direct I/O falls back
-to buffered async, then to plain synchronous reads, then to stdio.
+Each feature degrades independently at runtime: a file the filesystem will
+not open for direct I/O is read buffered, and an engine the OS refuses
+reads synchronously inside the same poll. Which of the three engines a
+build has is decided at compile time -- as is the stdio fallback, which is
+for platforms with none of them (wasm) rather than a rung anything
+degrades to. `backend()` names the rung that was engaged, with the reason
+appended when an asynchronous one was asked for and refused.
 
 ```cpp
 #include <blake3pp/io.hpp>   // sequential; standard library only
@@ -258,11 +263,12 @@ allocation instead of each faulting in its own. It is experimental;
 [Many files at once](async.md) has it.
 
 The parallel form hands each complete window to the scheduler as a
-subtree, which needs the hasher to sit on a window-aligned boundary when
-the file starts. That is true for a fresh hasher and after files whose
-sizes are window multiples; otherwise the windows go through `update()`
-instead. The digest is the same either way, and only the parallelism
-varies.
+subtree, which needs the hasher to sit on a window-aligned boundary. A
+hasher that does not -- one that has already absorbed part of a message --
+is brought back onto the grid by one short first window, whose head it
+absorbs itself and whose remainder fans out like any other window. The
+digest is the same wherever it started, and only how much of that first
+window is parallel varies.
 
 ## What runs it
 
@@ -374,20 +380,27 @@ std::cout << std::format("blake3pp {} (simd: {}, execution: {})\n",
 ### Allocation
 
 `hasher` is a fixed-size value type and never touches the heap.
-`parallel_hasher` allocates its window buffer once, at construction.
+Everything that fans out allocates once, when a run is planned: the window
+arena, the windows that carry the part tables, the reducer's nodes and the
+operation cells, and a part table's lane array on the first window that
+needs the size. `parallel_hasher` allocates its accumulation window at
+construction.
 Among the conveniences, `to_hex()` returns a `std::string` and
 `to_hex_chars()` returns a `std::array<char, 65>` without allocating;
 every span-filling overload writes into a buffer you own.
 
-### Stack
+### The part table, and stack
 
-The input is split into parts that the scheduler's agents pull as they
-go, and each part's 32-byte chaining value waits on the calling thread's
-stack. A `stack_budget` template argument sets how much stack that table
-may take, 32 KiB (1024 parts) by default. Where stacks are small, give it
-less and the input is split into fewer, larger parts. A budget that is
-not a multiple of 32 bytes, or that holds fewer than two parts, does not
-compile:
+The input is split into parts that the scheduler's agents pull as they go,
+and each part's 32-byte chaining value waits in a table that belongs to the
+window being hashed. A `stack_budget` template argument sets how much that
+table may take, 32 KiB (1024 parts) by default; give it less and the input
+is split into fewer, larger parts. The name is older than the engine: on
+the paths that have windows the table lives with the window, so this bounds
+memory per window in flight rather than a frame. What the agents spend on
+their own frames is a constant of the build instead
+([freestanding](freestanding.md)). A budget that is not a multiple of 32
+bytes, or that holds fewer than two parts, does not compile:
 
 ```cpp
 blake3pp::digest d = blake3pp::hash<blake3pp::stack_budget{1024}>(buffer, sched);   // 32 parts

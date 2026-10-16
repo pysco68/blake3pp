@@ -59,7 +59,7 @@ struct window_record {
   std::uint64_t agent_busy_ns;
   /// Bulk invocations that compressed at least one part.
   std::uint32_t agents_active;
-  /// flag_parallel, flag_last.
+  /// flag_parallel, flag_last, flag_short_first.
   std::uint32_t flags;
   /// Which window object -- buffer, part table and operation cell --
   /// carried this window. The pipeline reuses a fixed set of them, so

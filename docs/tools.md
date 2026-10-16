@@ -3,7 +3,7 @@
 [← blake3pp](../README.md)
 
 Two utilities build alongside the library, in top-level builds only.
-`blake3ppsum` hashes files the way `sha1sum` does. `blake3ppgen` produces
+`blake3ppsum` hashes files the way `sha256sum` does. `blake3ppgen` produces
 reproducible test data at the speed of your disk. Both are built on the
 library this documents, so they are also worked examples of it.
 

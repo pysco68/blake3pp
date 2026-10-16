@@ -85,9 +85,11 @@ struct io_context_options {
   std::size_t window_bytes = 8 * 1024 * 1024;
   /// Windows one operation may hold at once; clamped to [2, 32].
   unsigned queue_depth = 4;
-  /// Windows in the shared arena. Zero means queue_depth, which is one
-  /// operation's worth; a context that runs several files at once wants
-  /// more, at window_bytes each.
+  /// Windows in the shared arena, at window_bytes each. Zero means what
+  /// the plan asks for, which at the defaults is 16 windows and so a
+  /// 128 MiB arena -- several operations' worth already. Unlike
+  /// arena_bytes below, a count given here is taken as it stands: there
+  /// is no clamp between it and the memory it costs.
   unsigned windows = 0;
   /// The arena as a byte budget instead: when non-zero, the window count
   /// is this divided by the window size, at least queue_depth and at
@@ -141,7 +143,7 @@ struct pipeline_node {
 /// running thread, inside the run call, which is also the only place a
 /// receiver of one of these senders is ever invoked.
 ///
-/// @tparam Budget The stack a window's part table may take. It is the
+/// @tparam Budget What a window's part table may take. It is the
 ///                context's rather than the call's because the context
 ///                owns the tables; see stack_budget.
 template <stack_budget Budget = default_stack_budget>

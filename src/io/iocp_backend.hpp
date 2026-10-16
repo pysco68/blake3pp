@@ -5,7 +5,8 @@
 // completion port as the completion queue, and the SeManageVolumePrivilege
 // dance for SetFileValidData. The mapping to the io_uring backend is
 // nearly 1:1: one OVERLAPPED per buffer slot plays the SQE,
-// GetQueuedCompletionStatus plays wait_one, and FILE_FLAG_NO_BUFFERING is
+// GetQueuedCompletionStatus plays the completion-queue wait, and
+// FILE_FLAG_NO_BUFFERING is
 // O_DIRECT (same sector-alignment demands, same buffered-handle escape
 // hatch for the unaligned tail). Degrades per-feature at RUNTIME: no port
 // -> sync ReadFile/WriteFile, NO_BUFFERING refused -> buffered. Internal

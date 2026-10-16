@@ -41,11 +41,16 @@ built for the job.
 
 ![8 KiB messages](img/short-messages.svg)
 
-8 KiB per hasher, one hasher each: no tree worth spreading over cores and
+8 KiB per hasher, one hasher each, from the same runs as the chart above
+wherever that run had an 8 KiB row: no tree worth spreading over cores and
 no long run to amortise a wide batch over, which is the shape that shows
 per-call overhead rather than kernel throughput. This is where the library
-is furthest behind on x86, and the gap is the dispatch and setup cost per
-hasher rather than the compression itself.
+is furthest behind on x86. Where the gap is was measured in 2026-10:
+4-5% of it is the kernel (33% on Sapphire Rapids), and the rest is the
+message's parent spine, six single-block compressions below the width at
+which a batch pays for itself. Batching them was tried and measured
+slower once the input is larger than the cache; the comment in
+`compress_chunks` carries the figures.
 
 ## Extended output
 

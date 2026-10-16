@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
     // File sink, sequential: the generator fills one of the writer's
     // O_DIRECT-aligned buffers at a time and the next fills while the
     // device drains this one. This is the path for a one-thread pool, and
-    // the only one for a length the generator decides (--size omitted),
+    // the only one for a length the generator decides (--length omitted),
     // which the pipelined form cannot preallocate.
     try {
       blake3pp::file_write_options wopts;

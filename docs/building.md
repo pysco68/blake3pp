@@ -39,7 +39,7 @@ The devcontainer carries only the default gcc/clang pair; every other preset
 runs inside its per-compiler toolchain image via `tools/tc <preset>`;
 see `docker/README.md` for the image matrix and its glibc-floor design.
 The cross presets (`linux-arm64-gcc15-cxx23`, `linux-riscv64-gcc15-cxx23`,
-and the static musl trio `linux-{,arm64-,riscv64-}zigmusl-cxx23-static`)
+and the static musl set `linux-{,arm64-,riscv64-,ppc64le-,s390x-}zigmusl-cxx23-static`)
 run their whole test suites under qemu-user with a selectable vector
 length, so one build exercises every SVE VL or RVV VLEN; the emulator
 recipes are in `docker/README.md` too. Two kernel sets are opt-in:
@@ -168,7 +168,7 @@ reported at configure time when it is not the default.
 | `BLAKE3PP_KERNEL_ROT16_PER_COMPILER` | on, x86 clang | Spell rot16 as the byte shuffle on clang too, which LLVM lowers to `pshuflw`+`pshufhw` where the shift-or folds to one `pshufb`. The pre-split spelling, kept for the A/B. |
 | `BLAKE3PP_KERNEL_VROR_ROTATE` | on, RVV Zvbb variants | Spell the rotate as the 4-op shift-or (base RVV has no rotate) instead of `vxor`+`vror`. The RISC-V counterpart of the XAR switch; not yet measured on Zvbb silicon, which this switch makes possible. |
 | `BLAKE3PP_KERNEL_VEXT_W8_GATHER` | on, GCC at eight lanes with AVX-512 available | Transpose through the shuffle network there too. GCC lowers the network's cross-lane stage to an index-register permute per stage when the register is a raw vector extension and AVX-512 is in reach, so the staging gather is faster in exactly that corner; the switch is the A/B, and in AVX2-only builds the network wins by 19%. |
-| `BLAKE3PP_KERNEL_PIN_MESSAGE` | on, AVX-512 width on GCC and clang | Hold the message block in registers. At sixteen lanes the state takes half the register file and the message cannot fit beside it, so letting its address escape once makes the compiler read it through memory operands: worth 7.8% on the kernel and 8.5% end-to-end on Zen 5, and 2-4% at 32 threads. |
+| `BLAKE3PP_KERNEL_PIN_MESSAGE` | on, AVX-512 width on GCC and clang | Hold the message block in registers. At sixteen lanes the state takes half the register file and the message cannot fit beside it, so letting its address escape once makes the compiler read it through memory operands: worth 7.8% on the kernel row and 8.5% end-to-end on Zen 5, and 2-4% at 32 threads (3-6% measured on the chunk shape by itself). |
 
 ```bash
 # Re-run the inlining A/B on a new machine:

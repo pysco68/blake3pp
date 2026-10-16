@@ -159,11 +159,11 @@ This project's CI ships:
 |---|---|
 | x64      | SSE4.2, AVX2 and AVX-512 |
 | aarch64  | NEON, fixed-length SVE and SVE2 |
-| riscv    | RVV 1.0 with Zvbb twins and the T-Head draft dialect |
+| riscv    | RVV 1.0 with Zvbb twins, and the T-Head draft dialect (opt-in) |
 | wasm     | SIMD128 |
 | ppc64    | VSX |
 | IBM z    | VXE |
-| MIPS     | MSA |
+| MIPS     | MSA (emulator-tested only) |
 | everywhere | scalar |
 
 More details can be found in [Architectures and kernels](docs/architectures.md).
@@ -228,12 +228,15 @@ The rule behind the split, and which header owns which dependency, is in
 ### Guarantees and caveats
 
 - The sequential compute paths never allocate: `hasher` is a flat value
-  type, subtree buffers live on the stack, and the I/O pipeline
-  allocates only its window arena at setup -- once per call for the
-  blocking entry points, once per context for the async ones. The parallel engine is the
-  exception: `parallel_hasher` allocates its accumulation window at
-  construction, and each bulk launch allocates whatever the execution
-  provider needs (stdexec: one small task array per launch).
+  type and subtree buffers live on the stack. Everything that fans out
+  allocates once, when a run is planned: the I/O pipeline takes its window
+  arena, the windows that carry the part tables, the reducer's nodes and
+  the operation cells -- once per call for the blocking entry points, once
+  per context for the async ones -- and a part table grows its lane array
+  on the first window that needs the size. `parallel_hasher` also
+  allocates its accumulation window at construction, and each bulk launch
+  allocates whatever the execution provider needs (stdexec: one small task
+  array per launch).
 - A `hasher` instance is not thread-safe; distinct instances and all free
   functions are.
 - The library never mutates process-global state as a side effect:
