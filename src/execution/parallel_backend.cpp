@@ -214,7 +214,11 @@ class sized_backend final : public repl::parallel_scheduler_backend {
                              repl::bulk_item_receiver_proxy& proxy,
                              std::span<std::byte> storage) noexcept override {
     const std::size_t n = pool_.size();
-    schedule_bulk(shape, (shape + n - 1) / n, proxy, storage);
+    // Ceiling division spelled so that it cannot wrap: shape + n - 1
+    // overflows for a shape near the top of the type, and the zero chunk
+    // length it produced was then divided by.
+    const std::size_t per = shape / n + (shape % n != 0 ? 1 : 0);
+    schedule_bulk(shape, std::max<std::size_t>(1, per), proxy, storage);
   }
 
   void schedule_bulk_unchunked(std::size_t shape,
@@ -226,6 +230,14 @@ class sized_backend final : public repl::parallel_scheduler_backend {
  private:
   // The submitter's own guard: whoever brings the count to zero completes,
   // so a worker cannot finish and delete the job while more are queued.
+  //
+  // Which also means the submitter completes the job itself when every
+  // worker it queued has finished by the time it gets here -- a short bulk
+  // on an idle pool. So a receiver's completion may run on the thread that
+  // started the operation, and for the file pipeline that thread is the
+  // driver. Nothing here promises otherwise: the pipeline's "the driver
+  // spends its time polling" is an observation about measured runs, not a
+  // property this backend guarantees.
   static void settle(job* j, std::size_t wanted, std::size_t queued) noexcept {
     if (j->release(wanted - queued + 1)) {
       j->complete();
@@ -240,11 +252,16 @@ class sized_backend final : public repl::parallel_scheduler_backend {
       schedule(proxy, storage);
       return;
     }
-    const std::size_t chunks = (shape + chunk_length - 1) / chunk_length;
+    // The same arithmetic, the same way, and a chunk length of zero would
+    // be a caller asking for nothing per chunk: one item is the smallest
+    // thing a chunk can be.
+    const std::size_t per_chunk = std::max<std::size_t>(1, chunk_length);
+    const std::size_t chunks =
+        shape / per_chunk + (shape % per_chunk != 0 ? 1 : 0);
     const std::size_t wanted = std::min(chunks, pool_.size());
     bulk_job* j = nullptr;
     try {
-      j = new bulk_job(wanted, proxy, shape, chunk_length, chunks);
+      j = new bulk_job(wanted, proxy, shape, per_chunk, chunks);
     } catch (...) {
       proxy.set_error(std::current_exception());
       return;
@@ -272,11 +289,19 @@ namespace beman::execution::parallel_scheduler_replacement {
 auto query_parallel_scheduler_backend()
     -> std::shared_ptr<parallel_scheduler_backend> {
   static auto backend = [] {
-    unsigned threads = blake3pp::parallel_scheduler_threads();
-    if (threads == 0) {
-      threads = std::max(1u, std::thread::hardware_concurrency());
-    }
-    blake3pp::g_started.store(true, std::memory_order_relaxed);
+    // Reading the requested size and declaring the scheduler started is
+    // one decision, taken under the lock size_parallel_scheduler() takes:
+    // without it that call could check the flag, see this initializer has
+    // not set it yet, store a size this has already read past, and return
+    // success -- leaving the caller told it sized a pool that runs at
+    // hardware_concurrency(). The pool itself is built outside the lock,
+    // since it starts threads.
+    const unsigned threads = [] {
+      const std::lock_guard lock{blake3pp::g_mutex};
+      const unsigned sized = blake3pp::g_threads.load(std::memory_order_relaxed);
+      blake3pp::g_started.store(true, std::memory_order_relaxed);
+      return sized != 0 ? sized : std::max(1u, std::thread::hardware_concurrency());
+    }();
     return std::make_shared<blake3pp::sized_backend>(threads);
   }();
   return backend;
