@@ -347,6 +347,14 @@
       "configurePreset": "linux-zigmusl-cxx23-static"
     },
     {
+      "name": "linux-ppc64le-zigmusl-cxx23-static",
+      "configurePreset": "linux-ppc64le-zigmusl-cxx23-static"
+    },
+    {
+      "name": "linux-s390x-zigmusl-cxx23-static",
+      "configurePreset": "linux-s390x-zigmusl-cxx23-static"
+    },
+    {
       "name": "macos-appleclang-cxx23",
       "configurePreset": "macos-appleclang-cxx23",
       "condition": {
