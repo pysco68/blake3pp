@@ -22,6 +22,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <system_error>
@@ -457,9 +459,14 @@ class iocp_context {
   // Cancels what every open file still has on the port, reaps all of it
   // without reporting any, and forgets the deferred list. CancelIoEx
   // bounds the wait: every cancelled request completes, successfully or
-  // with ERROR_OPERATION_ABORTED. A null OVERLAPPED that is not the wake
-  // sentinel means the port itself has failed and nothing more can
-  // arrive.
+  // with ERROR_OPERATION_ABORTED.
+  //
+  // A null OVERLAPPED that is not the wake sentinel means the port itself
+  // has failed, so no completion can arrive and the requests the kernel
+  // holds can never be given back. The caller frees the buffers they name
+  // as soon as this returns -- that is the whole contract of a drain -- so
+  // the process ends with the reason instead, the same answer the ring
+  // gives in the same position (src/io/uring_backend.hpp).
   void drain() noexcept {
     for (file* f = files_; f != nullptr; f = f->next_) {
       if (f->f_.use_iocp && f->inflight_ > 0) {
@@ -476,7 +483,12 @@ class iocp_context {
           woken_ = true;
           continue;
         }
-        break;
+        std::fprintf(stderr,
+                     "blake3pp: the completion port failed while %zu "
+                     "transfer(s) were still owed (error %lu); their buffers "
+                     "cannot be released\n",
+                     port_owed_, static_cast<unsigned long>(::GetLastError()));
+        std::abort();
       }
       --port_owed_;
     }
@@ -485,41 +497,6 @@ class iocp_context {
     }
     deferred_.clear();
     in_flight_ = 0;
-  }
-
- private:
-  static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
-
-  // The degradation strings are observable API: tools print them and a
-  // run is read differently depending on which rung it names, so the
-  // spellings and suffixes are fixed.
-  [[nodiscard]] std::string name_for(bool direct, bool use_iocp,
-                                     bool write) const {
-    const char* const sync_name = write ? "writefile" : "readfile";
-    if (use_iocp) {
-      return direct ? "iocp+direct" : "iocp";
-    }
-    return direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
-  }
-
-  [[nodiscard]] bool port_wanted() const noexcept { return async_requested_; }
-  [[nodiscard]] HANDLE port() const noexcept {
-    return port_ ? port_.get() : nullptr;
-  }
-
-  void adopt(file& f) noexcept {
-    f.ctx_ = this;
-    f.next_ = files_;
-    files_ = &f;
-  }
-
-  void unlink(file& f) noexcept {
-    for (file** link = &files_; *link != nullptr; link = &(*link)->next_) {
-      if (*link == &f) {
-        *link = f.next_;
-        return;
-      }
-    }
   }
 
   // A file about to close cancels what it still owes and waits it out: the
@@ -561,7 +538,18 @@ class iocp_context {
           woken_ = true;  // remember it; a later poll() still owes it
           continue;
         }
-        break;  // the port is unusable; no completion can arrive
+        // The port is unusable, so this file's transfers can never come
+        // back. Its handles close next and the buffers they are writing into
+        // are released. Nothing here can make the kernel let go, and
+        // returning would leave the context counting a file that no longer
+        // exists, so the process ends with the reason, as the context-wide
+        // drain does.
+        std::fprintf(stderr,
+                     "blake3pp: the completion port failed while %zu "
+                     "transfer(s) of a closing file were still owed (error "
+                     "%lu); their buffers cannot be released\n",
+                     f.inflight_, static_cast<unsigned long>(::GetLastError()));
+        std::abort();
       }
       transfer& op = *op_of(pov);
       --port_owed_;
@@ -584,6 +572,42 @@ class iocp_context {
       }
     }
   }
+
+ private:
+  static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
+
+  // The degradation strings are observable API: tools print them and a
+  // run is read differently depending on which rung it names, so the
+  // spellings and suffixes are fixed.
+  [[nodiscard]] std::string name_for(bool direct, bool use_iocp,
+                                     bool write) const {
+    const char* const sync_name = write ? "writefile" : "readfile";
+    if (use_iocp) {
+      return direct ? "iocp+direct" : "iocp";
+    }
+    return direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
+  }
+
+  [[nodiscard]] bool port_wanted() const noexcept { return async_requested_; }
+  [[nodiscard]] HANDLE port() const noexcept {
+    return port_ ? port_.get() : nullptr;
+  }
+
+  void adopt(file& f) noexcept {
+    f.ctx_ = this;
+    f.next_ = files_;
+    files_ = &f;
+  }
+
+  void unlink(file& f) noexcept {
+    for (file** link = &files_; *link != nullptr; link = &(*link)->next_) {
+      if (*link == &f) {
+        *link = f.next_;
+        return;
+      }
+    }
+  }
+
 
   // Queues the rest of a short read. False means ReadFile refused it and
   // the op was completed with that error instead. Both callers are

@@ -544,6 +544,9 @@ class fake_driver {
   }
 
   void drain() noexcept { queued_.clear(); }
+  // One file per case here, and nothing in the OS's hands: this file's
+  // share of the queue is the queue.
+  void drain(file&) noexcept { queued_.clear(); }
 
   // A guard past the arena, filled with a byte the content never
   // contains. Nothing the pipeline does may reach it, so a read that
@@ -834,6 +837,102 @@ TEST_CASE("the io driver drains a read in flight before freeing its arena") {
   CHECK(probe.calls == 0);
 }
 
+// One file's share of that teardown, which is what a scope winding down
+// on a driver it shares with others asks for: the named file's transfers
+// are reaped and never reported, and the driver keeps serving the file
+// beside it. The whole drain would forget the sibling's too.
+TEST_CASE("one file's transfers are reclaimed without the others'") {
+  using blake3pp::detail::io_driver;
+  using blake3pp::detail::io_op;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 23);
+  const temp_file a(content);
+  const temp_file b(content);
+
+  io_driver drv({}, 4);
+  drv.reserve(2, len);
+  io_driver::file keep(drv, b.path, /*direct_io=*/false);
+  const auto kept_pool = drv.window_storage_for(keep, 1, 0, len).read_into;
+  io_op kept_op{};
+  read_probe kept;
+  kept_op.done = &read_probe::on_done;
+  kept_op.owner = &kept;
+  drv.submit_read(keep, 0, kept_pool, kept_op);
+
+  // Declared before the file it is submitted to, because the reclaim below
+  // reads it: a transfer still owed is one the caller still owns.
+  io_op op{};
+  read_probe closing;
+  {
+    io_driver::file going(drv, a.path, /*direct_io=*/false);
+    const auto pool = drv.window_storage_for(going, 0, 0, len).read_into;
+    op.done = &read_probe::on_done;
+    op.owner = &closing;
+    drv.submit_read(going, 0, pool, op);
+    drv.flush();
+    CHECK(drv.in_flight() == 2);
+    drv.drain(going);
+    CHECK(closing.calls == 0);  // reaped, and not reported
+  }
+
+  // The sibling's read is not lost. It may have been REPORTED inside the
+  // wait above -- a shared ring hands back whatever completed, and
+  // dropping another file's completion would strand an op that can never
+  // arrive -- so what is fixed is that it arrives, once, with its bytes.
+  while (kept.calls == 0) {
+    drv.poll(true);
+  }
+  CHECK(kept.calls == 1);
+  CHECK(!kept.ec);
+  CHECK(drv.in_flight() == 0);
+  CHECK(std::equal(kept_pool.begin(), kept_pool.end(), content.begin()));
+}
+
+// A file destroyed with a transfer still owed, which is the order a caller
+// gets by declaring the operation after the file. Its destructor cannot
+// read those transfers -- the operation they live in may already be gone --
+// so it takes the whole drain instead: the kernel is waited out, no
+// callback runs, and the driver is usable afterwards. The cost is that a
+// sibling's pending callback goes with it, which is why the pipeline
+// reclaims its file explicitly (above) rather than leaving it to this.
+TEST_CASE("a file closing with a transfer owed drains rather than read it") {
+  using blake3pp::detail::io_driver;
+  using blake3pp::detail::io_op;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 29);
+  const temp_file f(content);
+
+  io_driver drv({}, 4);
+  drv.reserve(1, len);
+  read_probe closing;
+  {
+    io_driver::file going(drv, f.path, /*direct_io=*/false);
+    const auto pool = drv.window_storage_for(going, 0, 0, len).read_into;
+    io_op op{};  // after the file, so it dies first
+    op.done = &read_probe::on_done;
+    op.owner = &closing;
+    drv.submit_read(going, 0, pool, op);
+    drv.flush();
+    CHECK(drv.in_flight() == 1);
+  }
+  CHECK(closing.calls == 0);
+  CHECK(drv.in_flight() == 0);
+
+  // And the driver still works: another file reads through it.
+  io_driver::file again(drv, f.path, /*direct_io=*/false);
+  const auto pool = drv.window_storage_for(again, 0, 0, len).read_into;
+  io_op op{};
+  read_probe after;
+  op.done = &read_probe::on_done;
+  op.owner = &after;
+  drv.submit_read(again, 0, pool, op);
+  while (after.calls == 0) {
+    drv.poll(true);
+  }
+  CHECK(!after.ec);
+  CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
+}
+
 // The same drain on a live driver: the owed read is reaped and never
 // reported, the op may go, and the driver then serves another read.
 TEST_CASE("the io driver drains on request and reads again afterwards") {
@@ -907,16 +1006,22 @@ TEST_CASE("a window read is a sender the driver loop completes") {
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
   blake3pp::detail::io_op rop{};
-  auto op = ex::connect(io.read(file, 0, pool, rop), chain_receiver{&r, &st});
+  // The scope's count of transfers the driver owes it, which the
+  // operation state keeps: raised by a submit that took, lowered by the
+  // completion, and left alone by a chain that never submitted.
+  unsigned owed = 0;
+  auto op = ex::connect(io.read(file, 0, pool, rop, owed), chain_receiver{&r, &st});
   // start() queues the read and nothing else: no flush, no callback.
   ex::start(op);
   CHECK(!r.completed);
   CHECK(drv.in_flight() == 1);
+  CHECK(owed == 1);  // the driver owes this chain its callback
 
   io.run_until(st);
   CHECK(r.completed);
   CHECK(!r.ec);
   CHECK(r.bytes == len);
+  CHECK(owed == 0);  // and does not, once it has run
   CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
 }
 
@@ -938,7 +1043,8 @@ TEST_CASE("a read that fails reports through the error channel") {
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
   blake3pp::detail::io_op rop{};
-  auto op = ex::connect(io.read(file, len, pool, rop), chain_receiver{&r, &st});
+  unsigned owed = 0;
+  auto op = ex::connect(io.read(file, len, pool, rop, owed), chain_receiver{&r, &st});
   ex::start(op);
   io.run_until(st);
   CHECK(r.completed);
@@ -987,7 +1093,8 @@ TEST_CASE("work parked from another thread wakes a blocked driver") {
   blake3pp::detail::loop_status st{false, 2};
   chain_result read_done;
   blake3pp::detail::io_op rop{};
-  auto transfer = ex::connect(io.read(file, 0, pool, rop),
+  unsigned owed = 0;
+  auto transfer = ex::connect(io.read(file, 0, pool, rop, owed),
                              chain_receiver{&read_done, &st});
   chain_result parked;
   auto sched_op =
@@ -1037,10 +1144,11 @@ TEST_CASE("the four-line window chain composes on this provider") {
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
   blake3pp::detail::io_op rop{};
+  unsigned owed = 0;
   auto op = ex::connect(
       ex::then(
           ex::continues_on(
-              ex::let_value(io.read(file, 0, pool, rop),
+              ex::let_value(io.read(file, 0, pool, rop, owed),
                             [&, sched](std::span<const std::byte> w) {
                               return ex::then(ex::schedule(sched), [&, w] {
                                 summed_elsewhere.store(

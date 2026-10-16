@@ -146,6 +146,12 @@ concept file_driver =
       { d.cancel(op) } noexcept;
       { cd.in_flight() } noexcept -> std::same_as<std::size_t>;
       { d.drain() } noexcept;
+      // The same for one file: afterwards no transfer of this file is
+      // referenced and in_flight() counts none of them, so its buffers
+      // and the operations naming them may be destroyed. A scope winding
+      // down on a driver it shares with others uses this: the whole
+      // drain would forget their transfers too.
+      { d.drain(f) } noexcept;
       // How much window memory the run will use. A driver that owns an
       // arena takes it here; one whose windows are views of memory the
       // caller already has takes nothing and remembers the geometry.

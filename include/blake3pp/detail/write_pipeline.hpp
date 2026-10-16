@@ -68,6 +68,7 @@ class write_scope
   using base::ec_;
   using base::eptr_;
   using base::in_flight_;
+  using base::transfers_owed_;
   using base::latch_error;
   using base::latch_exception;
   using base::quiesce;
@@ -100,6 +101,18 @@ class write_scope
 
   write_scope(const write_scope&) = delete;
   write_scope& operator=(const write_scope&) = delete;
+
+  // The windows, the operations naming them and the driver's arena all
+  // outlive this scope by one frame at most, so nothing of this run may
+  // still be running here: a fill writing into a freed window is the
+  // failure this catches. run() ends with nothing outstanding or winds
+  // down through quiesce(), which returns only once every chain has
+  // completed or been reclaimed from the driver -- reclaimed ones stay
+  // counted, hence the comparison rather than a zero.
+  ~write_scope() {
+    assert(in_flight_ == transfers_owed_ &&
+           "a window was still on the pool when its write scope went");
+  }
 
   // Drives the whole file on this thread.
   //
@@ -224,7 +237,7 @@ class write_scope
               return loop_.write(file_, w.offset,
                                  std::span<const std::byte>(w.buffer.data(),
                                                             w.bytes),
-                                 w.op);
+                                 w.op, transfers_owed_);
             }),
         [this, &w]() noexcept { landed(w); });
   }
@@ -334,6 +347,9 @@ class write_scope
 
   // The loop the base's quiesce drives, which this scope owns.
   [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
+  // What the base's teardown reclaims transfers from: this run's file,
+  // never the whole driver, which may be serving other pipelines.
+  [[nodiscard]] typename D::file& file() noexcept { return file_; }
 
   void push_free(window* w) noexcept {
     w->next_free = free_;

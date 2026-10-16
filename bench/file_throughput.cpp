@@ -409,6 +409,8 @@ class null_driver {
     return reads_.in_flight();
   }
   void drain() noexcept { reads_.drain(); }
+  // Nothing here is in the OS's hands, so one file's share is all of it.
+  void drain(file&) noexcept { reads_.drain(); }
 
  private:
   std::uint64_t size_;

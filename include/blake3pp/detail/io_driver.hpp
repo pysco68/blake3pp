@@ -121,6 +121,14 @@ class io_driver {
   // destroy the ops it submitted. The driver stays usable. The
   // destructor drains too, a no-op after this.
   void drain() noexcept;
+  // The same for one file: afterwards no transfer of this file is owed or
+  // referenced, so its buffers and the operations naming them may be
+  // destroyed, and the driver stays usable for every other file. A
+  // sibling file's completion that surfaces during the wait is reported
+  // normally -- dropping it would strand an op that can never complete --
+  // so a caller closing one file of several should idle it first. The
+  // file's destructor does this.
+  void drain(file& f) noexcept;
 
   // Takes the window memory: one direct-I/O-aligned arena of
   // windows * window_bytes, valid until the driver is destroyed -- which

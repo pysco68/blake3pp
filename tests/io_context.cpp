@@ -199,6 +199,9 @@ class fake_context {
     return queue_.size();
   }
   void drain() noexcept { queue_.clear(); }
+  // Nothing is ever in the OS's hands here, and the cases build one file
+  // per context, so forgetting a file's transfers is forgetting the queue.
+  void forget(file&) noexcept { queue_.clear(); }
 
   // The engine gives no way to reach its context, so the
   // window to fail is named before the engine is built. A static on a

@@ -200,6 +200,9 @@ class fake_write_driver {
     return queued_.size();
   }
   void drain() noexcept { queued_.clear(); }
+  // One file per case here, and nothing in the OS's hands: this file's
+  // share of the queue is the queue.
+  void drain(file&) noexcept { queued_.clear(); }
 
   [[nodiscard]] const std::vector<std::byte>& sink() const noexcept {
     return sink_;

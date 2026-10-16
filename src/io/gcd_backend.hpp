@@ -266,7 +266,6 @@ class gcd_context {
     in_flight_ = 0;
   }
 
- private:
   // A file about to close takes its transfers with it. The descriptor is
   // the hazard: a worker inside pread() on it would, once the number is
   // recycled by another thread's open(), read a different file's bytes
@@ -290,6 +289,7 @@ class gcd_context {
         [&f](const transfer& op) noexcept { return op.sync_file == &f.f_; });
   }
 
+ private:
   // What a transfer needs that does not depend on its direction.
   void arm(transfer& op, file& f, std::uint64_t off, std::size_t len) noexcept {
     op.len = len;

@@ -164,6 +164,8 @@ std::size_t io_driver::in_flight() const noexcept {
 
 void io_driver::drain() noexcept { impl_->ctx.drain(); }
 
+void io_driver::drain(file& f) noexcept { impl_->ctx.forget(f.impl_->f); }
+
 void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
   // One arena per driver, taken once when its window pool is built.
   // Aligned for direct I/O, which rejects an unaligned buffer outright.

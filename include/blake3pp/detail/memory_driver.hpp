@@ -217,6 +217,10 @@ class memory_driver {
     return reads_.in_flight();
   }
   void drain() noexcept { reads_.drain(); }
+  // One file's share of it. Every queued read of this driver is a view of
+  // bytes the caller already has, so none is in anyone else's hands and
+  // dropping them all is dropping this file's.
+  void drain(file&) noexcept { reads_.drain(); }
 
  private:
   queued_reads reads_;
