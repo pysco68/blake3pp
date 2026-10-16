@@ -198,20 +198,8 @@ class compute_pool {
   // A count of 0 means "as many as the machine has", which is what a
   // benchmark sweeping thread counts passes for its default.
   explicit compute_pool(unsigned threads,
-                        one_thread at_one = one_thread::sequential)
-      : threads_(threads != 0 ? threads : default_threads()), at_one_(at_one) {
-#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-    // One sized scheduler per process, whatever the provider: the tool
-    // fixes it here, before anything can have used it.
-    if (parallel()) {
-      blake3pp::size_parallel_scheduler(threads_);
-    }
-#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
-    if (parallel()) {
-      pool_.emplace(threads_);
-    }
-#endif
-  }
+                        one_thread at_one = one_thread::sequential) noexcept
+      : threads_(threads != 0 ? threads : default_threads()), at_one_(at_one) {}
 
   // The count in force, after a 0 resolved to the machine's.
   [[nodiscard]] unsigned count() const noexcept { return threads_; }
@@ -222,14 +210,32 @@ class compute_pool {
   }
 
   // Precondition: parallel(). With the sized backend this is the process
-  // scheduler at the size the constructor fixed; under stdexec without it,
-  // the owned pool's, which exists exactly when parallel() is true;
-  // otherwise the provider's unsized one, which ignores --threads.
+  // scheduler at the size this call fixes; under stdexec without it, an
+  // owned pool; otherwise the provider's unsized one, which ignores
+  // --threads.
+  //
+  // Built on first use, not at construction. A tool asks for a count on the
+  // command line and then may do a job too small to fan out -- 148 bytes of
+  // generated output, a one-line file -- and an eagerly built pool would
+  // still start a worker per core and leave them spinning for the length
+  // of the process. On an idle machine that goes unnoticed; a test suite
+  // running 32 such processes at once spends hours of CPU on it.
+  //
+  // Called from one thread, which is what a tool's main() is at this point.
   [[nodiscard]] blake3pp::parallel_scheduler_t scheduler() {
 #if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+    // One sized scheduler per process, whatever the provider, and the size
+    // has to be fixed before anything fetches it.
+    if (!sized_) {
+      blake3pp::size_parallel_scheduler(threads_);
+      sized_ = true;
+    }
     return blake3pp::get_parallel_scheduler();
 #elif defined(BLAKE3PP_EXECUTION_STDEXEC)
-    return pool_.value().get_scheduler();
+    if (!pool_.has_value()) {
+      pool_.emplace(threads_);
+    }
+    return pool_->get_scheduler();
 #else
     return blake3pp::get_parallel_scheduler();
 #endif
@@ -238,7 +244,9 @@ class compute_pool {
  private:
   unsigned threads_;
   one_thread at_one_;
-#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
+  bool sized_ = false;
+#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
   std::optional<exec::static_thread_pool> pool_;
 #endif
 };

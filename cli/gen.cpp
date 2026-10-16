@@ -179,9 +179,12 @@ int main(int argc, char** argv) {
   stream.seek(seek);
 
   // Fills `out` from the stream's current position and advances it,
-  // multi-core over the pool when one is running.
+  // multi-core over the pool when one is running and there is more than
+  // one segment to split. blake3pp::fill() does one segment or less
+  // sequentially anyway, and asking for a scheduler is what starts the
+  // pool, so a run emitting a few hundred bytes starts no workers.
   const auto fill = [&](std::span<std::byte> out) {
-    if (pool.parallel()) {
+    if (pool.parallel() && out.size() > segment) {
       blake3pp::fill(stream, out, pool.scheduler(), segment);
     } else {
       blake3pp::fill(stream, out);
