@@ -95,7 +95,11 @@ else()
   # reducer's property cases under GCC with address+undefined, which hash
   # a couple of gigabytes each and take about four minutes there against
   # under a second on the plain lanes.
-  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 900)
+  #
+  # PROCESSORS is what ctest -j<N> needs to know about a suite whose cases
+  # run their own threads: without it the two parallelisms multiply. The
+  # number is the cap tests/main.cpp sets on the suite's scheduler.
+  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 900 PROCESSORS 4)
 endif()
 
 # The sized parallel scheduler is one definition per program; the test

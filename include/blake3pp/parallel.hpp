@@ -92,9 +92,12 @@ using parallel_scheduler_t = beman::execution::parallel_scheduler;
 #elif BLAKE3PP_HAS_STD_THREAD  // BLAKE3PP_EXECUTION_STDEXEC
 
 namespace detail {
-// The size process_pool() will be built with, 0 meaning every core. Only
-// <blake3pp/parallel_backend.hpp>'s size_parallel_scheduler() writes it,
-// and only before the pool exists; the flag below is how it knows.
+// The size process_pool() will be built with, 0 meaning every core.
+// <blake3pp/parallel_backend.hpp>'s size_parallel_scheduler() writes it, and
+// so does the test suite's main() in builds without that backend, which
+// needs a bound so a parallel ctest run does not fan every case out over
+// every core. Either way only before the pool exists; the flag below is how
+// it knows.
 inline std::atomic<unsigned>& process_pool_threads() noexcept {
   static std::atomic<unsigned> threads{0};
   return threads;
