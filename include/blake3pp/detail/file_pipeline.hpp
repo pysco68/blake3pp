@@ -287,7 +287,7 @@ class io_op_state : public run_node {
   using operation_state_concept = ex_compat::operation_state_tag;
 
   io_op_state(Receiver r, driver_loop<D>* loop, typename D::file* f,
-              std::uint64_t off, io_buffer_t<Dir> buf, io_read_op* op)
+              std::uint64_t off, io_buffer_t<Dir> buf, io_op* op)
       : rcvr_(std::move(r)), loop_(loop), file_(f), off_(off), buf_(buf),
         op_(op) {
     run = &deliver_parked;
@@ -377,7 +377,7 @@ class io_op_state : public run_node {
   // The caller's, and outliving this state: the transfer is still owed
   // when a stopped chain's cell is re-emplaced, and the scope has to be
   // able to name it to cancel it.
-  io_read_op* op_;
+  io_op* op_;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
   bool stopped_ = false;
@@ -399,7 +399,7 @@ class io_sender {
                                     ex::set_stopped_t());
 
   io_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
-            io_buffer_t<Dir> buf, io_read_op* op) noexcept
+            io_buffer_t<Dir> buf, io_op* op) noexcept
       : loop_(loop), file_(f), off_(off), buf_(buf), op_(op) {}
 
   template <class Receiver>
@@ -412,7 +412,7 @@ class io_sender {
   typename D::file* file_;
   std::uint64_t off_;
   io_buffer_t<Dir> buf_;
-  io_read_op* op_;
+  io_op* op_;
 };
 
 template <file_driver D>
@@ -570,13 +570,13 @@ class driver_loop {
   // its chain lived in.
   [[nodiscard]] read_sender<D> read(typename D::file& f, std::uint64_t off,
                                     std::span<std::byte> buf,
-                                    io_read_op& op) noexcept {
+                                    io_op& op) noexcept {
     return read_sender<D>{this, &f, off, buf, &op};
   }
 
   [[nodiscard]] write_sender<D> write(typename D::file& f, std::uint64_t off,
                                       std::span<const std::byte> buf,
-                                      io_read_op& op) noexcept {
+                                      io_op& op) noexcept {
     return write_sender<D>{this, &f, off, buf, &op};
   }
 
@@ -1126,7 +1126,7 @@ struct pipeline_window {
   // driver may still owe this read after the chain's cell is gone, and
   // the stop sweep names it from here. Last, so the fields the agents
   // touch keep their offsets.
-  io_read_op op{};
+  io_op op{};
 };
 
 // The window storage of a run: the driver's arena, the window objects

@@ -392,19 +392,19 @@ class null_driver {
   }
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
-                   blake3pp::detail::io_read_op& op) noexcept {
+                   blake3pp::detail::io_op& op) noexcept {
     reads_.push(op);
   }
   // The sink half: the bytes are already where they were generated, so
   // the only work is reporting from poll() and not before.
   void submit_write(file&, std::uint64_t, std::span<const std::byte>,
-                    blake3pp::detail::io_read_op& op) noexcept {
+                    blake3pp::detail::io_op& op) noexcept {
     reads_.push(op);
   }
   void flush() noexcept {}
   std::size_t poll(bool block) { return reads_.poll(block); }
   void wake() noexcept { reads_.wake(); }
-  void cancel(blake3pp::detail::io_read_op& op) noexcept { reads_.cancel(op); }
+  void cancel(blake3pp::detail::io_op& op) noexcept { reads_.cancel(op); }
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return reads_.in_flight();
   }

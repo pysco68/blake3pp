@@ -1,13 +1,14 @@
 # bench/
 
-Three programs. `blake3pp_bench` (throughput.cpp) times the kernels, the
-end-to-end hasher and the parallel engine in memory, against upstream's
-kernels where they build; `blake3pp_bench_file` (file_throughput.cpp)
-times the file pipeline against the device's raw read rate. Both build
-with `BLAKE3PP_BUILD_BENCH` and are documented by their `--help`.
+`blake3pp_bench` (throughput.cpp) times the kernels, the end-to-end
+hasher and the parallel engine in memory, against upstream's kernels
+where they build; `blake3pp_bench_file` (file_throughput.cpp) times the
+file pipeline against the device's raw read rate. Both build with
+`BLAKE3PP_BUILD_BENCH` and are documented by their `--help`.
 
-The third, `blake3pp_dispatch_cost_<variant>`, answers one question and
-is off by default (`-DBLAKE3PP_BENCH_DISPATCH_COST=ON`).
+`blake3pp_dispatch_cost_<variant>` and `blake3pp_detect_cost` each answer
+one question and are off by default (`-DBLAKE3PP_BENCH_DISPATCH_COST=ON`;
+not built for MSVC-style compilers or Emscripten).
 
 `compare/` holds the reference implementation's own bench, the blake3
 crate over rayon, in its own Cargo project: `-DBLAKE3PP_BENCH_COMPARE=ON`

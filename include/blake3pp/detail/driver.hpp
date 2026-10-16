@@ -59,18 +59,18 @@ void bind_completion(Op& op, Owner& owner) noexcept {
   };
 }
 
-// A read in flight. Caller-owned and at a fixed address from submit_read
-// until its callback has run.
+// One transfer in flight, a read or a write. Caller-owned and at a fixed
+// address from the submit until its callback has run.
 //
 // The backend's own operation lives in `storage`: sized and aligned here
 // for the widest backend, checked against the real type by a
 // static_assert in io_driver.cpp, so a backend that outgrows it fails the
-// build rather than corrupting the neighbouring bytes. One io_read_op
-// serves read after read, each submit constructing a fresh backend op
+// build rather than corrupting the neighbouring bytes. One io_op serves
+// transfer after transfer, each submit constructing a fresh backend op
 // over the last one's bytes, which is why that type has to be trivially
 // destructible -- also checked there.
-struct io_read_op {
-  void (*done)(io_read_op*, std::error_code) noexcept = nullptr;
+struct io_op {
+  void (*done)(io_op*, std::error_code) noexcept = nullptr;
   void* owner = nullptr;
 
   static constexpr std::size_t storage_size = 160;
@@ -84,11 +84,11 @@ struct io_read_op {
   template <class Op>
   [[nodiscard]] Op& emplace_native() noexcept {
     static_assert(sizeof(Op) <= storage_size,
-                  "io_read_op::storage_size is smaller than this backend's op");
+                  "io_op::storage_size is smaller than this backend's op");
     static_assert(alignof(Op) <= storage_align,
-                  "io_read_op::storage_align is weaker than this backend's op");
+                  "io_op::storage_align is weaker than this backend's op");
     static_assert(std::is_trivially_destructible_v<Op>,
-                  "io_read_op::storage is reused per read, so the op must "
+                  "io_op::storage is reused per read, so the op must "
                   "be trivially destructible");
     return *::new (static_cast<void*>(storage)) Op{};
   }
@@ -104,16 +104,16 @@ struct io_read_op {
   }
 };
 
-// Size and alignment of the platform backend's own read operation: what
-// io_read_op::storage has to hold. The static_assert in io_driver.cpp is
+// Size and alignment of the platform backend's own operation: what
+// io_op::storage has to hold. The static_assert in io_driver.cpp is
 // the one that sees the real type, so this reports the margin on
 // platforms whose backend nobody here can compile.
-struct io_read_op_layout {
+struct io_op_layout {
   std::size_t size;
   std::size_t align;
 };
 
-[[nodiscard]] io_read_op_layout native_read_op_layout() noexcept;
+[[nodiscard]] io_op_layout native_op_layout() noexcept;
 
 // Where one window's bytes live, as the driver that owns them says.
 //
@@ -133,7 +133,7 @@ struct window_storage {
 // called it.
 template <class D>
 concept file_driver =
-    requires(D& d, const D& cd, typename D::file& f, io_read_op& op,
+    requires(D& d, const D& cd, typename D::file& f, io_op& op,
              std::uint64_t off, std::span<std::byte> buf, bool block,
              std::size_t bytes, unsigned windows) {
       typename D::file;

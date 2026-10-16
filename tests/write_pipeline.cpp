@@ -122,12 +122,12 @@ class fake_write_driver {
   }
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
-                   detail::io_read_op&) {
+                   detail::io_op&) {
     FAIL("the write pipeline must not read");
   }
 
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
-                    detail::io_read_op& op) {
+                    detail::io_op& op) {
     queued_.push_back(write{&op, off, buf, 0});
   }
 
@@ -187,7 +187,7 @@ class fake_write_driver {
     cv_.notify_one();
   }
 
-  void cancel(detail::io_read_op& op) noexcept {
+  void cancel(detail::io_op& op) noexcept {
     for (write& w : queued_) {
       if (w.op == &op) {
         w.cancelled = true;
@@ -210,7 +210,7 @@ class fake_write_driver {
 
  private:
   struct write {
-    detail::io_read_op* op;
+    detail::io_op* op;
     std::uint64_t off;
     std::span<const std::byte> buf;
     std::size_t done;

@@ -162,7 +162,7 @@ class write_scope
  private:
   struct window {
     std::span<std::byte> buffer;
-    io_read_op op{};
+    io_op op{};
     window* next_free = nullptr;
     std::uint64_t offset = 0;
     std::size_t bytes = 0;

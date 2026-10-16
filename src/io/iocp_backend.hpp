@@ -207,7 +207,7 @@ struct win_file {
 };
 
 // The IOCP reader context: one completion port, any number of files,
-// reads named by the caller's read_op, completions delivered as callbacks
+// reads named by the caller's transfer, completions delivered as callbacks
 // out of poll(). The port is the context's; each file associates its
 // overlapped handle with it at construction.
 //
@@ -220,7 +220,7 @@ class iocp_context {
  public:
   class file;
 
-  struct read_op : read_op_base {
+  struct transfer : transfer_base {
     OVERLAPPED ov{};
     std::byte* dst = nullptr;         // reads fill this
     const std::byte* src = nullptr;   // writes read from this
@@ -231,7 +231,7 @@ class iocp_context {
     HANDLE h = INVALID_HANDLE_VALUE;
     win_file* sync_file = nullptr;  // the deferred path needs the handles
     file* owner_file = nullptr;     // which file's drain owes this op
-    read_op* next_deferred = nullptr;
+    transfer* next_deferred = nullptr;
     bool on_port = false;   // the port owes a completion, so cancel is CancelIoEx
     bool cancelled = false;  // a cancel was asked for; one is enough
   };
@@ -342,7 +342,7 @@ class iocp_context {
   ~iocp_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   read_op& op) {
+                   transfer& op) {
     arm(op, f, off, buf.size());
     op.dst = buf.data();
     op.src = nullptr;
@@ -360,7 +360,7 @@ class iocp_context {
   // bytes posts a completion carrying zero bytes, which is the same
   // shape as a short transfer and cannot be told apart from one.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
-                    read_op& op) {
+                    transfer& op) {
     arm(op, f, off, buf.size());
     op.dst = nullptr;
     op.src = buf.data();
@@ -370,7 +370,7 @@ class iocp_context {
 
  private:
   // What a transfer needs that does not depend on its direction.
-  void arm(read_op& op, file& f, std::uint64_t off, std::size_t len) noexcept {
+  void arm(transfer& op, file& f, std::uint64_t off, std::size_t len) noexcept {
     op.len = len;
     op.off = off;
     op.filled = 0;
@@ -391,7 +391,7 @@ class iocp_context {
   // no completion, so nothing would ever take it off in_flight(): it goes
   // down the same ladder, where a second failure reaches the caller as
   // every other transfer error does.
-  void place(read_op& op, file& f) {
+  void place(transfer& op, file& f) {
     bool queued =
         f.f_.use_iocp && op.len != 0 && op.len % direct_align == 0;
     if (queued) {
@@ -417,7 +417,7 @@ class iocp_context {
   // completion is already on the port and arrives normally. A read on
   // the deferred list was never issued to anything, so the flag alone is
   // the whole cancel and run_one_deferred() honours it.
-  void cancel(read_op& op) noexcept {
+  void cancel(transfer& op) noexcept {
     if (std::exchange(op.cancelled, true)) {
       return;
     }
@@ -542,7 +542,7 @@ class iocp_context {
     // the wait below is on the port, which will never hand back a
     // transfer that was never given to it.
     const std::size_t dropped = deferred_.remove_if(
-        [&f](const read_op& op) noexcept { return op.owner_file == &f; });
+        [&f](const transfer& op) noexcept { return op.owner_file == &f; });
     in_flight_ -= dropped;
     f.inflight_ -= dropped;
     if (!f.f_.use_iocp || f.inflight_ == 0) {
@@ -563,7 +563,7 @@ class iocp_context {
         }
         break;  // the port is unusable; no completion can arrive
       }
-      read_op& op = *op_of(pov);
+      transfer& op = *op_of(pov);
       --port_owed_;
       if (op.owner_file == &f) {
         in_flight_--;
@@ -589,7 +589,7 @@ class iocp_context {
   // the op was completed with that error instead. Both callers are
   // inside poll(), which is where a read's error is allowed to reach its
   // callback; what cannot happen is leaving it counted and unissued.
-  [[nodiscard]] bool reissue(read_op& op) noexcept {
+  [[nodiscard]] bool reissue(transfer& op) noexcept {
     try {
       issue(op);
       return true;
@@ -599,7 +599,7 @@ class iocp_context {
     }
   }
 
-  void issue(read_op& op) {
+  void issue(transfer& op) {
     std::memset(&op.ov, 0, sizeof(op.ov));
     const std::uint64_t off = op.off + op.filled;
     op.ov.Offset = static_cast<DWORD>(off);
@@ -615,7 +615,7 @@ class iocp_context {
     ++port_owed_;
   }
 
-  void complete(read_op& op, std::error_code ec) noexcept {
+  void complete(transfer& op, std::error_code ec) noexcept {
     in_flight_--;
     if (op.owner_file != nullptr) {
       op.owner_file->inflight_--;
@@ -626,10 +626,10 @@ class iocp_context {
   // The op is the record its OVERLAPPED is a member of. The caller keeps
   // it at a fixed address from submit until its callback has run, which
   // is what makes the walk back valid; it is the documented IOCP idiom
-  // and the reason read_op is the caller's type rather than the
+  // and the reason transfer is the caller's type rather than the
   // context's.
-  [[nodiscard]] static read_op* op_of(OVERLAPPED* pov) noexcept {
-    return CONTAINING_RECORD(pov, read_op, ov);
+  [[nodiscard]] static transfer* op_of(OVERLAPPED* pov) noexcept {
+    return CONTAINING_RECORD(pov, transfer, ov);
   }
 
   std::size_t reap_ready(bool block) {
@@ -650,7 +650,7 @@ class iocp_context {
         }
         throw_winerr("GetQueuedCompletionStatus");
       }
-      read_op& op = *op_of(pov);
+      transfer& op = *op_of(pov);
       --port_owed_;
       if (ok == 0) {
         complete(op, read_error(::GetLastError()));
@@ -675,11 +675,11 @@ class iocp_context {
   }
 
   std::size_t run_one_deferred() noexcept {
-    read_op* const next = deferred_.take();
+    transfer* const next = deferred_.take();
     if (next == nullptr) {
       return 0;
     }
-    read_op& op = *next;
+    transfer& op = *next;
     std::error_code ec;
     if (op.cancelled) {
       ec = std::make_error_code(std::errc::operation_canceled);
@@ -763,7 +763,7 @@ class iocp_context {
 
   bool async_requested_ = true;
   unique_handle port_;
-  deferred_ops<read_op> deferred_;
+  deferred_ops<transfer> deferred_;
   file* files_ = nullptr;      // every open file, for the drain
   std::size_t in_flight_ = 0;
   std::size_t port_owed_ = 0;  // requests the port has yet to hand back

@@ -444,20 +444,20 @@ struct uring {
 };
 
 // The io_uring reader context: one ring, any number of files, reads named
-// by the caller's read_op, completions delivered as callbacks out of
+// by the caller's transfer, completions delivered as callbacks out of
 // poll(). Degrades per feature at runtime, as the whole layer does:
 // O_DIRECT refused by the filesystem -> buffered, io_uring refused ->
 // every read served synchronously from the deferred list.
 class uring_context {
  public:
-  struct read_op : read_op_base {
+  struct transfer : transfer_base {
     std::span<std::byte> buf{};         // reads fill this
     std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
     std::size_t filled = 0;
     int fd = -1;                      // the fd this transfer rides
     posix_file* sync_file = nullptr;  // the deferred path needs the pair
-    read_op* next_deferred = nullptr;
+    transfer* next_deferred = nullptr;
     bool on_ring = false;    // the kernel has it, so a cancel is an SQE
     bool cancelled = false;  // a cancel was asked for; one is enough
     bool is_write = false;
@@ -540,7 +540,7 @@ class uring_context {
   ~uring_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   read_op& op) {
+                   transfer& op) {
     arm(op, f, off);
     op.buf = buf;
     op.wbuf = {};
@@ -553,7 +553,7 @@ class uring_context {
   // inside poll(), through the plain fd. Nothing above the context sees
   // the difference.
   void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, read_op& op) {
+                    std::span<const std::byte> buf, transfer& op) {
     arm(op, f, off);
     op.buf = {};
     op.wbuf = buf;
@@ -563,7 +563,7 @@ class uring_context {
 
  private:
   // What a transfer needs that does not depend on its direction.
-  void arm(read_op& op, file& f, std::uint64_t off) noexcept {
+  void arm(transfer& op, file& f, std::uint64_t off) noexcept {
     op.off = off;
     op.filled = 0;
     op.fd = f.f_.fd();
@@ -581,7 +581,7 @@ class uring_context {
   // which is the signature of a short transfer with nothing left to give,
   // so a no-op never reaches the kernel. This is the whole
   // runtime-degradation question.
-  void issue(read_op& op, std::uint8_t opcode, const void* data,
+  void issue(transfer& op, std::uint8_t opcode, const void* data,
              std::size_t len) noexcept {
     if (use_uring_ && len != 0 && len % direct_align == 0) {
       op.on_ring = true;
@@ -597,7 +597,7 @@ class uring_context {
   // The kernel is asked once; a second ask would only add a CQE to drop.
   // A read on the deferred list has not been issued to anything, so the
   // flag alone is the whole cancel and run_one_deferred() honours it.
-  void cancel(read_op& op) noexcept {
+  void cancel(transfer& op) noexcept {
     if (std::exchange(op.cancelled, true)) {
       return;
     }
@@ -693,7 +693,7 @@ class uring_context {
       if (ud == cancel_ud()) {
         return;  // withdrawn with its target; nothing owes a completion
       }
-      read_op& op = *op_from(ud);
+      transfer& op = *op_from(ud);
       op.next_deferred = nullptr;
       op.on_ring = false;  // the kernel never took it; no SQE to cancel
       deferred_.push(op);
@@ -720,16 +720,16 @@ class uring_context {
     return n;
   }
 
-  [[nodiscard]] std::uint64_t op_ud(read_op* op) const noexcept {
+  [[nodiscard]] std::uint64_t op_ud(transfer* op) const noexcept {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(op));
   }
-  [[nodiscard]] read_op* op_from(std::uint64_t ud) const noexcept {
-    return std::bit_cast<read_op*>(static_cast<std::uintptr_t>(ud));
+  [[nodiscard]] transfer* op_from(std::uint64_t ud) const noexcept {
+    return std::bit_cast<transfer*>(static_cast<std::uintptr_t>(ud));
   }
-  // The wake completion needs a user_data no read_op can wear; its own
+  // The wake completion needs a user_data no transfer can wear; its own
   // op's address is one, and costs nothing. A cancel's CQE needs the
   // same, and for the same reason: reaping it as a read would walk to a
-  // read_op that does not exist.
+  // transfer that does not exist.
   [[nodiscard]] std::uint64_t wake_ud() const noexcept {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(&wake_op_));
   }
@@ -743,7 +743,7 @@ class uring_context {
     wake_armed_ = true;
   }
 
-  void complete(read_op& op, std::error_code ec) noexcept {
+  void complete(transfer& op, std::error_code ec) noexcept {
     in_flight_--;
     op.done(&op, ec);
   }
@@ -766,7 +766,7 @@ class uring_context {
       if (ud == cancel_ud()) {
         continue;  // the target's own completion is the one that matters
       }
-      read_op& op = *op_from(ud);
+      transfer& op = *op_from(ud);
       if (res < 0) {
         complete(op, std::error_code(-res, std::generic_category()));
         ran++;
@@ -813,11 +813,11 @@ class uring_context {
   // At most one per poll(): a synchronous read holds the calling thread
   // for the whole window, and the caller asked to be given control back.
   std::size_t run_one_deferred() noexcept {
-    read_op* const next = deferred_.take();
+    transfer* const next = deferred_.take();
     if (next == nullptr) {
       return 0;
     }
-    read_op& op = *next;
+    transfer& op = *next;
     std::error_code ec;
     if (op.cancelled) {
       ec = std::make_error_code(std::errc::operation_canceled);
@@ -880,10 +880,10 @@ class uring_context {
   // is closed and before the op whose address that poll wears goes.
   // Do not move ring_ above these two.
   poll_waiter waiter_;
-  read_op wake_op_{};    // address only: the wake completion's user_data
-  read_op cancel_op_{};  // address only: every cancel CQE's user_data
+  transfer wake_op_{};    // address only: the wake completion's user_data
+  transfer cancel_op_{};  // address only: every cancel CQE's user_data
   uring ring_;
-  deferred_ops<read_op> deferred_;
+  deferred_ops<transfer> deferred_;
   std::size_t in_flight_ = 0;
   bool async_requested_ = true;
   bool use_uring_ = false;

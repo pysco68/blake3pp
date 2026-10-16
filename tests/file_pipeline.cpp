@@ -438,7 +438,7 @@ class fake_driver {
   };
 
   void submit_read(file&, std::uint64_t off, std::span<std::byte> buf,
-                   blake3pp::detail::io_read_op& op) {
+                   blake3pp::detail::io_op& op) {
     if (script_.bad_alloc_at_window >= 0 &&
         off / window_bytes_ ==
             static_cast<std::uint64_t>(script_.bad_alloc_at_window)) {
@@ -478,7 +478,7 @@ class fake_driver {
         --r.cancel_polls;
         return 0;  // asked for, not yet given back
       }
-      blake3pp::detail::io_read_op* const op = r.op;
+      blake3pp::detail::io_op* const op = r.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
       ++callbacks_;
       op->done(op, std::make_error_code(std::errc::operation_canceled));
@@ -487,7 +487,7 @@ class fake_driver {
     const unsigned index = static_cast<unsigned>(r.off / window_bytes_);
     if (script_.fail_at_window >= 0 &&
         index == static_cast<unsigned>(script_.fail_at_window)) {
-      blake3pp::detail::io_read_op* const op = r.op;
+      blake3pp::detail::io_op* const op = r.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
       ++callbacks_;
       op->done(op, std::make_error_code(std::errc::io_error));
@@ -502,7 +502,7 @@ class fake_driver {
     if (r.filled < r.buf.size()) {
       return 0;  // still owed: the read takes another poll
     }
-    blake3pp::detail::io_read_op* const op = r.op;
+    blake3pp::detail::io_op* const op = r.op;
     queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
     ++callbacks_;
     op->done(op, std::error_code{});
@@ -520,7 +520,7 @@ class fake_driver {
   // What the script says this driver's device does about a cancel. The
   // three answers a real one can give are all here, because which of
   // them the pipeline gets must not change what it reports.
-  void cancel(blake3pp::detail::io_read_op& op) noexcept {
+  void cancel(blake3pp::detail::io_op& op) noexcept {
     ++cancels_;
     for (read& r : queued_) {
       if (r.op == &op) {
@@ -579,7 +579,7 @@ class fake_driver {
 
  private:
   struct read {
-    blake3pp::detail::io_read_op* op;
+    blake3pp::detail::io_op* op;
     std::uint64_t off;
     std::span<std::byte> buf;
     std::size_t filled;
@@ -633,7 +633,7 @@ static_assert(blake3pp::detail::file_driver<fake_driver>);
 struct read_probe {
   int calls = 0;
   std::error_code ec{};
-  static void on_done(blake3pp::detail::io_read_op* op,
+  static void on_done(blake3pp::detail::io_op* op,
                       std::error_code e) noexcept {
     auto* const p = static_cast<read_probe*>(op->owner);
     p->calls++;
@@ -750,26 +750,26 @@ TEST_CASE("std::execution senders are not silently untested") {
 #endif
 }
 
-// io_read_op::storage is sized for the widest backend, but only the
+// io_op::storage is sized for the widest backend, but only the
 // platform being built sees its own. Reporting the margin here is how a
 // backend that grows towards the limit becomes visible before the
 // static_assert in io_driver.cpp stops the build.
 TEST_CASE("the backend's read operation fits the driver's op storage") {
-  using blake3pp::detail::io_read_op;
-  const auto layout = blake3pp::detail::native_read_op_layout();
-  MESSAGE("backend read_op: " << layout.size << " bytes, align "
+  using blake3pp::detail::io_op;
+  const auto layout = blake3pp::detail::native_op_layout();
+  MESSAGE("backend transfer: " << layout.size << " bytes, align "
                               << layout.align << " (storage "
-                              << io_read_op::storage_size << " / "
-                              << io_read_op::storage_align << ")");
-  CHECK(layout.size <= io_read_op::storage_size);
-  CHECK(layout.align <= io_read_op::storage_align);
+                              << io_op::storage_size << " / "
+                              << io_op::storage_align << ")");
+  CHECK(layout.size <= io_op::storage_size);
+  CHECK(layout.align <= io_op::storage_align);
 }
 
 // The compiled seam: the same contract the backends keep, from behind a
 // pimpl, plus the arena whose lifetime the drain depends on.
 TEST_CASE("the io driver reads a file and keeps the callback discipline") {
   using blake3pp::detail::io_driver;
-  using blake3pp::detail::io_read_op;
+  using blake3pp::detail::io_op;
   constexpr std::size_t len = 256 * 1024;
   const auto content = pattern(len, 13);
   const temp_file f(content);
@@ -787,7 +787,7 @@ TEST_CASE("the io driver reads a file and keeps the callback discipline") {
   REQUIRE(pool.size() == len);
   CHECK(std::bit_cast<std::uintptr_t>(pool.data()) % 4096 == 0);
 
-  io_read_op op{};
+  io_op op{};
   read_probe probe;
   op.done = &read_probe::on_done;
   op.owner = &probe;
@@ -813,7 +813,7 @@ TEST_CASE("the io driver reads a file and keeps the callback discipline") {
 // read targets is freed. The sanitizer lanes are what would object.
 TEST_CASE("the io driver drains a read in flight before freeing its arena") {
   using blake3pp::detail::io_driver;
-  using blake3pp::detail::io_read_op;
+  using blake3pp::detail::io_op;
   constexpr std::size_t len = 256 * 1024;
   const auto content = pattern(len, 17);
   const temp_file f(content);
@@ -824,7 +824,7 @@ TEST_CASE("the io driver drains a read in flight before freeing its arena") {
     io_driver::file file(drv, f.path, /*direct_io=*/false);
     drv.reserve(1, len);
   const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
-    io_read_op op{};
+    io_op op{};
     op.done = &read_probe::on_done;
     op.owner = &probe;
     drv.submit_read(file, 0, pool, op);
@@ -838,7 +838,7 @@ TEST_CASE("the io driver drains a read in flight before freeing its arena") {
 // reported, the op may go, and the driver then serves another read.
 TEST_CASE("the io driver drains on request and reads again afterwards") {
   using blake3pp::detail::io_driver;
-  using blake3pp::detail::io_read_op;
+  using blake3pp::detail::io_op;
   constexpr std::size_t len = 256 * 1024;
   const auto content = pattern(len, 19);
   const temp_file f(content);
@@ -849,7 +849,7 @@ TEST_CASE("the io driver drains on request and reads again afterwards") {
   const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
   read_probe probe;
   {
-    io_read_op op{};
+    io_op op{};
     op.done = &read_probe::on_done;
     op.owner = &probe;
     drv.submit_read(file, 0, pool, op);
@@ -858,7 +858,7 @@ TEST_CASE("the io driver drains on request and reads again afterwards") {
     CHECK(drv.in_flight() == 0);
     CHECK(probe.calls == 0);
   }
-  io_read_op op{};
+  io_op op{};
   op.done = &read_probe::on_done;
   op.owner = &probe;
   drv.submit_read(file, 0, pool, op);
@@ -906,7 +906,7 @@ TEST_CASE("a window read is a sender the driver loop completes") {
 
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
-  blake3pp::detail::io_read_op rop{};
+  blake3pp::detail::io_op rop{};
   auto op = ex::connect(io.read(file, 0, pool, rop), chain_receiver{&r, &st});
   // start() queues the read and nothing else: no flush, no callback.
   ex::start(op);
@@ -937,7 +937,7 @@ TEST_CASE("a read that fails reports through the error channel") {
   // an error, and the chain sees it as std::error_code, not a value.
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
-  blake3pp::detail::io_read_op rop{};
+  blake3pp::detail::io_op rop{};
   auto op = ex::connect(io.read(file, len, pool, rop), chain_receiver{&r, &st});
   ex::start(op);
   io.run_until(st);
@@ -986,8 +986,8 @@ TEST_CASE("work parked from another thread wakes a blocked driver") {
   // has to get through to a driver already asleep.
   blake3pp::detail::loop_status st{false, 2};
   chain_result read_done;
-  blake3pp::detail::io_read_op rop{};
-  auto read_op = ex::connect(io.read(file, 0, pool, rop),
+  blake3pp::detail::io_op rop{};
+  auto transfer = ex::connect(io.read(file, 0, pool, rop),
                              chain_receiver{&read_done, &st});
   chain_result parked;
   auto sched_op =
@@ -1001,7 +1001,7 @@ TEST_CASE("work parked from another thread wakes a blocked driver") {
     ex::start(sched_op);  // push and wake, from off the driver thread
   });
 
-  ex::start(read_op);
+  ex::start(transfer);
   go.store(true, std::memory_order_release);
   io.run_until(st);
   other.join();
@@ -1036,7 +1036,7 @@ TEST_CASE("the four-line window chain composes on this provider") {
 
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
-  blake3pp::detail::io_read_op rop{};
+  blake3pp::detail::io_op rop{};
   auto op = ex::connect(
       ex::then(
           ex::continues_on(

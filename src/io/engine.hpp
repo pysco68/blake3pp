@@ -135,7 +135,7 @@ class polled_reader_engine {
 
  private:
   struct slot_state {
-    typename C::read_op op{};
+    typename C::transfer op{};
     std::uint64_t win = 0;
     std::size_t target = 0;
     std::error_code ec{};
@@ -314,7 +314,7 @@ class polled_writer_engine {
 
  private:
   struct slot_state {
-    typename C::read_op op{};
+    typename C::transfer op{};
     std::error_code ec{};
     bool busy = false;
 

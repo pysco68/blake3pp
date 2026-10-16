@@ -3,7 +3,7 @@
 //
 // Every member forwards to the native context named by
 // io/backend_select.hpp. The only real work here is fitting the
-// backend's operation inside the caller-owned io_read_op and putting the
+// backend's operation inside the caller-owned io_op and putting the
 // arena on the right side of the drain.
 
 #include <blake3pp/detail/io_driver.hpp>
@@ -26,9 +26,9 @@ namespace blake3pp::detail {
 
 namespace {
 using context = io_impl::native_io_context;
-using native_op = context::read_op;
+using native_op = context::transfer;
 
-// The backend's operation lives inside the caller's io_read_op, whose
+// The backend's operation lives inside the caller's io_op, whose
 // emplace_native() checks the fit and the trivial destructor where the
 // op is constructed. A backend that outgrows the storage fails that
 // check: raise storage_size in the header. One whose op acquires
@@ -40,8 +40,8 @@ static_assert(io_driver::direct_alignment == io_impl::direct_align,
 
 // The backend completes its own op; this carries that across to the
 // caller's, which is the only one the pipeline knows about.
-void trampoline(io_impl::read_op_base* base, std::error_code ec) noexcept {
-  auto* const outer = static_cast<io_read_op*>(base->owner);
+void trampoline(io_impl::transfer_base* base, std::error_code ec) noexcept {
+  auto* const outer = static_cast<io_op*>(base->owner);
   outer->done(outer, ec);
 }
 }  // namespace
@@ -93,7 +93,7 @@ struct io_driver::file::impl {
   impl& operator=(const impl&) = delete;
 };
 
-io_read_op_layout native_read_op_layout() noexcept {
+io_op_layout native_op_layout() noexcept {
   return {sizeof(native_op), alignof(native_op)};
 }
 
@@ -131,7 +131,7 @@ void io_driver::file::set_size(std::uint64_t bytes) {
 }
 
 void io_driver::submit_read(file& f, std::uint64_t off,
-                            std::span<std::byte> buf, io_read_op& op) {
+                            std::span<std::byte> buf, io_op& op) {
   native_op& inner = op.emplace_native<native_op>();
   inner.done = &trampoline;
   inner.owner = &op;
@@ -139,7 +139,7 @@ void io_driver::submit_read(file& f, std::uint64_t off,
 }
 
 void io_driver::submit_write(file& f, std::uint64_t off,
-                             std::span<const std::byte> buf, io_read_op& op) {
+                             std::span<const std::byte> buf, io_op& op) {
   native_op& inner = op.emplace_native<native_op>();
   inner.done = &trampoline;
   inner.owner = &op;
@@ -152,7 +152,7 @@ std::size_t io_driver::poll(bool block) { return impl_->ctx.poll(block); }
 
 void io_driver::wake() noexcept { impl_->ctx.wake(); }
 
-void io_driver::cancel(io_read_op& op) noexcept {
+void io_driver::cancel(io_op& op) noexcept {
   // The backend's own op is the one the context knows, and it lives in
   // the storage this read's submit constructed it in.
   impl_->ctx.cancel(op.native<native_op>());

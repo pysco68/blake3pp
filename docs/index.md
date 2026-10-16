@@ -86,7 +86,7 @@ BLAKE3 is more than a 32-byte digest, and all of it is available:
 
 | | |
 |---|---|
-| [Examples](examples/index.md) | seven standalone programs, one per subject. Start here if you learn by reading code |
+| [Examples](examples/index.md) | ten standalone programs, one per subject. Start here if you learn by reading code |
 | [The API](api.md) | the guide across the library: what you compute, how you feed it, what runs it, what it costs |
 | [Reference](reference/index.md) | every declaration on its own terms, generated from the headers' doc comments |
 | [Many files at once](async.md) | EXPERIMENTAL: file hashing as senders over a context you drive |
