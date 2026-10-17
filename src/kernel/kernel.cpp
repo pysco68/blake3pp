@@ -31,6 +31,22 @@ static_assert(u32v::width <= max_simd_degree,
               "BLAKE3PP_MAX_SIMD_DEGREE is narrower than this kernel's "
               "simd_degree: it sizes the staging buffers this kernel fills");
 
+// A SIMD variant whose provider found no width for the target would
+// compile to a one-lane kernel: correct, as slow as the scalar one, and
+// registered under a name that says otherwise -- a dispatch table whose
+// avx2 entry is scalar. It happens where a provider has no backend for an
+// ISA the compiler itself supports (GCC 16's <simd> carries its arch
+// traits under x86 only, so a std-provider build elsewhere deduces one
+// lane), which is a build to decline rather than ship.
+//
+// The scalar variant is the one that means it, and BLAKE3PP_FORCE_SCALAR
+// is how a target asks for it by name.
+static_assert(u32v::width > 1 || arch::BLAKE3PP_ARCH_NS == arch::scalar,
+              "this simd provider has no vector width for the target: the "
+              "variant would be a one-lane kernel under a vector name. Pick "
+              "another BLAKE3PP_SIMD_PROVIDER for it, or build the scalar "
+              "variant instead");
+
 // Little-endian load and store, spelled memcpy plus byteswap instead of
 // the byte-wise shift-or idiom. GCC and Clang fold both spellings to a
 // single mov on LE targets. MSVC 19.51 does not recognize the shift-or
