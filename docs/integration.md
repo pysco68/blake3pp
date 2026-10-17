@@ -15,7 +15,10 @@ target_link_libraries(app PRIVATE blake3pp::blake3pp)
 
 The library is C++20; with a C++26 toolchain it uses native `std::simd`,
 otherwise `std::experimental::simd` or xsimd: the same source, probed at
-configure time. Tests, benchmarks and the two CLI tools only build
+configure time. `-DBLAKE3PP_SIMD_PROVIDER=xvec` selects Intel's
+[xvec](https://github.com/intel/xvec) instead, an independent header-only
+implementation of the same C++26 library, fetched at a pinned commit;
+[Polyfills](polyfills.md) has the whole matrix. Tests, benchmarks and the two CLI tools only build
 when blake3pp is the top-level project, so vendoring costs you nothing
 beyond the library itself.
 
