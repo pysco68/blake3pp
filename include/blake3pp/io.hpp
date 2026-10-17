@@ -32,6 +32,7 @@
 /// std::system_error on I/O failure, the std::error_code& form reports
 /// through ec instead.
 
+#include <algorithm>
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -57,7 +58,10 @@ struct file_io_options {
   /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
   /// minimum 64 KiB.
   std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows in flight at once; clamped to [2, 32].
+  /// Windows in flight at once; clamped to [2, 256]. Every one of them is
+  /// window_bytes of arena, which is what the ceiling guards (and
+  /// BLAKE3PP_MAX_QUEUE_DEPTH moves); the measured sweet spot on every
+  /// device so far is four to eight.
   unsigned queue_depth = 4;
   /// Bypass the page cache where the platform supports it; degrades to
   /// buffered reads where it does not.
@@ -105,9 +109,7 @@ class hash_mode {
       std::span<const std::byte, key_size> key) noexcept {
     hash_mode m;
     m.kind_ = kind::keyed;
-    for (std::size_t i = 0; i < key_size; ++i) {
-      m.key_[i] = key[i];
-    }
+    std::ranges::copy(key, m.key_.begin());
     return m;
   }
 
@@ -159,7 +161,7 @@ struct hash_file_options {
   /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
   /// minimum 64 KiB.
   std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows in flight at once; clamped to [2, 32].
+  /// Windows in flight at once; clamped to [2, 256]; see file_io_options.
   unsigned queue_depth = 4;
   /// Bypass the page cache where the platform supports it.
   bool direct_io = true;
@@ -287,7 +289,7 @@ struct file_write_options {
   /// reading does, so one options object asking for an odd size can mean
   /// two geometries.
   std::size_t window_bytes = detail::default_write_window_bytes;
-  /// Windows in flight, clamped to [2, 32].
+  /// Windows in flight, clamped to [2, 256]; see file_io_options.
   unsigned queue_depth = detail::default_write_queue_depth;
   /// Bypass the page cache where the platform can.
   bool direct_io = true;

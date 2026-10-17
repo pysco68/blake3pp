@@ -2184,9 +2184,17 @@ TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the fi
   using blake3pp::detail::default_window_budget_bytes;
   using blake3pp::detail::max_queue_depth;
   using blake3pp::detail::plan_pipeline;
+  using blake3pp::detail::rounded_window_bytes;
   constexpr std::size_t mib = std::size_t{1} << 20;
   constexpr std::uint64_t large = std::uint64_t{64} << 30;
   static_assert(default_window_budget_bytes == 128 * mib);
+  // The 64 MiB windows below exist where max_window_bytes reaches them.
+  // On 32-bit size_t it is SIZE_MAX / max_queue_depth, just under 16 MiB,
+  // so the request rounds down to 8 MiB, the standing budget buys more
+  // windows than the reads, and those cases assert the rounded window's
+  // count instead.
+  constexpr std::size_t w64 = rounded_window_bytes(64 * mib);
+  constexpr bool wide_windows = w64 == 64 * mib;
 
   // A large file at 8 MiB x qd 4: the budget buys 16 windows, the
   // device still sees 4 reads.
@@ -2200,21 +2208,32 @@ TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the fi
   {
     const auto p = plan_pipeline(0, 64 * mib, 4, false, large);
     CHECK(p.reads_in_flight == 4);
-    CHECK(p.windows == 4);
-    CHECK(p.windows * p.window_bytes == 256 * mib);
+    if constexpr (wide_windows) {
+      CHECK(p.windows == 4);
+      CHECK(p.windows * p.window_bytes == 256 * mib);
+    } else {
+      CHECK(p.window_bytes == w64);
+      CHECK(p.windows == default_window_budget_bytes / w64);
+    }
   }
   // A deeper queue lifts the floor with it.
-  CHECK(plan_pipeline(0, 64 * mib, 8, false, large).windows == 8);
+  if constexpr (wide_windows) {
+    CHECK(plan_pipeline(0, 64 * mib, 8, false, large).windows == 8);
+  }
   // Small windows: the budget would buy 2048; the ceiling holds.
   {
     const auto p = plan_pipeline(0, 64 * 1024, 4, false, large);
     CHECK(p.windows == max_queue_depth);
     CHECK(p.reads_in_flight == 4);
   }
-  // The ceiling also bounds a queue depth asked above it.
-  CHECK(plan_pipeline(0, 8 * mib, 64, false, large).reads_in_flight ==
+  // A depth the ceiling allows is honoured as asked, however deep.
+  CHECK(plan_pipeline(0, 8 * mib, max_queue_depth, false, large)
+            .reads_in_flight == max_queue_depth);
+  // And one asked above the ceiling is bounded by it, whatever it was.
+  CHECK(plan_pipeline(0, 8 * mib, max_queue_depth + 7, false, large)
+            .reads_in_flight == max_queue_depth);
+  CHECK(plan_pipeline(0, 8 * mib, 100000, false, large).windows ==
         max_queue_depth);
-  CHECK(plan_pipeline(0, 8 * mib, 64, false, large).windows == max_queue_depth);
   // A small file gets exactly its windows, edges included.
   CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024).windows == 3);
   CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024 + 1).windows == 4);

@@ -58,7 +58,7 @@ inline constexpr unsigned default_write_queue_depth = 2;
 struct file_writer_options {
   // Rounded up to a multiple of 4 KiB, min 64 KiB, max 1 GiB.
   std::size_t buffer_bytes = 8 * 1024 * 1024;
-  unsigned queue_depth = 4;  // clamped to [2, 32]
+  unsigned queue_depth = 4;  // clamped to [2, max_queue_depth]
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused
   bool async = true;         // try io_uring; silently degrade if refused
   // Issue each write on the kernel's worker threads (io_uring: IOSQE_ASYNC)

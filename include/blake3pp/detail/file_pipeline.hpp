@@ -940,6 +940,13 @@ struct pipeline_options {
 // level, 54 levels at BLAKE3's 2^64-byte limit -- plus the one node the
 // next window needs, or the scope could reach a state where no window
 // may start; see admit_more().
+//
+// The floor is what any run needs; reducer_nodes_for() adds one node per
+// window that may be in flight, because windows complete out of order and
+// each one can leave a node with no sibling yet. Without that term a deep
+// queue would not stall or fail -- admission would simply stop early and
+// run fewer windows than the caller asked for, which is the sort of
+// silent difference that makes a queue-depth sweep lie.
 inline constexpr std::size_t reducer_nodes = 256;
 
 // The most nodes a run of `parts` equal parts can decompose into: one
@@ -950,6 +957,17 @@ inline constexpr std::size_t reducer_nodes = 256;
 // pipeline would stall rather than run slowly.
 [[nodiscard]] constexpr std::size_t nodes_for(std::size_t parts) noexcept {
   return 2 * static_cast<std::size_t>(std::bit_width(parts));
+}
+
+// The storage one run needs: a contiguous run's decomposition, both edge
+// windows' reservations, one node per window that may be in flight, and
+// one for the window admission is about to take. Never below
+// reducer_nodes, so a small run keeps the headroom the default had.
+[[nodiscard]] constexpr std::size_t reducer_nodes_for(
+    unsigned windows, std::size_t parts) noexcept {
+  const std::size_t needed =
+      2 * 54 + 2 * nodes_for(parts) + static_cast<std::size_t>(windows) + 1;
+  return std::max(reducer_nodes, needed);
 }
 
 // How many bytes of a file have to be read before its windows line up
@@ -1375,13 +1393,14 @@ class window_scope
         ends_message_(plan.ends_message),
         base_chunk_((h.count() + head_window_bytes_) / chunk_size),
         file_bytes_(file.size()),
+        nodes_total_(reducer_nodes_for(plan.windows, Budget.parts())),
         reducer_capacity_(opts.reducer_capacity == 0
-                              ? reducer_nodes
-                              : std::min(opts.reducer_capacity, reducer_nodes)),
+                              ? nodes_total_
+                              : std::min(opts.reducer_capacity, nodes_total_)),
         opts_stop_token_(opts.stop_token),
-        nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
+        nodes_(std::make_unique<tree_reducer::node[]>(nodes_total_)),
         reducer_(ops_, h.key_words(), h.mode_flags(),
-                 std::span<tree_reducer::node>(nodes_.get(), reducer_nodes)) {
+                 std::span<tree_reducer::node>(nodes_.get(), nodes_total_)) {
     // Where each window's bytes actually are is the driver's answer, and
     // it is asked per window, because a source already in memory has a
     // different view for every offset.
@@ -2329,6 +2348,8 @@ class window_scope
   bool ends_message_ = true;
   std::uint64_t base_chunk_ = 0;        // where the full windows' grid starts
   std::uint64_t file_bytes_ = 0;
+  // The storage this run allocated, and what admission may use of it.
+  std::size_t nodes_total_ = reducer_nodes;
   std::size_t reducer_capacity_ = reducer_nodes;
   ex::inplace_stop_token opts_stop_token_{};
   std::unique_ptr<tree_reducer::node[]> nodes_;

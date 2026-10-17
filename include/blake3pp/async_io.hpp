@@ -84,13 +84,13 @@ struct io_context_options {
   /// Bytes per window; rounded down to a power-of-2 multiple of
   /// chunk_size, minimum 64 KiB.
   std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows one operation may hold at once; clamped to [2, 32].
+  /// Windows one operation may hold at once; clamped to [2, 256].
   unsigned queue_depth = 4;
   /// Windows in the shared arena, at window_bytes each. Zero means what
   /// the plan asks for, which at the defaults is 16 windows and so a
-  /// 128 MiB arena -- several operations' worth already. Unlike
-  /// arena_bytes below, a count given here is taken as it stands: there
-  /// is no clamp between it and the memory it costs.
+  /// 128 MiB arena -- several operations' worth already. Clamped to the
+  /// same ceiling as queue_depth, because every window costs the same
+  /// window_bytes whether it was asked for as a count or as a budget.
   unsigned windows = 0;
   /// The arena as a byte budget instead: when non-zero, the window count
   /// is this divided by the window size, at least queue_depth and at
@@ -254,13 +254,17 @@ class basic_io_context {
   static unsigned pool_windows(
       const io_context_options& opts,
       const blake3pp::detail::pipeline_plan& plan) noexcept {
+    const unsigned ceiling = blake3pp::detail::max_queue_depth;
     if (opts.arena_bytes != 0) {
       const std::size_t by_budget =
           opts.arena_bytes / std::max<std::size_t>(1, plan.window_bytes);
       return static_cast<unsigned>(std::clamp<std::size_t>(
-          by_budget, std::max(1u, plan.reads_in_flight), 32));
+          by_budget, std::max(1u, plan.reads_in_flight), ceiling));
     }
-    return opts.windows != 0 ? opts.windows : plan.windows;
+    // A count given outright is clamped like one derived from a budget:
+    // every window is window_bytes of arena, so the two requests have the
+    // same ceiling whichever way they are spelled.
+    return opts.windows != 0 ? std::min(opts.windows, ceiling) : plan.windows;
   }
 
   void drive(bool until_idle, const std::atomic<bool>* until = nullptr) {
@@ -952,7 +956,6 @@ class update_files_sender {
   OnDone done_;
 };
 
-// Where sync_wait() parks a completion.
 // Where sync_wait() parks a completion. `done` is atomic and the
 // waiting thread is woken through the driver, because the last stage of
 // a composed sender need not run on the context's thread: a
@@ -1051,12 +1054,14 @@ template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
 /// this returns.
 template <stack_budget Budget, class Sender>
 auto sync_wait(basic_io_context<Budget>& ctx, Sender&& sndr) {
-  // The environment every sync_receiver has, which is the default one:
-  // the wake it carries is not part of it.
-  using probe_receiver =
-      detail::sync_receiver<std::tuple<>, void (*)() noexcept>;
+  // Asking the sender what it completes with needs a receiver environment
+  // to ask against, and the answer is what names the tuple this returns.
+  // Any sync_receiver's environment will do -- what it wakes is not part of
+  // it -- so the query uses a throwaway instantiation rather than the one
+  // built below, which cannot be named until the tuple is known.
   using env_t = decltype(blake3pp::ex::get_env(
-      std::declval<const probe_receiver&>()));
+      std::declval<const detail::sync_receiver<std::tuple<>,
+                                               void (*)() noexcept>&>()));
   using tuple_t = blake3pp::ex::value_types_of_t<std::remove_cvref_t<Sender>,
                                                  env_t, std::tuple,
                                                  std::type_identity_t>;
