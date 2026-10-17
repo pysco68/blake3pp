@@ -72,9 +72,16 @@ namespace blake3pp::detail {
 // platform deferred because they need a trap-guarded probe (a scoped
 // signal-handler swap), and upgrades the state platform_cpu_supports()
 // reads. Thread-safe and idempotent; returns whether anything new was
-// learned. Every platform TU defines it; only riscv64 has deferred
-// rungs today, the rest return false.
+// learned.
+//
+// Only riscv64 has deferred rungs, and its TU defines this. Everywhere
+// else the syscall and CPUID rungs tell the whole story, so the answer is
+// a constant and lives here rather than in a stub per platform.
+#if defined(BLAKE3PP_CPU_DETECT_RISCV)
 bool platform_run_trap_probes() noexcept;
+#else
+[[nodiscard]] inline bool platform_run_trap_probes() noexcept { return false; }
+#endif
 #endif
 
 }  // namespace blake3pp::detail
