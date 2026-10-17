@@ -3,7 +3,7 @@
 [← blake3pp](../README.md)
 
 Two utilities build alongside the library, in top-level builds only.
-`blake3ppsum` hashes files the way `sha1sum` does. `blake3ppgen` produces
+`blake3ppsum` hashes files the way `sha256sum` does. `blake3ppgen` produces
 reproducible test data at the speed of your disk. Both are built on the
 library this documents, so they are also worked examples of it.
 
@@ -130,6 +130,29 @@ bypassing the page cache entirely:
 
 `--no-direct`, `--no-async` and `--inline-submit` switch those off one at
 a time, which is how the pipeline gets measured against itself.
+
+## Tracing
+
+Neither tool records a trace of its own. What they expose are the knobs a
+trace settles: `--window`, `--qd`, `--threads`, `--no-direct` and
+`--inline-submit`, the same names on both, and the same pipeline
+underneath. `blake3ppgen -v` names the write backend that was engaged;
+that is as much as either tool says about the pipeline it ran.
+
+To see where a run's time actually goes, point `blake3pp_bench_file` at
+the same file with the same flags and add `--trace`:
+
+```bash
+blake3ppsum --window 32 --qd 16 big.iso
+blake3pp_bench_file big.iso --window 32 --qd 16 --trace t.json --trace-agents
+```
+
+It prints a per-window summary and writes the run as a Chrome trace. The
+summary gives the wait/hash/absorb/release shares, the driver's own busy
+fraction, and with `--trace-agents` an effective rate per CPU.
+[Performance tracing](tracing.md) explains the records, the summary and
+the trace file, and [Where a window's time goes](https://github.com/pysco68/blake3pp/blob/main/bench/README.md)
+has the bench's remaining rows.
 
 ## The allocator
 

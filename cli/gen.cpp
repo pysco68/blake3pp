@@ -179,9 +179,12 @@ int main(int argc, char** argv) {
   stream.seek(seek);
 
   // Fills `out` from the stream's current position and advances it,
-  // multi-core over the pool when one is running.
+  // multi-core over the pool when one is running and there is more than
+  // one segment to split. blake3pp::fill() does one segment or less
+  // sequentially anyway, and asking for a scheduler is what starts the
+  // pool, so a run emitting a few hundred bytes starts no workers.
   const auto fill = [&](std::span<std::byte> out) {
-    if (pool.parallel()) {
+    if (pool.parallel() && out.size() > segment) {
       blake3pp::fill(stream, out, pool.scheduler(), segment);
     } else {
       blake3pp::fill(stream, out);
@@ -209,7 +212,8 @@ int main(int argc, char** argv) {
       const std::uint64_t total = *remaining.total();
       blake3pp::write_file(
           output, total,
-          [&stream, seek](std::span<std::byte> out, std::uint64_t off) {
+          [&stream, seek](std::span<std::byte> out,
+                          std::uint64_t off) noexcept {
             blake3pp::output_reader r = stream;
             r.seek(seek + off);
             blake3pp::fill(r, out);
@@ -229,7 +233,7 @@ int main(int argc, char** argv) {
     // File sink, sequential: the generator fills one of the writer's
     // O_DIRECT-aligned buffers at a time and the next fills while the
     // device drains this one. This is the path for a one-thread pool, and
-    // the only one for a length the generator decides (--size omitted),
+    // the only one for a length the generator decides (--length omitted),
     // which the pipelined form cannot preallocate.
     try {
       blake3pp::file_write_options wopts;

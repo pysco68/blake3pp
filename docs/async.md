@@ -152,13 +152,14 @@ blake3pp::async::io_context ctx({
 ```
 
 The arena is `windows * window_bytes`, allocated and first-touched once.
-`windows` defaults to one operation's worth, which is the right size for
-a context that runs one file at a time and too small for one that runs
-several: an operation may hold up to `queue_depth` windows, so a context
-meant to keep *n* files moving wants around `n * queue_depth`.
+Left at zero, `windows` is what the plan asks for: 16 at the defaults, so a
+128 MiB arena, which keeps four operations of `queue_depth` 4 moving. A
+context meant to keep *n* files moving wants around `n * queue_depth`
+windows, and `arena_bytes` is the same request as a memory budget, which is
+usually the number a caller actually has.
 
 Fewer windows than that is not a deadlock — an operation that finds none
-free simply waits, and resumes when any other gives one back — but it
+free waits, and resumes when any other gives one back — but it
 does serialise the files.
 
 The part-table budget is the context's rather than the call's, because

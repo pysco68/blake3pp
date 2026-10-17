@@ -95,7 +95,11 @@ else()
   # reducer's property cases under GCC with address+undefined, which hash
   # a couple of gigabytes each and take about four minutes there against
   # under a second on the plain lanes.
-  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 900)
+  #
+  # PROCESSORS is what ctest -j<N> needs to know about a suite whose cases
+  # run their own threads: without it the two parallelisms multiply. The
+  # number is the cap tests/main.cpp sets on the suite's scheduler.
+  doctest_discover_tests(blake3pp_tests PROPERTIES TIMEOUT 900 PROCESSORS 4)
 endif()
 
 # The sized parallel scheduler is one definition per program; the test
@@ -113,6 +117,32 @@ if(TARGET blake3pp_parallel_backend)
     COMMAND blake3pp_sized_scheduler_test)
 endif()
 
+# The preconditions checked in every build, one process per case: what they
+# do is end the process with a named reason, so ctest matches that reason
+# rather than an exit code. A check nobody can show firing is a comment --
+# see tests/contract_violations.cpp.
+add_executable(blake3pp_contract_violations contract_violations.cpp)
+target_link_libraries(blake3pp_contract_violations PRIVATE
+  blake3pp::blake3pp blake3pp_warnings)
+foreach(case_and_message
+    "reducer-double-insert|tree_reducer::insert"
+    "reducer-hole|tree_reducer::drain_into"
+    "push-subtree-mid-chunk|push_subtree_cv"
+    "to-hex-short-output|to_hex"
+    "fold-odd-count|fold_sibling_cvs"
+    "two-runners|a second thread called run")
+  string(REPLACE "|" ";" _cv_pair "${case_and_message}")
+  list(GET _cv_pair 0 _cv_case)
+  list(GET _cv_pair 1 _cv_message)
+  add_test(NAME contract_${_cv_case}
+    COMMAND blake3pp_contract_violations ${_cv_case})
+  # The message decides, not the exit code: an abort's status says nothing
+  # about which contract was broken.
+  set_tests_properties(contract_${_cv_case} PROPERTIES
+    PASS_REGULAR_EXPRESSION "blake3pp: .*${_cv_message}"
+    TIMEOUT 60)
+endforeach()
+
 # The riscv detection ladder against machine shapes the emulator cannot
 # present (T-Head vendor ids, kernels without hwprobe, probes that trap):
 # a second compilation of the detection TU with its test seam enabled,
@@ -128,4 +158,24 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64" AND CMAKE_SYSTEM_NAME STREQUAL "Linu
   foreach(shape vendor thead-lie sg2042 sg2042-off legacy legacy-trap legacy-071 modern nothing assume-1 assume-0)
     add_test(NAME riscv_probe_${shape} COMMAND blake3pp_riscv_probe_shapes ${shape})
   endforeach()
+endif()
+
+# The libFuzzer harness, where the toolchain instruments for it
+# (linux-clang22-cxx23-fuzzer sets BLAKE3PP_TOOLCHAIN_FUZZER; the runtime
+# carries its own main(), so only this target links it). The harness
+# compares the library's paths against each other rather than against a
+# known answer -- see tests/fuzz_paths.cpp.
+#
+# ctest runs a short pass of it on every build of this lane: a few
+# thousand inputs take under a second and cover the lengths around every
+# boundary. A real campaign is `blake3pp_fuzz_paths -max_total_time=...`
+# with a corpus directory, which is a job rather than a test.
+if(BLAKE3PP_TOOLCHAIN_FUZZER)
+  add_executable(blake3pp_fuzz_paths fuzz_paths.cpp)
+  target_compile_options(blake3pp_fuzz_paths PRIVATE -fsanitize=fuzzer)
+  target_link_options(blake3pp_fuzz_paths PRIVATE -fsanitize=fuzzer)
+  target_link_libraries(blake3pp_fuzz_paths PRIVATE
+    blake3pp::blake3pp blake3pp_warnings)
+  add_test(NAME fuzz_paths_smoke
+    COMMAND blake3pp_fuzz_paths -runs=4000 -max_len=70000 -rss_limit_mb=4096)
 endif()

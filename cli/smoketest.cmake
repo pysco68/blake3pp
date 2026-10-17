@@ -13,8 +13,19 @@ file(MAKE_DIRECTORY "${WORK}")
 
 # EMULATOR (optional, e.g. "qemu-aarch64;-L;/usr/aarch64-linux-gnu")
 # prefixes every tool invocation on cross builds; empty on native ones.
+
+# What a smoke test's tools may take of the machine. ctest runs these cases in
+# parallel and each tool defaults to a worker per core, so without a bound a
+# 32-core box runs 32 cases x 32 workers, and the cases spend minutes being
+# descheduled, which reads as a hang. Four exercises the parallel paths. The
+# cases that are about thread counts pass their own.
+set(SMOKE_THREADS 4)
+
 function(run_sum out_var result_var)
   cmake_parse_arguments(RS "" "STDIN" "ARGS" ${ARGN})
+  if(NOT "--threads" IN_LIST RS_ARGS)
+    list(APPEND RS_ARGS --threads ${SMOKE_THREADS})
+  endif()
   set(input_args "")
   if(RS_STDIN)
     set(input_args INPUT_FILE "${RS_STDIN}")
@@ -50,6 +61,7 @@ elseif(CASE STREQUAL "stdin_parallel")
   # pool runs; it must agree with the sequential read and with the file
   # pipeline over the same bytes.
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed stdin --length 20000000
+    --threads ${SMOKE_THREADS}
     OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
   run_sum(par res1 ARGS --threads 4 - STDIN "${WORK}/stream")
   run_sum(seq res2 ARGS --threads 1 - STDIN "${WORK}/stream")
@@ -166,8 +178,10 @@ elseif(CASE STREQUAL "derive_key")
 
 elseif(CASE STREQUAL "gen_deterministic")
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 64 --hex
+    --threads ${SMOKE_THREADS}
     OUTPUT_VARIABLE a RESULT_VARIABLE r1)
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 64 --hex
+    --threads ${SMOKE_THREADS}
     OUTPUT_VARIABLE b RESULT_VARIABLE r2)
   if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT a STREQUAL b)
     message(FATAL_ERROR "gen is not deterministic")
@@ -175,6 +189,7 @@ elseif(CASE STREQUAL "gen_deterministic")
   # Cross-check the tools: gen of the empty seed at length 32 IS the
   # blake3 digest of empty input.
   execute_process(COMMAND ${EMULATOR} "${GEN}" --length 32 --hex
+    --threads ${SMOKE_THREADS}
     OUTPUT_VARIABLE g RESULT_VARIABLE r3)
   if(NOT r3 EQUAL 0 OR NOT g MATCHES
      "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
@@ -184,8 +199,10 @@ elseif(CASE STREQUAL "gen_deterministic")
 elseif(CASE STREQUAL "gen_seek")
   # O(1) seek: a slice at an offset equals that region of the full stream.
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 148 --hex
+    --threads ${SMOKE_THREADS}
     OUTPUT_VARIABLE full RESULT_VARIABLE r1)
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --seek 100 --length 48 --hex
+    --threads ${SMOKE_THREADS}
     OUTPUT_VARIABLE slice RESULT_VARIABLE r2)
   string(SUBSTRING "${full}" 200 96 expected)  # bytes 100..148 as hex
   string(SUBSTRING "${slice}" 0 96 got)
@@ -210,6 +227,7 @@ elseif(CASE STREQUAL "gen_seed_file")
   # multi-core, and cross-checks against blake3ppsum's extended output of
   # the same file (gen's stream IS that XOF).
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed material --length 20000000
+    --threads ${SMOKE_THREADS}
     OUTPUT_FILE "${WORK}/seed" RESULT_VARIABLE r0)
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${WORK}/seed" --length 4000000 --threads 1
     OUTPUT_FILE "${WORK}/one" RESULT_VARIABLE r1)
@@ -235,9 +253,12 @@ elseif(CASE STREQUAL "gen_output")
   # the stdout stream. Odd length: exercises the unaligned-tail path and
   # the preallocate-then-trim size logic.
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
+    --threads ${SMOKE_THREADS}
     OUTPUT_FILE "${WORK}/stdout_stream" RESULT_VARIABLE r1)
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
-    --output "${WORK}/direct" RESULT_VARIABLE r2)
+    --output "${WORK}/direct"
+    --threads ${SMOKE_THREADS}
+    RESULT_VARIABLE r2)
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
     --output "${WORK}/threaded" --threads 4 RESULT_VARIABLE r3)
   execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
@@ -293,6 +314,7 @@ elseif(CASE STREQUAL "key_forms")
     message(FATAL_ERROR "key forms disagree: raw=${a} hex=${b} stdin=${c}")
   endif()
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed k --length 20000000
+    --threads ${SMOKE_THREADS}
     OUTPUT_FILE "${WORK}/big" RESULT_VARIABLE rg)
   run_sum(p1 s1 ARGS --keyed hexkey big)
   run_sum(p2 s2 ARGS --keyed hexkey --threads 1 big)
@@ -308,8 +330,10 @@ elseif(CASE STREQUAL "gen_errors")
   # missing seed file and an unwritable --output all fail cleanly; 1K
   # means 1024.
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 1K --hex
+    --threads ${SMOKE_THREADS}
     OUTPUT_VARIABLE a RESULT_VARIABLE r1)
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 1024 --hex
+    --threads ${SMOKE_THREADS}
     OUTPUT_VARIABLE b RESULT_VARIABLE r2)
   if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT a STREQUAL b)
     message(FATAL_ERROR "--length 1K is not 1024 bytes")
@@ -317,7 +341,8 @@ elseif(CASE STREQUAL "gen_errors")
   foreach(bad "--length;12X" "--length;abc" "--seek;inf"
               "--seed-file;${WORK}/nope" "--output;${WORK}/no/such/dir/out")
     execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 16 ${bad}
-      OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE r)
+    --threads ${SMOKE_THREADS}
+    OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE r)
     if(r EQUAL 0)
       message(FATAL_ERROR "gen accepted '${bad}'")
     endif()

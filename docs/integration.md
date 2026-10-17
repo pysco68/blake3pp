@@ -15,7 +15,7 @@ target_link_libraries(app PRIVATE blake3pp::blake3pp)
 
 The library is C++20; with a C++26 toolchain it uses native `std::simd`,
 otherwise `std::experimental::simd` or xsimd: the same source, probed at
-configure time. Tests, benchmarks and the `blake3ppsum` CLI only build
+configure time. Tests, benchmarks and the two CLI tools only build
 when blake3pp is the top-level project, so vendoring costs you nothing
 beyond the library itself.
 
@@ -40,8 +40,9 @@ in the config and nothing to install alongside it. `BLAKE3PP_INSTALL`
 (default: on for top-level builds) turns the rules off for consumers who
 vendor.
 
-One thing does not travel, and it is the reason for the last column of the
-header table above. The execution provider is header-only and belongs to
+One thing does not travel, which is why the README's header table has a
+column for what each header needs. The execution provider is header-only
+and belongs to
 whoever builds the final program, so blake3pp does not install it. Code
 that includes `<blake3pp/parallel.hpp>` or `<blake3pp/parallel_io.hpp>`
 (including anything that pulls the umbrella header) must put that
@@ -99,6 +100,7 @@ the type does not own, a scheduler or a file, and each comes as a pair
 so call sites read alike with and without cores:
 `hash(data)` and `hash(data, sched)`,
 `update_file(h, path)` and `update_file(h, path, sched)`,
+`write_file(path, n, fill)` and `write_file(path, n, fill, sched)`,
 `fill(r, out)` and `fill(r, out, sched)`. The scheduler-taking
 half of each pair lives in the header that owns the dependency.
 The two I/O headers exist only when the library is built with

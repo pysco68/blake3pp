@@ -263,6 +263,35 @@ jobs:
           body: |
             The toolchain images of `main` are at content tag `${{ needs.changes.outputs.tag }}`; the committed cmake-re environment files still name an older tag or digest. The ci runs of `main` build on the injected files meanwhile (their releases are marked as built on uncommitted environment files); merging this makes the checkout clean again. Updated in place by ci while the tag moves; mark it ready for review to run CI on it.
 
+  # The single-file amalgamation, compiled and run on every pull request.
+  # The pages workflow builds it too, but that one fires only on main and
+  # on tags, so without this a change that breaks the generated file is
+  # found after it is published. Nothing else needs this job: it is a
+  # check, not an input.
+  amalgamation:
+    name: amalgamation
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Linked and run, not syntax-checked: a header the generator forgot
+      # to paste shows up at link time, and the demo prints the official
+      # vector for "abc", which is the answer check. C++20 is the
+      # library's baseline and what the generated file is written to, so
+      # the runner's own g++ builds it.
+      - name: Compile and run the amalgamation
+        run: |
+          set -euo pipefail
+          python3 website/amalgamate.py -o "${RUNNER_TEMP}/single-file.cpp"
+          g++ --version
+          g++ -std=c++20 -O2 -msse4.2 -Wall "${RUNNER_TEMP}/single-file.cpp" \
+            -o "${RUNNER_TEMP}/single-file"
+          out=$("${RUNNER_TEMP}/single-file")
+          echo "${out}"
+          echo "${out}" | grep -q \
+            6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85
+
   # Pure validation: the native compiler cohort, the sanitizers, and
   # the arm64 emulator matrix. Produces NOTHING downstream: no
   # artifacts, no hardware lane waits on it. It still gates the release
@@ -296,6 +325,10 @@ jobs:
           - { preset: linux-clang22-cxx26-asan, image: clang22 }
           - { preset: linux-clang22-cxx26-msan, image: clang22 }
           - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
+          # The differential fuzz harness, whose ctest leg is a short pass
+          # of it. Its lane is the libstdc++ C++23 one, which is what
+          # libFuzzer's runtime links against.
+          - { preset: linux-clang22-cxx23-fuzzer, image: clang22 }
           # Coverage: LLVM source-based, the report (summary, lcov, html)
           # is written by tools/ci-test.sh and uploaded below. The SDE
           # pass runs instrumented too, so the AVX-512 kernel counts.

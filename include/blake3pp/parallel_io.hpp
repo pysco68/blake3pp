@@ -70,10 +70,13 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 /// offset)` on the scheduler's agents, once per window, and must fill
 /// every byte of `out`; windows are filled and written concurrently, in
 /// no particular order, so a generator must depend on its offset and
-/// nothing else. It must also not throw: the fill runs inside a noexcept
-/// stage, so an exception escaping it terminates. A generator that can
-/// fail should record the failure and fill the window, leaving the
-/// caller to check afterwards.
+/// nothing else. It must also be `noexcept`, and say so: the fill runs on
+/// a pool thread inside a window already counted in flight, where an
+/// exception has nowhere to go, so a generator that is not declared
+/// noexcept does not compile. A generator that can fail should record the
+/// failure and fill the window, leaving the caller to check afterwards.
+/// The sequential forms in <blake3pp/io.hpp> take a throwing generator,
+/// because there the fill runs on the calling thread.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is
@@ -133,12 +136,13 @@ void write_file(const std::filesystem::path& path, std::uint64_t size,
 ///
 /// Same contract as io.hpp's update_file(): h keeps its mode, stays open
 /// for more input and for every finalize form, and files hash in
-/// sequence. A window is offloaded as a subtree only when h sits on a
-/// boundary aligned to it: always the case for a fresh hasher, and after
-/// files whose sizes are multiples of the window. Elsewhere the window
-/// goes through `h.update()` instead, so the digest is the same either way
-/// and only the parallelism varies.
-/// @tparam Budget     The stack a window's part table may take; see
+/// sequence. A hasher already part-way through a message is brought back
+/// onto a window boundary by one short first window, whose head goes
+/// through `h.update()` and whose remainder fans out like any other; every
+/// window after it is offloaded whole. The digest is the same wherever the
+/// hasher started, and only how much of the first window is parallel
+/// varies.
+/// @tparam Budget     What a window's part table may take; see
 ///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param h      The hasher to stream into.
@@ -180,7 +184,7 @@ void update_file(hasher& h, const std::filesystem::path& path,
 
 /// Streams a file into a hasher over a scheduler, reporting failure
 /// through ec instead of throwing.
-/// @tparam Budget     The stack a window's part table may take; see
+/// @tparam Budget     What a window's part table may take; see
 ///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param h      The hasher to stream into.
@@ -201,7 +205,7 @@ void update_file(hasher& h, const std::filesystem::path& path,
 /// One-shot digest of a file over the full pipeline: a hasher shaped by
 /// opts (SIMD variant, and plain, keyed or key-derivation mode), the file
 /// streamed through it multi-core, finalized.
-/// @tparam Budget     The stack a window's part table may take; see
+/// @tparam Budget     What a window's part table may take; see
 ///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param path   The file to hash.
@@ -227,7 +231,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 
 /// One-shot digest of a file over the full pipeline, reporting failure
 /// through ec instead of throwing.
-/// @tparam Budget     The stack a window's part table may take; see
+/// @tparam Budget     What a window's part table may take; see
 ///                    stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param path   The file to hash.

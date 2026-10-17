@@ -32,6 +32,7 @@
 #include <mutex>
 #include <utility>
 
+#include <blake3pp/detail/contract.hpp>
 #include <blake3pp/detail/driver.hpp>
 
 namespace blake3pp::detail {
@@ -54,7 +55,7 @@ class queued_reads {
   queued_reads(const queued_reads&) = delete;
   queued_reads& operator=(const queued_reads&) = delete;
 
-  void push(io_read_op& op) noexcept {
+  void push(io_op& op) noexcept {
     // Constructed fresh over whatever the last read left, which is the
     // one way the caller's storage is ever filled.
     op_node& n = op.emplace_native<op_node>();
@@ -67,11 +68,17 @@ class queued_reads {
       tail_ = &op;
     }
     ++queued_;
+    op.live = true;  // queued: this source owes the callback
   }
 
   // The bytes are already there, so a cancel always wins: nothing has
-  // been done that a completion could prefer over it.
-  void cancel(io_read_op& op) noexcept { node_of(op).cancelled = true; }
+  // been done that a completion could prefer over it. An op this source
+  // does not owe is not one to cancel -- its storage holds no node.
+  void cancel(io_op& op) noexcept {
+    if (op.live) {
+      node_of(op).cancelled = true;
+    }
+  }
 
   // Everything queued, in submission order. There is no work to pace,
   // and pacing it would only add this source's own cost to a
@@ -86,12 +93,13 @@ class queued_reads {
       return 0;
     }
     std::size_t ran = 0;
-    io_read_op* op = head_;
+    io_op* op = head_;
     head_ = tail_ = nullptr;
     queued_ = 0;
     while (op != nullptr) {
-      io_read_op* const next = node_of(*op).next;
+      io_op* const next = node_of(*op).next;
       const bool cancelled = node_of(*op).cancelled;
+      op->live = false;
       op->done(op, cancelled
                        ? std::make_error_code(std::errc::operation_canceled)
                        : std::error_code{});
@@ -116,13 +124,13 @@ class queued_reads {
   // The queue links live in the caller's operation, like every backend's
   // do, so nothing is allocated per read either.
   struct op_node {
-    io_read_op* next = nullptr;
+    io_op* next = nullptr;
     bool cancelled = false;
   };
-  static_assert(sizeof(op_node) <= io_read_op::storage_size);
-  static_assert(alignof(op_node) <= io_read_op::storage_align);
+  static_assert(sizeof(op_node) <= io_op::storage_size);
+  static_assert(alignof(op_node) <= io_op::storage_align);
 
-  [[nodiscard]] static op_node& node_of(io_read_op& op) noexcept {
+  [[nodiscard]] static op_node& node_of(io_op& op) noexcept {
     return op.native<op_node>();
   }
 
@@ -153,8 +161,8 @@ class queued_reads {
     bool signalled_ = false;
   };
 
-  io_read_op* head_ = nullptr;
-  io_read_op* tail_ = nullptr;
+  io_op* head_ = nullptr;
+  io_op* tail_ = nullptr;
   std::size_t queued_ = 0;
   waiter waiter_;
 };
@@ -199,24 +207,34 @@ class memory_driver {
   [[nodiscard]] window_storage window_storage_for(
       file& f, [[maybe_unused]] unsigned slot, std::uint64_t off,
       std::size_t bytes) noexcept {
-    assert(slot < windows_ && "a window outside the reserved geometry");
-    assert(off + bytes <= f.bytes_.size() && "a window past the span's end");
+    // Checked in every build: the subspan below is a view into the
+    // caller's own memory, and a window past its end is a read of whatever
+    // follows it -- which on this driver is the caller's address space
+    // rather than an arena of ours.
+    require(slot < windows_, "a window outside the reserved geometry");
+    require(off + bytes <= f.bytes_.size(),
+            "window_storage_for(): a window past the end of the span being "
+            "hashed");
     return {{}, f.bytes_.subspan(static_cast<std::size_t>(off), bytes)};
   }
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
-                   io_read_op& op) noexcept {
+                   io_op& op) noexcept {
     reads_.push(op);
   }
 
   void flush() noexcept {}
   std::size_t poll(bool block) { return reads_.poll(block); }
   void wake() noexcept { reads_.wake(); }
-  void cancel(io_read_op& op) noexcept { reads_.cancel(op); }
+  void cancel(io_op& op) noexcept { reads_.cancel(op); }
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return reads_.in_flight();
   }
   void drain() noexcept { reads_.drain(); }
+  // One file's share of it. Every queued read of this driver is a view of
+  // bytes the caller already has, so none is in anyone else's hands and
+  // dropping them all is dropping this file's.
+  void drain(file&) noexcept { reads_.drain(); }
 
  private:
   queued_reads reads_;

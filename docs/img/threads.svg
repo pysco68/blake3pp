@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" width="860" height="420" role="img" aria-label="Every core: throughput against thread count">
+<style>
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         fill: #24292f; }
+  .axis { stroke: #8b949e; stroke-width: 1; }
+  .grid { stroke: #d0d7de; stroke-width: 1; stroke-dasharray: 2 3; }
+  .muted { fill: #57606a; }
+  @media (prefers-color-scheme: dark) {
+    text { fill: #e6edf3; }
+    .axis { stroke: #6e7681; }
+    .grid { stroke: #30363d; }
+    .muted { fill: #9198a1; }
+  }
+</style>
+<text x="0" y="18" font-size="15" font-weight="600">Every core: throughput against thread count</text>
+<text x="0" y="36" font-size="12" class="muted">Ryzen AI MAX+ 395 (16 cores, 32 threads), 512 MiB in memory, fd432eb, 2026-10-03</text>
+<rect x="60" y="47" width="10" height="10" fill="#e8590c" rx="2"/>
+<text x="75" y="56" font-size="12">blake3pp pool</text>
+<rect x="187" y="47" width="10" height="10" fill="#1971c2" rx="2"/>
+<text x="202" y="56" font-size="12">reference kernel, same pool</text>
+<rect x="415" y="47" width="10" height="10" fill="#2f9e44" rx="2"/>
+<text x="430" y="56" font-size="12">crate rayon</text>
+<line class="grid" x1="60" y1="374.0" x2="830" y2="374.0"/>
+<text x="52" y="378.0" font-size="11" class="muted" text-anchor="end">0</text>
+<line class="grid" x1="60" y1="313.2" x2="830" y2="313.2"/>
+<text x="52" y="317.2" font-size="11" class="muted" text-anchor="end">20</text>
+<line class="grid" x1="60" y1="252.4" x2="830" y2="252.4"/>
+<text x="52" y="256.4" font-size="11" class="muted" text-anchor="end">40</text>
+<line class="grid" x1="60" y1="191.6" x2="830" y2="191.6"/>
+<text x="52" y="195.6" font-size="11" class="muted" text-anchor="end">60</text>
+<line class="grid" x1="60" y1="130.8" x2="830" y2="130.8"/>
+<text x="52" y="134.8" font-size="11" class="muted" text-anchor="end">80</text>
+<line class="grid" x1="60" y1="70.0" x2="830" y2="70.0"/>
+<text x="52" y="74.0" font-size="11" class="muted" text-anchor="end">100</text>
+<text x="60.0" y="394" font-size="11" class="muted" text-anchor="middle">1</text>
+<text x="214.0" y="394" font-size="11" class="muted" text-anchor="middle">2</text>
+<text x="368.0" y="394" font-size="11" class="muted" text-anchor="middle">4</text>
+<text x="522.0" y="394" font-size="11" class="muted" text-anchor="middle">8</text>
+<text x="676.0" y="394" font-size="11" class="muted" text-anchor="middle">16</text>
+<text x="830.0" y="394" font-size="11" class="muted" text-anchor="middle">32</text>
+<line class="axis" x1="60" y1="70" x2="60" y2="374"/>
+<line class="axis" x1="60" y1="374" x2="830" y2="374"/>
+<path d="M60.0,348.3 L214.0,323.2 L368.0,270.6 L522.0,235.4 L676.0,148.1 L830.0,141.1" fill="none" stroke="#e8590c" stroke-width="2.5"/>
+<circle cx="60.0" cy="348.3" r="3" fill="#e8590c"/>
+<circle cx="214.0" cy="323.2" r="3" fill="#e8590c"/>
+<circle cx="368.0" cy="270.6" r="3" fill="#e8590c"/>
+<circle cx="522.0" cy="235.4" r="3" fill="#e8590c"/>
+<circle cx="676.0" cy="148.1" r="3" fill="#e8590c"/>
+<circle cx="830.0" cy="141.1" r="3" fill="#e8590c"/>
+<text x="826.0" y="133.1" font-size="11" fill="#e8590c" text-anchor="end">76.6</text>
+<path d="M60.0,343.9 L214.0,315.9 L368.0,262.1 L522.0,219.9 L676.0,117.1 L830.0,126.2" fill="none" stroke="#1971c2" stroke-width="2.5"/>
+<circle cx="60.0" cy="343.9" r="3" fill="#1971c2"/>
+<circle cx="214.0" cy="315.9" r="3" fill="#1971c2"/>
+<circle cx="368.0" cy="262.1" r="3" fill="#1971c2"/>
+<circle cx="522.0" cy="219.9" r="3" fill="#1971c2"/>
+<circle cx="676.0" cy="117.1" r="3" fill="#1971c2"/>
+<circle cx="830.0" cy="126.2" r="3" fill="#1971c2"/>
+<text x="826.0" y="118.2" font-size="11" fill="#1971c2" text-anchor="end">81.5</text>
+<path d="M60.0,350.5 L214.0,328.5 L368.0,284.3 L522.0,250.9 L676.0,152.3 L830.0,162.9" fill="none" stroke="#2f9e44" stroke-width="2.5"/>
+<circle cx="60.0" cy="350.5" r="3" fill="#2f9e44"/>
+<circle cx="214.0" cy="328.5" r="3" fill="#2f9e44"/>
+<circle cx="368.0" cy="284.3" r="3" fill="#2f9e44"/>
+<circle cx="522.0" cy="250.9" r="3" fill="#2f9e44"/>
+<circle cx="676.0" cy="152.3" r="3" fill="#2f9e44"/>
+<circle cx="830.0" cy="162.9" r="3" fill="#2f9e44"/>
+<text x="826.0" y="154.9" font-size="11" fill="#2f9e44" text-anchor="end">69.44</text>
+<text x="60" y="414" font-size="11" class="muted">GiB/s against threads, higher is better</text>
+</svg>

@@ -11,18 +11,22 @@
 /// The engine partitions the input into equal such subtrees. The
 /// scheduler's execution agents pull them from a shared counter until none
 /// are left, which means a slow agent takes fewer instead of holding up
-/// the join. The chaining values are then absorbed in order through the
-/// hasher's CV-stack discipline, and the tail finishes sequentially. The
-/// merge work after the parallel phase is O(parts) scalar compressions,
-/// which is noise.
+/// the join. Their chaining values are folded lanes-wide in groups inside
+/// the parallel phase, one CV per window reaches the hasher's CV-stack
+/// discipline, and the tail finishes sequentially.
 ///
 /// The provider is a build-time choice, BLAKE3PP_EXECUTION_PROVIDER:
 /// std::execution where the standard library ships it, beman.execution as
 /// the conformance-first polyfill, NVIDIA stdexec as the performance
 /// workhorse. The same source compiles against all three, as with the simd providers.
 ///
-/// Nothing here touches the heap. The CV table lives on the caller's stack
-/// and sender operation states live inside sync_wait's frame.
+/// What this allocates: the window pool, each window carrying its part
+/// table (`stack_budget` bytes, 32 KiB by default), the reducer's nodes and
+/// the operation cells, all taken once when a run is planned and freed with
+/// it. The part table is a member of a window rather than a frame of the
+/// caller, which is what `stack_budget` bounds -- the agents' own frames
+/// are a constant of the build (`BLAKE3PP_MAX_SIMD_DEGREE` and
+/// `BLAKE3PP_SUBTREE_FOLD`; see docs/freestanding.md).
 
 #include <algorithm>
 #include <atomic>
@@ -92,9 +96,12 @@ using parallel_scheduler_t = beman::execution::parallel_scheduler;
 #elif BLAKE3PP_HAS_STD_THREAD  // BLAKE3PP_EXECUTION_STDEXEC
 
 namespace detail {
-// The size process_pool() will be built with, 0 meaning every core. Only
-// <blake3pp/parallel_backend.hpp>'s size_parallel_scheduler() writes it,
-// and only before the pool exists; the flag below is how it knows.
+// The size process_pool() will be built with, 0 meaning every core.
+// <blake3pp/parallel_backend.hpp>'s size_parallel_scheduler() writes it, and
+// so does the test suite's main() in builds without that backend, which
+// needs a bound so a parallel ctest run does not fan every case out over
+// every core. Either way only before the pool exists; the flag below is how
+// it knows.
 inline std::atomic<unsigned>& process_pool_threads() noexcept {
   static std::atomic<unsigned> threads{0};
   return threads;
@@ -216,7 +223,7 @@ template <stack_budget Budget, class Scheduler>
 
 /// Expert: multi-core hash on a caller-supplied kernel table, the same
 /// seam hasher's expert constructor exposes.
-/// @tparam Budget     The stack its part table may take; see stack_budget.
+/// @tparam Budget     What its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param input  Any length.
 /// @param sched  Where the subtree reductions run.
@@ -235,7 +242,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 ///
 /// Any std::execution-style scheduler works; inputs too small for
 /// parallelism to pay for itself take the sequential path.
-/// @tparam Budget     The stack its part table may take; see stack_budget.
+/// @tparam Budget     What its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param input  Any length.
 /// @param sched  Where the subtree reductions run.
@@ -256,7 +263,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 }
 
 /// Multi-core one-shot hash of a string's bytes.
-/// @tparam Budget     The stack its part table may take; see stack_budget.
+/// @tparam Budget     What its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param input  The bytes of the string.
 /// @param sched  Where the subtree reductions run.
@@ -271,7 +278,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 
 /// Multi-core keyed one-shot: the MAC/PRF of input under a 32-byte key,
 /// same decomposition as hash().
-/// @tparam Budget     The stack its part table may take; see stack_budget.
+/// @tparam Budget     What its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param key    Exactly key_size bytes, enforced by the span extent.
 /// @param input  Any length.
@@ -292,7 +299,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 }
 
 /// Multi-core keyed one-shot of a string's bytes.
-/// @tparam Budget     The stack its part table may take; see stack_budget.
+/// @tparam Budget     What its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param key    Exactly key_size bytes.
 /// @param input  The bytes of the string.
@@ -311,7 +318,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 /// Multi-core key derivation, for key material large enough to matter (a
 /// file's worth of entropy, a whole seed image); see core.hpp's
 /// derive_key() for the context contract.
-/// @tparam Budget     The stack its part table may take; see stack_budget.
+/// @tparam Budget     What its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param context       The domain-separation string; not a secret.
 /// @param key_material  The secret to derive from.
@@ -330,7 +337,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 }
 
 /// Multi-core key derivation from a string's bytes.
-/// @tparam Budget     The stack its part table may take; see stack_budget.
+/// @tparam Budget     What its part table may take; see stack_budget.
 /// @tparam Scheduler  Any std::execution-style scheduler.
 /// @param context       The domain-separation string; not a secret.
 /// @param key_material  The secret to derive from.
@@ -377,7 +384,7 @@ struct parallel_hasher_options {
 /// which keeps BLAKE3's final chunk with the hasher for ROOT
 /// finalization.
 /// @tparam Scheduler  Any std::execution-style scheduler, held by value.
-/// @tparam Budget     The stack a window's part table may take; see
+/// @tparam Budget     What a window's part table may take; see
 ///                    stack_budget.
 ///
 /// @code

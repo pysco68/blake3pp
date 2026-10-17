@@ -122,13 +122,14 @@ class fake_write_driver {
   }
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
-                   detail::io_read_op&) {
+                   detail::io_op&) {
     FAIL("the write pipeline must not read");
   }
 
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
-                    detail::io_read_op& op) {
+                    detail::io_op& op) {
     queued_.push_back(write{&op, off, buf, 0});
+    op.live = true;  // the driver owes this one a callback now
   }
 
   void flush() noexcept {}
@@ -154,6 +155,7 @@ class fake_write_driver {
     if (w.cancelled) {
       auto* const op = w.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      op->live = false;
       op->done(op, std::make_error_code(std::errc::operation_canceled));
       return 1;
     }
@@ -161,6 +163,7 @@ class fake_write_driver {
         index == static_cast<unsigned>(script_.fail_at_window)) {
       auto* const op = w.op;
       queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+      op->live = false;
       op->done(op, std::make_error_code(std::errc::io_error));
       return 1;
     }
@@ -175,6 +178,7 @@ class fake_write_driver {
     }
     auto* const op = w.op;
     queued_.erase(queued_.begin() + static_cast<std::ptrdiff_t>(pick));
+    op->live = false;
     op->done(op, std::error_code{});
     return 1;
   }
@@ -187,7 +191,7 @@ class fake_write_driver {
     cv_.notify_one();
   }
 
-  void cancel(detail::io_read_op& op) noexcept {
+  void cancel(detail::io_op& op) noexcept {
     for (write& w : queued_) {
       if (w.op == &op) {
         w.cancelled = true;
@@ -200,6 +204,9 @@ class fake_write_driver {
     return queued_.size();
   }
   void drain() noexcept { queued_.clear(); }
+  // One file per case here, and nothing in the OS's hands: this file's
+  // share of the queue is the queue.
+  void drain(file&) noexcept { queued_.clear(); }
 
   [[nodiscard]] const std::vector<std::byte>& sink() const noexcept {
     return sink_;
@@ -210,7 +217,7 @@ class fake_write_driver {
 
  private:
   struct write {
-    detail::io_read_op* op;
+    detail::io_op* op;
     std::uint64_t off;
     std::span<const std::byte> buf;
     std::size_t done;

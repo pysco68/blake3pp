@@ -86,12 +86,12 @@ class io_driver {
   // callback. A window the file cannot take asynchronously is served
   // synchronously inside poll(), as it is in the backends.
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   io_read_op& op);
+                   io_op& op);
   // The write side of the same contract: no syscall, no callback, and a
   // length the platform cannot take asynchronously is written inside
   // poll() like an unalignable read is.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
-                    io_read_op& op);
+                    io_op& op);
   // Pushes everything queued to the OS in one call. A read the OS
   // refuses is not lost: it is read synchronously inside poll(), which
   // is why nothing here reports a submit failure.
@@ -103,7 +103,7 @@ class io_driver {
   std::size_t poll(bool block);
   // The only member another thread may call.
   void wake() noexcept;
-  // Asks the OS to abandon one read. Advisory, and never a completion in
+  // Asks the OS to abandon one transfer. Advisory, and never a completion in
   // itself: the op is still owed its callback and still counted by
   // in_flight(), and the only way it can arrive is a later poll(). What
   // the callback reports is whichever happened first --
@@ -113,14 +113,22 @@ class io_driver {
   // Legal only from the thread that calls poll(), and only for an op
   // that was submitted and whose callback has not run. A platform with
   // no cancel mechanism does nothing and the read runs to completion.
-  void cancel(io_read_op& op) noexcept;
+  void cancel(io_op& op) noexcept;
   [[nodiscard]] std::size_t in_flight() const noexcept;
   // Waits out every read still owed, running no callback, and forgets
   // the rest. The invariant it establishes: afterwards in_flight() is
-  // zero and the driver references no io_read_op, so the caller may
+  // zero and the driver references no io_op, so the caller may
   // destroy the ops it submitted. The driver stays usable. The
   // destructor drains too, a no-op after this.
   void drain() noexcept;
+  // The same for one file: afterwards no transfer of this file is owed or
+  // referenced, so its buffers and the operations naming them may be
+  // destroyed, and the driver stays usable for every other file. A
+  // sibling file's completion that surfaces during the wait is reported
+  // normally -- dropping it would strand an op that can never complete --
+  // so a caller closing one file of several should idle it first. The
+  // file's destructor does this.
+  void drain(file& f) noexcept;
 
   // Takes the window memory: one direct-I/O-aligned arena of
   // windows * window_bytes, valid until the driver is destroyed -- which

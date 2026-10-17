@@ -3,7 +3,7 @@
 // memory_driver is a file_driver like io_driver is, so the first suite
 // below is the driver contract: callbacks only from poll(), a wake that
 // releases a blocked one, an advisory cancel, and two "files" sharing a
-// driver. It is deliberately NOT in tests/io_context.cpp -- that suite
+// driver. It is NOT in tests/io_context.cpp -- that suite
 // is about the platform backends and only builds with the file I/O
 // layer, and the whole point of this driver is that the in-memory path
 // does not need that layer.
@@ -50,7 +50,7 @@ struct probe {
   int calls = 0;
   std::error_code ec{};
   std::thread::id ran_on{};
-  static void on_done(detail::io_read_op* op, std::error_code e) noexcept {
+  static void on_done(detail::io_op* op, std::error_code e) noexcept {
     auto* const p = static_cast<probe*>(op->owner);
     p->calls++;
     p->ec = e;
@@ -58,8 +58,8 @@ struct probe {
   }
 };
 
-detail::io_read_op make_op(probe& p) noexcept {
-  detail::io_read_op op{};
+detail::io_op make_op(probe& p) noexcept {
+  detail::io_op op{};
   op.done = &probe::on_done;
   op.owner = &p;
   return op;
@@ -93,8 +93,8 @@ TEST_CASE("memory_driver reports its reads only from poll") {
 
   probe pa;
   probe pb;
-  detail::io_read_op op_a = make_op(pa);
-  detail::io_read_op op_b = make_op(pb);
+  detail::io_op op_a = make_op(pa);
+  detail::io_op op_b = make_op(pb);
 
   drv.submit_read(f, 0, {}, op_a);
   drv.submit_read(f, 32 * 1024, {}, op_b);
@@ -123,8 +123,8 @@ TEST_CASE("a cancelled memory read reports once, as cancelled") {
 
   probe pa;
   probe pb;
-  detail::io_read_op op_a = make_op(pa);
-  detail::io_read_op op_b = make_op(pb);
+  detail::io_op op_a = make_op(pa);
+  detail::io_op op_b = make_op(pb);
   drv.submit_read(f, 0, {}, op_a);
   drv.submit_read(f, 8 * 1024, {}, op_b);
   drv.cancel(op_a);
@@ -148,14 +148,14 @@ TEST_CASE("a memory driver drains without reporting, and stays usable") {
   drv.reserve(1, 16 * 1024);
 
   probe pa;
-  detail::io_read_op op_a = make_op(pa);
+  detail::io_op op_a = make_op(pa);
   drv.submit_read(f, 0, {}, op_a);
   drv.drain();
   CHECK(pa.calls == 0);
   CHECK(drv.in_flight() == 0);
 
   probe pb;
-  detail::io_read_op op_b = make_op(pb);
+  detail::io_op op_b = make_op(pb);
   drv.submit_read(f, 0, {}, op_b);
   drv.poll(true);
   CHECK(pb.calls == 1);
@@ -197,8 +197,8 @@ TEST_CASE("two spans share one memory driver") {
 
   probe pa;
   probe pb;
-  detail::io_read_op op_a = make_op(pa);
-  detail::io_read_op op_b = make_op(pb);
+  detail::io_op op_a = make_op(pa);
+  detail::io_op op_b = make_op(pb);
   drv.submit_read(fa, 0, {}, op_a);
   drv.submit_read(fb, 0, {}, op_b);
   CHECK(drv.poll(true) == 2);

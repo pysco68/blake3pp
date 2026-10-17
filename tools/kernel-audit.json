@@ -10,13 +10,17 @@
     "asks for both). The quality thresholds apply to the hot kernel",
     "functions: no call outside allow_calls (an inlining failure), at most",
     "max_loops backward branches, and in the wide entry points at least",
-    "min_vector vector instructions (a rolled round loop has a tenth)."
+    "min_vector vector instructions (a rolled round loop has a tenth).",
+    "max_loops bounds STRUCTURE, not size: a hot function that grew a",
+    "rolled round loop jumps by sevens. The widest today is avx512's",
+    "hash_many at 25 (its full-width loop, the padded remainder and the",
+    "scalar remainder, all inlined), so the bound sits a little above it."
   ],
   "min_vector_instructions": 500,
   "quality": {
     "hot": "::(hash_many|hash_batch|xof_wide|compress_in_place|compress_xof)\\(",
     "allow_calls": "^_?(memcpy|memset|memmove|__stack_chk_fail|__chkstk|__chkstk_darwin|__security_check_cookie|__security_push_cookie|__security_pop_cookie|__GSHandlerCheck|__asan_\\w+|__hwasan_\\w+|__ubsan_\\w+|__tsan_\\w+|__msan_\\w+|__sanitizer_\\w+|__gcov\\w*|__llvm_\\w+)$|kern::\\w+::.*(hash_many|hash_batch|xof_wide|xof_many|compress_in_place|compress_xof)\\(|std::_Atomic_storage<.*>::load\\(",
-    "max_loops": 24,
+    "max_loops": 28,
     "min_vector": 500
   },
   "x86_64": {

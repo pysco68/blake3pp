@@ -98,7 +98,7 @@ struct probe {
   int calls = 0;
   std::error_code ec{};
   std::thread::id ran_on{};
-  static void on_done(io_impl::read_op_base* base,
+  static void on_done(io_impl::transfer_base* base,
                       std::error_code e) noexcept {
     auto* const p = static_cast<probe*>(base->owner);
     p->calls++;
@@ -114,7 +114,7 @@ struct probe {
 // entitled to assume.
 class fake_context {
  public:
-  struct read_op : io_impl::read_op_base {
+  struct transfer : io_impl::transfer_base {
     std::span<std::byte> buf{};
     std::uint64_t off = 0;
     std::size_t filled = 0;
@@ -138,7 +138,7 @@ class fake_context {
   [[nodiscard]] bool async() const noexcept { return true; }
 
   void submit_read(file&, std::uint64_t off, std::span<std::byte> buf,
-                   read_op& op) {
+                   transfer& op) {
     op.buf = buf;
     op.off = off;
     op.filled = 0;
@@ -151,7 +151,7 @@ class fake_context {
   // The engine under test never writes; the contract still asks, so this
   // records the write and completes it like any other operation.
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
-                    read_op& op) {
+                    transfer& op) {
     op.buf = {};
     op.off = off;
     op.filled = buf.size();
@@ -160,14 +160,14 @@ class fake_context {
     queue_.push_back(&op);
   }
 
-  void cancel(read_op& op) noexcept { op.cancelled = true; }
+  void cancel(transfer& op) noexcept { op.cancelled = true; }
 
   std::size_t poll(bool) {
     if (queue_.empty()) {
       return 0;
     }
     // Out of order: the newest submission finishes first.
-    read_op& op = *queue_.back();
+    transfer& op = *queue_.back();
     queue_.pop_back();
     if (op.off == fail_offset) {
       op.done_once = true;
@@ -199,15 +199,18 @@ class fake_context {
     return queue_.size();
   }
   void drain() noexcept { queue_.clear(); }
+  // Nothing is ever in the OS's hands here, and the cases build one file
+  // per context, so forgetting a file's transfers is forgetting the queue.
+  void forget(file&) noexcept { queue_.clear(); }
 
-  // The engine deliberately gives no way to reach its context, so the
+  // The engine gives no way to reach its context, so the
   // window to fail is named before the engine is built. A static on a
   // type that exists only in this file is the smallest thing that can
   // say it.
   static inline std::uint64_t fail_offset = ~std::uint64_t{0};
 
  private:
-  std::vector<read_op*> queue_;
+  std::vector<transfer*> queue_;
   io_impl::poll_waiter waiter_;
 };
 
@@ -222,8 +225,8 @@ void check_callback_discipline(std::string_view tag, MakeFile make_file) {
   auto f = make_file(ctx);
   std::array<std::byte, 8192> a{};
   std::array<std::byte, 8192> b{};
-  typename C::read_op op_a{};
-  typename C::read_op op_b{};
+  typename C::transfer op_a{};
+  typename C::transfer op_b{};
   probe pa;
   probe pb;
   op_a.done = &probe::on_done;
@@ -269,8 +272,8 @@ void check_cancel_discipline(std::string_view tag, MakeFile make_file,
   auto f = make_file(ctx);
   std::array<std::byte, 8192> a{};
   std::array<std::byte, 8192> b{};
-  typename C::read_op op_a{};
-  typename C::read_op op_b{};
+  typename C::transfer op_a{};
+  typename C::transfer op_b{};
   probe pa;
   probe pb;
   op_a.done = &probe::on_done;
@@ -310,7 +313,7 @@ void check_cancel_discipline(std::string_view tag, MakeFile make_file,
   }
 
   // A cancel leaves the context usable, like drain() does.
-  typename C::read_op op_c{};
+  typename C::transfer op_c{};
   probe pc;
   op_c.done = &probe::on_done;
   op_c.owner = &pc;
@@ -337,7 +340,7 @@ void check_write_discipline(std::string_view tag, const fs::path& path,
   {
     C ctx({}, 4);
     auto f = make_file(ctx);
-    typename C::read_op op{};
+    typename C::transfer op{};
     probe p;
     op.done = &probe::on_done;
     op.owner = &p;
@@ -471,7 +474,7 @@ TEST_CASE("an IOCP file closed with deferred transfers takes them with it") {
     CAPTURE(async);
     io_impl::iocp_context ctx({.async = async}, 4);
     std::array<std::byte, 4096 + 100> buf{};  // never a NO_BUFFERING granule
-    io_impl::iocp_context::read_op op{};
+    io_impl::iocp_context::transfer op{};
     probe p;
     op.done = &probe::on_done;
     op.owner = &p;
@@ -504,7 +507,7 @@ TEST_CASE("a GCD file waits out its workers before its descriptor closes") {
   const temp_file f(content);
   io_impl::gcd_context ctx({}, 4);
   std::vector<std::byte> buf(content.size());
-  io_impl::gcd_context::read_op op{};
+  io_impl::gcd_context::transfer op{};
   probe p;
   op.done = &probe::on_done;
   op.owner = &p;
@@ -579,7 +582,7 @@ TEST_CASE("an empty transfer completes from poll, not as an error") {
   {
     io_impl::uring_context ctx({}, 4);
     io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
-    io_impl::uring_context::read_op op{};
+    io_impl::uring_context::transfer op{};
     probe p;
     op.done = &probe::on_done;
     op.owner = &p;
@@ -596,7 +599,7 @@ TEST_CASE("an empty transfer completes from poll, not as an error") {
   {
     io_impl::stdio_context ctx({}, 4);
     io_impl::stdio_context::file file(ctx, f.path, io_impl::file_open_options{});
-    io_impl::stdio_context::read_op op{};
+    io_impl::stdio_context::transfer op{};
     probe p;
     op.done = &probe::on_done;
     op.owner = &p;
@@ -612,7 +615,7 @@ TEST_CASE("an empty transfer completes from poll, not as an error") {
 
 #if defined(__linux__)
 // Preallocation is a hint. A filesystem that refuses it must leave a
-// usable file behind, not a failed open: the writes simply extend the
+// usable file behind, not a failed open: the writes extend the
 // file as they land, which is what every backend without fallocate does
 // anyway. Forced here by asking for more than the filesystem holds.
 TEST_CASE("a refused preallocation degrades to an ordinary writable open") {
@@ -627,7 +630,7 @@ TEST_CASE("a refused preallocation degrades to an ordinary writable open") {
         io_impl::file_open_options{.write = true,
                                    .direct_io = false,
                                    .preallocate_bytes = std::uint64_t{1} << 48});
-    io_impl::uring_context::read_op op{};
+    io_impl::uring_context::transfer op{};
     probe p;
     op.done = &probe::on_done;
     op.owner = &p;
@@ -701,8 +704,8 @@ TEST_CASE("two files share one context") {
     typename C::file file_b(ctx, fb.path, io_impl::file_open_options{});
     std::vector<std::byte> got_a(a.size());
     std::vector<std::byte> got_b(b.size());
-    typename C::read_op op_a{};
-    typename C::read_op op_b{};
+    typename C::transfer op_a{};
+    typename C::transfer op_b{};
     probe pa;
     probe pb;
     op_a.done = &probe::on_done;
@@ -767,8 +770,8 @@ TEST_CASE("io_uring: reads the ring would not take are served by poll()") {
   std::vector<std::byte> got_b(len / 2);
   probe pa;
   probe pb;
-  io_impl::uring_context::read_op a{};
-  io_impl::uring_context::read_op b{};
+  io_impl::uring_context::transfer a{};
+  io_impl::uring_context::transfer b{};
   a.done = &probe::on_done;
   a.owner = &pa;
   b.done = &probe::on_done;
@@ -884,7 +887,7 @@ TEST_CASE("a context destroyed with reads in flight runs no callback") {
   {
     ctx_type ctx({}, 4);
     ctx_type::file file(ctx, f.path, io_impl::file_open_options{});
-    ctx_type::read_op op{};
+    ctx_type::transfer op{};
     op.done = &probe::on_done;
     op.owner = &p;
     ctx.submit_read(file, 0, std::span{buf}, op);
@@ -908,7 +911,7 @@ TEST_CASE("drain() reaps owed reads without a callback and keeps the context usa
     CAPTURE(tag);
     using ctx_type = std::remove_reference_t<decltype(ctx)>;
     probe p;
-    typename ctx_type::read_op op{};
+    typename ctx_type::transfer op{};
     op.done = &probe::on_done;
     op.owner = &p;
     ctx.submit_read(file, 0, std::span{buf}, op);
@@ -918,7 +921,7 @@ TEST_CASE("drain() reaps owed reads without a callback and keeps the context usa
     CHECK(ctx.in_flight() == 0);
 
     // Still usable, and the callback discipline still holds.
-    typename ctx_type::read_op again{};
+    typename ctx_type::transfer again{};
     again.done = &probe::on_done;
     again.owner = &p;
     ctx.submit_read(file, 0, std::span{buf}, again);
@@ -1087,7 +1090,7 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
   const auto check = [&](auto& ctx, auto&& make_file) {
     auto file = make_file(ctx);
     std::vector<std::byte> buf(content.size());
-    typename std::remove_reference_t<decltype(ctx)>::read_op op{};
+    typename std::remove_reference_t<decltype(ctx)>::transfer op{};
     probe p;
     op.done = &probe::on_done;
     op.owner = &p;

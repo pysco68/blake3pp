@@ -114,12 +114,16 @@ run_ctest() {  # <label> [QEMU_CPU value] [extra ctest args...]
   local label=$1 cpu=${2-}
   shift; [ $# -gt 0 ] && shift
   echo "::group::ctest ${preset} [${label}]"
-  # --no-tests=ignore: a preset whose suite is one aggregate entry (wasm)
-  # matches neither half, and an empty selection is not a failure here.
   local -a env_prefix=(env -u QEMU_CPU)
   [ -n "${cpu}" ] && env_prefix=(env "QEMU_CPU=${cpu}")
+  # The parallel half must select tests: an empty selection there means
+  # discovery produced nothing -- a suite that did not link, a renamed
+  # binary -- and ignoring it is a green leg that ran no test at all. The
+  # serial half may legitimately be empty, because a preset whose suite is
+  # one aggregate entry (wasm) matches neither pattern and lands in the
+  # parallel half.
   "${env_prefix[@]}" ctest --test-dir "${build_dir}" --output-on-failure \
-    --no-tests=ignore -j"$(nproc)" -E "${CTEST_SERIAL}" "$@" \
+    --no-tests=error -j"$(nproc)" -E "${CTEST_SERIAL}" "$@" \
     || failed_passes+=("${label} (parallel)")
   "${env_prefix[@]}" ctest --test-dir "${build_dir}" --output-on-failure \
     --no-tests=ignore -R "${CTEST_SERIAL}" "$@" \

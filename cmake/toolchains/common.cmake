@@ -118,6 +118,12 @@ if(DEFINED TC_SANITIZERS AND NOT TC_SANITIZERS STREQUAL "")
   # their own link line.
   set(_san_for_flags "${TC_SANITIZERS}")
   list(TRANSFORM _san_for_flags REPLACE "^fuzzer$" "fuzzer-no-link")
+  if("fuzzer" IN_LIST TC_SANITIZERS)
+    # What tests/CMakeLists.txt gates the harness targets on: the
+    # instrumentation is global, the runtime is theirs alone.
+    set(BLAKE3PP_TOOLCHAIN_FUZZER ON CACHE INTERNAL
+      "this toolchain instruments for libFuzzer")
+  endif()
   string(REPLACE ";" "," _san_csv "${_san_for_flags}")
   list(APPEND _cxx_flags
     "-fsanitize=${_san_csv}"

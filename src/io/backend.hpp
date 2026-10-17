@@ -206,13 +206,14 @@ class poll_waiter {
 #endif
 };
 
-// A read in flight. The caller owns it and keeps it at a fixed address
-// from submit_read() until its callback has run; backends derive their
-// own op type from this and recover it from whatever the OS hands back
-// (io_uring's user_data, IOCP's OVERLAPPED*). `done` is called exactly
-// once per submitted read, with an empty error_code on success.
-struct read_op_base {
-  void (*done)(read_op_base*, std::error_code) noexcept = nullptr;
+// One transfer in flight, a read or a write. The caller owns it and keeps
+// it at a fixed address from the submit until its callback has run;
+// backends derive their own op type from this and recover it from whatever
+// the OS hands back (io_uring's user_data, IOCP's OVERLAPPED*). `done` is
+// called exactly once per submitted transfer, with an empty error_code on
+// success.
+struct transfer_base {
+  void (*done)(transfer_base*, std::error_code) noexcept = nullptr;
   void* owner = nullptr;  // for the caller's use
 };
 
@@ -249,14 +250,14 @@ struct read_op_base {
 // recover from.
 template <class C>
 concept io_context = requires(C c, const C cc, typename C::file& f,
-                              typename C::read_op& op, std::uint64_t off,
+                              typename C::transfer& op, std::uint64_t off,
                               std::span<std::byte> buf,
                               std::span<const std::byte> cbuf, bool block,
                               std::uint64_t bytes) {
   typename C::file;
-  typename C::read_op;
-  requires std::derived_from<typename C::read_op, read_op_base>;
-  requires std::default_initializable<typename C::read_op>;
+  typename C::transfer;
+  requires std::derived_from<typename C::transfer, transfer_base>;
+  requires std::default_initializable<typename C::transfer>;
   // The file_reader::backend() string, computed when the file was opened
   // and owned by it: the engine hands it straight to file_reader.
   { f.name() } noexcept -> std::same_as<std::string_view>;
@@ -288,12 +289,19 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   { cc.in_flight() } noexcept -> std::same_as<std::size_t>;
   // Waits out every read still owed, running no callback, and forgets
   // the rest: afterwards in_flight() is zero and the context references
-  // no read_op, so the caller may destroy them. The context stays
+  // no transfer, so the caller may destroy them. The context stays
   // usable. The destructor drains too, a no-op after this. Never
   // throws: nothing it could report would change what the caller has
   // to do next.
   { c.drain() } noexcept;
-  // Asks the OS to abandon one read. Advisory, and never a completion in
+  // The same for one file: afterwards the context references no transfer
+  // of this file and in_flight() counts none of them, so the file and the
+  // buffers its transfers named may be destroyed. Runs no callback of
+  // this file's; a sibling file's completion that surfaces during the
+  // wait is reported normally, because losing it would strand an op that
+  // can never complete. The file's own destructor does this.
+  { c.forget(f) } noexcept;
+  // Asks the OS to abandon one transfer. Advisory, and never a completion in
   // itself: the op is still owed its callback and still counted by
   // in_flight(), and the only way it can arrive is a later poll(). What
   // the callback then reports is whichever happened first --
@@ -385,21 +393,41 @@ class deferred_ops {
 template <class Source>
 class sync_context {
  public:
-  struct read_op : read_op_base {
+  class file;
+
+  struct transfer : transfer_base {
     std::span<std::byte> buf{};        // reads fill this
     std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
     Source* src = nullptr;
-    read_op* next_deferred = nullptr;
+    file* owner_file = nullptr;  // whose transfer this is, for forget()
+    transfer* next_deferred = nullptr;
     bool cancelled = false;
     bool is_write = false;
   };
 
   class file {
    public:
-    file(sync_context&, const std::filesystem::path& path,
+    file(sync_context& ctx, const std::filesystem::path& path,
          const file_open_options& how)
-        : src_(path, how) {}
+        : ctx_(&ctx), src_(path, how) {
+      next_open_ = ctx.files_;
+      ctx.files_ = this;
+    }
+
+    // Queued transfers name this file, so they go with it -- but not by
+    // being looked at: they live in the caller's operations, and an
+    // operation declared after the file is destroyed before it. With
+    // nothing queued for this file there is nothing to do, and otherwise
+    // the whole queue is dropped, which touches no transfer. A caller
+    // with other files queued reclaims this one first, through
+    // io_driver::drain(file&), while its operations are alive.
+    ~file() {
+      ctx_->unlink(*this);
+      if (queued_ != 0) {
+        ctx_->drain();
+      }
+    }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return src_.size(); }
     [[nodiscard]] std::string_view name() const noexcept {
@@ -409,45 +437,77 @@ class sync_context {
 
    private:
     friend class sync_context;
+    sync_context* ctx_;
     Source src_;
+    // This file's share of the context's count, so the destructor can tell
+    // whether anything of its own is queued without walking the queue.
+    std::size_t queued_ = 0;
+    file* next_open_ = nullptr;  // the context's list, for its own drain
   };
 
   sync_context(const reader_context_options&, unsigned) noexcept {}
   sync_context(const sync_context&) = delete;
   sync_context& operator=(const sync_context&) = delete;
   // Nothing is in flight by construction, so there is nothing to drain
-  // and no callback to suppress: the queued ops simply never complete.
+  // and no callback to suppress: the queued ops never complete.
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   read_op& op) {
+                   transfer& op) {
     op.buf = buf;
     op.wbuf = {};
     op.off = off;
     op.src = &f.src_;
+    op.owner_file = &f;
     op.cancelled = false;
     op.is_write = false;
     queue_.push(op);
     queued_++;
+    f.queued_++;
   }
 
   // Queued like a read and performed in poll(): nothing this context does
   // is allowed to happen inside submit.
   void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, read_op& op) {
+                    std::span<const std::byte> buf, transfer& op) {
     op.buf = {};
     op.wbuf = buf;
     op.off = off;
     op.src = &f.src_;
+    op.owner_file = &f;
     op.cancelled = false;
     op.is_write = true;
     queue_.push(op);
     queued_++;
+    f.queued_++;
   }
 
   void flush() noexcept {}
 
+  // Nothing here is ever in the OS's hands -- a queued transfer is
+  // performed inside poll() -- so forgetting one file's is dropping them
+  // off the queue, with no wait and no callback. Legal only while the
+  // operations they live in are alive, which is what asking for this
+  // means; the file's destructor does not assume it.
+  void forget(file& f) noexcept {
+    unlink(f);
+    const std::size_t dropped = queue_.remove_if(
+        [&f](const transfer& op) noexcept { return op.owner_file == &f; });
+    queued_ -= dropped;
+    f.queued_ -= std::min(dropped, f.queued_);
+  }
+
+  void unlink(file& f) noexcept {
+    for (file** at = &files_; *at != nullptr; at = &(*at)->next_open_) {
+      if (*at == &f) {
+        *at = f.next_open_;
+        f.next_open_ = nullptr;
+        return;
+      }
+    }
+  }
+
   std::size_t poll(bool block) {
-    read_op* const next = queue_.take();
+    transfer* const next = queue_.take();
     if (next == nullptr) {
       // Nothing to do: a blocking poll here is the driver waiting for
       // another thread, which is what wake() is for.
@@ -458,8 +518,11 @@ class sync_context {
       }
       return 0;
     }
-    read_op& op = *next;
+    transfer& op = *next;
     queued_--;
+    if (op.owner_file != nullptr) {
+      op.owner_file->queued_--;
+    }
     std::error_code ec;
     if (op.cancelled) {
       // Nothing was read, so there is no data to prefer over the cancel.
@@ -484,18 +547,24 @@ class sync_context {
   // A queued read is dropped by flagging it: the queue is singly linked
   // and poll() reaches every entry anyway, so the flag costs nothing and
   // an unlink would cost a walk.
-  void cancel(read_op& op) noexcept { op.cancelled = true; }
+  void cancel(transfer& op) noexcept { op.cancelled = true; }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
 
-  // Nothing was ever issued: the queued reads are simply forgotten.
+  // Nothing was ever issued: the queued reads are forgotten.
   void drain() noexcept {
     queue_.clear();
     queued_ = 0;
+    for (file* f = files_; f != nullptr; f = f->next_open_) {
+      f->queued_ = 0;
+    }
   }
 
  private:
-  deferred_ops<read_op> queue_;
+  deferred_ops<transfer> queue_;
+  // Every open file of this context, so its own drain can zero the shares
+  // they count.
+  file* files_ = nullptr;
   std::size_t queued_ = 0;
   poll_waiter waiter_;
 };

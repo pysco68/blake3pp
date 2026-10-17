@@ -6,7 +6,7 @@ The library core runs on targets with no filesystem and no OS threads;
 the reference port is Zephyr SMP on the RP2350 in both of its
 personalities, Cortex-M33 and Hazard3 RISC-V.
 
-Two build-time switches make it fit:
+Three build-time switches make it fit:
 
 - `-DBLAKE3PP_WITH_IO=OFF` drops the file-I/O layer entirely. It needs
   a filesystem, 64-bit seeks and OS-specific async I/O, none of which

@@ -158,3 +158,53 @@ if(BLAKE3PP_BENCH_DISPATCH_COST
     endif()
   endif()
 endif()
+
+# The reference implementation in its own configuration: the blake3 crate
+# over rayon, built from bench/compare/ (see its README). Off by default,
+# because it needs a Rust toolchain and nothing in the library depends on
+# it. One binary per compile-time cap, since the crate caps its SIMD
+# backend through negative features rather than at runtime.
+option(BLAKE3PP_BENCH_COMPARE
+  "Build the reference implementation's rayon bench (needs cargo)" OFF)
+if(BLAKE3PP_BENCH_COMPARE)
+  find_program(BLAKE3PP_CARGO cargo)
+  if(NOT BLAKE3PP_CARGO)
+    message(FATAL_ERROR
+      "blake3pp: BLAKE3PP_BENCH_COMPARE=ON needs cargo on PATH "
+      "(https://rustup.rs); see bench/compare/README.md")
+  endif()
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+    set(_cmp_caps default cap_avx2 cap_sse41 cap_sse2 portable)
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(_cmp_caps default cap_no_neon portable)
+  else()
+    # Every other architecture the crate has no backend for: its default
+    # build is the portable one, and both are built so the digests pair up.
+    set(_cmp_caps default portable)
+  endif()
+
+  set(_cmp_out "${CMAKE_CURRENT_BINARY_DIR}/compare")
+  set(_cmp_src "${CMAKE_CURRENT_SOURCE_DIR}/compare")
+  set(_cmp_bins "")
+  foreach(cap IN LISTS _cmp_caps)
+    set(_cmp_features "")
+    if(NOT cap STREQUAL "default")
+      set(_cmp_features --features "${cap}")
+    endif()
+    set(_cmp_bin "${_cmp_out}/blake3-rayon-bench-${cap}")
+    # One target directory per cap: the features change the artifact, and
+    # cargo would otherwise rebuild the same path back and forth.
+    add_custom_command(OUTPUT "${_cmp_bin}"
+      COMMAND "${CMAKE_COMMAND}" -E env "CARGO_TARGET_DIR=${_cmp_out}/target-${cap}"
+              "${BLAKE3PP_CARGO}" build --release --manifest-path
+              "${_cmp_src}/Cargo.toml" ${_cmp_features}
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+              "${_cmp_out}/target-${cap}/release/blake3-rayon-bench" "${_cmp_bin}"
+      DEPENDS "${_cmp_src}/src/main.rs" "${_cmp_src}/Cargo.toml"
+              "${_cmp_src}/Cargo.lock"
+      COMMENT "Building the reference rayon bench (${cap})"
+      VERBATIM)
+    list(APPEND _cmp_bins "${_cmp_bin}")
+  endforeach()
+  add_custom_target(blake3pp_bench_compare ALL DEPENDS ${_cmp_bins})
+endif()

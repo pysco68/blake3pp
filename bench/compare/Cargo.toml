@@ -1,0 +1,31 @@
+[package]
+name = "blake3-rayon-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The reference implementation in its own natural configuration: the
+# blake3 crate picks its SIMD backend at runtime, rayon drives the tree,
+# and mmap is what the crate itself recommends for files.
+[dependencies]
+blake3 = { version = "1", features = ["rayon", "mmap"] }
+rayon = "1"
+# --pin: confines the single-thread rows to one core.
+core_affinity = "0.8"
+
+# The crate picks its backend at RUNTIME but is capped at COMPILE time,
+# through negative features, so a sweep across instruction sets needs one
+# binary per cap rather than one binary with a flag. sweep.sh builds them.
+[features]
+default = []
+cap_avx2 = ["blake3/no_avx512"]
+cap_sse41 = ["blake3/no_avx512", "blake3/no_avx2"]
+cap_sse2 = ["blake3/no_avx512", "blake3/no_avx2", "blake3/no_sse41"]
+portable = ["blake3/pure"]
+# aarch64: NEON is on by default, so the interesting cap is its absence.
+cap_no_neon = ["blake3/no_neon"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

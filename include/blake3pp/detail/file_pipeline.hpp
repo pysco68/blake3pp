@@ -287,9 +287,10 @@ class io_op_state : public run_node {
   using operation_state_concept = ex_compat::operation_state_tag;
 
   io_op_state(Receiver r, driver_loop<D>* loop, typename D::file* f,
-              std::uint64_t off, io_buffer_t<Dir> buf, io_read_op* op)
+              std::uint64_t off, io_buffer_t<Dir> buf, io_op* op,
+              unsigned* owed)
       : rcvr_(std::move(r)), loop_(loop), file_(f), off_(off), buf_(buf),
-        op_(op) {
+        op_(op), owed_(owed) {
     run = &deliver_parked;
   }
 
@@ -319,6 +320,11 @@ class io_op_state : public run_node {
       } else {
         loop_->driver().submit_write(*file_, off_, buf_, *op_);
       }
+      // From here the driver owes this transfer a callback. A scope
+      // winding down has to tell the chains waiting on the driver from the
+      // chains running on the pool: the first it can reclaim, the second
+      // it has to wait out.
+      ++*owed_;
     } catch (const std::system_error& e) {
       ec_ = e.code();
       loop_->publish(this);
@@ -351,6 +357,7 @@ class io_op_state : public run_node {
   // from a device nobody asked to cancel is an I/O error like any other,
   // and a cancel that lost the race brings data, which is used.
   void on_transfer_done(std::error_code ec) noexcept {
+    --*owed_;
     if (ec) {
       if (ec == std::errc::operation_canceled &&
           stop_token().stop_requested()) {
@@ -377,7 +384,11 @@ class io_op_state : public run_node {
   // The caller's, and outliving this state: the transfer is still owed
   // when a stopped chain's cell is re-emplaced, and the scope has to be
   // able to name it to cancel it.
-  io_read_op* op_;
+  io_op* op_;
+  // The scope's count of transfers the driver owes it: raised when a
+  // submit has succeeded, lowered by the completion, so a chain that
+  // parked without submitting is never counted.
+  unsigned* owed_;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
   bool stopped_ = false;
@@ -399,12 +410,12 @@ class io_sender {
                                     ex::set_stopped_t());
 
   io_sender(driver_loop<D>* loop, typename D::file* f, std::uint64_t off,
-            io_buffer_t<Dir> buf, io_read_op* op) noexcept
-      : loop_(loop), file_(f), off_(off), buf_(buf), op_(op) {}
+            io_buffer_t<Dir> buf, io_op* op, unsigned* owed) noexcept
+      : loop_(loop), file_(f), off_(off), buf_(buf), op_(op), owed_(owed) {}
 
   template <class Receiver>
   [[nodiscard]] io_op_state<D, Receiver, Dir> connect(Receiver r) const {
-    return {std::move(r), loop_, file_, off_, buf_, op_};
+    return {std::move(r), loop_, file_, off_, buf_, op_, owed_};
   }
 
  private:
@@ -412,7 +423,8 @@ class io_sender {
   typename D::file* file_;
   std::uint64_t off_;
   io_buffer_t<Dir> buf_;
-  io_read_op* op_;
+  io_op* op_;
+  unsigned* owed_;
 };
 
 template <file_driver D>
@@ -568,16 +580,18 @@ class driver_loop {
   // The operation is the caller's: it has to outlive the chain that owns
   // this sender, because a read the driver still owes survives the cell
   // its chain lived in.
+  // `owed` is the scope's count of transfers this driver owes it, which
+  // its teardown reads: see pipeline_scope_base::quiesce().
   [[nodiscard]] read_sender<D> read(typename D::file& f, std::uint64_t off,
-                                    std::span<std::byte> buf,
-                                    io_read_op& op) noexcept {
-    return read_sender<D>{this, &f, off, buf, &op};
+                                    std::span<std::byte> buf, io_op& op,
+                                    unsigned& owed) noexcept {
+    return read_sender<D>{this, &f, off, buf, &op, &owed};
   }
 
   [[nodiscard]] write_sender<D> write(typename D::file& f, std::uint64_t off,
                                       std::span<const std::byte> buf,
-                                      io_read_op& op) noexcept {
-    return write_sender<D>{this, &f, off, buf, &op};
+                                      io_op& op, unsigned& owed) noexcept {
+    return write_sender<D>{this, &f, off, buf, &op, &owed};
   }
 
   [[nodiscard]] driver_scheduler<D> scheduler() noexcept {
@@ -724,9 +738,12 @@ class driver_loop {
     return ran;
   }
 
-  void poll_once() {
+  // One flush and one poll, for a caller winding the pipeline down
+  // outside run_until. Returns the callbacks the poll ran, and throws
+  // what poll() throws.
+  std::size_t poll_once(bool block = true) {
     drv_.flush();
-    drv_.poll(true);
+    return drv_.poll(block);
   }
 
  private:
@@ -744,9 +761,8 @@ class driver_loop {
 // stop source for the run, a latch that decides which failure the caller
 // hears about, a count of the ones it drops, and a teardown that cannot
 // trust the loop. They disagree about what a cancel sweep names and about
-// when a run is done, which is why this is a base they derive from rather
-// than a member they hold: the parts that differ stay in the scope, and
-// the members below are protected so the scope keeps naming them directly.
+// when a run is done, so those two stay in the scope. The members below
+// are protected, which is how the scope keeps naming them directly.
 //
 // Derived must provide loop() and sweep_cancels().
 template <class Derived, class D>
@@ -793,20 +809,24 @@ class pipeline_scope_base {
   // The stop path for a loop that can no longer be trusted to run.
   //
   // Reached when an exception has left the run, so the normal round --
-  // request, sweep, let the completions arrive -- cannot simply be
-  // continued: the poll that threw may throw again. The first two steps
-  // are the same as any stop's; what differs is the wait behind them.
-  // Nothing on the pool may publish into an operation cell once the cells
-  // are destroyed, so every transfer in flight is waited out here, with
-  // the cells still alive.
+  // request, sweep, let the completions arrive -- cannot be continued:
+  // the poll that threw may throw again. The first two steps are the same
+  // as any stop's; what differs is the wait behind them. Nothing on the
+  // pool may publish into an operation cell once the cells are destroyed,
+  // so every chain in flight is waited out here, with the cells alive.
+  //
+  // Which chains can be hurried and which have to be waited for is the
+  // whole of it. A chain waiting on a transfer is the driver's, and the
+  // driver can be told to give that transfer up; a chain on the pool or
+  // on the run queue comes back on its own and nothing can shorten it.
+  // transfers_owed_ counts the first kind, so in_flight_ above it means
+  // something is still running somewhere this scope cannot reach, and the
+  // only safe answer is to wait.
   //
   // The error the caller is already unwinding with is the one it keeps:
-  // whatever a poll throws here is dropped, and after max_failed_polls of
-  // them the driver is not asked again. From then on the run queue alone
-  // is watched, since a window on the pool publishes without the driver's
-  // help, and the transfers the driver still owes are drained through it,
-  // which runs no callback and leaves no operation referenced.
-  static constexpr unsigned max_failed_polls = 8;
+  // whatever a poll throws here is dropped, and a driver that throws or
+  // reports nothing that many times is not asked again.
+  static constexpr unsigned max_fruitless_polls = 8;
 
   void quiesce() noexcept {
     Derived& self = static_cast<Derived&>(*this);
@@ -816,27 +836,41 @@ class pipeline_scope_base {
     // shortens the wait. Advisory, so a backend that cannot is no worse
     // off than before.
     self.sweep_cancels();
-    unsigned failed_polls = 0;
+    unsigned fruitless = 0;
     for (;;) {
       self.loop().drain();
       if (in_flight_ == 0) {
         break;
       }
-      if (failed_polls < max_failed_polls) {
+      assert(transfers_owed_ <= in_flight_);
+      if (fruitless < max_fruitless_polls) {
+        // Blocking only while the driver has something to hand back.
+        // With nothing of anyone's in flight there is nothing for a sleep
+        // to wait for: the chains left are on the pool, and the loop's own
+        // run queue is where they arrive.
+        const bool owed = self.loop().driver().in_flight() != 0;
+        std::size_t ran = 0;
         try {
-          self.loop().poll_once();
+          ran = self.loop().poll_once(owed);
         } catch (...) {
-          ++failed_polls;
+          ran = 0;
+        }
+        if (ran == 0) {
+          ++fruitless;
+          std::this_thread::yield();
+        } else {
+          fruitless = 0;
         }
         continue;
       }
-      // Every chain the driver does not owe as a transfer is on the pool
-      // or on the run queue, and comes back on its own. Once only
-      // transfers are left the driver drains them itself, running no
-      // callback, so no context still references an op once the cells are
-      // gone.
-      if (in_flight_ <= self.loop().driver().in_flight()) {
-        self.loop().driver().drain();
+      if (in_flight_ == transfers_owed_) {
+        // Only transfers are left, so the driver is asked for them back:
+        // this file's, because the driver may be serving other pipelines
+        // whose transfers are not this scope's to forget. It runs no
+        // callback, so nothing publishes into a cell afterwards, and the
+        // chains stay counted -- there is nothing left that could count
+        // them down.
+        self.loop().driver().drain(self.file());
         break;
       }
       std::this_thread::yield();
@@ -846,6 +880,10 @@ class pipeline_scope_base {
 
   loop_status status_{};
   unsigned in_flight_ = 0;
+  // Of those, the ones waiting on a transfer the driver owes. Kept by the
+  // operation states (io_op_state), which are the only code that knows
+  // whether a submit happened.
+  unsigned transfers_owed_ = 0;
   // The one stop of the run. Every window receiver's environment answers
   // with its token, and the scope's own admission, sweep and settle read
   // it: there is no second flag that could disagree with it.
@@ -902,6 +940,13 @@ struct pipeline_options {
 // level, 54 levels at BLAKE3's 2^64-byte limit -- plus the one node the
 // next window needs, or the scope could reach a state where no window
 // may start; see admit_more().
+//
+// The floor is what any run needs; reducer_nodes_for() adds one node per
+// window that may be in flight, because windows complete out of order and
+// each one can leave a node with no sibling yet. Without that term a deep
+// queue would not stall or fail -- admission would simply stop early and
+// run fewer windows than the caller asked for, which is the sort of
+// silent difference that makes a queue-depth sweep lie.
 inline constexpr std::size_t reducer_nodes = 256;
 
 // The most nodes a run of `parts` equal parts can decompose into: one
@@ -912,6 +957,17 @@ inline constexpr std::size_t reducer_nodes = 256;
 // pipeline would stall rather than run slowly.
 [[nodiscard]] constexpr std::size_t nodes_for(std::size_t parts) noexcept {
   return 2 * static_cast<std::size_t>(std::bit_width(parts));
+}
+
+// The storage one run needs: a contiguous run's decomposition, both edge
+// windows' reservations, one node per window that may be in flight, and
+// one for the window admission is about to take. Never below
+// reducer_nodes, so a small run keeps the headroom the default had.
+[[nodiscard]] constexpr std::size_t reducer_nodes_for(
+    unsigned windows, std::size_t parts) noexcept {
+  const std::size_t needed =
+      2 * 54 + 2 * nodes_for(parts) + static_cast<std::size_t>(windows) + 1;
+  return std::max(reducer_nodes, needed);
 }
 
 // How many bytes of a file have to be read before its windows line up
@@ -943,9 +999,9 @@ inline constexpr std::size_t reducer_nodes = 256;
 
 // Buffer memory the pipeline spends on windows beyond the reads the
 // device sees, so that a pool has windows to work on while the device
-// serves the next ones. At 8 MiB windows this is 16 of them, twice
-// what a 16-thread pool needs with no device under it, and the same
-// 256 MiB a caller of 64 MiB x qd 4 spends.
+// serves the next ones. At 8 MiB windows this is 16 of them, twice what a
+// 16-thread pool needs with no device under it, and half of what a caller
+// asking for 64 MiB windows at queue depth 4 spends on its reads alone.
 inline constexpr std::size_t default_window_budget_bytes = std::size_t{128} << 20;
 
 // The geometry of one update_file() call, decided once from the hasher's
@@ -1127,7 +1183,7 @@ struct pipeline_window {
   // driver may still owe this read after the chain's cell is gone, and
   // the stop sweep names it from here. Last, so the fields the agents
   // touch keep their offsets.
-  io_read_op op{};
+  io_op op{};
 };
 
 // The window storage of a run: the driver's arena, the window objects
@@ -1159,11 +1215,11 @@ class window_pool {
     // window before any constructor runs, and the table has no
     // initialiser of its own to replace that fill with.
     //
-    // The check is the outcome rather than a trait: what the guarantee
-    // actually rests on is a default constructor that is neither
-    // user-provided nor deleted, and no standard trait spells that --
-    // is_trivially_default_constructible is already false here, for the
-    // members that do carry initialisers.
+    // What the guarantee rests on is a default constructor that is
+    // neither user-provided nor deleted, and no standard trait spells
+    // that -- is_trivially_default_constructible is already false here,
+    // for the members that do carry initialisers -- so the check is the
+    // outcome itself.
     static_assert(
         [] {
           const window probe{};
@@ -1287,6 +1343,7 @@ class window_scope
   using base::request_stop;
   using base::status_;
   using base::stop_requested;
+  using base::transfers_owed_;
   using base::stop_source_;
   using base::stopped_;
 
@@ -1336,21 +1393,26 @@ class window_scope
         ends_message_(plan.ends_message),
         base_chunk_((h.count() + head_window_bytes_) / chunk_size),
         file_bytes_(file.size()),
+        nodes_total_(reducer_nodes_for(plan.windows, Budget.parts())),
         reducer_capacity_(opts.reducer_capacity == 0
-                              ? reducer_nodes
-                              : std::min(opts.reducer_capacity, reducer_nodes)),
+                              ? nodes_total_
+                              : std::min(opts.reducer_capacity, nodes_total_)),
         opts_stop_token_(opts.stop_token),
-        nodes_(std::make_unique<tree_reducer::node[]>(reducer_nodes)),
+        nodes_(std::make_unique<tree_reducer::node[]>(nodes_total_)),
         reducer_(ops_, h.key_words(), h.mode_flags(),
-                 std::span<tree_reducer::node>(nodes_.get(), reducer_nodes)) {
+                 std::span<tree_reducer::node>(nodes_.get(), nodes_total_)) {
     // Where each window's bytes actually are is the driver's answer, and
     // it is asked per window, because a source already in memory has a
     // different view for every offset.
     assert((ends_message_ || file_bytes_ % window_bytes_ == 0) &&
            "a span that does not end the message must be a whole number "
            "of windows: a partial one cannot be absorbed as a subtree");
-    assert(host.pool().window_bytes() >= window_bytes_ &&
-           "the pool's windows are smaller than this run plans to read");
+    // Checked in every build: a read of window_bytes_ into a slot the pool
+    // sized smaller runs off the end of the arena, which the driver hands
+    // out by slot without a length of its own.
+    require(host.pool().window_bytes() >= window_bytes_,
+            "update_file(): a host whose windows are smaller than this run "
+            "plans to read");
     loop_.record_into(trace_);
     // One operation cell per window this run may hold at once. The cells
     // are the scope's; the windows are not, so a borrowed window carries
@@ -1385,7 +1447,18 @@ class window_scope
   // outstanding or was quiesced, both of which are checked above this
   // point. A pool that outlives the scope would otherwise lose a window
   // per run, and with it eventually every window it has.
-  ~window_scope() { give_back_all(); }
+  // Nothing of this run may still be running: a window given back here
+  // while a pool thread is inside its compress would be lent to another
+  // pipeline and written into from two places. run() ends with nothing
+  // outstanding or winds down through quiesce(), and quiesce() only
+  // returns once every chain has either completed or been reclaimed from
+  // the driver -- which leaves it counted, hence the comparison rather
+  // than a zero.
+  ~window_scope() {
+    assert(in_flight_ == transfers_owed_ &&
+           "a window was still on the pool when its scope went");
+    give_back_all();
+  }
 
   // The capacity the default storage has to clear, written from what the
   // scope actually reserves:
@@ -1619,11 +1692,34 @@ class window_scope
           break;
         }
         window* const w = pool_.take();
-        w->cell = free_cells_[--free_cell_count_];
-        w->next_taken = taken_;
-        taken_ = w;
+        // Built, then counted. Everything up to the connect is this
+        // window's own state, and a connect that throws -- an operation
+        // state a provider allocates, say -- leaves the window unadmitted
+        // and the pool whole, rather than a count this run can never work
+        // off. Starting is last, because from then on the chain may
+        // complete and will count itself down.
+        const unsigned cell = free_cells_[free_cell_count_ - 1];
         take_next(*w);
         claim_record(*w);
+        // An edge window is the short first one or the last one, each with
+        // its own cell, since a three-window file has both in flight at
+        // once; one with nothing to fan out is only a read.
+        const bool is_full = !w->last && !w->short_first;
+        const bool is_edge_fanout = !is_full && w->plan.parts >= 2;
+        if (is_full) {
+          prepare_compress(*w);
+          cells.full[cell].emplace(typename Cells::connect_full{this, w});
+        } else if (is_edge_fanout) {
+          (w->last ? cells.last_edge : cells.first_edge)
+              .emplace(typename Cells::connect_edge{this, w});
+        } else {
+          (w->last ? cells.last_read : cells.first_read)
+              .emplace(typename Cells::connect_read{this, w});
+        }
+        w->cell = cell;
+        --free_cell_count_;
+        w->next_taken = taken_;
+        taken_ = w;
         ++in_flight_;
         w->reading = true;
         ++reading_;
@@ -1634,26 +1730,17 @@ class window_scope
         if (w->last) {
           last_window_ = w;
         }
-        if (!w->last && !w->short_first) {
-          prepare_compress(*w);
-          cells.full[w->cell].emplace(typename Cells::connect_full{this, w});
+        if (is_full) {
           ex::start(*cells.full[w->cell]);
-        } else if (w->plan.parts >= 2) {
-          // An edge window: the short first one or the last one, each
-          // with its own cell, since a three-window file has both in
-          // flight at once.
-          auto& cell = w->last ? cells.last_edge : cells.first_edge;
-          cell.emplace(typename Cells::connect_edge{this, w});
-          ex::start(*cell);
+        } else if (is_edge_fanout) {
+          ex::start(*(w->last ? cells.last_edge : cells.first_edge));
         } else {
-          auto& cell = w->last ? cells.last_read : cells.first_read;
-          cell.emplace(typename Cells::connect_read{this, w});
-          ex::start(*cell);
+          ex::start(*(w->last ? cells.last_read : cells.first_read));
         }
       }
       // A stop that arrives with nothing in flight ends the run here.
       // Without this the loop would reach the stall report, which exists
-      // for a pipeline nobody can wake -- and this one is simply over.
+      // for a pipeline nobody can wake, and this one is over.
       settle();
     }
   }
@@ -1666,6 +1753,9 @@ class window_scope
 
   // The loop the base's quiesce drives, which is the host's.
   [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }
+  // What the base's teardown reclaims transfers from: this run's file,
+  // never the whole driver, which may be serving other pipelines.
+  [[nodiscard]] typename D::file& file() noexcept { return file_; }
 
   // Where the next window sits in the file: what take_next() hands out,
   // computed from the scope's cursor alone so a window can be planned
@@ -1739,7 +1829,7 @@ class window_scope
     return ex::then(
         ex::continues_on(
             ex::let_value(loop_.read(file_, w.offset,
-                                     w.read_into, w.op),
+                                     w.read_into, w.op, transfers_owed_),
                           [this, &w](std::span<const std::byte>) {
                             return compress_stage(w);
                           }),
@@ -1752,7 +1842,7 @@ class window_scope
   // land here, and so does a file below one window.
   template <class Tag = tu_tag>
   [[nodiscard]] auto read_only_chain(window& w) {
-    return ex::then(loop_.read(file_, w.offset, w.read_into, w.op),
+    return ex::then(loop_.read(file_, w.offset, w.read_into, w.op, transfers_owed_),
                     [this, &w](std::span<const std::byte>) noexcept {
                       read_landed(w);
                       // A short first window with nothing worth fanning
@@ -1777,7 +1867,7 @@ class window_scope
   [[nodiscard]] auto edge_chain(window& w) {
     return ex::then(
         ex::continues_on(
-            ex::let_value(loop_.read(file_, w.offset, w.read_into, w.op),
+            ex::let_value(loop_.read(file_, w.offset, w.read_into, w.op, transfers_owed_),
                           [this, &w](std::span<const std::byte>) {
                             return edge_compress_stage(w);
                           }),
@@ -1816,13 +1906,20 @@ class window_scope
 
   // On the driver, like every other insert.
   void insert_edge_nodes(window& w, std::size_t nodes) noexcept {
+    // fold_aligned_runs() wrote these, bounded by the span it was given;
+    // reading more than that span holds would walk off the array.
+    require(nodes <= edge_node_cap,
+            "an edge window produced more nodes than its slot holds");
     w.nodes = nodes;
     for (std::size_t i = 0; i < nodes; ++i) {
       const tree_reducer::node& n = edge_nodes_[w.plan.edge_slot][i];
-      const bool inserted = reducer_.insert(n.first_chunk, n.chunks, n.cv);
-      // Admission reserved a whole decomposition for this window.
-      assert(inserted && "the reducer refused an edge window's node");
-      (void)inserted;
+      // Admission reserved a whole decomposition for this window, so a
+      // refusal is capacity arithmetic that disagrees with itself. Checked
+      // in every build: dropping the node silently is a subtree missing
+      // from the tree, which is a wrong digest and no error.
+      require(reducer_.insert(n.first_chunk, n.chunks, n.cv),
+              "the reducer refused an edge window's node, which admission "
+              "had reserved room for");
     }
     max_pending_ = std::max(max_pending_, reducer_.pending());
     if (w.rec != nullptr) {
@@ -2067,10 +2164,12 @@ class window_scope
   }
 
   void reduce_into_tree(window& w, const cv_type& cv) noexcept {
-    const bool inserted = reducer_.insert(w.plan.first_chunk, w.chunks, cv);
-    // Admission reserved this node before the window started.
-    assert(inserted && "the reducer refused a window admission had room for");
-    (void)inserted;
+    // Admission reserved this node before the window started; the same
+    // reasoning as the edge path's, and the same consequence if it is
+    // wrong.
+    require(reducer_.insert(w.plan.first_chunk, w.chunks, cv),
+            "the reducer refused a window's node, which admission had "
+            "reserved room for");
     max_pending_ = std::max(max_pending_, reducer_.pending());
     if (w.rec != nullptr) {
       w.rec->t_absorbed = trace_->now();
@@ -2133,7 +2232,11 @@ class window_scope
   // still holds its buffer, and only poll() can deliver either.
   void sweep_cancels() noexcept {
     for (window* w = taken_; w != nullptr; w = w->next_taken) {
-      if (w->reading && !w->cancel_asked) {
+      // Only a window whose read the driver actually has: a window
+      // admitted in the same round that a stop arrived may have parked
+      // without submitting, and latching it here would stop the sweep
+      // asking for the read that follows.
+      if (w->reading && w->op.live && !w->cancel_asked) {
         w->cancel_asked = true;
         loop_.driver().cancel(w->op);
       }
@@ -2245,6 +2348,8 @@ class window_scope
   bool ends_message_ = true;
   std::uint64_t base_chunk_ = 0;        // where the full windows' grid starts
   std::uint64_t file_bytes_ = 0;
+  // The storage this run allocated, and what admission may use of it.
+  std::size_t nodes_total_ = reducer_nodes;
   std::size_t reducer_capacity_ = reducer_nodes;
   ex::inplace_stop_token opts_stop_token_{};
   std::unique_ptr<tree_reducer::node[]> nodes_;
@@ -2306,7 +2411,8 @@ struct pipeline_cells {
   pipeline_cells& operator=(const pipeline_cells&) = delete;
 
   // Builds a cell's operation state in place: an operation state does
-  // not move, so the optional is given a conversion rather than a value.
+  // not move, so the optional takes a conversion that constructs it
+  // where it will live.
   template <class Op, auto Chain>
   struct connect_as {
     Scope* scope;

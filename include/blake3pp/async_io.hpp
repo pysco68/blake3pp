@@ -50,11 +50,14 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <system_error>
 #include <tuple>
 #include <type_traits>
@@ -81,11 +84,13 @@ struct io_context_options {
   /// Bytes per window; rounded down to a power-of-2 multiple of
   /// chunk_size, minimum 64 KiB.
   std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows one operation may hold at once; clamped to [2, 32].
+  /// Windows one operation may hold at once; clamped to [2, 256].
   unsigned queue_depth = 4;
-  /// Windows in the shared arena. Zero means queue_depth, which is one
-  /// operation's worth; a context that runs several files at once wants
-  /// more, at window_bytes each.
+  /// Windows in the shared arena, at window_bytes each. Zero means what
+  /// the plan asks for, which at the defaults is 16 windows and so a
+  /// 128 MiB arena -- several operations' worth already. Clamped to the
+  /// same ceiling as queue_depth, because every window costs the same
+  /// window_bytes whether it was asked for as a count or as a budget.
   unsigned windows = 0;
   /// The arena as a byte budget instead: when non-zero, the window count
   /// is this divided by the window size, at least queue_depth and at
@@ -139,7 +144,7 @@ struct pipeline_node {
 /// running thread, inside the run call, which is also the only place a
 /// receiver of one of these senders is ever invoked.
 ///
-/// @tparam Budget The stack a window's part table may take. It is the
+/// @tparam Budget What a window's part table may take. It is the
 ///                context's rather than the call's because the context
 ///                owns the tables; see stack_budget.
 template <stack_budget Budget = default_stack_budget>
@@ -187,10 +192,14 @@ class basic_io_context {
   /// nothing started returns immediately.
   void run_until_idle() { drive(/*until_idle=*/true); }
 
-  /// Runs until `done` reads true, which something completing on this
-  /// thread sets; other operations may still be in flight when it
-  /// returns. What sync_wait() drives.
-  void run_until(const bool& done) { drive(/*until_idle=*/false, &done); }
+  /// Runs until `done` reads true, whichever thread sets it; other
+  /// operations may still be in flight when it returns. What sync_wait()
+  /// drives. The flag is atomic because a composed sender's last stage
+  /// may complete off this thread, and whoever sets it must then wake
+  /// this context -- which is what sync_wait()'s receiver does.
+  void run_until(const std::atomic<bool>& done) {
+    drive(/*until_idle=*/false, &done);
+  }
 
   /// How many windows the arena holds.
   [[nodiscard]] unsigned windows() const noexcept {
@@ -245,21 +254,31 @@ class basic_io_context {
   static unsigned pool_windows(
       const io_context_options& opts,
       const blake3pp::detail::pipeline_plan& plan) noexcept {
+    const unsigned ceiling = blake3pp::detail::max_queue_depth;
     if (opts.arena_bytes != 0) {
       const std::size_t by_budget =
           opts.arena_bytes / std::max<std::size_t>(1, plan.window_bytes);
       return static_cast<unsigned>(std::clamp<std::size_t>(
-          by_budget, std::max(1u, plan.reads_in_flight), 32));
+          by_budget, std::max(1u, plan.reads_in_flight), ceiling));
     }
-    return opts.windows != 0 ? opts.windows : plan.windows;
+    // A count given outright is clamped like one derived from a budget:
+    // every window is window_bytes of arena, so the two requests have the
+    // same ceiling whichever way they are spelled.
+    return opts.windows != 0 ? std::min(opts.windows, ceiling) : plan.windows;
   }
 
-  void drive(bool until_idle, const bool* until = nullptr) {
-    const bool was_running = running_.exchange(true, std::memory_order_acq_rel);
-    assert(!was_running &&
-           "only one thread may run an io_context; the others may call "
-           "request_stop() and start operations, nothing else");
-    (void)was_running;
+  void drive(bool until_idle, const std::atomic<bool>* until = nullptr) {
+    // Reported in every build, like the pipeline's own stall report and for
+    // the same reason: two threads inside one context is a shape a caller
+    // configured, not a bug a sanitizer lane would find, and under NDEBUG
+    // the second one would walk the operation list the first is mutating.
+    // run() is not noexcept, so this one can be thrown.
+    if (running_.exchange(true, std::memory_order_acq_rel)) {
+      throw std::logic_error(
+          "blake3pp: a second thread called run() on an io_context; only one "
+          "may run it, and the others may call request_stop() and start "
+          "operations");
+    }
     // Whatever leaves this frame, the context is runnable again: an
     // exception out of the driver's poll leaves the started operations
     // linked and unfinished, and the next run() continues them.
@@ -316,7 +335,7 @@ class basic_io_context {
           // A report may have started another operation; it is pending,
           // not live, so the list is consulted too.
           status.done =
-              (until != nullptr && *until) ||
+              (until != nullptr && until->load(std::memory_order_acquire)) ||
               (live_ == 0 &&
                pending_.load(std::memory_order_acquire) == nullptr &&
                (until_idle || stop_.load(std::memory_order_acquire)));
@@ -432,7 +451,7 @@ class update_file_op final : public pipeline_node {
     try {
       scope_->admit_round(*cells_);
     } catch (...) {
-      // The round threw, so the cells cannot simply be destroyed: a
+      // The round threw, so the cells cannot be destroyed yet: a
       // window on the pool may be about to publish into one. Wait those
       // out first, which also returns the windows this run held, then
       // report from the next round.
@@ -844,7 +863,7 @@ class update_files_op final : public pipeline_node {
   };
 
   // Builds the child in place: an operation state is immovable, so the
-  // optional is given a conversion rather than a value.
+  // optional takes a conversion that constructs it where it will live.
   struct child_connect {
     update_files_op* op;
     slot* s;
@@ -937,19 +956,25 @@ class update_files_sender {
   OnDone done_;
 };
 
-// Where sync_wait() parks a completion.
+// Where sync_wait() parks a completion. `done` is atomic and the
+// waiting thread is woken through the driver, because the last stage of
+// a composed sender need not run on the context's thread: a
+// continues_on() to a pool scheduler finishes this chain somewhere else,
+// and a plain flag read by a thread parked in poll() would never be
+// seen.
 template <class Tuple>
 struct sync_state {
   std::optional<Tuple> value;
   std::exception_ptr error;
   bool stopped = false;
-  bool done = false;
+  std::atomic<bool> done{false};
 };
 
-template <class Tuple>
+template <class Tuple, class Wake>
 struct sync_receiver {
   using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
-  explicit sync_receiver(sync_state<Tuple>* s) noexcept : st_(s) {}
+  sync_receiver(sync_state<Tuple>* s, Wake wake) noexcept
+      : st_(s), wake_(wake) {}
   template <class... Ts>
   void set_value(Ts&&... ts) const noexcept {
     try {
@@ -957,23 +982,31 @@ struct sync_receiver {
     } catch (...) {
       st_->error = std::current_exception();
     }
-    st_->done = true;
+    finish();
   }
   void set_error(std::error_code ec) const noexcept {
     st_->error = std::make_exception_ptr(std::system_error(ec));
-    st_->done = true;
+    finish();
   }
   void set_error(std::exception_ptr e) const noexcept {
     st_->error = std::move(e);
-    st_->done = true;
+    finish();
   }
   void set_stopped() const noexcept {
     st_->stopped = true;
-    st_->done = true;
+    finish();
   }
 
  private:
+  // The flag last, after everything the waiting thread will read, and the
+  // wake after the flag.
+  void finish() const noexcept {
+    st_->done.store(true, std::memory_order_release);
+    wake_();
+  }
+
   sync_state<Tuple>* st_;
+  Wake wake_;
 };
 
 }  // namespace detail
@@ -1021,16 +1054,51 @@ template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
 /// this returns.
 template <stack_budget Budget, class Sender>
 auto sync_wait(basic_io_context<Budget>& ctx, Sender&& sndr) {
+  // Asking the sender what it completes with needs a receiver environment
+  // to ask against, and the answer is what names the tuple this returns.
+  // Any sync_receiver's environment will do -- what it wakes is not part of
+  // it -- so the query uses a throwaway instantiation rather than the one
+  // built below, which cannot be named until the tuple is known.
   using env_t = decltype(blake3pp::ex::get_env(
-      std::declval<const detail::sync_receiver<std::tuple<>>&>()));
+      std::declval<const detail::sync_receiver<std::tuple<>,
+                                               void (*)() noexcept>&>()));
   using tuple_t = blake3pp::ex::value_types_of_t<std::remove_cvref_t<Sender>,
                                                  env_t, std::tuple,
                                                  std::type_identity_t>;
   detail::sync_state<tuple_t> st;
-  auto op = blake3pp::ex::connect(std::forward<Sender>(sndr),
-                                  detail::sync_receiver<tuple_t>{&st});
+  const auto wake = [&ctx]() noexcept { ctx.driver().wake(); };
+  auto op = blake3pp::ex::connect(
+      std::forward<Sender>(sndr),
+      detail::sync_receiver<tuple_t, decltype(wake)>{&st, wake});
   blake3pp::ex::start(op);
-  ctx.run_until(st.done);
+  try {
+    ctx.run_until(st.done);
+  } catch (...) {
+    // `op` is started and unfinished, and the context still has it
+    // linked: destroying it on the way out of this frame would leave the
+    // loop walking a dead node. So the run is stopped and wound down
+    // first, the same way a failing round winds its own scope down.
+    ctx.request_stop();
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+      if (st.done.load(std::memory_order_acquire)) {
+        break;
+      }
+      try {
+        ctx.run_until_idle();
+      } catch (...) {
+        // Whatever the driver is doing, it is not getting better by
+        // being asked differently; the loop below decides.
+      }
+    }
+    if (!st.done.load(std::memory_order_acquire)) {
+      std::fprintf(stderr,
+                   "blake3pp: an io_context could not be wound down while a "
+                   "sync_wait() operation was still in flight; it cannot be "
+                   "destroyed without leaving the context a dead node\n");
+      std::abort();
+    }
+    throw;
+  }
   if (st.error != nullptr) {
     std::rethrow_exception(st.error);
   }

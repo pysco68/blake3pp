@@ -182,11 +182,11 @@
       }
     },
     {
-      "name": "linux-clang22-cxx26-fuzzer",
-      "displayName": "Clang 22 with libc++ (system), C++26 + fuzzer",
+      "name": "linux-clang22-cxx23-fuzzer",
+      "displayName": "Clang 22 against libstdc++, C++23 + fuzzer",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-fuzzer",
-      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-fuzzer/linux-clang22-cxx26-fuzzer.cmake",
+      "binaryDir": "${sourceDir}/build/linux-clang22-cxx23-fuzzer",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx23-fuzzer/linux-clang22-cxx23-fuzzer.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
       }
@@ -276,8 +276,8 @@
       "configurePreset": "linux-clang22-cxx26-msan"
     },
     {
-      "name": "linux-clang22-cxx26-fuzzer",
-      "configurePreset": "linux-clang22-cxx26-fuzzer"
+      "name": "linux-clang22-cxx23-fuzzer",
+      "configurePreset": "linux-clang22-cxx23-fuzzer"
     },
     {
       "name": "linux-clang22-cxx26-coverage",

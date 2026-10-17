@@ -282,7 +282,8 @@ BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   // vectors of it in registers. At full AVX-512 width the state alone is 16
   // of the 32 zmm, so the message cannot fit beside it and what the compiler
   // keeps there it pays for twice over; freeing those registers is worth
-  // 3-6% on the chunk shape (Zen 5, clang 22, 32 inputs per call). An empty
+  // 3-6% on the chunk shape alone (Zen 5, clang 22, 32 inputs per call) and
+  // 7.8% on the kernel row end to end, which docs/building.md quotes. An empty
   // asm with an input-only constraint, so nothing is clobbered and the state
   // stays register-resident: a memory clobber here forces the state out too
   // and loses 4%.

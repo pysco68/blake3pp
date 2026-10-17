@@ -46,6 +46,9 @@ src=build/site-src
 rm -rf "${src}" build/doxygen
 mkdir -p "${src}" build/doxygen
 cp docs/*.md "${src}/"
+# The charts and the data they are rendered from (tools/bench-charts.py).
+mkdir -p "${src}/img"
+cp docs/img/*.svg "${src}/img/"
 
 # The reference pages, straight from the headers. Doxygen writes XML only;
 # none of its HTML is published.

@@ -341,7 +341,7 @@ kernel_deltas kernel_delta(const kernel_counters& before,
 // so what this measures is the engine, the fan-out and the fold, with
 // the device removed -- the ceiling a real one is measured against.
 //
-// That is deliberately NOT the same benchmark as hashing a real span:
+// That is NOT the same benchmark as hashing a real span:
 // the bytes here are a handful of resident windows, not a working set.
 // See bench/README.md.
 //
@@ -392,23 +392,25 @@ class null_driver {
   }
 
   void submit_read(file&, std::uint64_t, std::span<std::byte>,
-                   blake3pp::detail::io_read_op& op) noexcept {
+                   blake3pp::detail::io_op& op) noexcept {
     reads_.push(op);
   }
   // The sink half: the bytes are already where they were generated, so
   // the only work is reporting from poll() and not before.
   void submit_write(file&, std::uint64_t, std::span<const std::byte>,
-                    blake3pp::detail::io_read_op& op) noexcept {
+                    blake3pp::detail::io_op& op) noexcept {
     reads_.push(op);
   }
   void flush() noexcept {}
   std::size_t poll(bool block) { return reads_.poll(block); }
   void wake() noexcept { reads_.wake(); }
-  void cancel(blake3pp::detail::io_read_op& op) noexcept { reads_.cancel(op); }
+  void cancel(blake3pp::detail::io_op& op) noexcept { reads_.cancel(op); }
   [[nodiscard]] std::size_t in_flight() const noexcept {
     return reads_.in_flight();
   }
   void drain() noexcept { reads_.drain(); }
+  // Nothing here is in the OS's hands, so one file's share is all of it.
+  void drain(file&) noexcept { reads_.drain(); }
 
  private:
   std::uint64_t size_;
@@ -707,46 +709,17 @@ std::string trace_file_name(const std::string& path, const char* label,
 // claims to have read.
 constexpr std::byte null_filler{0xa5};
 
-// --threads resolved to a scheduler: an owned pool of exactly that size
-// under stdexec, the process-wide scheduler elsewhere.
+// --threads resolved to a scheduler (b3tool::compute_pool, one_thread::pooled:
+// a pool at exactly that size, one included, since a count of one is a
+// measurement here rather than the sequential path).
 //
 // The option exists as a DIAGNOSTIC for the sync-tier oversubscription
 // question. The pread fallback's reader is an implicit extra thread the
 // pool does not know about, so 11 runnable threads on a 10-core phone.
 // Sweep N-1/N/N+1 to separate reader starvation from other shortfalls.
-class engine_threads {
- public:
-  explicit engine_threads(unsigned threads)
-      : threads_(threads != 0 ? threads : std::thread::hardware_concurrency())
-#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-        ,
-        pool_(threads_)
-#endif
-  {
-#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-    // The process scheduler, sized for every provider alike.
-    blake3pp::size_parallel_scheduler(threads_);
-#endif
-  }
-
-  [[nodiscard]] unsigned count() const noexcept { return threads_; }
-
-  [[nodiscard]] blake3pp::parallel_scheduler_t scheduler() {
-#if defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-    return blake3pp::get_parallel_scheduler();
-#elif defined(BLAKE3PP_EXECUTION_STDEXEC)
-    return pool_.get_scheduler();
-#else
-    return blake3pp::get_parallel_scheduler();
-#endif
-  }
-
- private:
-  unsigned threads_;
-#if defined(BLAKE3PP_EXECUTION_STDEXEC) && !defined(BLAKE3PP_HAS_SIZED_SCHEDULER)
-  exec::static_thread_pool pool_;
-#endif
-};
+[[nodiscard]] inline b3tool::compute_pool engine_threads(unsigned threads) {
+  return b3tool::compute_pool{threads, b3tool::one_thread::pooled};
+}
 
 // The window x qd pacing matrix: same measurement as the main rows, swept.
 void io_sweep(const std::string& path, std::uint64_t bytes,
@@ -774,7 +747,7 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
   std::printf("\n");
 
   b3tool::cooldown cooldown(cooldown_s);
-  engine_threads engine(pool_threads);
+  auto engine = engine_threads(pool_threads);
   auto sched = engine.scheduler();
   double best_gibs = 0.0;
   double default_gibs = 0.0;
@@ -933,7 +906,7 @@ int main(int argc, char** argv) {
     }
     const blake3pp::digest want = expect.finalize();
 
-    engine_threads engine(threads);
+    auto engine = engine_threads(threads);
     auto sched = engine.scheduler();
     b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
     double best = 1e30;
@@ -1005,7 +978,7 @@ int main(int argc, char** argv) {
     seed.update(std::span<const std::byte>{&null_filler, 1});
     const blake3pp::output_reader stream = seed.finalize_xof();
 
-    engine_threads engine(threads);
+    auto engine = engine_threads(threads);
     auto sched = engine.scheduler();
     b3tool::cooldown cooldown(cooldown_s, /*skip_first=*/true);
     double best = 1e30;
@@ -1022,7 +995,7 @@ int main(int argc, char** argv) {
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_write_pipeline(
           drv, nf, sched,
-          [&stream](std::span<std::byte> out, std::uint64_t off) {
+          [&stream](std::span<std::byte> out, std::uint64_t off) noexcept {
             blake3pp::output_reader rd = stream;
             rd.seek(off);
             blake3pp::fill(rd, out);
@@ -1123,6 +1096,13 @@ int main(int argc, char** argv) {
   // Each row: best of reps. When tracing, every rep starts from an empty
   // buffer and the io-wq workers are read before and after it, so what is
   // summarized and exported is the last rep alone.
+  // Every row hashes the same file, so their digests are one answer: the
+  // first row's is what the rest are held to, and a disagreement makes the
+  // run fail rather than print two hexes and a rate. Without it a wrong
+  // parallel digest reads as a successful benchmark.
+  blake3pp::digest expect{};
+  bool have_expect = false;
+  bool digests_agree = true;
   const auto run = [&](const char* label, auto&& fn) {
     cooldown();
     blake3pp::digest d{};
@@ -1148,6 +1128,16 @@ int main(int argc, char** argv) {
     println(stdout, "{:<10} {}   ({}...)  [{:3.0f}% of raw]", label,
             b3tool::rate(static_cast<std::size_t>(bytes), best),
             d.to_hex().substr(0, 16), 100.0 * raw_s / best);
+    if (!have_expect) {
+      expect = d;
+      have_expect = true;
+    } else if (d != expect) {
+      digests_agree = false;
+      println(stdout,
+              "  DIGEST MISMATCH: {} hashed the same file as the row above "
+              "and got {} instead of {}",
+              label, d.to_hex(), expect.to_hex());
+    }
     if (trace) {
       print_trace_summary(
           *trace, threads_for_trace, iowq_cpu_s,
@@ -1166,7 +1156,7 @@ int main(int argc, char** argv) {
   run("seq", [&] { return blake3pp::hash_file(path.c_str(), opts); });
 
   if (!seq_only) {
-    engine_threads engine(pool_threads);
+    auto engine = engine_threads(pool_threads);
     auto sched = engine.scheduler();
     println(stdout, "parallel:   {} threads, affinity mask: {}",
             engine.count(),
@@ -1176,5 +1166,5 @@ int main(int argc, char** argv) {
     run("parallel",
         [&] { return blake3pp::hash_file(path.c_str(), sched, opts); });
   }
-  return 0;
+  return digests_agree ? 0 : 1;
 }

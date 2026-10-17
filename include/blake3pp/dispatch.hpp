@@ -81,9 +81,11 @@ enum class arch : std::uint8_t {
 /// question instead of answering it. =0 vetoes the XTheadVector kernel
 /// whatever detection says. =1 asserts the CPU has it without any check,
 /// which is the one way this library runs a kernel the CPU may lack, and
-/// a wrong assertion is a SIGILL on the first hash. It exists for boards
-/// whose kernel hides the answer and whose owner knows it. Nothing else
-/// should set it.
+/// a wrong assertion is a SIGILL on the first hash. It exists for the
+/// machines where no probe can answer -- a board whose kernel hides the
+/// extension, and an emulator that models neither the hwprobe key nor the
+/// trap -- and whose owner knows what is underneath. Nothing else should
+/// set it.
 /// @return true if anything new was learned.
 bool run_trap_probes() noexcept;
 
@@ -106,7 +108,8 @@ bool run_trap_probes() noexcept;
 /// stamp; see blake3ppsum --version).
 [[nodiscard]] std::string_view version() noexcept;
 /// Which SIMD facade backs this build of the library: "std::simd",
-/// "std::experimental::simd" or "xsimd".
+/// "std::experimental::simd", "xsimd", or "none (scalar only)" where the
+/// build has no facade at all and carries the scalar kernel alone.
 [[nodiscard]] std::string_view simd_provider() noexcept;
 /// Which sender/receiver implementation backs this build of the library:
 /// "std::execution", "beman.execution" or "stdexec", or "none" where the

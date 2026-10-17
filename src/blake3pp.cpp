@@ -1,5 +1,7 @@
 #include <blake3pp/core.hpp>
 
+#include <blake3pp/detail/contract.hpp>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -91,14 +93,20 @@ std::uint64_t hasher::count() const noexcept {
 void hasher::push_cv(std::span<const std::uint32_t, 8> cv,
                      std::uint64_t total_chunks,
                      std::uint64_t subtree_chunks) noexcept {
-  // push_subtree_cv is an expert entry point whose preconditions are
-  // documented but unenforceable at run time without cost. Violating them
-  // is not a graceful failure: subtree_chunks == 0 divides by zero here,
-  // and a misaligned or non-power-of-two size produces more trailing zero
-  // bits than there are stacked siblings, wrapping the uint8_t length to
-  // 255 and indexing a 54-entry array out of bounds. Debug builds say so.
-  assert(subtree_chunks > 0 && std::has_single_bit(subtree_chunks));
-  assert(total_chunks % subtree_chunks == 0);
+  // push_subtree_cv is an expert entry point, and these are the
+  // preconditions whose violation is not a graceful failure:
+  // subtree_chunks == 0 divides by zero here, and a misaligned or
+  // non-power-of-two size produces more trailing zero bits than there are
+  // stacked siblings, wrapping the uint8_t length to 255 and indexing a
+  // 54-entry array out of bounds. Two comparisons once per subtree, which
+  // is nothing beside the compression that produced it, so they are
+  // checked in every build.
+  detail::require(subtree_chunks > 0 && std::has_single_bit(subtree_chunks),
+                  "push_subtree_cv(): a subtree size that is not a power of "
+                  "two");
+  detail::require(total_chunks % subtree_chunks == 0,
+                  "push_subtree_cv(): a subtree at a position it cannot "
+                  "cover");
   std::array<std::uint32_t, 8> new_cv;
   core::copy_cv(cv, new_cv);
   std::uint64_t chunks = total_chunks / subtree_chunks;
@@ -307,12 +315,13 @@ void hasher::push_subtree_cv(std::span<const std::uint32_t, 8> cv,
                              std::uint64_t subtree_chunks) noexcept {
   assert(!right_held_);  // update_last() said the message ended
   close_full_chunk();
-  // The documented chunk-boundary precondition. close_full_chunk() ends a
+  // The documented chunk-boundary precondition, checked in every build for
+  // the same reason as the two in push_cv(): close_full_chunk() ends a
   // chunk that is complete and leaves a partial one alone, so bytes left
   // in the chunk state here would be hashed as the head of a chunk past
-  // the subtree: a wrong digest with nothing to see.
-  assert(core::chunk_len(chunk_) == 0 &&
-         "push_subtree_cv() needs the hasher on a chunk boundary");
+  // the subtree -- a wrong digest with nothing to see.
+  detail::require(core::chunk_len(chunk_) == 0,
+                  "push_subtree_cv(): a hasher part-way through a chunk");
   push_cv(cv, chunk_.chunk_counter + subtree_chunks, subtree_chunks);
   chunk_.chunk_counter += subtree_chunks;
 }
@@ -428,7 +437,15 @@ bool digest::matches(std::string_view hex) const noexcept {
 
 void to_hex(std::span<const std::byte> bytes, std::span<char> out) noexcept {
   static constexpr char alphabet[] = "0123456789abcdef";
-  assert(out.size() >= 2 * bytes.size());
+  // Checked in every build: the loop below writes two characters per byte
+  // whatever this says, and a span too small for them is a write past the
+  // end of a caller's buffer -- with lengths that can come from a file or
+  // a wire. There is nowhere to report it, since this is noexcept by
+  // design (the convenience overload returning a string is the one that
+  // may allocate).
+  detail::require(out.size() >= 2 * bytes.size(),
+                  "to_hex(): an output span smaller than two characters per "
+                  "byte");
   for (std::size_t i = 0; i < bytes.size(); ++i) {
     const auto v = std::to_integer<unsigned>(bytes[i]);
     out[2 * i] = alphabet[v >> 4];

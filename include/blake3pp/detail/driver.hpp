@@ -12,6 +12,7 @@
 // Internal to the library. Standard library only, and no execution
 // provider: the concept is about reads, not about senders.
 
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -59,20 +60,42 @@ void bind_completion(Op& op, Owner& owner) noexcept {
   };
 }
 
-// A read in flight. Caller-owned and at a fixed address from submit_read
-// until its callback has run.
+// One transfer in flight, a read or a write. Caller-owned and at a fixed
+// address from the submit until its callback has run.
 //
 // The backend's own operation lives in `storage`: sized and aligned here
 // for the widest backend, checked against the real type by a
 // static_assert in io_driver.cpp, so a backend that outgrows it fails the
-// build rather than corrupting the neighbouring bytes. One io_read_op
-// serves read after read, each submit constructing a fresh backend op
+// build rather than corrupting the neighbouring bytes. One io_op serves
+// transfer after transfer, each submit constructing a fresh backend op
 // over the last one's bytes, which is why that type has to be trivially
 // destructible -- also checked there.
-struct io_read_op {
-  void (*done)(io_read_op*, std::error_code) noexcept = nullptr;
+struct io_op {
+  void (*done)(io_op*, std::error_code) noexcept = nullptr;
   void* owner = nullptr;
+  // Whether a driver currently owes this operation a callback, which is
+  // also whether `storage` holds a backend operation. Raised by the driver
+  // once a submit has been taken and lowered before the callback runs, so
+  // a cancel sweep can tell an operation the device has from one that is
+  // only admitted: the two are indistinguishable from the window's own
+  // state, and cancelling the second reads storage holding no object, or
+  // the previous transfer left in it.
+  bool live = false;
 
+  // Sized for whatever transfer type the native backend derives from
+  // transfer_base (uring_context::transfer, iocp_context::transfer or
+  // gcd_context::transfer -- src/io/{uring,iocp,gcd}_backend.hpp): only
+  // one of those is ever compiled, so no header here can sizeof/alignof
+  // all three to take their max. Measured on this build (Linux, io_uring)
+  // by the "op storage" case in tests/file_pipeline.cpp: the real
+  // transfer is 104 bytes aligned to 8, leaving 56 bytes of headroom for
+  // the other backends' larger fields (Windows' OVERLAPPED among them).
+  // A backend that outgrows these numbers fails the static_assert in
+  // emplace_native() below instead of overrunning storage silently, and
+  // native_op_layout() reports the real size for that failure to quote.
+  // Could be derived as sizeof/alignof of a union of the three transfer
+  // types instead of asserted, at the cost of pulling every backend's
+  // header into every TU that only needs the concept.
   static constexpr std::size_t storage_size = 160;
   static constexpr std::size_t storage_align = 16;
   alignas(storage_align) std::byte storage[storage_size];
@@ -84,11 +107,11 @@ struct io_read_op {
   template <class Op>
   [[nodiscard]] Op& emplace_native() noexcept {
     static_assert(sizeof(Op) <= storage_size,
-                  "io_read_op::storage_size is smaller than this backend's op");
+                  "io_op::storage_size is smaller than this backend's op");
     static_assert(alignof(Op) <= storage_align,
-                  "io_read_op::storage_align is weaker than this backend's op");
+                  "io_op::storage_align is weaker than this backend's op");
     static_assert(std::is_trivially_destructible_v<Op>,
-                  "io_read_op::storage is reused per read, so the op must "
+                  "io_op::storage is reused per read, so the op must "
                   "be trivially destructible");
     return *::new (static_cast<void*>(storage)) Op{};
   }
@@ -96,24 +119,25 @@ struct io_read_op {
   // The operation emplace_native() left in the storage. Only the driver
   // that submitted this read may ask, and only while the read is owed:
   // the bytes hold that op until the next submit builds another over
-  // them. The hop through void* is what keeps this out of
-  // reinterpret_cast, as it does in the kernel tables.
+  // them, and `live` is that window. The hop through void* is what keeps
+  // this out of reinterpret_cast, as it does in the kernel tables.
   template <class Op>
   [[nodiscard]] Op& native() noexcept {
+    assert(live && "io_op::native() on an operation no driver owes");
     return *std::launder(static_cast<Op*>(static_cast<void*>(storage)));
   }
 };
 
-// Size and alignment of the platform backend's own read operation: what
-// io_read_op::storage has to hold. The static_assert in io_driver.cpp is
+// Size and alignment of the platform backend's own operation: what
+// io_op::storage has to hold. The static_assert in io_driver.cpp is
 // the one that sees the real type, so this reports the margin on
 // platforms whose backend nobody here can compile.
-struct io_read_op_layout {
+struct io_op_layout {
   std::size_t size;
   std::size_t align;
 };
 
-[[nodiscard]] io_read_op_layout native_read_op_layout() noexcept;
+[[nodiscard]] io_op_layout native_op_layout() noexcept;
 
 // Where one window's bytes live, as the driver that owns them says.
 //
@@ -133,12 +157,15 @@ struct window_storage {
 // called it.
 template <class D>
 concept file_driver =
-    requires(D& d, const D& cd, typename D::file& f, io_read_op& op,
+    requires(D& d, const D& cd, typename D::file& f, io_op& op,
              std::uint64_t off, std::span<std::byte> buf, bool block,
              std::size_t bytes, unsigned windows) {
       typename D::file;
       { f.size() } noexcept -> std::same_as<std::uint64_t>;
       { f.name() } noexcept -> std::same_as<std::string_view>;
+      // Queues one transfer. A driver that takes it raises op.live and
+      // lowers it before the callback runs: that is how a caller's cancel
+      // sweep tells a transfer the device has from one only admitted.
       { d.submit_read(f, off, buf, op) };
       { d.flush() } noexcept;
       { d.poll(block) } -> std::same_as<std::size_t>;
@@ -146,6 +173,12 @@ concept file_driver =
       { d.cancel(op) } noexcept;
       { cd.in_flight() } noexcept -> std::same_as<std::size_t>;
       { d.drain() } noexcept;
+      // The same for one file: afterwards no transfer of this file is
+      // referenced and in_flight() counts none of them, so its buffers
+      // and the operations naming them may be destroyed. A scope winding
+      // down on a driver it shares with others uses this: the whole
+      // drain would forget their transfers too.
+      { d.drain(f) } noexcept;
       // How much window memory the run will use. A driver that owns an
       // arena takes it here; one whose windows are views of memory the
       // caller already has takes nothing and remembers the geometry.

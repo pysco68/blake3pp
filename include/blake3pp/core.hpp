@@ -235,7 +235,8 @@ class hasher {
   /// message and the top parent for any longer one, and only the caller
   /// knows which it will be. Told that the message ends here, the final
   /// chunk joins a wide batch instead of being compressed a block at a
-  /// time, which is worth about 1.7x on messages of a few chunks.
+  /// time, which is worth about 1.4x on messages of a few chunks (8 KiB,
+  /// 2.04 -> 2.83 GiB/s on avx2).
   ///
   /// Only the finalize family may be called afterwards; a further update()
   /// would contradict the statement this call makes (checked by assert()).

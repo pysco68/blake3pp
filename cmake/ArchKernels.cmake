@@ -150,6 +150,26 @@ endif()
 target_compile_definitions(blake3pp_features
   INTERFACE "BLAKE3PP_MAX_SIMD_DEGREE=${BLAKE3PP_MAX_SIMD_DEGREE}")
 
+# The deepest queue the I/O engines and the pipeline accept
+# (include/blake3pp/detail/file_reader.hpp). A device is not what bounds it
+# -- NVMe takes tens of thousands of outstanding commands -- the arena is:
+# every window in flight costs window_bytes, so 256 at the default 8 MiB
+# window is 2 GiB, and the measured sweet spot on every device so far is
+# four to eight. The ceiling is a guard against a typo, and a caller who
+# knows the device and the budget moves it.
+set(BLAKE3PP_MAX_QUEUE_DEPTH "" CACHE STRING
+  "Deepest I/O queue a caller may ask for [default 256]")
+if(BLAKE3PP_MAX_QUEUE_DEPTH)
+  if(NOT BLAKE3PP_MAX_QUEUE_DEPTH MATCHES "^[0-9]+$"
+     OR BLAKE3PP_MAX_QUEUE_DEPTH LESS 2)
+    message(FATAL_ERROR
+      "BLAKE3PP_MAX_QUEUE_DEPTH must be an integer of at least 2, got "
+      "'${BLAKE3PP_MAX_QUEUE_DEPTH}'")
+  endif()
+  target_compile_definitions(blake3pp_features
+    INTERFACE "BLAKE3PP_MAX_QUEUE_DEPTH=${BLAKE3PP_MAX_QUEUE_DEPTH}")
+endif()
+
 # Opt-in: reduce a subtree by folding groups into a binary-counter stack
 # (core::compress_subtree_to_cv_folded) instead of the recursion that holds
 # one CV buffer per level. The value is the stack bound in levels, so it is

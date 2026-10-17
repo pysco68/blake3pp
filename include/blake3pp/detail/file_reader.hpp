@@ -35,7 +35,20 @@
 
 namespace blake3pp::detail {
 
-constexpr unsigned max_queue_depth = 32;
+// The deepest queue the engines and the pipeline accept. A device is not
+// the reason for a ceiling -- NVMe takes tens of thousands of outstanding
+// commands -- the memory is: every window in flight is window_bytes of
+// arena, so 256 of them at the default 8 MiB window is 2 GiB, and at the
+// 1 GiB maximum window it is more than any machine has. The ceiling is a
+// guard against a typo, and BLAKE3PP_MAX_QUEUE_DEPTH raises or lowers it
+// for a caller who knows the device and the budget.
+#if defined(BLAKE3PP_MAX_QUEUE_DEPTH)
+constexpr unsigned max_queue_depth = BLAKE3PP_MAX_QUEUE_DEPTH;
+#else
+constexpr unsigned max_queue_depth = 256;
+#endif
+static_assert(max_queue_depth >= 2,
+              "a queue depth below two cannot overlap a read with a hash");
 
 // The largest window or buffer the engines accept, 1 GiB, or less where
 // max_queue_depth of them would not fit in size_t. The cap keeps the pool
@@ -66,7 +79,7 @@ struct file_reader_options {
   // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB,
   // max 1 GiB.
   std::size_t window_bytes = 8 * 1024 * 1024;
-  unsigned queue_depth = 4;  // clamped to [2, 32]
+  unsigned queue_depth = 4;  // clamped to [2, max_queue_depth]
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused
   bool async = true;         // try io_uring; silently degrade if refused
   // Issue each read on the kernel's worker threads (io_uring: IOSQE_ASYNC)

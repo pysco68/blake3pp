@@ -831,6 +831,24 @@ TEST_CASE("reader latches a release it did not hand out") {
     r.release(*w);
     CHECK_THROWS_AS(r.next(), std::system_error);
   }
+  // The one the slot index alone cannot catch: a stale window naming a slot
+  // that has since been reassigned. Accepting it recycles the buffer the
+  // caller is reading from -- a wrong digest, no error anywhere -- so the
+  // window's offset has to match what the slot holds.
+  SUBCASE("stale window whose slot was reassigned") {
+    blake3pp::detail::file_reader r(
+        f.path, {.window_bytes = 64 * 1024, .queue_depth = 2});
+    const auto w0 = r.next();
+    REQUIRE(w0);
+    r.release(*w0);          // slot now carries a later window
+    const auto w1 = r.next();
+    REQUIRE(w1);
+    const auto w2 = r.next();
+    REQUIRE(w2);
+    REQUIRE(w2->slot == w0->slot);  // the same slot, a different window
+    r.release(*w0);                 // the stale one
+    CHECK_THROWS_AS(r.next(), std::system_error);
+  }
 }
 
 // A submit larger than the buffer it names would hand the kernel a span
@@ -845,6 +863,37 @@ TEST_CASE("writer refuses a submit larger than its buffer") {
   foreign.slot = 9;
   CHECK_THROWS_AS(w.submit(foreign, 4096), std::system_error);
   w.finish();
+}
+
+// Two buffers in hand are two slots, and a buffer may be submitted once.
+// A slot claimed only at submit would let a second acquire() hand out the
+// same buffer again: both writes would ride one busy flag, the first
+// completion would release it, and the producer would refill bytes the
+// device was still reading, a wrong file reported as success.
+TEST_CASE("writer hands out one buffer per slot and takes each back once") {
+  const auto content = make_input(128 * 1024);
+  const temp_file f({});
+  // The writer owns the file while it lives, and Windows will not open a
+  // second handle to it, so the read-back is outside the scope.
+  {
+    blake3pp::detail::file_writer w(
+        f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
+    const auto a = w.acquire();
+    const auto b = w.acquire();
+    CHECK(a.slot != b.slot);
+    CHECK(a.data != b.data);
+    // Every slot is held; the third ask says so rather than reusing one.
+    CHECK_THROWS_AS(w.acquire(), std::system_error);
+
+    std::copy_n(content.data(), 64 * 1024, a.data);
+    std::copy_n(content.data() + 64 * 1024, 64 * 1024, b.data);
+    w.submit(a, 64 * 1024);
+    CHECK_THROWS_AS(w.submit(a, 64 * 1024), std::system_error);  // taken back
+    w.submit(b, 64 * 1024);
+    w.finish();
+  }
+  CHECK(std::filesystem::file_size(f.path) == content.size());
+  CHECK(blake3pp::hash_file(f.path) == blake3pp::hash(content));
 }
 
 // The writer's async path with and without the io-wq hand-off must land

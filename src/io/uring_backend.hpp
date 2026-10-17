@@ -76,6 +76,9 @@ inline std::string no_uring_suffix(int err) {
     case EPERM:
       return " [io_uring: EPERM, blocked by policy]";
     case ENOSYS:
+      // Either io_uring_setup is absent (pre-5.1) or the ring came up
+      // without the read/write opcodes this backend needs (pre-5.6); both
+      // are the same answer to a caller: this kernel cannot serve it.
       return " [io_uring: ENOSYS, kernel too old]";
     default:
       return " [io_uring: errno " + std::to_string(err) + "]";
@@ -197,6 +200,18 @@ struct uring {
     fd.reset(sys_io_uring_setup(entries, &p));
     if (!fd) {
       setup_errno = errno;
+      return false;
+    }
+    // A ring that sets up only proves the syscall exists, which is 5.1.
+    // IORING_OP_READ and IORING_OP_WRITE -- the only two opcodes this
+    // backend uses -- arrived in 5.6, and on 5.1 to 5.5 every transfer
+    // would come back -EINVAL while backend() happily reported io_uring:
+    // Ubuntu 20.04 ships 5.4. IORING_FEAT_RW_CUR_POS is from the same
+    // release as those opcodes, so the feature word answers the question
+    // that IORING_REGISTER_PROBE cannot (it is itself 5.6).
+    if ((p.features & IORING_FEAT_RW_CUR_POS) == 0) {
+      setup_errno = ENOSYS;
+      destroy();
       return false;
     }
     sq_entries = p.sq_entries;
@@ -444,20 +459,23 @@ struct uring {
 };
 
 // The io_uring reader context: one ring, any number of files, reads named
-// by the caller's read_op, completions delivered as callbacks out of
+// by the caller's transfer, completions delivered as callbacks out of
 // poll(). Degrades per feature at runtime, as the whole layer does:
 // O_DIRECT refused by the filesystem -> buffered, io_uring refused ->
 // every read served synchronously from the deferred list.
 class uring_context {
  public:
-  struct read_op : read_op_base {
+  class file;  // defined below; a transfer names the file it belongs to
+
+  struct transfer : transfer_base {
     std::span<std::byte> buf{};         // reads fill this
     std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
     std::size_t filled = 0;
     int fd = -1;                      // the fd this transfer rides
     posix_file* sync_file = nullptr;  // the deferred path needs the pair
-    read_op* next_deferred = nullptr;
+    file* owner_file = nullptr;       // whose transfer this is, for forget()
+    transfer* next_deferred = nullptr;
     bool on_ring = false;    // the kernel has it, so a cancel is an SQE
     bool cancelled = false;  // a cancel was asked for; one is enough
     bool is_write = false;
@@ -493,6 +511,29 @@ class uring_context {
         f_.try_odirect(path.c_str(), (write_ ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
       }
       name_ = ctx.name_for(f_.direct(), write_);
+      ctx_ = &ctx;
+      next_open_ = ctx.files_;
+      ctx.files_ = this;
+    }
+
+    // A file that still owns transfers cannot simply close: the kernel is
+    // writing into the buffers they name and the context would be left
+    // counting them.
+    //
+    // What it must not do is look at those transfers. They live in the
+    // caller's operations, and an operation declared after the file --
+    // which is the natural order, since submitting needs a file -- is
+    // destroyed before it. So a file with nothing owed only unlinks, and
+    // one with transfers still owed takes the context-wide drain, which
+    // reaps without reporting and reads no transfer at all. That costs
+    // the other files their pending callbacks, which is why a caller with
+    // siblings in flight reclaims this file first, through
+    // io_driver::drain(file&), while its operations are alive.
+    ~file() {
+      ctx_->unlink(*this);
+      if (inflight_ != 0) {
+        ctx_->drain();
+      }
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
@@ -513,6 +554,11 @@ class uring_context {
     std::uint64_t size_ = 0;
     std::uint64_t prealloc_ = 0;
     std::string name_;
+    // This file's share of the context's count, which is what forget()
+    // waits out. The context-wide count stays the sum of these.
+    std::size_t inflight_ = 0;
+    uring_context* ctx_ = nullptr;
+    file* next_open_ = nullptr;  // the context's list, for its own drain
     bool write_ = false;
   };
 
@@ -540,7 +586,7 @@ class uring_context {
   ~uring_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   read_op& op) {
+                   transfer& op) {
     arm(op, f, off);
     op.buf = buf;
     op.wbuf = {};
@@ -553,7 +599,7 @@ class uring_context {
   // inside poll(), through the plain fd. Nothing above the context sees
   // the difference.
   void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, read_op& op) {
+                    std::span<const std::byte> buf, transfer& op) {
     arm(op, f, off);
     op.buf = {};
     op.wbuf = buf;
@@ -563,27 +609,45 @@ class uring_context {
 
  private:
   // What a transfer needs that does not depend on its direction.
-  void arm(read_op& op, file& f, std::uint64_t off) noexcept {
+  void arm(transfer& op, file& f, std::uint64_t off) noexcept {
     op.off = off;
     op.filled = 0;
     op.fd = f.f_.fd();
     op.sync_file = &f.f_;
+    op.owner_file = &f;
     op.next_deferred = nullptr;
     op.on_ring = false;
     op.cancelled = false;
     in_flight_++;
+    f.inflight_++;
   }
 
-  // The ladder, asked once for both directions: only whole granules may
-  // ride the ring, because O_DIRECT rejects an unaligned length, and the
-  // tail goes through the synchronous path inside poll(). A zero-length
+  // The ladder, asked once for both directions and for every piece of a
+  // transfer: only whole granules may ride the ring, because O_DIRECT
+  // rejects an unaligned length and an unaligned offset, and what it
+  // refuses goes through the synchronous path inside poll(). A zero-length
   // transfer takes that path too: io_uring would report it as res == 0,
   // which is the signature of a short transfer with nothing left to give,
   // so a no-op never reaches the kernel. This is the whole
   // runtime-degradation question.
-  void issue(read_op& op, std::uint8_t opcode, const void* data,
+  //
+  // The offset matters because of the continuation: a short transfer
+  // resumes at off + filled, which is a granule boundary only if the
+  // device stopped on one. Asking the same question again is what keeps a
+  // continuation off the ring on terms the first submit would have
+  // refused -- where it would come back EINVAL and fail the window, with
+  // the synchronous rung right there.
+  [[nodiscard]] bool may_ride(const transfer& op, std::uint64_t off,
+                              std::size_t len) const noexcept {
+    if (!use_uring_ || len == 0 || len % direct_align != 0) {
+      return false;
+    }
+    return !op.sync_file->direct() || off % direct_align == 0;
+  }
+
+  void issue(transfer& op, std::uint8_t opcode, const void* data,
              std::size_t len) noexcept {
-    if (use_uring_ && len != 0 && len % direct_align == 0) {
+    if (may_ride(op, op.off, len)) {
       op.on_ring = true;
       ring_.fill_rw(opcode, op.fd, data, static_cast<unsigned>(len), op.off,
                     op_ud(&op), offload_);
@@ -597,7 +661,7 @@ class uring_context {
   // The kernel is asked once; a second ask would only add a CQE to drop.
   // A read on the deferred list has not been issued to anything, so the
   // flag alone is the whole cancel and run_one_deferred() honours it.
-  void cancel(read_op& op) noexcept {
+  void cancel(transfer& op) noexcept {
     if (std::exchange(op.cancelled, true)) {
       return;
     }
@@ -666,6 +730,104 @@ class uring_context {
     }
     deferred_.clear();
     in_flight_ = 0;
+    for (file* f = files_; f != nullptr; f = f->next_open_) {
+      f->inflight_ = 0;
+    }
+  }
+
+  // Gives up every transfer this file owns, running no callback, so the
+  // file and the buffers its transfers name may be destroyed while the
+  // context stays usable: afterwards in_flight() counts none of them.
+  //
+  // Legal only while the operations those transfers live in are alive,
+  // which is what asking for this means: a transfer still owed is one the
+  // caller still owns. ~file() cannot assume it and does not call this.
+  // What never reached the kernel is dropped outright; what the kernel
+  // holds has to be waited out, because it is writing into those buffers
+  // and nothing can take that back.
+  //
+  // One sharp edge, since the ring is shared: a completion belonging to
+  // ANOTHER file can surface while this one is waited out, and it is
+  // reported normally rather than dropped -- losing it would strand an op
+  // that can never complete. So reclaiming one file of a multi-file
+  // context while a sibling has transfers in flight can run that
+  // sibling's callback from here.
+  void forget(file& f) noexcept {
+    unlink(f);
+    const std::size_t never_rode = deferred_.remove_if(
+        [&f](const transfer& op) noexcept { return op.owner_file == &f; });
+    in_flight_ -= std::min(never_rode, in_flight_);
+    f.inflight_ -= std::min(never_rode, f.inflight_);
+    if (!use_uring_ || f.inflight_ == 0) {
+      return;
+    }
+    // Everything queued goes to the kernel first: an entry still in the
+    // submission queue would be submitted by a later flush, reading into
+    // memory this call is about to release. What the kernel refuses comes
+    // back on the deferred list, where the sweep below drops this file's
+    // share.
+    try {
+      ring_.flush();
+    } catch (const std::system_error&) {
+      defer_unsubmitted();
+    }
+    for (;;) {
+      const std::size_t refused = deferred_.remove_if(
+          [&f](const transfer& op) noexcept { return op.owner_file == &f; });
+      in_flight_ -= std::min(refused, in_flight_);
+      f.inflight_ -= std::min(refused, f.inflight_);
+      if (f.inflight_ == 0) {
+        return;
+      }
+      std::uint64_t ud = 0;
+      int res = 0;
+      if (!ring_.reap(ud, res)) {
+        try {
+          ring_.wait_cq();
+        } catch (const std::system_error& e) {
+          // The same position the context-wide drain refuses to return
+          // from: transfers in the kernel, a ring that cannot be waited
+          // on, and buffers about to be reused.
+          std::fprintf(stderr,
+                       "blake3pp: io_uring_enter failed while %zu transfer(s) "
+                       "of a closing file were still owed (%s); their buffers "
+                       "cannot be released\n",
+                       f.inflight_, e.what());
+          std::abort();
+        }
+        continue;
+      }
+      if (ud == wake_ud()) {
+        wake_armed_ = false;  // one-shot; take_wake() re-arms
+        continue;
+      }
+      if (ud == cancel_ud()) {
+        continue;  // the target's own completion is the one that matters
+      }
+      transfer& op = *op_from(ud);
+      if (op.owner_file == &f) {
+        in_flight_--;
+        f.inflight_--;  // reaped, not reported
+        continue;
+      }
+      if (settle(op, ud, res)) {
+        try {
+          ring_.flush();
+        } catch (const std::system_error&) {
+          defer_unsubmitted();
+        }
+      }
+    }
+  }
+
+  void unlink(file& f) noexcept {
+    for (file** at = &files_; *at != nullptr; at = &(*at)->next_open_) {
+      if (*at == &f) {
+        *at = f.next_open_;
+        f.next_open_ = nullptr;
+        return;
+      }
+    }
   }
 
   // Every entry the kernel refused to take names a read that in_flight()
@@ -693,7 +855,7 @@ class uring_context {
       if (ud == cancel_ud()) {
         return;  // withdrawn with its target; nothing owes a completion
       }
-      read_op& op = *op_from(ud);
+      transfer& op = *op_from(ud);
       op.next_deferred = nullptr;
       op.on_ring = false;  // the kernel never took it; no SQE to cancel
       deferred_.push(op);
@@ -720,16 +882,16 @@ class uring_context {
     return n;
   }
 
-  [[nodiscard]] std::uint64_t op_ud(read_op* op) const noexcept {
+  [[nodiscard]] std::uint64_t op_ud(transfer* op) const noexcept {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(op));
   }
-  [[nodiscard]] read_op* op_from(std::uint64_t ud) const noexcept {
-    return std::bit_cast<read_op*>(static_cast<std::uintptr_t>(ud));
+  [[nodiscard]] transfer* op_from(std::uint64_t ud) const noexcept {
+    return std::bit_cast<transfer*>(static_cast<std::uintptr_t>(ud));
   }
-  // The wake completion needs a user_data no read_op can wear; its own
+  // The wake completion needs a user_data no transfer can wear; its own
   // op's address is one, and costs nothing. A cancel's CQE needs the
   // same, and for the same reason: reaping it as a read would walk to a
-  // read_op that does not exist.
+  // transfer that does not exist.
   [[nodiscard]] std::uint64_t wake_ud() const noexcept {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(&wake_op_));
   }
@@ -743,9 +905,53 @@ class uring_context {
     wake_armed_ = true;
   }
 
-  void complete(read_op& op, std::error_code ec) noexcept {
+  void complete(transfer& op, std::error_code ec) noexcept {
     in_flight_--;
+    if (op.owner_file != nullptr) {
+      op.owner_file->inflight_--;
+    }
     op.done(&op, ec);
+  }
+
+  // What one completion of `op` means. A transfer short of its length
+  // continues from where it stopped, reads and writes alike; only the
+  // opcode and which span it walks differ. Returns whether it was
+  // requeued rather than completed, which is the caller's cue to flush.
+  [[nodiscard]] bool settle(transfer& op, std::uint64_t ud, int res) noexcept {
+    if (res < 0) {
+      complete(op, std::error_code(-res, std::generic_category()));
+      return false;
+    }
+    if (res == 0) {
+      // Short of the length with nothing left to give: the file ended
+      // where the engine was told it would not.
+      complete(op, std::error_code(EIO, std::generic_category()));
+      return false;
+    }
+    if (!op.is_write) {
+      BLAKE3PP_MSAN_UNPOISON(op.buf.data() + op.filled,
+                             static_cast<std::size_t>(res));
+    }
+    op.filled += static_cast<std::size_t>(res);
+    if (op.filled < op.length()) {
+      const std::byte* const from =
+          op.is_write ? op.wbuf.data() + op.filled : op.buf.data() + op.filled;
+      const std::size_t rest = op.length() - op.filled;
+      if (!may_ride(op, op.off + op.filled, rest)) {
+        // The remainder is not something this file may hand the ring. It
+        // is still owed, so it goes down the same rung an unalignable
+        // transfer takes from the start, which finishes what is left.
+        op.on_ring = false;
+        deferred_.push(op);
+        return false;
+      }
+      ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, op.fd,
+                    from, static_cast<unsigned>(rest), op.off + op.filled, ud,
+                    offload_);
+      return true;
+    }
+    complete(op, {});
+    return false;
   }
 
   // Consumes every completion the ring has without blocking, reissuing
@@ -766,37 +972,12 @@ class uring_context {
       if (ud == cancel_ud()) {
         continue;  // the target's own completion is the one that matters
       }
-      read_op& op = *op_from(ud);
-      if (res < 0) {
-        complete(op, std::error_code(-res, std::generic_category()));
-        ran++;
-        continue;
-      }
-      if (res == 0) {
-        // Short of the length with nothing left to give: the file ended
-        // where the engine was told it would not.
-        complete(op, std::error_code(EIO, std::generic_category()));
-        ran++;
-        continue;
-      }
-      if (!op.is_write) {
-        BLAKE3PP_MSAN_UNPOISON(op.buf.data() + op.filled,
-                               static_cast<std::size_t>(res));
-      }
-      op.filled += static_cast<std::size_t>(res);
-      if (op.filled < op.length()) {
-        // A short transfer continues from where it stopped, reads and
-        // writes alike; only the opcode and which span it walks differ.
-        const std::byte* const from =
-            op.is_write ? op.wbuf.data() + op.filled : op.buf.data() + op.filled;
-        ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, op.fd,
-                      from, static_cast<unsigned>(op.length() - op.filled),
-                      op.off + op.filled, ud, offload_);
+      transfer& op = *op_from(ud);
+      if (settle(op, ud, res)) {
         requeued = true;
-        continue;
+      } else {
+        ran++;
       }
-      complete(op, {});
-      ran++;
     }
     if (requeued) {
       // The continuation of a short read is the same kind of entry as
@@ -813,22 +994,29 @@ class uring_context {
   // At most one per poll(): a synchronous read holds the calling thread
   // for the whole window, and the caller asked to be given control back.
   std::size_t run_one_deferred() noexcept {
-    read_op* const next = deferred_.take();
+    transfer* const next = deferred_.take();
     if (next == nullptr) {
       return 0;
     }
-    read_op& op = *next;
+    transfer& op = *next;
     std::error_code ec;
     if (op.cancelled) {
       ec = std::make_error_code(std::errc::operation_canceled);
     } else {
       try {
+        // From where the transfer stopped, which for a fresh one is the
+        // start and for a continuation is what the ring already moved.
+        // The remainder picks the descriptor: an unalignable rest is
+        // exactly what the plain fd exists for.
+        const std::size_t done = op.filled;
+        const std::size_t rest = op.length() - done;
         if (op.is_write) {
-          op.sync_file->pwrite_all(op.sync_file->sync_fd(op.wbuf.size()),
-                                   op.wbuf.data(), op.wbuf.size(), op.off);
+          op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
+                                   op.wbuf.data() + done, rest,
+                                   op.off + done);
         } else {
-          op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
-                                  op.buf.data(), op.buf.size(), op.off);
+          op.sync_file->pread_all(op.sync_file->sync_fd(rest),
+                                  op.buf.data() + done, rest, op.off + done);
         }
         op.filled = op.length();
       } catch (const std::system_error& e) {
@@ -880,10 +1068,13 @@ class uring_context {
   // is closed and before the op whose address that poll wears goes.
   // Do not move ring_ above these two.
   poll_waiter waiter_;
-  read_op wake_op_{};    // address only: the wake completion's user_data
-  read_op cancel_op_{};  // address only: every cancel CQE's user_data
+  transfer wake_op_{};    // address only: the wake completion's user_data
+  transfer cancel_op_{};  // address only: every cancel CQE's user_data
   uring ring_;
-  deferred_ops<read_op> deferred_;
+  deferred_ops<transfer> deferred_;
+  // Every open file of this context, so its own drain can zero the shares
+  // they count. Linked by the file, unlinked by forget().
+  file* files_ = nullptr;
   std::size_t in_flight_ = 0;
   bool async_requested_ = true;
   bool use_uring_ = false;

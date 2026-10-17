@@ -30,7 +30,12 @@ import subprocess
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 INCLUDE = re.compile(r'^#include "((?:kernel|core|io|dispatch)/[^"]+)"[^\n]*$', re.M)
-SHARED = {"kernel/kernel.hpp", "kernel/force_inline.hpp"}
+# Variant-neutral kernel headers: pasted once above both kernel copies,
+# because what they define lives outside the per-variant namespace and a
+# second copy is a redefinition. Every other kernel header is inside
+# blake3pp::kern::BLAKE3PP_ARCH_NS and is pasted once per variant.
+SHARED = {"kernel/kernel.hpp", "kernel/force_inline.hpp",
+          "kernel/endian.hpp"}
 # Everything the library needs beyond the kernels, in link order.
 # The kernel is registered under a real variant name because dispatch
 # gates on that name: registering AVX-512 code as "avx2" would enable it
@@ -54,7 +59,10 @@ SELECT = """
 SUPPORT = ["src/blake3pp.cpp", "src/dispatch/dispatch.cpp",
            "src/dispatch/cpu_detect_x86.cpp",
            "src/io/file_reader.cpp", "src/io_hash.cpp"]
-PUBLIC = ["include/blake3pp/dispatch.hpp", "include/blake3pp/core.hpp",
+PUBLIC = ["include/blake3pp/detail/contract.hpp",
+          "include/blake3pp/dispatch.hpp", "include/blake3pp/core.hpp",
+          "include/blake3pp/trace.hpp",
+          "include/blake3pp/detail/driver.hpp",
           "include/blake3pp/detail/file_reader.hpp",
           "include/blake3pp/detail/file_writer.hpp",
           "include/blake3pp/io.hpp"]
@@ -213,10 +221,15 @@ def main():
 
 #include <version>
 {SELECT}
-#if defined(__has_include) && __has_include(<simd>)
+// GCC 16 ships <simd> at every standard but defines std::simd only from
+// C++26, and there is no feature-test macro to ask, so the language
+// version is the gate. Below it the file carries the scalar kernel alone:
+// the library proper has a CMake probe and other providers, a single file
+// has neither.
+#if defined(__has_include) && __has_include(<simd>) && __cplusplus > 202302L
 #define BLAKE3PP_HAS_STD_SIMD 1
 #else
-#define BLAKE3PP_AMALGAM_SCALAR_ONLY 1   // no <simd> here
+#define BLAKE3PP_AMALGAM_SCALAR_ONLY 1   // no usable <simd> here
 #endif
 
 // The multi-core half, when the reader selected beman.execution in
@@ -240,14 +253,19 @@ def main():
         text = re.sub(r'#include [<"]blake3pp/[^>"]+[>"][^\n]*\n', "", text)
         out.append(text.rstrip() + "\n")
     # Variant-neutral, so once, before either kernel copy.
-    for h in ("kernel/force_inline.hpp", "kernel/kernel.hpp"):
+    for h in ("kernel/force_inline.hpp", "kernel/endian.hpp",
+              "kernel/kernel.hpp"):
         text = (REPO / "src" / h).read_text().replace("#pragma once", "")
         text = re.sub(r'#include [<"](kernel|blake3pp)/[^>"]+[>"][^\n]*\n', "", text)
         out.append(text.rstrip() + "\n")
 
     # The build generates these two; inline them instead.
+    # The second kernel is registered under exactly the condition that
+    # emits it: dispatch would otherwise name a variant whose ops table
+    # this file does not carry, which is a link error.
     registry = ("BLAKE3PP_KERNEL(scalar)\n"
-                "#ifdef BLAKE3PP_AMALGAM_NS\n"
+                "#if defined(BLAKE3PP_AMALGAM_NS) && "
+                "!defined(BLAKE3PP_AMALGAM_SCALAR_ONLY)\n"
                 "BLAKE3PP_KERNEL(BLAKE3PP_AMALGAM_NS)\n#endif\n")
     stamp = f'#define BLAKE3PP_STAMPED_VERSION "{version()}-amalgamated"\n'
     out += ["#define BLAKE3PP_FORCE_SCALAR 1",

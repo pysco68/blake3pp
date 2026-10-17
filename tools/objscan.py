@@ -627,7 +627,13 @@ def cmd_audit(args):
         per_arch = rules.get(arch, {})
         spec = next((s for s in per_arch.get("variants", []) if re.fullmatch(s["match"], variant)), None)
         if spec is None:
-            print(f"  {variant:<12} {len(insns):6d} insns  (no rule for {variant} on {arch})")
+            # A variant nobody wrote a rule for is not a variant that
+            # passed: the audit exists to say that a kernel got its flags,
+            # and it cannot say that about one it does not know.
+            print(f"  {variant:<12} {len(insns):6d} insns  "
+                  f"NO RULE for {variant} on {arch}: add one to the rules "
+                  f"file, since an unaudited kernel is not an audited one")
+            failures += 1
             continue
         ok, notes = True, []
         req = spec.get("require")

@@ -3,7 +3,7 @@
 //
 // Every member forwards to the native context named by
 // io/backend_select.hpp. The only real work here is fitting the
-// backend's operation inside the caller-owned io_read_op and putting the
+// backend's operation inside the caller-owned io_op and putting the
 // arena on the right side of the drain.
 
 #include <blake3pp/detail/io_driver.hpp>
@@ -26,9 +26,9 @@ namespace blake3pp::detail {
 
 namespace {
 using context = io_impl::native_io_context;
-using native_op = context::read_op;
+using native_op = context::transfer;
 
-// The backend's operation lives inside the caller's io_read_op, whose
+// The backend's operation lives inside the caller's io_op, whose
 // emplace_native() checks the fit and the trivial destructor where the
 // op is constructed. A backend that outgrows the storage fails that
 // check: raise storage_size in the header. One whose op acquires
@@ -40,8 +40,12 @@ static_assert(io_driver::direct_alignment == io_impl::direct_align,
 
 // The backend completes its own op; this carries that across to the
 // caller's, which is the only one the pipeline knows about.
-void trampoline(io_impl::read_op_base* base, std::error_code ec) noexcept {
-  auto* const outer = static_cast<io_read_op*>(base->owner);
+void trampoline(io_impl::transfer_base* base, std::error_code ec) noexcept {
+  auto* const outer = static_cast<io_op*>(base->owner);
+  // The transfer is settled before the callback runs, so a callback that
+  // resubmits this operation -- or a sweep that runs after it -- sees the
+  // storage as what it is: nothing the driver owes.
+  outer->live = false;
   outer->done(outer, ec);
 }
 }  // namespace
@@ -93,7 +97,7 @@ struct io_driver::file::impl {
   impl& operator=(const impl&) = delete;
 };
 
-io_read_op_layout native_read_op_layout() noexcept {
+io_op_layout native_op_layout() noexcept {
   return {sizeof(native_op), alignof(native_op)};
 }
 
@@ -131,19 +135,23 @@ void io_driver::file::set_size(std::uint64_t bytes) {
 }
 
 void io_driver::submit_read(file& f, std::uint64_t off,
-                            std::span<std::byte> buf, io_read_op& op) {
+                            std::span<std::byte> buf, io_op& op) {
   native_op& inner = op.emplace_native<native_op>();
   inner.done = &trampoline;
   inner.owner = &op;
   impl_->ctx.submit_read(f.impl_->f, off, buf, inner);
+  // Taken: from here the context owes this operation a callback.
+  op.live = true;
 }
 
 void io_driver::submit_write(file& f, std::uint64_t off,
-                             std::span<const std::byte> buf, io_read_op& op) {
+                             std::span<const std::byte> buf, io_op& op) {
   native_op& inner = op.emplace_native<native_op>();
   inner.done = &trampoline;
   inner.owner = &op;
   impl_->ctx.submit_write(f.impl_->f, off, buf, inner);
+  // Taken: from here the context owes this operation a callback.
+  op.live = true;
 }
 
 void io_driver::flush() noexcept { impl_->ctx.flush(); }
@@ -152,7 +160,17 @@ std::size_t io_driver::poll(bool block) { return impl_->ctx.poll(block); }
 
 void io_driver::wake() noexcept { impl_->ctx.wake(); }
 
-void io_driver::cancel(io_read_op& op) noexcept {
+void io_driver::cancel(io_op& op) noexcept {
+  // Only an operation this driver owes can be cancelled. A caller's sweep
+  // sees windows, not submits: a window is counted in flight from the
+  // moment it is admitted, and its write is submitted only after the fill
+  // that feeds it has run. So an op that was never taken, or whose
+  // callback has already run, can reach here. Its storage holds no backend
+  // operation, or the previous transfer's with a stale ring flag, and
+  // must not be handed to the device.
+  if (!op.live) {
+    return;
+  }
   // The backend's own op is the one the context knows, and it lives in
   // the storage this read's submit constructed it in.
   impl_->ctx.cancel(op.native<native_op>());
@@ -163,6 +181,8 @@ std::size_t io_driver::in_flight() const noexcept {
 }
 
 void io_driver::drain() noexcept { impl_->ctx.drain(); }
+
+void io_driver::drain(file& f) noexcept { impl_->ctx.forget(f.impl_->f); }
 
 void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
   // One arena per driver, taken once when its window pool is built.
