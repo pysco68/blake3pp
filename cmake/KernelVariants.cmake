@@ -42,10 +42,7 @@ function(blake3pp_probe_flag_candidates out_var probe_name)
     string(MAKE_C_IDENTIFIER "${probe_name}_${cand}" var)
     set(trial "${cand}")
     if(PF_PROBE_VLEN)
-      string(REPLACE "@VLEN@" "${PF_PROBE_VLEN}" trial "${trial}")
-      # SVE's cc1 spelling counts 128-bit granules, not bits.
-      math(EXPR _vscale "${PF_PROBE_VLEN} / 128")
-      string(REPLACE "@VSCALE@" "${_vscale}" trial "${trial}")
+      _blake3pp_fill_vlen("${trial}" "${PF_PROBE_VLEN}" trial)
     endif()
     string(REPLACE "|" " " trial "${trial}")
     string(REPLACE ";" " " extra "${PF_PROBE_EXTRA_FLAGS}")
@@ -75,6 +72,16 @@ function(_blake3pp_external_gcc_smoke out_var compiler smoke_name source)
     set(${out_var} FALSE PARENT_SCOPE)
   endif()
 endfunction()
+
+# The cross ISAs (POWER, IBM z, MIPS) are GNU-spelling only: no
+# MSVC-frontend compiler targets them, so their registrars decline rather
+# than probe flags cl.exe will never accept. A macro, not a function: the
+# return() has to leave the registrar.
+macro(_blake3pp_decline_on_msvc_frontend)
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    return()
+  endif()
+endmacro()
 
 function(_blake3pp_register_x86_kernels)
   if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
@@ -109,12 +116,22 @@ function(_blake3pp_register_x86_kernels)
   endif()
 endfunction()
 
-# <pattern> <vlen> <out>: the probed candidate with its vector length
-# filled in, split into arguments.
-function(_blake3pp_sve_flags pattern vlen out)
+# <pattern> <vlen> <out>: the placeholders a candidate flag set carries,
+# filled in for one vector length. @VLEN@ is the length in bits; @VSCALE@
+# is the same length in 128-bit granules, which is what SVE's cc1 spelling
+# counts. Used by the probe (one length, to find a candidate that works)
+# and by every registration (one length per kernel).
+function(_blake3pp_fill_vlen pattern vlen out)
   math(EXPR _vscale "${vlen} / 128")
   string(REPLACE "@VLEN@" "${vlen}" _f "${pattern}")
   string(REPLACE "@VSCALE@" "${_vscale}" _f "${_f}")
+  set(${out} "${_f}" PARENT_SCOPE)
+endfunction()
+
+# <pattern> <vlen> <out>: the probed candidate with its vector length
+# filled in, split into arguments.
+function(_blake3pp_expand_flags pattern vlen out)
+  _blake3pp_fill_vlen("${pattern}" "${vlen}" _f)
   separate_arguments(_f UNIX_COMMAND "${_f}")
   # -Xclang applies to the ONE argument after it, and CMake removes
   # duplicate compile options: a plain list holding it twice reaches the
@@ -224,26 +241,28 @@ function(_blake3pp_register_aarch64_kernels)
     # instant SIGILL on non-SVE hardware, defeating the fat binary.
     _blake3pp_fetch_xsimd()
   endif()
-  if(_blake3pp_sve1_flag)
-    _blake3pp_sve_flags("${_blake3pp_sve1_flag}" 256 _flags)
-    blake3pp_add_kernel(sve256 FORCE_XSIMD ARCH_FLAGS ${_flags})
-    _blake3pp_sve_flags("${_blake3pp_sve1_flag}" 512 _flags)
-    blake3pp_add_kernel(sve512 FORCE_XSIMD ARCH_FLAGS ${_flags})
-    if(BLAKE3PP_SVE_ALL_VARIANTS)
-      _blake3pp_sve_flags("${_blake3pp_sve1_flag}" 128 _flags)
-      blake3pp_add_kernel(sve128 FORCE_XSIMD ARCH_FLAGS ${_flags})
+  # One row per variant: the SVE generation its flag pattern comes from,
+  # the kernel name, its vector length, and whether shipping silicon has
+  # that combination. The |-joined row is this file's convention for a
+  # multi-value item (see CANDIDATES above), since CMake flattens ;-lists.
+  foreach(row IN ITEMS "1|sve256|256|shipping" "1|sve512|512|shipping"
+                       "1|sve128|128|emulator" "2|sve2_128|128|shipping"
+                       "2|sve2_256|256|emulator" "2|sve2_512|512|emulator")
+    string(REPLACE "|" ";" row "${row}")
+    list(GET row 0 _gen)
+    list(GET row 1 _name)
+    list(GET row 2 _vlen)
+    list(GET row 3 _where)
+    set(_pattern "${_blake3pp_sve${_gen}_flag}")
+    if(NOT _pattern)
+      continue()  # the probe found no spelling for this generation
     endif()
-  endif()
-  if(_blake3pp_sve2_flag)
-    _blake3pp_sve_flags("${_blake3pp_sve2_flag}" 128 _flags)
-    blake3pp_add_kernel(sve2_128 FORCE_XSIMD ARCH_FLAGS ${_flags})
-    if(BLAKE3PP_SVE_ALL_VARIANTS)
-      _blake3pp_sve_flags("${_blake3pp_sve2_flag}" 256 _flags)
-      blake3pp_add_kernel(sve2_256 FORCE_XSIMD ARCH_FLAGS ${_flags})
-      _blake3pp_sve_flags("${_blake3pp_sve2_flag}" 512 _flags)
-      blake3pp_add_kernel(sve2_512 FORCE_XSIMD ARCH_FLAGS ${_flags})
+    if(_where STREQUAL "emulator" AND NOT BLAKE3PP_SVE_ALL_VARIANTS)
+      continue()
     endif()
-  endif()
+    _blake3pp_expand_flags("${_pattern}" "${_vlen}" _flags)
+    blake3pp_add_kernel(${_name} FORCE_XSIMD ARCH_FLAGS ${_flags})
+  endforeach()
 endfunction()
 
 function(_blake3pp_register_riscv64_kernels)
@@ -301,8 +320,7 @@ function(_blake3pp_register_riscv64_kernels)
   if(_blake3pp_rvv_pattern)
     _blake3pp_fetch_xsimd()
     foreach(vlen IN ITEMS 128 256 512)
-      string(REPLACE "@VLEN@" "${vlen}" _flags "${_blake3pp_rvv_pattern}")
-      separate_arguments(_flags UNIX_COMMAND "${_flags}")
+      _blake3pp_expand_flags("${_blake3pp_rvv_pattern}" "${vlen}" _flags)
       blake3pp_add_kernel(rvv${vlen} FORCE_XSIMD ARCH_FLAGS ${_flags})
     endforeach()
     # The Zvbb twins: same kernels, single-instruction vror rotates via
@@ -315,9 +333,7 @@ function(_blake3pp_register_riscv64_kernels)
                  "-mcpu=baseline_rv64+v+zvbb+zvl@VLEN@b -mrvv-vector-bits=@VLEN@")
     if(_blake3pp_rvv_zvbb_pattern)
       foreach(vlen IN ITEMS 128 256 512)
-        string(REPLACE "@VLEN@" "${vlen}" _flags
-          "${_blake3pp_rvv_zvbb_pattern}")
-        separate_arguments(_flags UNIX_COMMAND "${_flags}")
+        _blake3pp_expand_flags("${_blake3pp_rvv_zvbb_pattern}" "${vlen}" _flags)
         blake3pp_add_kernel(rvv${vlen}_zvbb FORCE_XSIMD ARCH_FLAGS ${_flags})
       endforeach()
     endif()
@@ -330,14 +346,10 @@ function(_blake3pp_register_riscv64_kernels)
   option(BLAKE3PP_XTHEAD_KERNEL
     "Compile the hand-written T-Head XTheadVector (RVV 0.7.1) kernel" OFF)
   if(BLAKE3PP_XTHEAD_KERNEL)
-    set(CMAKE_REQUIRED_FLAGS "-march=rv64gc_xtheadvector")
-    # Compile-only probe: linking a full exe would trip binutils'
-    # xtheadvector-vs-v attribute-merge refusal against the distro crt
-    # objects, the very conflict the -mno-riscv-attribute pair below
-    # solves for the real kernel object.
-    set(_blake3pp_saved_tct "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
-    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-    check_cxx_source_compiles([=[
+    # One snippet for both routes (the primary compiler's probe and the
+    # external GCC's), and one flag set for both kernels: the attribute
+    # suppression pair is explained at the registration below.
+    set(_blake3pp_xthead_smoke [=[
       #include <riscv_th_vector.h>
       int main() {
         unsigned buf[4] = {1, 2, 3, 4};
@@ -346,7 +358,18 @@ function(_blake3pp_register_riscv64_kernels)
         __riscv_th_vsw_v_u32m1(buf, a, 4);
         return static_cast<int>(buf[0]) - 2;
       }
-    ]=] BLAKE3PP_COMPILER_XTHEADVECTOR)
+    ]=])
+    set(_blake3pp_xthead_flags -march=rv64gc_xtheadvector
+                               -mno-riscv-attribute -Wa,-mno-arch-attr)
+    set(CMAKE_REQUIRED_FLAGS "-march=rv64gc_xtheadvector")
+    # Compile-only probe: linking a full exe would trip binutils'
+    # xtheadvector-vs-v attribute-merge refusal against the distro crt
+    # objects, the very conflict the -mno-riscv-attribute pair below
+    # solves for the real kernel object.
+    set(_blake3pp_saved_tct "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    check_cxx_source_compiles("${_blake3pp_xthead_smoke}"
+      BLAKE3PP_COMPILER_XTHEADVECTOR)
     set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_blake3pp_saved_tct}")
     unset(CMAKE_REQUIRED_FLAGS)
     if(BLAKE3PP_COMPILER_XTHEADVECTOR)
@@ -359,8 +382,7 @@ function(_blake3pp_register_riscv64_kernels)
       # -Wa,-mno-arch-attr the assembler's own; the attribute is advisory
       # metadata, and execution gating is runtime dispatch's job.
       blake3pp_add_kernel(xthead SOURCE src/kernel/xthead_kernel.cpp
-        ARCH_FLAGS -march=rv64gc_xtheadvector
-                   -mno-riscv-attribute -Wa,-mno-arch-attr)
+        ARCH_FLAGS ${_blake3pp_xthead_flags})
     else()
       # The primary compiler cannot express XTheadVector: LLVM never
       # merged it, so the zig/clang musl chain lands here. Borrow the
@@ -372,22 +394,13 @@ function(_blake3pp_register_riscv64_kernels)
       find_program(BLAKE3PP_XTHEAD_GCC riscv64-linux-gnu-g++)
       if(BLAKE3PP_XTHEAD_GCC)
         _blake3pp_external_gcc_smoke(_xthead_gcc_ok
-          "${BLAKE3PP_XTHEAD_GCC}" xthead_smoke [=[
-#include <riscv_th_vector.h>
-int probe() {
-  unsigned buf[4] = {1, 2, 3, 4};
-  vuint32m1_t a = __riscv_th_vlwu_v_u32m1(buf, 4);
-  a = __riscv_vadd_vv_u32m1(a, a, 4);
-  __riscv_th_vsw_v_u32m1(buf, a, 4);
-  return static_cast<int>(buf[0]) - 2;
-}
-]=] -march=rv64gc_xtheadvector)
+          "${BLAKE3PP_XTHEAD_GCC}" xthead_smoke
+          "${_blake3pp_xthead_smoke}" -march=rv64gc_xtheadvector)
         if(_xthead_gcc_ok)
           message(STATUS "blake3pp: xthead kernel via external ${BLAKE3PP_XTHEAD_GCC}")
           blake3pp_add_kernel(xthead SOURCE src/kernel/xthead_kernel.cpp
             EXTERNAL_COMPILER "${BLAKE3PP_XTHEAD_GCC}"
-            ARCH_FLAGS -march=rv64gc_xtheadvector
-                       -mno-riscv-attribute -Wa,-mno-arch-attr)
+            ARCH_FLAGS ${_blake3pp_xthead_flags})
         else()
           message(WARNING "blake3pp: BLAKE3PP_XTHEAD_KERNEL=ON but neither "
             "the primary compiler nor ${BLAKE3PP_XTHEAD_GCC} can build "
@@ -411,9 +424,7 @@ function(_blake3pp_register_ppc64_kernels)
   # Correctness was validated byte-identical against the x86 golden
   # under qemu-ppc64le before this family existed. GNU-frontend
   # spelling only, like the other cross ISAs.
-  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    return()
-  endif()
+  _blake3pp_decline_on_msvc_frontend()
   # Mirrors xsimd's own gate (XSIMD_WITH_VSX = __VEC__ && __VSX__)
   # without needing its headers on the probe include path. Candidate
   # spellings: GCC says power9, clang/zig say pwr9.
@@ -446,9 +457,7 @@ function(_blake3pp_register_mips_kernels)
   # this kernel, and every throughput number for it would be a qemu
   # number. It ships with that stated, on the same terms as the POWER and
   # IBM z variants, minus their hardware.
-  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    return()
-  endif()
+  _blake3pp_decline_on_msvc_frontend()
   # -mmsa alone is not enough: MSA is an r5 extension and the distro
   # baseline is r2, so the arch has to be raised with it. GCC predefines
   # __mips_msa and __mips_msa_width when both land.
@@ -474,9 +483,7 @@ function(_blake3pp_register_s390x_kernels)
   # validated byte-identical against the x86 golden under qemu-s390x
   # before this family existed. -mzvector is what unlocks xsimd's
   # VXE backend.
-  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    return()
-  endif()
+  _blake3pp_decline_on_msvc_frontend()
   # Mirrors xsimd's own gate (XSIMD_WITH_VXE = __VEC__ >= 10304 &&
   # __ARCH__ >= 12) without needing its headers on the probe path.
   # Candidate spellings: GCC takes -march=z14, clang/zig -mcpu=z14.

@@ -277,6 +277,21 @@ function(blake3pp_add_kernel ns)
       VERBATIM)
     add_custom_target(blake3pp_kernel_${ns}_external DEPENDS "${_ak_obj}")
     set_property(GLOBAL APPEND PROPERTY BLAKE3PP_KERNELS "${ns}")
+  # What this variant was compiled with, for anything that has to reproduce
+  # the kernel's own build without re-spelling it: the dispatch-cost benches
+  # compile the same TU per variant and read these back.
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_FLAGS" "${AK_ARCH_FLAGS}")
+  set(_ak_provider "facade")
+  if(AK_FORCE_SCALAR)
+    set(_ak_provider "scalar")
+  elseif(AK_FORCE_VEXT)
+    set(_ak_provider "vext")
+  elseif(AK_FORCE_XSIMD)
+    set(_ak_provider "xsimd")
+  endif()
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
+
     set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_OBJECT" "${_ak_obj}")
     return()
   endif()
@@ -364,6 +379,20 @@ function(blake3pp_add_kernel ns)
     POSITION_INDEPENDENT_CODE ON)
 
   set_property(GLOBAL APPEND PROPERTY BLAKE3PP_KERNELS "${ns}")
+  # What this variant was compiled with, for anything that has to reproduce
+  # the kernel's own build without re-spelling it: the dispatch-cost benches
+  # compile the same TU per variant and read these back.
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_FLAGS" "${AK_ARCH_FLAGS}")
+  set(_ak_provider "facade")
+  if(AK_FORCE_SCALAR)
+    set(_ak_provider "scalar")
+  elseif(AK_FORCE_VEXT)
+    set(_ak_provider "vext")
+  elseif(AK_FORCE_XSIMD)
+    set(_ak_provider "xsimd")
+  endif()
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
 endfunction()
 
 # Attaches every registered kernel's objects to <target> and generates the

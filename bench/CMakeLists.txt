@@ -95,17 +95,31 @@ endif()
 # per vector variant the compiler can express for this target, then
 # called through a table pointer, through a plain call and by name.
 # Linux gets hardware counters through perf_event_open; elsewhere the
-# wall clock. The kernel flags mirror blake3pp_add_kernel()'s.
+# wall clock.
+#
+# The flags and the provider pin are the registered kernel's own, read back
+# from the properties blake3pp_add_kernel() records: this compiles the same
+# TU as the library and a second spelling of the flags would be a second
+# thing to keep in step. A variant this build did not register has none, and
+# the bench for it is skipped.
 function(_blake3pp_dispatch_cost ns)
+  get_property(_dc_kernels GLOBAL PROPERTY BLAKE3PP_KERNELS)
+  if(NOT ns IN_LIST _dc_kernels)
+    return()
+  endif()
+  get_property(_dc_flags GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_FLAGS")
+  get_property(_dc_provider GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER")
+  get_property(_dc_vext_bytes GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES")
   set(tgt blake3pp_dispatch_cost_${ns})
   add_executable(${tgt} dispatch_cost.cpp)
   get_property(_dc_switches GLOBAL PROPERTY BLAKE3PP_KERNEL_SWITCHES)
   target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_ARCH_NS=${ns}" ${_dc_switches})
-  if(ns STREQUAL "scalar")
-    # The same pin blake3pp_add_kernel(scalar FORCE_SCALAR) applies.
+  if(_dc_provider STREQUAL "scalar")
     target_compile_definitions(${tgt} PRIVATE BLAKE3PP_FORCE_SCALAR=1)
-  elseif(ns MATCHES "^rvv")
-    # The RVV kernels are xsimd-provider kernels, as in KernelVariants.
+  elseif(_dc_provider STREQUAL "vext")
+    target_compile_definitions(${tgt} PRIVATE
+      BLAKE3PP_FORCE_VEXT=1 "BLAKE3PP_VEXT_BYTES=${_dc_vext_bytes}")
+  elseif(_dc_provider STREQUAL "xsimd")
     target_compile_definitions(${tgt} PRIVATE BLAKE3PP_FORCE_XSIMD=1)
     target_link_libraries(${tgt} PRIVATE xsimd)
   endif()
@@ -119,7 +133,8 @@ function(_blake3pp_dispatch_cost ns)
   # and GCC otherwise specialises a clone of the kernel entry for them,
   # which the indirect call cannot reach, and the two paths stop running
   # the same body. Clang has neither pass to disable.
-  target_compile_options(${tgt} PRIVATE ${ARGN} "$<$<CONFIG:Release,RelWithDebInfo>:-O3>"
+  target_compile_options(${tgt} PRIVATE ${_dc_flags}
+    "$<$<CONFIG:Release,RelWithDebInfo>:-O3>"
     "$<$<CXX_COMPILER_ID:GNU>:-fno-devirtualize;-fno-ipa-cp-clone>")
   target_include_directories(${tgt} PRIVATE
     "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/include")
@@ -135,27 +150,21 @@ if(BLAKE3PP_BENCH_DISPATCH_COST
   # The detection ladder's cost: the first call of a fresh process.
   add_executable(blake3pp_detect_cost detect_cost.cpp)
   target_link_libraries(blake3pp_detect_cost PRIVATE blake3pp::blake3pp blake3pp_warnings)
+  # Which variants the call-site question needs, per architecture; each one
+  # is built only if the library registered it, with that kernel's flags.
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    _blake3pp_dispatch_cost(scalar)
-    _blake3pp_dispatch_cost(sse42 -msse4.2)
-    _blake3pp_dispatch_cost(avx2 -mavx2)
-    _blake3pp_dispatch_cost(avx512 -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq)
+    foreach(ns IN ITEMS scalar sse42 avx2 avx512)
+      _blake3pp_dispatch_cost(${ns})
+    endforeach()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-    _blake3pp_dispatch_cost(scalar)
-    _blake3pp_dispatch_cost(neon)
+    foreach(ns IN ITEMS scalar neon)
+      _blake3pp_dispatch_cost(${ns})
+    endforeach()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(riscv64)$")
-    _blake3pp_dispatch_cost(scalar)
-    # One RVV width is enough for the call-site question; the two flag
-    # spellings are KernelVariants' (its probe result is scoped to its
-    # own function, so the probe is repeated here).
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-march=rv64gcv_zvl256b -mrvv-vector-bits=zvl" BLAKE3PP_DC_RVV_MARCH)
-    if(BLAKE3PP_DC_RVV_MARCH)
-      _blake3pp_dispatch_cost(rvv256 -march=rv64gcv_zvl256b -mrvv-vector-bits=zvl)
-    else()
-      # zig's clang wants the cpu+features spelling and a numeric width.
-      _blake3pp_dispatch_cost(rvv256 -mcpu=baseline_rv64+v+zvl256b -mrvv-vector-bits=256)
-    endif()
+    # One RVV width is enough for the call-site question.
+    foreach(ns IN ITEMS scalar rvv256)
+      _blake3pp_dispatch_cost(${ns})
+    endforeach()
   endif()
 endif()
 
