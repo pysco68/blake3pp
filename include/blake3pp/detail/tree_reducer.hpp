@@ -37,7 +37,7 @@ namespace blake3pp::detail {
 // unmerged nodes may be in flight at once.
 //
 // Capacity: while the inserted ranges form a contiguous run broken by at
-// most K holes, pending stays at or below (K + 1) * 2 * 64 -- each of the
+// most K holes, pending stays at or below (K + 1) * 2 * 54 -- each of the
 // K + 1 contiguous segments decomposes into at most one ascending and one
 // descending chain of aligned nodes, one per level, and a message at
 // BLAKE3's 2^64-byte limit is 54 levels deep. An arbitrary insertion order
@@ -267,9 +267,12 @@ struct cv_run {
             "fold_aligned_runs(): an output span shorter than the run's "
             "decomposition (2 * 54 nodes covers any run)");
     tree_reducer::node& node = out[count++];
-    node.first_chunk =
-        run.base_chunk + static_cast<std::uint64_t>(i) * run.part_chunks;
-    node.chunks = static_cast<std::uint64_t>(parts) * run.part_chunks;
+    // i and parts stay std::size_t (they also index and size run.cvs), but
+    // multiplying either by the std::uint64_t part_chunks already widens
+    // it to std::uint64_t by the usual arithmetic conversions -- lossless
+    // on any size_t width, so no explicit cast earns its keep here.
+    node.first_chunk = run.base_chunk + i * run.part_chunks;
+    node.chunks = parts * run.part_chunks;
     if (parts == 1) {
       node.cv = run.cvs[i];
     } else {

@@ -89,6 +89,7 @@ BLAKE3 is more than a 32-byte digest, and all of it is available:
 | [Examples](examples/index.md) | ten standalone programs, one per subject. Start here if you learn by reading code |
 | [The API](api.md) | the guide across the library: what you compute, how you feed it, what runs it, what it costs |
 | [Reference](reference/index.md) | every declaration on its own terms, generated from the headers' doc comments |
+| [Inside the pipeline](pipeline.md) | how a file becomes sender chains: one window's chain, the rules that hold it, and the tree reducer |
 | [Many files at once](async.md) | EXPERIMENTAL: file hashing as senders over a context you drive |
 | [Architectures and kernels](architectures.md) | which SIMD variants a build carries, and how dispatch picks one |
 | [Performance](performance.md) | this library against the reference implementation, per machine, with the runs behind the charts |

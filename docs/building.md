@@ -50,6 +50,76 @@ recipes are in `docker/README.md` too. Two kernel sets are opt-in:
   XTheadVector (draft RVV 0.7.1) kernel, which only T-Head's qemu fork
   can execute
 
+## Provider and polyfill selection
+
+Two cache variables, each an explicit choice with an `auto` default,
+pick what the SIMD facade and the sender/receiver pipeline compile
+against. `cmake/StdFeatures.cmake` is the sole authority: it probes the
+active toolchain by compiling real usage rather than trusting
+feature-test macros, and the resolved choice is what every preset
+above actually builds with. The reasoning behind the defaults and the
+toolchain-specific overrides is in [Polyfills](polyfills.md); this is
+the configure-time surface.
+
+```
+-DBLAKE3PP_SIMD_PROVIDER=auto|std|std-experimental|xsimd
+-DBLAKE3PP_EXECUTION_PROVIDER=auto|std|beman|stdexec
+```
+
+`BLAKE3PP_SIMD_PROVIDER=auto` tries native `std::simd` (C++26 `<simd>`)
+first, falls back to the Parallelism TS v2 `std::experimental::simd`,
+and falls back again to xsimd, which is always buildable since it is a
+fetched header-only dependency with no toolchain requirement of its
+own. `std` and `std-experimental` each fail the configure outright if
+the probe behind them does not pass, rather than silently substituting
+something else; `xsimd` skips the std probes entirely.
+
+`BLAKE3PP_EXECUTION_PROVIDER=auto` picks `std::execution` when the
+standard library has a usable one and NVIDIA stdexec otherwise;
+beman.execution is never chosen by `auto` and needs the explicit
+`-DBLAKE3PP_EXECUTION_PROVIDER=beman` (it also needs C++23 or newer,
+which the project's C++20 presets cannot offer). `BLAKE3PP_SIZED_PARALLEL_SCHEDULER`
+(off by default) additionally builds `blake3pp::parallel_backend`, the
+sizable process-wide scheduler, and under beman builds its default
+backend out so the program keeps one definition of it.
+
+A configure reports every probe and the resolved choice regardless of
+whether either variable was touched:
+
+```
+-- blake3pp: BLAKE3PP_HAS_STD_SIMD = yes
+-- blake3pp: simd provider choice = auto
+-- blake3pp: BLAKE3PP_HAS_STD_SENDERS = no (polyfill path)
+-- blake3pp: execution provider = stdexec (BLAKE3PP_EXECUTION_PROVIDER=auto)
+```
+
+and a running binary reports which provider it was actually built with,
+independent of the configure log:
+
+```cpp
+blake3pp::simd_provider();       // "std::simd", "std::experimental::simd",
+                                  // "xsimd", or "none (scalar only)"
+blake3pp::execution_provider();  // "std::execution", "beman.execution",
+                                  // "stdexec", or "none"
+```
+
+(`blake3ppsum --version` prints both; so does the wasm module's
+`b3pp.simd_provider()`/`b3pp.execution_provider()`, see
+[Architectures and kernels](architectures.md).) A handful of
+cross-compiling toolchains pin `BLAKE3PP_SIMD_PROVIDER` themselves
+instead of leaving it on `auto` --
+`linux-riscv64-gcc15-cxx23`, `linux-ppc64le-gcc15-cxx23`,
+`linux-s390x-gcc15-cxx23` and the ppc64le/s390x zigmusl presets set it
+to `xsimd`, and `linux-mips64el-gcc14-cxx23` sets `std-experimental` --
+because each one's vector kernel already pins a provider for reasons
+specific to that ISA which `auto`'s probes cannot see, and leaving the
+project-wide variable on `auto` would make `simd_provider()` report a
+provider the kernel does not actually use.
+
+Overriding either variable on a preset that does not need it is for
+re-measuring a provider choice, the same spirit as the kernel tuning
+switches below.
+
 ## Coverage
 
 The `linux-clang22-cxx26-coverage` preset instruments at the plain

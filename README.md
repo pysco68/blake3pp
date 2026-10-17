@@ -34,44 +34,11 @@ That call opens the file with direct I/O, keeps several windows in flight,
 hashes with the widest kernel the processor turns out to have and spreads
 the work over all cores the system has.
 
-<details>
-<summary>How the file path is built</summary>
-
-A file is cut into windows. Each window is one sender chain:
-
-```
-read(window)                 // completes on the driver's thread
-  | let_value(compress)      // the window's parts, over your scheduler
-  | continues_on(driver)     // back to the driver's thread
-  | then(reduce_into_tree)   // order-free
-```
-
-Several of those run at once. A window's parts compress in parallel and
-fold to one chaining value, which goes into a tree reducer that accepts
-windows in any order and hands the hasher subtrees in message order --
-so the device is never waiting for the hash, and the hash is never
-waiting for a particular window.
-
-One thread drives it. That thread is the only one that touches the I/O
-context, and three rules hold the shape together: a transfer's callback
-runs only inside `poll()`, nothing completes inside a `start()`, and
-once a stage has published work to the run queue it touches only the
-loop. A pool thread that finishes a window parks a node on the run queue
-and nudges the driver awake rather than reaching into it.
-
-Writes run the same chain backwards: generate on the pool, write on the
-driver, with no reducer, because a window's bytes depend on its offset and
-nothing else. That is `write_file()`. It also comes in a form that needs
-no scheduler, and in one whose generator decides the file's length.
-`blake3ppgen --output` is built on them.
-
-The storage is a window arena the driver owns, so a read is never in
-flight into memory that has already been freed. The blocking entry
-points allocate one per call; `<blake3pp/async_io.hpp>` gives the same
-pipeline as senders over a context that owns one arena for many files,
-which is most of the win on a directory of small ones.
-
-</details>
+Underneath, each window of the file is one `std::execution` sender chain --
+read, compress over your scheduler, absorb -- driven by the thread that
+called `hash_file()`, and a tree reducer takes the windows back in whatever
+order they finish. [Inside the pipeline](docs/pipeline.md) has the chain,
+the rules that hold it together, and the write direction.
 
 The whole specification is here, not just the digest:
 
@@ -177,6 +144,7 @@ All of this, rendered and searchable, with a version for every release:
 |---|---|
 | [Examples](examples/) | ten standalone programs, one per aspect of the library |
 | [The API](docs/api.md) | the guide across the library: what you compute, how you feed it, what runs it, what it costs |
+| [Inside the pipeline](docs/pipeline.md) | how a file becomes sender chains: one window's chain, the rules that hold it, and the tree reducer |
 | [Many files at once](docs/async.md) | EXPERIMENTAL: file hashing as senders over a context you drive |
 | [Architectures and kernels](docs/architectures.md) | details about every kernel a build carries and why the WASM build is an edge case |
 | [Command-line tools](docs/tools.md) | `blake3ppsum` and `blake3ppgen` |
