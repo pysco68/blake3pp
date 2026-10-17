@@ -403,6 +403,14 @@ BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
   return {u32v::load(lo), u32v::load(hi)};
 }
 
+// The two wide compressions below set up the same 16-word state and pick
+// block flags the same way, and folding either into a shared helper was
+// measured and rejected: the state initialiser costs the chunk path 1 to 3%
+// on Zen 3+ (gcc 16, four alternating rounds, 3.69-3.77 against 3.81
+// GiB/s), because it forces the XOF's broadcast chaining values through an
+// array and changes the register allocation of hash_batch's block loop.
+// The duplication is two sites in one file; the throughput is not.
+
 // Fills u32v::width consecutive XOF output blocks: the root node's cv and
 // message are BROADCAST (identical in every lane); only the counter varies
 // per lane. No input transpose exists at all; the store is the only
