@@ -295,7 +295,13 @@ BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   // measure its own.
 #if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__)) && \
     BLAKE3PP_KERNEL_PIN_MESSAGE
-  if constexpr (u32v::width >= 16) {
+  // Wide-word-only, like the staged_rounds gate below: u32v::width is the
+  // translation unit's width and says nothing about W. The scalar compress
+  // in this same TU -- the incremental hasher's partial block, and
+  // hash_many's remainder below pad_remainder_min -- has sixteen
+  // general-purpose registers and no register pressure to relieve, and
+  // nothing was measured for it.
+  if constexpr (std::is_same_v<W, u32v> && u32v::width >= 16) {
     asm volatile("" : : "r"(m));
   }
 #endif
@@ -311,29 +317,57 @@ BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   }(std::make_index_sequence<7>{});
 }
 
+// A caller's 64-byte block in a form the word loads may read.
+//
+// See BLAKE3PP_ALIGN_MESSAGE_BLOCK: where a compiler merges the sixteen
+// word loads into element-width vector loads, a block the caller aligned
+// to nothing faults on the targets that require the type's alignment.
+// Every path that reads a block through load32() goes through this, so
+// the mitigation cannot be complete for one of them and missing for
+// another.
+//
+// Staging unconditionally does not work: the optimizer forwards the copy
+// and rebuilds the loads from the original pointer. The aligned case,
+// which is the common one, pays one predictable branch and no copy.
+class readable_block {
+ public:
+  explicit BLAKE3PP_FORCE_INLINE readable_block(
+      const std::uint8_t* block) noexcept
+      : at_(block) {
+#if BLAKE3PP_ALIGN_MESSAGE_BLOCK
+    if ((std::bit_cast<std::uintptr_t>(at_) &
+         (alignof(std::uint32_t) - 1)) != 0) {
+      std::memcpy(staged_, at_, block_len);
+      at_ = staged_;
+    }
+    at_ = static_cast<const std::uint8_t*>(
+        __builtin_assume_aligned(at_, alignof(std::uint32_t)));
+#endif
+  }
+  readable_block(const readable_block&) = delete;
+  readable_block& operator=(const readable_block&) = delete;
+
+  [[nodiscard]] BLAKE3PP_FORCE_INLINE const std::uint8_t* get()
+      const noexcept {
+    return at_;
+  }
+
+ private:
+#if BLAKE3PP_ALIGN_MESSAGE_BLOCK
+  alignas(std::uint32_t) std::uint8_t staged_ BLAKE3PP_CXXATTR_UNINITIALIZED
+      [block_len];
+#endif
+  const std::uint8_t* at_;
+};
+
 BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
                      const std::uint8_t block[block_len], std::uint32_t len,
                      std::uint64_t counter, std::uint32_t flags,
                      std::array<std::uint32_t, 16>& out) noexcept {
-  // See BLAKE3PP_ALIGN_MESSAGE_BLOCK. Where the merged load would fault,
-  // an unaligned block is copied once so that the address really is
-  // aligned.
-  //
-  // Staging it unconditionally does not work: the optimizer forwards the
-  // copy and rebuilds the loads from the original pointer. The aligned
-  // case, which is the common one, pays one predictable branch and no
-  // copy.
-  const std::uint8_t* src = block;
-#if BLAKE3PP_ALIGN_MESSAGE_BLOCK
-  alignas(std::uint32_t) std::uint8_t staged BLAKE3PP_CXXATTR_UNINITIALIZED [block_len];
-  if ((std::bit_cast<std::uintptr_t>(src) &
-       (alignof(std::uint32_t) - 1)) != 0) {
-    std::memcpy(staged, src, block_len);
-    src = staged;
-  }
-  src = static_cast<const std::uint8_t*>(
-      __builtin_assume_aligned(src, alignof(std::uint32_t)));
-#endif
+  // See readable_block: where the merged load would fault, an unaligned
+  // block is copied once so that the address really is aligned.
+  const readable_block in(block);
+  const std::uint8_t* const src = in.get();
 
   std::uint32_t m BLAKE3PP_CXXATTR_UNINITIALIZED [16];
   for (std::size_t i = 0; i < 16; ++i) {
@@ -418,11 +452,11 @@ BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
 void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
               std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
               std::uint8_t* out) noexcept {
-  constexpr std::size_t W = u32v::width;
+  const readable_block in(block);
 
   u32v m[16];
   for (std::size_t i = 0; i < 16; ++i) {
-    m[i] = u32v::broadcast(load32(block + 4 * i));
+    m[i] = u32v::broadcast(load32(in.get() + 4 * i));
   }
 
   const auto [ctr_lo, ctr_hi] = counter_lanes(counter, true);
