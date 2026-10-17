@@ -217,6 +217,58 @@ TEST_CASE("hash_many agrees across all available arches") {
   }
 }
 
+// Input at every byte offset from a 64-byte boundary. The callers' buffers
+// carry no alignment, and RISC-V lets an implementation refuse a
+// misaligned vector access (the SpacemiT X60 does), so a kernel whose
+// compiler turned its loads into element-width vector loads of the
+// caller's pointer faults here while an aligned buffer passes.
+TEST_CASE("hash_many and compress agree with the oracle at every input offset") {
+  constexpr std::size_t max_blocks = chunk_len / block_len;
+  constexpr std::size_t n = blake3pp::kern::max_simd_degree + 1;
+  constexpr std::size_t stride = max_blocks * block_len + 1;
+  std::vector<std::uint8_t> storage(64 + n * stride + 64);
+  for (std::size_t i = 0; i < storage.size(); ++i) {
+    storage[i] = static_cast<std::uint8_t>((i * 13 + 5) % 251);
+  }
+  const auto base_addr = reinterpret_cast<std::uintptr_t>(storage.data());
+  std::uint8_t* const base = storage.data() + (64 - base_addr % 64) % 64;
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (std::size_t offset = 1; offset < 64; ++offset) {
+      CAPTURE(offset);
+      const std::uint8_t* inputs[n];
+      for (std::size_t i = 0; i < n; ++i) {
+        inputs[i] = base + offset + i * stride;
+      }
+      for (const std::size_t blocks : {std::size_t{1}, max_blocks}) {
+        CAPTURE(blocks);
+        std::vector<std::uint8_t> expected(n * out_len);
+        scalar::ops.hash_many(inputs, n, blocks, iv.data(), 3, true, 0,
+                              flag_chunk_start, flag_chunk_end,
+                              expected.data());
+        std::vector<std::uint8_t> out(n * out_len, 0xee);
+        ops->hash_many(inputs, n, blocks, iv.data(), 3, true, 0,
+                       flag_chunk_start, flag_chunk_end, out.data());
+        CHECK(out == expected);
+      }
+      std::array<std::uint32_t, 8> want = iv;
+      scalar::ops.compress_in_place(want.data(), inputs[0],
+                                    static_cast<std::uint32_t>(block_len), 9,
+                                    flag_chunk_start);
+      std::array<std::uint32_t, 8> got = iv;
+      ops->compress_in_place(got.data(), inputs[0],
+                             static_cast<std::uint32_t>(block_len), 9,
+                             flag_chunk_start);
+      CHECK(got == want);
+    }
+  }
+}
+
 TEST_CASE("hash_many matches a per-input compress loop") {
   // Four "chunks" of 2 blocks each, deterministic contents.
   constexpr std::size_t num_inputs = 4;
