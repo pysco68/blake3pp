@@ -154,9 +154,19 @@ struct win_file {
   }
 
   // NO_BUFFERING and OVERLAPPED are per-open flags: engage by reopening,
-  // keeping the plain handle for unaligned lengths. Best-effort: a
-  // refused reopen, or a port that will not attach, leaves the
-  // plain handle in charge with direct/use_iocp still false.
+  // keeping the plain handle for unaligned lengths. Best-effort: when
+  // nothing can be engaged the plain handle stays in charge with direct
+  // and use_iocp still false.
+  //
+  // Per feature, not all-or-nothing. The two flags are asked for together
+  // first, and a refusal drops one and asks again: NO_BUFFERING is a
+  // property of the filesystem (SMB and some virtual volumes reject it)
+  // while OVERLAPPED is not, and buffered async on Windows measures within
+  // noise of direct async, so the port is the half worth keeping. Asking
+  // for both at once and giving up on a refusal is what made direct_io =
+  // true SLOWER than false on such a volume: the file lost its IOCP with
+  // the cache bypass it could not have.
+  //
   // shared_port, when given, is a port this file does not own: the reader
   // context keeps one port for every file it opens, while the writer still
   // creates its own here. Ownership is the only difference; association
@@ -164,48 +174,75 @@ struct win_file {
   void engage(const wchar_t* path, DWORD access, DWORD share,
               bool want_direct, bool want_async,
               HANDLE shared_port = nullptr, bool writing = false) noexcept {
-    if (!want_direct && !want_async) {
-      return;
-    }
-    DWORD flags = FILE_ATTRIBUTE_NORMAL;
-    if (want_direct) {
-      flags |= FILE_FLAG_NO_BUFFERING;
-    }
-    if (want_async) {
-      flags |= FILE_FLAG_OVERLAPPED;
-    }
-    // OPEN_EXISTING on the reopen in both directions: the plain handle
-    // has already created and truncated a file being written, and a
-    // second CREATE_ALWAYS here would truncate it again -- including any
+    // OPEN_EXISTING on the reopen in both directions: the plain handle has
+    // already created and truncated a file being written, and a second
+    // CREATE_ALWAYS here would truncate it again -- including any
     // preallocation just set on it.
     (void)writing;
+    if (want_direct && want_async) {
+      if (engage_one(path, access, share, true, true, shared_port)) {
+        return;
+      }
+      // The port first, as the measured better half.
+      if (engage_one(path, access, share, false, true, shared_port)) {
+        return;
+      }
+      (void)engage_one(path, access, share, true, false, shared_port);
+      return;
+    }
+    if (want_direct || want_async) {
+      (void)engage_one(path, access, share, want_direct, want_async,
+                       shared_port);
+    }
+  }
+
+  // One rung: reopen with exactly these two flags, attach the port when
+  // async was asked for, and take the handle only if both steps worked.
+  // Leaves everything untouched on failure, so the caller may ask again
+  // for less.
+  [[nodiscard]] bool engage_one(const wchar_t* path, DWORD access, DWORD share,
+                                bool with_direct, bool with_async,
+                                HANDLE shared_port) noexcept {
+    DWORD flags = FILE_ATTRIBUTE_NORMAL;
+    if (with_direct) {
+      flags |= FILE_FLAG_NO_BUFFERING;
+    }
+    if (with_async) {
+      flags |= FILE_FLAG_OVERLAPPED;
+    }
     unique_handle cand(::CreateFileW(path, access, share, nullptr,
                                      OPEN_EXISTING, flags, nullptr));
     if (!cand) {
-      return;
+      return false;
     }
-    if (want_async) {
+    unique_handle own_port;
+    if (with_async) {
       if (shared_port != nullptr) {
         // An unattachable port takes the fast handle down with it: a
         // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path,
-        // so the candidate closes on the way out.
+        // so the candidate closes on the way out and the caller asks for
+        // a rung without it.
         if (::CreateIoCompletionPort(cand.get(), shared_port, 0, 0) ==
             nullptr) {
-          return;
+          return false;
         }
       } else {
         unique_handle p(
             ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1));
         if (!p ||
             ::CreateIoCompletionPort(cand.get(), p.get(), 0, 0) == nullptr) {
-          return;
+          return false;
         }
-        port = std::move(p);
+        own_port = std::move(p);
       }
-      use_iocp = true;
     }
+    if (own_port) {
+      port = std::move(own_port);
+    }
+    use_iocp = with_async;
     fast = std::move(cand);
-    direct = want_direct;
+    direct = with_direct;
+    return true;
   }
 };
 
