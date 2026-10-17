@@ -55,6 +55,7 @@ struct machine {
   std::uint64_t mvendorid = 0;
   bool force_trap = false;               // the guarded probes hit an illegal instruction
   bool dialect_071 = false;              // the vsetvli probe answers as 0.7.1 hardware
+  bool foreign_trap = false;             // a SIGILL not of the probe's making arrives inside the guard
 };
 void set_machine(const machine& m) noexcept;
 }  // namespace blake3pp::detail::test
