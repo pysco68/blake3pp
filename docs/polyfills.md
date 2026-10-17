@@ -60,22 +60,42 @@ anyone re-measuring the choice.
 ## SIMD providers
 
 Selected by `BLAKE3PP_SIMD_PROVIDER` (`auto`, `std`, `std-experimental`,
-`xsimd`); see [Building](building.md#provider-and-polyfill-selection)
-for the cache variable and what a configure reports. A fourth path, the
+`xsimd`, `xvec`); see [Building](building.md#provider-and-polyfill-selection)
+for the cache variable and what a configure reports. One further path, the
 raw vector-extension provider, is not project-wide: it exists only as a
-per-kernel override for ISAs none of the other three reach.
+per-kernel override for ISAs none of the others reach.
 
 | provider | needs | `auto` picks it when |
 |---|---|---|
 | `std::simd` | C++26 `<simd>` | the standard library has a usable one |
 | `std::experimental::simd` | the Parallelism TS v2 header | no `std::simd`, and the TS header compiles and vectorizes |
 | xsimd | nothing from the toolchain (fetched, header-only) | neither std facility is usable |
+| xvec | nothing from the toolchain (fetched, header-only) | never: by explicit choice only |
 | vector extensions (GNU/Clang `vector_size`) | never project-wide | pinned per kernel, for an ISA no other provider's width logic reaches |
 | none (scalar) | nothing | a build's only kernel is the scalar one |
 
 `auto` tries `std::simd` first, falls back to
 `std::experimental::simd`, and falls back again to xsimd, which is
 always available since it carries no toolchain requirement of its own.
+
+[xvec](https://github.com/intel/xvec) is Intel's independent
+implementation of the same C++26 library, and the one provider `auto`
+never reaches for: it is there to run the library against a second
+implementation of the standard interface rather than to fill a gap. The
+facade is the `std::simd` one with the namespace swapped
+(`src/kernel/simd/xvec.hpp`), which is the whole point -- a second
+implementation of one interface should need nothing else. It is fetched
+header-only at a pinned commit, and on GCC 16 the avx512 translation unit
+takes `-flax-vector-conversions` for xvec's x86 permute layer, scoped to
+that unit and that provider.
+
+A provider that has no vector width for a target does not quietly produce
+a one-lane kernel: a SIMD variant whose width comes out as 1 fails the
+build, because it would otherwise be registered under a vector name and
+dispatched to as though it were one (`src/kernel/kernel.cpp`). GCC 16's
+`<simd>` is the live example -- its arch traits are compiled for x86 only
+-- which is why the aarch64, ppc64le and s390x toolchains do not take the
+`std` provider.
 A build can also carry no SIMD provider at all: a scalar-only build
 (the single-file amalgamation below C++26, for instance) needs none,
 and `blake3pp::simd_provider()` reports `"none (scalar only)"`.

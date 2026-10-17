@@ -146,7 +146,10 @@ All of this, rendered and searchable, with a version for every release:
 | [The API](docs/api.md) | the guide across the library: what you compute, how you feed it, what runs it, what it costs |
 | [Inside the pipeline](docs/pipeline.md) | how a file becomes sender chains: one window's chain, the rules that hold it, and the tree reducer |
 | [Many files at once](docs/async.md) | EXPERIMENTAL: file hashing as senders over a context you drive |
-| [Architectures and kernels](docs/architectures.md) | details about every kernel a build carries and why the WASM build is an edge case |
+| [Direct I/O](docs/direct-io.md) | what `direct_io` asks for on each platform, the alignment contract, and when buffered is the right call |
+| [Architectures and kernels](docs/architectures.md) | every kernel a build carries, how it is tested, and what has no kernel yet |
+| [Polyfills](docs/polyfills.md) | the SIMD and execution providers: what may stand in for what, and what a choice cannot change |
+| [Performance tracing](docs/tracing.md) | where a file run's time went, and reading one in the tools |
 | [Command-line tools](docs/tools.md) | `blake3ppsum` and `blake3ppgen` |
 | [Integration](docs/integration.md) | vendoring, installing, and `find_package` |
 | [Building](docs/building.md) | presets, the toolchain images, cmake-re, and the kernel switches |

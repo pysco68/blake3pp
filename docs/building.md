@@ -62,7 +62,7 @@ toolchain-specific overrides is in [Polyfills](polyfills.md); this is
 the configure-time surface.
 
 ```
--DBLAKE3PP_SIMD_PROVIDER=auto|std|std-experimental|xsimd
+-DBLAKE3PP_SIMD_PROVIDER=auto|std|std-experimental|xsimd|xvec
 -DBLAKE3PP_EXECUTION_PROVIDER=auto|std|beman|stdexec
 ```
 
@@ -72,7 +72,12 @@ and falls back again to xsimd, which is always buildable since it is a
 fetched header-only dependency with no toolchain requirement of its
 own. `std` and `std-experimental` each fail the configure outright if
 the probe behind them does not pass, rather than silently substituting
-something else; `xsimd` skips the std probes entirely.
+something else; `xsimd` skips the std probes entirely, and so does `xvec`,
+which `auto` never reaches for -- it is Intel's implementation of the same
+C++26 library, fetched at a pinned commit, and exists to run the library
+against a second implementation of the standard interface. See
+[Polyfills](polyfills.md) for what a provider choice may and may not
+change.
 
 `BLAKE3PP_EXECUTION_PROVIDER=auto` picks `std::execution` when the
 standard library has a usable one and NVIDIA stdexec otherwise;
