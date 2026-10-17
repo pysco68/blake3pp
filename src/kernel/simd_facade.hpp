@@ -47,6 +47,8 @@
 #include "kernel/simd/vext.hpp"
 #elif defined(BLAKE3PP_FORCE_XSIMD)
 #include "kernel/simd/xsimd.hpp"
+#elif defined(BLAKE3PP_HAS_XVEC)
+#include "kernel/simd/xvec.hpp"
 #elif defined(BLAKE3PP_HAS_STD_SIMD)
 #include "kernel/simd/std_simd.hpp"
 #elif defined(BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
@@ -54,5 +56,5 @@
 #elif defined(BLAKE3PP_HAS_XSIMD)
 #include "kernel/simd/xsimd.hpp"
 #else
-#error "No simd provider: expected BLAKE3PP_FORCE_SCALAR, BLAKE3PP_FORCE_VEXT, BLAKE3PP_HAS_STD_SIMD, BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD or BLAKE3PP_HAS_XSIMD"
+#error "No simd provider: expected BLAKE3PP_FORCE_SCALAR, BLAKE3PP_FORCE_VEXT, BLAKE3PP_HAS_XVEC, BLAKE3PP_HAS_STD_SIMD, BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD or BLAKE3PP_HAS_XSIMD"
 #endif

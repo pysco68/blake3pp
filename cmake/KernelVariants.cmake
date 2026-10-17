@@ -112,7 +112,11 @@ function(_blake3pp_register_x86_kernels)
     # The canonical F->CD->DQ->BW progression plus VL: xsimd's arch
     # hierarchy requires CD once DQ is on, and every physical AVX-512 CPU
     # has all five.
-    blake3pp_add_kernel(avx512 ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq)
+    # xvec's x86 permute layer initialises __v32hi/__v64qi from __m512i,
+    # which GCC 16 no longer converts implicitly; the flag restores the
+    # GCC 13-15 behaviour for this one TU (clang is unaffected).
+    blake3pp_add_kernel(avx512 ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq
+      "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<STREQUAL:${BLAKE3PP_SIMD_PROVIDER},xvec>>:-flax-vector-conversions>")
   endif()
 endfunction()
 
