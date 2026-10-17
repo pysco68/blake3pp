@@ -453,15 +453,37 @@ BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
   return {u32v::load(lo), u32v::load(hi)};
 }
 
-// The two wide compressions below set up the same 16-word state and pick
-// block flags the same way. Folding them into a shared helper was tried and
-// put back: the shared state initialiser forces the XOF's broadcast
-// chaining values through an array, which changes the register allocation
-// of hash_batch's block loop. The only A/B of it ran on the throttling Zen
-// 3+ laptop and read 1-3% (3.69-3.77 against 3.81 GiB/s), which is that
-// machine's own noise floor rather than a result, so what stands here is
-// the mechanism; a machine that holds its clocks would settle the size of
-// it either way.
+// The 16-word state a wide compression starts from: the chaining value
+// in words 0-7, as whatever the caller holds it as (a transposed vector
+// per word, or a scalar word to broadcast), then the IV, the per-lane
+// counter halves, the block length and the flags. The chaining value is
+// read through `cv_word(j)` rather than an array so that a broadcast
+// caller never stages its eight words through memory.
+template <class CvWord>
+BLAKE3PP_FORCE_INLINE void init_state(u32v v[16], const CvWord& cv_word,
+                                      u32v ctr_lo, u32v ctr_hi,
+                                      std::uint32_t len,
+                                      std::uint32_t flags) noexcept {
+  for (std::size_t j = 0; j < 8; ++j) {
+    v[j] = cv_word(j);
+  }
+  for (std::size_t j = 0; j < 4; ++j) {
+    v[8 + j] = u32v::broadcast(iv[j]);
+  }
+  v[12] = ctr_lo;
+  v[13] = ctr_hi;
+  v[14] = u32v::broadcast(len);
+  v[15] = u32v::broadcast(flags);
+}
+
+// The flags of block b of a chunk of `blocks`: the caller's, plus the
+// start flag on the first block and the end flag on the last.
+[[nodiscard]] constexpr std::uint32_t block_flags_for(
+    std::size_t b, std::size_t blocks, std::uint32_t flags,
+    std::uint32_t flags_start, std::uint32_t flags_end) noexcept {
+  return flags | (b == 0 ? flags_start : 0u) |
+         (b == blocks - 1 ? flags_end : 0u);
+}
 
 // Fills u32v::width consecutive XOF output blocks: the root node's cv and
 // message are BROADCAST (identical in every lane); only the counter varies
@@ -480,16 +502,9 @@ void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
   const auto [ctr_lo, ctr_hi] = counter_lanes(counter, true);
 
   u32v v[16];
-  for (std::size_t j = 0; j < 8; ++j) {
-    v[j] = u32v::broadcast(cv[j]);
-  }
-  for (std::size_t j = 0; j < 4; ++j) {
-    v[8 + j] = u32v::broadcast(iv[j]);
-  }
-  v[12] = ctr_lo;
-  v[13] = ctr_hi;
-  v[14] = u32v::broadcast(len);
-  v[15] = u32v::broadcast(flags);
+  init_state(
+      v, [cv](std::size_t j) { return u32v::broadcast(cv[j]); }, ctr_lo,
+      ctr_hi, len, flags);
 
   all_rounds(v, m);
 
@@ -534,28 +549,13 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
   const auto [ctr_lo, ctr_hi] = counter_lanes(counter, increment_counter);
 
   for (std::size_t b = 0; b < blocks; ++b) {
-    std::uint32_t block_flags = flags;
-    if (b == 0) {
-      block_flags |= flags_start;
-    }
-    if (b == blocks - 1) {
-      block_flags |= flags_end;
-    }
-
     u32v m[16];
     load_transposed(inputs, b * block_len, m);
 
     u32v v[16];
-    for (std::size_t j = 0; j < 8; ++j) {
-      v[j] = cv[j];
-    }
-    for (std::size_t j = 0; j < 4; ++j) {
-      v[8 + j] = u32v::broadcast(iv[j]);
-    }
-    v[12] = ctr_lo;
-    v[13] = ctr_hi;
-    v[14] = u32v::broadcast(block_len);
-    v[15] = u32v::broadcast(block_flags);
+    init_state(
+        v, [&cv](std::size_t j) { return cv[j]; }, ctr_lo, ctr_hi,
+        block_len, block_flags_for(b, blocks, flags, flags_start, flags_end));
 
     all_rounds(v, m);
 
@@ -616,18 +616,12 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
     }
     const std::uint64_t ctr = counter + (increment_counter ? i : 0);
     for (std::size_t b = 0; b < blocks; ++b) {
-      std::uint32_t f = flags;
-      if (b == 0) {
-        f |= flags_start;
-      }
-      if (b == blocks - 1) {
-        f |= flags_end;
-      }
       // The inlined compress (not the exported compress_in_place): keeps
       // the chaining value in registers across the block loop instead of a
       // call plus CV store/reload round-trip per 64-byte block.
       std::array<std::uint32_t, 16> wide;
-      compress(cv.data(), inputs[i] + b * block_len, block_len, ctr, f,
+      compress(cv.data(), inputs[i] + b * block_len, block_len, ctr,
+               block_flags_for(b, blocks, flags, flags_start, flags_end),
                wide);
       for (std::size_t j = 0; j < 8; ++j) {
         cv[j] = wide[j];
