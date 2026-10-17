@@ -12,9 +12,11 @@ namespace blake3pp {
 
 void update_file(hasher& h, const std::filesystem::path& path,
                  const file_io_options& opts) {
-  detail::file_reader reader(
-      path, {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-             opts.offload_submit});
+  detail::file_reader reader(path, {.window_bytes = opts.window_bytes,
+                                    .queue_depth = opts.queue_depth,
+                                    .direct_io = opts.direct_io,
+                                    .async = opts.async,
+                                    .offload_submit = opts.offload_submit});
   trace_buffer* const trace = opts.trace;
   std::uint64_t index = 0;
   for (;;) {

@@ -192,9 +192,10 @@ Every rep starts from an empty buffer, so the last rep of each row is what
 gets summarized and exported. With both rows, `PATH` becomes
 `<stem>.seq.<ext>` and `<stem>.parallel.<ext>`.
 
-The captures below come from a 16-thread Linux container on a virtualized
-disk with cache drops unavailable. They show the shape of the output; the
-rates in them are not a device figure.
+The captures below are from a 32-thread Zen 5 machine (Ryzen AI MAX+ 395)
+under WSL2, on its virtual disk and without cache drops, so the device
+figures are that disk's rather than an SSD's. The shape of the output is
+the subject.
 
 ### A compute-bound run
 
@@ -202,90 +203,110 @@ rates in them are not a device figure.
 the only thing left to be the limit:
 
 ```
-$ blake3pp_bench_file --null-source 8 --reps 1 --cooldown 0 \
-      --trace n.json --trace-agents
-null source: 8.00 GiB, window 8 MiB, qd 4, 16 threads
-null           9.87 GiB/s   (54f0cbf85ca9a108...)  [digest matches the in-memory hash]
-  trace (last rep): 1024 windows (1024 fanned out, 0 dropped), wall 0.810 s
-    per window: wait   5.5%  hash 1515.4%  absorb  59.5%  release   0.0%
-    driver busy   2.3% of its own 0.810 s, 846 iterations, 845 polls (787 blocking, 378 woken), 1024 completions, 0 admission stalls, reducer held at most 19, at most 4 reads and 16 windows in flight
-    median per window: submit->read      4.0 us  read->cv  12012.3 us  cv->reduced     43.0 us
-    pool busy  88.1% of 16 threads, 8.2 agents active per fanned window
+$ blake3pp_bench_file --null-source 16 --reps 1 --cooldown 0 \
+      --trace null.json --trace-agents
+null source: 16.00 GiB, window 8 MiB, qd 4, 32 threads
+null           84.0 GiB/s   (8390e37432eb3939...)  [digest matches the in-memory hash]
+  trace (last rep): 2048 windows (2048 fanned out, 0 dropped), wall 0.190 s
+    per window: wait  18.5%  hash 1337.2%  absorb 155.1%  release   0.1%
+    driver busy   4.0% of its own 0.190 s, 870 iterations, 869 polls (814 blocking, 284 woken), 2048 completions, 0 admission stalls, reducer held at most 21, at most 4 reads and 16 windows in flight
+    median per window: submit->read      2.4 us  read->cv   1296.4 us  cv->reduced     32.0 us
+    pool busy  79.3% of 32 threads, 23.5 agents active per fanned window
+    io-wq cpu = 0.00 cores (worker threads' cpu / wall); machine (/proc/stat): user 23.67 nice 0.00 sys 0.85 idle 6.51 iowait 0.00 irq 0.00 softirq 0.00 steal 0.00 cores
 ```
 
-Line by line. All 1024 windows fanned out and none was dropped, so the
-storage was sized right. The `hash` share of 1515% is sixteen threads'
-worth of overlap, not an error: each window spent 12 ms being compressed
+Line by line. All 2048 windows fanned out and none was dropped, so the
+storage was sized right. The `hash` share of 1337% is sixteen windows'
+worth of overlap, not an error: each window spent 1.3 ms being compressed
 while fifteen others did the same. `absorb` overlaps the same way. `wait` at
-5.5% is the source handing back buffers it never read. The driver was busy
-2.3% of its own time, so the loop is not the limit. `pool busy 88.1% of 16
+18.5% is the source handing back buffers it never read. The driver was busy
+4.0% of its own time, so the loop is not the limit. `pool busy 79.3% of 32
 threads` is the number that is: the agents' summed compress time over
 threads × wall, which is as close to the machine as this engine gets. The
-8.2 agents per window beside it is how many invocations found parts left to
-take, out of the sixteen threads the pool has.
+23.5 agents per window beside it is how many invocations found parts left
+to take, out of the thirty-two threads the pool has.
 
 With `--trace-agents`, the same run resolves that per core:
 
 ```
-    8433 agent records (0 dropped) on 16 cpus:
-        cpu  records    parts    busy ms      effective
-          0      419    26079      508.7      801 MiB/s
-          1      597    36880      814.7      707 MiB/s
+    48202 agent records (0 dropped) on 32 cpus:
+        cpu  records    parts    busy ms      effective      irqs
+          0     1546    32901      151.7     3.31 GiB/s       227
+          1     1555    32906      152.2     3.30 GiB/s       169
           ...
-         15      492    29894      685.5      681 MiB/s
-      per-cpu GiB/s: min 0.58, median 0.69, max 0.80; worst max/min part on one agent: 1909.8x
-      sum of per-cpu rates 11.30 GiB/s; the run delivered 9.87 GiB/s, 87.3% of it
+         31     1498    32925      152.0     3.30 GiB/s       191
+      per-cpu GiB/s: min 3.26, median 3.30, max 3.40; worst max/min part on one agent: 371.9x
+      sum of per-cpu rates 105.99 GiB/s; the run delivered 84.05 GiB/s, 79.3% of it
 ```
 
-The spread of 0.58 to 0.80 GiB/s is one core's compress rate against
-another's; a single outlier here would be the core to look at. The
-`max/min part` ratio of 1910x is one invocation whose longest part took
-that much longer than its shortest — a scheduled-out agent, not a slow
-core, since that core's own rate is unremarkable. And the last line bounds
-what is left to win: the cores together managed 11.30 GiB/s while
-compressing, the run delivered 87.3% of that, and the missing 13% is
-everything that is not compression.
+The spread of 3.26 to 3.40 GiB/s is one core's compress rate against
+another's, and on a machine whose cores are alike that is how it should
+look; a single outlier would be the core to look at. The `irqs` column is
+each core's interrupt count over the rep, which is how a core that services
+the device is told from a slow one — here they are even, because a null
+source raises none. The `max/min part` ratio of 372x is one invocation
+whose longest part took that much longer than its shortest, which is a
+scheduled-out agent rather than a slow core, since that core's own rate is
+unremarkable. The last line bounds what is left to win: the cores together
+managed 105.99 GiB/s while compressing, the run delivered 79.3% of that,
+and the missing fifth is everything that is not compression.
 
 ### A read-limited run
 
 The same flags over a real file, parallel row:
 
 ```
-$ blake3pp_bench_file --make 512 --reps 1 --cooldown 0 \
-      --trace t.json --trace-agents
-file: blake3pp_bench_file.dat (512.0 MiB), backend: io_uring+direct, window 8 MiB, qd 4
-trace: 65 window records and 1040 agent records, JSON to t.json
-raw io         1.47 GiB/s   [device ceiling, no hashing]
+$ blake3pp_bench_file --make 1024 --reps 1 --cooldown 0 \
+      --trace file.json --trace-agents
+file: blake3pp_bench_file.dat (1024.0 MiB), backend: io_uring+direct, window 8 MiB, qd 4
+trace: 129 window records and 4128 agent records, JSON to file.json
+cache: not dropped (needs root or elevation); direct I/O bypasses it, metadata stays warm
+raw io         2.09 GiB/s   [device ceiling, no hashing]
 ...
-  trace (last rep): 64 windows (64 fanned out, 0 dropped), wall 0.432 s
-    per window: wait 395.5%  hash  55.3%  absorb   0.9%  release   0.0%
-    driver busy   0.5% of its own 0.432 s, 121 iterations, 120 polls (120 blocking, 58 woken), 64 completions, 0 admission stalls, reducer held at most 15, at most 4 reads and 9 windows in flight
-    median per window: submit->read  13582.0 us  read->cv    835.4 us  cv->reduced     56.8 us
-    pool busy   5.9% of 16 threads, 12.6 agents active per fanned window
-    io-wq cpu = 1.60 cores (worker threads' cpu / wall); machine (/proc/stat): user 0.97 nice 0.00 sys 1.78 idle 11.88 iowait 0.84 irq 0.00 softirq 0.20 steal 0.00 cores
-      per-cpu GiB/s: min 1.14, median 1.22, max 1.30; worst max/min part on one agent: 86.9x
-      sum of per-cpu rates 19.65 GiB/s; the run delivered 0.83 GiB/s, 4.2% of it
+parallel       2.14 GiB/s   (1ec8ab3adeac66e7...)  [102% of raw]
+  trace (last rep): 128 windows (128 fanned out, 0 dropped), wall 0.468 s
+    per window: wait 396.1%  hash  13.5%  absorb   1.2%  release   0.0%
+    driver busy   0.6% of its own 0.468 s, 253 iterations, 252 polls (252 blocking, 125 woken), 128 completions, 0 admission stalls, reducer held at most 16, at most 4 reads and 6 windows in flight
+    median per window: submit->read  14295.1 us  read->cv    489.4 us  cv->reduced     44.5 us
+    pool busy   1.0% of 32 threads, 12.4 agents active per fanned window
+    io-wq cpu = 0.04 cores (worker threads' cpu / wall); machine (/proc/stat): user 0.70 nice 0.00 sys 1.13 idle 28.61 iowait 0.96 irq 0.00 softirq 0.00 steal 0.00 cores
+    1581 agent records (0 dropped) on 27 cpus:
+        cpu  records    parts    busy ms      effective      irqs
+          0       24      729        1.9     5.79 GiB/s      1805
+          1      116     9610       21.1     6.95 GiB/s       858
+          ...
+         13        1        1        0.0      828 MiB/s       400
+         30       89     5832       13.1     6.78 GiB/s      1034
 ```
 
 Every line of the compute-bound reading inverts. The median window waited
-13.6 ms for its read and was compressed in 0.84 ms, `wait` dominates the
-shares, the pool was busy 5.9% of sixteen threads and the driver 0.5% of
-its own time. The cores managed 19.65 GiB/s between them and the run
-delivered 4.2% of that. Nothing here is a hashing problem, and the
-`--window`/`--qd` sweep (`--io-sweep`) is what such a run is handed to
-next.
+14.3 ms for its read and was compressed in 0.49 ms, `wait` dominates the
+shares at four windows' worth of overlap, the pool was busy 1.0% of
+thirty-two threads and the driver 0.6% of its own time. The run delivered
+2.14 GiB/s against a device ceiling of 2.09, so there is nothing left to
+win here at all: the hash is free and the disk is the answer. Nothing in
+this run is a hashing problem, and the `--window`/`--qd` sweep
+(`--io-sweep`) is what one is handed to next.
+
+The agent table reads differently too. Records land on 27 of the 32 cores
+rather than all of them, several with one record and a rate that means
+nothing, because there was not enough work to go round — a pool that is 1%
+busy does not fill a machine. The `irqs` column is populated now (cpu 0 at
+1805 against ~900 elsewhere): that is the core taking the device's
+completions, and on a read-limited run it is the one core whose numbers are
+not about hashing.
 
 The last line is Linux's own accounting, printed with every traced summary
 and interesting once there is a device. `io-wq cpu` is the CPU time of the
 kernel's io_uring worker threads (`iou-wrk-*` under `/proc/self/task`)
-over the rep's wall time, in cores — 1.60 here, which is what issuing
-direct reads costs off the driving thread, and 0.00 in the run above,
-which issues none. Workers come and go with the load, so the figure only
+over the rep's wall time, in cores — 0.04 here, which is what issuing
+direct reads costs off the driving thread at this rate, and 0.00 in the run
+above, which issues none. Workers come and go with the load, so the figure only
 credits workers alive at both ends of the rep. `machine (/proc/stat)` is
 the whole machine over the same window, so the kernel's share can be told
-from the pool's. Where `/proc/interrupts` has per-CPU columns, the agent
-table gains an `irqs` column, which is how a core that services the device
-is told from a slow one.
+from the pool's. The agent table's `irqs` column needs `/proc/interrupts`
+to carry per-CPU columns, which it does on a Linux host and inside WSL2,
+and does not in every container.
 
 ### The Chrome trace
 
@@ -293,13 +314,14 @@ is told from a slow one.
 [Perfetto](https://ui.perfetto.dev/) or `chrome://tracing`:
 
 ```json
-{"epoch_ns":139773839006594,"displayTimeUnit":"ns","pool_threads":16,"traceEvents":[
-{"name":"process_name","ph":"M","pid":1,"args":{"name":"blake3pp_bench_file parallel"}},
+{"epoch_ns":177415647362187,"displayTimeUnit":"ns","pool_threads":32,"traceEvents":[
+{"name":"process_name","ph":"M","pid":1,"args":{"name":"blake3pp_bench_file null"}},
 {"name":"thread_name","ph":"M","pid":1,"tid":1,"args":{"name":"driver"}},
-{"name":"driver","ph":"X","pid":1,"tid":1,"ts":1787532.972,"dur":431701.247,"args":{"busy_ns":2273591,"parked_ns":429419320,"iterations":121,"polls":120,"blocking_polls":120,"wakes":58,"queue_runs":64,"admission_stalls":0,"max_pending":15}},
+{"name":"driver","ph":"X","pid":1,"tid":1,"ts":244016.924,"dur":29103.355,"args":{"busy_ns":2564772,"parked_ns":26531260,"iterations":161,"polls":160,"blocking_polls":146,"wakes":68,"queue_runs":256,"admission_stalls":0,"max_pending":17}},
 {"name":"thread_name","ph":"M","pid":1,"tid":10,"args":{"name":"window object 0"}},
-{"name":"wait","ph":"X","pid":1,"tid":10,"ts":1787532.972,"dur":7569.115,"args":{"window":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
-{"name":"hash","ph":"X","pid":1,"tid":10,"ts":1795102.087,"dur":888.821,"args":{"window":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
+{"name":"wait","ph":"X","pid":1,"tid":10,"ts":244016.924,"dur":877.162,"args":{"window":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
+{"name":"thread_name","ph":"M","pid":1,"tid":10,"args":{"name":"window object 0"}},
+{"name":"hash","ph":"X","pid":1,"tid":10,"ts":244894.086,"dur":1203.918,"args":{"window":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
 ```
 
 | track | holds |

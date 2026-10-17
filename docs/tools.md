@@ -47,6 +47,7 @@ OPTIONS:
                               I/O window size in MiB
           --qd UINT [4]       I/O queue depth (the reader clamps it to its range)
           --no-direct         keep the OS page cache (no O_DIRECT)
+          --no-async          read synchronously (no io_uring/IOCP/GCD queue)
           --inline-submit     issue reads inline in the submitting thread, not on io_uring's
                               workers
 ```

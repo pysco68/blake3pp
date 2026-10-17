@@ -610,7 +610,7 @@ inline void fold_sibling_cvs_wide(const kern::kernel_ops& k,
                                   std::span<std::array<std::uint32_t, 8>> cvs,
                                   std::span<const std::uint32_t, 8> key,
                                   std::uint32_t base_flags,
-                                  std::span<std::uint32_t, 8> out_cv) noexcept {
+                                  std::span<std::uint32_t, 8> out_cv) {
   // Checked in every build: the loop below writes back take / 2 parents
   // per batch, so an odd count silently drops the chaining value that had
   // no sibling -- a digest over fewer subtrees than it was given, which

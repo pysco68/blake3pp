@@ -377,6 +377,7 @@ int main(int argc, char** argv) {
   options o;
   constexpr std::size_t mib = std::size_t{1} << 20;
   bool no_direct = false;
+  bool no_async = false;
   bool inline_submit = false;
 
   CLI::App app{
@@ -410,12 +411,14 @@ int main(int argc, char** argv) {
       ->capture_default_str();
 
   app.add_flag("--no-direct", no_direct, "keep the OS page cache (no O_DIRECT)");
+  app.add_flag("--no-async", no_async, "read synchronously (no io_uring/IOCP/GCD queue)");
   app.add_flag("--inline-submit", inline_submit, "issue reads inline in the submitting thread, not on io_uring's workers");
   app.add_option("files", o.files, "files to hash (or checksum lists)");
 
   CLI11_PARSE(app, argc, argv);
 
   o.io.direct_io = !no_direct;
+  o.io.async = !no_async;
   o.io.offload_submit = !inline_submit;
   if (!blake3pp::is_available(o.io.a)) {
     println(stderr, "blake3ppsum: arch '{}' not available on this machine (auto -> {})", blake3pp::to_string(o.io.a), blake3pp::to_string(blake3pp::best_available()));

@@ -204,9 +204,12 @@ class memory_driver {
 
   // A window of a span is a subspan of it. Nothing to read into, because
   // the bytes never move.
+  // @throws std::logic_error for a slot or a window the geometry does not
+  //         cover: past the end this hands back a view of the caller's own
+  //         memory beyond the span being hashed.
   [[nodiscard]] window_storage window_storage_for(
       file& f, [[maybe_unused]] unsigned slot, std::uint64_t off,
-      std::size_t bytes) noexcept {
+      std::size_t bytes) {
     // Checked in every build: the subspan below is a view into the
     // caller's own memory, and a window past its end is a read of whatever
     // follows it -- which on this driver is the caller's address space

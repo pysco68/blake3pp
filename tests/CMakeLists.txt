@@ -36,6 +36,7 @@ add_executable(blake3pp_tests
   memory_source.cpp
   subtree_fold.cpp
   tree_reducer.cpp
+  contracts.cpp
   unwinder.cpp
   "${vectors_hpp}")
 # The io suite tests hash_file and the backend engines; without the
@@ -116,32 +117,6 @@ if(TARGET blake3pp_parallel_backend)
   add_test(NAME sized_parallel_scheduler
     COMMAND blake3pp_sized_scheduler_test)
 endif()
-
-# The preconditions checked in every build, one process per case: what they
-# do is end the process with a named reason, so ctest matches that reason
-# rather than an exit code. A check nobody can show firing is a comment --
-# see tests/contract_violations.cpp.
-add_executable(blake3pp_contract_violations contract_violations.cpp)
-target_link_libraries(blake3pp_contract_violations PRIVATE
-  blake3pp::blake3pp blake3pp_warnings)
-foreach(case_and_message
-    "reducer-double-insert|tree_reducer::insert"
-    "reducer-hole|tree_reducer::drain_into"
-    "push-subtree-mid-chunk|push_subtree_cv"
-    "to-hex-short-output|to_hex"
-    "fold-odd-count|fold_sibling_cvs"
-    "two-runners|a second thread called run")
-  string(REPLACE "|" ";" _cv_pair "${case_and_message}")
-  list(GET _cv_pair 0 _cv_case)
-  list(GET _cv_pair 1 _cv_message)
-  add_test(NAME contract_${_cv_case}
-    COMMAND blake3pp_contract_violations ${_cv_case})
-  # The message decides, not the exit code: an abort's status says nothing
-  # about which contract was broken.
-  set_tests_properties(contract_${_cv_case} PROPERTIES
-    PASS_REGULAR_EXPRESSION "blake3pp: .*${_cv_message}"
-    TIMEOUT 60)
-endforeach()
 
 # The riscv detection ladder against machine shapes the emulator cannot
 # present (T-Head vendor ids, kernels without hwprobe, probes that trap):

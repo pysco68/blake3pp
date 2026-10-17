@@ -368,11 +368,12 @@ struct window_compress {
   // An edge window: the caller says how big a part is and how many of
   // them belong to the tree, because the rest of the window is the
   // hasher's own. counter is the absolute chunk of part 0.
+  // @throws std::logic_error if parts exceeds what the budget's table holds.
   void prepare_edge(const kern::kernel_ops* o, const std::byte* d,
                     std::size_t part_chunks, std::size_t parts,
                     std::uint64_t counter,
                     std::span<const std::uint32_t, 8> k, std::uint32_t f,
-                    trace_buffer* buf, std::uint64_t window_id) noexcept {
+                    trace_buffer* buf, std::uint64_t window_id) {
     // Checked in every build: the table is a fixed Budget.parts() entries
     // inside this object, and a part past the end writes through the
     // members that follow it. The two callers derive `parts` from the
@@ -464,8 +465,12 @@ template <bool Traced, stack_budget Budget, class Scheduler,
           class Token = ex::never_stop_token>
 [[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w,
                                Token tok = {}) {
+  // The fold is not noexcept: fold_sibling_cvs() checks a contract whose
+  // violation would be a wrong digest, and a throw here completes the
+  // chain with set_error(exception_ptr), which the scope latches and run()
+  // rethrows. The per-part bulk function above is the one that cannot.
   return part_bulk_sender<Traced>(sched, w, tok) |
-         ex::then([&w]() noexcept {
+         ex::then([&w]() {
            // The fold runs even when the agents stopped early: the part
            // table is zeroed with the window it lives in, so this reads
            // nothing uninitialised, and what it produces is dropped by
@@ -506,7 +511,7 @@ template <bool Traced, stack_budget Budget, class Scheduler,
                                     std::span<tree_reducer::node> out,
                                     Token tok = {}) {
   return part_bulk_sender<Traced>(sched, w, tok) |
-         ex::then([&w, out]() noexcept {
+         ex::then([&w, out]() {
            return fold_aligned_runs(
                w.ops, w.key, w.flags,
                cv_run{std::span(w.cvs).first(w.n_parts), 0, w.n_parts,

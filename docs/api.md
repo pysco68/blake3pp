@@ -472,3 +472,11 @@ layer itself — `hasher::push_subtree_cv()` absorbs an externally-computed
 subtree chaining value, and `hasher` and the parallel `hash()` accept a
 caller-supplied kernel table. That seam is how the benchmark plugs
 upstream's hand-written assembly into this pipeline.
+
+Its preconditions are the ones a caller cannot be trusted with, so the
+three that can be checked are checked in every build and throw
+`std::invalid_argument`: a subtree size that is not a power of two, a
+position the subtree cannot cover, and a hasher part-way through a chunk.
+The two that cannot be checked here are the caller's alone — the subtree
+must not contain the message's final chunk, and it must have been hashed
+under this hasher's `key_words()` and `mode_flags()`.

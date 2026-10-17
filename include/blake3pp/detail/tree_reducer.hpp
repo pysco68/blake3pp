@@ -73,8 +73,11 @@ class tree_reducer {
   // @pre The range does not contain the message's final chunk. Not checked
   //      at all: the caller knows where the message ends and this does not.
   // @return false, with the reducer unchanged, if storage is full.
+  // @throws std::logic_error if the range overlaps one already inserted.
+  //         A full set of storage is a capacity answer the caller acts on;
+  //         an overlap is a mistake no caller can act on.
   [[nodiscard]] bool insert(std::uint64_t first_chunk, std::uint64_t chunks,
-                            std::span<const std::uint32_t, 8> cv) noexcept {
+                            std::span<const std::uint32_t, 8> cv) {
     assert(chunks > 0 && std::has_single_bit(chunks));
     assert(first_chunk % chunks == 0);
     const std::uint64_t low = count_ == 0 && inserted_ == 0
@@ -159,7 +162,9 @@ class tree_reducer {
   //      nothing else.
   // @pre h has the key and flags this reducer was built with. Not checked:
   //      nothing here can see them.
-  void drain_into(hasher& h) noexcept {
+  // @throws std::logic_error if the pending run has a hole or does not
+  //         start where the hasher stands.
+  void drain_into(hasher& h) {
     const std::span<const node> nodes = sorted();
     require(h.count() % chunk_size == 0,
             "tree_reducer::drain_into(): a hasher part-way through a chunk");
@@ -246,7 +251,7 @@ struct cv_run {
 [[nodiscard]] inline std::size_t fold_aligned_runs(
     const kern::kernel_ops* ops, std::span<const std::uint32_t, 8> key,
     std::uint32_t base_flags, const cv_run& run,
-    std::span<tree_reducer::node> out) noexcept {
+    std::span<tree_reducer::node> out) {
   assert(run.part_chunks > 0 && std::has_single_bit(run.part_chunks));
   assert(run.base_chunk % run.part_chunks == 0);
   assert(run.last <= run.cvs.size());

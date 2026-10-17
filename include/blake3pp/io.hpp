@@ -73,8 +73,18 @@ struct file_io_options {
   /// whenever they can, so this asks for the hand-off explicitly. Ignored
   /// where the platform has no such notion.
   bool offload_submit = true;
+  /// Queue reads asynchronously (io_uring, IOCP, GCD) where the platform
+  /// offers it; off reads them synchronously inside the same poll, which is
+  /// what a platform offering none does anyway. The engaged rung names
+  /// itself -- see file_reader::backend() and write_report::backend.
+  bool async = true;
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing, at the cost of one branch per window.
+  ///
+  /// Not owned and not copied: the buffer has to outlive every operation
+  /// these options start, which for the blocking entry points is the call
+  /// and for the senders in <blake3pp/async_io.hpp> is the whole
+  /// operation.
   trace_buffer* trace = nullptr;
 };
 
@@ -167,6 +177,9 @@ struct hash_file_options {
   bool direct_io = true;
   /// Issue reads on the kernel's I/O worker threads; see file_io_options.
   bool offload_submit = true;
+  /// Queue reads asynchronously where the platform offers it; see
+  /// file_io_options.
+  bool async = true;
   /// Plain, keyed or key-derivation mode: `hash_mode::keyed(key)` or
   /// `hash_mode::derive_key(context)`, named as hasher spells them.
   ///
@@ -181,7 +194,12 @@ struct hash_file_options {
   /// The pipeline knobs alone, so one options object drives update_file()
   /// too.
   constexpr operator file_io_options() const noexcept {
-    return {window_bytes, queue_depth, direct_io, offload_submit, trace};
+    return {.window_bytes = window_bytes,
+            .queue_depth = queue_depth,
+            .direct_io = direct_io,
+            .offload_submit = offload_submit,
+            .async = async,
+            .trace = trace};
   }
 };
 
@@ -299,6 +317,8 @@ struct file_write_options {
   bool async = true;
   /// io_uring: issue on io-wq rather than inline in the submit call.
   bool offload_submit = true;
+  // No trace field, unlike file_io_options: the write pipeline keeps no
+  // per-window records, so there would be nothing to record into.
 };
 
 /// What a write_file() run did.

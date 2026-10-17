@@ -41,7 +41,9 @@ inline constexpr std::size_t key_size = 32;
 /// Neither allocates nor NUL-terminates.
 /// @param bytes  The bytes to encode (extended output, a key, a digest).
 /// @param out    Receives 2 * `bytes.size()` characters; must be that large.
-void to_hex(std::span<const std::byte> bytes, std::span<char> out) noexcept;
+/// @throws std::length_error if it is not, rather than writing past its
+///         end. The lengths reaching this come from files and wires.
+void to_hex(std::span<const std::byte> bytes, std::span<char> out);
 /// Returns the lowercase hex of any byte sequence as a string.
 /// @param bytes  The bytes to encode.
 /// @return 2 * `bytes.size()` lowercase hex characters.
@@ -293,14 +295,22 @@ class hasher {
   ///      not contain the final chunk.
   /// @pre The message stays within BLAKE3's 2^64 bytes, at most 2^54
   ///      chunks in total, which is what the chaining-value stack holds.
-  /// These preconditions are checked by assert() only. Violating them in
-  /// a release build corrupts the hasher.
+  /// The first three are checked in every build and throw
+  /// std::invalid_argument: a size that is not a power of two, or a
+  /// position the subtree cannot cover, divides by zero or indexes the
+  /// chaining-value stack out of bounds, and a hasher part-way through a
+  /// chunk would hash those bytes at the wrong position -- a wrong digest
+  /// with nothing to see. The last two cannot be checked here: only the
+  /// caller knows where the message ends and under which key the subtree
+  /// was hashed.
   /// The subtree must have been hashed under this hasher's key_words() and
   /// mode_flags() so keyed and derive_key modes propagate.
   /// @param cv              The subtree's root chaining value.
   /// @param subtree_chunks  The number of complete chunks it covers.
+  /// @throws std::invalid_argument if the subtree's size or position
+  ///         cannot be what it claims.
   void push_subtree_cv(std::span<const std::uint32_t, 8> cv,
-                       std::uint64_t subtree_chunks) noexcept;
+                       std::uint64_t subtree_chunks);
 
   /// Expert observer pairing with push_subtree_cv(): the key schedule
   /// external subtree computation must hash under.
@@ -400,12 +410,15 @@ std::size_t compress_subtree_cvs(const kern::kernel_ops* ops,
 // clobbered. Same key and flags contract as compress_subtree_cv; take them
 // from the destination hasher's key_words() and mode_flags(). Thread-safe
 // and allocation-free.
-// @pre cvs.size() is a power of two, at least 2.
+// @pre cvs.size() is a power of two, at least 2. Checked in every build:
+//      an odd count would drop the chaining value that had no sibling, for
+//      a digest over fewer subtrees than it was given.
+// @throws std::logic_error if it is not.
 void fold_sibling_cvs(const kern::kernel_ops* ops,
                       std::span<std::array<std::uint32_t, 8>> cvs,
                       std::span<const std::uint32_t, 8> key,
                       std::uint32_t base_flags,
-                      std::span<std::uint32_t, 8> out_cv) noexcept;
+                      std::span<std::uint32_t, 8> out_cv);
 
 // One parent node: the chaining value of the subtree whose children have
 // these CVs. Never the root, so no ROOT flag. Same key and flags contract
