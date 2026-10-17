@@ -10,6 +10,7 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/dispatch.hpp>
 #include <blake3pp/parallel.hpp>
+#include "kernel/kernel.hpp"  // max_simd_degree, for the static_assert below
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
@@ -20,6 +21,15 @@
 #endif
 
 namespace {
+
+// A part is the unit one agent takes, and window_compress's grouped fold
+// assumes a part leaves exactly one kernel batch of chaining values per
+// call (compress.hpp's fold_group_parts). min_part_chunks is a public
+// header's constant and max_simd_degree an internal one, so the two cannot
+// be tied together where either is declared; this is where they meet.
+static_assert(blake3pp::detail::min_part_chunks >= blake3pp::kern::max_simd_degree,
+              "a part shorter than the kernel's batch would leave a window's "
+              "lane slots partly unwritten");
 
 std::vector<std::byte> make_input(std::size_t len) {
   std::vector<std::byte> v(len);

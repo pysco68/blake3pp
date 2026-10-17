@@ -299,10 +299,10 @@ BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   // of the 32 zmm, so the message cannot fit beside it and what the compiler
   // keeps there it pays for twice over; freeing those registers is worth
   // 3-6% on the chunk shape alone (Zen 5, clang 22, 32 inputs per call) and
-  // 7.8% on the kernel row end to end, which docs/building.md quotes. An empty
-  // asm with an input-only constraint, so nothing is clobbered and the state
-  // stays register-resident: a memory clobber here forces the state out too
-  // and loses 4%.
+  // 7.8% on the kernel row, 8.5% end to end, which docs/building.md
+  // quotes. An empty asm with an input-only constraint, so nothing is
+  // clobbered and the state stays register-resident: a memory clobber here
+  // forces the state out too and loses 4%.
   //
   // Narrower widths do not want it: measured +0.8% and -1.8% on avx2 and
   // -0.1% on sse42, all inside the noise, because at eight lanes and 16
@@ -454,12 +454,14 @@ BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
 }
 
 // The two wide compressions below set up the same 16-word state and pick
-// block flags the same way, and folding either into a shared helper was
-// measured and rejected: the state initialiser costs the chunk path 1 to 3%
-// on Zen 3+ (gcc 16, four alternating rounds, 3.69-3.77 against 3.81
-// GiB/s), because it forces the XOF's broadcast chaining values through an
-// array and changes the register allocation of hash_batch's block loop.
-// The duplication is two sites in one file; the throughput is not.
+// block flags the same way. Folding them into a shared helper was tried and
+// put back: the shared state initialiser forces the XOF's broadcast
+// chaining values through an array, which changes the register allocation
+// of hash_batch's block loop. The only A/B of it ran on the throttling Zen
+// 3+ laptop and read 1-3% (3.69-3.77 against 3.81 GiB/s), which is that
+// machine's own noise floor rather than a result, so what stands here is
+// the mechanism; a machine that holds its clocks would settle the size of
+// it either way.
 
 // Fills u32v::width consecutive XOF output blocks: the root node's cv and
 // message are BROADCAST (identical in every lane); only the counter varies
@@ -596,11 +598,11 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
   // threshold is where one batch undercuts that many scalar blocks.
   if constexpr (u32v::width > 1) {
     if (const std::size_t rem = num_inputs - i; rem >= pad_remainder_min) {
-      const std::uint8_t* padded[u32v::width];
+      const std::uint8_t* padded BLAKE3PP_CXXATTR_UNINITIALIZED [u32v::width];
       for (std::size_t l = 0; l < u32v::width; ++l) {
         padded[l] = inputs[i + (l < rem ? l : rem - 1)];
       }
-      std::uint8_t tmp[u32v::width * out_len];
+      std::uint8_t tmp BLAKE3PP_CXXATTR_UNINITIALIZED [u32v::width * out_len];
       hash_batch(padded, blocks, key, counter + (increment_counter ? i : 0),
                  increment_counter, flags, flags_start, flags_end, tmp);
       std::memcpy(out + i * out_len, tmp, rem * out_len);
