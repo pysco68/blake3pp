@@ -76,6 +76,9 @@ inline std::string no_uring_suffix(int err) {
     case EPERM:
       return " [io_uring: EPERM, blocked by policy]";
     case ENOSYS:
+      // Either io_uring_setup is absent (pre-5.1) or the ring came up
+      // without the read/write opcodes this backend needs (pre-5.6); both
+      // are the same answer to a caller: this kernel cannot serve it.
       return " [io_uring: ENOSYS, kernel too old]";
     default:
       return " [io_uring: errno " + std::to_string(err) + "]";
@@ -197,6 +200,18 @@ struct uring {
     fd.reset(sys_io_uring_setup(entries, &p));
     if (!fd) {
       setup_errno = errno;
+      return false;
+    }
+    // A ring that sets up only proves the syscall exists, which is 5.1.
+    // IORING_OP_READ and IORING_OP_WRITE -- the only two opcodes this
+    // backend uses -- arrived in 5.6, and on 5.1 to 5.5 every transfer
+    // would come back -EINVAL while backend() happily reported io_uring:
+    // Ubuntu 20.04 ships 5.4. IORING_FEAT_RW_CUR_POS is from the same
+    // release as those opcodes, so the feature word answers the question
+    // that IORING_REGISTER_PROBE cannot (it is itself 5.6).
+    if ((p.features & IORING_FEAT_RW_CUR_POS) == 0) {
+      setup_errno = ENOSYS;
+      destroy();
       return false;
     }
     sq_entries = p.sq_entries;
@@ -607,16 +622,32 @@ class uring_context {
     f.inflight_++;
   }
 
-  // The ladder, asked once for both directions: only whole granules may
-  // ride the ring, because O_DIRECT rejects an unaligned length, and the
-  // tail goes through the synchronous path inside poll(). A zero-length
+  // The ladder, asked once for both directions and for every piece of a
+  // transfer: only whole granules may ride the ring, because O_DIRECT
+  // rejects an unaligned length and an unaligned offset, and what it
+  // refuses goes through the synchronous path inside poll(). A zero-length
   // transfer takes that path too: io_uring would report it as res == 0,
   // which is the signature of a short transfer with nothing left to give,
   // so a no-op never reaches the kernel. This is the whole
   // runtime-degradation question.
+  //
+  // The offset matters because of the continuation: a short transfer
+  // resumes at off + filled, which is a granule boundary only if the
+  // device stopped on one. Asking the same question again is what keeps a
+  // continuation off the ring on terms the first submit would have
+  // refused -- where it would come back EINVAL and fail the window, with
+  // the synchronous rung right there.
+  [[nodiscard]] bool may_ride(const transfer& op, std::uint64_t off,
+                              std::size_t len) const noexcept {
+    if (!use_uring_ || len == 0 || len % direct_align != 0) {
+      return false;
+    }
+    return !op.sync_file->direct() || off % direct_align == 0;
+  }
+
   void issue(transfer& op, std::uint8_t opcode, const void* data,
              std::size_t len) noexcept {
-    if (use_uring_ && len != 0 && len % direct_align == 0) {
+    if (may_ride(op, op.off, len)) {
       op.on_ring = true;
       ring_.fill_rw(opcode, op.fd, data, static_cast<unsigned>(len), op.off,
                     op_ud(&op), offload_);
@@ -905,9 +936,18 @@ class uring_context {
     if (op.filled < op.length()) {
       const std::byte* const from =
           op.is_write ? op.wbuf.data() + op.filled : op.buf.data() + op.filled;
+      const std::size_t rest = op.length() - op.filled;
+      if (!may_ride(op, op.off + op.filled, rest)) {
+        // The remainder is not something this file may hand the ring. It
+        // is still owed, so it goes down the same rung an unalignable
+        // transfer takes from the start, which finishes what is left.
+        op.on_ring = false;
+        deferred_.push(op);
+        return false;
+      }
       ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, op.fd,
-                    from, static_cast<unsigned>(op.length() - op.filled),
-                    op.off + op.filled, ud, offload_);
+                    from, static_cast<unsigned>(rest), op.off + op.filled, ud,
+                    offload_);
       return true;
     }
     complete(op, {});
@@ -964,12 +1004,19 @@ class uring_context {
       ec = std::make_error_code(std::errc::operation_canceled);
     } else {
       try {
+        // From where the transfer stopped, which for a fresh one is the
+        // start and for a continuation is what the ring already moved.
+        // The remainder picks the descriptor: an unalignable rest is
+        // exactly what the plain fd exists for.
+        const std::size_t done = op.filled;
+        const std::size_t rest = op.length() - done;
         if (op.is_write) {
-          op.sync_file->pwrite_all(op.sync_file->sync_fd(op.wbuf.size()),
-                                   op.wbuf.data(), op.wbuf.size(), op.off);
+          op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
+                                   op.wbuf.data() + done, rest,
+                                   op.off + done);
         } else {
-          op.sync_file->pread_all(op.sync_file->sync_fd(op.buf.size()),
-                                  op.buf.data(), op.buf.size(), op.off);
+          op.sync_file->pread_all(op.sync_file->sync_fd(rest),
+                                  op.buf.data() + done, rest, op.off + done);
         }
         op.filled = op.length();
       } catch (const std::system_error& e) {
