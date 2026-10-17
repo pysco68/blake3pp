@@ -16,6 +16,10 @@
 #include "kernel/force_inline.hpp"
 
 namespace blake3pp::kern::BLAKE3PP_ARCH_NS {
+// Internal linkage, like every other provider: the type's layout is this
+// TU's -m flags, and a shared-namespace definition would be an ODR lie
+// (simd_facade.hpp).
+namespace {
 
 struct u32v {
   using impl = xvec::simd::vec<std::uint32_t>;
@@ -46,4 +50,5 @@ struct u32v {
   }
 };
 
+}  // namespace
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS

@@ -1,7 +1,7 @@
 #pragma once
 
-// The u32-vector facade: one minimal wide-word type, four providers, chosen
-// here and nowhere else.
+// The u32-vector facade: one minimal wide-word type, five providers plus two
+// per-TU overrides, chosen here and nowhere else.
 //
 //   BLAKE3PP_FORCE_SCALAR   width-1 plain uint32_t (the scalar kernel, and
 //                           the correctness oracle for everything else)
@@ -19,6 +19,9 @@
 //                           non-SVE machine, which defeats the whole
 //                           fat-binary premise. xsimd's SVE backend is
 //                           initializer-free.
+//   BLAKE3PP_HAS_XVEC       Intel's xvec: the same C++26 interface from a
+//                           second implementation, by explicit choice only,
+//                           and tried before std::simd below
 //   BLAKE3PP_HAS_STD_SIMD   native C++26 std::simd (GCC 16's <simd>)
 //   BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD
 //                           Parallelism TS v2 <experimental/simd>

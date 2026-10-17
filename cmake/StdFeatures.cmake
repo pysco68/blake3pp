@@ -72,11 +72,21 @@ message(STATUS
   "blake3pp: simd provider choice = ${BLAKE3PP_SIMD_PROVIDER}")
 
 if(BLAKE3PP_SIMD_PROVIDER MATCHES "^(auto|std)$")
+  # Both shapes the facade needs: a fixed width to know the API is there,
+  # and the NATIVE width it actually spells (src/kernel/simd/std_simd.hpp).
+  # An implementation whose arch traits do not cover this target deduces one
+  # lane and compiles perfectly, which would be a scalar kernel registered
+  # under a vector name -- GCC 16's <simd> off x86 is the live example, and
+  # the kernel's own static_assert refuses to build it.
   _blake3pp_probe(BLAKE3PP_HAS_STD_SIMD [[
+#include <cstdint>
 #include <simd>
 int main() {
-  std::simd::vec<unsigned, 8> v{};
-  return static_cast<int>(v.size()) - 8;
+  std::simd::vec<unsigned, 8> fixed{};
+  using native = std::simd::vec<std::uint32_t>;
+  static_assert(native::size() > 1,
+                "std::simd deduces a single lane for this target");
+  return static_cast<int>(fixed.size()) - 8;
 }
 ]])
 endif()
