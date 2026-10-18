@@ -127,14 +127,20 @@ using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
 
 // A full window's parts are reduced in groups of this many, by the agent
 // that finishes a group's last part, before the fold after the bulk sees
-// anything. A part reduced on its own ends in log2(part) parent
-// generations below full lane occupancy, a measured 15% of a 16-chunk
-// part's time on AVX2 and 22% on AVX-512; folded 16 parts at a time the
-// generations stay lane-filling down to the last log2(degree), 4% and 8%.
+// anything. A 16-chunk part reduced on its own is 16 lane-filling chunk
+// compressions followed by four parent generations at 8, 4, 2 and 1 of the
+// kernel's 16 lanes; grouping the parts keeps those generations filled down
+// to the last log2(degree). Measured, at 8 MiB windows: +13.8% on Emerald
+// Rapids, +2.8% on Zen 5, and nothing at 64 MiB windows, where a window's
+// parts already outnumber the agents by enough that the tail is noise
+// (docs/performance.md). The mechanism was confirmed separately by deferring
+// parents in the sequential path, where nothing overlaps the narrow
+// generations: 17% on AVX-512 and 25% on AVX2, 91-95% of the kernel's own
+// hash_many ceiling.
+//
 // The reduction has to happen inside the bulk: moved whole into the fold
-// behind it, which one agent runs, it is a sixteenth of the window's
-// blocks on one thread, and from eight agents up that costs more wall
-// time than the parts saved.
+// behind it, which one agent runs, it is a sixteenth of the window's blocks
+// on one thread while the others have nothing left to do.
 inline constexpr std::size_t fold_group_parts = 16;
 static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
 
@@ -338,16 +344,24 @@ struct window_compress {
   // fan out and belongs on the sequential path, the same verdict
   // a window's compress stage reaches.
   //
+  // Not noexcept: the lane table grows here, on the first window of a run
+  // that needs the size, so this is where a run out of memory surfaces.
+  // Admission calls it before the window is counted in flight.
+  //
   // @pre chunks is a power of two. The parts have to divide the window
   //      exactly: a remainder would be chunks this never compresses, and
   //      the grouped fold below needs a power-of-two group. Every caller
   //      gets it from rounded_window_bytes(), which bit_floors.
+  // @throws std::logic_error if it is not a power of two: the parts would
+  //         then leave chunks % p chunks out of the digest.
   [[nodiscard]] bool prepare(const kern::kernel_ops* o, const std::byte* d,
                              std::size_t chunks, std::uint64_t counter,
                              std::span<const std::uint32_t, 8> k,
                              std::uint32_t f, trace_buffer* buf,
-                             std::uint64_t window_id) noexcept {
-    assert(chunks > 0 && std::has_single_bit(chunks));
+                             std::uint64_t window_id) {
+    require(chunks > 0 && std::has_single_bit(chunks),
+            "window_compress::prepare(): a window that is not a power-of-two "
+            "number of chunks");
     const std::size_t p = part_chunks<Budget>(chunks);
     if (p >= chunks) {
       return false;

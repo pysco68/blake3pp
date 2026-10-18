@@ -44,8 +44,8 @@ namespace blake3pp::detail {
 
 // What a write run needs beyond the plan.
 struct write_options {
-  std::size_t window_bytes = 64 * 1024 * 1024;
-  unsigned queue_depth = 2;
+  std::size_t window_bytes = default_write_window_bytes;
+  unsigned queue_depth = default_write_queue_depth;
   ex::inplace_stop_token stop_token{};
 };
 
@@ -270,18 +270,31 @@ class write_scope
              free_ != nullptr && next_offset_ < total_) {
         window* const w = free_;
         free_ = w->next_free;
-        take_next(*w);
+        // Built, then counted: anything that throws before the start --
+        // the geometry check below, a provider's operation state -- puts
+        // the window back on the free list rather than leaving a count
+        // this run can never work off.
+        try {
+          take_next(*w);
+          cells[w->slot].emplace(ConnectOne{this, w});
+        } catch (...) {
+          w->op.live = false;
+          w->next_free = free_;
+          free_ = w;
+          throw;
+        }
         ++in_flight_;
         w->writing = true;
         status_.outstanding = in_flight_;
-        cells[w->slot].emplace(ConnectOne{this, w});
         ex::start(*cells[w->slot]);
       }
       settle();
     }, [this] { this->report_stall(); });
   }
 
-  void take_next(window& w) noexcept {
+  // Not noexcept: the geometry check below is one the chain's own error
+  // channel carries, and admission runs before the window is counted.
+  void take_next(window& w) {
     w.cancel_asked = false;
     w.offset = next_offset_;
     w.bytes = static_cast<std::size_t>(

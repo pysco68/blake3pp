@@ -904,8 +904,8 @@ class pipeline_scope_base {
 struct pipeline_options {
   // The requests plan_pipeline() rounds and clamps; the scope itself
   // reads only the plan.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  unsigned queue_depth = 4;
+  std::size_t window_bytes = default_window_bytes;
+  unsigned queue_depth = default_queue_depth;
   trace_buffer* trace = nullptr;
   // Windows allowed in flight at once, capped to the window count; 0
   // means the window count. The tests run the whole matrix at 1 first,
@@ -1538,6 +1538,9 @@ class window_scope
 
     if (trace_ != nullptr) {
       driver_stats& d = trace_->driver();
+      // The rung is the file's, which closes with the run: copied here so a
+      // trace read afterwards still names it.
+      set_read_backend(d, file_.name());
       d.admission_stalls = admission_stalls_;
       d.max_pending = max_pending_;
       d.max_reads_in_flight = max_reading_;
@@ -1693,28 +1696,39 @@ class window_scope
         }
         window* const w = pool_.take();
         // Built, then counted. Everything up to the connect is this
-        // window's own state, and a connect that throws -- an operation
-        // state a provider allocates, say -- leaves the window unadmitted
-        // and the pool whole, rather than a count this run can never work
-        // off. Starting is last, because from then on the chain may
-        // complete and will count itself down.
+        // window's own state, and anything that throws there -- an
+        // operation state a provider allocates, the lane table a window
+        // shape needs, a plan the geometry contradicts -- gives the window
+        // straight back, rather than leaving a count this run can never
+        // work off or a window a shared pool never offers again. Starting
+        // is last, because from then on the chain may complete and will
+        // count itself down.
         const unsigned cell = free_cells_[free_cell_count_ - 1];
-        take_next(*w);
-        claim_record(*w);
-        // An edge window is the short first one or the last one, each with
-        // its own cell, since a three-window file has both in flight at
-        // once; one with nothing to fan out is only a read.
-        const bool is_full = !w->last && !w->short_first;
-        const bool is_edge_fanout = !is_full && w->plan.parts >= 2;
-        if (is_full) {
-          prepare_compress(*w);
-          cells.full[cell].emplace(typename Cells::connect_full{this, w});
-        } else if (is_edge_fanout) {
-          (w->last ? cells.last_edge : cells.first_edge)
-              .emplace(typename Cells::connect_edge{this, w});
-        } else {
-          (w->last ? cells.last_read : cells.first_read)
-              .emplace(typename Cells::connect_read{this, w});
+        bool is_full = false;
+        bool is_edge_fanout = false;
+        try {
+          take_next(*w);
+          claim_record(*w);
+          // An edge window is the short first one or the last one, each
+          // with its own cell, since a three-window file has both in
+          // flight at once; one with nothing to fan out is only a read.
+          is_full = !w->last && !w->short_first;
+          is_edge_fanout = !is_full && w->plan.parts >= 2;
+          if (is_full) {
+            prepare_compress(*w);
+            cells.full[cell].emplace(typename Cells::connect_full{this, w});
+          } else if (is_edge_fanout) {
+            (w->last ? cells.last_edge : cells.first_edge)
+                .emplace(typename Cells::connect_edge{this, w});
+          } else {
+            (w->last ? cells.last_read : cells.first_read)
+                .emplace(typename Cells::connect_read{this, w});
+          }
+        } catch (...) {
+          w->rec = nullptr;
+          w->op.live = false;
+          pool_.give_back(w);
+          throw;
         }
         w->cell = cell;
         --free_cell_count_;
@@ -1834,7 +1848,7 @@ class window_scope
                             return compress_stage(w);
                           }),
             loop_.scheduler()),
-        [this, &w](const cv_type& cv) noexcept { reduce_into_tree(w, cv); });
+        [this, &w](const cv_type& cv) { reduce_into_tree(w, cv); });
   }
 
   // An edge window with nothing worth fanning out: read it, hold it, and
@@ -1872,9 +1886,7 @@ class window_scope
                             return edge_compress_stage(w);
                           }),
             loop_.scheduler()),
-        [this, &w](std::size_t nodes) noexcept {
-          insert_edge_nodes(w, nodes);
-        });
+        [this, &w](std::size_t nodes) { insert_edge_nodes(w, nodes); });
   }
 
  private:
@@ -1904,8 +1916,11 @@ class window_scope
         w, tok, compress_edge_on<Traced>(sched_, w.compress, out, tok));
   }
 
-  // On the driver, like every other insert.
-  void insert_edge_nodes(window& w, std::size_t nodes) noexcept {
+  // On the driver, like every other insert. Not noexcept: the contract
+  // checks below are the kind the chain carries as set_error(exception_ptr)
+  // for run() to rethrow (contract.hpp), which a noexcept frame would turn
+  // into a terminate.
+  void insert_edge_nodes(window& w, std::size_t nodes) {
     // fold_aligned_runs() wrote these, bounded by the span it was given;
     // reading more than that span holds would walk off the array.
     require(nodes <= edge_node_cap,
@@ -2055,7 +2070,11 @@ class window_scope
   }
 
   // Takes the next window's geometry and plan into w and advances.
-  void take_next(window& w) noexcept {
+  //
+  // Not noexcept: window_storage_for() checks the geometry against the
+  // plan, and admission runs before the window is counted in flight, so
+  // the throw unwinds a round that owes nothing.
+  void take_next(window& w) {
     w.cancel_asked = false;
     w.view_ready = false;
     const geometry g = next_geometry();
@@ -2151,7 +2170,8 @@ class window_scope
   // Runs at admission, BEFORE the read: what it records is where the
   // compress stage will find the window, and that stage only starts once
   // the read has completed. Hence at() rather than view().
-  void prepare_compress(window& w) noexcept {
+  // Not noexcept: prepare() grows the lane table for this window's shape.
+  void prepare_compress(window& w) {
     const bool fanned =
         w.compress.prepare(ops_, w.at(), w.chunks,
                            w.plan.first_chunk, h_.key_words(), h_.mode_flags(),
@@ -2163,7 +2183,8 @@ class window_scope
     (void)fanned;
   }
 
-  void reduce_into_tree(window& w, const cv_type& cv) noexcept {
+  // Not noexcept, for the reason insert_edge_nodes() gives.
+  void reduce_into_tree(window& w, const cv_type& cv) {
     // Admission reserved this node before the window started; the same
     // reasoning as the edge path's, and the same consequence if it is
     // wrong.
@@ -2258,6 +2279,10 @@ class window_scope
       w->next_taken = nullptr;
       w->reading = false;
       w->rec = nullptr;
+      // Nothing is in flight here, and a drain forgets without a callback,
+      // so the driver owes this operation nothing -- whoever takes the
+      // window next must not read a transfer that was forgotten.
+      w->op.live = false;
       pool_.give_back(w);
     }
     last_window_ = nullptr;

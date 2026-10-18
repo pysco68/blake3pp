@@ -1,8 +1,7 @@
 // The preconditions the library checks in EVERY build, each shown failing.
 //
-// A check that cannot be shown to fire is a comment, and these are the
-// contracts whose violation would otherwise be a wrong digest or a write
-// past the end of a span, with nothing reported. They throw
+// These are the contracts whose violation would otherwise be a wrong digest
+// or a write past the end of a span, with nothing reported. They throw
 // (include/blake3pp/detail/contract.hpp), so they are ordinary cases here:
 // what each one promises is the exception type its caller would expect.
 #include <doctest/doctest.h>
@@ -40,14 +39,22 @@ struct reducer_fixture {
 TEST_SUITE_BEGIN("contracts");
 
 // Absorbing the same chunks twice: the digest would cover a message that
-// does not exist and verify against nothing. The range that overlaps has
-// already merged away, which is what the pending scan could not see.
+// does not exist and verify against nothing. Both shapes: a range whose
+// sibling has already merged it away, and a duplicate that fits inside a
+// hole in the covered span, which totals alone cannot tell from a new range.
 TEST_CASE("the reducer refuses a range it has already absorbed") {
   reducer_fixture f;
   const auto cv = some_cv(1);
   CHECK(f.r.insert(0, 4, cv));
   CHECK(f.r.insert(4, 4, cv));  // 0..8 now, as one node
-  CHECK_THROWS_AS(f.r.insert(0, 4, cv), std::logic_error);
+  CHECK_THROWS_AS((void)f.r.insert(0, 4, cv), std::logic_error);
+}
+
+TEST_CASE("the reducer refuses a duplicate that fits in a hole") {
+  reducer_fixture f;
+  CHECK(f.r.insert(0, 1, some_cv(1)));
+  CHECK(f.r.insert(4, 1, some_cv(2)));  // chunks 1..4 are still missing
+  CHECK_THROWS_AS((void)f.r.insert(4, 1, some_cv(2)), std::logic_error);
 }
 
 // A hole in the run puts every node after it at the wrong position.

@@ -2,26 +2,22 @@
 
 // The preconditions the library checks in every build.
 //
-// Most of its preconditions are assert()s, which is right where a violation
-// is something a test or a sanitizer lane would find: an index out of
-// range, a null driver, a state machine in the wrong state. The ones that
-// come through here are the others -- a caller that inserts the same range
-// of a message twice gets a digest that is simply wrong, verifies against
-// nothing and reports no error anywhere, and a span written past its end is
-// a corruption that surfaces somewhere unrelated. Both vanish under NDEBUG
-// if they are only asserted, which is the build that matters.
+// Most preconditions are assert()s: an index out of range, a null driver, a
+// state machine in the wrong state -- violations a test or a sanitizer lane
+// finds. The ones that come through here are the others, whose consequence
+// under NDEBUG is silent. A range of the message inserted twice produces a
+// digest that is simply wrong, verifies against nothing and reports no
+// error anywhere; a span written past its end corrupts memory that surfaces
+// somewhere unrelated.
 //
-// They are reported as exceptions, not as a message and an abort. The
-// library already has a carrier for one: a stage that throws completes its
-// chain with set_error(exception_ptr), the scope latches it, and run()
-// rethrows it to whoever called update_file(). A caller that broke a
-// documented contract gets something it can catch, print and test, and the
-// library writes nothing to a stream of its own.
+// They are reported as exceptions, which the pipeline already carries: a
+// stage that throws completes its chain with set_error(exception_ptr), the
+// scope latches it, and run() rethrows it to whoever called update_file().
 //
-// Two places do not use this, and cannot: the io_uring and IOCP drains
-// that cannot give back buffers the kernel still owns. Unwinding there IS
-// the corruption -- the stack unwinds, the arena is freed, and the kernel
-// writes into it -- so those end the process with the reason named.
+// The io_uring and IOCP drains cannot use this, per file or per context:
+// they cannot give back buffers the kernel still owns, and unwinding frees
+// the arena the kernel is about to write into. Those end the process with
+// the reason named.
 #include <stdexcept>
 #include <string>
 

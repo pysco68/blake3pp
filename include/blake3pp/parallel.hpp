@@ -21,15 +21,20 @@
 /// workhorse. The same source compiles against all three, as with the simd providers.
 ///
 /// What this allocates: the window pool, each window carrying its part
-/// table (`stack_budget` bytes, 32 KiB by default), the reducer's nodes and
-/// the operation cells, all taken once when a run is planned and freed with
-/// it. The part table is a member of a window rather than a frame of the
+/// table (`stack_budget` bytes, 32 KiB by default) and the chaining values
+/// its groups fold into, the reducer's nodes and the operation cells, all
+/// taken once when a run is planned and freed with it. One table per window
+/// grows later, on the first window of a shape that needs it: the lane
+/// slots a window's parts leave their kernel batches in, `n_parts * width`
+/// chaining values, up to 512 KiB at the default budget on a 16-lane
+/// kernel. The part table is a member of a window rather than a frame of the
 /// caller, which is what `stack_budget` bounds -- the agents' own frames
 /// are a constant of the build (`BLAKE3PP_MAX_SIMD_DEGREE` and
 /// `BLAKE3PP_SUBTREE_FOLD`; see docs/freestanding.md).
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <bit>
 #include <cassert>
 #include <array>
@@ -111,13 +116,26 @@ inline std::atomic<bool>& process_pool_started() noexcept {
   return started;
 }
 
+// Reading the size and declaring the pool started is one decision, and so
+// is size_parallel_scheduler()'s check-and-set, so both take this. Without
+// it a caller could check the flag, see this initializer has not set it
+// yet, store a size the initializer has already read past, and be told it
+// sized a pool that in fact runs at hardware_concurrency().
+inline std::mutex& process_pool_sizing() noexcept {
+  static std::mutex m;
+  return m;
+}
+
 // Function-local static: constructed on first use, threads joined during
 // static destruction; the same lifetime the standard's parallel scheduler
-// has.
+// has. The pool is built outside the lock, since it starts threads.
 inline exec::static_thread_pool& process_pool() {
   static exec::static_thread_pool pool{[] {
-    process_pool_started().store(true, std::memory_order_relaxed);
-    const unsigned n = process_pool_threads().load(std::memory_order_relaxed);
+    const unsigned n = [] {
+      const std::lock_guard lock{process_pool_sizing()};
+      process_pool_started().store(true, std::memory_order_relaxed);
+      return process_pool_threads().load(std::memory_order_relaxed);
+    }();
     return n != 0 ? n : std::thread::hardware_concurrency();
   }()};
   return pool;
@@ -168,21 +186,21 @@ inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
 // The window a span already in memory is cut into.
 //
 // A window is what a file pipeline reads while it hashes the previous
-// one. A span has nothing to overlap: the bytes are all there already,
-// so a window buys no concurrency and costs a join, a reducer insert and
-// a part table. What it still does is bound the part table, which is why
-// there is a ceiling at all rather than one window per span always.
+// one. A span has nothing to overlap: the bytes are all there already, so
+// a second window buys no concurrency and costs a join, a reducer insert
+// and a part table. The answer is the FEWEST windows that still bound a
+// part table, which is one window up to max_window_bytes.
 //
-// So the answer is the FEWEST windows the budget allows, not a round of
-// them in flight. One window per span against fixed 8 MiB windows, 16
-// threads, ABBA, eight samples a side, medians: +8% at 8 MiB, +15% at
-// 64 MiB, +53% at 1 GiB, where the fixed windows are 128 narrow
-// fan-outs against one wide one. Below max_window_bytes that is a
-// single window.
+// One window per span against fixed 8 MiB windows, 16 threads, ABBA,
+// eight samples a side, medians: +8% at 8 MiB, +15% at 64 MiB, +53% at
+// 1 GiB, where the fixed windows are 128 narrow fan-outs against one
+// wide one.
+//
+// default_window_bytes is only the floor: a span at or below it is one
+// window either way.
 [[nodiscard]] constexpr std::size_t memory_window_bytes(
     std::uint64_t span_bytes) noexcept {
-  constexpr std::size_t floor_bytes = 8 * 1024 * 1024;
-  return std::clamp(static_cast<std::size_t>(span_bytes), floor_bytes,
+  return std::clamp(static_cast<std::size_t>(span_bytes), default_window_bytes,
                     max_window_bytes);
 }
 
@@ -359,10 +377,11 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 struct parallel_hasher_options {
   /// The SIMD variant of the internal hasher.
   arch a = arch::auto_detect;
-  /// Bytes accumulated before a window is fanned out; rounded down to a
-  /// power-of-2 multiple of chunk_size, minimum 64 KiB. Buffered input
-  /// below one window hashes sequentially at `finalize()`.
-  std::size_t window_bytes = 8 * 1024 * 1024;
+  /// Bytes accumulated before a window is fanned out; rounded by
+  /// detail::rounded_window_bytes to a power of two in
+  /// [64 KiB, 1 GiB]. Buffered input below one window hashes
+  /// sequentially at `finalize()`.
+  std::size_t window_bytes = detail::default_window_bytes;
 };
 
 /// The incremental counterpart of the multi-core hash(). It offers the
@@ -406,8 +425,7 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(ops_),
-        remainder_(std::bit_floor(
-            std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
+        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
 
   /// Keyed (MAC/PRF) mode.
   /// @param sched  Where the subtree reductions run.
@@ -418,8 +436,7 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::keyed(key, ops_)),
-        remainder_(std::bit_floor(
-            std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
+        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
 
   /// Key-derivation mode: the input is the key material, domain-separated
   /// by context (see hasher::derive_key).
@@ -431,8 +448,7 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::derive_key(context, ops_)),
-        remainder_(std::bit_floor(
-            std::max<std::size_t>(opts.window_bytes, 64 * 1024))) {}
+        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
 
   /// Absorbs the next bytes of the message; complete windows are fanned
   /// out over the scheduler from here.
@@ -459,9 +475,13 @@ class parallel_hasher {
         return;
       }
       // More input exists, so what is buffered is provably not the
-      // message's end: it may go to the pool as a subtree.
-      absorb(std::span<const std::byte>{remainder_});
+      // message's end: it may go to the pool as a subtree. The buffer is
+      // emptied before the call, not after: absorb() may throw -- the
+      // scheduler stopping the run, a provider's allocation -- and bytes
+      // the hasher has not taken must not be absorbed twice by a later
+      // call. A throw loses them, which the exception says.
       filled_ = 0;
+      absorb(std::span<const std::byte>{remainder_});
     }
 
     // What is left starts on a window boundary, because the hasher does:
@@ -581,6 +601,10 @@ class parallel_hasher {
   std::size_t filled_ = 0;
 };
 
+/// The segment a parallel XOF fill splits its request into by default, and
+/// the granularity a generator writing that stream out naturally works in.
+inline constexpr std::size_t default_fill_segment_bytes = 4 * 1024 * 1024;
+
 /// Fills a buffer from an output reader on every core: the request is
 /// split into segments, and each task copies the reader, seeks its own
 /// segment and fills it straight into the caller's buffer.
@@ -594,14 +618,13 @@ class parallel_hasher {
 /// @param sched          Where the segments are filled.
 /// @param segment_bytes  Bytes per task; rounded down to a multiple of
 ///                       block_size so every task starts on the wide path.
-///                       The default matches a generator's natural write
-///                       granularity.
+///                       Defaults to default_fill_segment_bytes.
 /// @throws std::system_error with errc::operation_canceled if sched
 ///         completes the work stopped; r is then left where it was.
 template <class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 void fill(output_reader& r, std::span<std::byte> out, Scheduler&& sched,
-          std::size_t segment_bytes = 4 * 1024 * 1024) {
+          std::size_t segment_bytes = default_fill_segment_bytes) {
   const std::size_t segment = std::max(
       segment_bytes - segment_bytes % block_size, block_size);
   if (out.size() <= segment) {
