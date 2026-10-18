@@ -123,11 +123,17 @@ class io_driver {
   void drain() noexcept;
   // The same for one file: afterwards no transfer of this file is owed or
   // referenced, so its buffers and the operations naming them may be
-  // destroyed, and the driver stays usable for every other file. A
-  // sibling file's completion that surfaces during the wait is reported
+  // destroyed, and the driver stays usable for this file and every other.
+  // A sibling file's completion that surfaces during the wait is reported
   // normally -- dropping it would strand an op that can never complete --
-  // so a caller closing one file of several should idle it first. The
-  // file's destructor does this.
+  // so a caller closing one file of several should idle it first.
+  //
+  // The file's destructor does NOT do this: it cannot, because the
+  // operations whose transfers would be forgotten may already be gone, and
+  // reading them is what this call does. A file destroyed with transfers
+  // still owed drains the WHOLE context instead, which is the backends'
+  // last resort and strands every sibling's owed transfer. Call this while
+  // the operations are alive.
   void drain(file& f) noexcept;
 
   // Takes the window memory: one direct-I/O-aligned arena of

@@ -489,7 +489,8 @@ class sync_context {
   // operations they live in are alive, which is what asking for this
   // means; the file's destructor does not assume it.
   void forget(file& f) noexcept {
-    unlink(f);
+    // The file stays on files_: it is still open and may be read again (see
+    // the uring backend's forget).
     const std::size_t dropped = queue_.remove_if(
         [&f](const transfer& op) noexcept { return op.owner_file == &f; });
     queued_ -= dropped;

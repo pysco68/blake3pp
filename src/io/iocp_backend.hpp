@@ -1,9 +1,9 @@
 #pragma once
 
 // The Windows backend: CreateFileW handles (std::filesystem::path's native
-// wide string is the whole reason the public API trades in paths), an I/O
-// completion port as the completion queue, and the SeManageVolumePrivilege
-// dance for SetFileValidData. The mapping to the io_uring backend is
+// wide string is the whole reason the public API trades in paths) and an
+// I/O completion port as the completion queue. The mapping to the io_uring
+// backend is
 // nearly 1:1: one OVERLAPPED per buffer slot plays the SQE,
 // GetQueuedCompletionStatus plays the completion-queue wait, and
 // FILE_FLAG_NO_BUFFERING is
@@ -47,35 +47,6 @@ namespace blake3pp::detail::io_impl {
   return err == ERROR_OPERATION_ABORTED
              ? std::make_error_code(std::errc::operation_canceled)
              : std::error_code(static_cast<int>(err), std::system_category());
-}
-
-// Writes that land beyond the file's valid data length force NTFS to
-// zero-fill the gap synchronously, the Windows twin of ext4's
-// extending-write serialization. SetFileValidData waives the zero-fill,
-// but only for callers holding SeManageVolumePrivilege (admins, usually,
-// and only if the privilege is enabled in the token). Best-effort by
-// design: returns whether it actually took.
-inline bool try_set_valid_data(HANDLE file, std::int64_t size) noexcept {
-  HANDLE token = nullptr;
-  if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES,
-                         &token) == 0) {
-    return false;
-  }
-  TOKEN_PRIVILEGES tp{};
-  tp.PrivilegeCount = 1;
-  tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-  bool ok = ::LookupPrivilegeValueW(nullptr, L"SeManageVolumePrivilege",
-                                    &tp.Privileges[0].Luid) != 0;
-  ok = ok &&
-       ::AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) != 0 &&
-       ::GetLastError() == ERROR_SUCCESS;
-  ::CloseHandle(token);
-  if (!ok) {
-    return false;
-  }
-  LARGE_INTEGER n;
-  n.QuadPart = size;
-  return ::SetFileValidData(file, n.QuadPart) != 0;
 }
 
 // Owns one Win32 HANDLE and closes it exactly once. Win32 spells "no
@@ -158,14 +129,11 @@ struct win_file {
   // nothing can be engaged the plain handle stays in charge with direct
   // and use_iocp still false.
   //
-  // Per feature, not all-or-nothing. The two flags are asked for together
-  // first, and a refusal drops one and asks again: NO_BUFFERING is a
-  // property of the filesystem (SMB and some virtual volumes reject it)
-  // while OVERLAPPED is not, and buffered async on Windows measures within
-  // noise of direct async, so the port is the half worth keeping. Asking
-  // for both at once and giving up on a refusal is what made direct_io =
-  // true SLOWER than false on such a volume: the file lost its IOCP with
-  // the cache bypass it could not have.
+  // Per feature. The two flags are asked for together first, and a
+  // refusal drops one and asks again: NO_BUFFERING is a property of the
+  // filesystem (SMB and some virtual volumes reject it) while OVERLAPPED is
+  // not, and on Windows buffered async measures within noise of direct
+  // async (docs/performance.md), so the port is the half to keep.
   //
   // shared_port, when given, is a port this file does not own: the reader
   // context keeps one port for every file it opens, while the writer still
@@ -183,7 +151,8 @@ struct win_file {
       if (engage_one(path, access, share, true, true, shared_port)) {
         return;
       }
-      // The port first, as the measured better half.
+      // The port first: per the measurement above, Windows can do
+      // without the cache bypass more easily than without the asynchrony.
       if (engage_one(path, access, share, false, true, shared_port)) {
         return;
       }
@@ -299,14 +268,14 @@ class iocp_context {
       f_.open(path.c_str(), access, share, creation,
               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
       size_ = write_ ? 0 : f_.stat_size();
-      // Preallocation belongs to the OPEN, not to the finish: a write
-      // that extends the file serializes, and with an async direct queue
-      // that collapses it to one stalled write at a time. Windows
-      // preallocates by setting the end of file and then the valid data
-      // length, which is what keeps the extension from zero-filling;
-      // SetFileValidData needs a privilege the process may not hold, so
-      // it is best-effort and the size alone still helps. set_size()
-      // trims back afterwards.
+      // Preallocation belongs to the OPEN, not to the finish: a write that
+      // extends the file serializes, and with an async direct queue that
+      // collapses it to one stalled write at a time. On Windows that is
+      // SetEndOfFile, and set_size() trims back afterwards. The writes
+      // still zero-fill up to the valid data length as NTFS requires;
+      // SetFileValidData would waive that, but it needs
+      // SeManageVolumePrivilege and hands the file whatever those disk
+      // blocks held until they are written, so it is not done here.
       if (write_ && how.preallocate_bytes > 0) {
         if (set_end_of_file(how.preallocate_bytes)) {
           prealloc_ = how.preallocate_bytes;
@@ -320,7 +289,12 @@ class iocp_context {
 
     ~file() {
       if (ctx_ != nullptr) {
+        // Reclaimed, then off the context's list: forget() leaves a file on
+        // it, because a file that is merely idled is still open and may be
+        // read again. This one is not -- and a destroyed file still on the
+        // list is what a later drain() would walk.
         ctx_->forget(*this);
+        ctx_->unlink(*this);
       }
     }
     file(const file&) = delete;
@@ -431,9 +405,25 @@ class iocp_context {
   // no completion, so nothing would ever take it off in_flight(): it goes
   // down the same ladder, where a second failure reaches the caller as
   // every other transfer error does.
+  // Whether this file may hand the port a transfer of `len` bytes at
+  // `off`. The offset matters because of the continuation: a short transfer
+  // resumes at off + filled, which is a granule boundary only if the device
+  // stopped on one, and NO_BUFFERING rejects an unaligned offset as it
+  // rejects an unaligned length. Asking again is what keeps a continuation
+  // off the port on terms the first issue would have refused -- where it
+  // comes back ERROR_INVALID_PARAMETER and fails the window, with the
+  // synchronous rung right there. The io_uring backend's may_ride() is the
+  // same question.
+  [[nodiscard]] bool may_ride(const transfer& op, std::uint64_t off,
+                              std::size_t len) const noexcept {
+    if (!op.sync_file->use_iocp || len == 0 || len % direct_align != 0) {
+      return false;
+    }
+    return !op.sync_file->direct || off % direct_align == 0;
+  }
+
   void place(transfer& op, file& f) {
-    bool queued =
-        f.f_.use_iocp && op.len != 0 && op.len % direct_align == 0;
+    bool queued = may_ride(op, op.off, op.len);
     if (queued) {
       try {
         issue(op);
@@ -550,7 +540,8 @@ class iocp_context {
   // destructor. The engine never does it (one file per context), and a
   // multi-file driver should idle a file before closing it.
   void forget(file& f) noexcept {
-    unlink(f);
+    // The file stays on files_: it is still open and may be read again (see
+    // the uring backend's forget).
     // What never reached the port goes first. A deferred transfer names
     // this file's handles and this file's share of the count, and the
     // next poll() would run it through both after they are gone; and
@@ -652,6 +643,14 @@ class iocp_context {
   // inside poll(), which is where a read's error is allowed to reach its
   // callback; what cannot happen is leaving it counted and unissued.
   [[nodiscard]] bool reissue(transfer& op) noexcept {
+    if (!may_ride(op, op.off + op.filled, op.len - op.filled)) {
+      // The remainder is not something this file may hand the port. It is
+      // still owed, so it goes down the same rung an unalignable transfer
+      // takes from the start, which finishes what is left inside poll().
+      op.on_port = false;
+      deferred_.push(op);
+      return true;
+    }
     try {
       issue(op);
       return true;
@@ -746,11 +745,17 @@ class iocp_context {
     if (op.cancelled) {
       ec = std::make_error_code(std::errc::operation_canceled);
     } else {
+      // From op.filled, not from zero: a short transfer whose remainder the
+      // port would not take arrives here part-done, and the bytes already
+      // in the buffer must not be fetched again over themselves.
       try {
+        const std::size_t rest = op.len - op.filled;
         if (op.is_write) {
-          write_sync(*op.sync_file, op.off, {op.src, op.len});
+          write_sync(*op.sync_file, op.off + op.filled,
+                     {op.src + op.filled, rest});
         } else {
-          read_sync(*op.sync_file, op.off, {op.dst, op.len});
+          read_sync(*op.sync_file, op.off + op.filled,
+                    {op.dst + op.filled, rest});
         }
         op.filled = op.len;
       } catch (const std::system_error& e) {

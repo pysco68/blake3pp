@@ -394,7 +394,14 @@ struct uring {
       const int n = sys_io_uring_enter(fd.get(), tail - head, 0, 0);
       if (n >= 0) {
         outstanding += static_cast<unsigned>(n);
-        return;
+        // An enter may take fewer than it was offered, and the rest stay
+        // published. In steady state the next flush would pick them up, but
+        // forget() waits out a count that includes them, so they are
+        // offered again here. n == 0 is no progress: leave them.
+        if (n == 0 || static_cast<unsigned>(n) == tail - head) {
+          return;
+        }
+        continue;
       }
       if (errno != EINTR) {
         throw_errno("io_uring_enter(submit)");
@@ -753,7 +760,8 @@ class uring_context {
   // context while a sibling has transfers in flight can run that
   // sibling's callback from here.
   void forget(file& f) noexcept {
-    unlink(f);
+    // The file stays on files_: it is still open and may be read again, and
+    // a later context-wide drain has to be able to zero its count.
     const std::size_t never_rode = deferred_.remove_if(
         [&f](const transfer& op) noexcept { return op.owner_file == &f; });
     in_flight_ -= std::min(never_rode, in_flight_);
@@ -1073,7 +1081,8 @@ class uring_context {
   uring ring_;
   deferred_ops<transfer> deferred_;
   // Every open file of this context, so its own drain can zero the shares
-  // they count. Linked by the file, unlinked by forget().
+  // they count. Linked and unlinked by the file: forget() leaves one on the
+  // list, because an idled file is still open and may be read again.
   file* files_ = nullptr;
   std::size_t in_flight_ = 0;
   bool async_requested_ = true;
