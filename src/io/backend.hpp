@@ -37,6 +37,9 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
 #endif
+#if defined(__linux__)
+#include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for the arena
+#endif
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -70,9 +73,28 @@ struct aligned_delete {
 };
 using aligned_buffer = std::unique_ptr<std::byte[], aligned_delete>;
 
+// The arena is virtual until the first pass of a run touches it, so every
+// page is a fault paid inside the pipeline, 262144 of them per GiB at
+// 4 KiB. Transparent huge pages make that pass cheaper where the kernel
+// offers them. Touching 1 GiB a page at a time on Zen 3+ measured
+// 550-740 ms as plain pages against 216-221 ms advised.
+//
+// End to end, where the hash is the limit, it measured 2-4% on a warm
+// 2 GiB file at a 1 GiB arena, within that machine's noise. Runs where
+// the device outruns the hash, which would pay the faults in the open,
+// have not been measured.
+//
+// A hint, so a kernel without THP or set to `never` refuses it and nothing
+// changes; only asked above one huge page, 2 MiB everywhere it exists.
 [[nodiscard]] inline aligned_buffer make_aligned_buffer(std::size_t bytes) {
-  return aligned_buffer(static_cast<std::byte*>(
+  aligned_buffer buf(static_cast<std::byte*>(
       ::operator new(bytes, std::align_val_t{direct_align})));
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+  if (bytes >= std::size_t{2} << 20) {
+    (void)::madvise(buf.get(), bytes, MADV_HUGEPAGE);
+  }
+#endif
+  return buf;
 }
 
 // How a file is opened on a context. Reads want a path and maybe direct

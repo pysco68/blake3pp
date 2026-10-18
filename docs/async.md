@@ -25,9 +25,10 @@ the thread that called it.
 `async_io.hpp` moves that storage up into a context and turns the call
 into a sender. Reach for it when either is true:
 
-- **You have many files.** The blocking form allocates and first-touches
-  an arena per call, and no two files ever overlap. A context allocates
-  once and lets several files share it.
+- **You have many files.** The blocking form takes an arena per call and
+  pays its page faults on the first pass over it, and no two files ever
+  overlap. A context allocates once and lets several files share it, so the
+  second file onwards finds the pages already faulted in.
 - **You have work of your own.** A sender composes: `then`, `let_value`,
   `when_all`, a stop token from your own receiver.
 
@@ -152,7 +153,12 @@ blake3pp::async::io_context ctx({
     .direct_io    = true});
 ```
 
-The arena is `windows * window_bytes`, allocated and first-touched once.
+The arena is `windows * window_bytes`, allocated once. Its pages are not
+touched at allocation: they fault in as the first pass over the arena
+reaches them, which is the first `windows` windows of the first operation,
+and every operation after that finds them warm. On Linux the allocation asks
+for transparent huge pages, which makes that pass cheaper where the kernel
+grants them.
 Left at zero, `windows` is what the plan asks for: 16 at the defaults, so a
 128 MiB arena, which keeps four operations of `queue_depth` 4 moving. Both
 `windows` and `queue_depth` are clamped to the same ceiling, 256 unless the

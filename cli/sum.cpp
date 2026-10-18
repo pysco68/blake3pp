@@ -179,11 +179,11 @@ class engine {
   // Several files over one context, a bounded number in flight at a
   // time, each outcome reported as its file completes and in input order.
   //
-  // What this buys over calling hash_hex() per file is the arena: the
-  // blocking path allocates and first-touches windows * window_bytes per
-  // call and lets no two files overlap, while here one allocation serves
-  // every file and several are in flight at once. On a directory of
-  // small files that allocation is most of the work.
+  // The gain over calling hash_hex() per file is the arena. The blocking
+  // path allocates windows * window_bytes per call, takes the page faults
+  // of its first pass over it, and lets no two files overlap. Here one
+  // allocation serves every file, faults in once, and several files are
+  // in flight at once.
   //
   // A file that fails carries its message instead of a digest, so one bad
   // file does not end the run. report(index, result) says whether that

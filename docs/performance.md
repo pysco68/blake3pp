@@ -929,9 +929,28 @@ Each of these is a measured gap with an open item behind it.
   default that helps the stripe can cost every laptop, and a tuner is
   process-global state with a policy to document.
 - **`blake3ppsum` runs at about three quarters of `blake3pp_bench_file`'s
-  parallel row in steady state, and pays about 0.9 s on its first file.**
-  Measured on a Scaleway EM-L520E with NVMe. The tool people actually run
-  has not been profiled against the bench on the same box.
+  parallel row in steady state, and paid about 0.9 s on its first file** on a
+  Scaleway EM-L520E with NVMe (32 GiB at `--window 128 --qd 8`: 1.953 s for
+  the first file against 1.078 s for the second in the same process). Two
+  thirds of that question is now answered, both parts on the Z13 and neither
+  needing the device:
+    - It is **not** process or pool setup. The whole fixed cost of the tool,
+      process start through CPU detection, pool, arena and open, is 7.5 ms on
+      an empty file against 0.7 ms for `/bin/true`.
+    - Part of the steady-state gap is the two programs measuring different
+      things. The arena is allocated but not touched, so its page faults land
+      on the first pass over it — and `blake3pp_bench_file`'s null driver
+      faults its pool in at construction *specifically to keep those faults
+      out of the clock* (`bench/file_throughput.cpp`). The CLI's wall time
+      includes them; the bench's reported rate does not.
+    - At that geometry the arena is 1 GiB, and faulting 1 GiB costs 550-740 ms
+      as 4 KiB pages against 216-221 ms with `MADV_HUGEPAGE` (Zen 3+, best of
+      three, a page at a time) — the same order as the gap. The allocation
+      now asks for huge pages, which is 2-4% end to end where the hash is the
+      limit, below this machine's noise floor: it is a box whose device
+      outruns its hash that would show it.
+  What is left is the steady-state remainder on a fast device, which needs
+  one.
 - **MSVC's AVX-512 kernel runs at 54% of the assembly** on Emerald Rapids
   where clang runs at 82%, and its pool row at 7.89 GiB/s on four threads
   against 12.6 for upstream's kernels in the same pipeline. Parked on
