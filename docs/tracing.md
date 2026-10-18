@@ -149,6 +149,13 @@ thread is the bottleneck.
 | `max_pending` | the most subtrees the reducer held at once: how far ahead of the tree the reads ran |
 | `max_reads_in_flight` | the most reads submitted and not yet landed: what the device saw |
 | `max_windows_in_flight` | the most windows reading, on the pool or waiting to reduce |
+| `read_backend` | the rung the reads engaged, through `read_backend(d)` |
+
+`read_backend(d)` is how the read side's degradation becomes visible to a
+caller: `"io_uring+direct"` when everything was granted, `"io_uring"` when
+the filesystem refused `O_DIRECT`, `"pread [io_uring: EPERM, blocked by
+policy]"` when the engine itself was, and so on. [Direct I/O](direct-io.md)
+lists the rungs.
 
 ## How to read a run
 
