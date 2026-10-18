@@ -320,11 +320,11 @@ window to keep for the end. The generator must therefore depend on its
 offset alone in the scheduler-taking form, where windows are filled
 concurrently and in no particular order.
 
-The generator also must not throw: it runs on a pool thread inside a window
-already counted in flight, where an exception has nowhere to go. A
-`static_assert` makes a generator that can throw a compile error rather
-than a crash under load. The sequential forms of `write_file()`, which do
-not go through this chain, accept one that may throw.
+The generator may throw, even on a pool thread inside a window already
+counted in flight: nothing is submitted for that window before the fill, so
+the exception owes the driver nothing and travels the chain's own error
+channel -- `set_error(exception_ptr)` to the scope, which stops the run,
+gives the window back and rethrows from `write_file()`.
 
 Three public forms: a known length generated on the calling thread, a length
 the generator decides by returning short of a whole window, and the windows
@@ -351,9 +351,9 @@ layers that use senders:
 
 - The **blocking entry points** (`hash_file`, `update_file`, `write_file`)
   build a driver, an arena and a loop for the one file they are hashing, and
-  give them up when they return. One allocation and one first touch per
-  call, and no two files ever overlap. For one large file that is the right
-  shape, and it is not slower.
+  give them up when they return. One allocation per call, whose pages fault
+  in on the first pass over it, and no two files ever overlap. For one large
+  file that is the right shape, and it is not slower.
 - **`<blake3pp/async_io.hpp>`** moves the storage up into an `io_context`
   that owns the driver, the arena and the run queue, and turns the call into
   a sender. Several files borrow windows from one arena at once, which is

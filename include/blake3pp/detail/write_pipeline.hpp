@@ -231,7 +231,7 @@ class write_scope
         ex::let_value(
             declared(ex::continues_on(
                 ex::then(ex::schedule(sched_),
-                         [this, &w]() noexcept { fill_window(w); }),
+                         [this, &w] { fill_window(w); }),
                 loop_.scheduler())),
             [this, &w] {
               return loop_.write(file_, w.offset,
@@ -242,21 +242,16 @@ class write_scope
         [this, &w]() noexcept { landed(w); });
   }
 
-  // Marked noexcept, which is the caller's contract too: an exception
-  // escaping the generator terminates rather than unwinding through a
-  // stage whose window is already counted in flight. write_file's
-  // documentation says so, and the static_assert makes a generator that
-  // can throw a compile error rather than a crash under load -- the
-  // sequential forms of write_file() take one that may throw, and this is
-  // the path that cannot.
-  void fill_window(window& w) noexcept {
-    static_assert(
-        std::is_nothrow_invocable_v<Fill&, std::span<std::byte>, std::uint64_t>,
-        "the scheduler-taking write_file() needs a noexcept generator: it "
-        "runs on a pool thread inside a window already counted in flight, "
-        "where an exception has nowhere to go");
-    fill_(w.buffer.first(w.bytes), w.offset);
-  }
+  // The generator may throw, on a pool thread, inside a window already
+  // counted in flight: the chain carries it from there like any other
+  // stage's exception. The window's own completion is set_error with the
+  // exception_ptr, the scope latches it, stops the run, gives the window
+  // back, and run() rethrows it to whoever called write_file(). The file is
+  // then left as far as it got, which is what an I/O failure leaves too.
+  //
+  // Nothing is submitted for this window before the fill, so a throw owes
+  // the driver nothing.
+  void fill_window(window& w) { fill_(w.buffer.first(w.bytes), w.offset); }
 
   void landed(window& w) noexcept { w.writing = false; }
 

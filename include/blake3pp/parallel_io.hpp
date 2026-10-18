@@ -68,15 +68,15 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 ///
 /// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
 /// offset)` on the scheduler's agents, once per window, and must fill
-/// every byte of `out`; windows are filled and written concurrently, in
-/// no particular order, so a generator must depend on its offset and
-/// nothing else. It must also be `noexcept`, and say so: the fill runs on
-/// a pool thread inside a window already counted in flight, where an
-/// exception has nowhere to go, so a generator that is not declared
-/// noexcept does not compile. A generator that can fail should record the
-/// failure and fill the window, leaving the caller to check afterwards.
-/// The sequential forms in <blake3pp/io.hpp> take a throwing generator,
-/// because there the fill runs on the calling thread.
+/// every byte of `out`. Windows are filled and written concurrently and
+/// in no particular order, so a generator must depend on its offset and
+/// nothing else.
+///
+/// `fill` may throw. The exception stops the run and comes back out of
+/// this call, and the file is left as far as it got, as after an I/O
+/// failure. The `std::error_code` overload reports it as
+/// not_enough_memory, like a provider's exception, so a caller whose
+/// generator can fail takes the throwing form.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is

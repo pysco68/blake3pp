@@ -290,6 +290,48 @@ TEST_CASE("a generated file is exactly what the generator described") {
   }
 }
 
+// A generator that throws, on the pool, inside a window already counted in
+// flight: the chain carries the exception, the run stops, and write_file
+// rethrows it. Nothing is submitted for that window before the fill, so the
+// file is whatever landed before it -- and never a length nobody produced.
+TEST_CASE("a write generator's exception comes back out of write_file") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::uint64_t size = 8 * win;
+  for (const unsigned qd : {2u, 4u}) {
+    CAPTURE(qd);
+    const temp_path out;
+    std::atomic<unsigned> fills{0};
+    // The third window to be filled throws, whichever offset that is: the
+    // windows are filled concurrently and in no particular order.
+    auto fill = [&fills](std::span<std::byte> w, std::uint64_t off) {
+      if (fills.fetch_add(1, std::memory_order_relaxed) == 2) {
+        throw std::runtime_error("the generator gave up");
+      }
+      fill_from_offset(w, off);
+    };
+    CHECK_THROWS_AS(blake3pp::write_file(out.path, size, fill, sched,
+                                        {.window_bytes = win,
+                                         .queue_depth = qd}),
+                    std::runtime_error);
+    // The file exists and is not the full length: a length invented for
+    // bytes nobody produced is what this must never do.
+    CHECK(size_of(out.path) <= size);
+  }
+  // The error_code form cannot tell a generator's exception from the other
+  // things that escape a pipeline, and says so by reporting one.
+  {
+    const temp_path out;
+    std::error_code ec;
+    auto fill = [](std::span<std::byte>, std::uint64_t) -> void {
+      throw std::runtime_error("no");
+    };
+    blake3pp::write_file(out.path, size, fill, sched, ec,
+                         {.window_bytes = win});
+    CHECK(ec);
+  }
+}
+
 // The sequential forms take the same generator without a scheduler: the
 // bounded one writes exactly what it was asked for, the unbounded one
 // stops where the generator stops, and both name the mechanism that

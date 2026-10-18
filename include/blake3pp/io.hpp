@@ -223,9 +223,11 @@ inline hasher make_hasher(const hash_file_options& opts,
 
 // The body of every std::error_code overload: ec is cleared, then set
 // from the std::system_error the throwing form raises. Anything else
-// escaping the pipeline is an allocation failure at setup (the buffer
-// ring, the queue), reported as not_enough_memory. Value-returning
-// callers get a default-constructed result on failure.
+// escaping the pipeline reads as not_enough_memory: a setup allocation (the
+// buffer ring, the queue), whatever an execution provider raises, or a write
+// generator's own exception, none of which this seam can tell apart. A
+// caller that needs to know takes the throwing form. Value-returning callers
+// get a default-constructed result on failure.
 template <class F>
 auto with_error_code(std::error_code& ec, F&& fn) noexcept
     -> std::invoke_result_t<F> {
@@ -381,10 +383,11 @@ write_report write_sequential(const std::filesystem::path& path,
 ///
 /// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
 /// offset)`, once per window and in file order, and must fill every byte
-/// of `out`. It may throw, and the file is then left as far as it got;
-/// the fill runs on this thread, so the exception propagates out of this
-/// call. The parallel_io.hpp overload runs the windows over a scheduler
-/// instead, and needs a `noexcept` generator.
+/// of `out`. It may throw, and the file is then left as far as it got; the
+/// fill runs on this thread, so the exception propagates out of this call.
+/// The parallel_io.hpp overload runs the windows over a scheduler instead,
+/// where a throwing generator is carried by the chain rather than by the
+/// stack.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is
