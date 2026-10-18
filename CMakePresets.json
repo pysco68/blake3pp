@@ -168,6 +168,21 @@
       }
     },
     {
+      "name": "windows-msvc2026-cxx23-asan",
+      "displayName": "Windows MSVC (cl.exe), C++23, asan (vcvars64 shell)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-msvc2026-cxx23-asan",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-msvc2026-cxx23-asan/windows-msvc2026-cxx23-asan.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
       "name": "windows-arm64-msvc2026-cxx23",
       "displayName": "Windows arm64 cross (MSVC, scalar-only by verdict \u2014 see KernelVariants.cmake), vcvarsamd64_arm64 shell",
       "generator": "Ninja",
@@ -382,6 +397,15 @@
       }
     },
     {
+      "name": "windows-msvc2026-cxx23-asan",
+      "configurePreset": "windows-msvc2026-cxx23-asan",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
       "name": "windows-clangcl-cxx23",
       "configurePreset": "windows-clangcl-cxx23",
       "condition": {
@@ -535,6 +559,18 @@
     {
       "name": "windows-msvc2026-cxx23",
       "configurePreset": "windows-msvc2026-cxx23",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-msvc2026-cxx23-asan",
+      "configurePreset": "windows-msvc2026-cxx23-asan",
       "output": {
         "outputOnFailure": true
       },

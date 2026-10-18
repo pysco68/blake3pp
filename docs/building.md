@@ -27,6 +27,16 @@ Any name from `cmake/toolchains/` works as a preset (see
   libFuzzer's runtime is built against libstdc++, which is why this lane
   is not a libc++ one.
 
+On Windows, from a `vcvars64` shell:
+
+- `windows-clangcl-cxx23` and `windows-msvc2026-cxx23`
+- `windows-msvc2026-cxx23-asan`: the same cl.exe build under
+  AddressSanitizer, which is what exercises the IOCP backend under a
+  sanitizer at all. cl rather than clang-cl, for the reason
+  `cmake/toolchains/windows-common.cmake` gives where it refuses the other
+  spelling: on Windows the clang driver is what links clang's sanitizer
+  runtimes, and CMake does not link through it.
+
 On a Mac:
 
 - `macos-appleclang-cxx23`: the native preset (Apple clang, GCD +
