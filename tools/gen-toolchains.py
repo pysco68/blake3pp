@@ -69,8 +69,15 @@ CLANG_TO_GCC = {17: 14, 18: 14, 19: 14, 20: 15, 21: 15, 22: 16, 23: 16}
 # that ships, and the emulator passes (SDE, qemu) are minutes at -O0.
 # LLVM's source-based mapping is optimisation-independent; gcov's line
 # attribution blurs a little under inlining, measured and accepted.
+#
+# One lane sanitizes the OTHER optimisation level the plain matrix builds:
+# -O3 inlines and vectorises where -O2 does not, and an optimiser-dependent
+# defect only exists under the optimiser that made it (clang 21's merged
+# load was one). ASan alone, so the matrix grows by one lane and not four.
 INSTRUMENTATIONS = {
     "asan": {"sanitizers": ["address", "undefined"], "build_type": "RelWithDebInfo"},
+    "asan-release": {"sanitizers": ["address", "undefined"],
+                     "build_type": "Release", "desc": "asan at -O3"},
     "tsan": {"sanitizers": ["thread"], "build_type": "RelWithDebInfo"},
     "msan": {"sanitizers": ["memory"], "build_type": "RelWithDebInfo", "clang_only": True},
     "fuzzer": {"sanitizers": ["fuzzer", "address", "undefined"], "clang_only": True},
@@ -238,7 +245,7 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
                 # An uninstrumented libc++ makes MSan report other people's
                 # uninitialised memory, so point it at the instrumented build.
                 new["MSAN_LIBCXX_PREFIX"] = "/opt/libcxx-msan"
-            if inst == "asan" and not is_clang and "g++-16" in tc["CXX_COMPILER"]:
+            if inst.startswith("asan") and not is_clang and "g++-16" in tc["CXX_COMPILER"]:
                 # GCC 16's null checks leak into constant evaluation: with
                 # -fsanitize=null (or its two nonnull-attribute siblings),
                 # comparing the addresses of two variable-template
@@ -262,7 +269,8 @@ def instrumented(bases: list[tuple[str, str, dict]], everywhere: bool):
                 inst_desc = (desc.replace("with libc++ (system)",
                                           "against libstdc++")
                                  .replace(f"C++{tc['CXX_STANDARD']}", "C++23"))
-            out.append((inst_name, f"{inst_desc} + {inst}", new))
+            out.append((inst_name,
+                        f"{inst_desc} + {spec.get('desc', inst)}", new))
     return out
 
 
@@ -318,10 +326,15 @@ def main() -> int:
                     "binaryDir": "${sourceDir}/build/" + name,
                     "toolchainFile": "${sourceDir}/" + f"{rel}/{name}/{name}.cmake",
                     "cacheVariables": {
-                        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+                        # The preset states the build type, so the toolchain's
+                        # own default is not what decides it: a lane that
+                        # sanitizes -O3 has to arrive at -O3 through the
+                        # preset too.
+                        "CMAKE_BUILD_TYPE": tc.get("DEFAULT_BUILD_TYPE",
+                                                   "RelWithDebInfo")
                     },
                 }
-                for name, desc, _ in configs
+                for name, desc, tc in configs
             ],
             "buildPresets": [{"name": n, "configurePreset": n} for n, _, _ in configs],
         }

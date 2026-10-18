@@ -17,7 +17,9 @@ Any name from `cmake/toolchains/` works as a preset (see
 
 - `linux-gcc16-cxx26` and `linux-clang22-cxx26`
 - `linux-clang18-cxx20-libstdcxx`: the C++20 polyfill path
-- the two `-asan` variants
+- the `-asan` variants: one per compiler at the plain matrix's `-O2 -g`,
+  and `-asan-release` for the `-O3` the matrix also builds, because an
+  optimiser-dependent defect only exists under the optimiser that made it
 - `linux-clang22-cxx23-fuzzer`: the differential fuzz harness
   (`tests/fuzz_paths.cpp`), which feeds the same bytes through every path
   the library has and compares them. Its ctest leg is a few thousand

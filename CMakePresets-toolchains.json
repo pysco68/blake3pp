@@ -132,6 +132,16 @@
       }
     },
     {
+      "name": "linux-gcc16-cxx26-asan-release",
+      "displayName": "GCC 16 with libstdc++ 16, C++26 + asan at -O3",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-gcc16-cxx26-asan-release",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-gcc16-cxx26-asan-release/linux-gcc16-cxx26-asan-release.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "linux-gcc16-cxx26-tsan",
       "displayName": "GCC 16 with libstdc++ 16, C++26 + tsan",
       "generator": "Ninja",
@@ -159,6 +169,16 @@
       "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-asan/linux-clang22-cxx26-asan.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "linux-clang22-cxx26-asan-release",
+      "displayName": "Clang 22 with libc++ (system), C++26 + asan at -O3",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-clang22-cxx26-asan-release",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-clang22-cxx26-asan-release/linux-clang22-cxx26-asan-release.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
       }
     },
     {
@@ -256,6 +276,10 @@
       "configurePreset": "linux-gcc16-cxx26-asan"
     },
     {
+      "name": "linux-gcc16-cxx26-asan-release",
+      "configurePreset": "linux-gcc16-cxx26-asan-release"
+    },
+    {
       "name": "linux-gcc16-cxx26-tsan",
       "configurePreset": "linux-gcc16-cxx26-tsan"
     },
@@ -266,6 +290,10 @@
     {
       "name": "linux-clang22-cxx26-asan",
       "configurePreset": "linux-clang22-cxx26-asan"
+    },
+    {
+      "name": "linux-clang22-cxx26-asan-release",
+      "configurePreset": "linux-clang22-cxx26-asan-release"
     },
     {
       "name": "linux-clang22-cxx26-tsan",
