@@ -423,6 +423,50 @@ TEST_CASE("async_update_files reports every file and completes once") {
   CHECK(calls == 0);
 }
 
+// A stop from the RECEIVER, not from the context: the many-files operation
+// has to reach the files already in flight as well as the ones it has not
+// started, because a when_all sibling failing is how a caller cancels it.
+TEST_CASE("a receiver's stop ends async_update_files, in flight and not") {
+  constexpr std::size_t files = 6;
+  std::vector<std::vector<std::byte>> contents;
+  std::vector<std::unique_ptr<temp_file>> temps;
+  std::vector<fs::path> paths;
+  for (std::size_t i = 0; i < files; ++i) {
+    contents.push_back(pattern(32 * 64 * 1024 + i, 70 + static_cast<std::uint32_t>(i)));
+    temps.push_back(std::make_unique<temp_file>(contents.back()));
+    paths.push_back(temps.back()->path());
+  }
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+  unsigned calls = 0;
+  unsigned stopped = 0;
+  ex::inplace_stop_source src;
+  auto work = async::async_update_files(
+      ctx, paths, sched, {.in_flight = 2},
+      [](std::size_t) { return blake3pp::hasher{}; },
+      [&](std::size_t, blake3pp::hasher&, const async::file_outcome& o) noexcept {
+        ++calls;
+        if (o.stopped) {
+          ++stopped;
+        }
+        // The stop arrives once the first file has been reported, so some
+        // files are in flight and some have not started.
+        src.request_stop();
+      });
+  record rec;
+  auto op = ex::connect(std::move(work), handle_receiver{&rec, src.get_token()});
+  ex::start(op);
+  ctx.run_until_idle();
+  // Every file is accounted for exactly once, the operation completes
+  // exactly once, and the stop was not silently ignored.
+  CHECK(calls == paths.size());
+  CHECK(stopped > 0);
+  CHECK(rec.total() == 1);
+  CHECK(rec.stops == 1);
+  CHECK(!ctx.stop_requested());  // the receiver's stop is not the context's
+}
+
 // A byte budget for the arena is the knob a caller actually has.
 TEST_CASE("arena_bytes sizes the window count") {
   async::io_context by_bytes({.window_bytes = 64 * 1024,

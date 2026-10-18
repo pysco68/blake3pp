@@ -115,15 +115,16 @@ void request_stop();               // from any thread
   what a thread dedicated to the context wants. A thread with other work
   should call `run_until_idle()` instead, which returns as soon as
   nothing is in flight — including immediately, when nothing was.
-- Only one thread may run a context. A second is a contract violation
-  and debug builds assert on it.
+- Only one thread may run a context. A second is a contract violation and
+  throws `std::logic_error`, in every build.
 - Any thread may start an operation on the context: `start()` only joins
   it, and the open and the first reads happen on the running thread in
   the operation's first round.
 - `request_stop()` is the other member another thread may call. It asks
   every started operation to stop; each one then completes with
   `set_stopped()`, or with its value if it had already finished. The
-  request clears when the run call returns, so a context is reusable.
+  request clears once nothing is left to stop and the run call returns, so
+  a context is reusable.
 - An operation completes **inside** a run call, never inside `start()`.
   A file that cannot even be opened is reported from the first round,
   not from the `start()` that found it.
