@@ -329,7 +329,7 @@ void check_cancel_discipline(std::string_view tag, MakeFile make_file,
 // The write half of the same contract: submit queues, flush pushes,
 // poll reports, and the bytes that land are the bytes that were handed
 // over. Lengths either side of the direct-I/O granule are the point --
-// an unaligned one takes the deferred path inside the backend.
+// an unaligned one ends in a piece the direct descriptor cannot take.
 template <class C, class MakeFile>
 void check_write_discipline(std::string_view tag, const fs::path& path,
                             bool direct, std::size_t len, MakeFile make_file) {
@@ -461,6 +461,42 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
 }
 
 #if defined(_WIN32)
+// The IOCP half of the unaligned-length contract: a buffered file hands
+// the port any length, so none of it is synchronous; a NO_BUFFERING file
+// hands it the whole granules and finishes the sub-granule rest on the
+// plain handle, which is one synchronous piece per such file rather than
+// the whole read.
+TEST_CASE("IOCP: an unaligned length rides the port but for a direct tail") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  constexpr std::size_t len = 2 * 4096 + 100;
+  const auto content = pattern(len, 43);
+  const temp_file f(content);
+  for (const bool direct : {false, true}) {
+    CAPTURE(direct);
+    io_impl::iocp_context ctx({}, 4);
+    io_impl::iocp_context::file file(
+        ctx, f.path, io_impl::file_open_options{.direct_io = direct});
+    MESSAGE("read through " << file.name());
+    const bool on_port = file.name().starts_with("iocp");
+    const bool bypassing = file.name().find("direct") != std::string_view::npos;
+    std::vector<std::byte> got(len);
+    probe p;
+    io_impl::iocp_context::transfer op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, std::span(got), op);
+    ctx.flush();
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(!p.ec);
+    CHECK(got == content);
+    if (on_port) {
+      CHECK(ctx.served_synchronously() == (bypassing ? 1u : 0u));
+    }
+  }
+}
+
 // A file closed with transfers it could not hand to the port (an
 // unaligned length under NO_BUFFERING, or no port at all) has to take
 // them with it: they name its handles and its share of the count. Left
@@ -473,7 +509,7 @@ TEST_CASE("an IOCP file closed with deferred transfers takes them with it") {
   for (const bool async : {false, true}) {
     CAPTURE(async);
     io_impl::iocp_context ctx({.async = async}, 4);
-    std::array<std::byte, 4096 + 100> buf{};  // never a NO_BUFFERING granule
+    std::array<std::byte, 100> buf{};  // below one NO_BUFFERING granule
     io_impl::iocp_context::transfer op{};
     probe p;
     op.done = &probe::on_done;
@@ -799,6 +835,75 @@ TEST_CASE("io_uring: reads the ring would not take are served by poll()") {
   CHECK(ctx.in_flight() == 0);
   CHECK(std::equal(got_a.begin(), got_a.end(), content.begin()));
   CHECK(std::equal(got_b.begin(), got_b.end(), content.begin() + len / 2));
+}
+
+// A length that is not a multiple of the direct-I/O granule is the last
+// read of almost every real file, and the whole read of a small one. It
+// rides the ring in both directions: on the plain descriptor for a
+// buffered file, and for a direct one as the whole granules on the direct
+// descriptor followed by the rest on the plain one. None of it reaches
+// the synchronous path, which costs one device round trip per poll().
+// Before this held, a directory of 65000-byte files read at a quarter of
+// the rate of 65536-byte ones, buffered or direct.
+TEST_CASE("io_uring: an unaligned length rides the ring, buffered or direct") {
+  constexpr std::size_t len = 2 * 4096 + 100;
+  const auto content = pattern(len, 43);
+  for (const bool direct : {false, true}) {
+    CAPTURE(direct);
+    const temp_file f(content);
+    io_impl::uring_context ctx({}, 4);
+    {
+      io_impl::uring_context::file file(
+          ctx, f.path, io_impl::file_open_options{.direct_io = direct});
+      if (!file.name().starts_with("io_uring")) {
+        MESSAGE("no io_uring here (" << file.name() << "); nothing to check");
+        return;
+      }
+      MESSAGE("read through " << file.name());
+      // A direct transfer takes a buffer aligned as the engines' arena
+      // is, so both directions hand the context the same kind of buffer.
+      const auto got = io_impl::make_aligned_buffer(len);
+      probe p;
+      io_impl::uring_context::transfer op{};
+      op.done = &probe::on_done;
+      op.owner = &p;
+      ctx.submit_read(file, 0, std::span<std::byte>{got.get(), len}, op);
+      ctx.flush();
+      while (p.calls == 0) {
+        ctx.poll(true);
+      }
+      CHECK(!p.ec);
+      CHECK(std::ranges::equal(std::span<const std::byte>{got.get(), len},
+                               content));
+      CHECK(ctx.served_synchronously() == 0);
+    }
+    // The write twin: the same shape lands through the same descriptors.
+    const temp_file w({});
+    {
+      io_impl::uring_context::file file(
+          ctx, w.path,
+          io_impl::file_open_options{.write = true, .direct_io = direct});
+      const auto buf = io_impl::make_aligned_buffer(len);
+      std::ranges::copy(content, buf.get());
+      probe p;
+      io_impl::uring_context::transfer op{};
+      op.done = &probe::on_done;
+      op.owner = &p;
+      ctx.submit_write(file, 0, std::span<const std::byte>{buf.get(), len}, op);
+      ctx.flush();
+      while (p.calls == 0) {
+        ctx.poll(true);
+      }
+      CHECK(!p.ec);
+      CHECK(ctx.served_synchronously() == 0);
+      file.set_size(len);
+    }
+    std::ifstream in(w.path, std::ios::binary);
+    std::vector<char> landed((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+    REQUIRE(landed.size() == len);
+    CHECK(std::memcmp(landed.data(), content.data(), len) == 0);
+  }
 }
 
 TEST_CASE("io_uring: giving up the ring mid-run leaves wake() working") {

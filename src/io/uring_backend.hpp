@@ -601,10 +601,10 @@ class uring_context {
     issue(op, IORING_OP_READ, buf.data(), buf.size());
   }
 
-  // Same rules as submit_read, and the same ladder: a length O_DIRECT
-  // cannot take rides the deferred list and is written synchronously
-  // inside poll(), through the plain fd. Nothing above the context sees
-  // the difference.
+  // Same rules as submit_read, and the same choice of descriptor: the
+  // granules O_DIRECT can take go through the direct fd, the rest
+  // through the plain one, both on the ring. Nothing above the context
+  // sees the difference.
   void submit_write(file& f, std::uint64_t off,
                     std::span<const std::byte> buf, transfer& op) {
     arm(op, f, off);
@@ -629,35 +629,49 @@ class uring_context {
     f.inflight_++;
   }
 
-  // The ladder, asked once for both directions and for every piece of a
-  // transfer: only whole granules may ride the ring, because O_DIRECT
-  // rejects an unaligned length and an unaligned offset, and what it
-  // refuses goes through the synchronous path inside poll(). A zero-length
-  // transfer takes that path too: io_uring would report it as res == 0,
-  // which is the signature of a short transfer with nothing left to give,
-  // so a no-op never reaches the kernel. This is the whole
-  // runtime-degradation question.
+  // How much of a piece of a transfer the ring takes, and through which
+  // descriptor. Asked for both directions and for every piece: the
+  // initial one, and what is left after a short completion, which
+  // resumes at off + filled -- a granule boundary only if the device
+  // stopped on one.
   //
-  // The offset matters because of the continuation: a short transfer
-  // resumes at off + filled, which is a granule boundary only if the
-  // device stopped on one. Asking the same question again is what keeps a
-  // continuation off the ring on terms the first submit would have
-  // refused -- where it would come back EINVAL and fail the window, with
-  // the synchronous rung right there.
-  [[nodiscard]] bool may_ride(const transfer& op, std::uint64_t off,
-                              std::size_t len) const noexcept {
-    if (!use_uring_ || len == 0 || len % direct_align != 0) {
-      return false;
+  // O_DIRECT rejects an unaligned length and an unaligned offset, so the
+  // direct descriptor carries whole granules at a granule offset, and a
+  // piece with a sub-granule end is cut to the granules it holds. What
+  // that leaves -- the end of a file whose size is not a multiple of the
+  // granule, a resumption off a boundary, and every piece of a buffered
+  // file -- goes to the ring through the plain descriptor, which takes
+  // any shape. A file's last window therefore stays asynchronous however
+  // long it is; what reaches the synchronous path inside poll() is a
+  // context with no ring, a submit the kernel refused, and a zero-length
+  // transfer, which io_uring would report as res == 0, the signature of
+  // a short transfer with nothing left to give.
+  struct ring_piece {
+    int fd;           // -1: the ring takes none of it
+    std::size_t len;  // what rides, from the piece's start
+  };
+  [[nodiscard]] ring_piece piece_for(const transfer& op, std::uint64_t off,
+                                     std::size_t len) const noexcept {
+    if (!use_uring_ || len == 0) {
+      return {-1, 0};
     }
-    return !op.sync_file->direct() || off % direct_align == 0;
+    if (op.sync_file->direct()) {
+      const std::size_t granules = len - len % direct_align;
+      if (off % direct_align == 0 && granules > 0) {
+        return {op.sync_file->fd(), granules};
+      }
+    }
+    return {op.sync_file->fd_plain(), len};
   }
 
   void issue(transfer& op, std::uint8_t opcode, const void* data,
              std::size_t len) noexcept {
-    if (may_ride(op, op.off, len)) {
+    const ring_piece piece = piece_for(op, op.off, len);
+    if (piece.fd >= 0) {
       op.on_ring = true;
-      ring_.fill_rw(opcode, op.fd, data, static_cast<unsigned>(len), op.off,
-                    op_ud(&op), offload_);
+      op.fd = piece.fd;
+      ring_.fill_rw(opcode, piece.fd, data, static_cast<unsigned>(piece.len),
+                    op.off, op_ud(&op), offload_);
     } else {
       deferred_.push(op);
     }
@@ -692,9 +706,13 @@ class uring_context {
     }
   }
 
+  // The ring first, then the deferred list, in that order and never the
+  // other way round: a completion the ring hands back can park its
+  // remainder on the list, and the list is what serves it.
   std::size_t poll(bool block) {
     flush();
-    std::size_t ran = reap_ready() + run_one_deferred();
+    std::size_t ran = reap_ready();
+    ran += run_one_deferred();
     if (ran > 0 || !block) {
       return ran;
     }
@@ -703,7 +721,8 @@ class uring_context {
         return ran;
       }
       sleep_once();
-      ran += reap_ready() + run_one_deferred();
+      ran += reap_ready();
+      ran += run_one_deferred();
       if (ran > 0 || take_wake()) {
         return ran;
       }
@@ -714,6 +733,12 @@ class uring_context {
   void wake() noexcept { waiter_.wake(); }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+  // Transfers, or remainders of transfers, finished on the synchronous
+  // path inside poll() since construction: zero for a context whose ring
+  // took everything.
+  [[nodiscard]] std::size_t served_synchronously() const noexcept {
+    return served_synchronously_;
+  }
 
   // Entries the kernel never took are withdrawn, the reads it did take
   // are reaped and discarded, and the deferred list is forgotten. The
@@ -945,17 +970,19 @@ class uring_context {
       const std::byte* const from =
           op.is_write ? op.wbuf.data() + op.filled : op.buf.data() + op.filled;
       const std::size_t rest = op.length() - op.filled;
-      if (!may_ride(op, op.off + op.filled, rest)) {
-        // The remainder is not something this file may hand the ring. It
-        // is still owed, so it goes down the same rung an unalignable
-        // transfer takes from the start, which finishes what is left.
+      const ring_piece piece = piece_for(op, op.off + op.filled, rest);
+      if (piece.fd < 0) {
+        // A ring that is reaping takes every non-empty piece, so this is
+        // the path a refusal would take rather than one a ring reaches:
+        // the remainder is still owed and finishes inside poll().
         op.on_ring = false;
         deferred_.push(op);
         return false;
       }
-      ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, op.fd,
-                    from, static_cast<unsigned>(rest), op.off + op.filled, ud,
-                    offload_);
+      op.fd = piece.fd;
+      ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, piece.fd,
+                    from, static_cast<unsigned>(piece.len), op.off + op.filled,
+                    ud, offload_);
       return true;
     }
     complete(op, {});
@@ -1027,6 +1054,7 @@ class uring_context {
                                   op.buf.data() + done, rest, op.off + done);
         }
         op.filled = op.length();
+        served_synchronously_++;
       } catch (const std::system_error& e) {
         ec = e.code();
       }
@@ -1085,6 +1113,7 @@ class uring_context {
   // list, because an idled file is still open and may be read again.
   file* files_ = nullptr;
   std::size_t in_flight_ = 0;
+  std::size_t served_synchronously_ = 0;
   bool async_requested_ = true;
   bool use_uring_ = false;
   bool offload_ = false;

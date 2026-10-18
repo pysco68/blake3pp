@@ -396,37 +396,45 @@ class iocp_context {
     op.cancelled = false;
   }
 
-  // The ladder, asked once for both directions. NO_BUFFERING rejects an
-  // unaligned length, so only whole granules ride the port and the tail
-  // goes through the synchronous path inside poll(). A zero-length
-  // transfer takes that path too: it would post a completion carrying
-  // zero bytes, which is the same shape as a short transfer and cannot be
-  // told apart from one. And a ReadFile or WriteFile refused outright owes
-  // no completion, so nothing would ever take it off in_flight(): it goes
-  // down the same ladder, where a second failure reaches the caller as
-  // every other transfer error does.
-  // Whether this file may hand the port a transfer of `len` bytes at
-  // `off`. The offset matters because of the continuation: a short transfer
-  // resumes at off + filled, which is a granule boundary only if the device
-  // stopped on one, and NO_BUFFERING rejects an unaligned offset as it
-  // rejects an unaligned length. Asking again is what keeps a continuation
-  // off the port on terms the first issue would have refused -- where it
-  // comes back ERROR_INVALID_PARAMETER and fails the window, with the
-  // synchronous rung right there. The io_uring backend's may_ride() is the
-  // same question.
-  [[nodiscard]] bool may_ride(const transfer& op, std::uint64_t off,
-                              std::size_t len) const noexcept {
-    if (!op.sync_file->use_iocp || len == 0 || len % direct_align != 0) {
-      return false;
+  // How much of a piece of a transfer the port takes; zero means none of
+  // it. Asked for both directions and for every piece: the initial one,
+  // and what is left after a short completion, which resumes at
+  // off + filled -- a granule boundary only if the device stopped on one.
+  //
+  // A buffered overlapped handle takes any shape, so a buffered file's
+  // pieces ride whole. NO_BUFFERING rejects an unaligned length and an
+  // unaligned offset, so a direct file's piece is cut to the whole
+  // granules it holds at a granule offset, and what that leaves -- the
+  // sub-granule end of a file, or a resumption off a boundary -- goes
+  // through the synchronous path inside poll(), on the plain handle,
+  // because that handle is not overlapped and cannot be given to the
+  // port. The io_uring backend's piece_for() is the same question with a
+  // plain descriptor that can ride.
+  //
+  // A zero-length transfer takes the synchronous path too: it would post
+  // a completion carrying zero bytes, the same shape as a short transfer.
+  // And a ReadFile or WriteFile refused outright owes no completion, so
+  // nothing would ever take it off in_flight(): it goes down the same
+  // ladder, where a second failure reaches the caller as every other
+  // transfer error does.
+  [[nodiscard]] DWORD port_len(const transfer& op, std::uint64_t off,
+                               std::size_t len) const noexcept {
+    if (!op.sync_file->use_iocp || len == 0) {
+      return 0;
     }
-    return !op.sync_file->direct || off % direct_align == 0;
+    if (op.sync_file->direct) {
+      const std::size_t granules = len - len % direct_align;
+      return off % direct_align == 0 ? static_cast<DWORD>(granules) : 0;
+    }
+    return static_cast<DWORD>(len);
   }
 
   void place(transfer& op, file& f) {
-    bool queued = may_ride(op, op.off, op.len);
+    const DWORD len = port_len(op, op.off, op.len);
+    bool queued = len != 0;
     if (queued) {
       try {
-        issue(op);
+        issue(op, len);
       } catch (const std::system_error&) {
         queued = false;
       }
@@ -460,8 +468,12 @@ class iocp_context {
   // push. The contract keeps the call because io_uring has.
   void flush() noexcept {}
 
+  // The port first, then the deferred list, in that order and never
+  // the other way round: a completion the port hands back can park its
+  // remainder on the list, and the list is what serves it.
   std::size_t poll(bool block) {
-    std::size_t ran = reap_ready(false) + run_one_deferred();
+    std::size_t ran = reap_ready(false);
+    ran += run_one_deferred();
     if (ran > 0 || !block) {
       return ran;
     }
@@ -469,7 +481,8 @@ class iocp_context {
       if (std::exchange(woken_, false)) {
         return ran;
       }
-      ran += reap_ready(true) + run_one_deferred();
+      ran += reap_ready(true);
+      ran += run_one_deferred();
       if (ran > 0 || std::exchange(woken_, false)) {
         return ran;
       }
@@ -483,6 +496,12 @@ class iocp_context {
   }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
+  // Transfers, or remainders of transfers, finished on the synchronous
+  // path inside poll() since construction: zero for a buffered file on a
+  // port, one per direct file whose size is not a multiple of the granule.
+  [[nodiscard]] std::size_t served_synchronously() const noexcept {
+    return served_synchronously_;
+  }
 
   // Cancels what every open file still has on the port, reaps all of it
   // without reporting any, and forgets the deferred list. CancelIoEx
@@ -643,7 +662,8 @@ class iocp_context {
   // inside poll(), which is where a read's error is allowed to reach its
   // callback; what cannot happen is leaving it counted and unissued.
   [[nodiscard]] bool reissue(transfer& op) noexcept {
-    if (!may_ride(op, op.off + op.filled, op.len - op.filled)) {
+    const DWORD len = port_len(op, op.off + op.filled, op.len - op.filled);
+    if (len == 0) {
       // The remainder is not something this file may hand the port. It is
       // still owed, so it goes down the same rung an unalignable transfer
       // takes from the start, which finishes what is left inside poll().
@@ -652,7 +672,7 @@ class iocp_context {
       return true;
     }
     try {
-      issue(op);
+      issue(op, len);
       return true;
     } catch (const std::system_error& e) {
       complete(op, e.code());
@@ -660,16 +680,17 @@ class iocp_context {
     }
   }
 
-  void issue(transfer& op) {
+  // Hands the port `len` bytes of what the transfer still owes, from
+  // op.filled: all of it, or the granules of it that port_len() allowed.
+  void issue(transfer& op, DWORD len) {
     std::memset(&op.ov, 0, sizeof(op.ov));
     const std::uint64_t off = op.off + op.filled;
     op.ov.Offset = static_cast<DWORD>(off);
     op.ov.OffsetHigh = static_cast<DWORD>(off >> 32);
-    const DWORD rest = static_cast<DWORD>(op.len - op.filled);
     const BOOL ok =
         op.is_write
-            ? ::WriteFile(op.h, op.src + op.filled, rest, nullptr, &op.ov)
-            : ::ReadFile(op.h, op.dst + op.filled, rest, nullptr, &op.ov);
+            ? ::WriteFile(op.h, op.src + op.filled, len, nullptr, &op.ov)
+            : ::ReadFile(op.h, op.dst + op.filled, len, nullptr, &op.ov);
     if (ok == 0 && ::GetLastError() != ERROR_IO_PENDING) {
       throw_winerr(op.is_write ? "WriteFile(async)" : "ReadFile(async)");
     }
@@ -693,14 +714,22 @@ class iocp_context {
     return CONTAINING_RECORD(pov, transfer, ov);
   }
 
+  // Takes what the port has, running the callbacks of transfers that
+  // ended and reissuing the rest of the ones that stopped short. With
+  // `block`, waits for the first completion -- but not past a remainder
+  // the port would not take: that one is parked on the deferred list,
+  // and only poll()'s next step serves it, so waiting on the port with
+  // nothing else owed to it would never return.
   std::size_t reap_ready(bool block) {
     std::size_t ran = 0;
+    bool parked = false;
     for (;;) {
       DWORD bytes = 0;
       ULONG_PTR key = 0;
       OVERLAPPED* pov = nullptr;
       const BOOL ok = ::GetQueuedCompletionStatus(
-          port_.get(), &bytes, &key, &pov, block && ran == 0 ? INFINITE : 0);
+          port_.get(), &bytes, &key, &pov,
+          block && ran == 0 && !parked ? INFINITE : 0);
       if (pov == nullptr) {
         if (ok == 0 && ::GetLastError() == WAIT_TIMEOUT) {
           return ran;  // nothing more queued
@@ -727,6 +756,8 @@ class iocp_context {
       if (op.filled < op.len) {
         if (!reissue(op)) {
           ran++;  // it ended here, with the error ReadFile gave
+        } else if (!op.on_port) {
+          parked = true;  // the rest is on the deferred list
         }
         continue;
       }
@@ -758,6 +789,7 @@ class iocp_context {
                     {op.dst + op.filled, rest});
         }
         op.filled = op.len;
+        served_synchronously_++;
       } catch (const std::system_error& e) {
         ec = e.code();
       }
@@ -833,6 +865,7 @@ class iocp_context {
   deferred_ops<transfer> deferred_;
   file* files_ = nullptr;      // every open file, for the drain
   std::size_t in_flight_ = 0;
+  std::size_t served_synchronously_ = 0;
   std::size_t port_owed_ = 0;  // requests the port has yet to hand back
   bool woken_ = false;
 };

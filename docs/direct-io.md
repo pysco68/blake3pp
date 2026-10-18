@@ -65,23 +65,29 @@ having to think about it:
 
 What a power-of-two window cannot fix is the tail: a file whose length
 is not a whole number of granules, or the last short write of a
-generator that stops mid-window. On Linux, every read and write first
-passes `may_ride()`, the one gate in `src/io/uring_backend.hpp` that
-decides whether a transfer -- the initial one, or what is left after a
-short completion -- may go on the ring at all: it refuses a length that
-is not a multiple of the granule, and, once direct I/O is engaged,
-refuses an offset that is not one either. Whatever it refuses goes on a
-deferred list instead, and `run_one_deferred()` walks that list
-synchronously, one entry per `poll()` call, through the plain buffered
-descriptor the direct one sits beside -- picking the transfer up exactly
-where the ring left off. Nothing above the backend can tell a window's
-bytes arrived whole on the ring from arriving mostly on the ring and
-finishing synchronously; both land in the same buffer. Windows' `place()`
-and its own deferred list apply the identical ladder, for the identical
-reason (`NO_BUFFERING` rejects the same shapes `O_DIRECT` does). GCD
-needs no deferred list for alignment at all, because `F_NOCACHE` imposes
-none -- its deferred list exists only for the separate case of GCD itself
-being unavailable.
+generator that stops mid-window. Almost every file has one, and a file
+smaller than a window is nothing else. On Linux, every piece of a
+transfer -- the initial one, or what is left after a short completion --
+passes `piece_for()` in `src/io/uring_backend.hpp`, which says how much
+of it the ring takes and through which descriptor: a direct file's piece
+rides the `O_DIRECT` descriptor for the whole granules it holds at a
+granule offset, and what that leaves -- the sub-granule end, a
+resumption off a boundary, and every piece of a buffered file -- rides
+the ring through the plain buffered descriptor that sits beside the
+direct one, which takes any shape. So the last window of a file is as
+asynchronous as the others, and the synchronous path inside `poll()`
+(`run_one_deferred()`, one entry per call) serves only a context with no
+ring, a submit the kernel refused and a zero-length transfer. Nothing
+above the backend can tell a window's bytes arrived through one
+descriptor from arriving through two; both land in the same buffer.
+
+Windows' `port_len()` asks the same question with one difference: the
+plain handle there is not overlapped and cannot be given to the port, so
+a `NO_BUFFERING` file's sub-granule rest -- at most 4095 bytes, once per
+file -- is the one piece that finishes synchronously; a buffered file on
+the port hands it every length whole. GCD needs none of this, because
+`F_NOCACHE` imposes no alignment -- its deferred list exists only for the
+separate case of GCD itself being unavailable.
 
 ## What was actually engaged
 
