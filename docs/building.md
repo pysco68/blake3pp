@@ -31,11 +31,14 @@ On Windows, from a `vcvars64` shell:
 
 - `windows-clangcl-cxx23` and `windows-msvc2026-cxx23`
 - `windows-msvc2026-cxx23-asan`: the same cl.exe build under
-  AddressSanitizer, which is what exercises the IOCP backend under a
+  AddressSanitizer, which is what would exercise the IOCP backend under a
   sanitizer at all. cl rather than clang-cl, for the reason
   `cmake/toolchains/windows-common.cmake` gives where it refuses the other
   spelling: on Windows the clang driver is what links clang's sanitizer
-  runtimes, and CMake does not link through it.
+  runtimes, and CMake does not link through it. Known slow and not in CI:
+  cl plus ASan on the kernel translation units has not produced an object in
+  500 s of CPU per unit, so the lane waits on instrumenting everything
+  *except* the kernels.
 
 On a Mac:
 

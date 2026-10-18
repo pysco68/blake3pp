@@ -7,6 +7,18 @@
 # runtime itself; windows-common.cmake says what goes wrong otherwise.
 # Run from a vcvars64 shell.
 #
+# KNOWN SLOW, and deliberately not in CI yet: cl plus ASan on the KERNEL
+# translation units does not finish in a usable time. Measured on a Ryzen AI
+# MAX+ 395, three kernel objects compiling in parallel: past 500 s of CPU
+# each at the kernels' /Ob3, and past 335 s each with the inlining budget
+# dropped to /Ob1, neither producing an object. What the lane exists for is
+# the I/O backend and the pipeline, not a leaf kernel whose hazards five
+# Linux lanes already cover, so the fix is to stop instrumenting the
+# kernels -- which needs the sanitizer flags to move out of the toolchain's
+# global CMAKE_CXX_FLAGS into a target-scoped interface library, a change
+# that touches every sanitizer lane. This preset is here because that
+# refactor should start from a lane that exists.
+#
 #   cmake -S . -B build/windows-msvc2026-cxx23-asan -G Ninja \
 #         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/windows-msvc2026-cxx23-asan/windows-msvc2026-cxx23-asan.cmake
 
