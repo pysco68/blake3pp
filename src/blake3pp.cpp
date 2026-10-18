@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 

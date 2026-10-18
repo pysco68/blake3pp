@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 #include <blake3pp/io.hpp>

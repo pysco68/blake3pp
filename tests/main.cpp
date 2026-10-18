@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <thread>
 
 #include <blake3pp/dispatch.hpp>

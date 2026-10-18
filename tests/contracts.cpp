@@ -9,6 +9,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <thread>
 #include <vector>
