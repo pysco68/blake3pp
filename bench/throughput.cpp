@@ -884,17 +884,32 @@ int main(int argc, char** argv) {
           affinity > 0 ? std::format(", affinity mask: {} cpus", affinity)
                        : std::string{});
 
-  // A parallel table row, measured and printed immediately (interleaving
-  // exists for the single-thread comparisons; these rows use every core by
-  // construction, so placement symmetry is moot).
-  const auto row = [&](std::string_view label, std::string_view note,
-                       auto&& fn, int width = 15) {
-    cooldown();
+  // The rows are declared here and measured together below, rep-outer and
+  // row-inner with the start row rotated per pass, as the single-thread
+  // rows are. Every row here uses every core, so placement does not
+  // matter, but heat does: measured one row after another, the row that
+  // runs last meets the hottest machine, which on a device that throttles
+  // is a difference that does not belong to the row.
+  struct par_row {
+    std::string label;
+    std::string note;
+    std::function<blake3pp::digest()> fn;  // null: info-only line
+    std::string info;
+    int width = 15;
+    double best = 1e100;
     blake3pp::digest d{};
-    const double best =
-        b3tool::best_seconds(reps, /*warmup=*/true, [&] { d = fn(); });
-    println(stdout, "  {:<{}} {}   ({}...)  [{}]", label, width,
-            b3tool::rate(input.size(), best), d.to_hex().substr(0, 16), note);
+  };
+  std::vector<par_row> par_rows;
+  const auto row = [&](std::string_view label, std::string_view note,
+                       std::function<blake3pp::digest()> fn, int width = 15) {
+    par_rows.push_back({std::string(label), std::string(note), std::move(fn),
+                        {}, width});
+  };
+  // A line that is not one of the compared rows: a ceiling, measured when
+  // it is declared and printed in place.
+  const auto info_row = [&](std::string_view label, std::string_view text,
+                            int width = 15) {
+    par_rows.push_back({std::string(label), {}, {}, std::string(text), width});
   };
 
   // A pool at exactly nthreads, one included: --threads 1 is a valid and
@@ -902,12 +917,13 @@ int main(int argc, char** argv) {
   // where a tool would take the sequential path instead.
   b3tool::compute_pool engine_pool{nthreads, b3tool::one_thread::pooled};
   auto engine_sched = engine_pool.scheduler();
-  {
-    auto sched = engine_sched;
-    row("blake3pp/pool",
-        std::format("{} pool", blake3pp::execution_provider()),
-        [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); });
-  }
+  // Every row below captures its scheduler BY VALUE: the measurement loop
+  // runs after this function's blocks have closed, so a reference to a
+  // block-local scheduler would dangle.
+  row("blake3pp/pool", std::format("{} pool", blake3pp::execution_provider()),
+      [sched = engine_sched, &input] {
+        return blake3pp::hash(std::span<const std::byte>{input}, sched);
+      });
 
   // The streaming shape: a caller that does not have the message in one
   // span feeds it in read-sized pieces. parallel_hasher hashes whole
@@ -932,15 +948,17 @@ int main(int argc, char** argv) {
       const volatile std::byte keep = copy[window - 1];  // the copy is observed
       (void)keep;
     });
-    println(stdout, "  {:<{}} {}   [one thread, one {} MiB window: what every stream row copies per window]",
-            "memcpy", 20, b3tool::rate(window, s), window >> 20);
+    info_row("memcpy",
+             std::format("{}   [one thread, one {} MiB window: what every "
+                         "stream row copies per window]",
+                         b3tool::rate(window, s), window >> 20),
+             20);
   }
   for (const std::size_t feed :
        {std::size_t{256} << 10, std::size_t{1} << 20, std::size_t{8} << 20}) {
-    auto sched = engine_sched;
     row(std::format("blake3pp/stream {}K", feed >> 10),
         std::format("parallel_hasher, {} KiB feed", feed >> 10),
-        [&] {
+        [sched = engine_sched, &input, feed] {
           blake3pp::parallel_hasher ph{sched};
           const std::span<const std::byte> all{input};
           for (std::size_t at = 0; at < all.size(); at += feed) {
@@ -957,13 +975,14 @@ int main(int argc, char** argv) {
   // (QoS-placed across P/E cores by the OS) instead of a process-owned
   // thread pool. Same engine, different scheduler argument; compare with
   // the blake3pp/pool row.
-  {
-    exec::libdispatch_queue queue;
-    auto sched = queue.get_scheduler();
-    row("blake3pp/gcd", "stdexec on GCD",
-        [&] { return blake3pp::hash(std::span<const std::byte>{input}, sched); },
-        15);
-  }
+  // The queue outlives the measurement loop below, for the same reason the
+  // schedulers are captured by value.
+  exec::libdispatch_queue gcd_queue;
+  row("blake3pp/gcd", "stdexec on GCD",
+      [sched = gcd_queue.get_scheduler(), &input] {
+        return blake3pp::hash(std::span<const std::byte>{input}, sched);
+      },
+      15);
 #endif
 
 #if defined(BLAKE3PP_BENCH_UPSTREAM) && \
@@ -971,25 +990,67 @@ int main(int argc, char** argv) {
   // The widest reference kernel on the same parallel engine: separates
   // kernel from scheduler in the rows above.
   if (asm_row != nullptr) {
-    auto sched = engine_sched;
     row("reference/pool",
         std::format("{} kernel, {} pool", asm_row,
                     blake3pp::execution_provider()),
-        [&] {
+        [sched = engine_sched, &input, &asm_ops] {
           return blake3pp::hash(std::span<const std::byte>{input}, sched,
                                 &asm_ops);
         },
         15);
-    // The same kernel and pool under a static split, the control for the
-    // counter-pulled parts in the row above.
+    // The same kernel and pool under a static split: the control for the
+    // counter-pulled parts in the row above, which shows what the counter
+    // split is worth.
     row("reference/static",
         std::format("{} kernel, 256 parts, fixed shares", asm_row),
-        [&] {
+        [sched = engine_sched, &input, &asm_ops] {
           return static_split_hash(std::span<const std::byte>{input}, sched,
                                    &asm_ops);
         },
         15);
   }
 #endif
+  // Pass 0 is the uncounted warmup, and the cooldown idles between passes
+  // rather than between rows, as in the single-thread loop above.
+  {
+    std::vector<par_row*> flat;
+    for (par_row& r : par_rows) {
+      if (r.fn) {
+        flat.push_back(&r);
+      }
+    }
+    const bool progress = stderr_is_tty();
+    for (int pass = 0; pass <= reps && !flat.empty(); ++pass) {
+      cooldown();
+      if (progress) {
+        b3tool::print(stderr, "\r[parallel pass {}/{}{}] ", pass + 1, reps + 1,
+                      pass == 0 ? ", warmup" : "");
+        std::fflush(stderr);
+      }
+      for (std::size_t i = 0; i < flat.size(); ++i) {
+        par_row& r = *flat[(i + static_cast<std::size_t>(pass)) % flat.size()];
+        const auto t0 = std::chrono::steady_clock::now();
+        r.d = r.fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        const double sec = std::chrono::duration<double>(t1 - t0).count();
+        if (pass > 0 && sec < r.best) {
+          r.best = sec;
+        }
+      }
+    }
+    if (progress) {
+      b3tool::print(stderr, "\r{:30}\r", "");
+      std::fflush(stderr);
+    }
+    for (const par_row& r : par_rows) {
+      if (!r.fn) {
+        println(stdout, "  {:<{}} {}", r.label, r.width, r.info);
+        continue;
+      }
+      println(stdout, "  {:<{}} {}   ({}...)  [{}]", r.label, r.width,
+              b3tool::rate(input.size(), r.best), r.d.to_hex().substr(0, 16),
+              r.note);
+    }
+  }
   return digests_agree ? 0 : 1;
 }
