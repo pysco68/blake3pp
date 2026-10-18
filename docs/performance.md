@@ -934,9 +934,14 @@ Each of these is a measured gap with an open item behind it.
   the first file against 1.078 s for the second in the same process). Two
   thirds of that question is now answered, both parts on the Z13 and neither
   needing the device:
-    - It is **not** process or pool setup. The whole fixed cost of the tool,
-      process start through CPU detection, pool, arena and open, is 7.5 ms on
-      an empty file against 0.7 ms for `/bin/true`.
+    - It is **not** the 0.9 s. The tool's whole fixed cost -- process start,
+      CPU detection, pool, arena, open -- was 7.5 ms on an empty file against
+      0.7 ms for `/bin/true`. Half of it was still worth removing and is
+      gone: asking for the scheduler is what starts the pool's threads, and
+      the tool asked before it knew the file's size, so 16 threads were
+      started and joined to hash 64 KiB the pipeline hashed sequentially
+      anyway. An empty-file run is 3.3 ms now and a 64 KiB one 4.8 ms, best
+      of eleven.
     - Part of the steady-state gap is the two programs measuring different
       things. The arena is allocated but not touched, so its page faults land
       on the first pass over it — and `blake3pp_bench_file`'s null driver
