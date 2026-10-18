@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 500" width="860" height="500" role="img" aria-label="A file against its device's ceiling">
+<style>
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         fill: #24292f; }
+  .axis { stroke: #8b949e; stroke-width: 1; }
+  .grid { stroke: #d0d7de; stroke-width: 1; stroke-dasharray: 2 3; }
+  .muted { fill: #57606a; }
+  @media (prefers-color-scheme: dark) {
+    text { fill: #e6edf3; }
+    .axis { stroke: #6e7681; }
+    .grid { stroke: #30363d; }
+    .muted { fill: #9198a1; }
+  }
+</style>
+<text x="0" y="18" font-size="15" font-weight="600">A file against its device's ceiling</text>
+<text x="0" y="36" font-size="12" class="muted">cold cache before every repetition, direct I/O, the raw rate measured through the same pipeline with the hashing removed</text>
+<rect x="210" y="47" width="10" height="10" fill="#e8590c" rx="2"/>
+<text x="225" y="56" font-size="12">the device, no hashing</text>
+<rect x="402" y="47" width="10" height="10" fill="#1971c2" rx="2"/>
+<text x="417" y="56" font-size="12">blake3pp, all cores</text>
+<line class="grid" x1="210.0" y1="70" x2="210.0" y2="370"/>
+<text x="210.0" y="386" font-size="11" class="muted" text-anchor="middle">0</text>
+<line class="grid" x1="308.3" y1="70" x2="308.3" y2="370"/>
+<text x="308.3" y="386" font-size="11" class="muted" text-anchor="middle">10</text>
+<line class="grid" x1="406.7" y1="70" x2="406.7" y2="370"/>
+<text x="406.7" y="386" font-size="11" class="muted" text-anchor="middle">20</text>
+<line class="grid" x1="505.0" y1="70" x2="505.0" y2="370"/>
+<text x="505.0" y="386" font-size="11" class="muted" text-anchor="middle">30</text>
+<line class="grid" x1="603.3" y1="70" x2="603.3" y2="370"/>
+<text x="603.3" y="386" font-size="11" class="muted" text-anchor="middle">40</text>
+<line class="grid" x1="701.7" y1="70" x2="701.7" y2="370"/>
+<text x="701.7" y="386" font-size="11" class="muted" text-anchor="middle">50</text>
+<line class="grid" x1="800.0" y1="70" x2="800.0" y2="370"/>
+<text x="800.0" y="386" font-size="11" class="muted" text-anchor="middle">60</text>
+<line class="axis" x1="210" y1="70" x2="210" y2="370"/>
+<text x="202" y="99.0" font-size="12" text-anchor="end">4x PCIe 5 stripe, 128 MiB x 8</text>
+<rect x="210" y="77.0" width="521.2" height="15" fill="#e8590c" rx="2"/>
+<text x="737.2" y="88.0" font-size="11" class="muted">53</text>
+<rect x="210" y="95.0" width="434.6" height="15" fill="#1971c2" rx="2"/>
+<text x="650.6" y="106.0" font-size="11" class="muted">44.2</text>
+<text x="202" y="149.0" font-size="12" text-anchor="end">z3 striped local SSD</text>
+<rect x="210" y="127.0" width="89.1" height="15" fill="#e8590c" rx="2"/>
+<text x="305.1" y="138.0" font-size="11" class="muted">9.06</text>
+<rect x="210" y="145.0" width="89.1" height="15" fill="#1971c2" rx="2"/>
+<text x="305.1" y="156.0" font-size="11" class="muted">9.06</text>
+<text x="202" y="199.0" font-size="12" text-anchor="end">EPYC Milan local disk</text>
+<rect x="210" y="177.0" width="61.8" height="15" fill="#e8590c" rx="2"/>
+<text x="277.8" y="188.0" font-size="11" class="muted">6.28</text>
+<rect x="210" y="195.0" width="60.0" height="15" fill="#1971c2" rx="2"/>
+<text x="276.0" y="206.0" font-size="11" class="muted">6.1</text>
+<text x="202" y="249.0" font-size="12" text-anchor="end">Ryzen AI MAX+ 395 NVMe</text>
+<rect x="210" y="227.0" width="52.4" height="15" fill="#e8590c" rx="2"/>
+<text x="268.4" y="238.0" font-size="11" class="muted">5.33</text>
+<rect x="210" y="245.0" width="53.0" height="15" fill="#1971c2" rx="2"/>
+<text x="269.0" y="256.0" font-size="11" class="muted">5.39</text>
+<text x="202" y="299.0" font-size="12" text-anchor="end">Apple M2 internal SSD</text>
+<rect x="210" y="277.0" width="30.1" height="15" fill="#e8590c" rx="2"/>
+<text x="246.1" y="288.0" font-size="11" class="muted">3.06</text>
+<rect x="210" y="295.0" width="30.5" height="15" fill="#1971c2" rx="2"/>
+<text x="246.5" y="306.0" font-size="11" class="muted">3.1</text>
+<text x="202" y="349.0" font-size="12" text-anchor="end">Axion Titanium local SSD</text>
+<rect x="210" y="327.0" width="25.1" height="15" fill="#e8590c" rx="2"/>
+<text x="241.1" y="338.0" font-size="11" class="muted">2.55</text>
+<rect x="210" y="345.0" width="25.1" height="15" fill="#1971c2" rx="2"/>
+<text x="241.1" y="356.0" font-size="11" class="muted">2.55</text>
+<text x="0" y="410" font-size="11" class="muted">GiB/s, higher is better</text>
+<text x="0" y="428" font-size="10" class="muted">4x PCIe 5 stripe, 128 MiB x 8: Scaleway EM-L520E (EPYC 8124P), four drives RAID 0, kernel 7.0, 32 GiB file, 12ec998, 2026-09-15</text>
+<text x="0" y="442" font-size="10" class="muted">z3 striped local SSD: GCP z3-highmem-22-highlssd, 8 GiB file, 8 MiB x 4, ac53d08, 2026-10-01</text>
+<text x="0" y="456" font-size="10" class="muted">EPYC Milan local disk: Hetzner ccx63 (48 vCPU), kernel 6.8, 8 GiB file, 8 MiB x 4, 82f0b36, 2026-09-23</text>
+<text x="0" y="470" font-size="10" class="muted">Ryzen AI MAX+ 395 NVMe: WSL2, 4 GiB file, 8 MiB x 4, 582226e, 2026-10-02</text>
+<text x="0" y="484" font-size="10" class="muted">Apple M2 internal SSD: M2 MacBook Air, GCD + F_NOCACHE, 4 GiB file, 8 MiB x 4, 582226e, 2026-10-02</text>
+<text x="0" y="498" font-size="10" class="muted">Axion Titanium local SSD: GCP c4a-standard-16, 4 GiB file, 8 MiB x 4, 0542923, 2026-10-01</text>
+</svg>

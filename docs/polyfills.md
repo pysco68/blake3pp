@@ -30,32 +30,25 @@ single internal namespace (`blake3pp::kern::<arch>::u32v`,
 `blake3pp::ex`), so kernel and pipeline source never sees which provider
 it got.
 
-## Why an explicit choice, not pure detection
+## Choosing a provider
 
-Each axis has a cache variable with an `auto` default (below). Nothing
-about either axis is decided by silently preferring whatever a
-toolchain happens to expose, for two reasons.
+Each axis has a cache variable with an `auto` default (below), and `auto`
+resolves by compiling real usage rather than by reading a feature-test
+macro. A toolchain trunk can ship a working facility before it defines the
+macro that announces it, so the probes compile that usage under the exact
+standard, standard library and flags of the current configure.
 
-First, feature-test macros lie in the window that matters most: a
-toolchain trunk can ship a working facility before it defines the
-macro that is supposed to announce it. Detection compiles real usage
-under the exact standard, standard library and toolchain flags of the
-current configure, and trusts the compile, not the macro.
+A probe that passes can still be the wrong answer. libstdc++'s
+`std::experimental::simd` deduces a native vector width from a fixed list of
+ISAs; on an architecture the list has never heard of (MIPS/MSA, at the time
+of writing) the deduced width is 1 and no vector instruction is emitted,
+even though the probe compiled cleanly and the compiler targets that ISA
+perfectly well. Detection cannot tell a width-1 fallback from a real one, so
+that override is explicit.
 
-Second, a toolchain can pass that probe and still be the wrong answer.
-libstdc++'s `std::experimental::simd` deduces a native vector width from
-a fixed list of ISAs; on an architecture the list has never heard of
-(MIPS/MSA, at the time of writing) the deduced width is 1 and no vector
-instruction is ever emitted, even though the probe compiled cleanly and
-the compiler can target that ISA perfectly well. A toolchain-specific
-override exists for exactly this gap, and only an explicit choice can
-express "this probe is not a good enough answer here" — detection
-alone cannot tell a width-1 fallback from a real one.
-
-`auto` is still the right default almost everywhere: it is the fastest
-answer the project knows of for a given toolchain, and the explicit
-settings exist for the toolchains that need to say otherwise and for
-anyone re-measuring the choice.
+`auto` is the right default almost everywhere; the named values exist for
+the toolchains that have to say otherwise and for anyone re-measuring the
+choice.
 
 ## SIMD providers
 
@@ -68,7 +61,7 @@ per-kernel override for ISAs none of the others reach.
 | provider | needs | `auto` picks it when |
 |---|---|---|
 | `std::simd` | C++26 `<simd>` | the standard library has a usable one |
-| `std::experimental::simd` | the Parallelism TS v2 header | no `std::simd`, and the TS header compiles and vectorizes |
+| `std::experimental::simd` | the Parallelism TS v2 header | no `std::simd`, and the TS header compiles |
 | xsimd | nothing from the toolchain (fetched, header-only) | neither std facility is usable |
 | xvec | nothing from the toolchain (fetched, header-only) | never: by explicit choice only |
 | vector extensions (GNU/Clang `vector_size`) | never project-wide | pinned per kernel, for an ISA no other provider's width logic reaches |
@@ -83,19 +76,20 @@ implementation of the same C++26 library, and the one provider `auto`
 never reaches for: it is there to run the library against a second
 implementation of the standard interface rather than to fill a gap. The
 facade is the `std::simd` one with the namespace swapped
-(`src/kernel/simd/xvec.hpp`), which is the whole point -- a second
-implementation of one interface should need nothing else. It is fetched
+(`src/kernel/simd/xvec.hpp`). It is fetched
 header-only at a pinned commit, and on GCC 16 the avx512 translation unit
 takes `-flax-vector-conversions` for xvec's x86 permute layer, scoped to
 that unit and that provider.
 
-A provider that has no vector width for a target does not quietly produce
-a one-lane kernel: a SIMD variant whose width comes out as 1 fails the
-build, because it would otherwise be registered under a vector name and
-dispatched to as though it were one (`src/kernel/kernel.cpp`). GCC 16's
-`<simd>` is the live example -- its arch traits are compiled for x86 only
--- which is why the aarch64, ppc64le and s390x toolchains do not take the
-`std` provider.
+A provider that has no vector width for a target does not quietly produce a
+one-lane kernel. Two things stop it: the configure probe asks for the
+*native* width, which is what the facade spells, and declines a provider
+that deduces one lane (`cmake/StdFeatures.cmake`); and a variant whose width
+comes out 1 anyway fails to compile, because it would otherwise be
+registered under a vector name and dispatched to as though it were one
+(`src/kernel/kernel.cpp`). GCC 16's `<simd>` is the live example: its arch
+traits are compiled for x86 only, so off x86 the probe fails and `auto`
+passes over it.
 A build can also carry no SIMD provider at all: a scalar-only build
 (the single-file amalgamation below C++26, for instance) needs none,
 and `blake3pp::simd_provider()` reports `"none (scalar only)"`.
@@ -120,13 +114,15 @@ narrower mechanisms than the cache variable above:
   runtime dispatch outright, so every SVE kernel variant pins xsimd
   (initializer-free there) regardless of the project-wide setting.
 
-Three cross-compiling toolchains (riscv64, ppc64le, s390x) set
-`BLAKE3PP_SIMD_PROVIDER` to `xsimd` for the whole build rather than
-leaving it on `auto`, for a third reason again: none of the three has
-an `std::experimental::simd` ABI worth trusting on that architecture,
-and each one's vector kernel (RVV, VSX, VXE) already pins xsimd for
-itself regardless. Stating the project-wide choice to match keeps
-`simd_provider()`'s answer truthful instead of reporting a provider
+Five cross-compiling toolchain files name a provider for the whole build
+rather than leaving it on `auto`, for a third reason again. The riscv64,
+ppc64le and s390x ones (two spellings each for ppc64le and s390x, GCC and
+zig/musl) say `xsimd`: none of those architectures has an
+`std::experimental::simd` ABI worth trusting, and each one's vector kernel
+(RVV, VSX, VXE) already pins xsimd for itself regardless. The mips64el one
+says `std-experimental` for the same reason in reverse, its MSA kernel
+having pinned the vector-extension provider. Naming the project-wide choice
+keeps `simd_provider()`'s answer truthful instead of reporting a provider
 the vector kernel does not actually use.
 
 ## Execution providers

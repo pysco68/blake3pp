@@ -56,8 +56,10 @@ Starting that only enqueues onto the caller's scheduler. Every part, and
 the fold behind the bulk, then run on an agent of that scheduler, so the
 driver's share of a window's compute is one enqueue. With a trace buffer
 set, `driver_stats::busy_ns` against `parked_ns` is where a provider that
-ran the bulk on the starting thread would show up instead; both providers a
-preset can select leave the driver's busy share at or below 1%.
+ran the bulk on the starting thread would show up instead. On the captures in
+[Performance tracing](tracing.md) the driver is busy 0.6% of its own time on
+a read-limited file run, and 4.0% on a compute-bound one whose 32 pool
+threads were busy 79%.
 
 The bulk's shape only supplies the agents. Each invocation pulls part
 indices from one atomic counter until none are left, so the split follows
@@ -67,13 +69,14 @@ distributes the calls.
 
 A part is at least 16 chunks, and a full window's parts are reduced in
 groups of 16 *inside* the bulk, by the agent whose part completes a group.
-A part reduced on its own ends in `log2(part)` parent generations below
-full lane occupancy -- a measured 15% of a 16-chunk part's time on AVX2 and
-22% on AVX-512; folded sixteen at a time the generations stay lane-filling
-down to the last `log2(degree)`, 4% and 8%. Moving that reduction behind
-the bulk instead would put a sixteenth of the window's blocks on one
-thread, which from eight agents up costs more wall time than the parts
-save.
+A 16-chunk part reduced on its own is 16 lane-filling chunk compressions
+followed by four parent generations at 8, 4, 2 and 1 of a 16-lane kernel's
+lanes; grouping the parts keeps those generations filled down to the last
+`log2(degree)`. It measured +13.8% on Emerald Rapids and +2.8% on Zen 5 at
+8 MiB windows, and nothing at 64 MiB
+([Performance](performance.md)). Moving the reduction behind the bulk
+instead would put a sixteenth of the window's blocks on one thread while
+the other agents have nothing left to do.
 
 The fold after the bulk turns the group chaining values into the window's
 one chaining value, on whichever agent finished the bulk. The driver thread
@@ -262,9 +265,11 @@ window reserves the whole decomposition of its run, since a reservation
 of one against an insert of a hundred is the refusal this rule prevents.
 Since reads start in file order, when nothing is in flight the windows that
 have finished are a contiguous run from the beginning, which decomposes into
-at most `2 * 54` nodes. The default storage is 256 nodes, which clears that
-plus both edge windows' reservations, and a `static_assert` ties the
-constant to the stack budget. A run that is held back anyway counts the
+at most `2 * 54` nodes. A run's storage is sized for exactly that, plus both
+edge windows' reservations, plus one node per window that may be in flight
+-- windows complete out of order, and each can leave a node waiting for a
+sibling -- with 256 nodes as the floor, so the deepest queue a caller asks
+for cannot quietly admit fewer windows than it asked for. A run that is held back anyway counts the
 event in `driver_stats::admission_stalls`; a configuration that could never
 start a window at all is reported as a `std::logic_error` naming every
 number involved rather than entered.
@@ -321,10 +326,12 @@ already counted in flight, where an exception has nowhere to go. A
 than a crash under load. The sequential forms of `write_file()`, which do
 not go through this chain, accept one that may throw.
 
-Three public forms, one generator shape `fill(std::span<std::byte> out,
-std::uint64_t offset)`: a known length generated on the calling thread, a
-length the generator decides by returning short of a whole window, and the
-windows filled over a scheduler while the previous one is written.
+Three public forms: a known length generated on the calling thread, a length
+the generator decides by returning short of a whole window, and the windows
+filled over a scheduler while the previous one is written. The first and the
+third call `fill(std::span<std::byte> out, std::uint64_t offset)`; the
+length-deciding one returns the bytes it produced, `std::size_t
+fill(std::span<std::byte> out, std::uint64_t offset)`.
 `blake3ppgen --output` is built on them. On failure the file is left as far
 as it got and is not truncated, because a length invented for bytes that
 were never produced would hide the failure.

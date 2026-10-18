@@ -218,9 +218,13 @@ The rule behind the split, and which header owns which dependency, is in
   machines conservatively report scalar. The CLI tools opt in at
   startup, since a standalone binary owns its process.
 - The sequential compute API (`core.hpp`, `dispatch.hpp`) is `noexcept`
-  end to end, with one exception: `digest::to_hex()` builds a
-  `std::string` (use `to_hex_chars()` for the allocation-free,
-  nonthrowing form). The I/O layer throws `std::system_error`, or
+  end to end for valid input. Two kinds of call are not: the ones that
+  build a `std::string` (`digest::to_hex()` and free `to_hex(bytes)`; the
+  span-filling `to_hex_chars()` is the allocation-free form), and the
+  checked preconditions of the expert seams (`push_subtree_cv()`,
+  `to_hex(bytes, out)` and the reducer), which throw
+  `std::invalid_argument` or `std::length_error` in every build rather
+  than write a wrong digest. The I/O layer throws `std::system_error`, or
   reports through the `std::error_code` overloads, which also fold
   allocation failure into an error code. The scheduler-taking parallel
   APIs propagate whatever the execution provider raises, plus

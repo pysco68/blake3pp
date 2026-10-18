@@ -93,7 +93,7 @@ BLAKE3 is more than a 32-byte digest, and all of it is available:
 | [Many files at once](async.md) | EXPERIMENTAL: file hashing as senders over a context you drive |
 | [Direct I/O](direct-io.md) | what `direct_io` asks for per platform, the alignment contract, and when buffered is the right call |
 | [Architectures and kernels](architectures.md) | which SIMD variants a build carries, how dispatch picks one, and what has no kernel yet |
-| [Polyfills](polyfills.md) | the philosophy behind the SIMD and execution providers, and which can stand in for which |
+| [Polyfills](polyfills.md) | the SIMD and execution providers: what may stand in for what, and what a choice cannot change |
 | [Performance](performance.md) | this library against the reference implementation, per machine, with the runs behind the charts |
 | [Performance tracing](tracing.md) | where a file run's time went: the records the pipeline keeps, and reading one in the tools |
 | [Command-line tools](tools.md) | `blake3ppsum` and `blake3ppgen` |

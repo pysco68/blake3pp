@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 420" width="860" height="420" role="img" aria-label="Window size is a device property, not a CPU one">
+<style>
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         fill: #24292f; }
+  .axis { stroke: #8b949e; stroke-width: 1; }
+  .grid { stroke: #d0d7de; stroke-width: 1; stroke-dasharray: 2 3; }
+  .muted { fill: #57606a; }
+  @media (prefers-color-scheme: dark) {
+    text { fill: #e6edf3; }
+    .axis { stroke: #6e7681; }
+    .grid { stroke: #30363d; }
+    .muted { fill: #9198a1; }
+  }
+</style>
+<text x="0" y="18" font-size="15" font-weight="600">Window size is a device property, not a CPU one</text>
+<text x="0" y="36" font-size="12" class="muted">parallel row at queue depth 4, cold cache before every repetition; the runs are named on the page</text>
+<rect x="60" y="47" width="10" height="10" fill="#e8590c" rx="2"/>
+<text x="75" y="56" font-size="12">4x PCIe 5 stripe</text>
+<rect x="209" y="47" width="10" height="10" fill="#1971c2" rx="2"/>
+<text x="224" y="56" font-size="12">z3 striped local SSD</text>
+<rect x="387" y="47" width="10" height="10" fill="#2f9e44" rx="2"/>
+<text x="402" y="56" font-size="12">EPYC Milan local disk</text>
+<rect x="572" y="47" width="10" height="10" fill="#9c36b5" rx="2"/>
+<text x="587" y="56" font-size="12">Apple M4 Max SSD</text>
+<line class="grid" x1="60" y1="374.0" x2="830" y2="374.0"/>
+<text x="52" y="378.0" font-size="11" class="muted" text-anchor="end">0</text>
+<line class="grid" x1="60" y1="313.2" x2="830" y2="313.2"/>
+<text x="52" y="317.2" font-size="11" class="muted" text-anchor="end">10</text>
+<line class="grid" x1="60" y1="252.4" x2="830" y2="252.4"/>
+<text x="52" y="256.4" font-size="11" class="muted" text-anchor="end">20</text>
+<line class="grid" x1="60" y1="191.6" x2="830" y2="191.6"/>
+<text x="52" y="195.6" font-size="11" class="muted" text-anchor="end">30</text>
+<line class="grid" x1="60" y1="130.8" x2="830" y2="130.8"/>
+<text x="52" y="134.8" font-size="11" class="muted" text-anchor="end">40</text>
+<line class="grid" x1="60" y1="70.0" x2="830" y2="70.0"/>
+<text x="52" y="74.0" font-size="11" class="muted" text-anchor="end">50</text>
+<text x="60.0" y="394" font-size="11" class="muted" text-anchor="middle">8</text>
+<text x="316.7" y="394" font-size="11" class="muted" text-anchor="middle">16</text>
+<text x="573.3" y="394" font-size="11" class="muted" text-anchor="middle">32</text>
+<text x="830.0" y="394" font-size="11" class="muted" text-anchor="middle">64</text>
+<line class="axis" x1="60" y1="70" x2="60" y2="374"/>
+<line class="axis" x1="60" y1="374" x2="830" y2="374"/>
+<path d="M60.0,220.8 L316.7,209.8 L573.3,161.2 L830.0,124.1" fill="none" stroke="#e8590c" stroke-width="2.5"/>
+<circle cx="60.0" cy="220.8" r="3" fill="#e8590c"/>
+<circle cx="316.7" cy="209.8" r="3" fill="#e8590c"/>
+<circle cx="573.3" cy="161.2" r="3" fill="#e8590c"/>
+<circle cx="830.0" cy="124.1" r="3" fill="#e8590c"/>
+<text x="826.0" y="116.1" font-size="11" fill="#e8590c" text-anchor="end">41.1</text>
+<path d="M60.0,319.4 L316.7,319.5 L573.3,319.7 L830.0,320.3" fill="none" stroke="#1971c2" stroke-width="2.5"/>
+<circle cx="60.0" cy="319.4" r="3" fill="#1971c2"/>
+<circle cx="316.7" cy="319.5" r="3" fill="#1971c2"/>
+<circle cx="573.3" cy="319.7" r="3" fill="#1971c2"/>
+<circle cx="830.0" cy="320.3" r="3" fill="#1971c2"/>
+<text x="826.0" y="312.3" font-size="11" fill="#1971c2" text-anchor="end">8.84</text>
+<path d="M60.0,335.3 L316.7,334.4 L573.3,334.8 L830.0,336.9" fill="none" stroke="#2f9e44" stroke-width="2.5"/>
+<circle cx="60.0" cy="335.3" r="3" fill="#2f9e44"/>
+<circle cx="316.7" cy="334.4" r="3" fill="#2f9e44"/>
+<circle cx="573.3" cy="334.8" r="3" fill="#2f9e44"/>
+<circle cx="830.0" cy="336.9" r="3" fill="#2f9e44"/>
+<text x="826.0" y="328.9" font-size="11" fill="#2f9e44" text-anchor="end">6.1</text>
+<path d="M60.0,338.4 L316.7,337.0 L573.3,336.8 L830.0,337.8" fill="none" stroke="#9c36b5" stroke-width="2.5"/>
+<circle cx="60.0" cy="338.4" r="3" fill="#9c36b5"/>
+<circle cx="316.7" cy="337.0" r="3" fill="#9c36b5"/>
+<circle cx="573.3" cy="336.8" r="3" fill="#9c36b5"/>
+<circle cx="830.0" cy="337.8" r="3" fill="#9c36b5"/>
+<text x="826.0" y="329.8" font-size="11" fill="#9c36b5" text-anchor="end">5.95</text>
+<text x="60" y="414" font-size="11" class="muted">GiB/s against window size in MiB, higher is better</text>
+</svg>
