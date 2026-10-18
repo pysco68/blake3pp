@@ -69,8 +69,7 @@ length, seekable streams of data which is perfect for test data generation.
 
 The drive column is the same reader with hashing switched off, on the
 same machine and the same file: the ceiling any tool on that box is
-working against. Pacing is a property of the device,
-not a constant, and the wider window raises the ceiling as well as the
+working against. The wider window raises both that ceiling and the
 result.
 </details>
 

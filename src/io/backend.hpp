@@ -16,7 +16,12 @@
 //    submit_write(), flush(), wake() or a destructor. The pipelines --
 //    several windows, then several files, driven as senders from one
 //    thread -- depend on there being exactly one place where caller code
-//    regains control.
+//    regains control. forget(file&) is the one exception, and only for a
+//    SIBLING's transfer: where the completion mechanism is shared (one
+//    ring, one port), waiting out this file's transfers reaps another
+//    file's, and reporting it is better than stranding an operation that
+//    could never complete. It runs on the same thread, from a call the
+//    pipeline makes itself while its own cells are alive.
 // Internal to src/io/, never installed.
 
 #include <cerrno>

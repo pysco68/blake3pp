@@ -867,9 +867,11 @@ class pipeline_scope_base {
         // Only transfers are left, so the driver is asked for them back:
         // this file's, because the driver may be serving other pipelines
         // whose transfers are not this scope's to forget. It runs no
-        // callback, so nothing publishes into a cell afterwards, and the
-        // chains stay counted -- there is nothing left that could count
-        // them down.
+        // callback of THIS scope's, so nothing publishes into a cell
+        // afterwards and the chains stay counted -- there is nothing left
+        // that could count them down. A sibling file's completion may be
+        // reported from inside it, on this thread, where the backends say
+        // so.
         self.loop().driver().drain(self.file());
         break;
       }

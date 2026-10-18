@@ -753,12 +753,12 @@ class uring_context {
   // holds has to be waited out, because it is writing into those buffers
   // and nothing can take that back.
   //
-  // One sharp edge, since the ring is shared: a completion belonging to
-  // ANOTHER file can surface while this one is waited out, and it is
-  // reported normally rather than dropped -- losing it would strand an op
-  // that can never complete. So reclaiming one file of a multi-file
-  // context while a sibling has transfers in flight can run that
-  // sibling's callback from here.
+  // The ring is shared, so a completion belonging to ANOTHER file can
+  // surface while this one is waited out; it is reported normally rather
+  // than dropped, since losing it would strand an operation that can never
+  // complete. Reclaiming one file of a multi-file context while a sibling
+  // has transfers in flight therefore runs that sibling's callback from
+  // here, which is the one place outside poll() where one runs.
   void forget(file& f) noexcept {
     // The file stays on files_: it is still open and may be read again, and
     // a later context-wide drain has to be able to zero its count.

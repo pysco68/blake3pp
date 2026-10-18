@@ -245,9 +245,7 @@ class sized_backend final : public repl::parallel_scheduler_backend {
   // worker it queued has finished by the time it gets here -- a short bulk
   // on an idle pool. So a receiver's completion may run on the thread that
   // started the operation, and for the file pipeline that thread is the
-  // driver. Nothing here promises otherwise: the pipeline's "the driver
-  // spends its time polling" is an observation about measured runs, not a
-  // property this backend guarantees.
+  // driver.
   static void settle(job* j, std::size_t wanted, std::size_t queued) noexcept {
     if (j->release(wanted - queued + 1)) {
       j->complete();

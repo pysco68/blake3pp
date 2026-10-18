@@ -85,9 +85,11 @@ nav:
       - blake3pp.hpp: reference/blake3pp.md
       - core.hpp: reference/core.md
       - io.hpp: reference/io.md
+      - async_io.hpp: reference/async_io.md
       - parallel.hpp: reference/parallel.md
       - parallel_io.hpp: reference/parallel_io.md
       - parallel_backend.hpp: reference/parallel_backend.md
+      - trace.hpp: reference/trace.md
       - dispatch.hpp: reference/dispatch.md
   - Building:
       - Building: building.md

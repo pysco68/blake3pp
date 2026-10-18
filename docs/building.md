@@ -121,9 +121,8 @@ specific to that ISA which `auto`'s probes cannot see, and leaving the
 project-wide variable on `auto` would make `simd_provider()` report a
 provider the kernel does not actually use.
 
-Overriding either variable on a preset that does not need it is for
-re-measuring a provider choice, the same spirit as the kernel tuning
-switches below.
+Override either on a preset that does not need it to re-measure the
+choice.
 
 ## Coverage
 
@@ -274,6 +273,18 @@ AVX-512 with the parent work unchanged and only its grouping varied:
 `BLAKE3PP_SUBTREE_FOLD=<levels>` goes the other way, for targets that
 cannot spare the burst's staging buffers. The frames are in
 [Freestanding and RTOS builds](freestanding.md#stack-requirements).
+
+One more shapes the I/O geometry. `BLAKE3PP_MAX_QUEUE_DEPTH=<n>` (at least
+2, 256 by default) is the deepest queue a caller may ask for, and with it
+the largest window the engines accept, since the arena is the product of the
+two: a window in flight costs `window_bytes` plus its own tables, so 256 at
+the default 8 MiB window is already over 2 GiB. It is a guard against a typo
+rather than a device limit -- NVMe takes tens of thousands of outstanding
+commands -- and the measured sweet spot on every device so far is four to
+eight ([Performance](performance.md#window-and-queue-depth-are-a-device-property)).
+An installed package carries the value it was built with, because the
+constants it sets are used by inline functions on both sides of that
+boundary.
 
 Layout:
 

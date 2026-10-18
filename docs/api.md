@@ -401,10 +401,10 @@ The input is split into parts that the scheduler's agents pull as they go,
 and each part's 32-byte chaining value waits in a table that belongs to the
 window being hashed. A `stack_budget` template argument sets how much that
 table may take, 32 KiB (1024 parts) by default; give it less and the input
-is split into fewer, larger parts. The name is older than the engine: on
-the paths that have windows the table lives with the window, so this bounds
-memory per window in flight rather than a frame. What the agents spend on
-their own frames is a constant of the build instead
+is split into fewer, larger parts. On the paths that have windows the table
+lives with the window, so the budget bounds memory per window in flight, not
+a stack frame. What the agents spend on their own frames is a constant of
+the build instead
 ([freestanding](freestanding.md)). A budget that is not a multiple of 32
 bytes, or that holds fewer than two parts, does not compile:
 

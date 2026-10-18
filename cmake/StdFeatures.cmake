@@ -136,7 +136,8 @@ if(BLAKE3PP_SIMD_PROVIDER STREQUAL "std-experimental"
 endif()
 
 # ------------------------------------------------------ sender/receiver
-# The provider is an explicit choice, not pure detection:
+# Provider selection: `auto` resolves by probe, the named values are taken
+# as given:
 #   auto    - std::execution when the standard library ships a usable one,
 #             NVIDIA stdexec otherwise (beman is never auto-selected while
 #             its upstream labels itself pre-production)
