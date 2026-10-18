@@ -47,6 +47,7 @@
 
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/file_writer.hpp>
+#include <blake3pp/detail/io_geometry.hpp>
 
 namespace blake3pp {
 
@@ -55,14 +56,14 @@ class trace_buffer;
 /// The pipeline's knobs: what update_file() takes. The hasher it streams
 /// into already carries the SIMD variant and the mode.
 struct file_io_options {
-  /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
-  /// minimum 64 KiB.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows in flight at once; clamped to [2, 256]. Every one of them is
-  /// window_bytes of arena, which is what the ceiling guards (and
-  /// BLAKE3PP_MAX_QUEUE_DEPTH moves); the measured sweet spot on every
-  /// device so far is four to eight.
-  unsigned queue_depth = 4;
+  /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
+  /// multiple of chunk_size, minimum 64 KiB.
+  std::size_t window_bytes = detail::default_window_bytes;
+  /// Windows in flight at once, four by default; clamped to [2, 256]. Each
+  /// costs window_bytes of arena plus its own tables, which is what the
+  /// ceiling guards (and BLAKE3PP_MAX_QUEUE_DEPTH moves); the measured
+  /// sweet spot on every device so far is four to eight.
+  unsigned queue_depth = detail::default_queue_depth;
   /// Bypass the page cache where the platform supports it; degrades to
   /// buffered reads where it does not.
   bool direct_io = true;
@@ -75,8 +76,9 @@ struct file_io_options {
   bool offload_submit = true;
   /// Queue reads asynchronously (io_uring, IOCP, GCD) where the platform
   /// offers it; off reads them synchronously inside the same poll, which is
-  /// what a platform offering none does anyway. The engaged rung names
-  /// itself -- see file_reader::backend() and write_report::backend.
+  /// what a platform offering none does anyway. Which rung was engaged is
+  /// reported after the fact: read_backend(trace.driver()) for a read,
+  /// write_report::backend for a write.
   bool async = true;
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing, at the cost of one branch per window.
@@ -168,11 +170,12 @@ class hash_mode {
 struct hash_file_options {
   /// The SIMD variant of the hasher.
   arch a = arch::auto_detect;
-  /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
-  /// minimum 64 KiB.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows in flight at once; clamped to [2, 256]; see file_io_options.
-  unsigned queue_depth = 4;
+  /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
+  /// multiple of chunk_size, minimum 64 KiB.
+  std::size_t window_bytes = detail::default_window_bytes;
+  /// Windows in flight at once, four by default; clamped to [2, 256]; see
+  /// file_io_options.
+  unsigned queue_depth = detail::default_queue_depth;
   /// Bypass the page cache where the platform supports it.
   bool direct_io = true;
   /// Issue reads on the kernel's I/O worker threads; see file_io_options.
@@ -326,11 +329,14 @@ struct write_report {
   /// Bytes written: the size that was asked for, or what the generator
   /// produced before it stopped.
   std::uint64_t bytes = 0;
-  /// Which mechanism carried them, as the writer names it:
-  /// "io_uring+direct", "iocp+direct", "gcd-write+nocache", "pwrite",
-  /// "writefile" or "stdio", each with the reason appended where an
-  /// asynchronous rung was asked for and refused. Owned by the report,
-  /// because the writer that composed it is gone by then.
+  /// Which mechanism carried them, as the writer names it: the engine
+  /// ("io_uring", "iocp", "gcd-write", or the synchronous "pwrite",
+  /// "writefile", "stdio"), plus "+direct" or "+nocache" where the cache
+  /// bypass engaged; then " (inline submit)" where offload_submit was off,
+  /// and the reason where an asynchronous rung was asked for and refused.
+  /// So "io_uring+direct", "pwrite+direct [io_uring: ENOSYS, kernel too
+  /// old]", and so on. Owned by the report, because the writer that
+  /// composed it is gone by then.
   std::string backend;
 };
 
@@ -375,9 +381,10 @@ write_report write_sequential(const std::filesystem::path& path,
 ///
 /// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
 /// offset)`, once per window and in file order, and must fill every byte
-/// of `out`. It must not throw: an exception from it leaves the file as
-/// far as it got. The parallel_io.hpp overload takes the same generator
-/// and runs the windows over a scheduler instead.
+/// of `out`. It may throw, and the file is then left as far as it got;
+/// the fill runs on this thread, so the exception propagates out of this
+/// call. The parallel_io.hpp overload runs the windows over a scheduler
+/// instead, and needs a `noexcept` generator.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is
@@ -419,7 +426,8 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
 /// `fill` is called as `std::size_t fill(std::span<std::byte> out,
 /// std::uint64_t offset)`, once per window and in file order, and returns
 /// how many bytes of `out` it produced. Anything short of the whole
-/// buffer, zero included, ends the file. It must not throw.
+/// buffer, zero included, ends the file. It may throw, as in the
+/// length-taking form above.
 /// @param path  The file to create or truncate.
 /// @param fill  The generator; its return value is the file's length.
 /// @param opts  The geometry.

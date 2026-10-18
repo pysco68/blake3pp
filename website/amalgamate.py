@@ -63,6 +63,7 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/dispatch.hpp", "include/blake3pp/core.hpp",
           "include/blake3pp/trace.hpp",
           "include/blake3pp/detail/driver.hpp",
+          "include/blake3pp/detail/io_geometry.hpp",
           "include/blake3pp/detail/file_reader.hpp",
           "include/blake3pp/detail/file_writer.hpp",
           "include/blake3pp/io.hpp"]

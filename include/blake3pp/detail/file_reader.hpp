@@ -33,53 +33,15 @@
 #include <optional>
 #include <string_view>
 
+#include <blake3pp/detail/io_geometry.hpp>
+
 namespace blake3pp::detail {
 
-// The deepest queue the engines and the pipeline accept. A device is not
-// the reason for a ceiling -- NVMe takes tens of thousands of outstanding
-// commands -- the memory is: every window in flight is window_bytes of
-// arena, so 256 of them at the default 8 MiB window is 2 GiB, and at the
-// 1 GiB maximum window it is more than any machine has. The ceiling is a
-// guard against a typo, and BLAKE3PP_MAX_QUEUE_DEPTH raises or lowers it
-// for a caller who knows the device and the budget.
-#if defined(BLAKE3PP_MAX_QUEUE_DEPTH)
-constexpr unsigned max_queue_depth = BLAKE3PP_MAX_QUEUE_DEPTH;
-#else
-constexpr unsigned max_queue_depth = 256;
-#endif
-static_assert(max_queue_depth >= 2,
-              "a queue depth below two cannot overlap a read with a hash");
-
-// The largest window or buffer the engines accept, 1 GiB, or less where
-// max_queue_depth of them would not fit in size_t. The cap keeps the pool
-// size from wrapping and every transfer below the 32-bit length the
-// backends hand the kernel (io_uring's sqe.len, WriteFile's DWORD).
-constexpr std::size_t max_window_bytes =
-    std::min<std::size_t>(std::size_t{1} << 30,
-                          std::numeric_limits<std::size_t>::max() / max_queue_depth);
-
-// The window the reader actually uses for a requested size: a power of
-// two (so every full window is a subtree-aligned unit) between 64 KiB
-// (which keeps O_DIRECT alignment trivial) and max_window_bytes. Anything
-// that sizes storage per window must use the same rounding.
-[[nodiscard]] constexpr std::size_t rounded_window_bytes(
-    std::size_t requested) noexcept {
-  return std::bit_floor(
-      std::clamp<std::size_t>(requested, 64 * 1024, max_window_bytes));
-}
-
-// The queue depth the engines and the pipeline actually use for a
-// requested one: at least two, so one window can be read while another
-// is hashed, and at most max_queue_depth.
-[[nodiscard]] constexpr unsigned clamp_queue_depth(unsigned requested) noexcept {
-  return std::clamp(requested, 2u, max_queue_depth);
-}
-
 struct file_reader_options {
-  // Rounded down to a power-of-2 multiple of the chunk size, min 64 KiB,
-  // max 1 GiB.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  unsigned queue_depth = 4;  // clamped to [2, max_queue_depth]
+  // Rounded by rounded_window_bytes: a power of two in
+  // [min_window_bytes, max_window_bytes].
+  std::size_t window_bytes = default_window_bytes;
+  unsigned queue_depth = default_queue_depth;  // clamped by clamp_queue_depth
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused
   bool async = true;         // try io_uring; silently degrade if refused
   // Issue each read on the kernel's worker threads (io_uring: IOSQE_ASYNC)

@@ -7,8 +7,8 @@
 //           per-feature fallback (no O_DIRECT -> buffered io_uring;
 //           no io_uring -> synchronous pwrite)
 //   Windows: IOCP + FILE_FLAG_NO_BUFFERING, preallocation via
-//           SetEndOfFile + best-effort SetFileValidData (waives NTFS's
-//           synchronous zero-fill to the valid-data length)
+//           SetEndOfFile (NTFS still zero-fills to the valid data length;
+//           waiving that needs a privilege and exposes stale blocks)
 //   macOS:  GCD (libdispatch pool) + F_NOCACHE, preallocation via
 //           F_PREALLOCATE + ftruncate
 //   POSIX:  synchronous pwrite
@@ -44,21 +44,15 @@
 #include <filesystem>
 #include <memory>
 
+#include <blake3pp/detail/io_geometry.hpp>
+
 namespace blake3pp::detail {
 
-// The default geometry for a generated file (write_file(), io.hpp): 64 MiB
-// windows, two in flight. Not the reader's budget -- this is blake3ppgen's
-// measured shape, from four PCIe 5 drives in RAID 0, 32 threads, 32 GiB
-// written: 24.2 GiB/s at 64 MiB x 2 and 23.8 at 64 MiB x 4, against 20.7
-// at the uncapped 128 MiB x 4 and 14.8 at 256 MiB x 8. Past a few hundred
-// MiB in flight a striped NVMe volume slows down.
-inline constexpr std::size_t default_write_window_bytes = 64 * 1024 * 1024;
-inline constexpr unsigned default_write_queue_depth = 2;
-
 struct file_writer_options {
-  // Rounded up to a multiple of 4 KiB, min 64 KiB, max 1 GiB.
-  std::size_t buffer_bytes = 8 * 1024 * 1024;
-  unsigned queue_depth = 4;  // clamped to [2, max_queue_depth]
+  // Rounded up to a multiple of 4 KiB, then clamped to
+  // [min_window_bytes, max_window_bytes].
+  std::size_t buffer_bytes = default_write_window_bytes;
+  unsigned queue_depth = default_write_queue_depth;  // clamped to [2, max]
   bool direct_io = true;     // try O_DIRECT; silently degrade if refused
   bool async = true;         // try io_uring; silently degrade if refused
   // Issue each write on the kernel's worker threads (io_uring: IOSQE_ASYNC)
@@ -69,9 +63,8 @@ struct file_writer_options {
   // This matters enormously for async direct I/O: writes that EXTEND the
   // file serialize on the inode lock (each waits out journal + allocation),
   // while writes into preallocated extents overlap freely. On Windows the
-  // same role is played by SetEndOfFile plus SetFileValidData (privilege
-  // permitting). finish() trims the file back to the bytes actually
-  // written.
+  // same role is played by SetEndOfFile. finish() trims the file back to
+  // the bytes actually written.
   std::uint64_t preallocate_bytes = 0;
 };
 
@@ -91,16 +84,17 @@ class file_writer {
   };
 
   // Next buffer in round-robin order; blocks until that slot's previous
-  // write has landed. Throws std::system_error if any write so far
-  // failed.
+  // write has landed. Throws std::system_error if any write so far failed,
+  // or if every slot is already in the producer's hands unsubmitted.
   buffer acquire();
 
   // Accepts `bytes` from the buffer for the next sequential file offset
   // and returns without waiting or writing. `bytes` must be a multiple of
   // 4 KiB except on the final submit before finish(). Throws only for a
-  // buffer this writer did not hand out, a length larger than it holds,
-  // or a submit after a partial one; a WRITE error is reported by the
-  // next acquire() or by finish(), never from here.
+  // buffer this writer did not hand out or has already taken back, a
+  // length larger than it holds, or a submit after a partial one; a WRITE
+  // error is reported by the next acquire() or by finish(), never from
+  // here.
   void submit(const buffer& b, std::size_t bytes);
 
   // Lands every accepted byte and surfaces the first write error there

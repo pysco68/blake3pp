@@ -151,7 +151,7 @@ target_compile_definitions(blake3pp_features
   INTERFACE "BLAKE3PP_MAX_SIMD_DEGREE=${BLAKE3PP_MAX_SIMD_DEGREE}")
 
 # The deepest queue the I/O engines and the pipeline accept
-# (include/blake3pp/detail/file_reader.hpp). A device is not what bounds it
+# (include/blake3pp/detail/io_geometry.hpp). A device is not what bounds it
 # -- NVMe takes tens of thousands of outstanding commands -- the arena is:
 # every window in flight costs window_bytes, so 256 at the default 8 MiB
 # window is 2 GiB, and the measured sweet spot on every device so far is
@@ -170,15 +170,6 @@ if(BLAKE3PP_MAX_QUEUE_DEPTH)
     INTERFACE "BLAKE3PP_MAX_QUEUE_DEPTH=${BLAKE3PP_MAX_QUEUE_DEPTH}")
 endif()
 
-# Opt-in: reduce a subtree by folding groups into a binary-counter stack
-# (core::compress_subtree_to_cv_folded) instead of the recursion that holds
-# one CV buffer per level. The value is the stack bound in levels, so it is
-# also the working set: 12 levels is 384 bytes, covering a subtree of
-# 2^12 groups, and ON means 54, the largest subtree BLAKE3 defines. For
-# microcontrollers: the fold trades lane occupancy in the parent
-# compressions for a working set that does not grow with the subtree's
-# depth, which costs 11% on sse42 and avx2 and nothing measurable on a
-# scalar kernel, where there are no lanes to leave idle.
 # How many chunk batches a subtree reduction hashes before it compresses
 # their parents (src/core/subtree.hpp). A kernel body at full width is
 # large enough that the chunk loop and the one-block parent call do not
@@ -200,6 +191,16 @@ if(BLAKE3PP_SUBTREE_GROUP)
     "(default is 8); non-default kernel tuning")
 endif()
 
+# Opt-in: reduce a subtree one batch at a time, merging through a
+# binary-counter stack, instead of the grouped sweep the library takes by
+# default (both in src/core/subtree.hpp; neither is the old recursion, which
+# nothing reaches). The value is the stack bound in levels, so it is also the
+# working set: 12 levels is 384 bytes plus one group's staging, and ON means
+# 54, the largest subtree BLAKE3 defines. For microcontrollers: the fold
+# trades lane occupancy in the parent compressions for a working set that
+# does not grow with the subtree's depth, which costs 11% on sse42 and avx2
+# and nothing measurable on a scalar kernel, where there are no lanes to
+# leave idle.
 set(BLAKE3PP_SUBTREE_FOLD OFF CACHE STRING
   "Fold subtrees through a bounded CV stack instead of per-level buffers [OFF|ON|<levels>]")
 if(BLAKE3PP_SUBTREE_FOLD)
@@ -323,8 +324,9 @@ function(blake3pp_add_kernel ns)
     # Pin this TU to the xsimd provider regardless of the project-wide
     # selection (see BLAKE3PP_FORCE_XSIMD in src/kernel/simd_facade.hpp;
     # the SVE variants need it to stay free of load-time SVE code). The
-    # caller must have made the xsimd target available first
-    # (_blake3pp_fetch_xsimd in cmake/StdFeatures.cmake).
+    # project-wide choice may be one that needs no xsimd at all -- std, or
+    # xvec, which skips the fetch -- so a pinned variant asks for it here.
+    _blake3pp_fetch_xsimd()
     target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_FORCE_XSIMD=1")
     target_link_libraries(${tgt} PRIVATE xsimd)
   endif()

@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
   // file sink makes each window one segment; the sequential file sink and
   // stdout buffer one segment per thread so every fill fans out fully, the
   // file sink capped at max_buffer. --window overrides the file sinks.
-  constexpr std::size_t segment = 4 * 1024 * 1024;
+  constexpr std::size_t segment = blake3pp::default_fill_segment_bytes;
   constexpr std::size_t max_buffer = 64 * 1024 * 1024;
 
   // Seed ingestion: the hasher carries the mode, and a seed file streams
