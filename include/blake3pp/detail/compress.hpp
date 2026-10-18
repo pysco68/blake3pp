@@ -119,9 +119,16 @@ template <stack_budget Budget>
       (num_chunks + Budget.parts() - 1) / Budget.parts(), min_part_chunks));
 }
 
-// One CV slot per part. The slots are unpadded: each is written once per
-// part-sized task, so neighbours sharing a cache line cost nothing
-// measurable.
+// One CV slot per part, 32 bytes, so two slots share a cache line.
+//
+// Unpadded on purpose, and the arithmetic is the argument rather than a
+// measurement: a slot is written ONCE, when its part is done, and a part is
+// at least min_part_chunks chunks, which is 16 KiB of hashing. Two agents
+// finishing adjacent parts at the same moment therefore contend for one
+// line once per pair -- a single cache-line transfer against thousands of
+// times that in work. Padding to 64 bytes would halve the parts a budget
+// holds (1024 to 512 at the 32 KiB default), and the part count is what
+// balances the agents' tail.
 template <stack_budget Budget>
 using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
 
