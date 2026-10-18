@@ -3,8 +3,9 @@
 /// @file
 /// The sequential core: the digest value type, the incremental hasher in
 /// its three modes (plain, keyed, derive_key), extended output, and the
-/// one-shot functions. Standard library only; never allocates except in
-/// the std::string-returning conveniences.
+/// one-shot functions. Standard library only; allocates only in the
+/// std::string-returning conveniences, and in the message of a broken
+/// precondition on its way to being thrown.
 
 #include <array>
 #include <cstddef>
@@ -165,7 +166,8 @@ inline void fill(output_reader& r, std::span<std::byte> out) noexcept {
 /// The incremental BLAKE3 hasher: plain, keyed (MAC/PRF) or key-derivation
 /// mode, with a non-destructive finalize family.
 ///
-/// A fixed-size, trivially relocatable value; never allocates. Every
+/// A fixed-size, trivially relocatable value, allocating nothing on any
+/// path that returns. Every
 /// finalize form leaves the hasher usable, so a digest can be taken
 /// mid-stream and feeding can continue. An instance is not thread-safe;
 /// distinct instances are independent. The chaining-value stack is sized
@@ -240,8 +242,10 @@ class hasher {
   /// time, which is worth about 1.4x on messages of a few chunks (8 KiB,
   /// 2.04 -> 2.83 GiB/s on avx2).
   ///
-  /// Only the finalize family may be called afterwards; a further update()
-  /// would contradict the statement this call makes (checked by assert()).
+  /// The statement is not binding: a further update() simply means the
+  /// message did not end here, and the held subtree goes back on the stack
+  /// as update() would have left it. The digest is the same either way;
+  /// what is lost is the batching this call bought.
   /// @param input  Any length, including zero.
   void update_last(std::span<const std::byte> input) noexcept;
   /// Absorbs the rest of the message, given as text (see update_last()).
@@ -331,6 +335,7 @@ class hasher {
                std::uint64_t total_chunks,
                std::uint64_t subtree_chunks) noexcept;
   void close_full_chunk() noexcept;
+  void resume_held() noexcept;
 
   const kern::kernel_ops* ops_;
   std::array<std::uint32_t, 8> key_words_;
@@ -341,8 +346,11 @@ class hasher {
   // update_last() leaves the message's rightmost subtree here instead of
   // on the stack: it is the right child of the root parent, the node the
   // ROOT flag belongs to. While it is held, the chunk state is spent and
-  // finalization starts from this CV rather than from an open chunk.
+  // finalization starts from this CV rather than from an open chunk. Its
+  // size is what putting it back on the stack costs, which is what a
+  // further update() does.
   bool right_held_;
+  std::uint64_t right_chunks_;
   std::array<std::uint32_t, 8> right_cv_;
 };
 

@@ -44,7 +44,7 @@ hasher::hasher(const kern::kernel_ops* ops,
                std::span<const std::uint32_t, 8> key,
                std::uint32_t base_flags) noexcept
     : ops_(ops), base_flags_(base_flags), cv_stack_len_(0),
-      right_held_(false) {
+      right_held_(false), right_chunks_(0) {
   std::ranges::copy(key, key_words_.begin());
   core::chunk_init(chunk_, key_words_, 0);
 }
@@ -77,6 +77,7 @@ void hasher::reset() noexcept {
   core::chunk_init(chunk_, key_words_, 0);
   cv_stack_len_ = 0;
   right_held_ = false;
+  right_chunks_ = 0;
 }
 
 arch hasher::selected_arch() const noexcept { return ops_->variant; }
@@ -135,8 +136,22 @@ void hasher::close_full_chunk() noexcept {
   }
 }
 
+// update_last() left the message's rightmost subtree out of the stack so
+// finalization could make it the root parent's right child without
+// recompressing it. The held CV is a complete, aligned, left-complete
+// subtree at its position -- BLAKE3 compresses a full chunk the same way
+// whether or not the message continues -- so putting it on the stack
+// restores exactly the state update() would have reached. A further update
+// therefore costs the batching, not the digest.
+void hasher::resume_held() noexcept {
+  if (right_held_) {
+    right_held_ = false;
+    push_cv(right_cv_, chunk_.chunk_counter, right_chunks_);
+  }
+}
+
 void hasher::update(std::span<const std::byte> input) noexcept {
-  assert(!right_held_);  // update_last() said the message ended
+  resume_held();
   const auto* p = kern::kernel_bytes(input.data());
   std::size_t len = input.size();
 
@@ -175,7 +190,7 @@ void hasher::update(std::string_view input) noexcept {
 }
 
 void hasher::update_last(std::span<const std::byte> input) noexcept {
-  assert(!right_held_);
+  resume_held();
   close_full_chunk();
   const std::size_t len = input.size();
   // Only a message ending on a chunk boundary has a final chunk that could
@@ -213,6 +228,7 @@ void hasher::update_last(std::span<const std::byte> input) noexcept {
   assert(held_chunks != 0 && cv_stack_len_ > 0);
   core::copy_cv(held, right_cv_);
   right_held_ = true;
+  right_chunks_ = held_chunks;
   // The chunk state is spent, but count() still owes every absorbed byte.
   chunk_.chunk_counter = first + num_chunks;
 }
@@ -308,7 +324,7 @@ void output_reader::fill(std::span<std::byte> out) noexcept {
 
 void hasher::push_subtree_cv(std::span<const std::uint32_t, 8> cv,
                              std::uint64_t subtree_chunks) {
-  assert(!right_held_);  // update_last() said the message ended
+  resume_held();  // the message did not end at update_last() after all
   // The expert entry point's arguments, checked in every build: push_cv()
   // below cannot do it, because update() reaches it too and is noexcept.
   detail::require<std::invalid_argument>(
@@ -441,12 +457,10 @@ bool digest::matches(std::string_view hex) const noexcept {
 
 void to_hex(std::span<const std::byte> bytes, std::span<char> out) {
   static constexpr char alphabet[] = "0123456789abcdef";
-  // Checked in every build: the loop below writes two characters per byte
-  // whatever this says, and a span too small for them is a write past the
-  // end of a caller's buffer -- with lengths that can come from a file or
-  // a wire. There is nowhere to report it, since this is noexcept by
-  // design (the convenience overload returning a string is the one that
-  // may allocate).
+  // The loop below writes two characters per byte whatever the span says,
+  // so a span too small for them is a write past the end of a caller's
+  // buffer -- with lengths that can come from a file or a wire. Checked in
+  // every build.
   detail::require<std::length_error>(
       out.size() >= 2 * bytes.size(),
       "to_hex(): an output span smaller than two characters per byte");
