@@ -81,6 +81,14 @@ struct io_op {
   // state, and cancelling the second reads storage holding no object, or
   // the previous transfer left in it.
   bool live = false;
+  // The driver's list of the operations it owes, so that a drain can
+  // lower `live` on exactly the ones it forgot: linked by submit,
+  // unlinked before the callback runs or when a drain drops the
+  // operation. `owed_by` names the file the transfer belongs to, which
+  // is what a per-file drain keys on.
+  io_op* owed_next = nullptr;
+  io_op* owed_prev = nullptr;
+  const void* owed_by = nullptr;
 
   // Sized for whatever transfer type the native backend derives from
   // transfer_base (uring_context::transfer, iocp_context::transfer or
@@ -164,8 +172,9 @@ concept file_driver =
       { f.size() } noexcept -> std::same_as<std::uint64_t>;
       { f.name() } noexcept -> std::same_as<std::string_view>;
       // Queues one transfer. A driver that takes it raises op.live and
-      // lowers it before the callback runs: that is how a caller's cancel
-      // sweep tells a transfer the device has from one only admitted.
+      // lowers it before the callback runs, or when a drain forgets it:
+      // that is how a caller's cancel sweep tells a transfer the device
+      // has from one only admitted, or from one already dropped.
       { d.submit_read(f, off, buf, op) };
       { d.flush() } noexcept;
       { d.poll(block) } -> std::same_as<std::size_t>;

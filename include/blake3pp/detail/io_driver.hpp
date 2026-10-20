@@ -117,13 +117,15 @@ class io_driver {
   [[nodiscard]] std::size_t in_flight() const noexcept;
   // Waits out every read still owed, running no callback, and forgets
   // the rest. The invariant it establishes: afterwards in_flight() is
-  // zero and the driver references no io_op, so the caller may
-  // destroy the ops it submitted. The driver stays usable. The
-  // destructor drains too, a no-op after this.
+  // zero, the driver references no io_op, and every op it owed has
+  // `live` lowered, so the caller may destroy the ops it submitted or
+  // sweep them with cancel() and meet nothing. The driver stays usable.
+  // The destructor drains too, a no-op after this.
   void drain() noexcept;
   // The same for one file: afterwards no transfer of this file is owed or
-  // referenced, so its buffers and the operations naming them may be
-  // destroyed, and the driver stays usable for this file and every other.
+  // referenced and its operations have `live` lowered, so its buffers and
+  // the operations naming them may be destroyed, and the driver stays
+  // usable for this file and every other.
   // A sibling file's completion that surfaces during the wait is reported
   // normally -- dropping it would strand an op that can never complete --
   // so a caller closing one file of several should idle it first.
