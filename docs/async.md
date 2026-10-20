@@ -80,9 +80,9 @@ than one of the four.
 keyed and `derive_key` hashers work exactly as they do everywhere else,
 and several files can go into one hasher in sequence.
 
-`async_update_files` runs a bounded number of files at once (the
-context's windows divided by its queue depth, or `opts.in_flight`) and
-refills a slot as each file ends. Every file's end goes to
+`async_update_files` runs a bounded number of files at once (one per
+window the context holds, or `opts.in_flight`) and refills a slot as
+each file ends. Every file's end goes to
 `done(index, hasher&, file_outcome)` on the context's thread, with the
 hasher that streamed it, so the caller finalizes to whatever length and
 mode it wants; a file that fails is an outcome, not the end of the run.
