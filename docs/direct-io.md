@@ -99,7 +99,12 @@ be bypassed. Which rung was engaged is reported after the fact.
 
 Every reader and writer names the rung it landed on:
 
-- On the read side the rung reaches a caller through the trace:
+- `blake3pp::probe_file_io(path, opts)` answers before any read: it opens
+  the file as `update_file()` would, returns the plan's geometry, whether
+  the bypass was asked for, and the rung the open landed on, then closes
+  it. The spellings are the same as below, so a buffered rung beside
+  `direct_io == true` says the filesystem declined.
+- During or after a hash the rung reaches a caller through the trace:
   `blake3pp::read_backend(buffer.driver())` after an `update_file()` that
   was given a `trace_buffer` ([Performance tracing](tracing.md)). The
   spellings are `"io_uring+direct"`, `"iocp+direct"`, `"gcd+nocache"`,

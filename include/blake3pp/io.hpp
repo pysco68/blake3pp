@@ -301,6 +301,54 @@ void update_file(hasher& h, const std::filesystem::path& path,
                  std::error_code& ec,
                  const file_io_options& opts = {}) noexcept;
 
+/// What update_file() would engage for a file: the geometry its plan
+/// decides from the options and the file's size, and the rung the open
+/// lands on. See probe_file_io().
+struct file_io_probe {
+  /// The file's size as the filesystem reports it.
+  std::uint64_t file_bytes = 0;
+  /// Bytes per window, as the pipeline rounds the request.
+  std::size_t window_bytes = 0;
+  /// Reads the device sees at once.
+  unsigned reads_in_flight = 0;
+  /// Windows in flight at most, reading or being hashed; never more than
+  /// the file has.
+  unsigned windows = 0;
+  /// Whether the open asks for the cache bypass: the caller's direct_io,
+  /// granted only to a file of at least 512 KiB (detail::min_pipeline_bytes)
+  /// and to a size the filesystem would not give.
+  bool direct_io = false;
+  /// The rung the open landed on, spelled as write_report::backend is:
+  /// "io_uring+direct", "iocp", "gcd+nocache", "pread", "readfile",
+  /// "stdio", with " (inline submit)" where offload_submit was off and the
+  /// reason appended where the async engine was asked for and refused.
+  /// Where the bypass was asked for and the filesystem declined it, this
+  /// says so by naming the buffered rung while direct_io above is true.
+  std::string backend;
+};
+
+/// Opens the file the way update_file() opens it for a fresh hasher,
+/// reports what that open engaged, and closes it; nothing is read. The
+/// answer is this filesystem's and this kernel's for this path and these
+/// options, which is why it takes an open to give it: a hashing call with
+/// the same options gets the same rung. A hasher part-way through a
+/// message may lose the bypass to an unaligned window grid, which this
+/// probe, asked for a fresh hasher, does not see.
+/// @param path  The file to probe.
+/// @param opts  The pipeline knobs update_file() would be given.
+/// @throws std::system_error when the file cannot be opened.
+[[nodiscard]] file_io_probe probe_file_io(const std::filesystem::path& path,
+                                          const file_io_options& opts = {});
+
+/// probe_file_io() reporting failure through ec instead of throwing.
+/// @param path  The file to probe.
+/// @param ec    Cleared on success; the error otherwise.
+/// @param opts  The pipeline knobs update_file() would be given.
+/// @return The probe, or a default one when ec is set.
+[[nodiscard]] file_io_probe probe_file_io(const std::filesystem::path& path,
+                                          std::error_code& ec,
+                                          const file_io_options& opts = {}) noexcept;
+
 /// Knobs for write_file(): the geometry of a generated file.
 ///
 /// On the write side the windows in flight are the whole parallelism,
@@ -575,6 +623,28 @@ template <detail::foreign_path P>
                                const hash_file_options& opts = {}) noexcept {
   return detail::with_error_code(ec, [&] {
     return hash_file(std::filesystem::path(path.native()), opts);
+  });
+}
+
+/// probe_file_io() for a foreign path type.
+/// @param path  The file to probe.
+/// @param opts  The pipeline knobs update_file() would be given.
+template <detail::foreign_path P>
+[[nodiscard]] file_io_probe probe_file_io(const P& path,
+                                          const file_io_options& opts = {}) {
+  return probe_file_io(std::filesystem::path(path.native()), opts);
+}
+
+/// probe_file_io() for a foreign path type, reporting through ec.
+/// @param path  The file to probe.
+/// @param ec    Cleared on success; the error otherwise.
+/// @param opts  The pipeline knobs update_file() would be given.
+template <detail::foreign_path P>
+[[nodiscard]] file_io_probe probe_file_io(
+    const P& path, std::error_code& ec,
+    const file_io_options& opts = {}) noexcept {
+  return detail::with_error_code(ec, [&] {
+    return probe_file_io(std::filesystem::path(path.native()), opts);
   });
 }
 

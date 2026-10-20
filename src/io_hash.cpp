@@ -1,4 +1,6 @@
+#include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/file_reader.hpp>
+#include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/trace.hpp>
 
@@ -6,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <string>
 #include <system_error>
 
 namespace blake3pp {
@@ -58,6 +61,33 @@ void update_file(hasher& h, const std::filesystem::path& path,
 void update_file(hasher& h, const std::filesystem::path& path,
                  std::error_code& ec, const file_io_options& opts) noexcept {
   detail::with_error_code(ec, [&] { update_file(h, path, opts); });
+}
+
+file_io_probe probe_file_io(const std::filesystem::path& path,
+                            const file_io_options& opts) {
+  // The plan update_file() makes over a scheduler for a fresh hasher,
+  // and the open it makes from that plan; the sequential form opens the
+  // same way and differs only in the geometry it reads with.
+  std::error_code size_ec;
+  const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
+  const detail::pipeline_plan plan = detail::plan_pipeline(
+      0, opts.window_bytes, opts.queue_depth, opts.direct_io,
+      size_ec ? 0 : static_cast<std::uint64_t>(size));
+  detail::io_driver drv({opts.async, opts.offload_submit},
+                        plan.reads_in_flight);
+  detail::io_driver::file file(drv, path, plan.direct_io);
+  return {.file_bytes = file.size(),
+          .window_bytes = plan.window_bytes,
+          .reads_in_flight = plan.reads_in_flight,
+          .windows = plan.windows,
+          .direct_io = plan.direct_io,
+          .backend = std::string(file.name())};
+}
+
+file_io_probe probe_file_io(const std::filesystem::path& path,
+                            std::error_code& ec,
+                            const file_io_options& opts) noexcept {
+  return detail::with_error_code(ec, [&] { return probe_file_io(path, opts); });
 }
 
 digest hash_file(const std::filesystem::path& path,

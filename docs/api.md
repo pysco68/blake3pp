@@ -177,6 +177,20 @@ auto d2 = blake3pp::hash_file(config.input_path, ec);   // reports via ec
 if (ec) { log_error(ec.message()); }
 ```
 
+Which mechanism a file would get is a question of its own,
+`probe_file_io()`: it opens the file as `update_file()` would and reports
+the plan's window and queue, whether the cache bypass was asked for (a
+file under 512 KiB never is), and the rung the open landed on, without
+reading anything. The detail of what a hash then did is the trace's
+([Performance tracing](tracing.md)).
+
+```cpp
+auto p = blake3pp::probe_file_io("dataset.parquet");
+p.backend;     // "io_uring+direct", "iocp", "pread", ...
+p.direct_io;   // what was asked of the filesystem
+p.windows;     // windows the pipeline would keep in flight
+```
+
 `hash_file()` is the one-shot form. `update_file()` is the primitive
 underneath it: `hasher::update()` with a file as the source. It streams
 into a hasher you own and returns, so the hasher's mode and every

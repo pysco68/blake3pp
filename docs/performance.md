@@ -447,6 +447,17 @@ in this tree against this library's padded 2.15.
 swapped in, so the two differ only in the kernel. `crate rayon` is the
 reference implementation's own parallel path.
 
+Every row of the chart, and every `*-threads.txt` behind the tables in this
+section, hashes 512 MiB per repetition. At 32 threads on the stripe box that
+is a 14 ms row, so what the column measures is the fan-out, the wake latency
+and the join as much as the steady-state rate, and the engine with the
+larger setup cost loses more of it. The same two programs on the same idle
+box read 36.10 GiB/s against rayon's 50.34 at 512 MiB, a 39% lead for the
+crate, and 61.8 against 71.34 at 8 GiB, 15%. The figures below are correct
+as what they are; read the cross-tool gaps in this section as latency
+comparisons, and the 8 GiB pair as the throughput one, until the sweeps are
+retaken at a size that gives seconds of steady state.
+
 ### The engine against a work-stealing pool
 
 The control that matters is the middle line against rayon: the same kernel,

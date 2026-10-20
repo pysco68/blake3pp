@@ -72,6 +72,52 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
 GLOBAL = set()          # non-kernel internals: emitted once for the file
 
 
+# Definitions a single file cannot carry, and what to say where they
+# were. The file pipeline (detail/file_pipeline.hpp) is written against
+# a sender/receiver provider and the single file has none of its own:
+# its API is the sequential half, which is why file_pipeline.hpp is not
+# in PUBLIC above and parallel_io.hpp is emitted only behind
+# BLAKE3PP_AMALGAM_HAS_PARALLEL. probe_file_io() is the one definition
+# in the provider-free sources that reaches across that line (it wants
+# the plan update_file() would have made), so it is cut here instead of
+# failing at the paste site.
+OMIT = {"src/io_hash.cpp": [("file_io_probe probe_file_io(",
+                             "probe_file_io(): it needs the file pipeline's "
+                             "plan, which needs an execution provider")]}
+
+
+def drop_definition(text, head, why):
+    """Cut every definition whose first line starts with `head`.
+
+    Brace-counted from the signature rather than regex-matched over the
+    body, and the comment block immediately above goes with it: a
+    definition's explanation describes code this file does not have.
+    """
+    while True:
+        at = text.find("\n" + head)
+        if at < 0:
+            return text
+        start = at + 1
+        # The comment block attached above, if any.
+        while True:
+            prev = text.rfind("\n", 0, start - 1) + 1
+            if prev == start or not text[prev:start].lstrip().startswith("//"):
+                break
+            start = prev
+        depth, i, opened = 0, text.index("{", at), False
+        while i < len(text):
+            if text[i] == "{":
+                depth, opened = depth + 1, True
+            elif text[i] == "}":
+                depth -= 1
+                if opened and depth == 0:
+                    break
+            i += 1
+        end = text.index("\n", i) + 1
+        text = text[:start] + f"// Omitted from the single file: {why}.\n" + text[end:]
+
+
+
 def inline(rel, seen, variant):
     text = (REPO / "src" / rel).read_text().replace("#pragma once", "")
     text = re.sub(r'#ifndef BLAKE3PP_ARCH_NS\n#error[^\n]*\n#endif\n', "", text)
@@ -277,6 +323,8 @@ def main():
             "#endif"]
     for f in SUPPORT:
         text = inline(f[len("src/"):], set(), "BLAKE3PP_AMALGAM_NS")
+        for head, why in OMIT.get(f, ()):
+            text = drop_definition(text, head, why)
         text = text.replace('#include "blake3pp_version_stamp.hpp"', stamp)
         text = text.replace('#include "blake3pp_kernel_registry.inc"', registry)
         # arch.def is an X-macro table, not a header: it is included at
