@@ -160,13 +160,14 @@ and every operation after that finds them warm. On Linux the allocation asks
 for transparent huge pages, which makes that pass cheaper where the kernel
 grants them.
 Left at zero, `windows` is what the plan asks for: 16 at the defaults, so a
-128 MiB arena, which keeps four operations of `queue_depth` 4 moving. Both
-`windows` and `queue_depth` are clamped to the same ceiling, 256 unless the
-build moved it, because a window costs the same whether it was asked for as
-a count or as a budget. A
-context meant to keep *n* files moving wants around `n * queue_depth`
-windows, and `arena_bytes` is the same request as a memory budget, which is
-usually the number a caller actually has.
+128 MiB arena, and `async_update_files` keeps one file in flight per window
+unless told otherwise, sixteen here. Both `windows` and `queue_depth` are
+clamped to the same ceiling, 256 unless the build moved it, because a
+window costs the same whether it was asked for as a count or as a budget.
+A context meant to keep *n* files moving wants at least *n* windows, and
+`n * queue_depth` of them if every file is large enough to fill its queue;
+`arena_bytes` is the same request as a memory budget, which is usually the
+number a caller actually has.
 
 Fewer windows than that is not a deadlock — an operation that finds none
 free waits, and resumes when any other gives one back — but it

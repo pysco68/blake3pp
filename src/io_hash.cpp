@@ -12,9 +12,17 @@ namespace blake3pp {
 
 void update_file(hasher& h, const std::filesystem::path& path,
                  const file_io_options& opts) {
+  // The same open-mode rule the pipeline's plan applies: a small file is
+  // read through the page cache whatever was asked, and a size the
+  // filesystem will not give counts as large.
+  std::error_code size_ec;
+  const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
+  const bool direct_io =
+      opts.direct_io &&
+      detail::direct_io_worthwhile(size_ec ? 0 : static_cast<std::uint64_t>(size));
   detail::file_reader reader(path, {.window_bytes = opts.window_bytes,
                                     .queue_depth = opts.queue_depth,
-                                    .direct_io = opts.direct_io,
+                                    .direct_io = direct_io,
                                     .async = opts.async,
                                     .offload_submit = opts.offload_submit});
   trace_buffer* const trace = opts.trace;

@@ -134,7 +134,13 @@ bet stops paying off, or actively costs, in a few shapes:
   I/O exists to refuse.
 - **A small file.** The extra reopen for the flag, and the granule
   bookkeeping around it, are a fixed cost per file; a long transfer
-  amortizes it and a short one does not.
+  amortizes it and a short one does not. Measured on four PCIe 5 drives
+  in RAID 0 over 1000 MiB of files per row, buffered reads 5-10% faster
+  than direct at every size up to 256 KiB and direct 12% faster at 1 MiB,
+  so the plan reads a file below `min_pipeline_bytes` (512 KiB, the size
+  at which the pipeline is skipped as well) through the page cache
+  whatever `direct_io` says. A file whose size the filesystem will not
+  give counts as large.
 - **A filesystem that refuses it.** Network filesystems, overlay and
   virtual filesystems, and some container volumes decline `O_DIRECT` /
   `FILE_FLAG_NO_BUFFERING` outright. The degradation above makes this

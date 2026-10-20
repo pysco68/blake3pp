@@ -24,6 +24,7 @@
 #include <span>
 #include <system_error>
 #include <type_traits>
+#include <thread>
 #include <utility>
 
 #include <blake3pp/core.hpp>
@@ -95,8 +96,9 @@ template <class Scheduler, class Fill>
 void write_file(const std::filesystem::path& path, std::uint64_t size,
                 Fill&& fill, Scheduler&& sched,
                 const file_write_options& opts = {}) {
-  detail::io_driver drv({opts.async, opts.offload_submit},
-                        detail::clamp_queue_depth(opts.queue_depth));
+  const unsigned depth = detail::resolve_write_queue_depth(
+      opts.queue_depth, opts.window_bytes, std::thread::hardware_concurrency());
+  detail::io_driver drv({opts.async, opts.offload_submit}, depth);
   detail::io_driver::file file(
       drv, path,
       detail::io_driver::open_options{.write = true,
@@ -105,7 +107,7 @@ void write_file(const std::filesystem::path& path, std::uint64_t size,
   detail::run_write_pipeline(drv, file, std::forward<Scheduler>(sched),
                              std::forward<Fill>(fill), size,
                              {.window_bytes = opts.window_bytes,
-                              .queue_depth = opts.queue_depth});
+                              .queue_depth = depth});
 }
 
 /// write_file() over a scheduler, reporting failure through ec instead of

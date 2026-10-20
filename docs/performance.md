@@ -724,10 +724,18 @@ Doubling the depth from 2 to 4 nearly doubles the rate; from 8 to 16 it buys
 nothing, because by then there are more windows than the generator has cores
 to fill. The window *size* barely matters across a 16x range. So the one
 tuning lever on the write side is the queue depth, and the useful setting is
-about the core count. On four PCIe 5 drives in RAID 0 with 32 threads and
-32 GiB written, the writer's own default geometry measured 24.2 GiB/s at
-64 MiB x 2 and 23.8 at 64 MiB x 4, against 20.7 at 128 MiB x 4 and 14.8 at
-256 MiB x 8: past a few hundred MiB in flight a striped volume slows down.
+the core count: on 32 cores the same measurement reads 4.07 / 8.28 / 15.8 /
+34.8 / 62.9 GiB/s at qd 2 / 4 / 8 / 16 / 32, peaks there, and declines past
+it (58.6 at 64, 55.4 at 256). End to end, `blake3ppgen` onto four PCIe 5
+drives in RAID 0 (kernel 7.0, 128 GiB per row) writes 6.51 GiB/s at qd 4,
+13.5 at qd 8 and 30.96 at qd 32, 98% of the 31.5 the device sustains under
+fio. The memory in flight is depth x window, and past a few hundred MiB of
+it a striped volume slows down (24.2 GiB/s at 128 MiB in flight against
+20.7 at 512 MiB and 14.8 at 2 GiB, same drives). Hence the defaults: an
+automatic depth of one window per hardware thread, 8 MiB windows, and a
+256 MiB bound on their product; `blake3ppgen` counts its own pool's threads
+instead. A caller with a smaller pool or a device that prefers less in
+flight sets `queue_depth` itself.
 
 `--null-source` is the read side's equivalent and is a **ceiling, not a
 throughput**: the driver owns only `windows x window_bytes` of buffer and

@@ -45,7 +45,9 @@ namespace blake3pp::detail {
 // What a write run needs beyond the plan.
 struct write_options {
   std::size_t window_bytes = default_write_window_bytes;
-  unsigned queue_depth = default_write_queue_depth;
+  // Resolved by the caller (resolve_write_queue_depth); a zero here is
+  // clamped to the minimum like any other request.
+  unsigned queue_depth = sequential_write_queue_depth;
   ex::inplace_stop_token stop_token{};
 };
 

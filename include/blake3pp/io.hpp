@@ -65,7 +65,10 @@ struct file_io_options {
   /// sweet spot on every device so far is four to eight.
   unsigned queue_depth = detail::default_queue_depth;
   /// Bypass the page cache where the platform supports it; degrades to
-  /// buffered reads where it does not.
+  /// buffered reads where it does not. A file below 512 KiB
+  /// (detail::min_pipeline_bytes) is read through the page cache either
+  /// way: it runs without the pipeline, and buffered is the faster read
+  /// there by 5-10%.
   bool direct_io = true;
   /// Issue each read on the kernel's I/O worker threads instead of inline
   /// in the submitting thread (Linux: io_uring's IOSQE_ASYNC). Issuing a
@@ -176,7 +179,8 @@ struct hash_file_options {
   /// Windows in flight at once, four by default; clamped to [2, 256]; see
   /// file_io_options.
   unsigned queue_depth = detail::default_queue_depth;
-  /// Bypass the page cache where the platform supports it.
+  /// Bypass the page cache where the platform supports it; see
+  /// file_io_options for the small-file exception.
   bool direct_io = true;
   /// Issue reads on the kernel's I/O worker threads; see file_io_options.
   bool offload_submit = true;
@@ -299,12 +303,13 @@ void update_file(hasher& h, const std::filesystem::path& path,
 
 /// Knobs for write_file(): the geometry of a generated file.
 ///
-/// The defaults are a writer's shape rather than a reader's: 64 MiB
-/// windows, two in flight. On four PCIe 5 drives in RAID 0 with 32
-/// threads that geometry measured 24.2 GiB/s, against 20.7 at 128 MiB x 4
-/// and 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
-/// volume slows down. blake3ppgen sets its own from --window and
-/// --threads and does not take these.
+/// On the write side the windows in flight are the whole parallelism,
+/// because one window's fill is sequential, so the queue depth is the
+/// lever and the window size moves little. The default depth is
+/// therefore automatic: over a scheduler, one window per hardware thread
+/// as long as depth x window stays within 256 MiB in flight (32 windows
+/// of the default 8 MiB), past which a striped volume slows down; in the
+/// sequential forms, two, one filling while the other drains.
 struct file_write_options {
   /// Bytes per window. The sequential forms round up to a multiple of
   /// 4 KiB (minimum 64 KiB, maximum 1 GiB); the forms that take a
@@ -312,7 +317,9 @@ struct file_write_options {
   /// reading does, so one options object asking for an odd size can mean
   /// two geometries.
   std::size_t window_bytes = detail::default_write_window_bytes;
-  /// Windows in flight, clamped to [2, 256]; see file_io_options.
+  /// Windows in flight, clamped to [2, 256]; zero means automatic, as
+  /// described above. A caller that knows its pool is smaller than the
+  /// machine, or its device prefers less in flight, sets it.
   unsigned queue_depth = detail::default_write_queue_depth;
   /// Bypass the page cache where the platform can.
   bool direct_io = true;
@@ -355,7 +362,9 @@ write_report write_sequential(const std::filesystem::path& path,
                               const file_write_options& opts) {
   file_writer writer(path,
                      {.buffer_bytes = opts.window_bytes,
-                      .queue_depth = opts.queue_depth,
+                      .queue_depth = opts.queue_depth != 0
+                                         ? opts.queue_depth
+                                         : sequential_write_queue_depth,
                       .direct_io = opts.direct_io,
                       .async = opts.async,
                       .offload_submit = opts.offload_submit,

@@ -2234,6 +2234,19 @@ TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the fi
             .reads_in_flight == max_queue_depth);
   CHECK(plan_pipeline(0, 8 * mib, 100000, false, large).windows ==
         max_queue_depth);
+  // Direct I/O is granted for a file at or above min_pipeline_bytes, or
+  // of unknown size, and withheld below it, where buffered is faster.
+  {
+    using blake3pp::detail::min_pipeline_bytes;
+    CHECK(plan_pipeline(0, 8 * mib, 4, true, large).direct_io);
+    CHECK(plan_pipeline(0, 8 * mib, 4, true, 0).direct_io);
+    CHECK(plan_pipeline(0, 8 * mib, 4, true, min_pipeline_bytes).direct_io);
+    CHECK(!plan_pipeline(0, 8 * mib, 4, true, min_pipeline_bytes - 1).direct_io);
+    CHECK(!plan_pipeline(0, 8 * mib, 4, true, 100000).direct_io);
+    CHECK(!plan_pipeline(0, 8 * mib, 4, false, large).direct_io);
+    // An unaligned head still withholds it on its own.
+    CHECK(!plan_pipeline(4096 + 1, 8 * mib, 4, true, large).direct_io);
+  }
   // A small file gets exactly its windows, edges included.
   CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024).windows == 3);
   CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024 + 1).windows == 4);
@@ -2316,7 +2329,10 @@ TEST_CASE("prior content sets the window grid and the open mode") {
   using blake3pp::detail::plan_pipeline;
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
-  const std::size_t len = 3 * win + 1234;
+  // Above min_pipeline_bytes, so the size rule leaves the open mode to
+  // the alignment rule this case is about.
+  const std::size_t len = 9 * win + 1234;
+  static_assert(9 * win + 1234 >= blake3pp::detail::min_pipeline_bytes);
   const auto content = pattern(len, 121);
   const temp_file f(content);
 

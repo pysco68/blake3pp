@@ -181,7 +181,8 @@ namespace detail {
 // a fifth and climbing. The figure is one machine's; the curve either
 // side of it is flat enough that a factor of two costs little.
 //
-inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
+// min_pipeline_bytes itself is defined in io_geometry.hpp, because the
+// file side keys its direct-I/O decision on the same size.
 
 // The window a span already in memory is cut into.
 //

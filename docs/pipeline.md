@@ -314,6 +314,12 @@ complete inside `start()`, take whatever `poll()` reports. The direction
 decides the buffer's constness, which driver call submits it, and whether
 the value completion carries bytes back.
 
+One window's fill is sequential, so on this side the windows in flight are
+the whole parallelism: the queue depth is the lever, and its default is
+automatic -- one window per hardware thread over a scheduler, bounded so
+that depth times window stays within 256 MiB in flight, and two in the
+sequential forms ([Performance](performance.md)).
+
 What the write side does not have is a reducer. A window's bytes depend on
 its offset and nothing else, so there is no tree to rebuild and no last
 window to keep for the end. The generator must therefore depend on its
@@ -393,7 +399,9 @@ are one implementation for files and for buffers, and a window folds
 identically whichever path ran it.
 
 Below `min_pipeline_bytes` the pipeline is not entered at all; the bytes go
-straight into the hasher.
+straight into the hasher, and a file of that size is opened through the page
+cache whatever `direct_io` asked for, since buffered reads are the faster
+ones there ([Direct I/O](direct-io.md)).
 
 ## Where the time went
 

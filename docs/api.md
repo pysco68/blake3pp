@@ -255,8 +255,11 @@ blake3pp::write_file("seed.bin", 1 << 30, fill, pool.get_scheduler());
 
 In the scheduler form the generator must depend on its offset and nothing
 else, because windows are filled concurrently and in no particular order.
-Either form takes a generator that may throw: sequentially the exception
-propagates off the calling thread, and over a scheduler the window's chain
+How many are filled at once is the queue depth: by default one per
+hardware thread, within a 256 MiB bound on the bytes in flight.
+
+Every form takes a generator that may throw. Sequentially the exception
+propagates off the calling thread; over a scheduler the window's chain
 carries it, stops the run and rethrows it from `write_file()`. On failure
 the file is left as far as it got and is not truncated, because a length
 invented for bytes that were never produced would hide the failure.

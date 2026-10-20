@@ -1024,8 +1024,10 @@ struct pipeline_plan {
   // The short first window that brings the hasher onto the window grid;
   // zero for a hasher already on it.
   std::size_t head_bytes;
-  // Whether the file is opened for direct I/O: the caller asked, and the
-  // grid is one the platform's alignment can serve.
+  // Whether the file is opened for direct I/O: the caller asked, the
+  // grid is one the platform's alignment can serve, and the file is not
+  // below min_pipeline_bytes, where buffered reads are the faster ones.
+  // A size the filesystem will not give counts as large.
   bool direct_io;
   // Whether this span ends the message. False for a caller streaming a
   // sequence of spans into one hasher: the final window is then an
@@ -1069,7 +1071,8 @@ struct pipeline_plan {
   return {window, reads,
           file_bytes == 0 ? windows
                           : std::min(windows, file_windows(file_bytes, window, head)),
-          head, direct_io && direct_io_fits(head)};
+          head,
+          direct_io && direct_io_fits(head) && direct_io_worthwhile(file_bytes)};
 }
 
 

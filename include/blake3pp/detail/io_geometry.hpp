@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 namespace blake3pp::detail {
@@ -71,13 +72,63 @@ inline constexpr unsigned default_queue_depth = 4;
   return std::clamp(requested, 2u, max_queue_depth);
 }
 
-// The default geometry for a generated file (write_file(), io.hpp): 64 MiB
-// windows, two in flight. Not the reader's budget -- this is blake3ppgen's
-// measured shape, from four PCIe 5 drives in RAID 0, 32 threads, 32 GiB
-// written: 24.2 GiB/s at 64 MiB x 2 and 23.8 at 64 MiB x 4, against 20.7
-// at 128 MiB x 4 and 14.8 at 256 MiB x 8. Past a few hundred MiB in flight
-// a striped NVMe volume slows down.
-inline constexpr std::size_t default_write_window_bytes = 64 * 1024 * 1024;
-inline constexpr unsigned default_write_queue_depth = 2;
+// The size below which a message is small: a span of fewer bytes is
+// hashed without the pipeline (parallel.hpp has the measurement), and a
+// file of fewer bytes is read through the page cache whatever the caller
+// asked, because the pipeline it would feed is skipped and the cache
+// bypass costs more than it saves there. Measured on four PCIe 5 drives
+// in RAID 0, 1000 MiB of files per row, cold, direct against buffered:
+// 1.41 against 1.49 GB/s at 64 KiB, 1.99 against 2.18 at 96, 4.48
+// against 4.79 at 256, and the other way at 1 MiB, 10.50 against 9.21.
+inline constexpr std::size_t min_pipeline_bytes = 512 * 1024;
+
+// Whether a file of file_bytes is read through the cache bypass when the
+// caller asked for it: zero is a size the filesystem would not give, and
+// counts as large. Every reading entry point asks this, so a file is
+// opened the same way whichever one opens it.
+[[nodiscard]] constexpr bool direct_io_worthwhile(
+    std::uint64_t file_bytes) noexcept {
+  return file_bytes == 0 || file_bytes >= min_pipeline_bytes;
+}
+
+// The default geometry for a generated file (write_file(), io.hpp).
+//
+// One window's fill is sequential, so on the write side the windows in
+// flight are the whole parallelism and the queue depth is the one lever:
+// with the device removed, 2 / 4 / 8 / 16 / 32 in flight generate 4.1 /
+// 8.3 / 15.8 / 34.8 / 62.9 GiB/s on 32 cores and the window size moves
+// that by a few percent across a 16x range. End to end on four PCIe 5
+// drives in RAID 0 the same machine writes 6.5 GiB/s at four in flight
+// and 31.0 at thirty-two, 98% of what the device sustains. So the depth
+// follows the hardware thread count when none is asked for, and the
+// window is small enough that a deep queue stays within a bytes-in-flight
+// budget, past which a striped volume slows down (20.7 GiB/s at 512 MiB
+// in flight and 14.8 at 2 GiB, against 24.2 at 128 MiB, on the same
+// drives).
+inline constexpr std::size_t default_write_window_bytes = 8 * 1024 * 1024;
+// Zero: resolve_write_queue_depth() decides from the thread count.
+inline constexpr unsigned default_write_queue_depth = 0;
+// Bytes in flight an automatic depth may reach: 32 windows at the default
+// size.
+inline constexpr std::size_t default_write_budget_bytes = std::size_t{256} << 20;
+// What the sequential write_file() forms use for an automatic depth: one
+// buffer fills while the other drains, and a single producer cannot use
+// more.
+inline constexpr unsigned sequential_write_queue_depth = 2;
+
+// The depth a write over a scheduler uses: the requested one, clamped
+// like every other, or for a request of zero one window per thread of
+// `threads`, bounded so that depth x window stays within the budget.
+[[nodiscard]] constexpr unsigned resolve_write_queue_depth(
+    unsigned requested, std::size_t window_bytes, unsigned threads) noexcept {
+  if (requested != 0) {
+    return clamp_queue_depth(requested);
+  }
+  const std::size_t window = rounded_window_bytes(window_bytes);
+  const std::size_t by_budget = default_write_budget_bytes / window;
+  const std::size_t want = std::min<std::size_t>(std::max(1u, threads), by_budget);
+  return clamp_queue_depth(static_cast<unsigned>(
+      std::min<std::size_t>(want, std::numeric_limits<unsigned>::max())));
+}
 
 }  // namespace blake3pp::detail

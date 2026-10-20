@@ -98,8 +98,9 @@ OPTIONS:
           --window UINT Needs: --output
                               with --output: write buffer size in MiB (default: 4 MiB per
                               generator thread, so every fill fans out fully)
-          --qd UINT [4]  Needs: --output
-                              with --output: write buffers in flight (the writer clamps it to
+          --qd UINT Needs: --output
+                              with --output: write buffers in flight (default: one per
+                              generator thread, or 2 with --threads 1; the writer clamps it to
                               its range)
   -v,     --verbose           report the engaged write backend on stderr
           --threads UINT:THREADS [<cores>]
