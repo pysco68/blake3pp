@@ -1370,7 +1370,7 @@ TEST_CASE("sibling windows the reducer cannot hold still finish") {
   // ends up held, nothing is in flight and the run never finishes.
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 8 * win;
@@ -1399,7 +1399,7 @@ TEST_CASE("sibling windows the reducer cannot hold still finish") {
 TEST_CASE("admission throttles starts instead of refusing an insert") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   // Eight windows: a contiguous run of k of them holds popcount(k)
@@ -1428,7 +1428,7 @@ TEST_CASE("admission throttles starts instead of refusing an insert") {
 TEST_CASE("the full reducer capacity never throttles a normal run") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 32 * win + 999;
@@ -2200,7 +2200,7 @@ TEST_CASE("an 8 MiB last window fans out too") {
 TEST_CASE("a last window with many parts never refuses an insert") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   // Four windows, the last one all but a byte short of full: its parts
@@ -2230,7 +2230,7 @@ TEST_CASE("a last window with many parts never refuses an insert") {
 TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 8 * win;

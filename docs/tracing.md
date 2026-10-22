@@ -56,6 +56,23 @@ for (const blake3pp::window_record& w : trace.windows()) {
 const blake3pp::driver_stats& d = trace.driver();
 ```
 
+The senders in `<blake3pp/async_io.hpp>` take the buffer differently.
+An operation state is a type fixed when the receiver is connected, so a
+sender cannot decide from a pointer at start whether its scope records;
+it takes the decision as a type instead, as its last argument:
+`blake3pp::buffer_tracer{&trace}` records, and the default
+`blake3pp::null_tracer` records nothing at no cost. `file_io_options::trace`
+is not read on that path.
+
+```cpp
+auto s = blake3pp::async::async_update_file(ctx, h, path, sched, {},
+                                            blake3pp::buffer_tracer{&trace});
+```
+
+`async_update_files` takes the same argument and fills one buffer with
+every file's windows; each record's `index` is the window's position in
+its own file.
+
 Per-agent records are opt-in, by giving the buffer a second span. One
 bulk invocation is at most one record per thread per window, which sizes
 it:

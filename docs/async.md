@@ -184,6 +184,13 @@ blake3pp::async::basic_io_context<blake3pp::stack_budget{8 * 1024}> small(opts);
 
 ## What is experimental
 
+Tracing ([Performance tracing](tracing.md)) is an argument of the senders
+rather than an option: `async_update_file(ctx, h, path, sched, opts,
+blake3pp::buffer_tracer{&trace})`, and the same last argument on
+`async_hash_file` and `async_update_files`. The default records nothing
+at no cost, and `file_io_options::trace` is not consulted on this path,
+because the tracer is part of the operation state's type.
+
 Two things may still change:
 
 - **The error channels.** Today a failed read arrives as

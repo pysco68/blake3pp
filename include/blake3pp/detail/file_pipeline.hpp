@@ -908,6 +908,10 @@ struct pipeline_options {
   // reads only the plan.
   std::size_t window_bytes = default_window_bytes;
   unsigned queue_depth = default_queue_depth;
+  // The blocking entry points' request: run_window_pipeline() turns it
+  // into the tracer the scope is instantiated with. The scope itself
+  // reads only its tracer, so a caller that constructs a scope passes
+  // the policy and this field is not consulted.
   trace_buffer* trace = nullptr;
   // Windows allowed in flight at once, capped to the window count; 0
   // means the window count. The tests run the whole matrix at 1 first,
@@ -1327,9 +1331,9 @@ using pipeline_cells_for = pipeline_cells<
                              std::declval<typename Scope::window&>())),
                          typename Scope::scope_receiver>>;
 
-template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
+template <tracer Tracer, stack_budget Budget, file_driver D, class Scheduler>
 class window_scope
-    : public pipeline_scope_base<window_scope<Traced, Budget, D, Scheduler>,
+    : public pipeline_scope_base<window_scope<Tracer, Budget, D, Scheduler>,
                                  D> {
   // The base drives this scope's loop and sweep, both of which are its
   // own business and nobody else's.
@@ -1379,13 +1383,14 @@ class window_scope
   // drains is still targeting its arena.
   window_scope(hasher& h, pipeline_host<Budget, D>& host,
                typename D::file& file, Scheduler sched,
-               const pipeline_plan& plan, const pipeline_options& opts)
+               const pipeline_plan& plan, const pipeline_options& opts,
+               Tracer tracer = Tracer{})
       : h_(h),
         loop_(host.loop()),
         pool_(host.pool()),
         file_(file),
         sched_(std::move(sched)),
-        trace_(opts.trace),
+        trace_(tracer.buffer()),
         ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
         window_bytes_(plan.window_bytes),
         count_(std::min(plan.windows, host.pool().count())),
@@ -1918,7 +1923,7 @@ class window_scope
     const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
     const ex::inplace_stop_token tok = stop_source_.get_token();
     return stamped<std::size_t>(
-        w, tok, compress_edge_on<Traced>(sched_, w.compress, out, tok));
+        w, tok, compress_edge_on<Tracer::traced>(sched_, w.compress, out, tok));
   }
 
   // On the driver, like every other insert. Not noexcept: the contract
@@ -1950,7 +1955,8 @@ class window_scope
   [[nodiscard]] auto compress_stage(window& w) {
     read_landed(w);
     const ex::inplace_stop_token tok = stop_source_.get_token();
-    return stamped<cv_type>(w, tok, compress_on<Traced>(sched_, w.compress, tok));
+    return stamped<cv_type>(
+        w, tok, compress_on<Tracer::traced>(sched_, w.compress, tok));
   }
 
   // A compress stage's tail: stopped if the run was, and, when tracing,
@@ -1958,7 +1964,7 @@ class window_scope
   template <class Value, class Stage>
   [[nodiscard]] auto stamped(window& w, ex::inplace_stop_token tok,
                              Stage&& stage) {
-    if constexpr (Traced) {
+    if constexpr (Tracer::traced) {
       return stopped_if<Value>(
           tok, ex::then(std::forward<Stage>(stage),
                         [this, &w](Value v) noexcept {
@@ -2468,9 +2474,9 @@ struct pipeline_cells {
 
 // Runs one open file through the pipeline on the calling thread.
 //
-// Tracing is a template parameter below this point, because the window
-// chain's type has to be settled before the run starts; here is where the
-// runtime choice becomes a compile-time one, once per run.
+// Tracing is a policy type below this point, because the window chain's
+// type has to be settled before the run starts; here is where the
+// runtime request becomes one of the two policies, once per run.
 template <stack_budget Budget, file_driver D, class Scheduler>
 void run_window_pipeline(hasher& h, pipeline_host<Budget, D>& host,
                          typename D::file& file, Scheduler&& sched,
@@ -2478,11 +2484,12 @@ void run_window_pipeline(hasher& h, pipeline_host<Budget, D>& host,
                          const pipeline_options& opts) {
   using sched_type = std::remove_cvref_t<Scheduler>;
   if (opts.trace != nullptr) {
-    window_scope<true, Budget, D, sched_type> scope(
-        h, host, file, std::forward<Scheduler>(sched), plan, opts);
+    window_scope<buffer_tracer, Budget, D, sched_type> scope(
+        h, host, file, std::forward<Scheduler>(sched), plan, opts,
+        buffer_tracer{opts.trace});
     scope.run();
   } else {
-    window_scope<false, Budget, D, sched_type> scope(
+    window_scope<null_tracer, Budget, D, sched_type> scope(
         h, host, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   }

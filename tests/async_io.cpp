@@ -179,6 +179,92 @@ TEST_CASE("a file hashes to the same digest through the async API") {
   CHECK(rec.value == want);
 }
 
+// Tracing over the senders is a type, not an option: the operation state
+// is fixed at connect, so the tracer goes in as an argument and the
+// default records nothing. With a buffer, every window of the file gets a
+// record, the pool windows carry their agents' stamp, and the batch form
+// fills one buffer with every file's windows.
+TEST_CASE("the senders record into a buffer handed in as a tracer") {
+  constexpr std::size_t win = 64 * 1024;
+  const auto content = pattern(5 * win + 4097, 14);
+  const temp_file f(content);
+  const blake3pp::digest want = blake3pp::hash(content);
+  const std::size_t windows_per_file = (content.size() + win - 1) / win;
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+
+  std::vector<blake3pp::window_record> windows(3 * windows_per_file);
+  std::vector<blake3pp::agent_record> agents(windows.size() * 64);
+  blake3pp::trace_buffer trace(windows, agents);
+
+  SUBCASE("one file, hashed") {
+    record rec;
+    auto op = ex::connect(async::async_hash_file(ctx, f.path(), sched, {},
+                                                 blake3pp::buffer_tracer{&trace}),
+                          move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    REQUIRE(rec.values == 1);
+    CHECK(rec.value == want);
+    REQUIRE(trace.windows().size() == windows_per_file);
+    bool parallel = false;
+    for (const blake3pp::window_record& w : trace.windows()) {
+      CHECK(w.t_ready >= w.t_wait_begin);
+      CHECK(w.t_joined >= w.t_ready);
+      parallel = parallel || (w.flags & blake3pp::window_record::flag_parallel) != 0;
+    }
+    CHECK(parallel);
+    CHECK(trace.agents().size() > 0);
+  }
+
+  SUBCASE("one file, streamed into a hasher") {
+    blake3pp::hasher h;
+    record rec;
+    auto op = ex::connect(async::async_update_file(ctx, h, f.path(), sched, {},
+                                                   blake3pp::buffer_tracer{&trace}),
+                          move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    REQUIRE(rec.values == 1);
+    CHECK(h.finalize() == want);
+    CHECK(trace.windows().size() == windows_per_file);
+  }
+
+  SUBCASE("three files, one buffer") {
+    const std::array<std::filesystem::path, 3> paths{f.path(), f.path(),
+                                                     f.path()};
+    std::size_t ended = 0;
+    record rec;
+    auto op = ex::connect(
+        async::async_update_files(
+            ctx, paths, sched, {.in_flight = 2},
+            [](std::size_t) { return blake3pp::hasher{}; },
+            [&](std::size_t, blake3pp::hasher& h,
+                const async::file_outcome& o) noexcept {
+              if (o.ok() && h.finalize() == want) {
+                ++ended;
+              }
+            },
+            blake3pp::buffer_tracer{&trace}),
+        move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    CHECK(ended == 3);
+    CHECK(trace.windows().size() == 3 * windows_per_file);
+  }
+
+  SUBCASE("the default records nothing") {
+    record rec;
+    auto op = ex::connect(async::async_hash_file(ctx, f.path(), sched),
+                          move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    CHECK(rec.value == want);
+    CHECK(trace.windows().empty());
+  }
+}
+
 TEST_CASE("async_update_file streams into the caller's hasher") {
   const auto head = pattern(1000, 12);
   const auto content = pattern(2 * 64 * 1024, 13);

@@ -86,10 +86,10 @@ struct file_io_options {
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing, at the cost of one branch per window.
   ///
-  /// Not owned and not copied: the buffer has to outlive every operation
-  /// these options start, which for the blocking entry points is the call
-  /// and for the senders in <blake3pp/async_io.hpp> is the whole
-  /// operation.
+  /// Not owned and not copied: the buffer has to outlive the call. The
+  /// senders in <blake3pp/async_io.hpp> do not read this field: their
+  /// operation state is a type fixed at connect, so they take the tracing
+  /// policy as an argument instead (blake3pp::buffer_tracer).
   trace_buffer* trace = nullptr;
 };
 
