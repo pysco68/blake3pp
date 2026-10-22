@@ -154,7 +154,7 @@ hashing:
 | OS | async engine | page-cache bypass |
 |----|--------------|-------------------|
 | Linux | io_uring | `O_DIRECT` |
-| Windows | IOCP | `FILE_FLAG_NO_BUFFERING` |
+| Windows | IoRing (Windows 11) or IOCP | `FILE_FLAG_NO_BUFFERING` |
 | macOS | GCD (libdispatch) | `F_NOCACHE` |
 
 Each feature degrades independently at runtime: a file the filesystem will
@@ -249,7 +249,8 @@ submit inline (`--inline-submit` in the tools), and the writer behind
 
 The reverse direction is `write_file()`: a generator fills windows, the
 library writes them through the same per-OS mechanism the reader uses
-(io_uring + `O_DIRECT`, IOCP + `FILE_FLAG_NO_BUFFERING`, GCD + `F_NOCACHE`,
+(io_uring + `O_DIRECT`, IoRing or IOCP + `FILE_FLAG_NO_BUFFERING`,
+GCD + `F_NOCACHE`,
 or synchronous `pwrite`). Three forms, one generator shape
 `fill(std::span<std::byte> out, std::uint64_t offset)`:
 

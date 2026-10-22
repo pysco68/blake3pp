@@ -50,6 +50,13 @@ struct file_reader_options {
   // otherwise lands on the thread that also waits for the hash; see
   // src/io/uring_backend.hpp. Ignored by backends without the notion.
   bool offload_submit = true;
+  // Windows: prefer the I/O ring (Windows 11) over the completion port
+  // where the machine has one; off selects the port. The engaged rung is
+  // in backend().
+  bool ioring = true;
+  // Windows I/O ring: register the arena and the file handle with the
+  // ring rather than naming a pointer and a HANDLE per transfer.
+  bool registered_buffers = false;
 };
 
 class file_reader {

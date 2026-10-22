@@ -50,6 +50,8 @@ OPTIONS:
           --no-async          read synchronously (no io_uring/IOCP/GCD queue)
           --inline-submit     issue reads inline in the submitting thread, not on io_uring's
                               workers
+          --no-ioring         Windows: read through the completion port instead of the I/O
+                              ring
 ```
 
 ```bash
@@ -95,6 +97,9 @@ OPTIONS:
           --inline-submit Needs: --output
                               with --output: issue writes inline in the submitting thread, not
                               on io_uring's workers
+          --no-ioring Needs: --output
+                              with --output, Windows: write through the completion port
+                              instead of the I/O ring
           --waive-zero-fill Needs: --output
                               with --output, Windows: set the valid data length up front
                               instead of writing a sparse file (needs the volume-maintenance
@@ -131,11 +136,12 @@ bypassing the page cache entirely:
 | OS | writer |
 |----|--------|
 | Linux | io_uring + `O_DIRECT` |
-| Windows | IOCP + no buffering |
+| Windows | IoRing (Windows 11) or IOCP + no buffering |
 | macOS | GCD + `F_NOCACHE` |
 
-`--no-direct`, `--no-async` and `--inline-submit` switch those off one at
-a time, which is how the pipeline gets measured against itself.
+`--no-direct`, `--no-async`, `--inline-submit` and, on Windows,
+`--no-ioring` switch those off one at a time, which is how the pipeline
+gets measured against itself.
 
 ## Tracing
 

@@ -32,7 +32,8 @@ blake3pp::digest d = blake3pp::hash_file("dataset.parquet");
 ```
 
 That opens the file with the fastest mechanism your platform has --
-io_uring on Linux, IOCP on Windows, GCD on macOS -- bypasses the page
+io_uring on Linux, an I/O ring or a completion port on Windows, GCD on
+macOS -- bypasses the page
 cache, and keeps several reads in flight while it hashes. If any of that
 is unavailable it quietly steps down to something that works.
 

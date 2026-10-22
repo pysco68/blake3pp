@@ -100,7 +100,11 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
                         const file_write_options& opts = {}) {
   const unsigned depth = detail::resolve_write_queue_depth(
       opts.queue_depth, opts.window_bytes, std::thread::hardware_concurrency());
-  detail::io_driver drv({opts.async, opts.offload_submit}, depth);
+  detail::io_driver drv({.async = opts.async,
+                         .offload_submit = opts.offload_submit,
+                         .ioring = opts.ioring,
+                         .registered_buffers = opts.registered_buffers},
+                        depth);
   detail::io_driver::file file(
       drv, path,
       detail::io_driver::open_options{.write = true,
@@ -178,7 +182,10 @@ void update_file(hasher& h, const std::filesystem::path& path,
   const detail::pipeline_plan plan = detail::plan_pipeline(
       h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io,
       size_ec ? 0 : static_cast<std::uint64_t>(size));
-  detail::io_driver drv({opts.async, opts.offload_submit},
+  detail::io_driver drv({.async = opts.async,
+                         .offload_submit = opts.offload_submit,
+                         .ioring = opts.ioring,
+                         .registered_buffers = opts.registered_buffers},
                         plan.reads_in_flight);
   detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(

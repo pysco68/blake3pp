@@ -83,6 +83,16 @@ struct file_io_options {
   /// reported after the fact: read_backend(trace.driver()) for a read,
   /// write_report::backend for a write.
   bool async = true;
+  /// Windows: prefer the I/O ring (Windows 11, `ioringapi.h`) over the
+  /// completion port where the machine has one. Off selects the port,
+  /// which is also what a machine without a ring gets; the engaged rung
+  /// is reported after the fact and names which one ran.
+  bool ioring = true;
+  /// Windows I/O ring: register the window arena and the file handle with
+  /// the ring, so a transfer names a region index and a table slot
+  /// instead of a pointer and a HANDLE. Off by default, and silently
+  /// ignored where the ring refuses it or where no ring is in use.
+  bool registered_buffers = false;
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing, at the cost of one branch per window.
   ///
@@ -187,6 +197,12 @@ struct hash_file_options {
   /// Queue reads asynchronously where the platform offers it; see
   /// file_io_options.
   bool async = true;
+  /// Windows: prefer the I/O ring over the completion port; see
+  /// file_io_options.
+  bool ioring = true;
+  /// Windows I/O ring: register the arena and the file handle; see
+  /// file_io_options.
+  bool registered_buffers = false;
   /// Plain, keyed or key-derivation mode: `hash_mode::keyed(key)` or
   /// `hash_mode::derive_key(context)`, named as hasher spells them.
   ///
@@ -206,6 +222,8 @@ struct hash_file_options {
             .direct_io = direct_io,
             .offload_submit = offload_submit,
             .async = async,
+            .ioring = ioring,
+            .registered_buffers = registered_buffers,
             .trace = trace};
   }
 };
@@ -377,6 +395,16 @@ struct file_write_options {
   bool async = true;
   /// io_uring: issue on io-wq rather than inline in the submit call.
   bool offload_submit = true;
+  /// Windows: prefer the I/O ring (Windows 11, `ioringapi.h`) over the
+  /// completion port where the machine has one. Off selects the port,
+  /// which is also what a machine without a ring gets; the engaged rung
+  /// is reported after the fact and names which one ran.
+  bool ioring = true;
+  /// Windows I/O ring: register the window arena and the file handle with
+  /// the ring, so a transfer names a region index and a table slot
+  /// instead of a pointer and a HANDLE. Off by default, and silently
+  /// ignored where the ring refuses it or where no ring is in use.
+  bool registered_buffers = false;
   /// Windows only: set the valid data length up front instead of making
   /// the file sparse.
   ///
@@ -441,6 +469,8 @@ write_report write_sequential(const std::filesystem::path& path,
                       .direct_io = opts.direct_io,
                       .async = opts.async,
                       .offload_submit = opts.offload_submit,
+                      .ioring = opts.ioring,
+                      .registered_buffers = opts.registered_buffers,
                       .preallocate_bytes = preallocate,
                       .waive_zero_fill = opts.waive_zero_fill});
   std::uint64_t done = 0;

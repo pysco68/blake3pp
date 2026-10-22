@@ -123,7 +123,28 @@ struct file_open_options {
 struct reader_context_options {
   bool async = true;           // try the OS's async engine at all
   bool offload_submit = true;  // io_uring: issue on io-wq (IOSQE_ASYNC)
+  // Windows: prefer the I/O ring over the completion port where the
+  // machine has one (Windows 11, IORING_VERSION_3). Off selects the
+  // port, which is the fallback anyway; the file's name() says which ran.
+  bool ioring = true;
+  // Windows I/O ring: register the arena and the file handle with the
+  // ring instead of naming a pointer and a HANDLE per transfer. Off
+  // until measured, as the io_uring backend's header explains for Linux.
+  bool registered_buffers = false;
 };
+
+// Hands a context the arena its transfers read into, where the context
+// has something to do with it. An optional extension rather than part of
+// io_context: only the Windows I/O ring can register buffers, and the
+// callers that own an arena (the engines and io_driver) should not have
+// to know which backend they were given.
+template <class C>
+void register_arena_if_supported(C& ctx,
+                                 std::span<std::byte> arena) noexcept {
+  if constexpr (requires { ctx.register_arena(arena); }) {
+    ctx.register_arena(arena);
+  }
+}
 
 // The wake primitive behind every context's poll(block). wake() is the
 // only member of a context another thread may call, so this is the only

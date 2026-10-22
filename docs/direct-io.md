@@ -15,7 +15,7 @@ caller, and when to turn it off.
 | OS | async engine | cache-bypass flag |
 |----|--------------|--------------------|
 | Linux | io_uring | `O_DIRECT` |
-| Windows | IOCP | `FILE_FLAG_NO_BUFFERING` |
+| Windows | IoRing (Windows 11) or IOCP | `FILE_FLAG_NO_BUFFERING` |
 | macOS | GCD (libdispatch) | `F_NOCACHE` |
 
 Each is a per-open property. `src/io/posix_file.hpp` engages `O_DIRECT`
@@ -25,14 +25,35 @@ whatever the direct one cannot carry. Darwin has no `O_DIRECT`;
 `src/io/gcd_backend.hpp` instead flips `F_NOCACHE` on the single
 descriptor with `fcntl`, per-fd rather than per-open. Windows carries two
 independent per-open flags, `FILE_FLAG_NO_BUFFERING` and
-`FILE_FLAG_OVERLAPPED` (the port); `src/io/iocp_backend.hpp` asks for
-both together on the first reopen and, if that is refused, asks again
-for the port alone before falling back further. The port is kept on its
+`FILE_FLAG_OVERLAPPED` (the asynchronous handle); `src/io/iocp_backend.hpp`
+and `src/io/ioring_backend.hpp` both ask for the two together on the
+first reopen and, if that is refused, ask again for the asynchronous
+handle alone before falling back further. The asynchrony is kept on its
 own deliberately: `NO_BUFFERING` is usually what a filesystem (SMB
 shares, some virtual volumes) actually rejects, and buffered-but-async
 reads measure within noise of direct-and-async ones on Windows, so
 giving up both together for a refusal that only concerned one of them
 would discard the half that still works.
+
+Windows has two completion mechanisms, so it is the one platform whose
+backend is chosen at runtime. An I/O ring (`ioringapi.h`, Windows 11) is
+the submission-queue model io_uring introduced: entries are built into a
+queue the application owns, one `SubmitIoRing` hands a whole batch to the
+kernel, and completions are popped from a second queue. Where the machine
+offers `IORING_VERSION_3` -- reads, writes, cancel and registration --
+`src/io/backend_select.hpp` takes it; everything older gets the completion
+port. `file_io_options::ioring` and `file_write_options::ioring` (both
+default `true`) choose the port instead, which is what the IOCP-against-
+IoRing comparison needs, and the rung names below say which one ran. The
+entry points are resolved from `KernelBase.dll` at first use rather than
+linked, so a binary built against the Windows 11 SDK still loads on
+Windows 10.
+
+`file_io_options::registered_buffers` (default `false`) additionally
+registers the window arena and the file handle with the ring, so a
+transfer names a region index and a table slot instead of a pointer and a
+`HANDLE`. A ring that refuses either keeps serving pointer refs, and a
+transfer into a buffer outside the arena uses one anyway.
 
 Bypassing the cache means every transfer does real device work: a page
 the kernel already held will not save a second trip, and a drive earning
@@ -107,11 +128,13 @@ Every reader and writer names the rung it landed on:
 - During or after a hash the rung reaches a caller through the trace:
   `blake3pp::read_backend(buffer.driver())` after an `update_file()` that
   was given a `trace_buffer` ([Performance tracing](tracing.md)). The
-  spellings are `"io_uring+direct"`, `"iocp+direct"`, `"gcd+nocache"`,
-  `"pread"`, `"readfile"` and `"stdio"`.
+  spellings are `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
+  `"gcd+nocache"`, `"pread"`, `"readfile"` and `"stdio"`, with
+  `"+regbuf"` appended where the ring took the arena registration.
 - `write_report::backend` names the write side the same way:
-  `"io_uring+direct"`, `"iocp+direct"`, `"gcd-write+nocache"`, `"pwrite"`,
-  `"writefile"`, or `"stdio"`, and on Windows adds how the preallocation
+  `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
+  `"gcd-write+nocache"`, `"pwrite"`, `"writefile"`, or `"stdio"`, and on
+  Windows adds how the preallocation
   was kept from zeroing ahead of the writes: `"+sparse"` or `"+validdata"`
   (next section).
 
@@ -122,7 +145,13 @@ Linux when `offload_submit` was turned off. When the async engine itself
 was asked for and refused, not just the cache bypass -- a kernel too old
 for io_uring, or io_uring blocked by seccomp policy -- the Linux backend
 appends why: `" [io_uring: EPERM, blocked by policy]"` or
-`" [io_uring: ENOSYS, kernel too old]"`. A benchmark or a bug report
+`" [io_uring: ENOSYS, kernel too old]"`. The ring does the same where it
+is used directly rather than through the selector: `" [ioring: no api]"`,
+`" [ioring: version 1]"` or `" [ioring: CreateIoRing failed 0x...]"`, and
+a ring the selector asked for and could not have puts the same suffix on
+the completion port's names, as in `"iocp+direct [ioring: no api]"`, so a
+run on such a machine reads as what it is. A benchmark or a bug
+report
 therefore reads differently depending on which rung actually ran, never
 only the one that was asked for.
 

@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
   bool no_direct = false;
   bool no_async = false;
   bool inline_submit = false;
+  bool no_ioring = false;
   bool waive_zero_fill = false;
   std::size_t window_mib = 0;
   unsigned qd = 0;
@@ -126,6 +127,7 @@ int main(int argc, char** argv) {
   app.add_flag("--no-direct", no_direct, "with --output: no direct I/O (write through the page cache)")->needs(output_opt);
   app.add_flag("--no-async", no_async, "with --output: no async queue (synchronous writes)")->needs(output_opt);
   app.add_flag("--inline-submit", inline_submit, "with --output: issue writes inline in the submitting thread, not on io_uring's workers")->needs(output_opt);
+  app.add_flag("--no-ioring", no_ioring, "with --output, Windows: write through the completion port instead of the I/O ring")->needs(output_opt);
   app.add_flag("--waive-zero-fill", waive_zero_fill, "with --output, Windows: set the valid data length up front instead of writing a sparse file (needs the volume-maintenance privilege; exposes stale disk blocks until written)")->needs(output_opt);
   app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 4 MiB per generator thread, so every fill fans out fully)")->needs(output_opt);
   app.add_option("--qd", qd, "with --output: write buffers in flight (default: one per generator thread, or 2 with --threads 1; the writer clamps it to its range)")->needs(output_opt);
@@ -207,6 +209,7 @@ int main(int argc, char** argv) {
       blake3pp::file_write_options wopts;
       wopts.direct_io = !no_direct;
       wopts.offload_submit = !inline_submit;
+      wopts.ioring = !no_ioring;
       wopts.waive_zero_fill = waive_zero_fill;
       // One window per thread, so every core has a window to generate
       // into, each the size one task used to fill. The depth is the
@@ -246,6 +249,7 @@ int main(int argc, char** argv) {
       wopts.direct_io = !no_direct;
       wopts.async = !no_async;
       wopts.offload_submit = !inline_submit;
+      wopts.ioring = !no_ioring;
       wopts.waive_zero_fill = waive_zero_fill;
       if (window_mib > 0) {
         wopts.window_bytes = window_mib * 1024 * 1024;
