@@ -55,11 +55,12 @@ class queued_reads {
   queued_reads(const queued_reads&) = delete;
   queued_reads& operator=(const queued_reads&) = delete;
 
-  void push(io_op& op) noexcept {
+  void push(io_op& op, const void* owner) noexcept {
     // Constructed fresh over whatever the last read left, which is the
     // one way the caller's storage is ever filled.
     op_node& n = op.emplace_native<op_node>();
     n.next = nullptr;
+    n.owner = owner;
     n.cancelled = false;
     if (tail_ == nullptr) {
       head_ = tail_ = &op;
@@ -114,10 +115,38 @@ class queued_reads {
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
 
   // Queued reads are forgotten, and none gets its callback: the
-  // contract's teardown drain for a source with nothing in flight.
+  // contract's teardown drain for a source with nothing in flight. The
+  // live flag goes down with them, because nothing is owed afterwards.
   void drain() noexcept {
+    // The link is read before the flag goes down: native<op_node>() is only
+    // valid while the driver owes the operation, which is what live says.
+    io_op* op = head_;
+    while (op != nullptr) {
+      io_op* const next = node_of(*op).next;
+      op->live = false;
+      op = next;
+    }
     head_ = tail_ = nullptr;
     queued_ = 0;
+  }
+
+  // One owner's reads, forgotten the same way. The others stay queued and
+  // still get their callbacks, which is what a shared driver needs.
+  void drain(const void* owner) noexcept {
+    io_op** link = &head_;
+    tail_ = nullptr;
+    while (*link != nullptr) {
+      io_op& op = **link;
+      op_node& n = node_of(op);
+      if (n.owner == owner) {
+        *link = n.next;
+        op.live = false;
+        --queued_;
+      } else {
+        tail_ = &op;
+        link = &n.next;
+      }
+    }
   }
 
  private:
@@ -125,6 +154,9 @@ class queued_reads {
   // do, so nothing is allocated per read either.
   struct op_node {
     io_op* next = nullptr;
+    // Which file queued it, so one file's reads can be forgotten without
+    // touching another's: several spans may share one driver.
+    const void* owner = nullptr;
     bool cancelled = false;
   };
   static_assert(sizeof(op_node) <= io_op::storage_size);
@@ -204,23 +236,27 @@ class memory_driver {
 
   // A window of a span is a subspan of it. Nothing to read into, because
   // the bytes never move.
+  // @throws std::logic_error for a slot or a window the geometry does not
+  //         cover: past the end this hands back a view of the caller's own
+  //         memory beyond the span being hashed.
   [[nodiscard]] window_storage window_storage_for(
       file& f, [[maybe_unused]] unsigned slot, std::uint64_t off,
-      std::size_t bytes) noexcept {
+      std::size_t bytes) {
     // Checked in every build: the subspan below is a view into the
     // caller's own memory, and a window past its end is a read of whatever
     // follows it -- which on this driver is the caller's address space
     // rather than an arena of ours.
-    require(slot < windows_, "a window outside the reserved geometry");
+    require(slot < windows_,
+            "window_storage_for(): a slot outside the reserved geometry");
     require(off + bytes <= f.bytes_.size(),
             "window_storage_for(): a window past the end of the span being "
             "hashed");
     return {{}, f.bytes_.subspan(static_cast<std::size_t>(off), bytes)};
   }
 
-  void submit_read(file&, std::uint64_t, std::span<std::byte>,
+  void submit_read(file& f, std::uint64_t, std::span<std::byte>,
                    io_op& op) noexcept {
-    reads_.push(op);
+    reads_.push(op, &f);
   }
 
   void flush() noexcept {}
@@ -231,10 +267,10 @@ class memory_driver {
     return reads_.in_flight();
   }
   void drain() noexcept { reads_.drain(); }
-  // One file's share of it. Every queued read of this driver is a view of
-  // bytes the caller already has, so none is in anyone else's hands and
-  // dropping them all is dropping this file's.
-  void drain(file&) noexcept { reads_.drain(); }
+  // One file's share of it: this file's queued reads are forgotten and
+  // every other file's stay, since several spans may share one driver and
+  // a sibling whose read was dropped would never complete its chain.
+  void drain(file& f) noexcept { reads_.drain(&f); }
 
  private:
   queued_reads reads_;

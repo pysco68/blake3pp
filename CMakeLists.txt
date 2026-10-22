@@ -206,9 +206,11 @@ add_dependencies(blake3pp blake3pp_version_stamp)
 # include paths that point into the hermetic dependency trees. Those are
 # meaningful here and meaningless to someone consuming an INSTALLED blake3pp,
 # so it is scoped to the build tree. What an installed consumer needs from it
-# is one thing only: the BLAKE3PP_EXECUTION_* macro, so <blake3pp/parallel.hpp>
-# selects the same provider branch the library was compiled against. That is
-# re-stated on the install interface below.
+# is the macros its own headers read: the BLAKE3PP_EXECUTION_* one, so
+# <blake3pp/parallel.hpp> selects the same provider branch the library was
+# compiled against, and BLAKE3PP_MAX_QUEUE_DEPTH, because the geometry
+# constants it sets are odr-used by inline functions on both sides of the
+# boundary. Both are re-stated on the install interface below.
 # Both are wrapped: a STATIC library propagates even PRIVATE dependencies
 # into its link interface as $<LINK_ONLY:...>, so an unwrapped warnings
 # target would have to join the export set despite carrying nothing but
@@ -219,6 +221,10 @@ target_link_libraries(blake3pp
 string(TOUPPER "${_blake3pp_execution_provider}" _blake3pp_provider_uc)
 target_compile_definitions(blake3pp INTERFACE
   $<INSTALL_INTERFACE:BLAKE3PP_EXECUTION_${_blake3pp_provider_uc}=1>)
+if(BLAKE3PP_MAX_QUEUE_DEPTH)
+  target_compile_definitions(blake3pp INTERFACE
+    $<INSTALL_INTERFACE:BLAKE3PP_MAX_QUEUE_DEPTH=${BLAKE3PP_MAX_QUEUE_DEPTH}>)
+endif()
 target_include_directories(blake3pp PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 

@@ -54,26 +54,39 @@ endfunction()
 #                      sets this: libstdc++ has no RVV ABI, so its
 #                      experimental::simd would pass the probe yet never
 #                      vectorize there.
+#   xvec             - Intel's xvec, an independent header-only
+#                      implementation of the C++26 library (xvec::simd),
+#                      fetched from GitHub; the std probes are skipped.
 # Note the per-kernel FORCE_XSIMD pin (cmake/ArchKernels.cmake) is a
 # separate, narrower mechanism: it overrides the provider for single
 # kernel TUs (the SVE/RVV variants) regardless of this choice.
 set(BLAKE3PP_SIMD_PROVIDER "auto" CACHE STRING
-  "simd provider: auto, std, std-experimental, xsimd")
+  "simd provider: auto, std, std-experimental, xsimd, xvec")
 set_property(CACHE BLAKE3PP_SIMD_PROVIDER
-  PROPERTY STRINGS auto std std-experimental xsimd)
-if(NOT BLAKE3PP_SIMD_PROVIDER MATCHES "^(auto|std|std-experimental|xsimd)$")
+  PROPERTY STRINGS auto std std-experimental xsimd xvec)
+if(NOT BLAKE3PP_SIMD_PROVIDER MATCHES "^(auto|std|std-experimental|xsimd|xvec)$")
   message(FATAL_ERROR "blake3pp: BLAKE3PP_SIMD_PROVIDER must be one of "
-    "auto, std, std-experimental, xsimd (got '${BLAKE3PP_SIMD_PROVIDER}')")
+    "auto, std, std-experimental, xsimd, xvec (got '${BLAKE3PP_SIMD_PROVIDER}')")
 endif()
 message(STATUS
   "blake3pp: simd provider choice = ${BLAKE3PP_SIMD_PROVIDER}")
 
 if(BLAKE3PP_SIMD_PROVIDER MATCHES "^(auto|std)$")
+  # Both shapes the facade needs: a fixed width to know the API is there,
+  # and the NATIVE width it actually spells (src/kernel/simd/std_simd.hpp).
+  # An implementation whose arch traits do not cover this target deduces one
+  # lane and compiles perfectly, which would be a scalar kernel registered
+  # under a vector name -- GCC 16's <simd> off x86 is the live example, and
+  # the kernel's own static_assert refuses to build it.
   _blake3pp_probe(BLAKE3PP_HAS_STD_SIMD [[
+#include <cstdint>
 #include <simd>
 int main() {
-  std::simd::vec<unsigned, 8> v{};
-  return static_cast<int>(v.size()) - 8;
+  std::simd::vec<unsigned, 8> fixed{};
+  using native = std::simd::vec<std::uint32_t>;
+  static_assert(native::size() > 1,
+                "std::simd deduces a single lane for this target");
+  return static_cast<int>(fixed.size()) - 8;
 }
 ]])
 endif()
@@ -123,7 +136,8 @@ if(BLAKE3PP_SIMD_PROVIDER STREQUAL "std-experimental"
 endif()
 
 # ------------------------------------------------------ sender/receiver
-# The provider is an explicit choice, not pure detection:
+# Provider selection: `auto` resolves by probe, the named values are taken
+# as given:
 #   auto    - std::execution when the standard library ships a usable one,
 #             NVIDIA stdexec otherwise (beman is never auto-selected while
 #             its upstream labels itself pre-production)
@@ -345,8 +359,25 @@ macro(_blake3pp_fetch_xsimd)
   endif()
 endmacro()
 
+# xvec by explicit choice: header-only and without a build system of its
+# own, so it is populated with plain FetchContent (not hermetic: nothing to
+# build) and exposed as an INTERFACE target over its include directory.
+if(BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
+  FetchContent_Declare(xvec
+    GIT_REPOSITORY https://github.com/intel/xvec.git
+    GIT_TAG 0a2a1928b863ab1af530fa5be435b851e5084345) # master, 2026-09-14
+  FetchContent_MakeAvailable(xvec)
+  add_library(xvec INTERFACE)
+  add_library(xvec::xvec ALIAS xvec)
+  target_include_directories(xvec SYSTEM INTERFACE "${xvec_SOURCE_DIR}/include")
+  target_link_libraries(blake3pp_features INTERFACE xvec)
+  target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XVEC=1)
+  message(STATUS "blake3pp: simd provider = xvec (${xvec_SOURCE_DIR})")
+endif()
+
 # Last resort: the project-wide simd provider falls back to xsimd.
-if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
+if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD
+   AND NOT BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
   _blake3pp_fetch_xsimd()
   target_link_libraries(blake3pp_features INTERFACE xsimd)
   target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XSIMD=1)

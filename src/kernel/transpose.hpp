@@ -35,6 +35,7 @@
 #include "kernel/force_inline.hpp"
 #include "kernel/shuffle.hpp"
 #include "kernel/simd_facade.hpp"
+#include "kernel/uninitialized.hpp"
 
 #ifndef BLAKE3PP_ARCH_NS
 #error "transpose.hpp is kernel-TU-internal; compile with -DBLAKE3PP_ARCH_NS=<variant>"
@@ -260,7 +261,7 @@ BLAKE3PP_FORCE_INLINE void load_transposed(const std::uint8_t* const* inputs,
     return;
   }
 #endif
-  std::uint32_t lanes[W];
+  std::uint32_t lanes BLAKE3PP_CXXATTR_UNINITIALIZED [W];
   for (std::size_t j = 0; j < 16; ++j) {
     for (std::size_t lane = 0; lane < W; ++lane) {
       lanes[lane] = endian::load32(inputs[lane] + offset + 4 * j);
@@ -300,7 +301,7 @@ BLAKE3PP_FORCE_INLINE void store_transposed(const u32v (&w)[16],
     return;
   }
 #endif
-  std::uint32_t lanes[W];
+  std::uint32_t lanes BLAKE3PP_CXXATTR_UNINITIALIZED [W];
   for (std::size_t j = 0; j < 16; ++j) {
     w[j].store(lanes);
     for (std::size_t lane = 0; lane < W; ++lane) {

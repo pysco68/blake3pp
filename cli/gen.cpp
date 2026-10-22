@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
   bool no_async = false;
   bool inline_submit = false;
   std::size_t window_mib = 0;
-  unsigned qd = 4;
+  unsigned qd = 0;
   bool verbose = false;
   unsigned threads = b3tool::default_threads();
 
@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
   app.add_flag("--no-async", no_async, "with --output: no async queue (synchronous writes)")->needs(output_opt);
   app.add_flag("--inline-submit", inline_submit, "with --output: issue writes inline in the submitting thread, not on io_uring's workers")->needs(output_opt);
   app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 4 MiB per generator thread, so every fill fans out fully)")->needs(output_opt);
-  app.add_option("--qd", qd, "with --output: write buffers in flight (the writer clamps it to its range)")->needs(output_opt)->capture_default_str();
+  app.add_option("--qd", qd, "with --output: write buffers in flight (default: one per generator thread, or 2 with --threads 1; the writer clamps it to its range)")->needs(output_opt);
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
   app.add_option("--threads", threads, "generator threads (1 = sequential; default: all)")->check(b3tool::at_least_one_thread)->capture_default_str();
   CLI11_PARSE(app, argc, argv);
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
   // file sink makes each window one segment; the sequential file sink and
   // stdout buffer one segment per thread so every fill fans out fully, the
   // file sink capped at max_buffer. --window overrides the file sinks.
-  constexpr std::size_t segment = 4 * 1024 * 1024;
+  constexpr std::size_t segment = blake3pp::default_fill_segment_bytes;
   constexpr std::size_t max_buffer = 64 * 1024 * 1024;
 
   // Seed ingestion: the hasher carries the mode, and a seed file streams
@@ -206,7 +206,9 @@ int main(int argc, char** argv) {
       wopts.direct_io = !no_direct;
       wopts.offload_submit = !inline_submit;
       // One window per thread, so every core has a window to generate
-      // into, each the size one task used to fill.
+      // into, each the size one task used to fill. The depth is the
+      // pool's own size rather than the library's automatic one, which
+      // counts the machine's threads and not this pool's.
       wopts.window_bytes = window_mib > 0 ? window_mib * 1024 * 1024 : segment;
       wopts.queue_depth = qd > 0 ? qd : threads;
       const std::uint64_t total = *remaining.total();

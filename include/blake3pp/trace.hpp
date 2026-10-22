@@ -17,11 +17,14 @@
 /// Standard library only, C++20.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <concepts>
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <type_traits>
 
 namespace blake3pp {
@@ -138,7 +141,29 @@ struct driver_stats {
   /// waiting to reduce -- bounded by the window objects the plan
   /// allocated.
   std::uint64_t max_windows_in_flight;
+  /// The rung the reads actually engaged, NUL-padded: "io_uring+direct",
+  /// "pread", "readfile" and the rest, with the reason appended when an
+  /// asynchronous engine was asked for and refused. Copied rather than
+  /// referenced, so it outlives the file. Read it through
+  /// read_backend(), which trims the padding.
+  std::array<char, 56> read_backend;
 };
+
+/// The engaged read rung as text; empty when nothing recorded one.
+[[nodiscard]] inline std::string_view read_backend(
+    const driver_stats& d) noexcept {
+  const std::size_t n = static_cast<std::size_t>(
+      std::find(d.read_backend.begin(), d.read_backend.end(), '\0') -
+      d.read_backend.begin());
+  return {d.read_backend.data(), n};
+}
+
+/// Records `name` in `d`, truncated to what the field holds.
+inline void set_read_backend(driver_stats& d, std::string_view name) noexcept {
+  d.read_backend = {};
+  const std::size_t n = std::min(name.size(), d.read_backend.size() - 1);
+  std::copy_n(name.begin(), n, d.read_backend.begin());
+}
 
 static_assert(std::is_trivially_copyable_v<window_record>);
 static_assert(std::is_trivially_copyable_v<agent_record>);
@@ -274,5 +299,48 @@ class trace_buffer {
   std::atomic<std::size_t> next_agent_{0};
   std::atomic<std::uint64_t> dropped_agents_{0};
 };
+
+/// How a pipeline run records, decided by type.
+///
+/// The blocking entry points take a `trace_buffer*` in their options and
+/// choose between the two policies below at run time, once per call. A
+/// sender cannot: its operation state is a type fixed when the receiver
+/// is connected, so the senders in <blake3pp/async_io.hpp> take the policy
+/// as an argument instead. `null_tracer` is the default and records
+/// nothing, at no cost; `buffer_tracer` records into the buffer it names.
+///
+/// @code
+/// blake3pp::trace_buffer trace(windows);
+/// auto s = blake3pp::async::async_update_file(ctx, h, path, sched, {},
+///                                             blake3pp::buffer_tracer{&trace});
+/// @endcode
+struct null_tracer {
+  static constexpr bool traced = false;
+  [[nodiscard]] constexpr trace_buffer* buffer() const noexcept {
+    return nullptr;
+  }
+};
+
+struct buffer_tracer {
+  static constexpr bool traced = true;
+  /// Not owned: the buffer has to outlive every operation started with
+  /// this tracer, and nothing reads its records until they have completed.
+  trace_buffer* buf = nullptr;
+  [[nodiscard]] constexpr trace_buffer* buffer() const noexcept {
+    return buf;
+  }
+};
+
+/// What the pipeline asks of a tracing policy: whether its runs are
+/// instrumented, decided at compile time, and the buffer they record into.
+template <class T>
+concept tracer = std::is_nothrow_copy_constructible_v<T> &&
+                 requires(const T& t) {
+                   { T::traced } -> std::convertible_to<bool>;
+                   { t.buffer() } noexcept -> std::same_as<trace_buffer*>;
+                 };
+
+static_assert(tracer<null_tracer>);
+static_assert(tracer<buffer_tracer>);
 
 }  // namespace blake3pp

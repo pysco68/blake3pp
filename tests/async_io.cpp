@@ -179,6 +179,92 @@ TEST_CASE("a file hashes to the same digest through the async API") {
   CHECK(rec.value == want);
 }
 
+// Tracing over the senders is a type, not an option: the operation state
+// is fixed at connect, so the tracer goes in as an argument and the
+// default records nothing. With a buffer, every window of the file gets a
+// record, the pool windows carry their agents' stamp, and the batch form
+// fills one buffer with every file's windows.
+TEST_CASE("the senders record into a buffer handed in as a tracer") {
+  constexpr std::size_t win = 64 * 1024;
+  const auto content = pattern(5 * win + 4097, 14);
+  const temp_file f(content);
+  const blake3pp::digest want = blake3pp::hash(content);
+  const std::size_t windows_per_file = (content.size() + win - 1) / win;
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+
+  std::vector<blake3pp::window_record> windows(3 * windows_per_file);
+  std::vector<blake3pp::agent_record> agents(windows.size() * 64);
+  blake3pp::trace_buffer trace(windows, agents);
+
+  SUBCASE("one file, hashed") {
+    record rec;
+    auto op = ex::connect(async::async_hash_file(ctx, f.path(), sched, {},
+                                                 blake3pp::buffer_tracer{&trace}),
+                          move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    REQUIRE(rec.values == 1);
+    CHECK(rec.value == want);
+    REQUIRE(trace.windows().size() == windows_per_file);
+    bool parallel = false;
+    for (const blake3pp::window_record& w : trace.windows()) {
+      CHECK(w.t_ready >= w.t_wait_begin);
+      CHECK(w.t_joined >= w.t_ready);
+      parallel = parallel || (w.flags & blake3pp::window_record::flag_parallel) != 0;
+    }
+    CHECK(parallel);
+    CHECK(trace.agents().size() > 0);
+  }
+
+  SUBCASE("one file, streamed into a hasher") {
+    blake3pp::hasher h;
+    record rec;
+    auto op = ex::connect(async::async_update_file(ctx, h, f.path(), sched, {},
+                                                   blake3pp::buffer_tracer{&trace}),
+                          move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    REQUIRE(rec.values == 1);
+    CHECK(h.finalize() == want);
+    CHECK(trace.windows().size() == windows_per_file);
+  }
+
+  SUBCASE("three files, one buffer") {
+    const std::array<std::filesystem::path, 3> paths{f.path(), f.path(),
+                                                     f.path()};
+    std::size_t ended = 0;
+    record rec;
+    auto op = ex::connect(
+        async::async_update_files(
+            ctx, paths, sched, {.in_flight = 2},
+            [](std::size_t) { return blake3pp::hasher{}; },
+            [&](std::size_t, blake3pp::hasher& h,
+                const async::file_outcome& o) noexcept {
+              if (o.ok() && h.finalize() == want) {
+                ++ended;
+              }
+            },
+            blake3pp::buffer_tracer{&trace}),
+        move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    CHECK(ended == 3);
+    CHECK(trace.windows().size() == 3 * windows_per_file);
+  }
+
+  SUBCASE("the default records nothing") {
+    record rec;
+    auto op = ex::connect(async::async_hash_file(ctx, f.path(), sched),
+                          move_only_receiver{&rec});
+    ex::start(op);
+    ctx.run_until_idle();
+    CHECK(rec.value == want);
+    CHECK(trace.windows().empty());
+  }
+}
+
 TEST_CASE("async_update_file streams into the caller's hasher") {
   const auto head = pattern(1000, 12);
   const auto content = pattern(2 * 64 * 1024, 13);
@@ -421,6 +507,50 @@ TEST_CASE("async_update_files reports every file and completes once") {
                [&](std::size_t, blake3pp::hasher&, const async::file_outcome&) noexcept { ++calls; }));
   REQUIRE(empty.has_value());
   CHECK(calls == 0);
+}
+
+// A stop from the RECEIVER, not from the context: the many-files operation
+// has to reach the files already in flight as well as the ones it has not
+// started, because a when_all sibling failing is how a caller cancels it.
+TEST_CASE("a receiver's stop ends async_update_files, in flight and not") {
+  constexpr std::size_t files = 6;
+  std::vector<std::vector<std::byte>> contents;
+  std::vector<std::unique_ptr<temp_file>> temps;
+  std::vector<fs::path> paths;
+  for (std::size_t i = 0; i < files; ++i) {
+    contents.push_back(pattern(32 * 64 * 1024 + i, 70 + static_cast<std::uint32_t>(i)));
+    temps.push_back(std::make_unique<temp_file>(contents.back()));
+    paths.push_back(temps.back()->path());
+  }
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+  unsigned calls = 0;
+  unsigned stopped = 0;
+  ex::inplace_stop_source src;
+  auto work = async::async_update_files(
+      ctx, paths, sched, {.in_flight = 2},
+      [](std::size_t) { return blake3pp::hasher{}; },
+      [&](std::size_t, blake3pp::hasher&, const async::file_outcome& o) noexcept {
+        ++calls;
+        if (o.stopped) {
+          ++stopped;
+        }
+        // The stop arrives once the first file has been reported, so some
+        // files are in flight and some have not started.
+        src.request_stop();
+      });
+  record rec;
+  auto op = ex::connect(std::move(work), handle_receiver{&rec, src.get_token()});
+  ex::start(op);
+  ctx.run_until_idle();
+  // Every file is accounted for exactly once, the operation completes
+  // exactly once, and the stop was not silently ignored.
+  CHECK(calls == paths.size());
+  CHECK(stopped > 0);
+  CHECK(rec.total() == 1);
+  CHECK(rec.stops == 1);
+  CHECK(!ctx.stop_requested());  // the receiver's stop is not the context's
 }
 
 // A byte budget for the arena is the knob a caller actually has.

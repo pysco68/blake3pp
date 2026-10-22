@@ -43,11 +43,21 @@
 namespace blake3pp {
 namespace {
 
-// The size the program asked for; 0 until it asks. Guarded by its own
-// mutex rather than made atomic, because "fix it, but only once, and only
-// before anything used it" is a two-field decision.
-std::mutex g_mutex;
-// Written under g_mutex, whose purpose is the check-and-set in
+// The size the program asked for; 0 until it asks. Guarded by a mutex
+// rather than made atomic, because "fix it, but only once, and only before
+// anything used it" is a two-field decision. Under stdexec the pool's own
+// initializer takes the same lock (parallel.hpp's process_pool_sizing), so
+// the two cannot interleave; under beman the backend below is the moment
+// and takes it too.
+#if defined(BLAKE3PP_EXECUTION_STDEXEC) && BLAKE3PP_HAS_STD_THREAD
+std::mutex& sizing_mutex() noexcept { return detail::process_pool_sizing(); }
+#else
+std::mutex& sizing_mutex() noexcept {
+  static std::mutex m;
+  return m;
+}
+#endif
+// Written under sizing_mutex(), whose purpose is the check-and-set in
 // size_parallel_scheduler, and read without it, so the noexcept reader
 // cannot hit a lock failure and terminate.
 std::atomic<unsigned> g_threads{0};
@@ -235,9 +245,7 @@ class sized_backend final : public repl::parallel_scheduler_backend {
   // worker it queued has finished by the time it gets here -- a short bulk
   // on an idle pool. So a receiver's completion may run on the thread that
   // started the operation, and for the file pipeline that thread is the
-  // driver. Nothing here promises otherwise: the pipeline's "the driver
-  // spends its time polling" is an observation about measured runs, not a
-  // property this backend guarantees.
+  // driver.
   static void settle(job* j, std::size_t wanted, std::size_t queued) noexcept {
     if (j->release(wanted - queued + 1)) {
       j->complete();
@@ -297,7 +305,7 @@ auto query_parallel_scheduler_backend()
     // hardware_concurrency(). The pool itself is built outside the lock,
     // since it starts threads.
     const unsigned threads = [] {
-      const std::lock_guard lock{blake3pp::g_mutex};
+      const std::lock_guard lock{blake3pp::sizing_mutex()};
       const unsigned sized = blake3pp::g_threads.load(std::memory_order_relaxed);
       blake3pp::g_started.store(true, std::memory_order_relaxed);
       return sized != 0 ? sized : std::max(1u, std::thread::hardware_concurrency());
@@ -318,7 +326,7 @@ void size_parallel_scheduler(unsigned threads) {
     throw std::invalid_argument(
         "blake3pp::size_parallel_scheduler: threads must be at least 1");
   }
-  const std::lock_guard lock{g_mutex};
+  const std::lock_guard lock{sizing_mutex()};
   if (scheduler_started()) {
     already("the parallel scheduler is already running");
   }

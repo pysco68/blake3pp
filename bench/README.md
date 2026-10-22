@@ -140,9 +140,10 @@ variant's `kernel_ops` table (`hasher::update` is one memory-indirect
 call), and the kernel bodies live in translation units of their own, so
 nothing can be inlined across that boundary. This bench isolates what
 that costs: the kernel TU is compiled into the bench itself, once per
-variant (`scalar`, `sse42`, `avx2`, `avx512` on x86-64; `neon` on
-aarch64, with the flags of `blake3pp_add_kernel()`), and the same body
-is called three ways on one pinned core:
+variant (`scalar`, `sse42`, `avx2`, `avx512` on x86-64; `scalar` and
+`neon` on aarch64; `scalar` and `rvv256` on riscv64; each only where the
+library registered it, with the flags of `blake3pp_add_kernel()`), and
+the same body is called three ways on one pinned core:
 
 | variant | shape |
 |---|---|

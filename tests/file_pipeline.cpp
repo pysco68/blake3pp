@@ -815,6 +815,80 @@ TEST_CASE("the io driver reads a file and keeps the callback discipline") {
   CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
 }
 
+// What a drain leaves on the operations it forgot: `live` lowered, so a
+// cancel sweep run afterwards (a scope stopping after its driver gave up
+// a file) meets an operation nobody owes, and hands no stale one to the
+// backend. Whole-driver and per-file. The per-file form keeps a
+// sibling's operation owed unless the wait surfaced its completion, in
+// which case it was reported and lowered by that.
+TEST_CASE("a drain lowers live on the operations it forgot") {
+  using blake3pp::detail::io_driver;
+  using blake3pp::detail::io_op;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 19);
+  const temp_file fa(content);
+  const temp_file fb(content);
+
+  SUBCASE("the whole driver") {
+    io_driver drv({}, 4);
+    io_driver::file file(drv, fa.path, /*direct_io=*/false);
+    drv.reserve(1, len);
+    const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
+    io_op op{};
+    read_probe probe;
+    op.done = &read_probe::on_done;
+    op.owner = &probe;
+    drv.submit_read(file, 0, pool, op);
+    drv.flush();
+    CHECK(op.live);
+    drv.drain();
+    CHECK(!op.live);
+    CHECK(drv.in_flight() == 0);
+    CHECK(probe.calls == 0);
+    drv.cancel(op);  // nothing owed: a no-op, not a stale request
+    CHECK(drv.poll(false) == 0);
+    CHECK(probe.calls == 0);
+  }
+
+  SUBCASE("one file of two") {
+    io_driver drv({}, 4);
+    io_driver::file file_a(drv, fa.path, /*direct_io=*/false);
+    io_driver::file file_b(drv, fb.path, /*direct_io=*/false);
+    drv.reserve(2, len);
+    const auto pool_a = drv.window_storage_for(file_a, 0, 0, len).read_into;
+    const auto pool_b = drv.window_storage_for(file_b, 1, 0, len).read_into;
+    io_op op_a{};
+    io_op op_b{};
+    read_probe probe_a;
+    read_probe probe_b;
+    op_a.done = &read_probe::on_done;
+    op_a.owner = &probe_a;
+    op_b.done = &read_probe::on_done;
+    op_b.owner = &probe_b;
+    drv.submit_read(file_a, 0, pool_a, op_a);
+    drv.submit_read(file_b, 0, pool_b, op_b);
+    drv.flush();
+    CHECK(op_a.live);
+    CHECK(op_b.live);
+    drv.drain(file_a);
+    CHECK(!op_a.live);
+    CHECK(probe_a.calls == 0);
+    // B is still owed unless its completion surfaced during the wait, and
+    // then it was reported, which is the same statement.
+    CHECK(op_b.live == (probe_b.calls == 0));
+    while (probe_b.calls == 0) {
+      drv.poll(true);
+    }
+    CHECK(!op_b.live);
+    CHECK(!probe_b.ec);
+    CHECK(drv.in_flight() == 0);
+    CHECK(std::equal(pool_b.begin(), pool_b.end(), content.begin()));
+    drv.cancel(op_a);
+    drv.cancel(op_b);
+    CHECK(drv.poll(false) == 0);
+  }
+}
+
 // The teardown contract the arena exists for: a driver destroyed with a
 // read still owed drains it, running no callback, before the memory that
 // read targets is freed. The sanitizer lanes are what would object.
@@ -1296,7 +1370,7 @@ TEST_CASE("sibling windows the reducer cannot hold still finish") {
   // ends up held, nothing is in flight and the run never finishes.
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 8 * win;
@@ -1325,7 +1399,7 @@ TEST_CASE("sibling windows the reducer cannot hold still finish") {
 TEST_CASE("admission throttles starts instead of refusing an insert") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   // Eight windows: a contiguous run of k of them holds popcount(k)
@@ -1354,7 +1428,7 @@ TEST_CASE("admission throttles starts instead of refusing an insert") {
 TEST_CASE("the full reducer capacity never throttles a normal run") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 32 * win + 999;
@@ -2126,7 +2200,7 @@ TEST_CASE("an 8 MiB last window fans out too") {
 TEST_CASE("a last window with many parts never refuses an insert") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   // Four windows, the last one all but a byte short of full: its parts
@@ -2156,7 +2230,7 @@ TEST_CASE("a last window with many parts never refuses an insert") {
 TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
   using blake3pp::default_stack_budget;
   using scope_type =
-      blake3pp::detail::window_scope<false, default_stack_budget, fake_driver,
+      blake3pp::detail::window_scope<blake3pp::null_tracer, default_stack_budget, fake_driver,
                                      blake3pp::parallel_scheduler_t>;
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 8 * win;
@@ -2234,6 +2308,19 @@ TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the fi
             .reads_in_flight == max_queue_depth);
   CHECK(plan_pipeline(0, 8 * mib, 100000, false, large).windows ==
         max_queue_depth);
+  // Direct I/O is granted for a file at or above min_pipeline_bytes, or
+  // of unknown size, and withheld below it, where buffered is faster.
+  {
+    using blake3pp::detail::min_pipeline_bytes;
+    CHECK(plan_pipeline(0, 8 * mib, 4, true, large).direct_io);
+    CHECK(plan_pipeline(0, 8 * mib, 4, true, 0).direct_io);
+    CHECK(plan_pipeline(0, 8 * mib, 4, true, min_pipeline_bytes).direct_io);
+    CHECK(!plan_pipeline(0, 8 * mib, 4, true, min_pipeline_bytes - 1).direct_io);
+    CHECK(!plan_pipeline(0, 8 * mib, 4, true, 100000).direct_io);
+    CHECK(!plan_pipeline(0, 8 * mib, 4, false, large).direct_io);
+    // An unaligned head still withholds it on its own.
+    CHECK(!plan_pipeline(4096 + 1, 8 * mib, 4, true, large).direct_io);
+  }
   // A small file gets exactly its windows, edges included.
   CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024).windows == 3);
   CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024 + 1).windows == 4);
@@ -2316,7 +2403,10 @@ TEST_CASE("prior content sets the window grid and the open mode") {
   using blake3pp::detail::plan_pipeline;
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
-  const std::size_t len = 3 * win + 1234;
+  // Above min_pipeline_bytes, so the size rule leaves the open mode to
+  // the alignment rule this case is about.
+  const std::size_t len = 9 * win + 1234;
+  static_assert(9 * win + 1234 >= blake3pp::detail::min_pipeline_bytes);
   const auto content = pattern(len, 121);
   const temp_file f(content);
 

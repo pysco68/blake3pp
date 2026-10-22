@@ -867,9 +867,11 @@ class pipeline_scope_base {
         // Only transfers are left, so the driver is asked for them back:
         // this file's, because the driver may be serving other pipelines
         // whose transfers are not this scope's to forget. It runs no
-        // callback, so nothing publishes into a cell afterwards, and the
-        // chains stay counted -- there is nothing left that could count
-        // them down.
+        // callback of THIS scope's, so nothing publishes into a cell
+        // afterwards and the chains stay counted -- there is nothing left
+        // that could count them down. A sibling file's completion may be
+        // reported from inside it, on this thread, where the backends say
+        // so.
         self.loop().driver().drain(self.file());
         break;
       }
@@ -904,8 +906,12 @@ class pipeline_scope_base {
 struct pipeline_options {
   // The requests plan_pipeline() rounds and clamps; the scope itself
   // reads only the plan.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  unsigned queue_depth = 4;
+  std::size_t window_bytes = default_window_bytes;
+  unsigned queue_depth = default_queue_depth;
+  // The blocking entry points' request: run_window_pipeline() turns it
+  // into the tracer the scope is instantiated with. The scope itself
+  // reads only its tracer, so a caller that constructs a scope passes
+  // the policy and this field is not consulted.
   trace_buffer* trace = nullptr;
   // Windows allowed in flight at once, capped to the window count; 0
   // means the window count. The tests run the whole matrix at 1 first,
@@ -1022,8 +1028,10 @@ struct pipeline_plan {
   // The short first window that brings the hasher onto the window grid;
   // zero for a hasher already on it.
   std::size_t head_bytes;
-  // Whether the file is opened for direct I/O: the caller asked, and the
-  // grid is one the platform's alignment can serve.
+  // Whether the file is opened for direct I/O: the caller asked, the
+  // grid is one the platform's alignment can serve, and the file is not
+  // below min_pipeline_bytes, where buffered reads are the faster ones.
+  // A size the filesystem will not give counts as large.
   bool direct_io;
   // Whether this span ends the message. False for a caller streaming a
   // sequence of spans into one hasher: the final window is then an
@@ -1067,7 +1075,8 @@ struct pipeline_plan {
   return {window, reads,
           file_bytes == 0 ? windows
                           : std::min(windows, file_windows(file_bytes, window, head)),
-          head, direct_io && direct_io_fits(head)};
+          head,
+          direct_io && direct_io_fits(head) && direct_io_worthwhile(file_bytes)};
 }
 
 
@@ -1322,9 +1331,9 @@ using pipeline_cells_for = pipeline_cells<
                              std::declval<typename Scope::window&>())),
                          typename Scope::scope_receiver>>;
 
-template <bool Traced, stack_budget Budget, file_driver D, class Scheduler>
+template <tracer Tracer, stack_budget Budget, file_driver D, class Scheduler>
 class window_scope
-    : public pipeline_scope_base<window_scope<Traced, Budget, D, Scheduler>,
+    : public pipeline_scope_base<window_scope<Tracer, Budget, D, Scheduler>,
                                  D> {
   // The base drives this scope's loop and sweep, both of which are its
   // own business and nobody else's.
@@ -1374,13 +1383,14 @@ class window_scope
   // drains is still targeting its arena.
   window_scope(hasher& h, pipeline_host<Budget, D>& host,
                typename D::file& file, Scheduler sched,
-               const pipeline_plan& plan, const pipeline_options& opts)
+               const pipeline_plan& plan, const pipeline_options& opts,
+               Tracer tracer = Tracer{})
       : h_(h),
         loop_(host.loop()),
         pool_(host.pool()),
         file_(file),
         sched_(std::move(sched)),
-        trace_(opts.trace),
+        trace_(tracer.buffer()),
         ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
         window_bytes_(plan.window_bytes),
         count_(std::min(plan.windows, host.pool().count())),
@@ -1538,6 +1548,9 @@ class window_scope
 
     if (trace_ != nullptr) {
       driver_stats& d = trace_->driver();
+      // The rung is the file's, which closes with the run: copied here so a
+      // trace read afterwards still names it.
+      set_read_backend(d, file_.name());
       d.admission_stalls = admission_stalls_;
       d.max_pending = max_pending_;
       d.max_reads_in_flight = max_reading_;
@@ -1693,28 +1706,39 @@ class window_scope
         }
         window* const w = pool_.take();
         // Built, then counted. Everything up to the connect is this
-        // window's own state, and a connect that throws -- an operation
-        // state a provider allocates, say -- leaves the window unadmitted
-        // and the pool whole, rather than a count this run can never work
-        // off. Starting is last, because from then on the chain may
-        // complete and will count itself down.
+        // window's own state, and anything that throws there -- an
+        // operation state a provider allocates, the lane table a window
+        // shape needs, a plan the geometry contradicts -- gives the window
+        // straight back, rather than leaving a count this run can never
+        // work off or a window a shared pool never offers again. Starting
+        // is last, because from then on the chain may complete and will
+        // count itself down.
         const unsigned cell = free_cells_[free_cell_count_ - 1];
-        take_next(*w);
-        claim_record(*w);
-        // An edge window is the short first one or the last one, each with
-        // its own cell, since a three-window file has both in flight at
-        // once; one with nothing to fan out is only a read.
-        const bool is_full = !w->last && !w->short_first;
-        const bool is_edge_fanout = !is_full && w->plan.parts >= 2;
-        if (is_full) {
-          prepare_compress(*w);
-          cells.full[cell].emplace(typename Cells::connect_full{this, w});
-        } else if (is_edge_fanout) {
-          (w->last ? cells.last_edge : cells.first_edge)
-              .emplace(typename Cells::connect_edge{this, w});
-        } else {
-          (w->last ? cells.last_read : cells.first_read)
-              .emplace(typename Cells::connect_read{this, w});
+        bool is_full = false;
+        bool is_edge_fanout = false;
+        try {
+          take_next(*w);
+          claim_record(*w);
+          // An edge window is the short first one or the last one, each
+          // with its own cell, since a three-window file has both in
+          // flight at once; one with nothing to fan out is only a read.
+          is_full = !w->last && !w->short_first;
+          is_edge_fanout = !is_full && w->plan.parts >= 2;
+          if (is_full) {
+            prepare_compress(*w);
+            cells.full[cell].emplace(typename Cells::connect_full{this, w});
+          } else if (is_edge_fanout) {
+            (w->last ? cells.last_edge : cells.first_edge)
+                .emplace(typename Cells::connect_edge{this, w});
+          } else {
+            (w->last ? cells.last_read : cells.first_read)
+                .emplace(typename Cells::connect_read{this, w});
+          }
+        } catch (...) {
+          w->rec = nullptr;
+          w->op.live = false;
+          pool_.give_back(w);
+          throw;
         }
         w->cell = cell;
         --free_cell_count_;
@@ -1834,7 +1858,7 @@ class window_scope
                             return compress_stage(w);
                           }),
             loop_.scheduler()),
-        [this, &w](const cv_type& cv) noexcept { reduce_into_tree(w, cv); });
+        [this, &w](const cv_type& cv) { reduce_into_tree(w, cv); });
   }
 
   // An edge window with nothing worth fanning out: read it, hold it, and
@@ -1872,9 +1896,7 @@ class window_scope
                             return edge_compress_stage(w);
                           }),
             loop_.scheduler()),
-        [this, &w](std::size_t nodes) noexcept {
-          insert_edge_nodes(w, nodes);
-        });
+        [this, &w](std::size_t nodes) { insert_edge_nodes(w, nodes); });
   }
 
  private:
@@ -1901,11 +1923,14 @@ class window_scope
     const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
     const ex::inplace_stop_token tok = stop_source_.get_token();
     return stamped<std::size_t>(
-        w, tok, compress_edge_on<Traced>(sched_, w.compress, out, tok));
+        w, tok, compress_edge_on<Tracer::traced>(sched_, w.compress, out, tok));
   }
 
-  // On the driver, like every other insert.
-  void insert_edge_nodes(window& w, std::size_t nodes) noexcept {
+  // On the driver, like every other insert. Not noexcept: the contract
+  // checks below are the kind the chain carries as set_error(exception_ptr)
+  // for run() to rethrow (contract.hpp), which a noexcept frame would turn
+  // into a terminate.
+  void insert_edge_nodes(window& w, std::size_t nodes) {
     // fold_aligned_runs() wrote these, bounded by the span it was given;
     // reading more than that span holds would walk off the array.
     require(nodes <= edge_node_cap,
@@ -1930,7 +1955,8 @@ class window_scope
   [[nodiscard]] auto compress_stage(window& w) {
     read_landed(w);
     const ex::inplace_stop_token tok = stop_source_.get_token();
-    return stamped<cv_type>(w, tok, compress_on<Traced>(sched_, w.compress, tok));
+    return stamped<cv_type>(
+        w, tok, compress_on<Tracer::traced>(sched_, w.compress, tok));
   }
 
   // A compress stage's tail: stopped if the run was, and, when tracing,
@@ -1938,7 +1964,7 @@ class window_scope
   template <class Value, class Stage>
   [[nodiscard]] auto stamped(window& w, ex::inplace_stop_token tok,
                              Stage&& stage) {
-    if constexpr (Traced) {
+    if constexpr (Tracer::traced) {
       return stopped_if<Value>(
           tok, ex::then(std::forward<Stage>(stage),
                         [this, &w](Value v) noexcept {
@@ -2055,7 +2081,11 @@ class window_scope
   }
 
   // Takes the next window's geometry and plan into w and advances.
-  void take_next(window& w) noexcept {
+  //
+  // Not noexcept: window_storage_for() checks the geometry against the
+  // plan, and admission runs before the window is counted in flight, so
+  // the throw unwinds a round that owes nothing.
+  void take_next(window& w) {
     w.cancel_asked = false;
     w.view_ready = false;
     const geometry g = next_geometry();
@@ -2151,7 +2181,8 @@ class window_scope
   // Runs at admission, BEFORE the read: what it records is where the
   // compress stage will find the window, and that stage only starts once
   // the read has completed. Hence at() rather than view().
-  void prepare_compress(window& w) noexcept {
+  // Not noexcept: prepare() grows the lane table for this window's shape.
+  void prepare_compress(window& w) {
     const bool fanned =
         w.compress.prepare(ops_, w.at(), w.chunks,
                            w.plan.first_chunk, h_.key_words(), h_.mode_flags(),
@@ -2163,7 +2194,8 @@ class window_scope
     (void)fanned;
   }
 
-  void reduce_into_tree(window& w, const cv_type& cv) noexcept {
+  // Not noexcept, for the reason insert_edge_nodes() gives.
+  void reduce_into_tree(window& w, const cv_type& cv) {
     // Admission reserved this node before the window started; the same
     // reasoning as the edge path's, and the same consequence if it is
     // wrong.
@@ -2258,6 +2290,10 @@ class window_scope
       w->next_taken = nullptr;
       w->reading = false;
       w->rec = nullptr;
+      // Nothing is in flight here, and a drain forgets without a callback,
+      // so the driver owes this operation nothing -- whoever takes the
+      // window next must not read a transfer that was forgotten.
+      w->op.live = false;
       pool_.give_back(w);
     }
     last_window_ = nullptr;
@@ -2438,9 +2474,9 @@ struct pipeline_cells {
 
 // Runs one open file through the pipeline on the calling thread.
 //
-// Tracing is a template parameter below this point, because the window
-// chain's type has to be settled before the run starts; here is where the
-// runtime choice becomes a compile-time one, once per run.
+// Tracing is a policy type below this point, because the window chain's
+// type has to be settled before the run starts; here is where the
+// runtime request becomes one of the two policies, once per run.
 template <stack_budget Budget, file_driver D, class Scheduler>
 void run_window_pipeline(hasher& h, pipeline_host<Budget, D>& host,
                          typename D::file& file, Scheduler&& sched,
@@ -2448,11 +2484,12 @@ void run_window_pipeline(hasher& h, pipeline_host<Budget, D>& host,
                          const pipeline_options& opts) {
   using sched_type = std::remove_cvref_t<Scheduler>;
   if (opts.trace != nullptr) {
-    window_scope<true, Budget, D, sched_type> scope(
-        h, host, file, std::forward<Scheduler>(sched), plan, opts);
+    window_scope<buffer_tracer, Budget, D, sched_type> scope(
+        h, host, file, std::forward<Scheduler>(sched), plan, opts,
+        buffer_tracer{opts.trace});
     scope.run();
   } else {
-    window_scope<false, Budget, D, sched_type> scope(
+    window_scope<null_tracer, Budget, D, sched_type> scope(
         h, host, file, std::forward<Scheduler>(sched), plan, opts);
     scope.run();
   }

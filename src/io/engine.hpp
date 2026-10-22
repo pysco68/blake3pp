@@ -237,7 +237,8 @@ class polled_reader_engine {
 // Hence the timing both paths share:
 //
 //   submit() ACCEPTS bytes. finish() LANDS them.
-//   Errors surface from acquire() or finish(), never from submit().
+//   A WRITE error surfaces from acquire() or finish(), never from submit();
+//   a broken contract throws where it is detected.
 template <io_context C>
 class polled_writer_engine {
  public:
@@ -269,10 +270,17 @@ class polled_writer_engine {
   // handed out the same buffer twice, both writes rode one busy flag, and
   // the producer refilled bytes the device was still reading.
   buffer acquire() {
-    const unsigned s = next_slot_;
-    if (slots_[s].acquired) {
-      throw std::system_error(EINVAL, std::generic_category(),
-                              "acquire() with every buffer slot already held");
+    // Round-robin from the last hand-out, but past any slot the producer
+    // still holds: submits may come back out of order, and a free slot is a
+    // buffer this call can hand out. Only every slot held is a refusal.
+    unsigned s = next_slot_;
+    for (unsigned tried = 0; slots_[s].acquired; ++tried) {
+      if (tried + 1 == qd_) {
+        throw std::system_error(
+            EINVAL, std::generic_category(),
+            "acquire() with every buffer slot already held");
+      }
+      s = (s + 1) % qd_;
     }
     wait_slot(s);
     throw_if_failed();
@@ -374,10 +382,10 @@ class polled_writer_engine {
     }
   }
 
-  // Round up to the O_DIRECT length granule; >= 64 KiB so queued writes
-  // are worth their submission cost.
+  // Round up to the O_DIRECT length granule; >= min_window_bytes so queued
+  // writes are worth their submission cost.
   static std::size_t rounded_buffer(std::size_t bytes) noexcept {
-    bytes = std::clamp<std::size_t>(bytes, 64 * 1024,
+    bytes = std::clamp<std::size_t>(bytes, min_window_bytes,
                                     max_window_bytes / direct_align *
                                         direct_align);
     return (bytes + direct_align - 1) / direct_align * direct_align;

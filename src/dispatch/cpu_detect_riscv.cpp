@@ -161,8 +161,12 @@ bool hwcap_has_v() noexcept {
 bool test_force_trap() noexcept {
   return test::g_machine.active && test::g_machine.force_trap;
 }
+bool test_foreign_trap() noexcept {
+  return test::g_machine.active && test::g_machine.foreign_trap;
+}
 #else
 constexpr bool test_force_trap() noexcept { return false; }
+constexpr bool test_foreign_trap() noexcept { return false; }
 #endif
 
 // The trap-rung classifier state. Only ever touched from
@@ -172,20 +176,40 @@ constexpr bool test_force_trap() noexcept { return false; }
 //
 // A signal disposition is process-wide, so a SIGILL raised on another
 // thread inside that window reaches this handler too. The jump buffer
-// is per thread and the flag says whether this thread is probing. A
-// foreign fault gets the previous disposition back and returns, so the
-// faulting instruction re-executes under it and takes the path it
-// would have taken anyway, instead of a siglongjmp into a frame that
-// is not on its stack.
+// is per thread and the flag says whether this thread is probing, so a
+// foreign fault never siglongjmps into a frame that is not on its
+// stack.
+//
+// What it does instead must not take this guard down: the probing
+// thread's next instruction is the one it is guarding, and restoring the
+// previous disposition would leave that trap to kill the process -- the
+// one thing the guard exists to prevent. So the fault is handed to what
+// the program had installed before, with ours left in place, in whichever
+// of the two forms that handler was installed: ours takes SA_SIGINFO so
+// it has the siginfo_t and the context a three-argument handler (a JIT, a
+// sanitizer, a managed runtime) needs. A default or ignored disposition is
+// the exception: there is nothing to call, so ours is taken down, the
+// instruction re-executes and ends the process as it would have without
+// us.
 thread_local sigjmp_buf g_probe_jmp;
 thread_local volatile std::sig_atomic_t g_probing = 0;
 struct sigaction g_probe_old {};
 
-void probe_sigill(int) {
+void probe_sigill(int sig, siginfo_t* info, void* ctx) {
   if (g_probing) {
     siglongjmp(g_probe_jmp, 1);
   }
-  sigaction(SIGILL, &g_probe_old, nullptr);
+  const struct sigaction prev = g_probe_old;
+  if ((prev.sa_flags & SA_SIGINFO) != 0) {
+    if (prev.sa_sigaction != nullptr) {
+      prev.sa_sigaction(sig, info, ctx);
+      return;
+    }
+  } else if (prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) {
+    prev.sa_handler(sig);
+    return;
+  }
+  sigaction(SIGILL, &prev, nullptr);
 }
 
 // Run one probe under a scoped SIGILL guard. Only ever called from
@@ -197,14 +221,24 @@ void probe_sigill(int) {
 template <class F>
 bool guarded(F&& body) noexcept {
   struct sigaction sa {};
-  sa.sa_handler = &probe_sigill;
+  sa.sa_sigaction = &probe_sigill;
+  sa.sa_flags = SA_SIGINFO;
   sigemptyset(&sa.sa_mask);
   if (sigaction(SIGILL, &sa, &g_probe_old) != 0) {
     return false;  // cannot make the probe safe -> claim nothing
   }
   bool ok = false;
-  g_probing = 1;
+  // The flag after the buffer, never before it: it is what tells the
+  // handler the buffer may be jumped through.
   if (sigsetjmp(g_probe_jmp, 1) == 0) {
+    g_probing = 1;
+    if (test_foreign_trap()) {
+      // What another thread's fault inside this window looks like to
+      // the handler: a SIGILL while this thread is not the one probing.
+      g_probing = 0;
+      raise(SIGILL);
+      g_probing = 1;
+    }
     body();
     ok = true;
   }

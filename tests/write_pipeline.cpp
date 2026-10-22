@@ -290,6 +290,86 @@ TEST_CASE("a generated file is exactly what the generator described") {
   }
 }
 
+// A generator that throws, on the pool, inside a window already counted in
+// flight: the chain carries the exception, the run stops, and write_file
+// rethrows it. Nothing is submitted for that window before the fill, so the
+// file is whatever landed before it -- and never a length nobody produced.
+TEST_CASE("a write generator's exception comes back out of write_file") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::uint64_t size = 8 * win;
+  for (const unsigned qd : {2u, 4u}) {
+    CAPTURE(qd);
+    const temp_path out;
+    std::atomic<unsigned> fills{0};
+    // The third window to be filled throws, whichever offset that is: the
+    // windows are filled concurrently and in no particular order.
+    auto fill = [&fills](std::span<std::byte> w, std::uint64_t off) {
+      if (fills.fetch_add(1, std::memory_order_relaxed) == 2) {
+        throw std::runtime_error("the generator gave up");
+      }
+      fill_from_offset(w, off);
+    };
+    CHECK_THROWS_AS(blake3pp::write_file(out.path, size, fill, sched,
+                                        {.window_bytes = win,
+                                         .queue_depth = qd}),
+                    std::runtime_error);
+    // The file exists and is not the full length: a length invented for
+    // bytes nobody produced is what this must never do.
+    CHECK(size_of(out.path) <= size);
+  }
+  // The error_code form cannot tell a generator's exception from the other
+  // things that escape a pipeline, and says so by reporting one.
+  {
+    const temp_path out;
+    std::error_code ec;
+    auto fill = [](std::span<std::byte>, std::uint64_t) -> void {
+      throw std::runtime_error("no");
+    };
+    blake3pp::write_file(out.path, size, fill, sched, ec,
+                         {.window_bytes = win});
+    CHECK(ec);
+  }
+}
+
+// The automatic depth: a request is clamped like any other; zero becomes
+// one window per thread, bounded by the bytes-in-flight budget and by the
+// range every depth has.
+TEST_CASE("an automatic write depth follows the threads within the budget") {
+  using blake3pp::detail::resolve_write_queue_depth;
+  using blake3pp::detail::rounded_window_bytes;
+  constexpr std::size_t mib = 1024 * 1024;
+  // The 64 MiB and 1 GiB windows the cases below name are what the
+  // platform's window cap lets through (see the read plan test): on 32-bit
+  // size_t both round down to 8 MiB, and the thread counts scale by the
+  // same ratio, so each expectation is computed from the rounded window.
+  const std::size_t w64 = rounded_window_bytes(64 * mib);
+  const unsigned t64 = 32 * static_cast<unsigned>(64 * mib / w64);
+  const std::size_t w1g = rounded_window_bytes(1024 * mib);
+  const unsigned t1g = 32 * static_cast<unsigned>(1024 * mib / w1g);
+  CHECK(resolve_write_queue_depth(6, 8 * mib, 32) == 6);
+  CHECK(resolve_write_queue_depth(1, 8 * mib, 32) == 2);
+  CHECK(resolve_write_queue_depth(0, 8 * mib, 32) == 32);
+  CHECK(resolve_write_queue_depth(0, 8 * mib, 16) == 16);
+  CHECK(resolve_write_queue_depth(0, 8 * mib, 1) == 2);
+  CHECK(resolve_write_queue_depth(0, 8 * mib, 0) == 2);
+  // 256 MiB in flight bounds the product: 32 windows of 8 MiB, and 4 of
+  // 64 MiB where the window is not rounded down.
+  CHECK(resolve_write_queue_depth(0, 8 * mib, 1024) == 32);
+  CHECK(resolve_write_queue_depth(0, 64 * mib, t64) == (256 * mib) / w64);
+  CHECK(resolve_write_queue_depth(0, 1024 * mib, t1g) ==
+        std::max<unsigned>(2u, std::min<unsigned>(
+            t1g, static_cast<unsigned>((256 * mib) / w1g))));
+  if constexpr (sizeof(std::size_t) == 8) {
+    // Where nothing rounds the windows down, the figures themselves.
+    CHECK(resolve_write_queue_depth(0, 64 * mib, 32) == 4);
+    CHECK(resolve_write_queue_depth(0, 1024 * mib, 32) == 2);
+  }
+  // A request outranks the budget: the caller stated it.
+  CHECK(resolve_write_queue_depth(64, 64 * mib, 32) == 64);
+  static_assert(resolve_write_queue_depth(0, 8 * mib, 32) == 32);
+}
+
 // The sequential forms take the same generator without a scheduler: the
 // bounded one writes exactly what it was asked for, the unbounded one
 // stops where the generator stops, and both name the mechanism that

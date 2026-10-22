@@ -119,22 +119,35 @@ template <stack_budget Budget>
       (num_chunks + Budget.parts() - 1) / Budget.parts(), min_part_chunks));
 }
 
-// One CV slot per part. The slots are unpadded: each is written once per
-// part-sized task, so neighbours sharing a cache line cost nothing
-// measurable.
+// One CV slot per part, 32 bytes, so two slots share a cache line.
+//
+// Unpadded on purpose, and the arithmetic is the argument rather than a
+// measurement: a slot is written ONCE, when its part is done, and a part is
+// at least min_part_chunks chunks, which is 16 KiB of hashing. Two agents
+// finishing adjacent parts at the same moment therefore contend for one
+// line once per pair -- a single cache-line transfer against thousands of
+// times that in work. Padding to 64 bytes would halve the parts a budget
+// holds (1024 to 512 at the 32 KiB default), and the part count is what
+// balances the agents' tail.
 template <stack_budget Budget>
 using part_cvs = std::array<std::array<std::uint32_t, 8>, Budget.parts()>;
 
 // A full window's parts are reduced in groups of this many, by the agent
 // that finishes a group's last part, before the fold after the bulk sees
-// anything. A part reduced on its own ends in log2(part) parent
-// generations below full lane occupancy, a measured 15% of a 16-chunk
-// part's time on AVX2 and 22% on AVX-512; folded 16 parts at a time the
-// generations stay lane-filling down to the last log2(degree), 4% and 8%.
+// anything. A 16-chunk part reduced on its own is 16 lane-filling chunk
+// compressions followed by four parent generations at 8, 4, 2 and 1 of the
+// kernel's 16 lanes; grouping the parts keeps those generations filled down
+// to the last log2(degree). Measured, at 8 MiB windows: +13.8% on Emerald
+// Rapids, +2.8% on Zen 5, and nothing at 64 MiB windows, where a window's
+// parts already outnumber the agents by enough that the tail is noise
+// (docs/performance.md). The mechanism was confirmed separately by deferring
+// parents in the sequential path, where nothing overlaps the narrow
+// generations: 17% on AVX-512 and 25% on AVX2, 91-95% of the kernel's own
+// hash_many ceiling.
+//
 // The reduction has to happen inside the bulk: moved whole into the fold
-// behind it, which one agent runs, it is a sixteenth of the window's
-// blocks on one thread, and from eight agents up that costs more wall
-// time than the parts saved.
+// behind it, which one agent runs, it is a sixteenth of the window's blocks
+// on one thread while the others have nothing left to do.
 inline constexpr std::size_t fold_group_parts = 16;
 static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_part);
 
@@ -338,16 +351,24 @@ struct window_compress {
   // fan out and belongs on the sequential path, the same verdict
   // a window's compress stage reaches.
   //
+  // Not noexcept: the lane table grows here, on the first window of a run
+  // that needs the size, so this is where a run out of memory surfaces.
+  // Admission calls it before the window is counted in flight.
+  //
   // @pre chunks is a power of two. The parts have to divide the window
   //      exactly: a remainder would be chunks this never compresses, and
   //      the grouped fold below needs a power-of-two group. Every caller
   //      gets it from rounded_window_bytes(), which bit_floors.
+  // @throws std::logic_error if it is not a power of two: the parts would
+  //         then leave chunks % p chunks out of the digest.
   [[nodiscard]] bool prepare(const kern::kernel_ops* o, const std::byte* d,
                              std::size_t chunks, std::uint64_t counter,
                              std::span<const std::uint32_t, 8> k,
                              std::uint32_t f, trace_buffer* buf,
-                             std::uint64_t window_id) noexcept {
-    assert(chunks > 0 && std::has_single_bit(chunks));
+                             std::uint64_t window_id) {
+    require(chunks > 0 && std::has_single_bit(chunks),
+            "window_compress::prepare(): a window that is not a power-of-two "
+            "number of chunks");
     const std::size_t p = part_chunks<Budget>(chunks);
     if (p >= chunks) {
       return false;
@@ -368,11 +389,12 @@ struct window_compress {
   // An edge window: the caller says how big a part is and how many of
   // them belong to the tree, because the rest of the window is the
   // hasher's own. counter is the absolute chunk of part 0.
+  // @throws std::logic_error if parts exceeds what the budget's table holds.
   void prepare_edge(const kern::kernel_ops* o, const std::byte* d,
                     std::size_t part_chunks, std::size_t parts,
                     std::uint64_t counter,
                     std::span<const std::uint32_t, 8> k, std::uint32_t f,
-                    trace_buffer* buf, std::uint64_t window_id) noexcept {
+                    trace_buffer* buf, std::uint64_t window_id) {
     // Checked in every build: the table is a fixed Budget.parts() entries
     // inside this object, and a part past the end writes through the
     // members that follow it. The two callers derive `parts` from the
@@ -464,8 +486,12 @@ template <bool Traced, stack_budget Budget, class Scheduler,
           class Token = ex::never_stop_token>
 [[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w,
                                Token tok = {}) {
+  // The fold is not noexcept: fold_sibling_cvs() checks a contract whose
+  // violation would be a wrong digest, and a throw here completes the
+  // chain with set_error(exception_ptr), which the scope latches and run()
+  // rethrows. The per-part bulk function above is the one that cannot.
   return part_bulk_sender<Traced>(sched, w, tok) |
-         ex::then([&w]() noexcept {
+         ex::then([&w]() {
            // The fold runs even when the agents stopped early: the part
            // table is zeroed with the window it lives in, so this reads
            // nothing uninitialised, and what it produces is dropped by
@@ -506,7 +532,7 @@ template <bool Traced, stack_budget Budget, class Scheduler,
                                     std::span<tree_reducer::node> out,
                                     Token tok = {}) {
   return part_bulk_sender<Traced>(sched, w, tok) |
-         ex::then([&w, out]() noexcept {
+         ex::then([&w, out]() {
            return fold_aligned_runs(
                w.ops, w.key, w.flags,
                cv_run{std::span(w.cvs).first(w.n_parts), 0, w.n_parts,

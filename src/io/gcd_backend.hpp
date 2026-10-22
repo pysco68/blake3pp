@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -278,15 +279,18 @@ class gcd_context {
   // That is longer than necessary and harmless: a sibling's finished
   // transfer stays on the done list for a later poll() to report.
   void forget(file& f) noexcept {
+    // std::min on both, like the other backends: a counting slip must not
+    // underflow a size_t, which is what quiesce() and the stall check read.
     const std::size_t never_started = deferred_.remove_if(
         [&f](const transfer& op) noexcept { return op.sync_file == &f.f_; });
-    in_flight_ -= never_started;
+    in_flight_ -= std::min(never_started, in_flight_);
     if (!use_gcd_) {
       return;  // nothing is in a worker: the deferred list is poll()'s
     }
     dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
-    in_flight_ -= done_.remove_if(
+    const std::size_t finished = done_.remove_if(
         [&f](const transfer& op) noexcept { return op.sync_file == &f.f_; });
+    in_flight_ -= std::min(finished, in_flight_);
   }
 
  private:

@@ -223,7 +223,9 @@ std::span<const arch> all_arches() noexcept { return all_enumerators; }
 std::string_view version() noexcept { return BLAKE3PP_STAMPED_VERSION; }
 
 std::string_view simd_provider() noexcept {
-#if defined(BLAKE3PP_HAS_STD_SIMD)
+#if defined(BLAKE3PP_HAS_XVEC)
+  return "xvec";
+#elif defined(BLAKE3PP_HAS_STD_SIMD)
   return "std::simd";
 #elif defined(BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD)
   return "std::experimental::simd";

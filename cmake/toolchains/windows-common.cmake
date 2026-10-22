@@ -97,6 +97,49 @@ if(DEFINED TC_TARGET_ARCH AND TC_TARGET_ARCH STREQUAL "arm64")
   endif()
 endif()
 
+# --------------------------------------------------------------- sanitizers
+# The MSVC dialect of common.cmake's sanitizer block, and a much shorter
+# list: this family has AddressSanitizer, and nothing else that a lane can
+# use. A toolchain asking for TSan or MSan says so at configure time rather
+# than producing an uninstrumented build that looks like a lane.
+#
+# cl.exe only, and that is a finding rather than a preference. clang-cl
+# compiles the instrumentation happily, but on Windows it is the clang
+# DRIVER that puts the sanitizer runtimes on the link line, and CMake links
+# with lld-link directly: the runtimes then resolve to nothing
+# (__asan_init), they live in the clang resource directory which is on no
+# search path, and the path to it cannot be handed to lld-link through
+# CMAKE_EXE_LINKER_FLAGS because a Visual Studio install path has spaces in
+# it and the flags are one space-separated string. cl.exe's own ASan needs
+# none of that: /fsanitize=address links it, from the lib directories the
+# developer shell already exports.
+#
+# What the build must not do is ask for incremental linking or
+# edit-and-continue debug info, which the runtime refuses -- Release and
+# RelWithDebInfo give neither.
+if(DEFINED TC_SANITIZERS AND NOT TC_SANITIZERS STREQUAL "")
+  foreach(_tc_san IN LISTS TC_SANITIZERS)
+    if(_tc_san STREQUAL "address")
+      if(_tc_is_clang_cl)
+        message(FATAL_ERROR
+          "toolchain: the MSVC-family ASan lane is the cl.exe one; clang-cl's "
+          "runtimes are added by its driver, which CMake does not link "
+          "through (see the comment above this message in "
+          "windows-common.cmake)")
+      endif()
+      list(APPEND _tc_san_flags "/fsanitize=address")
+    else()
+      message(FATAL_ERROR
+        "toolchain: no ${_tc_san} sanitizer in the MSVC family; address is "
+        "what exists")
+    endif()
+  endforeach()
+  # Symbol names in a report, and frames the unwinder can follow.
+  list(APPEND _tc_san_flags "/Zi" "/Oy-")
+  list(APPEND TC_EXTRA_CXX_FLAGS ${_tc_san_flags})
+  list(APPEND TC_EXTRA_LINK_FLAGS "/INCREMENTAL:NO" "/DEBUG")
+endif()
+
 # ------------------------------------------------------------------ extras
 if(DEFINED TC_EXTRA_CXX_FLAGS)
   list(JOIN TC_EXTRA_CXX_FLAGS " " _tc_extra_cxx)

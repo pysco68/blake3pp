@@ -44,8 +44,10 @@ namespace blake3pp::detail {
 
 // What a write run needs beyond the plan.
 struct write_options {
-  std::size_t window_bytes = 64 * 1024 * 1024;
-  unsigned queue_depth = 2;
+  std::size_t window_bytes = default_write_window_bytes;
+  // Resolved by the caller (resolve_write_queue_depth); a zero here is
+  // clamped to the minimum like any other request.
+  unsigned queue_depth = sequential_write_queue_depth;
   ex::inplace_stop_token stop_token{};
 };
 
@@ -231,7 +233,7 @@ class write_scope
         ex::let_value(
             declared(ex::continues_on(
                 ex::then(ex::schedule(sched_),
-                         [this, &w]() noexcept { fill_window(w); }),
+                         [this, &w] { fill_window(w); }),
                 loop_.scheduler())),
             [this, &w] {
               return loop_.write(file_, w.offset,
@@ -242,21 +244,16 @@ class write_scope
         [this, &w]() noexcept { landed(w); });
   }
 
-  // Marked noexcept, which is the caller's contract too: an exception
-  // escaping the generator terminates rather than unwinding through a
-  // stage whose window is already counted in flight. write_file's
-  // documentation says so, and the static_assert makes a generator that
-  // can throw a compile error rather than a crash under load -- the
-  // sequential forms of write_file() take one that may throw, and this is
-  // the path that cannot.
-  void fill_window(window& w) noexcept {
-    static_assert(
-        std::is_nothrow_invocable_v<Fill&, std::span<std::byte>, std::uint64_t>,
-        "the scheduler-taking write_file() needs a noexcept generator: it "
-        "runs on a pool thread inside a window already counted in flight, "
-        "where an exception has nowhere to go");
-    fill_(w.buffer.first(w.bytes), w.offset);
-  }
+  // The generator may throw, on a pool thread, inside a window already
+  // counted in flight: the chain carries it from there like any other
+  // stage's exception. The window's own completion is set_error with the
+  // exception_ptr, the scope latches it, stops the run, gives the window
+  // back, and run() rethrows it to whoever called write_file(). The file is
+  // then left as far as it got, which is what an I/O failure leaves too.
+  //
+  // Nothing is submitted for this window before the fill, so a throw owes
+  // the driver nothing.
+  void fill_window(window& w) { fill_(w.buffer.first(w.bytes), w.offset); }
 
   void landed(window& w) noexcept { w.writing = false; }
 
@@ -270,18 +267,31 @@ class write_scope
              free_ != nullptr && next_offset_ < total_) {
         window* const w = free_;
         free_ = w->next_free;
-        take_next(*w);
+        // Built, then counted: anything that throws before the start --
+        // the geometry check below, a provider's operation state -- puts
+        // the window back on the free list rather than leaving a count
+        // this run can never work off.
+        try {
+          take_next(*w);
+          cells[w->slot].emplace(ConnectOne{this, w});
+        } catch (...) {
+          w->op.live = false;
+          w->next_free = free_;
+          free_ = w;
+          throw;
+        }
         ++in_flight_;
         w->writing = true;
         status_.outstanding = in_flight_;
-        cells[w->slot].emplace(ConnectOne{this, w});
         ex::start(*cells[w->slot]);
       }
       settle();
     }, [this] { this->report_stall(); });
   }
 
-  void take_next(window& w) noexcept {
+  // Not noexcept: the geometry check below is one the chain's own error
+  // channel carries, and admission runs before the window is counted.
+  void take_next(window& w) {
     w.cancel_asked = false;
     w.offset = next_offset_;
     w.bytes = static_cast<std::size_t>(

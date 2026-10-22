@@ -179,6 +179,42 @@ TEST_CASE("update_last agrees with update for every length") {
   }
 }
 
+// The message not ending where update_last() said it did: the held subtree
+// goes back on the stack, so the digest is the one-stream digest. Every
+// first piece that takes the batched path, against every continuation that
+// reaches a different branch of it.
+TEST_CASE("update after update_last is the whole message") {
+  const auto input = make_input(80 * 1024);
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    for (const std::size_t first : {2048u, 3072u, 16384u, 17408u, 33792u}) {
+      for (const std::size_t rest : {1u, 512u, 1024u, 2048u, 9216u}) {
+        CAPTURE(first);
+        CAPTURE(rest);
+        const auto bytes = std::span{input}.first(first + rest);
+        blake3pp::hasher streamed{ops};
+        streamed.update(bytes);
+        blake3pp::hasher resumed{ops};
+        resumed.update_last(bytes.first(first));
+        resumed.update(bytes.subspan(first));
+        CHECK(resumed.count() == first + rest);
+        CHECK(resumed.finalize() == streamed.finalize());
+        // And again on the piece that followed, which the hasher is now
+        // free to call the last one.
+        blake3pp::hasher twice{ops};
+        twice.update_last(bytes.first(first));
+        twice.update_last(bytes.subspan(first));
+        CHECK(twice.finalize() == streamed.finalize());
+      }
+    }
+  }
+}
+
 // The extended output stream comes off the same root node, so a reader
 // taken after update_last() must match one taken after update().
 TEST_CASE("update_last leaves the same XOF stream") {

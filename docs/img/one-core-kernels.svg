@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 444" width="860" height="444" role="img" aria-label="Long messages: the kernel, and everything around it">
+<style>
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         fill: #24292f; }
+  .axis { stroke: #8b949e; stroke-width: 1; }
+  .grid { stroke: #d0d7de; stroke-width: 1; stroke-dasharray: 2 3; }
+  .muted { fill: #57606a; }
+  @media (prefers-color-scheme: dark) {
+    text { fill: #e6edf3; }
+    .axis { stroke: #6e7681; }
+    .grid { stroke: #30363d; }
+    .muted { fill: #9198a1; }
+  }
+</style>
+<text x="0" y="18" font-size="15" font-weight="600">Long messages: the kernel, and everything around it</text>
+<text x="0" y="36" font-size="12" class="muted">one core, in memory (512 MiB, 256 on the M2); the middle bar is upstream's kernel driven by this library's tree</text>
+<rect x="210" y="47" width="10" height="10" fill="#e8590c" rx="2"/>
+<text x="225" y="56" font-size="12">blake3pp</text>
+<rect x="301" y="47" width="10" height="10" fill="#1971c2" rx="2"/>
+<text x="316" y="56" font-size="12">upstream kernel, this tree</text>
+<rect x="522" y="47" width="10" height="10" fill="#2f9e44" rx="2"/>
+<text x="537" y="56" font-size="12">upstream, own tree</text>
+<line class="grid" x1="210.0" y1="70" x2="210.0" y2="342"/>
+<text x="210.0" y="358" font-size="11" class="muted" text-anchor="middle">0</text>
+<line class="grid" x1="308.3" y1="70" x2="308.3" y2="342"/>
+<text x="308.3" y="358" font-size="11" class="muted" text-anchor="middle">2</text>
+<line class="grid" x1="406.7" y1="70" x2="406.7" y2="342"/>
+<text x="406.7" y="358" font-size="11" class="muted" text-anchor="middle">4</text>
+<line class="grid" x1="505.0" y1="70" x2="505.0" y2="342"/>
+<text x="505.0" y="358" font-size="11" class="muted" text-anchor="middle">6</text>
+<line class="grid" x1="603.3" y1="70" x2="603.3" y2="342"/>
+<text x="603.3" y="358" font-size="11" class="muted" text-anchor="middle">8</text>
+<line class="grid" x1="701.7" y1="70" x2="701.7" y2="342"/>
+<text x="701.7" y="358" font-size="11" class="muted" text-anchor="middle">10</text>
+<line class="grid" x1="800.0" y1="70" x2="800.0" y2="342"/>
+<text x="800.0" y="358" font-size="11" class="muted" text-anchor="middle">12</text>
+<line class="axis" x1="210" y1="70" x2="210" y2="342"/>
+<text x="202" y="108.0" font-size="12" text-anchor="end">Zen 5, AVX-512</text>
+<rect x="210" y="77.0" width="459.7" height="15" fill="#e8590c" rx="2"/>
+<text x="675.7" y="88.0" font-size="11" class="muted">9.35</text>
+<rect x="210" y="95.0" width="491.7" height="15" fill="#1971c2" rx="2"/>
+<text x="707.7" y="106.0" font-size="11" class="muted">10</text>
+<rect x="210" y="113.0" width="397.8" height="15" fill="#2f9e44" rx="2"/>
+<text x="613.8" y="124.0" font-size="11" class="muted">8.09</text>
+<text x="202" y="176.0" font-size="12" text-anchor="end">Sapphire Rapids, AVX-512</text>
+<rect x="210" y="145.0" width="207.0" height="15" fill="#e8590c" rx="2"/>
+<text x="423.0" y="156.0" font-size="11" class="muted">4.21</text>
+<rect x="210" y="163.0" width="229.1" height="15" fill="#1971c2" rx="2"/>
+<text x="445.1" y="174.0" font-size="11" class="muted">4.66</text>
+<rect x="210" y="181.0" width="227.6" height="15" fill="#2f9e44" rx="2"/>
+<text x="443.6" y="192.0" font-size="11" class="muted">4.63</text>
+<text x="202" y="244.0" font-size="12" text-anchor="end">Neoverse V2</text>
+<rect x="210" y="213.0" width="92.9" height="15" fill="#e8590c" rx="2"/>
+<text x="308.9" y="224.0" font-size="11" class="muted">1.89</text>
+<rect x="210" y="231.0" width="78.7" height="15" fill="#1971c2" rx="2"/>
+<text x="294.7" y="242.0" font-size="11" class="muted">1.6</text>
+<rect x="210" y="249.0" width="79.2" height="15" fill="#2f9e44" rx="2"/>
+<text x="295.2" y="260.0" font-size="11" class="muted">1.61</text>
+<text x="202" y="312.0" font-size="12" text-anchor="end">Apple M2</text>
+<rect x="210" y="281.0" width="92.4" height="15" fill="#e8590c" rx="2"/>
+<text x="308.4" y="292.0" font-size="11" class="muted">1.88</text>
+<rect x="210" y="299.0" width="92.4" height="15" fill="#1971c2" rx="2"/>
+<text x="308.4" y="310.0" font-size="11" class="muted">1.88</text>
+<rect x="210" y="317.0" width="91.9" height="15" fill="#2f9e44" rx="2"/>
+<text x="307.9" y="328.0" font-size="11" class="muted">1.87</text>
+<text x="0" y="382" font-size="11" class="muted">GiB/s, higher is better</text>
+<text x="0" y="400" font-size="10" class="muted">Zen 5, AVX-512: Ryzen AI MAX+ 395, WSL2, clang/musl, pinned, eb16605, 2026-10-02</text>
+<text x="0" y="414" font-size="10" class="muted">Sapphire Rapids, AVX-512: Xeon 8481C (GCP c3-standard-22), 4b7b949, 2026-10-03</text>
+<text x="0" y="428" font-size="10" class="muted">Neoverse V2: GCP Axion c4a-standard-16, 4b7b949, 2026-10-03</text>
+<text x="0" y="442" font-size="10" class="muted">Apple M2: M2 MacBook Air (fanless), appleclang, 582226e, 2026-10-02</text>
+</svg>

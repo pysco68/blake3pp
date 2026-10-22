@@ -81,11 +81,12 @@ namespace blake3pp::async {
 /// operation may hold at most `queue_depth` of them at once, which is
 /// what keeps one large file from starving the rest.
 struct io_context_options {
-  /// Bytes per window; rounded down to a power-of-2 multiple of
-  /// chunk_size, minimum 64 KiB.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows one operation may hold at once; clamped to [2, 256].
-  unsigned queue_depth = 4;
+  /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
+  /// multiple of chunk_size, minimum 64 KiB.
+  std::size_t window_bytes = detail::default_window_bytes;
+  /// Windows one operation may hold at once, four by default; clamped to
+  /// [2, 256].
+  unsigned queue_depth = detail::default_queue_depth;
   /// Windows in the shared arena, at window_bytes each. Zero means what
   /// the plan asks for, which at the defaults is 16 windows and so a
   /// 128 MiB arena -- several operations' worth already. Clamped to the
@@ -93,8 +94,8 @@ struct io_context_options {
   /// window_bytes whether it was asked for as a count or as a budget.
   unsigned windows = 0;
   /// The arena as a byte budget instead: when non-zero, the window count
-  /// is this divided by the window size, at least queue_depth and at
-  /// most 32, and `windows` is ignored. The budget is what a caller
+  /// is this divided by the window size, at least queue_depth and under
+  /// the same ceiling, and `windows` is ignored. The budget is what a caller
   /// knows; how many windows it buys depends on the window size.
   std::size_t arena_bytes = 0;
   /// Bypass the page cache where the platform supports it, per file.
@@ -347,7 +348,12 @@ class basic_io_context {
           // run_until only calls this when it is about to block, and a
           // wake() from link() or request_stop() is what ends it.
         });
-    stop_.store(false, std::memory_order_release);
+    // The stop is cleared only once there is nothing left for it to reach:
+    // a sync_wait that returns on its own flag can leave siblings live, and
+    // they, plus anything started while the stop stands, must still see it.
+    if (live_ == 0 && pending_.load(std::memory_order_acquire) == nullptr) {
+      stop_.store(false, std::memory_order_release);
+    }
   }
 
   io_context_options opts_;
@@ -397,36 +403,39 @@ struct forward_stop {
 // externally-linked receiver would agree on this class's name and
 // disagree on its layout.
 template <stack_budget Budget, class Sched, class Receiver, class Value,
-          class Cells>
+          class Cells, tracer Tracer>
 class update_file_op final : public pipeline_node {
  public:
   using operation_state_concept = blake3pp::detail::ex_compat::operation_state_tag;
   using scope_type =
-      blake3pp::detail::window_scope<false, Budget, io_driver, Sched>;
+      blake3pp::detail::window_scope<Tracer, Budget, io_driver, Sched>;
   using cells_type = Cells;
 
   // Over a hasher the caller owns: it must outlive the operation, and
   // nothing else may touch it while this runs.
   update_file_op(basic_io_context<Budget>& ctx, hasher& h,
                  std::filesystem::path path, Sched sched,
-                 const file_io_options& opts, Receiver r)
+                 const file_io_options& opts, Tracer tracer, Receiver r)
       : ctx_(&ctx),
         h_(&h),
         path_(std::move(path)),
         sched_(std::move(sched)),
         opts_(opts),
+        tracer_(tracer),
         rcvr_(std::move(r)) {}
 
   // Over a hasher of its own, built from the call's options and
   // finalized into the value this completes with.
   update_file_op(basic_io_context<Budget>& ctx, std::filesystem::path path,
-                 Sched sched, const hash_file_options& opts, Receiver r)
+                 Sched sched, const hash_file_options& opts, Tracer tracer,
+                 Receiver r)
       : ctx_(&ctx),
         own_h_(blake3pp::detail::make_hasher(opts, blake3pp::detail::resolve(opts.a))),
         h_(&*own_h_),
         path_(std::move(path)),
         sched_(std::move(sched)),
         opts_(opts),
+        tracer_(tracer),
         rcvr_(std::move(r)) {}
 
   update_file_op(const update_file_op&) = delete;
@@ -480,8 +489,8 @@ class update_file_op final : public pipeline_node {
                      blake3pp::detail::pipeline_options{
                          .window_bytes = cfg.window_bytes,
                          .queue_depth = cfg.queue_depth,
-                         .trace = nullptr,
-                         .stop_token = stop_.get_token()});
+                         .stop_token = stop_.get_token()},
+                     tracer_);
       cells_.emplace(scope_->count());
       live_ = scope_->begin(watch_);
     } catch (...) {
@@ -521,7 +530,18 @@ class update_file_op final : public pipeline_node {
       complete_value();
       return;
     }
-    switch (scope_->end(watch_)) {
+    // end() drains the reducer into the hasher, so the contract checks on
+    // that path (contract.hpp) throw from here rather than from a stage;
+    // the blocking entry points let that propagate out of run(), and this
+    // one has the sender's own error channel for it.
+    typename scope_type::outcome done = scope_type::outcome::value;
+    try {
+      done = scope_->end(watch_);
+    } catch (...) {
+      blake3pp::ex::set_error(std::move(rcvr_), std::current_exception());
+      return;
+    }
+    switch (done) {
       case scope_type::outcome::exception:
         blake3pp::ex::set_error(std::move(rcvr_), scope_->exception());
         return;
@@ -571,6 +591,7 @@ class update_file_op final : public pipeline_node {
   std::filesystem::path path_;
   Sched sched_;
   file_io_options opts_;
+  Tracer tracer_;
   Receiver rcvr_;
   blake3pp::ex::inplace_stop_source stop_;
   blake3pp::detail::pipeline_plan plan_{};
@@ -613,7 +634,8 @@ struct sender_env {
 
 // The sender for both entry points: the value is a digest or nothing,
 // and everything else about them is the same.
-template <stack_budget Budget, class Sched, class Value, class Options>
+template <stack_budget Budget, class Sched, class Value, class Options,
+          tracer Tracer = null_tracer>
 class update_file_sender {
  public:
   using sender_concept = blake3pp::detail::ex_compat::sender_tag;
@@ -624,30 +646,35 @@ class update_file_sender {
       blake3pp::ex::set_stopped_t());
 
   update_file_sender(basic_io_context<Budget>& ctx, hasher* h,
-                     std::filesystem::path path, Sched sched, Options opts)
+                     std::filesystem::path path, Sched sched, Options opts,
+                     Tracer tracer = Tracer{})
       : ctx_(&ctx),
         h_(h),
         path_(std::move(path)),
         sched_(std::move(sched)),
-        opts_(opts) {}
+        opts_(opts),
+        tracer_(tracer) {}
 
   [[nodiscard]] sender_env get_env() const noexcept {
     return {ctx_->scheduler()};
   }
 
   // The scope and its cell store, named here so connect() can spell the
-  // operation state's type.
+  // operation state's type. The tracer is part of that type, which is
+  // why it is an argument of the sender rather than a field of the
+  // options.
   using scope_type =
-      blake3pp::detail::window_scope<false, Budget, io_driver, Sched>;
+      blake3pp::detail::window_scope<Tracer, Budget, io_driver, Sched>;
   using cells_type = blake3pp::detail::pipeline_cells_for<scope_type>;
 
   template <class Receiver>
-  [[nodiscard]] update_file_op<Budget, Sched, Receiver, Value, cells_type>
+  [[nodiscard]] update_file_op<Budget, Sched, Receiver, Value, cells_type,
+                               Tracer>
   connect(Receiver r) const {
     if constexpr (std::is_void_v<Value>) {
-      return {*ctx_, *h_, path_, sched_, opts_, std::move(r)};
+      return {*ctx_, *h_, path_, sched_, opts_, tracer_, std::move(r)};
     } else {
-      return {*ctx_, path_, sched_, opts_, std::move(r)};
+      return {*ctx_, path_, sched_, opts_, tracer_, std::move(r)};
     }
   }
 
@@ -657,6 +684,7 @@ class update_file_sender {
   std::filesystem::path path_;
   Sched sched_;
   Options opts_;
+  Tracer tracer_;
 };
 
 }  // namespace detail
@@ -677,15 +705,22 @@ class update_file_sender {
 /// @param sched  Where the subtree compressions run.
 /// @param opts   Per-call knobs. The window geometry is the context's;
 ///               what is left here is direct_io, which can only turn the
-///               context's default off.
-template <stack_budget Budget, class Sched>
+///               context's default off. `opts.trace` is not consulted:
+///               tracing is the next argument.
+/// @param tracer How to record (<blake3pp/trace.hpp>): the default
+///               null_tracer records nothing; buffer_tracer{&buf} fills
+///               the buffer with this file's window records. A type
+///               rather than an option, because it becomes part of the
+///               operation state's type.
+template <stack_budget Budget, class Sched, tracer Tracer = null_tracer>
   requires ex::scheduler<std::remove_cvref_t<Sched>>
 [[nodiscard]] auto async_update_file(basic_io_context<Budget>& ctx, hasher& h,
                                      std::filesystem::path path, Sched&& sched,
-                                     const file_io_options& opts = {}) {
+                                     const file_io_options& opts = {},
+                                     Tracer tracer = {}) {
   return detail::update_file_sender<Budget, std::remove_cvref_t<Sched>, void,
-                                    file_io_options>(
-      ctx, &h, std::move(path), std::forward<Sched>(sched), opts);
+                                    file_io_options, Tracer>(
+      ctx, &h, std::move(path), std::forward<Sched>(sched), opts, tracer);
 }
 
 /// Hashes a whole file over a context, as a sender.
@@ -698,16 +733,18 @@ template <stack_budget Budget, class Sched>
 /// @param path   The file to read; copied.
 /// @param sched  Where the subtree compressions run.
 /// @param opts   Per-call knobs: the arch, the mode, and direct_io. Copied
-///               into the operation, so a key-derivation context in the
-///               mode must outlive the operation, not just this call.
-template <stack_budget Budget, class Sched>
+///               into the operation, mode included, so nothing it names
+///               has to outlive the call. `opts.trace` is not consulted.
+/// @param tracer How to record, as for async_update_file().
+template <stack_budget Budget, class Sched, tracer Tracer = null_tracer>
   requires ex::scheduler<std::remove_cvref_t<Sched>>
 [[nodiscard]] auto async_hash_file(basic_io_context<Budget>& ctx,
                                    std::filesystem::path path, Sched&& sched,
-                                   const hash_file_options& opts = {}) {
+                                   const hash_file_options& opts = {},
+                                   Tracer tracer = {}) {
   return detail::update_file_sender<Budget, std::remove_cvref_t<Sched>, digest,
-                                    hash_file_options>(
-      ctx, nullptr, std::move(path), std::forward<Sched>(sched), opts);
+                                    hash_file_options, Tracer>(
+      ctx, nullptr, std::move(path), std::forward<Sched>(sched), opts, tracer);
 }
 
 /// How one file of a many-files operation ended. The outcome is reported
@@ -728,9 +765,11 @@ struct file_outcome {
 
 /// Knobs for async_update_files().
 struct many_files_options {
-  /// Files in flight at once. Zero means the context's windows divided
-  /// by its queue depth, which is as many as can each hold a full queue
-  /// of windows without starving one another.
+  /// Files in flight at once. Zero means as many as the context has
+  /// windows, so that every file in flight can hold a window; the
+  /// context's window admission shares them out from there. A file
+  /// smaller than one window is one read, so this is the count that
+  /// keeps a device and a pool busy over many small files.
   unsigned in_flight = 0;
   /// Per-file knobs, as for async_update_file().
   file_io_options io{};
@@ -750,34 +789,39 @@ namespace detail {
 // failures are outcomes, not completions: one unreadable file does not
 // end the run.
 template <stack_budget Budget, class Sched, class MakeHasher, class OnDone,
-          class Receiver>
+          class Receiver, tracer Tracer>
 class update_files_op final : public pipeline_node {
  public:
   using operation_state_concept =
       blake3pp::detail::ex_compat::operation_state_tag;
-  using child_sender = update_file_sender<Budget, Sched, void, file_io_options>;
+  using child_sender =
+      update_file_sender<Budget, Sched, void, file_io_options, Tracer>;
 
   update_files_op(basic_io_context<Budget>& ctx,
                   std::span<const std::filesystem::path> paths, Sched sched,
                   const many_files_options& opts, MakeHasher make, OnDone done,
-                  Receiver r)
+                  Tracer tracer, Receiver r)
       : ctx_(&ctx),
         paths_(paths),
         sched_(std::move(sched)),
         opts_(opts),
         make_(std::move(make)),
         done_(std::move(done)),
+        tracer_(tracer),
         rcvr_(std::move(r)) {}
 
   update_files_op(const update_files_op&) = delete;
   update_files_op& operator=(const update_files_op&) = delete;
 
   void start() noexcept {
+    // One slot per window rather than one per full read queue: a slot
+    // reserving a queue of windows under-counts the files exactly where
+    // files are small and need one read each. Measured on 32 cores over
+    // 2000 x 1 MiB files: 3.7 GiB/s at two slots, 11.6 at eight, 15.0 at
+    // sixteen, and within 5% of that from there to sixty-four.
     const unsigned width =
-        opts_.in_flight != 0
-            ? opts_.in_flight
-            : std::max(1u, ctx_->windows() /
-                               std::max(1u, ctx_->plan().reads_in_flight));
+        opts_.in_flight != 0 ? opts_.in_flight : std::max(1u, ctx_->windows());
+    watch_receiver_stop();
     try {
       // Slots hold operation states, which do not move: one allocation,
       // sized once, never grown.
@@ -799,11 +843,11 @@ class update_files_op final : public pipeline_node {
         s.h.reset();
         s.reported = false;
       }
-      if (!s.op && !stop_requested_ && next_ < paths_.size()) {
+      if (!s.op && !stop_.stop_requested() && next_ < paths_.size()) {
         start_slot(s, next_++);
       }
     }
-    if (stop_requested_) {
+    if (stop_.stop_requested()) {
       // Files that never started are stopped outcomes, reported in order.
       while (next_ < paths_.size()) {
         done_(next_, spare_, file_outcome{.stopped = true});
@@ -819,12 +863,17 @@ class update_files_op final : public pipeline_node {
 
   [[nodiscard]] unsigned outstanding() const noexcept override { return 0; }
 
-  void request_stop() noexcept override { stop_requested_ = true; }
+  // From the context's own request_stop, on the running thread. The
+  // receiver's token arrives through the same source from any thread.
+  void request_stop() noexcept override { stop_.request_stop(); }
 
   void report() noexcept override {
+    // The receiver's stop is done with before anything is reported: the
+    // callback's destructor waits out one already running.
+    rcvr_watch_.reset();
     if (eptr_ != nullptr) {
       blake3pp::ex::set_error(std::move(rcvr_), std::move(eptr_));
-    } else if (stop_requested_) {
+    } else if (stop_.stop_requested()) {
       blake3pp::ex::set_stopped(std::move(rcvr_));
     } else {
       blake3pp::ex::set_value(std::move(rcvr_));
@@ -834,10 +883,25 @@ class update_files_op final : public pipeline_node {
  private:
   struct slot;
 
+  // The environment a child runs in: the parent's stop token, so a stop
+  // the parent took -- the context's, or the receiver's -- reaches every
+  // file already in flight through the child's own watch, and not only the
+  // files not yet started.
+  struct child_env {
+    blake3pp::ex::inplace_stop_token token;
+    [[nodiscard]] blake3pp::ex::inplace_stop_token query(
+        blake3pp::ex::get_stop_token_t) const noexcept {
+      return token;
+    }
+  };
+
   // What a child completes into: the slot's outcome, through the parent.
   struct child_receiver {
     using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
     child_receiver(update_files_op* op, slot* s) noexcept : op_(op), s_(s) {}
+    [[nodiscard]] child_env get_env() const noexcept {
+      return {op_->stop_.get_token()};
+    }
     void set_value() const noexcept { op_->child_done(*s_, {}); }
     void set_error(std::error_code ec) const noexcept {
       op_->child_done(*s_, file_outcome{.error = ec});
@@ -855,6 +919,31 @@ class update_files_op final : public pipeline_node {
   };
   using child_op = blake3pp::ex::connect_result_t<child_sender, child_receiver>;
 
+  // A stop from the receiver -- a when_all sibling failing, a stop_when --
+  // requests the same source the context's request_stop() does, and nudges
+  // the driver: the round that reports the files that never started is the
+  // one this has to bring about.
+  struct forward_stop_and_wake {
+    update_files_op* op;
+    void operator()() const noexcept {
+      op->stop_.request_stop();
+      op->ctx_->driver().wake();
+    }
+  };
+  using receiver_token =
+      blake3pp::ex::stop_token_of_t<blake3pp::ex::env_of_t<Receiver>>;
+  using receiver_watch =
+      blake3pp::ex::stop_callback_for_t<receiver_token, forward_stop_and_wake>;
+
+  void watch_receiver_stop() noexcept {
+    auto token = blake3pp::ex::get_stop_token(blake3pp::ex::get_env(rcvr_));
+    if constexpr (blake3pp::ex::unstoppable_token<receiver_token>) {
+      (void)token;
+    } else {
+      rcvr_watch_.emplace(std::move(token), forward_stop_and_wake{this});
+    }
+  }
+
   struct slot {
     std::size_t index = 0;
     std::optional<hasher> h;
@@ -870,7 +959,7 @@ class update_files_op final : public pipeline_node {
     operator child_op() const {
       return blake3pp::ex::connect(
           child_sender(*op->ctx_, &*s->h, op->paths_[s->index], op->sched_,
-                       op->opts_.io),
+                       op->opts_.io, op->tracer_),
           child_receiver{op, s});
     }
   };
@@ -908,17 +997,23 @@ class update_files_op final : public pipeline_node {
   many_files_options opts_;
   MakeHasher make_;
   OnDone done_;
+  Tracer tracer_;
   Receiver rcvr_;
   std::unique_ptr<slot[]> slots_;
   std::size_t width_ = 0;
   hasher spare_{};  // what a file that never started is reported with
   std::size_t next_ = 0;
   std::size_t reported_ = 0;
-  bool stop_requested_ = false;
+  // The one stop of this run: the context's request_stop() and the
+  // receiver's token both go through it, and every child reads it from its
+  // environment.
+  blake3pp::ex::inplace_stop_source stop_;
+  std::optional<receiver_watch> rcvr_watch_;
   std::exception_ptr eptr_;
 };
 
-template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
+template <stack_budget Budget, class Sched, class MakeHasher, class OnDone,
+          tracer Tracer = null_tracer>
 class update_files_sender {
  public:
   using sender_concept = blake3pp::detail::ex_compat::sender_tag;
@@ -929,22 +1024,25 @@ class update_files_sender {
   update_files_sender(basic_io_context<Budget>& ctx,
                       std::span<const std::filesystem::path> paths,
                       Sched sched, const many_files_options& opts,
-                      MakeHasher make, OnDone done)
+                      MakeHasher make, OnDone done, Tracer tracer = Tracer{})
       : ctx_(&ctx),
         paths_(paths),
         sched_(std::move(sched)),
         opts_(opts),
         make_(std::move(make)),
-        done_(std::move(done)) {}
+        done_(std::move(done)),
+        tracer_(tracer) {}
 
   [[nodiscard]] sender_env get_env() const noexcept {
     return {ctx_->scheduler()};
   }
 
   template <class Receiver>
-  [[nodiscard]] update_files_op<Budget, Sched, MakeHasher, OnDone, Receiver>
+  [[nodiscard]] update_files_op<Budget, Sched, MakeHasher, OnDone, Receiver,
+                                Tracer>
   connect(Receiver r) const {
-    return {*ctx_, paths_, sched_, opts_, make_, done_, std::move(r)};
+    return {*ctx_, paths_, sched_, opts_, make_, done_, tracer_,
+            std::move(r)};
   }
 
  private:
@@ -954,6 +1052,7 @@ class update_files_sender {
   many_files_options opts_;
   MakeHasher make_;
   OnDone done_;
+  Tracer tracer_;
 };
 
 // Where sync_wait() parks a completion. `done` is atomic and the
@@ -1028,7 +1127,12 @@ struct sync_receiver {
 ///               with its mode (plain, keyed, derive_key) and variant.
 /// @param done   `void(std::size_t index, hasher& h, const
 ///               file_outcome&) noexcept`: the file's end.
-template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
+/// @param tracer How to record, as for async_update_file(): one buffer
+///               for every file in flight, whose window records carry
+///               the window index within its file. `opts.io.trace` is
+///               not consulted.
+template <stack_budget Budget, class Sched, class MakeHasher, class OnDone,
+          tracer Tracer = null_tracer>
   requires ex::scheduler<std::remove_cvref_t<Sched>> &&
            std::is_invocable_r_v<hasher, MakeHasher&, std::size_t> &&
            std::is_nothrow_invocable_v<OnDone&, std::size_t, hasher&,
@@ -1037,11 +1141,12 @@ template <stack_budget Budget, class Sched, class MakeHasher, class OnDone>
                                       std::span<const std::filesystem::path> paths,
                                       Sched&& sched,
                                       const many_files_options& opts,
-                                      MakeHasher make, OnDone done) {
+                                      MakeHasher make, OnDone done,
+                                      Tracer tracer = {}) {
   return detail::update_files_sender<Budget, std::remove_cvref_t<Sched>,
-                                     MakeHasher, OnDone>(
+                                     MakeHasher, OnDone, Tracer>(
       ctx, paths, std::forward<Sched>(sched), opts, std::move(make),
-      std::move(done));
+      std::move(done), tracer);
 }
 
 /// Starts `sndr` and drives the context on this thread until it

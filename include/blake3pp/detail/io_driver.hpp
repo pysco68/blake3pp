@@ -117,17 +117,25 @@ class io_driver {
   [[nodiscard]] std::size_t in_flight() const noexcept;
   // Waits out every read still owed, running no callback, and forgets
   // the rest. The invariant it establishes: afterwards in_flight() is
-  // zero and the driver references no io_op, so the caller may
-  // destroy the ops it submitted. The driver stays usable. The
-  // destructor drains too, a no-op after this.
+  // zero, the driver references no io_op, and every op it owed has
+  // `live` lowered, so the caller may destroy the ops it submitted or
+  // sweep them with cancel() and meet nothing. The driver stays usable.
+  // The destructor drains too, a no-op after this.
   void drain() noexcept;
   // The same for one file: afterwards no transfer of this file is owed or
-  // referenced, so its buffers and the operations naming them may be
-  // destroyed, and the driver stays usable for every other file. A
-  // sibling file's completion that surfaces during the wait is reported
+  // referenced and its operations have `live` lowered, so its buffers and
+  // the operations naming them may be destroyed, and the driver stays
+  // usable for this file and every other.
+  // A sibling file's completion that surfaces during the wait is reported
   // normally -- dropping it would strand an op that can never complete --
-  // so a caller closing one file of several should idle it first. The
-  // file's destructor does this.
+  // so a caller closing one file of several should idle it first.
+  //
+  // The file's destructor does NOT do this: it cannot, because the
+  // operations whose transfers would be forgotten may already be gone, and
+  // reading them is what this call does. A file destroyed with transfers
+  // still owed drains the WHOLE context instead, which is the backends'
+  // last resort and strands every sibling's owed transfer. Call this while
+  // the operations are alive.
   void drain(file& f) noexcept;
 
   // Takes the window memory: one direct-I/O-aligned arena of

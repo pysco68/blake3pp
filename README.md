@@ -69,8 +69,7 @@ length, seekable streams of data which is perfect for test data generation.
 
 The drive column is the same reader with hashing switched off, on the
 same machine and the same file: the ceiling any tool on that box is
-working against. Pacing is a property of the device,
-not a constant, and the wider window raises the ceiling as well as the
+working against. The wider window raises both that ceiling and the
 result.
 </details>
 
@@ -146,7 +145,10 @@ All of this, rendered and searchable, with a version for every release:
 | [The API](docs/api.md) | the guide across the library: what you compute, how you feed it, what runs it, what it costs |
 | [Inside the pipeline](docs/pipeline.md) | how a file becomes sender chains: one window's chain, the rules that hold it, and the tree reducer |
 | [Many files at once](docs/async.md) | EXPERIMENTAL: file hashing as senders over a context you drive |
-| [Architectures and kernels](docs/architectures.md) | details about every kernel a build carries and why the WASM build is an edge case |
+| [Direct I/O](docs/direct-io.md) | what `direct_io` asks for on each platform, the alignment contract, and when buffered is the right call |
+| [Architectures and kernels](docs/architectures.md) | every kernel a build carries, how it is tested, and what has no kernel yet |
+| [Polyfills](docs/polyfills.md) | the SIMD and execution providers: what may stand in for what, and what a choice cannot change |
+| [Performance tracing](docs/tracing.md) | where a file run's time went, and reading one in the tools |
 | [Command-line tools](docs/tools.md) | `blake3ppsum` and `blake3ppgen` |
 | [Integration](docs/integration.md) | vendoring, installing, and `find_package` |
 | [Building](docs/building.md) | presets, the toolchain images, cmake-re, and the kernel switches |
@@ -215,9 +217,13 @@ The rule behind the split, and which header owns which dependency, is in
   machines conservatively report scalar. The CLI tools opt in at
   startup, since a standalone binary owns its process.
 - The sequential compute API (`core.hpp`, `dispatch.hpp`) is `noexcept`
-  end to end, with one exception: `digest::to_hex()` builds a
-  `std::string` (use `to_hex_chars()` for the allocation-free,
-  nonthrowing form). The I/O layer throws `std::system_error`, or
+  end to end for valid input. Two kinds of call are not: the ones that
+  build a `std::string` (`digest::to_hex()` and free `to_hex(bytes)`; the
+  span-filling `to_hex_chars()` is the allocation-free form), and the
+  checked preconditions of the expert seams (`push_subtree_cv()`,
+  `to_hex(bytes, out)` and the reducer), which throw
+  `std::invalid_argument` or `std::length_error` in every build rather
+  than write a wrong digest. The I/O layer throws `std::system_error`, or
   reports through the `std::error_code` overloads, which also fold
   allocation failure into an error code. The scheduler-taking parallel
   APIs propagate whatever the execution provider raises, plus

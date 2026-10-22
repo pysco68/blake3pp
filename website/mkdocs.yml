@@ -60,8 +60,13 @@ nav:
   - Home: index.md
   - Guide:
       - The API: api.md
+      - Inside the pipeline: pipeline.md
+      - Many files at once: async.md
+      - Direct I/O: direct-io.md
       - Architectures and kernels: architectures.md
+      - Polyfills: polyfills.md
       - Performance: performance.md
+      - Performance tracing: tracing.md
       - Command-line tools: tools.md
   - Examples:
       - Overview: examples/index.md
@@ -80,9 +85,11 @@ nav:
       - blake3pp.hpp: reference/blake3pp.md
       - core.hpp: reference/core.md
       - io.hpp: reference/io.md
+      - async_io.hpp: reference/async_io.md
       - parallel.hpp: reference/parallel.md
       - parallel_io.hpp: reference/parallel_io.md
       - parallel_backend.hpp: reference/parallel_backend.md
+      - trace.hpp: reference/trace.md
       - dispatch.hpp: reference/dispatch.md
   - Building:
       - Building: building.md

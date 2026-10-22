@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <type_traits>
 #include <vector>
 
 #include <blake3pp/io.hpp>
@@ -647,6 +649,59 @@ TEST_CASE("reader reports a backend") {
   CHECK(r.file_size() == content.size());
   MESSAGE("file_reader backend: " << r.backend());
   CHECK(!r.backend().empty());
+}
+
+// What a file would get, answered without reading it: the plan's
+// geometry and open mode from the size, and the rung the open lands on.
+// The size rule shows here as it shows in strace: a small file is never
+// opened for the cache bypass, a large one is when asked and the
+// filesystem allows, and the name agrees with the mode either way.
+TEST_CASE("probe_file_io reports the open mode and the rung without reading") {
+  const auto small = make_input(100 * 1000);
+  const auto large = make_input(1024 * 1024);
+  const temp_file fs(small);
+  const temp_file fl(large);
+
+  const auto ps = blake3pp::probe_file_io(fs.path);
+  MESSAGE("small: " << ps.backend);
+  CHECK(ps.file_bytes == small.size());
+  CHECK(!ps.direct_io);
+  CHECK(ps.windows == 1);
+  CHECK(ps.backend.find("direct") == std::string::npos);
+  CHECK(ps.backend.find("nocache") == std::string::npos);
+
+  const auto pl = blake3pp::probe_file_io(fl.path);
+  MESSAGE("large: " << pl.backend);
+  CHECK(pl.file_bytes == large.size());
+  CHECK(pl.direct_io);
+  CHECK(pl.window_bytes == blake3pp::detail::rounded_window_bytes(
+                               blake3pp::file_io_options{}.window_bytes));
+  CHECK(pl.reads_in_flight == blake3pp::detail::clamp_queue_depth(
+                                  blake3pp::file_io_options{}.queue_depth));
+  CHECK(pl.windows == 1);
+  CHECK(!pl.backend.empty());
+
+  // The caller's refusal is final, whatever the size.
+  const auto pb = blake3pp::probe_file_io(fl.path, {.direct_io = false});
+  CHECK(!pb.direct_io);
+  CHECK(pb.backend.find("direct") == std::string::npos);
+
+  // The geometry is the plan's: a request is rounded as the pipeline
+  // rounds it, and a file gets no more windows than it has.
+  const auto pg = blake3pp::probe_file_io(
+      fl.path, {.window_bytes = 100 * 1024, .queue_depth = 8});
+  CHECK(pg.window_bytes == 64 * 1024);
+  CHECK(pg.reads_in_flight == 8);
+  CHECK(pg.windows == 16);
+
+  // A missing file is reported both ways.
+  const std::filesystem::path missing = fs.path.string() + ".missing";
+  CHECK_THROWS_AS((void)blake3pp::probe_file_io(missing), std::system_error);
+  std::error_code ec;
+  const auto pm = blake3pp::probe_file_io(missing, ec);
+  CHECK(ec);
+  CHECK(pm.backend.empty());
+  CHECK(pm.file_bytes == 0);
 }
 
 // The engaged rung, asserted rather than merely printed.

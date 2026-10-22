@@ -391,15 +391,15 @@ class null_driver {
     return {slice, std::span<const std::byte>(slice)};
   }
 
-  void submit_read(file&, std::uint64_t, std::span<std::byte>,
+  void submit_read(file& f, std::uint64_t, std::span<std::byte>,
                    blake3pp::detail::io_op& op) noexcept {
-    reads_.push(op);
+    reads_.push(op, &f);
   }
   // The sink half: the bytes are already where they were generated, so
   // the only work is reporting from poll() and not before.
-  void submit_write(file&, std::uint64_t, std::span<const std::byte>,
+  void submit_write(file& f, std::uint64_t, std::span<const std::byte>,
                     blake3pp::detail::io_op& op) noexcept {
-    reads_.push(op);
+    reads_.push(op, &f);
   }
   void flush() noexcept {}
   std::size_t poll(bool block) { return reads_.poll(block); }
@@ -409,8 +409,9 @@ class null_driver {
     return reads_.in_flight();
   }
   void drain() noexcept { reads_.drain(); }
-  // Nothing here is in the OS's hands, so one file's share is all of it.
-  void drain(file&) noexcept { reads_.drain(); }
+  // Nothing here is in the OS's hands; one file's share is its own queued
+  // operations, as on the memory driver.
+  void drain(file& f) noexcept { reads_.drain(&f); }
 
  private:
   std::uint64_t size_;
@@ -563,6 +564,10 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
   const auto& d = trace.driver();
   if (d.iterations > 0) {
     const double driver_ns = static_cast<double>(d.busy_ns + d.parked_ns);
+    if (const std::string_view rung = blake3pp::read_backend(d);
+        !rung.empty()) {
+      println(stdout, "    read backend: {}", rung);
+    }
     println(stdout,
             "    driver busy {:5.1f}% of its own {:.3f} s, {} iterations, {} "
             "polls ({} blocking, {} woken), {} completions, {} admission "

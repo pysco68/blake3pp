@@ -47,6 +47,7 @@ OPTIONS:
                               I/O window size in MiB
           --qd UINT [4]       I/O queue depth (the reader clamps it to its range)
           --no-direct         keep the OS page cache (no O_DIRECT)
+          --no-async          read synchronously (no io_uring/IOCP/GCD queue)
           --inline-submit     issue reads inline in the submitting thread, not on io_uring's
                               workers
 ```
@@ -97,8 +98,9 @@ OPTIONS:
           --window UINT Needs: --output
                               with --output: write buffer size in MiB (default: 4 MiB per
                               generator thread, so every fill fans out fully)
-          --qd UINT [4]  Needs: --output
-                              with --output: write buffers in flight (the writer clamps it to
+          --qd UINT Needs: --output
+                              with --output: write buffers in flight (default: one per
+                              generator thread, or 2 with --threads 1; the writer clamps it to
                               its range)
   -v,     --verbose           report the engaged write backend on stderr
           --threads UINT:THREADS [<cores>]

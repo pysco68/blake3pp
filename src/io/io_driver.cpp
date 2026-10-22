@@ -38,6 +38,16 @@ static_assert(io_driver::direct_alignment == io_impl::direct_align,
               "the alignment callers plan their reads around must be the "
               "one the backends enforce");
 
+// Takes an operation off the driver's owed list. The list is circular
+// around a sentinel the driver owns, so no unlink needs the head.
+void unlink_owed(io_op& op) noexcept {
+  op.owed_prev->owed_next = op.owed_next;
+  op.owed_next->owed_prev = op.owed_prev;
+  op.owed_next = op.owed_prev = nullptr;
+  op.owed_by = nullptr;
+  op.live = false;
+}
+
 // The backend completes its own op; this carries that across to the
 // caller's, which is the only one the pipeline knows about.
 void trampoline(io_impl::transfer_base* base, std::error_code ec) noexcept {
@@ -45,7 +55,7 @@ void trampoline(io_impl::transfer_base* base, std::error_code ec) noexcept {
   // The transfer is settled before the callback runs, so a callback that
   // resubmits this operation -- or a sweep that runs after it -- sees the
   // storage as what it is: nothing the driver owes.
-  outer->live = false;
+  unlink_owed(*outer);
   outer->done(outer, ec);
 }
 }  // namespace
@@ -59,6 +69,10 @@ struct io_driver::impl {
   std::size_t window_bytes = 0;
   std::size_t arena_bytes = 0;
   context ctx;
+  // Every operation the context owes a callback, as the driver's
+  // callers know it: what a drain walks to lower `live` on the ones the
+  // context forgot without reporting.
+  io_op owed_sentinel{};
 #ifndef NDEBUG
   // A file holds a reference to the context that opened it. One that
   // outlives its driver is a use-after-free the backend would only report
@@ -69,20 +83,52 @@ struct io_driver::impl {
 
   impl(const io_driver_options& opts, unsigned max_inflight)
       : ctx(io_impl::reader_context_options{opts.async, opts.offload_submit},
-            max_inflight) {}
+            max_inflight) {
+    owed_sentinel.owed_next = owed_sentinel.owed_prev = &owed_sentinel;
+  }
+
+  void link_owed(io_op& op, const void* by) noexcept {
+    op.owed_by = by;
+    op.owed_next = owed_sentinel.owed_next;
+    op.owed_prev = &owed_sentinel;
+    owed_sentinel.owed_next->owed_prev = &op;
+    owed_sentinel.owed_next = &op;
+  }
+
+  // Drops the list without reading any operation on it, for the
+  // teardown paths whose operations may already be gone (a file destroyed
+  // with transfers owed, the driver's own destructor). Their `live` stays
+  // as it was: nothing here may touch them, which is why those paths are
+  // documented as the last resort and the pipelines drain explicitly.
+  void abandon_owed() noexcept {
+    owed_sentinel.owed_next = owed_sentinel.owed_prev = &owed_sentinel;
+  }
+
+  // Lowers `live` on every owed operation, or on those of one file, after
+  // the context has forgotten them: afterwards a cancel sweep that meets
+  // one of these sees an operation nobody owes. Only for the explicit
+  // drains, whose contract keeps the operations alive until they return.
+  void forget_owed(const void* by) noexcept {
+    io_op* op = owed_sentinel.owed_next;
+    while (op != &owed_sentinel) {
+      io_op* const next = op->owed_next;
+      if (by == nullptr || op->owed_by == by) {
+        unlink_owed(*op);
+      }
+      op = next;
+    }
+  }
 };
 
 struct io_driver::file::impl {
   context::file f;
-#ifndef NDEBUG
   io_driver::impl* drv = nullptr;
-#endif
 
   impl(io_driver::impl& d, const std::filesystem::path& path,
        const io_impl::file_open_options& how)
       : f(d.ctx, path, how) {
-#ifndef NDEBUG
     drv = &d;
+#ifndef NDEBUG
     ++d.live_files;
 #endif
   }
@@ -110,7 +156,10 @@ io_driver::~io_driver() {
          "an io_driver::file outlived its io_driver: every file must be "
          "destroyed before the driver it was opened on");
 #endif
-  drain();
+  // The context's drain, not drain(): the operations a caller left owed
+  // at destruction are not promised to exist any more.
+  impl_->ctx.drain();
+  impl_->abandon_owed();
 }
 
 io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
@@ -120,7 +169,19 @@ io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
           io_impl::file_open_options{how.write, how.direct_io,
                                      how.preallocate_bytes})) {}
 
-io_driver::file::~file() = default;
+// A file destroyed with transfers still owed makes the context drain
+// itself, which forgets every file's transfers without a callback. The
+// operations behind them may already be gone -- that is the reason this
+// path exists -- so the list is dropped unread and their `live` is not
+// lowered. Every owed operation is one the context has in flight, so an
+// empty context with a non-empty list is exactly that case.
+io_driver::file::~file() {
+  io_driver::impl& d = *impl_->drv;
+  impl_.reset();
+  if (d.ctx.in_flight() == 0) {
+    d.abandon_owed();
+  }
+}
 
 std::uint64_t io_driver::file::size() const noexcept {
   return impl_->f.size();
@@ -142,6 +203,7 @@ void io_driver::submit_read(file& f, std::uint64_t off,
   impl_->ctx.submit_read(f.impl_->f, off, buf, inner);
   // Taken: from here the context owes this operation a callback.
   op.live = true;
+  impl_->link_owed(op, &f);
 }
 
 void io_driver::submit_write(file& f, std::uint64_t off,
@@ -152,6 +214,7 @@ void io_driver::submit_write(file& f, std::uint64_t off,
   impl_->ctx.submit_write(f.impl_->f, off, buf, inner);
   // Taken: from here the context owes this operation a callback.
   op.live = true;
+  impl_->link_owed(op, &f);
 }
 
 void io_driver::flush() noexcept { impl_->ctx.flush(); }
@@ -180,9 +243,18 @@ std::size_t io_driver::in_flight() const noexcept {
   return impl_->ctx.in_flight();
 }
 
-void io_driver::drain() noexcept { impl_->ctx.drain(); }
+void io_driver::drain() noexcept {
+  impl_->ctx.drain();
+  impl_->forget_owed(nullptr);
+}
 
-void io_driver::drain(file& f) noexcept { impl_->ctx.forget(f.impl_->f); }
+void io_driver::drain(file& f) noexcept {
+  // A sibling's completion the wait surfaces is reported through the
+  // trampoline and unlinks itself; what is left of this file afterwards
+  // is what the context dropped.
+  impl_->ctx.forget(f.impl_->f);
+  impl_->forget_owed(&f);
+}
 
 void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
   // One arena per driver, taken once when its window pool is built.

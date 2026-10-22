@@ -159,7 +159,20 @@ class engine {
       return finish(h);
     }
     blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
-    if (pool_.parallel()) {
+    // Asking for the scheduler is what builds the pool, so a file too small
+    // to fan out does not ask. Below min_pipeline_bytes the library skips
+    // the pipeline and hashes sequentially anyway, and the threads would
+    // be started, parked and joined for nothing. Measured on 16 threads, best
+    // of eleven, a whole run took 7.6 ms with the pool and 4.8 ms without
+    // on a 64 KiB file, and 6.7 and 3.3 ms on an empty one. A size the
+    // filesystem will not give is treated as large: the pipeline is the
+    // better guess for a file of unknown size (a block device, a procfs
+    // entry).
+    std::error_code size_ec;
+    const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
+    const bool worth_a_pool =
+        size_ec || size >= blake3pp::detail::min_pipeline_bytes;
+    if (pool_.parallel() && worth_a_pool) {
       blake3pp::update_file(h, path, pool_.scheduler(), opts_.io);
     } else {
       blake3pp::update_file(h, path, opts_.io);
@@ -179,11 +192,11 @@ class engine {
   // Several files over one context, a bounded number in flight at a
   // time, each outcome reported as its file completes and in input order.
   //
-  // What this buys over calling hash_hex() per file is the arena: the
-  // blocking path allocates and first-touches windows * window_bytes per
-  // call and lets no two files overlap, while here one allocation serves
-  // every file and several are in flight at once. On a directory of
-  // small files that allocation is most of the work.
+  // The gain over calling hash_hex() per file is the arena. The blocking
+  // path allocates windows * window_bytes per call, takes the page faults
+  // of its first pass over it, and lets no two files overlap. Here one
+  // allocation serves every file, faults in once, and several files are
+  // in flight at once.
   //
   // A file that fails carries its message instead of a digest, so one bad
   // file does not end the run. report(index, result) says whether that
@@ -377,6 +390,7 @@ int main(int argc, char** argv) {
   options o;
   constexpr std::size_t mib = std::size_t{1} << 20;
   bool no_direct = false;
+  bool no_async = false;
   bool inline_submit = false;
 
   CLI::App app{
@@ -410,12 +424,14 @@ int main(int argc, char** argv) {
       ->capture_default_str();
 
   app.add_flag("--no-direct", no_direct, "keep the OS page cache (no O_DIRECT)");
+  app.add_flag("--no-async", no_async, "read synchronously (no io_uring/IOCP/GCD queue)");
   app.add_flag("--inline-submit", inline_submit, "issue reads inline in the submitting thread, not on io_uring's workers");
   app.add_option("files", o.files, "files to hash (or checksum lists)");
 
   CLI11_PARSE(app, argc, argv);
 
   o.io.direct_io = !no_direct;
+  o.io.async = !no_async;
   o.io.offload_submit = !inline_submit;
   if (!blake3pp::is_available(o.io.a)) {
     println(stderr, "blake3ppsum: arch '{}' not available on this machine (auto -> {})", blake3pp::to_string(o.io.a), blake3pp::to_string(blake3pp::best_available()));

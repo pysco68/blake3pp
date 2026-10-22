@@ -21,8 +21,9 @@ PRIVATE_NS = ("blake3pp::detail", "blake3pp::kern", "blake3pp::ex", "stdexec")
 # The order headers are presented in: the path a reader takes, not
 # alphabetical. Anything not listed still appears, after these.
 HEADER_ORDER = [
-    "blake3pp.hpp", "core.hpp", "io.hpp",
-    "parallel.hpp", "parallel_io.hpp", "parallel_backend.hpp", "dispatch.hpp",
+    "blake3pp.hpp", "core.hpp", "io.hpp", "async_io.hpp",
+    "parallel.hpp", "parallel_io.hpp", "parallel_backend.hpp", "trace.hpp",
+    "dispatch.hpp",
 ]
 
 # The order sections appear in, most-used first; anything unlisted follows.

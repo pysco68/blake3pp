@@ -31,6 +31,22 @@ static_assert(u32v::width <= max_simd_degree,
               "BLAKE3PP_MAX_SIMD_DEGREE is narrower than this kernel's "
               "simd_degree: it sizes the staging buffers this kernel fills");
 
+// A SIMD variant whose provider found no width for the target would
+// compile to a one-lane kernel: correct, as slow as the scalar one, and
+// registered under a name that says otherwise -- a dispatch table whose
+// avx2 entry is scalar. It happens where a provider has no backend for an
+// ISA the compiler itself supports (GCC 16's <simd> carries its arch
+// traits under x86 only, so a std-provider build elsewhere deduces one
+// lane), which is a build to decline rather than ship.
+//
+// The scalar variant is the one that means it, and BLAKE3PP_FORCE_SCALAR
+// is how a target asks for it by name.
+static_assert(u32v::width > 1 || arch::BLAKE3PP_ARCH_NS == arch::scalar,
+              "this simd provider has no vector width for the target: the "
+              "variant would be a one-lane kernel under a vector name. Pick "
+              "another BLAKE3PP_SIMD_PROVIDER for it, or build the scalar "
+              "variant instead");
+
 // Little-endian load and store, spelled memcpy plus byteswap instead of
 // the byte-wise shift-or idiom. GCC and Clang fold both spellings to a
 // single mov on LE targets. MSVC 19.51 does not recognize the shift-or
@@ -283,10 +299,10 @@ BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   // of the 32 zmm, so the message cannot fit beside it and what the compiler
   // keeps there it pays for twice over; freeing those registers is worth
   // 3-6% on the chunk shape alone (Zen 5, clang 22, 32 inputs per call) and
-  // 7.8% on the kernel row end to end, which docs/building.md quotes. An empty
-  // asm with an input-only constraint, so nothing is clobbered and the state
-  // stays register-resident: a memory clobber here forces the state out too
-  // and loses 4%.
+  // 7.8% on the kernel row, 8.5% end to end, which docs/building.md
+  // quotes. An empty asm with an input-only constraint, so nothing is
+  // clobbered and the state stays register-resident: a memory clobber here
+  // forces the state out too and loses 4%.
   //
   // Narrower widths do not want it: measured +0.8% and -1.8% on avx2 and
   // -0.1% on sse42, all inside the noise, because at eight lanes and 16
@@ -295,7 +311,13 @@ BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   // measure its own.
 #if defined(__AVX512F__) && (defined(__GNUC__) || defined(__clang__)) && \
     BLAKE3PP_KERNEL_PIN_MESSAGE
-  if constexpr (u32v::width >= 16) {
+  // Wide-word-only, like the staged_rounds gate below: u32v::width is the
+  // translation unit's width and says nothing about W. The scalar compress
+  // in this same TU -- the incremental hasher's partial block, and
+  // hash_many's remainder below pad_remainder_min -- has sixteen
+  // general-purpose registers and no register pressure to relieve, and
+  // nothing was measured for it.
+  if constexpr (std::is_same_v<W, u32v> && u32v::width >= 16) {
     asm volatile("" : : "r"(m));
   }
 #endif
@@ -311,29 +333,57 @@ BLAKE3PP_FORCE_INLINE void all_rounds(W v[16], const W m[16]) noexcept {
   }(std::make_index_sequence<7>{});
 }
 
+// A caller's 64-byte block in a form the word loads may read.
+//
+// See BLAKE3PP_ALIGN_MESSAGE_BLOCK: where a compiler merges the sixteen
+// word loads into element-width vector loads, a block the caller aligned
+// to nothing faults on the targets that require the type's alignment.
+// Every path that reads a block through load32() goes through this, so
+// the mitigation cannot be complete for one of them and missing for
+// another.
+//
+// Staging unconditionally does not work: the optimizer forwards the copy
+// and rebuilds the loads from the original pointer. The aligned case,
+// which is the common one, pays one predictable branch and no copy.
+class readable_block {
+ public:
+  explicit BLAKE3PP_FORCE_INLINE readable_block(
+      const std::uint8_t* block) noexcept
+      : at_(block) {
+#if BLAKE3PP_ALIGN_MESSAGE_BLOCK
+    if ((std::bit_cast<std::uintptr_t>(at_) &
+         (alignof(std::uint32_t) - 1)) != 0) {
+      std::memcpy(staged_, at_, block_len);
+      at_ = staged_;
+    }
+    at_ = static_cast<const std::uint8_t*>(
+        __builtin_assume_aligned(at_, alignof(std::uint32_t)));
+#endif
+  }
+  readable_block(const readable_block&) = delete;
+  readable_block& operator=(const readable_block&) = delete;
+
+  [[nodiscard]] BLAKE3PP_FORCE_INLINE const std::uint8_t* get()
+      const noexcept {
+    return at_;
+  }
+
+ private:
+#if BLAKE3PP_ALIGN_MESSAGE_BLOCK
+  alignas(std::uint32_t) std::uint8_t staged_ BLAKE3PP_CXXATTR_UNINITIALIZED
+      [block_len];
+#endif
+  const std::uint8_t* at_;
+};
+
 BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
                      const std::uint8_t block[block_len], std::uint32_t len,
                      std::uint64_t counter, std::uint32_t flags,
                      std::array<std::uint32_t, 16>& out) noexcept {
-  // See BLAKE3PP_ALIGN_MESSAGE_BLOCK. Where the merged load would fault,
-  // an unaligned block is copied once so that the address really is
-  // aligned.
-  //
-  // Staging it unconditionally does not work: the optimizer forwards the
-  // copy and rebuilds the loads from the original pointer. The aligned
-  // case, which is the common one, pays one predictable branch and no
-  // copy.
-  const std::uint8_t* src = block;
-#if BLAKE3PP_ALIGN_MESSAGE_BLOCK
-  alignas(std::uint32_t) std::uint8_t staged BLAKE3PP_CXXATTR_UNINITIALIZED [block_len];
-  if ((std::bit_cast<std::uintptr_t>(src) &
-       (alignof(std::uint32_t) - 1)) != 0) {
-    std::memcpy(staged, src, block_len);
-    src = staged;
-  }
-  src = static_cast<const std::uint8_t*>(
-      __builtin_assume_aligned(src, alignof(std::uint32_t)));
-#endif
+  // See readable_block: where the merged load would fault, an unaligned
+  // block is copied once so that the address really is aligned.
+  const readable_block in(block);
+  const std::uint8_t* const src = in.get();
 
   std::uint32_t m BLAKE3PP_CXXATTR_UNINITIALIZED [16];
   for (std::size_t i = 0; i < 16; ++i) {
@@ -403,25 +453,19 @@ BLAKE3PP_FORCE_INLINE counter_words counter_lanes(
   return {u32v::load(lo), u32v::load(hi)};
 }
 
-// Fills u32v::width consecutive XOF output blocks: the root node's cv and
-// message are BROADCAST (identical in every lane); only the counter varies
-// per lane. No input transpose exists at all; the store is the only
-// lane-major step.
-void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
-              std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
-              std::uint8_t* out) noexcept {
-  constexpr std::size_t W = u32v::width;
-
-  u32v m[16];
-  for (std::size_t i = 0; i < 16; ++i) {
-    m[i] = u32v::broadcast(load32(block + 4 * i));
-  }
-
-  const auto [ctr_lo, ctr_hi] = counter_lanes(counter, true);
-
-  u32v v[16];
+// The 16-word state a wide compression starts from: the chaining value
+// in words 0-7, as whatever the caller holds it as (a transposed vector
+// per word, or a scalar word to broadcast), then the IV, the per-lane
+// counter halves, the block length and the flags. The chaining value is
+// read through `cv_word(j)` rather than an array so that a broadcast
+// caller never stages its eight words through memory.
+template <class CvWord>
+BLAKE3PP_FORCE_INLINE void init_state(u32v v[16], const CvWord& cv_word,
+                                      u32v ctr_lo, u32v ctr_hi,
+                                      std::uint32_t len,
+                                      std::uint32_t flags) noexcept {
   for (std::size_t j = 0; j < 8; ++j) {
-    v[j] = u32v::broadcast(cv[j]);
+    v[j] = cv_word(j);
   }
   for (std::size_t j = 0; j < 4; ++j) {
     v[8 + j] = u32v::broadcast(iv[j]);
@@ -430,6 +474,37 @@ void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
   v[13] = ctr_hi;
   v[14] = u32v::broadcast(len);
   v[15] = u32v::broadcast(flags);
+}
+
+// The flags of block b of a chunk of `blocks`: the caller's, plus the
+// start flag on the first block and the end flag on the last.
+[[nodiscard]] constexpr std::uint32_t block_flags_for(
+    std::size_t b, std::size_t blocks, std::uint32_t flags,
+    std::uint32_t flags_start, std::uint32_t flags_end) noexcept {
+  return flags | (b == 0 ? flags_start : 0u) |
+         (b == blocks - 1 ? flags_end : 0u);
+}
+
+// Fills u32v::width consecutive XOF output blocks: the root node's cv and
+// message are BROADCAST (identical in every lane); only the counter varies
+// per lane. No input transpose exists at all; the store is the only
+// lane-major step.
+void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
+              std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
+              std::uint8_t* out) noexcept {
+  const readable_block in(block);
+
+  u32v m[16];
+  for (std::size_t i = 0; i < 16; ++i) {
+    m[i] = u32v::broadcast(load32(in.get() + 4 * i));
+  }
+
+  const auto [ctr_lo, ctr_hi] = counter_lanes(counter, true);
+
+  u32v v[16];
+  init_state(
+      v, [cv](std::size_t j) { return u32v::broadcast(cv[j]); }, ctr_lo,
+      ctr_hi, len, flags);
 
   all_rounds(v, m);
 
@@ -474,28 +549,13 @@ void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
   const auto [ctr_lo, ctr_hi] = counter_lanes(counter, increment_counter);
 
   for (std::size_t b = 0; b < blocks; ++b) {
-    std::uint32_t block_flags = flags;
-    if (b == 0) {
-      block_flags |= flags_start;
-    }
-    if (b == blocks - 1) {
-      block_flags |= flags_end;
-    }
-
     u32v m[16];
     load_transposed(inputs, b * block_len, m);
 
     u32v v[16];
-    for (std::size_t j = 0; j < 8; ++j) {
-      v[j] = cv[j];
-    }
-    for (std::size_t j = 0; j < 4; ++j) {
-      v[8 + j] = u32v::broadcast(iv[j]);
-    }
-    v[12] = ctr_lo;
-    v[13] = ctr_hi;
-    v[14] = u32v::broadcast(block_len);
-    v[15] = u32v::broadcast(block_flags);
+    init_state(
+        v, [&cv](std::size_t j) { return cv[j]; }, ctr_lo, ctr_hi,
+        block_len, block_flags_for(b, blocks, flags, flags_start, flags_end));
 
     all_rounds(v, m);
 
@@ -538,11 +598,11 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
   // threshold is where one batch undercuts that many scalar blocks.
   if constexpr (u32v::width > 1) {
     if (const std::size_t rem = num_inputs - i; rem >= pad_remainder_min) {
-      const std::uint8_t* padded[u32v::width];
+      const std::uint8_t* padded BLAKE3PP_CXXATTR_UNINITIALIZED [u32v::width];
       for (std::size_t l = 0; l < u32v::width; ++l) {
         padded[l] = inputs[i + (l < rem ? l : rem - 1)];
       }
-      std::uint8_t tmp[u32v::width * out_len];
+      std::uint8_t tmp BLAKE3PP_CXXATTR_UNINITIALIZED [u32v::width * out_len];
       hash_batch(padded, blocks, key, counter + (increment_counter ? i : 0),
                  increment_counter, flags, flags_start, flags_end, tmp);
       std::memcpy(out + i * out_len, tmp, rem * out_len);
@@ -556,18 +616,12 @@ void hash_many(const std::uint8_t* const* inputs, std::size_t num_inputs,
     }
     const std::uint64_t ctr = counter + (increment_counter ? i : 0);
     for (std::size_t b = 0; b < blocks; ++b) {
-      std::uint32_t f = flags;
-      if (b == 0) {
-        f |= flags_start;
-      }
-      if (b == blocks - 1) {
-        f |= flags_end;
-      }
       // The inlined compress (not the exported compress_in_place): keeps
       // the chaining value in registers across the block loop instead of a
       // call plus CV store/reload round-trip per 64-byte block.
       std::array<std::uint32_t, 16> wide;
-      compress(cv.data(), inputs[i] + b * block_len, block_len, ctr, f,
+      compress(cv.data(), inputs[i] + b * block_len, block_len, ctr,
+               block_flags_for(b, blocks, flags, flags_start, flags_end),
                wide);
       for (std::size_t j = 0; j < 8; ++j) {
         cv[j] = wide[j];

@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 444" width="860" height="444" role="img" aria-label="Streaming against the one-shot, on every core">
+<style>
+  text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         fill: #24292f; }
+  .axis { stroke: #8b949e; stroke-width: 1; }
+  .grid { stroke: #d0d7de; stroke-width: 1; stroke-dasharray: 2 3; }
+  .muted { fill: #57606a; }
+  @media (prefers-color-scheme: dark) {
+    text { fill: #e6edf3; }
+    .axis { stroke: #6e7681; }
+    .grid { stroke: #30363d; }
+    .muted { fill: #9198a1; }
+  }
+</style>
+<text x="0" y="18" font-size="15" font-weight="600">Streaming against the one-shot, on every core</text>
+<text x="0" y="36" font-size="12" class="muted">each machine at its full thread count; parallel_hasher fed 8 MiB at a time; the copy is one core's memcpy of one 8 MiB window</text>
+<rect x="210" y="47" width="10" height="10" fill="#e8590c" rx="2"/>
+<text x="225" y="56" font-size="12">hash() on the pool</text>
+<rect x="373" y="47" width="10" height="10" fill="#1971c2" rx="2"/>
+<text x="388" y="56" font-size="12">parallel_hasher</text>
+<rect x="515" y="47" width="10" height="10" fill="#2f9e44" rx="2"/>
+<text x="530" y="56" font-size="12">one core's copy</text>
+<line class="grid" x1="210.0" y1="70" x2="210.0" y2="342"/>
+<text x="210.0" y="358" font-size="11" class="muted" text-anchor="middle">0</text>
+<line class="grid" x1="357.5" y1="70" x2="357.5" y2="342"/>
+<text x="357.5" y="358" font-size="11" class="muted" text-anchor="middle">20</text>
+<line class="grid" x1="505.0" y1="70" x2="505.0" y2="342"/>
+<text x="505.0" y="358" font-size="11" class="muted" text-anchor="middle">40</text>
+<line class="grid" x1="652.5" y1="70" x2="652.5" y2="342"/>
+<text x="652.5" y="358" font-size="11" class="muted" text-anchor="middle">60</text>
+<line class="grid" x1="800.0" y1="70" x2="800.0" y2="342"/>
+<text x="800.0" y="358" font-size="11" class="muted" text-anchor="middle">80</text>
+<line class="axis" x1="210" y1="70" x2="210" y2="342"/>
+<text x="202" y="108.0" font-size="12" text-anchor="end">Zen 5, 32 threads</text>
+<rect x="210" y="77.0" width="564.9" height="15" fill="#e8590c" rx="2"/>
+<text x="780.9" y="88.0" font-size="11" class="muted">76.6</text>
+<rect x="210" y="95.0" width="54.9" height="15" fill="#1971c2" rx="2"/>
+<text x="270.9" y="106.0" font-size="11" class="muted">7.45</text>
+<rect x="210" y="113.0" width="510.4" height="15" fill="#2f9e44" rx="2"/>
+<text x="726.4" y="124.0" font-size="11" class="muted">69.2</text>
+<text x="202" y="176.0" font-size="12" text-anchor="end">Sapphire Rapids, 22 threads</text>
+<rect x="210" y="145.0" width="391.6" height="15" fill="#e8590c" rx="2"/>
+<text x="607.6" y="156.0" font-size="11" class="muted">53.1</text>
+<rect x="210" y="163.0" width="41.2" height="15" fill="#1971c2" rx="2"/>
+<text x="257.2" y="174.0" font-size="11" class="muted">5.58</text>
+<rect x="210" y="181.0" width="103.2" height="15" fill="#2f9e44" rx="2"/>
+<text x="319.2" y="192.0" font-size="11" class="muted">14</text>
+<text x="202" y="244.0" font-size="12" text-anchor="end">Neoverse V2, 16 threads</text>
+<rect x="210" y="213.0" width="218.3" height="15" fill="#e8590c" rx="2"/>
+<text x="434.3" y="224.0" font-size="11" class="muted">29.6</text>
+<rect x="210" y="231.0" width="73.8" height="15" fill="#1971c2" rx="2"/>
+<text x="289.8" y="242.0" font-size="11" class="muted">10</text>
+<rect x="210" y="249.0" width="162.2" height="15" fill="#2f9e44" rx="2"/>
+<text x="378.2" y="260.0" font-size="11" class="muted">22</text>
+<text x="202" y="312.0" font-size="12" text-anchor="end">Apple M2, 8 threads</text>
+<rect x="210" y="281.0" width="77.4" height="15" fill="#e8590c" rx="2"/>
+<text x="293.4" y="292.0" font-size="11" class="muted">10.5</text>
+<rect x="210" y="299.0" width="58.3" height="15" fill="#1971c2" rx="2"/>
+<text x="274.3" y="310.0" font-size="11" class="muted">7.91</text>
+<rect x="210" y="317.0" width="350.3" height="15" fill="#2f9e44" rx="2"/>
+<text x="566.3" y="328.0" font-size="11" class="muted">47.5</text>
+<text x="0" y="382" font-size="11" class="muted">GiB/s, higher is better</text>
+<text x="0" y="400" font-size="10" class="muted">Zen 5, 32 threads: Ryzen AI MAX+ 395, WSL2, clang/musl, eb16605, 2026-10-02</text>
+<text x="0" y="414" font-size="10" class="muted">Sapphire Rapids, 22 threads: Xeon 8481C (GCP c3-standard-22), 4b7b949, 2026-10-03</text>
+<text x="0" y="428" font-size="10" class="muted">Neoverse V2, 16 threads: GCP Axion c4a-standard-16, 4b7b949, 2026-10-03</text>
+<text x="0" y="442" font-size="10" class="muted">Apple M2, 8 threads: M2 MacBook Air (fanless), appleclang, 582226e, 2026-10-02</text>
+</svg>

@@ -65,46 +65,57 @@ having to think about it:
 
 What a power-of-two window cannot fix is the tail: a file whose length
 is not a whole number of granules, or the last short write of a
-generator that stops mid-window. On Linux, every read and write first
-passes `may_ride()`, the one gate in `src/io/uring_backend.hpp` that
-decides whether a transfer -- the initial one, or what is left after a
-short completion -- may go on the ring at all: it refuses a length that
-is not a multiple of the granule, and, once direct I/O is engaged,
-refuses an offset that is not one either. Whatever it refuses goes on a
-deferred list instead, and `run_one_deferred()` walks that list
-synchronously, one entry per `poll()` call, through the plain buffered
-descriptor the direct one sits beside -- picking the transfer up exactly
-where the ring left off. Nothing above the backend can tell a window's
-bytes arrived whole on the ring from arriving mostly on the ring and
-finishing synchronously; both land in the same buffer. Windows' `place()`
-and its own deferred list apply the identical ladder, for the identical
-reason (`NO_BUFFERING` rejects the same shapes `O_DIRECT` does). GCD
-needs no deferred list for alignment at all, because `F_NOCACHE` imposes
-none -- its deferred list exists only for the separate case of GCD itself
-being unavailable.
+generator that stops mid-window. Almost every file has one, and a file
+smaller than a window is nothing else. On Linux, every piece of a
+transfer -- the initial one, or what is left after a short completion --
+passes `piece_for()` in `src/io/uring_backend.hpp`, which says how much
+of it the ring takes and through which descriptor: a direct file's piece
+rides the `O_DIRECT` descriptor for the whole granules it holds at a
+granule offset, and what that leaves -- the sub-granule end, a
+resumption off a boundary, and every piece of a buffered file -- rides
+the ring through the plain buffered descriptor that sits beside the
+direct one, which takes any shape. So the last window of a file is as
+asynchronous as the others, and the synchronous path inside `poll()`
+(`run_one_deferred()`, one entry per call) serves only a context with no
+ring, a submit the kernel refused and a zero-length transfer. Nothing
+above the backend can tell a window's bytes arrived through one
+descriptor from arriving through two; both land in the same buffer.
 
-## Degradation is visible, never silent
+Windows' `port_len()` asks the same question with one difference: the
+plain handle there is not overlapped and cannot be given to the port, so
+a `NO_BUFFERING` file's sub-granule rest -- at most 4095 bytes, once per
+file -- is the one piece that finishes synchronously; a buffered file on
+the port hands it every length whole. GCD needs none of this, because
+`F_NOCACHE` imposes no alignment -- its deferred list exists only for the
+separate case of GCD itself being unavailable.
+
+## What was actually engaged
 
 A file a filesystem will not open for direct I/O -- tmpfs, overlayfs,
 some network and virtual filesystems -- is read or written buffered
 instead, automatically: asking for `direct_io = true` and having it
 refused is not an error, and nothing throws because the device could not
-be bypassed. That is as far as "automatic" goes, though. A caller unable
-to tell afterward which path actually ran is not how this library
-behaves.
+be bypassed. Which rung was engaged is reported after the fact.
 
-Every reader and writer reports, after the fact, exactly which rung it
-landed on:
+Every reader and writer names the rung it landed on:
 
-- `file_reader::backend()` returns a `std::string_view`: `"io_uring+direct"`,
-  `"iocp+direct"`, `"gcd+nocache"`, `"pread"`, `"readfile"`, or `"stdio"`.
+- `blake3pp::probe_file_io(path, opts)` answers before any read: it opens
+  the file as `update_file()` would, returns the plan's geometry, whether
+  the bypass was asked for, and the rung the open landed on, then closes
+  it. The spellings are the same as below, so a buffered rung beside
+  `direct_io == true` says the filesystem declined.
+- During or after a hash the rung reaches a caller through the trace:
+  `blake3pp::read_backend(buffer.driver())` after an `update_file()` that
+  was given a `trace_buffer` ([Performance tracing](tracing.md)). The
+  spellings are `"io_uring+direct"`, `"iocp+direct"`, `"gcd+nocache"`,
+  `"pread"`, `"readfile"` and `"stdio"`.
 - `write_report::backend` names the write side the same way:
   `"io_uring+direct"`, `"iocp+direct"`, `"gcd-write+nocache"`, `"pwrite"`,
   `"writefile"`, or `"stdio"`.
 
 `"stdio"` is not a rung anything degrades to: it is the fixed answer on
-platforms with none of the three async engines (wasm), the same way it
-is the answer on no other platform. `" (inline submit)"` is appended on
+platforms with none of the three async engines (wasm), and on no other
+platform. `" (inline submit)"` is appended on
 Linux when `offload_submit` was turned off. When the async engine itself
 was asked for and refused, not just the cache bypass -- a kernel too old
 for io_uring, or io_uring blocked by seccomp policy -- the Linux backend
@@ -128,33 +139,39 @@ bet stops paying off, or actively costs, in a few shapes:
   I/O exists to refuse.
 - **A small file.** The extra reopen for the flag, and the granule
   bookkeeping around it, are a fixed cost per file; a long transfer
-  amortizes it and a short one does not.
+  amortizes it and a short one does not. Measured on four PCIe 5 drives
+  in RAID 0 over 1000 MiB of files per row, buffered reads 5-10% faster
+  than direct at every size up to 256 KiB and direct 12% faster at 1 MiB,
+  so the plan reads a file below `min_pipeline_bytes` (512 KiB, the size
+  at which the pipeline is skipped as well) through the page cache
+  whatever `direct_io` says. A file whose size the filesystem will not
+  give counts as large.
 - **A filesystem that refuses it.** Network filesystems, overlay and
   virtual filesystems, and some container volumes decline `O_DIRECT` /
   `FILE_FLAG_NO_BUFFERING` outright. The degradation above makes this
   work correctly, but what runs afterward is buffered I/O with an extra
   refused reopen paid for nothing.
-- **Linux kernels before 7.0, specifically.** Measured on a four-drive
-  PCIe 5 NVMe stripe through this pipeline: kernel 6.8 read 3.84 GiB/s
-  buffered against 6.79 GiB/s direct, with the reading thread spending
-  72% of wall time inside the kernel's own buffered-read copy path
-  rather than in this library's code; the same device on kernel 7.0 read
-  6.03 GiB/s buffered, matching its own direct throughput, with that
-  copy cost down to about two cores of io-wq work. Windows and macOS
-  show no such gap on any machine measured -- their buffered reads
-  measure the same as their direct ones. The pre-7.0 Linux gap is the
-  kernel's buffered-read path, not this library's; whether it still
-  applies to every kernel still in use is an open question.
-
-None of this argues for defaulting `direct_io` to `false` -- it is why
-the option exists rather than being assumed, and why turning it off is
-one flag away rather than a rebuild.
+- **Linux kernels before 7.0.** On a 48-vCPU EPYC Milan machine with a
+  local disk and kernel 6.8, this pipeline read 3.84 GiB/s buffered
+  against 6.79 GiB/s direct, with the reading thread spending 72% of wall
+  time inside the kernel's own buffered-read copy path rather than in
+  this library's code. On a kernel 7.0 machine with two local SSDs in
+  RAID 0 the buffered rate equals the direct one, 6.03 GiB/s both ways,
+  with the copy down to about two cores of io-wq work. Those are two
+  different machines, so what the pair shows is a pre-7.0 kernel path
+  that is gone on 7.0 rather than one device measured twice; whether a
+  given kernel still in use has it is a question for that kernel.
+  Buffered above about 6 GiB/s is a separate open item, and
+  [Performance](performance.md#direct-against-buffered) has both.
+  On Windows and on macOS the two measure the same, closely enough that an
+  M4 Max reads 6.12 GiB/s buffered against 5.86 direct -- buffered 4%
+  ahead of `F_NOCACHE`.
 
 ## How to tell what you got
 
-In code, read `backend()` on the reader or `write_report::backend` after
-a write -- the exact strings are in "Degradation is visible, never
-silent" above.
+In code, `write_report::backend` names the write side after a write, and
+`blake3pp::read_backend(trace.driver())` the read side -- the exact strings
+are in "What was actually engaged" above.
 
 From the command line:
 

@@ -134,14 +134,15 @@ the hasher's state, so a long stream can be checkpointed without giving
 up the hasher. How the input is chunked never changes the result.
 
 A caller that knows it is passing the last bytes says so with
-`update_last()` instead, after which only the finalize family may be
-called. BLAKE3 marks one node of the tree as the root, and which node that
+`update_last()` instead. BLAKE3 marks one node of the tree as the root, and which node that
 is depends on the message: the single chunk of a short message, or the top
 parent of anything longer. `update()` therefore has to keep the final
 chunk out of the wide batches in case the message ends there; told that it
 does end, that chunk goes through the batch with its neighbours, which is
 worth about 1.4x on messages of a few chunks. The one-shot `hash()`,
-`keyed_hash()` and `derive_key()` take this route already.
+`keyed_hash()` and `derive_key()` take this route already. Updating after
+`update_last()` is allowed and gives the same digest as if the message had
+been fed in one stream; all it costs is that batching.
 
 ### From memory, or from a file
 
@@ -161,8 +162,10 @@ not open for direct I/O is read buffered, and an engine the OS refuses
 reads synchronously inside the same poll. Which of the three engines a
 build has is decided at compile time -- as is the stdio fallback, which is
 for platforms with none of them (wasm) rather than a rung anything
-degrades to. `backend()` names the rung that was engaged, with the reason
-appended when an asynchronous one was asked for and refused.
+degrades to. The rung that was engaged is reported after the fact, with the
+reason appended when an asynchronous engine was asked for and refused:
+`write_report::backend` for a write, and
+`blake3pp::read_backend(trace.driver())` for a read given a `trace_buffer`.
 
 ```cpp
 #include <blake3pp/io.hpp>   // sequential; standard library only
@@ -172,6 +175,20 @@ auto d = blake3pp::hash_file("dataset.parquet");        // throws system_error
 std::error_code ec;
 auto d2 = blake3pp::hash_file(config.input_path, ec);   // reports via ec
 if (ec) { log_error(ec.message()); }
+```
+
+Which mechanism a file would get is a question of its own,
+`probe_file_io()`: it opens the file as `update_file()` would and reports
+the plan's window and queue, whether the cache bypass was asked for (a
+file under 512 KiB never is), and the rung the open landed on, without
+reading anything. The detail of what a hash then did is the trace's
+([Performance tracing](tracing.md)).
+
+```cpp
+auto p = blake3pp::probe_file_io("dataset.parquet");
+p.backend;     // "io_uring+direct", "iocp", "pread", ...
+p.direct_io;   // what was asked of the filesystem
+p.windows;     // windows the pipeline would keep in flight
 ```
 
 `hash_file()` is the one-shot form. `update_file()` is the primitive
@@ -250,11 +267,16 @@ auto all = blake3pp::write_file("stream.bin", produce);
 blake3pp::write_file("seed.bin", 1 << 30, fill, pool.get_scheduler());
 ```
 
-The generator must depend on its offset and nothing else in the scheduler
-form, where windows are filled concurrently and in no particular order; it
-must not throw in any of them. On failure the file is left as far as it
-got and is not truncated, because a length invented for bytes that were
-never produced would hide the failure.
+In the scheduler form the generator must depend on its offset and nothing
+else, because windows are filled concurrently and in no particular order.
+How many are filled at once is the queue depth: by default one per
+hardware thread, within a 256 MiB bound on the bytes in flight.
+
+Every form takes a generator that may throw. Sequentially the exception
+propagates off the calling thread; over a scheduler the window's chain
+carries it, stops the run and rethrows it from `write_file()`. On failure
+the file is left as far as it got and is not truncated, because a length
+invented for bytes that were never produced would hide the failure.
 
 For many files rather than one large one, there is a third layer:
 `<blake3pp/async_io.hpp>` turns the same pipeline into senders over a
@@ -395,10 +417,10 @@ The input is split into parts that the scheduler's agents pull as they go,
 and each part's 32-byte chaining value waits in a table that belongs to the
 window being hashed. A `stack_budget` template argument sets how much that
 table may take, 32 KiB (1024 parts) by default; give it less and the input
-is split into fewer, larger parts. The name is older than the engine: on
-the paths that have windows the table lives with the window, so this bounds
-memory per window in flight rather than a frame. What the agents spend on
-their own frames is a constant of the build instead
+is split into fewer, larger parts. On the paths that have windows the table
+lives with the window, so the budget bounds memory per window in flight, not
+a stack frame. What the agents spend on their own frames is a constant of
+the build instead
 ([freestanding](freestanding.md)). A budget that is not a multiple of 32
 bytes, or that holds fewer than two parts, does not compile:
 
@@ -446,7 +468,8 @@ nothing to take, and the slowest part sets the finish time.
 If the agents' frames are the problem, two build settings cut them:
 `BLAKE3PP_SUBTREE_GROUP=1` stages one chunk batch per burst instead of
 eight, and `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
-single-leaf fold at 32 bytes per level. Both cost throughput, and
+single-leaf fold, whose frame is a 32-byte chaining value per level plus one
+leaf's staging (3152 bytes at 12 levels and degree 16). Both cost throughput, and
 `BLAKE3PP_MAX_SIMD_DEGREE` scales every figure with the widest kernel the
 build carries. The measured frames and a worked Zephyr case are in
 [Freestanding and RTOS builds](freestanding.md#stack-requirements).
@@ -461,9 +484,11 @@ Every I/O entry point has a throwing form and a `std::error_code` form,
 mirroring the standard library, so a caller branches or catches as it
 prefers.
 
-Nothing else in the library reports failure. Hashing cannot fail. A
-variant the CPU cannot run falls back to one it can. Malformed hex
-counts as no match.
+Nothing else in the library reports failure on valid input: a variant the
+CPU cannot run falls back to one it can, and malformed hex counts as no
+match. What remains are broken preconditions, which throw in every build
+rather than return: `push_subtree_cv()` (below), `to_hex()` into a span
+too small for the digest, and the expert reducer seams.
 
 ## Expert seams
 
@@ -472,3 +497,11 @@ layer itself — `hasher::push_subtree_cv()` absorbs an externally-computed
 subtree chaining value, and `hasher` and the parallel `hash()` accept a
 caller-supplied kernel table. That seam is how the benchmark plugs
 upstream's hand-written assembly into this pipeline.
+
+Its preconditions are the ones a caller cannot be trusted with, so the
+three that can be checked are checked in every build and throw
+`std::invalid_argument`: a subtree size that is not a power of two, a
+position the subtree cannot cover, and a hasher part-way through a chunk.
+The two that cannot be checked here are the caller's alone — the subtree
+must not contain the message's final chunk, and it must have been hashed
+under this hasher's `key_words()` and `mode_flags()`.

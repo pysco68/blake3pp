@@ -47,6 +47,7 @@
 
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/file_writer.hpp>
+#include <blake3pp/detail/io_geometry.hpp>
 
 namespace blake3pp {
 
@@ -55,16 +56,19 @@ class trace_buffer;
 /// The pipeline's knobs: what update_file() takes. The hasher it streams
 /// into already carries the SIMD variant and the mode.
 struct file_io_options {
-  /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
-  /// minimum 64 KiB.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows in flight at once; clamped to [2, 256]. Every one of them is
-  /// window_bytes of arena, which is what the ceiling guards (and
-  /// BLAKE3PP_MAX_QUEUE_DEPTH moves); the measured sweet spot on every
-  /// device so far is four to eight.
-  unsigned queue_depth = 4;
+  /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
+  /// multiple of chunk_size, minimum 64 KiB.
+  std::size_t window_bytes = detail::default_window_bytes;
+  /// Windows in flight at once, four by default; clamped to [2, 256]. Each
+  /// costs window_bytes of arena plus its own tables, which is what the
+  /// ceiling guards (and BLAKE3PP_MAX_QUEUE_DEPTH moves); the measured
+  /// sweet spot on every device so far is four to eight.
+  unsigned queue_depth = detail::default_queue_depth;
   /// Bypass the page cache where the platform supports it; degrades to
-  /// buffered reads where it does not.
+  /// buffered reads where it does not. A file below 512 KiB
+  /// (detail::min_pipeline_bytes) is read through the page cache either
+  /// way: it runs without the pipeline, and buffered is the faster read
+  /// there by 5-10%.
   bool direct_io = true;
   /// Issue each read on the kernel's I/O worker threads instead of inline
   /// in the submitting thread (Linux: io_uring's IOSQE_ASYNC). Issuing a
@@ -73,8 +77,19 @@ struct file_io_options {
   /// whenever they can, so this asks for the hand-off explicitly. Ignored
   /// where the platform has no such notion.
   bool offload_submit = true;
+  /// Queue reads asynchronously (io_uring, IOCP, GCD) where the platform
+  /// offers it; off reads them synchronously inside the same poll, which is
+  /// what a platform offering none does anyway. Which rung was engaged is
+  /// reported after the fact: read_backend(trace.driver()) for a read,
+  /// write_report::backend for a write.
+  bool async = true;
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing, at the cost of one branch per window.
+  ///
+  /// Not owned and not copied: the buffer has to outlive the call. The
+  /// senders in <blake3pp/async_io.hpp> do not read this field: their
+  /// operation state is a type fixed at connect, so they take the tracing
+  /// policy as an argument instead (blake3pp::buffer_tracer).
   trace_buffer* trace = nullptr;
 };
 
@@ -158,15 +173,20 @@ class hash_mode {
 struct hash_file_options {
   /// The SIMD variant of the hasher.
   arch a = arch::auto_detect;
-  /// Bytes per window; rounded down to a power-of-2 multiple of chunk_size,
-  /// minimum 64 KiB.
-  std::size_t window_bytes = 8 * 1024 * 1024;
-  /// Windows in flight at once; clamped to [2, 256]; see file_io_options.
-  unsigned queue_depth = 4;
-  /// Bypass the page cache where the platform supports it.
+  /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
+  /// multiple of chunk_size, minimum 64 KiB.
+  std::size_t window_bytes = detail::default_window_bytes;
+  /// Windows in flight at once, four by default; clamped to [2, 256]; see
+  /// file_io_options.
+  unsigned queue_depth = detail::default_queue_depth;
+  /// Bypass the page cache where the platform supports it; see
+  /// file_io_options for the small-file exception.
   bool direct_io = true;
   /// Issue reads on the kernel's I/O worker threads; see file_io_options.
   bool offload_submit = true;
+  /// Queue reads asynchronously where the platform offers it; see
+  /// file_io_options.
+  bool async = true;
   /// Plain, keyed or key-derivation mode: `hash_mode::keyed(key)` or
   /// `hash_mode::derive_key(context)`, named as hasher spells them.
   ///
@@ -181,7 +201,12 @@ struct hash_file_options {
   /// The pipeline knobs alone, so one options object drives update_file()
   /// too.
   constexpr operator file_io_options() const noexcept {
-    return {window_bytes, queue_depth, direct_io, offload_submit, trace};
+    return {.window_bytes = window_bytes,
+            .queue_depth = queue_depth,
+            .direct_io = direct_io,
+            .offload_submit = offload_submit,
+            .async = async,
+            .trace = trace};
   }
 };
 
@@ -202,9 +227,11 @@ inline hasher make_hasher(const hash_file_options& opts,
 
 // The body of every std::error_code overload: ec is cleared, then set
 // from the std::system_error the throwing form raises. Anything else
-// escaping the pipeline is an allocation failure at setup (the buffer
-// ring, the queue), reported as not_enough_memory. Value-returning
-// callers get a default-constructed result on failure.
+// escaping the pipeline reads as not_enough_memory: a setup allocation (the
+// buffer ring, the queue), whatever an execution provider raises, or a write
+// generator's own exception, none of which this seam can tell apart. A
+// caller that needs to know takes the throwing form. Value-returning callers
+// get a default-constructed result on failure.
 template <class F>
 auto with_error_code(std::error_code& ec, F&& fn) noexcept
     -> std::invoke_result_t<F> {
@@ -274,14 +301,63 @@ void update_file(hasher& h, const std::filesystem::path& path,
                  std::error_code& ec,
                  const file_io_options& opts = {}) noexcept;
 
+/// What update_file() would engage for a file: the geometry its plan
+/// decides from the options and the file's size, and the rung the open
+/// lands on. See probe_file_io().
+struct file_io_probe {
+  /// The file's size as the filesystem reports it.
+  std::uint64_t file_bytes = 0;
+  /// Bytes per window, as the pipeline rounds the request.
+  std::size_t window_bytes = 0;
+  /// Reads the device sees at once.
+  unsigned reads_in_flight = 0;
+  /// Windows in flight at most, reading or being hashed; never more than
+  /// the file has.
+  unsigned windows = 0;
+  /// Whether the open asks for the cache bypass: the caller's direct_io,
+  /// granted only to a file of at least 512 KiB (detail::min_pipeline_bytes)
+  /// and to a size the filesystem would not give.
+  bool direct_io = false;
+  /// The rung the open landed on, spelled as write_report::backend is:
+  /// "io_uring+direct", "iocp", "gcd+nocache", "pread", "readfile",
+  /// "stdio", with " (inline submit)" where offload_submit was off and the
+  /// reason appended where the async engine was asked for and refused.
+  /// Where the bypass was asked for and the filesystem declined it, this
+  /// says so by naming the buffered rung while direct_io above is true.
+  std::string backend;
+};
+
+/// Opens the file the way update_file() opens it for a fresh hasher,
+/// reports what that open engaged, and closes it; nothing is read. The
+/// answer is this filesystem's and this kernel's for this path and these
+/// options, which is why it takes an open to give it: a hashing call with
+/// the same options gets the same rung. A hasher part-way through a
+/// message may lose the bypass to an unaligned window grid, which this
+/// probe, asked for a fresh hasher, does not see.
+/// @param path  The file to probe.
+/// @param opts  The pipeline knobs update_file() would be given.
+/// @throws std::system_error when the file cannot be opened.
+[[nodiscard]] file_io_probe probe_file_io(const std::filesystem::path& path,
+                                          const file_io_options& opts = {});
+
+/// probe_file_io() reporting failure through ec instead of throwing.
+/// @param path  The file to probe.
+/// @param ec    Cleared on success; the error otherwise.
+/// @param opts  The pipeline knobs update_file() would be given.
+/// @return The probe, or a default one when ec is set.
+[[nodiscard]] file_io_probe probe_file_io(const std::filesystem::path& path,
+                                          std::error_code& ec,
+                                          const file_io_options& opts = {}) noexcept;
+
 /// Knobs for write_file(): the geometry of a generated file.
 ///
-/// The defaults are a writer's shape rather than a reader's: 64 MiB
-/// windows, two in flight. On four PCIe 5 drives in RAID 0 with 32
-/// threads that geometry measured 24.2 GiB/s, against 20.7 at 128 MiB x 4
-/// and 14.8 at 256 MiB x 8 -- past a few hundred MiB in flight a striped
-/// volume slows down. blake3ppgen sets its own from --window and
-/// --threads and does not take these.
+/// On the write side the windows in flight are the whole parallelism,
+/// because one window's fill is sequential, so the queue depth is the
+/// lever and the window size moves little. The default depth is
+/// therefore automatic: over a scheduler, one window per hardware thread
+/// as long as depth x window stays within 256 MiB in flight (32 windows
+/// of the default 8 MiB), past which a striped volume slows down; in the
+/// sequential forms, two, one filling while the other drains.
 struct file_write_options {
   /// Bytes per window. The sequential forms round up to a multiple of
   /// 4 KiB (minimum 64 KiB, maximum 1 GiB); the forms that take a
@@ -289,7 +365,9 @@ struct file_write_options {
   /// reading does, so one options object asking for an odd size can mean
   /// two geometries.
   std::size_t window_bytes = detail::default_write_window_bytes;
-  /// Windows in flight, clamped to [2, 256]; see file_io_options.
+  /// Windows in flight, clamped to [2, 256]; zero means automatic, as
+  /// described above. A caller that knows its pool is smaller than the
+  /// machine, or its device prefers less in flight, sets it.
   unsigned queue_depth = detail::default_write_queue_depth;
   /// Bypass the page cache where the platform can.
   bool direct_io = true;
@@ -299,6 +377,8 @@ struct file_write_options {
   bool async = true;
   /// io_uring: issue on io-wq rather than inline in the submit call.
   bool offload_submit = true;
+  // No trace field, unlike file_io_options: the write pipeline keeps no
+  // per-window records, so there would be nothing to record into.
 };
 
 /// What a write_file() run did.
@@ -306,11 +386,14 @@ struct write_report {
   /// Bytes written: the size that was asked for, or what the generator
   /// produced before it stopped.
   std::uint64_t bytes = 0;
-  /// Which mechanism carried them, as the writer names it:
-  /// "io_uring+direct", "iocp+direct", "gcd-write+nocache", "pwrite",
-  /// "writefile" or "stdio", each with the reason appended where an
-  /// asynchronous rung was asked for and refused. Owned by the report,
-  /// because the writer that composed it is gone by then.
+  /// Which mechanism carried them, as the writer names it: the engine
+  /// ("io_uring", "iocp", "gcd-write", or the synchronous "pwrite",
+  /// "writefile", "stdio"), plus "+direct" or "+nocache" where the cache
+  /// bypass engaged; then " (inline submit)" where offload_submit was off,
+  /// and the reason where an asynchronous rung was asked for and refused.
+  /// So "io_uring+direct", "pwrite+direct [io_uring: ENOSYS, kernel too
+  /// old]", and so on. Owned by the report, because the writer that
+  /// composed it is gone by then.
   std::string backend;
 };
 
@@ -327,7 +410,9 @@ write_report write_sequential(const std::filesystem::path& path,
                               const file_write_options& opts) {
   file_writer writer(path,
                      {.buffer_bytes = opts.window_bytes,
-                      .queue_depth = opts.queue_depth,
+                      .queue_depth = opts.queue_depth != 0
+                                         ? opts.queue_depth
+                                         : sequential_write_queue_depth,
                       .direct_io = opts.direct_io,
                       .async = opts.async,
                       .offload_submit = opts.offload_submit,
@@ -355,9 +440,11 @@ write_report write_sequential(const std::filesystem::path& path,
 ///
 /// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
 /// offset)`, once per window and in file order, and must fill every byte
-/// of `out`. It must not throw: an exception from it leaves the file as
-/// far as it got. The parallel_io.hpp overload takes the same generator
-/// and runs the windows over a scheduler instead.
+/// of `out`. It may throw, and the file is then left as far as it got; the
+/// fill runs on this thread, so the exception propagates out of this call.
+/// The parallel_io.hpp overload runs the windows over a scheduler instead,
+/// where a throwing generator is carried by the chain rather than by the
+/// stack.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is
@@ -399,7 +486,8 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
 /// `fill` is called as `std::size_t fill(std::span<std::byte> out,
 /// std::uint64_t offset)`, once per window and in file order, and returns
 /// how many bytes of `out` it produced. Anything short of the whole
-/// buffer, zero included, ends the file. It must not throw.
+/// buffer, zero included, ends the file. It may throw, as in the
+/// length-taking form above.
 /// @param path  The file to create or truncate.
 /// @param fill  The generator; its return value is the file's length.
 /// @param opts  The geometry.
@@ -535,6 +623,28 @@ template <detail::foreign_path P>
                                const hash_file_options& opts = {}) noexcept {
   return detail::with_error_code(ec, [&] {
     return hash_file(std::filesystem::path(path.native()), opts);
+  });
+}
+
+/// probe_file_io() for a foreign path type.
+/// @param path  The file to probe.
+/// @param opts  The pipeline knobs update_file() would be given.
+template <detail::foreign_path P>
+[[nodiscard]] file_io_probe probe_file_io(const P& path,
+                                          const file_io_options& opts = {}) {
+  return probe_file_io(std::filesystem::path(path.native()), opts);
+}
+
+/// probe_file_io() for a foreign path type, reporting through ec.
+/// @param path  The file to probe.
+/// @param ec    Cleared on success; the error otherwise.
+/// @param opts  The pipeline knobs update_file() would be given.
+template <detail::foreign_path P>
+[[nodiscard]] file_io_probe probe_file_io(
+    const P& path, std::error_code& ec,
+    const file_io_options& opts = {}) noexcept {
+  return detail::with_error_code(ec, [&] {
+    return probe_file_io(std::filesystem::path(path.native()), opts);
   });
 }
 

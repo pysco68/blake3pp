@@ -16,7 +16,12 @@
 //    submit_write(), flush(), wake() or a destructor. The pipelines --
 //    several windows, then several files, driven as senders from one
 //    thread -- depend on there being exactly one place where caller code
-//    regains control.
+//    regains control. forget(file&) is the one exception, and only for a
+//    SIBLING's transfer: where the completion mechanism is shared (one
+//    ring, one port), waiting out this file's transfers reaps another
+//    file's, and reporting it is better than stranding an operation that
+//    could never complete. It runs on the same thread, from a call the
+//    pipeline makes itself while its own cells are alive.
 // Internal to src/io/, never installed.
 
 #include <cerrno>
@@ -31,6 +36,9 @@
 #endif
 #if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for the arena
 #endif
 #include <concepts>
 #include <cstddef>
@@ -65,9 +73,28 @@ struct aligned_delete {
 };
 using aligned_buffer = std::unique_ptr<std::byte[], aligned_delete>;
 
+// The arena is virtual until the first pass of a run touches it, so every
+// page is a fault paid inside the pipeline, 262144 of them per GiB at
+// 4 KiB. Transparent huge pages make that pass cheaper where the kernel
+// offers them. Touching 1 GiB a page at a time on Zen 3+ measured
+// 550-740 ms as plain pages against 216-221 ms advised.
+//
+// End to end, where the hash is the limit, it measured 2-4% on a warm
+// 2 GiB file at a 1 GiB arena, within that machine's noise. Runs where
+// the device outruns the hash, which would pay the faults in the open,
+// have not been measured.
+//
+// A hint, so a kernel without THP or set to `never` refuses it and nothing
+// changes; only asked above one huge page, 2 MiB everywhere it exists.
 [[nodiscard]] inline aligned_buffer make_aligned_buffer(std::size_t bytes) {
-  return aligned_buffer(static_cast<std::byte*>(
+  aligned_buffer buf(static_cast<std::byte*>(
       ::operator new(bytes, std::align_val_t{direct_align})));
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+  if (bytes >= std::size_t{2} << 20) {
+    (void)::madvise(buf.get(), bytes, MADV_HUGEPAGE);
+  }
+#endif
+  return buf;
 }
 
 // How a file is opened on a context. Reads want a path and maybe direct
@@ -489,7 +516,8 @@ class sync_context {
   // operations they live in are alive, which is what asking for this
   // means; the file's destructor does not assume it.
   void forget(file& f) noexcept {
-    unlink(f);
+    // The file stays on files_: it is still open and may be read again (see
+    // the uring backend's forget).
     const std::size_t dropped = queue_.remove_if(
         [&f](const transfer& op) noexcept { return op.owner_file == &f; });
     queued_ -= dropped;

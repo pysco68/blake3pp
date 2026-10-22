@@ -226,10 +226,9 @@ Only plain mode is bound; keyed and derive_key are not.
 A new variant needs four things: a facade that reaches the ISA at a width
 the build can name, a capability check the library can read *without*
 executing the ISA, a compiler that accepts the flags, and something that
-can run the result. The last one decides whether a variant ships at all —
-vector code nobody has executed is a wrong digest waiting for a user,
-which is why the SVE variants matching no silicon are opt-in and why MSA
-ships labelled as never having run on hardware.
+can run the result. The last one decides whether a variant ships enabled: the SVE variants
+matching no silicon are opt-in, and MSA ships labelled as never having run
+on hardware.
 
 Three of the four are cheaper than they look, because the facade has a
 provider that needs nothing from a SIMD library: GNU vector extensions at

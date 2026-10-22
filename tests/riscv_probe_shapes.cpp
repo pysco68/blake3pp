@@ -5,9 +5,12 @@
 // logic and the guarded probes run for real. One shape per process, since
 // detection is computed once per process: the shape is argv[1], and
 // tests/CMakeLists.txt registers one test per shape.
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include <signal.h>
 
 #include "dispatch/cpu_detect.hpp"
 
@@ -90,7 +93,64 @@ const shape shapes[] = {
     {.name = "assume-0",
      .m = {.active = true, .mvendorid = thead},
      .expect_learned = true, .expect_xthead = false, .expect_rvv = false},
+    // The sg2042 shape with a SIGILL that is not the probe's arriving
+    // inside the guard, as another thread's fault would. The program has
+    // its own handler, installed with SA_SIGINFO or without it, and main()
+    // checks that the fault reached it and that it is installed again
+    // once the probes are done; the probes still classify the machine.
+    {.name = "foreign-siginfo",
+     .m = {.active = true, .mvendorid = thead, .foreign_trap = true},
+     .expect_learned = true, .expect_xthead = true, .expect_rvv = false},
+    {.name = "foreign-plain",
+     .m = {.active = true, .mvendorid = thead, .foreign_trap = true},
+     .expect_learned = true, .expect_xthead = true, .expect_rvv = false},
 };
+
+// The program's own SIGILL handler, in both forms a program installs.
+volatile std::sig_atomic_t g_program_sigills = 0;
+volatile std::sig_atomic_t g_program_signo = 0;
+
+void program_siginfo(int sig, siginfo_t* info, void*) {
+  g_program_sigills = g_program_sigills + 1;
+  g_program_signo = info != nullptr ? info->si_signo : 0;
+  (void)sig;
+}
+
+void program_plain(int sig) {
+  g_program_sigills = g_program_sigills + 1;
+  g_program_signo = sig;
+}
+
+// Installs the program's handler for a foreign-* shape.
+bool install_program_handler(bool siginfo) {
+  struct sigaction sa {};
+  sigemptyset(&sa.sa_mask);
+  if (siginfo) {
+    sa.sa_sigaction = &program_siginfo;
+    sa.sa_flags = SA_SIGINFO;
+  } else {
+    sa.sa_handler = &program_plain;
+  }
+  return sigaction(SIGILL, &sa, nullptr) == 0;
+}
+
+// Whether the program's handler reached the foreign fault, and is the
+// disposition again now the probes are done.
+bool program_handler_kept(bool siginfo) {
+  struct sigaction now {};
+  if (sigaction(SIGILL, nullptr, &now) != 0) {
+    return false;
+  }
+  const bool installed =
+      siginfo ? ((now.sa_flags & SA_SIGINFO) != 0 &&
+                 now.sa_sigaction == &program_siginfo)
+              : ((now.sa_flags & SA_SIGINFO) == 0 &&
+                 now.sa_handler == &program_plain);
+  std::printf("program handler: %d call(s), signo %d, installed afterwards %d\n",
+              static_cast<int>(g_program_sigills),
+              static_cast<int>(g_program_signo), installed);
+  return installed && g_program_sigills > 0 && g_program_signo == SIGILL;
+}
 
 bool any_rvv() {
   for (const arch a : {arch::rvv128, arch::rvv256, arch::rvv512, arch::rvv128_zvbb,
@@ -118,6 +178,12 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(s.name, "assume-0") == 0) {
       setenv("BLAKE3PP_ASSUME_XTHEADVECTOR", "0", 1);
     }
+    const bool foreign = std::strncmp(s.name, "foreign-", 8) == 0;
+    const bool siginfo = std::strcmp(s.name, "foreign-siginfo") == 0;
+    if (foreign && !install_program_handler(siginfo)) {
+      std::fputs("could not install the program's SIGILL handler\n", stderr);
+      return 2;
+    }
     blake3pp::detail::test::set_machine(s.m);
     const bool before_rvv = any_rvv();
     const bool before_xthead = platform_cpu_supports(arch::xthead);
@@ -129,6 +195,9 @@ int main(int argc, char** argv) {
     if (learned != s.expect_learned || xthead != s.expect_xthead || rvv != s.expect_rvv) {
       std::printf("expected learned=%d xthead=%d rvv=%d\n", s.expect_learned,
                   s.expect_xthead, s.expect_rvv);
+      return 1;
+    }
+    if (foreign && !program_handler_kept(siginfo)) {
       return 1;
     }
     return 0;

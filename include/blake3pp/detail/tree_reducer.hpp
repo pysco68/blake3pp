@@ -67,23 +67,32 @@ class tree_reducer {
   // is pending.
   // @pre chunks is a power of two; first_chunk % chunks == 0.
   // @pre The range is disjoint from every range inserted before. Checked in
-  //      every build, because inserting one twice is a digest that is
-  //      wrong and reports nothing: the chunks inserted can never exceed
-  //      the span they cover, which holds whatever has already merged away.
+  //      every build, because inserting one twice is a digest that is wrong
+  //      and reports nothing.
   // @pre The range does not contain the message's final chunk. Not checked
   //      at all: the caller knows where the message ends and this does not.
   // @return false, with the reducer unchanged, if storage is full.
+  // @throws std::logic_error if the range overlaps one already inserted.
+  //         A full set of storage is a capacity answer the caller acts on;
+  //         an overlap is a mistake no caller can act on.
   [[nodiscard]] bool insert(std::uint64_t first_chunk, std::uint64_t chunks,
-                            std::span<const std::uint32_t, 8> cv) noexcept {
+                            std::span<const std::uint32_t, 8> cv) {
     assert(chunks > 0 && std::has_single_bit(chunks));
     assert(first_chunk % chunks == 0);
-    const std::uint64_t low = count_ == 0 && inserted_ == 0
-                                  ? first_chunk
-                                  : std::min(lowest_, first_chunk);
-    const std::uint64_t high = std::max(highest_end_, first_chunk + chunks);
-    require(inserted_ + chunks <= high - low,
-            "tree_reducer::insert(): a range overlapping one already "
-            "inserted, which would absorb the same chunks twice");
+    // Every chunk inserted so far is covered by exactly one pending node: a
+    // merge replaces two siblings with the one contiguous range they cover,
+    // so nothing inserted is ever unaccounted for. Testing the new range
+    // against the nodes is therefore exact, where arithmetic on totals is
+    // only necessary -- a duplicate no larger than a hole in the covered
+    // span satisfies the sums and is still the same chunks twice. The scan
+    // is the one the merge loop below already walks.
+    for (std::size_t i = 0; i < count_; ++i) {
+      const node& n = storage_[i];
+      require(first_chunk + chunks <= n.first_chunk ||
+                  n.first_chunk + n.chunks <= first_chunk,
+              "tree_reducer::insert(): a range overlapping one already "
+              "inserted, which would absorb the same chunks twice");
+    }
     node merged;
     merged.first_chunk = first_chunk;
     merged.chunks = chunks;
@@ -124,9 +133,6 @@ class tree_reducer {
     storage_[count_] = merged;
     count_++;
     sorted_ = false;
-    inserted_ += chunks;
-    lowest_ = low;
-    highest_end_ = high;
     return true;
   }
 
@@ -159,7 +165,9 @@ class tree_reducer {
   //      nothing else.
   // @pre h has the key and flags this reducer was built with. Not checked:
   //      nothing here can see them.
-  void drain_into(hasher& h) noexcept {
+  // @throws std::logic_error if the pending run has a hole or does not
+  //         start where the hasher stands.
+  void drain_into(hasher& h) {
     const std::span<const node> nodes = sorted();
     require(h.count() % chunk_size == 0,
             "tree_reducer::drain_into(): a hasher part-way through a chunk");
@@ -179,9 +187,6 @@ class tree_reducer {
   void clear() noexcept {
     count_ = 0;
     sorted_ = true;
-    inserted_ = 0;
-    lowest_ = 0;
-    highest_end_ = 0;
   }
 
  private:
@@ -209,9 +214,6 @@ class tree_reducer {
   // scan of what is still pending: the chunks inserted since the last
   // clear(), and the span they cover. Disjoint ranges keep the first at or
   // below the second whatever has merged away in between.
-  std::uint64_t inserted_ = 0;
-  std::uint64_t lowest_ = 0;
-  std::uint64_t highest_end_ = 0;
   bool sorted_ = true;
 };
 
@@ -246,10 +248,18 @@ struct cv_run {
 [[nodiscard]] inline std::size_t fold_aligned_runs(
     const kern::kernel_ops* ops, std::span<const std::uint32_t, 8> key,
     std::uint32_t base_flags, const cv_run& run,
-    std::span<tree_reducer::node> out) noexcept {
-  assert(run.part_chunks > 0 && std::has_single_bit(run.part_chunks));
-  assert(run.base_chunk % run.part_chunks == 0);
+    std::span<tree_reducer::node> out) {
   assert(run.last <= run.cvs.size());
+  // Checked in every build: the alignment arithmetic below divides by
+  // part_chunks and tests the quotient, so a size that is not a power of two
+  // or a base that is not a multiple of it yields nodes claiming ranges that
+  // are not nodes of the tree -- a wrong digest whose sizes still sum
+  // correctly, which is exactly what the reducer's own check cannot catch.
+  require(run.part_chunks > 0 && std::has_single_bit(run.part_chunks),
+          "fold_aligned_runs(): a part size that is not a power of two");
+  require(run.base_chunk % run.part_chunks == 0,
+          "fold_aligned_runs(): a run that does not start on a part "
+          "boundary");
   std::size_t count = 0;
   std::size_t i = run.first;
   while (i < run.last) {

@@ -25,9 +25,10 @@ the thread that called it.
 `async_io.hpp` moves that storage up into a context and turns the call
 into a sender. Reach for it when either is true:
 
-- **You have many files.** The blocking form allocates and first-touches
-  an arena per call, and no two files ever overlap. A context allocates
-  once and lets several files share it.
+- **You have many files.** The blocking form takes an arena per call and
+  pays its page faults on the first pass over it, and no two files ever
+  overlap. A context allocates once and lets several files share it, so the
+  second file onwards finds the pages already faulted in.
 - **You have work of your own.** A sender composes: `then`, `let_value`,
   `when_all`, a stop token from your own receiver.
 
@@ -79,9 +80,9 @@ than one of the four.
 keyed and `derive_key` hashers work exactly as they do everywhere else,
 and several files can go into one hasher in sequence.
 
-`async_update_files` runs a bounded number of files at once (the
-context's windows divided by its queue depth, or `opts.in_flight`) and
-refills a slot as each file ends. Every file's end goes to
+`async_update_files` runs a bounded number of files at once (one per
+window the context holds, or `opts.in_flight`) and refills a slot as
+each file ends. Every file's end goes to
 `done(index, hasher&, file_outcome)` on the context's thread, with the
 hasher that streamed it, so the caller finalizes to whatever length and
 mode it wants; a file that fails is an outcome, not the end of the run.
@@ -115,15 +116,16 @@ void request_stop();               // from any thread
   what a thread dedicated to the context wants. A thread with other work
   should call `run_until_idle()` instead, which returns as soon as
   nothing is in flight — including immediately, when nothing was.
-- Only one thread may run a context. A second is a contract violation
-  and debug builds assert on it.
+- Only one thread may run a context. A second is a contract violation and
+  throws `std::logic_error`, in every build.
 - Any thread may start an operation on the context: `start()` only joins
   it, and the open and the first reads happen on the running thread in
   the operation's first round.
 - `request_stop()` is the other member another thread may call. It asks
   every started operation to stop; each one then completes with
   `set_stopped()`, or with its value if it had already finished. The
-  request clears when the run call returns, so a context is reusable.
+  request clears once nothing is left to stop and the run call returns, so
+  a context is reusable.
 - An operation completes **inside** a run call, never inside `start()`.
   A file that cannot even be opened is reported from the first round,
   not from the `start()` that found it.
@@ -151,12 +153,21 @@ blake3pp::async::io_context ctx({
     .direct_io    = true});
 ```
 
-The arena is `windows * window_bytes`, allocated and first-touched once.
+The arena is `windows * window_bytes`, allocated once. Its pages are not
+touched at allocation: they fault in as the first pass over the arena
+reaches them, which is the first `windows` windows of the first operation,
+and every operation after that finds them warm. On Linux the allocation asks
+for transparent huge pages, which makes that pass cheaper where the kernel
+grants them.
 Left at zero, `windows` is what the plan asks for: 16 at the defaults, so a
-128 MiB arena, which keeps four operations of `queue_depth` 4 moving. A
-context meant to keep *n* files moving wants around `n * queue_depth`
-windows, and `arena_bytes` is the same request as a memory budget, which is
-usually the number a caller actually has.
+128 MiB arena, and `async_update_files` keeps one file in flight per window
+unless told otherwise, sixteen here. Both `windows` and `queue_depth` are
+clamped to the same ceiling, 256 unless the build moved it, because a
+window costs the same whether it was asked for as a count or as a budget.
+A context meant to keep *n* files moving wants at least *n* windows, and
+`n * queue_depth` of them if every file is large enough to fill its queue;
+`arena_bytes` is the same request as a memory budget, which is usually the
+number a caller actually has.
 
 Fewer windows than that is not a deadlock — an operation that finds none
 free waits, and resumes when any other gives one back — but it
@@ -172,6 +183,13 @@ blake3pp::async::basic_io_context<blake3pp::stack_budget{8 * 1024}> small(opts);
 `blake3pp::async::io_context` is that template with the default budget.
 
 ## What is experimental
+
+Tracing ([Performance tracing](tracing.md)) is an argument of the senders
+rather than an option: `async_update_file(ctx, h, path, sched, opts,
+blake3pp::buffer_tracer{&trace})`, and the same last argument on
+`async_hash_file` and `async_update_files`. The default records nothing
+at no cost, and `file_io_options::trace` is not consulted on this path,
+because the tracer is part of the operation state's type.
 
 Two things may still change:
 

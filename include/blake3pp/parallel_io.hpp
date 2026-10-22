@@ -24,6 +24,7 @@
 #include <span>
 #include <system_error>
 #include <type_traits>
+#include <thread>
 #include <utility>
 
 #include <blake3pp/core.hpp>
@@ -68,15 +69,15 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 ///
 /// `fill` is called as `fill(std::span<std::byte> out, std::uint64_t
 /// offset)` on the scheduler's agents, once per window, and must fill
-/// every byte of `out`; windows are filled and written concurrently, in
-/// no particular order, so a generator must depend on its offset and
-/// nothing else. It must also be `noexcept`, and say so: the fill runs on
-/// a pool thread inside a window already counted in flight, where an
-/// exception has nowhere to go, so a generator that is not declared
-/// noexcept does not compile. A generator that can fail should record the
-/// failure and fill the window, leaving the caller to check afterwards.
-/// The sequential forms in <blake3pp/io.hpp> take a throwing generator,
-/// because there the fill runs on the calling thread.
+/// every byte of `out`. Windows are filled and written concurrently and
+/// in no particular order, so a generator must depend on its offset and
+/// nothing else.
+///
+/// `fill` may throw. The exception stops the run and comes back out of
+/// this call, and the file is left as far as it got, as after an I/O
+/// failure. The `std::error_code` overload reports it as
+/// not_enough_memory, like a provider's exception, so a caller whose
+/// generator can fail takes the throwing form.
 ///
 /// On success the file is exactly `size` bytes. On failure the file is
 /// left as far as it got: what lies past the last landed window is
@@ -95,8 +96,9 @@ template <class Scheduler, class Fill>
 void write_file(const std::filesystem::path& path, std::uint64_t size,
                 Fill&& fill, Scheduler&& sched,
                 const file_write_options& opts = {}) {
-  detail::io_driver drv({opts.async, opts.offload_submit},
-                        detail::clamp_queue_depth(opts.queue_depth));
+  const unsigned depth = detail::resolve_write_queue_depth(
+      opts.queue_depth, opts.window_bytes, std::thread::hardware_concurrency());
+  detail::io_driver drv({opts.async, opts.offload_submit}, depth);
   detail::io_driver::file file(
       drv, path,
       detail::io_driver::open_options{.write = true,
@@ -105,7 +107,7 @@ void write_file(const std::filesystem::path& path, std::uint64_t size,
   detail::run_write_pipeline(drv, file, std::forward<Scheduler>(sched),
                              std::forward<Fill>(fill), size,
                              {.window_bytes = opts.window_bytes,
-                              .queue_depth = opts.queue_depth});
+                              .queue_depth = depth});
 }
 
 /// write_file() over a scheduler, reporting failure through ec instead of
@@ -171,7 +173,7 @@ void update_file(hasher& h, const std::filesystem::path& path,
   const detail::pipeline_plan plan = detail::plan_pipeline(
       h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io,
       size_ec ? 0 : static_cast<std::uint64_t>(size));
-  detail::io_driver drv({/*async=*/true, opts.offload_submit},
+  detail::io_driver drv({opts.async, opts.offload_submit},
                         plan.reads_in_flight);
   detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(
