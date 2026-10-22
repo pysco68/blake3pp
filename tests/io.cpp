@@ -39,6 +39,9 @@
 #include "io/backend.hpp"
 #include "io/uring_backend.hpp"
 #endif
+#if defined(__FreeBSD__)
+#include "io/aio_backend.hpp"
+#endif
 #if defined(_WIN32)
 #include "io/ioring_backend.hpp"
 #endif
@@ -733,6 +736,9 @@ TEST_CASE("an engaged backend is the platform's async engine, or says why not") 
   constexpr std::string_view engine_alt = "ioring";
 #elif defined(__APPLE__)
   constexpr std::string_view engine = "gcd";
+  constexpr std::string_view engine_alt = "";
+#elif defined(__FreeBSD__)
+  constexpr std::string_view engine = "aio";
   constexpr std::string_view engine_alt = "";
 #else
   constexpr std::string_view engine = "";

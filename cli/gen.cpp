@@ -5,16 +5,20 @@
 //   blake3ppgen --seed hello --seek 10G --length 1M > slice.bin
 //
 // The same seed always produces the same infinite stream, and --seek is
-// O(1): materializing a slice at offset 10 GB costs the same as offset 0.
-// That makes it a reproducible test-data source at hashing speed (dd for
-// deterministic bytes). --derive-key domain-separates streams sharing seed
-// material; --hex prints hex instead of raw bytes. --output FILE writes
-// through io_uring + O_DIRECT where available: the generator fills the
-// writer's aligned buffers in place, so bytes go from the XOF kernel to
-// the device with no page cache and no intermediate copy. --seed-file
-// takes the same road in: it streams through the library's file pipeline
-// (direct async reads, multi-core windows when --threads allows) rather
-// than being copied into memory first.
+// O(1), so a slice at offset 10 GB costs the same as one at offset 0. That
+// makes it a reproducible test-data source at hashing speed (dd for
+// deterministic bytes).
+//
+//   * --derive-key domain-separates streams sharing seed material.
+//   * --hex prints hex instead of raw bytes.
+//   * --output FILE writes through the platform's direct async writer
+//     where available (io_uring, IoRing or IOCP, GCD, POSIX AIO). The
+//     generator fills the writer's aligned buffers in place, so bytes go
+//     from the XOF kernel to the device with no page cache and no
+//     intermediate copy.
+//   * --seed-file streams the seed through the library's file pipeline
+//     (direct async reads, multi-core windows when --threads allows)
+//     without first copying it into memory.
 
 #include <algorithm>
 #include <cstddef>

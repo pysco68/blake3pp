@@ -239,6 +239,13 @@ using native_io_context = gcd_context;
 using native_reader_engine = polled_reader_engine<native_io_context>;
 using native_writer_engine = polled_writer_engine<native_io_context>;
 }  // namespace blake3pp::detail::io_impl
+#elif defined(__FreeBSD__)
+#include "io/aio_backend.hpp"
+namespace blake3pp::detail::io_impl {
+using native_io_context = aio_context;
+using native_reader_engine = polled_reader_engine<native_io_context>;
+using native_writer_engine = polled_writer_engine<native_io_context>;
+}  // namespace blake3pp::detail::io_impl
 #elif defined(__unix__)
 #include "io/pread_backend.hpp"
 namespace blake3pp::detail::io_impl {

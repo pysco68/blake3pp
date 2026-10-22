@@ -3,13 +3,12 @@
 /// @file
 /// File hashing at storage speed: the windowed pipeline that joins the
 /// file_reader to the compute engine. The reader uses io_uring +
-/// O_DIRECT, IOCP + NO_BUFFERING, or GCD + F_NOCACHE, whatever the
-/// platform allows.
+/// O_DIRECT, the I/O ring or IOCP + NO_BUFFERING, GCD + F_NOCACHE, or
+/// POSIX AIO + O_DIRECT, whatever the platform allows.
 ///
 /// While window i is being hashed, windows i+1..i+depth-1 are already
 /// streaming in. The queue-depth buffer ring is the backpressure
-/// mechanism, so the pipeline never allocates past setup, and never lets
-/// the device idle waiting for compute or the other way round.
+/// mechanism, so the pipeline allocates nothing past setup.
 ///
 /// The primitive is `update_file()`, which is `hasher::update()` with a file
 /// as the source. It streams into a caller-owned hasher and returns.
