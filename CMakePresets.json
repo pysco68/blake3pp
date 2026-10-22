@@ -138,6 +138,51 @@
       }
     },
     {
+      "name": "freebsd-clang-cxx23",
+      "displayName": "FreeBSD base Clang, C++23 (POSIX AIO on a kqueue)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-clang-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-clang-cxx23/freebsd-clang-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-asan",
+      "displayName": "FreeBSD base Clang, C++23 + ASan/UBSan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-clang-cxx23-asan",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-clang-cxx23-asan/freebsd-clang-cxx23-asan.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-tsan",
+      "displayName": "FreeBSD base Clang, C++23 + TSan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-clang-cxx23-tsan",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-clang-cxx23-tsan/freebsd-clang-cxx23-tsan.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
       "generator": "Ninja",
@@ -388,6 +433,33 @@
       }
     },
     {
+      "name": "freebsd-clang-cxx23",
+      "configurePreset": "freebsd-clang-cxx23",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-asan",
+      "configurePreset": "freebsd-clang-cxx23-asan",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-tsan",
+      "configurePreset": "freebsd-clang-cxx23-tsan",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "configurePreset": "windows-msvc2026-cxx23",
       "condition": {
@@ -554,6 +626,42 @@
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23",
+      "configurePreset": "freebsd-clang-cxx23",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-asan",
+      "configurePreset": "freebsd-clang-cxx23-asan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-tsan",
+      "configurePreset": "freebsd-clang-cxx23-tsan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
       }
     },
     {

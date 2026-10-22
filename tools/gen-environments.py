@@ -69,10 +69,19 @@ IMAGE_FOR = [
     ("linux-mips64el-gcc14-*", "mips64el-gcc14"),
     ("linux-s390x-gcc15-*", "s390x-gcc15"),
     ("*zigmusl*", "zig"),
+    # The FreeBSD cross presets live in the zig image beside the musl
+    # ones; they do not match *zigmusl* because their triples name an
+    # ABI version instead of a libc.
+    ("freebsd-*-zig-cxx23", "zig"),
+    ("freebsd-zig-cxx23", "zig"),
     ("wasm32-*", "emscripten"),
 ]
-# Not containerized: no environment (windows and macos build natively).
-SKIP = ["windows-*", "macos-*"]
+# Not containerized: no environment. windows and macos build natively,
+# and so do the freebsd-clang-* presets -- those are for someone sitting
+# on a FreeBSD machine using its base system compiler, which no image
+# here contains. The freebsd-*zig* presets above are the opposite case:
+# they cross-build FreeBSD binaries FROM a Linux container.
+SKIP = ["windows-*", "macos-*", "freebsd-clang-*"]
 
 
 def image_for(name):
