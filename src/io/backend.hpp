@@ -407,6 +407,13 @@ class deferred_ops {
 
   [[nodiscard]] bool empty() const noexcept { return head_ == nullptr; }
 
+  // The oldest queued op, left queued; the rest follow its
+  // next_deferred. For a backend that OFFERS a batch to the OS and only
+  // takes off the queue what the OS accepted: reading the queue and
+  // emptying it have to be separable for that, since a refusal must
+  // leave the order as it was.
+  [[nodiscard]] Op* front() const noexcept { return head_; }
+
   // Forgets every queued op: none was ever issued, so there is nothing
   // to wait for, and none gets its callback.
   void clear() noexcept { head_ = tail_ = nullptr; }
