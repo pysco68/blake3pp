@@ -111,7 +111,9 @@ Every reader and writer names the rung it landed on:
   `"pread"`, `"readfile"` and `"stdio"`.
 - `write_report::backend` names the write side the same way:
   `"io_uring+direct"`, `"iocp+direct"`, `"gcd-write+nocache"`, `"pwrite"`,
-  `"writefile"`, or `"stdio"`.
+  `"writefile"`, or `"stdio"`, and on Windows adds how the preallocation
+  was kept from zeroing ahead of the writes: `"+sparse"` or `"+validdata"`
+  (next section).
 
 `"stdio"` is not a rung anything degrades to: it is the fixed answer on
 platforms with none of the three async engines (wasm), and on no other
@@ -123,6 +125,41 @@ appends why: `" [io_uring: EPERM, blocked by policy]"` or
 `" [io_uring: ENOSYS, kernel too old]"`. A benchmark or a bug report
 therefore reads differently depending on which rung actually ran, never
 only the one that was asked for.
+
+## Preallocation on NTFS
+
+A write that extends a file serializes on its allocation, which collapses
+an asynchronous direct queue to one write at a time, so every writer here
+preallocates the whole file at the open. On Windows that leaves a second
+cost: NTFS keeps a *valid data length* per file, and every write that
+lands beyond it makes NTFS zero the bytes in between first, so that no
+reader ever sees the blocks a deleted file left there. With several
+windows in flight their completions land out of order, every one of them
+past the valid data length, and the zeroing is most of the write's cost:
+measured on a PCIe 4 NVMe, 2.2-2.4 GiB/s at the automatic depth where the
+device writes 5.9.
+
+Two ways out, and the writer takes them in this order:
+
+- **The valid data length set up front** (`SetFileValidData`), asked for
+  with `file_write_options::waive_zero_fill`. Nothing is zeroed and
+  nothing is zeroed later: 4.4-5.6 GiB/s at the automatic depth on the
+  same drive. It needs `SeManageVolumePrivilege`, which the request
+  enables on the process token, and until the writes land the file
+  exposes whatever its disk blocks held before -- which is what the
+  privilege gates, and why this is never the default. Reported as
+  `"+validdata"`.
+- **A sparse file**, the default, and the fallback where the privilege is
+  not held. The file is made sparse before the preallocation, so the gaps
+  stay holes that read as zeros instead of being written, and the flag is
+  cleared once the file is complete, leaving a plain file: 4.5-4.8 GiB/s
+  at the automatic depth. A run that fails leaves a sparse file with
+  holes where no window landed. Reported as `"+sparse"`.
+
+A file system that refuses sparse files gets neither, and the writer
+runs with the zeroing; the report then names the rung alone. Unix file
+systems preallocate unwritten extents that read as zeros at no cost, so
+none of this exists there.
 
 ## When direct I/O is the wrong choice
 

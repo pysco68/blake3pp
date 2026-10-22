@@ -89,13 +89,15 @@ inline ex::inplace_stop_source*& installed_stop_source() noexcept {
 /// @param fill   The generator, called per window on the pool.
 /// @param sched  Where the fills run.
 /// @param opts   The geometry.
+/// @return The bytes written (size) and the rung the file was written
+///         through, as write_report says.
 /// @throws std::system_error on I/O failure, and whatever the execution
 ///         provider raises.
 template <class Scheduler, class Fill>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
-void write_file(const std::filesystem::path& path, std::uint64_t size,
-                Fill&& fill, Scheduler&& sched,
-                const file_write_options& opts = {}) {
+write_report write_file(const std::filesystem::path& path, std::uint64_t size,
+                        Fill&& fill, Scheduler&& sched,
+                        const file_write_options& opts = {}) {
   const unsigned depth = detail::resolve_write_queue_depth(
       opts.queue_depth, opts.window_bytes, std::thread::hardware_concurrency());
   detail::io_driver drv({opts.async, opts.offload_submit}, depth);
@@ -103,11 +105,13 @@ void write_file(const std::filesystem::path& path, std::uint64_t size,
       drv, path,
       detail::io_driver::open_options{.write = true,
                                       .direct_io = opts.direct_io,
-                                      .preallocate_bytes = size});
+                                      .preallocate_bytes = size,
+                                      .waive_zero_fill = opts.waive_zero_fill});
   detail::run_write_pipeline(drv, file, std::forward<Scheduler>(sched),
                              std::forward<Fill>(fill), size,
                              {.window_bytes = opts.window_bytes,
                               .queue_depth = depth});
+  return {.bytes = size, .backend = std::string(file.name())};
 }
 
 /// write_file() over a scheduler, reporting failure through ec instead of
@@ -122,14 +126,15 @@ void write_file(const std::filesystem::path& path, std::uint64_t size,
 /// @param sched  Where the fills run.
 /// @param ec     Cleared on success; the failure otherwise.
 /// @param opts   The geometry.
+/// @return The report, or a default one when ec is set.
 template <class Scheduler, class Fill>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
-void write_file(const std::filesystem::path& path, std::uint64_t size,
-                Fill&& fill, Scheduler&& sched, std::error_code& ec,
-                const file_write_options& opts = {}) noexcept {
-  detail::with_error_code(ec, [&] {
-    write_file(path, size, std::forward<Fill>(fill),
-               std::forward<Scheduler>(sched), opts);
+write_report write_file(const std::filesystem::path& path, std::uint64_t size,
+                        Fill&& fill, Scheduler&& sched, std::error_code& ec,
+                        const file_write_options& opts = {}) noexcept {
+  return detail::with_error_code(ec, [&] {
+    return write_file(path, size, std::forward<Fill>(fill),
+                      std::forward<Scheduler>(sched), opts);
   });
 }
 

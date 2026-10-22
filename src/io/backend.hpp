@@ -106,6 +106,14 @@ struct file_open_options {
   bool write = false;          // create/truncate for writing
   bool direct_io = false;      // O_DIRECT / FILE_FLAG_NO_BUFFERING
   std::uint64_t preallocate_bytes = 0;  // writes only; 0 for none
+  // Writes with a preallocation, Windows only: declare the preallocated
+  // range valid without zeroing it (SetFileValidData), which needs
+  // SeManageVolumePrivilege and enables it on the process token. Where
+  // that cannot be had the file is made sparse instead, which is also
+  // what a write without this does; see iocp_backend.hpp. Unix file
+  // systems preallocate unwritten extents that read as zeros for free,
+  // so the flag means nothing there.
+  bool waive_zero_fill = false;
 };
 
 // What a context needs to know at construction; the engine fills it from

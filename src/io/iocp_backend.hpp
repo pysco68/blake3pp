@@ -17,6 +17,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winioctl.h>
 #include <string>
 #include <string_view>
 
@@ -271,19 +272,43 @@ class iocp_context {
       // Preallocation belongs to the OPEN, not to the finish: a write that
       // extends the file serializes, and with an async direct queue that
       // collapses it to one stalled write at a time. On Windows that is
-      // SetEndOfFile, and set_size() trims back afterwards. The writes
-      // still zero-fill up to the valid data length as NTFS requires;
-      // SetFileValidData would waive that, but it needs
-      // SeManageVolumePrivilege and hands the file whatever those disk
-      // blocks held until they are written, so it is not done here.
+      // SetEndOfFile, and set_size() trims back afterwards.
+      //
+      // NTFS then zeroes every byte between the valid data length and a
+      // write that lands beyond it, which with several writes in flight
+      // cost the writer half the device. Two ways out, in the order the
+      // file system allows them:
+      //  - the valid data length set to the preallocation up front. It
+      //    needs SeManageVolumePrivilege and exposes the old blocks until
+      //    they are written, so only on request (waive_zero_fill);
+      //  - else a sparse file, whose gaps stay holes that read as zeros,
+      //    made plain again by set_size() once the file is complete.
+      // The sparse flag has to precede the preallocation for the range to
+      // be a hole, and a valid data length can only be set on a file that
+      // is not sparse.
       if (write_ && how.preallocate_bytes > 0) {
+        const bool valid_data =
+            how.waive_zero_fill && enable_manage_volume_privilege();
+        if (!valid_data) {
+          sparse_ = set_sparse(true);
+        }
         if (set_end_of_file(how.preallocate_bytes)) {
           prealloc_ = how.preallocate_bytes;
+          if (valid_data) {
+            valid_data_ = ::SetFileValidData(
+                              f_.plain.get(),
+                              static_cast<LONGLONG>(how.preallocate_bytes)) != 0;
+          }
         }
       }
       f_.engage(path.c_str(), access, share, how.direct_io,
                 ctx.port_wanted(), ctx.port(), write_);
       name_ = ctx.name_for(f_.direct, f_.use_iocp, write_);
+      if (valid_data_) {
+        name_ += "+validdata";
+      } else if (sparse_) {
+        name_ += "+sparse";
+      }
       ctx.adopt(*this);
     }
 
@@ -304,12 +329,17 @@ class iocp_context {
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
     // Trims a preallocation back to what was written. Harmless when
-    // nothing was preallocated, which is what a reader's file is.
+    // nothing was preallocated, which is what a reader's file is. A file
+    // made sparse for the run is a plain file again from here: every byte
+    // below the new end has been written, so there is no hole to keep.
     void set_size(std::uint64_t bytes) {
       if (!set_end_of_file(bytes)) {
         throw_winerr("SetEndOfFile");
       }
       prealloc_ = 0;
+      if (sparse_ && set_sparse(false)) {
+        sparse_ = false;
+      }
     }
 
    private:
@@ -327,11 +357,47 @@ class iocp_context {
       return ::SetEndOfFile(f_.plain.get()) != 0;
     }
 
+    // Sets or clears the sparse attribute on the plain handle. A file
+    // system without sparse files refuses, and the writer then runs with
+    // the zero-fill it always had.
+    [[nodiscard]] bool set_sparse(bool on) noexcept {
+      FILE_SET_SPARSE_BUFFER in{};
+      in.SetSparse = on ? TRUE : FALSE;
+      DWORD got = 0;
+      return ::DeviceIoControl(f_.plain.get(), FSCTL_SET_SPARSE, &in,
+                               sizeof in, nullptr, 0, &got, nullptr) != 0;
+    }
+
+    // Enables SeManageVolumePrivilege on the process token, which is what
+    // SetFileValidData checks. False where the account does not hold it,
+    // which is every non-elevated session: ERROR_NOT_ALL_ASSIGNED comes
+    // back from a successful AdjustTokenPrivileges call in that case.
+    [[nodiscard]] static bool enable_manage_volume_privilege() noexcept {
+      HANDLE tok = nullptr;
+      if (::OpenProcessToken(::GetCurrentProcess(),
+                             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                             &tok) == 0) {
+        return false;
+      }
+      TOKEN_PRIVILEGES tp{};
+      tp.PrivilegeCount = 1;
+      tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+      const bool ok =
+          ::LookupPrivilegeValueW(nullptr, L"SeManageVolumePrivilege",
+                                  &tp.Privileges[0].Luid) != 0 &&
+          ::AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) != 0 &&
+          ::GetLastError() == ERROR_SUCCESS;
+      ::CloseHandle(tok);
+      return ok;
+    }
+
     win_file f_;
     std::uint64_t size_ = 0;
     std::uint64_t prealloc_ = 0;
     bool write_ = false;
     std::string name_ = "readfile";
+    bool sparse_ = false;      // made sparse for the run; cleared by set_size()
+    bool valid_data_ = false;  // the valid data length was set up front
     iocp_context* ctx_ = nullptr;
     file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's

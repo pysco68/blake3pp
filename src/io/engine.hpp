@@ -255,7 +255,8 @@ class polled_writer_engine {
         file_(ctx_, path,
               file_open_options{.write = true,
                                 .direct_io = opts.direct_io,
-                                .preallocate_bytes = opts.preallocate_bytes}) {}
+                                .preallocate_bytes = opts.preallocate_bytes,
+                                .waive_zero_fill = opts.waive_zero_fill}) {}
 
   [[nodiscard]] std::uint64_t bytes_written() const noexcept {
     return written_;

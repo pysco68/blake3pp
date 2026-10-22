@@ -95,6 +95,10 @@ OPTIONS:
           --inline-submit Needs: --output
                               with --output: issue writes inline in the submitting thread, not
                               on io_uring's workers
+          --waive-zero-fill Needs: --output
+                              with --output, Windows: set the valid data length up front
+                              instead of writing a sparse file (needs the volume-maintenance
+                              privilege; exposes stale disk blocks until written)
           --window UINT Needs: --output
                               with --output: write buffer size in MiB (default: 4 MiB per
                               generator thread, so every fill fans out fully)

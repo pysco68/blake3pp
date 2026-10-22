@@ -167,7 +167,8 @@ io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
     : impl_(std::make_unique<impl>(
           *drv.impl_, path,
           io_impl::file_open_options{how.write, how.direct_io,
-                                     how.preallocate_bytes})) {}
+                                     how.preallocate_bytes,
+                                     how.waive_zero_fill})) {}
 
 // A file destroyed with transfers still owed makes the context drain
 // itself, which forgets every file's transfers without a callback. The

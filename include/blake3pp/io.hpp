@@ -377,6 +377,29 @@ struct file_write_options {
   bool async = true;
   /// io_uring: issue on io-wq rather than inline in the submit call.
   bool offload_submit = true;
+  /// Windows only: set the valid data length up front instead of making
+  /// the file sparse.
+  ///
+  /// NTFS zeroes every byte between a file's valid data length and a
+  /// write that lands beyond it, so that no reader sees the blocks a
+  /// deleted file left there; with several writes in flight that zeroing
+  /// is most of the write's cost. By default the writer makes the file
+  /// sparse for the duration of the run, which turns those gaps into holes
+  /// (read as zeros, nothing exposed), and clears the flag once the file is
+  /// complete. A run that fails leaves a sparse file with holes.
+  ///
+  /// This flag sets the valid data length to the preallocation up front
+  /// (SetFileValidData), which is faster still. It needs
+  /// SeManageVolumePrivilege, which the request enables on the PROCESS
+  /// token, and until the writes land the file exposes whatever its disk
+  /// blocks held before. Where the privilege is not held, the sparse route
+  /// is taken as if the flag were off.
+  ///
+  /// write_report::backend says which route ran: "+validdata", "+sparse",
+  /// or neither where the file system refused sparse files too. Unix
+  /// preallocates unwritten extents that read as zeros, and ignores the
+  /// flag.
+  bool waive_zero_fill = false;
   // No trace field, unlike file_io_options: the write pipeline keeps no
   // per-window records, so there would be nothing to record into.
 };
@@ -389,11 +412,13 @@ struct write_report {
   /// Which mechanism carried them, as the writer names it: the engine
   /// ("io_uring", "iocp", "gcd-write", or the synchronous "pwrite",
   /// "writefile", "stdio"), plus "+direct" or "+nocache" where the cache
-  /// bypass engaged; then " (inline submit)" where offload_submit was off,
-  /// and the reason where an asynchronous rung was asked for and refused.
-  /// So "io_uring+direct", "pwrite+direct [io_uring: ENOSYS, kernel too
-  /// old]", and so on. Owned by the report, because the writer that
-  /// composed it is gone by then.
+  /// bypass engaged; on Windows "+sparse" or "+validdata" for how the
+  /// preallocation was kept from zeroing ahead of the writes (see
+  /// file_write_options::waive_zero_fill); then " (inline submit)" where
+  /// offload_submit was off, and the reason where an asynchronous rung
+  /// was asked for and refused. So "io_uring+direct", "iocp+direct+sparse",
+  /// "pwrite+direct [io_uring: ENOSYS, kernel too old]", and so on. Owned
+  /// by the report, because the writer that composed it is gone by then.
   std::string backend;
 };
 
@@ -416,7 +441,8 @@ write_report write_sequential(const std::filesystem::path& path,
                       .direct_io = opts.direct_io,
                       .async = opts.async,
                       .offload_submit = opts.offload_submit,
-                      .preallocate_bytes = preallocate});
+                      .preallocate_bytes = preallocate,
+                      .waive_zero_fill = opts.waive_zero_fill});
   std::uint64_t done = 0;
   for (;;) {
     file_writer::buffer b = writer.acquire();

@@ -66,6 +66,8 @@ struct file_writer_options {
   // same role is played by SetEndOfFile. finish() trims the file back to
   // the bytes actually written.
   std::uint64_t preallocate_bytes = 0;
+  // See file_write_options::waive_zero_fill (io.hpp).
+  bool waive_zero_fill = false;
 };
 
 class file_writer {

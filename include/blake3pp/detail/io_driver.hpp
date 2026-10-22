@@ -54,6 +54,8 @@ class io_driver {
     bool write = false;
     bool direct_io = false;
     std::uint64_t preallocate_bytes = 0;
+    // See file_write_options::waive_zero_fill.
+    bool waive_zero_fill = false;
   };
 
   // An open file bound to a driver. Destroy every file before its
