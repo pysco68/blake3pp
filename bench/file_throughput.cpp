@@ -813,6 +813,7 @@ int main(int argc, char** argv) {
   double null_gib = 0;
   double null_sink_gib = 0;
   bool inline_submit = false;
+  bool no_async = false;
   bool no_direct = false;
   bool no_ioring = false;
   bool registered_buffers = false;
@@ -838,6 +839,9 @@ int main(int argc, char** argv) {
       ->capture_default_str();
   app.add_flag("--no-direct", no_direct,
                "keep the OS page cache (no O_DIRECT)");
+  app.add_flag("--no-async", no_async,
+               "read synchronously (no io_uring/IOCP/GCD/AIO queue): the "
+               "comparison arm against the platform's async engine");
   app.add_flag("--inline-submit", inline_submit,
                "issue each read inline in the submitting thread instead of "
                "on io_uring's workers (IOSQE_ASYNC off)");
@@ -883,6 +887,7 @@ int main(int argc, char** argv) {
   CLI11_PARSE(app, argc, argv);
 
   opts.direct_io = !no_direct;
+  opts.async = !no_async;
   opts.offload_submit = !inline_submit;
   opts.ioring = !no_ioring;
   opts.registered_buffers = registered_buffers;
@@ -1054,7 +1059,7 @@ int main(int argc, char** argv) {
         {.window_bytes = opts.window_bytes,
          .queue_depth = opts.queue_depth,
          .direct_io = opts.direct_io,
-         .async = true,
+         .async = opts.async,
          .offload_submit = opts.offload_submit,
          .ioring = opts.ioring,
          .registered_buffers = opts.registered_buffers});
@@ -1117,7 +1122,7 @@ int main(int argc, char** argv) {
         {.window_bytes = opts.window_bytes,
          .queue_depth = opts.queue_depth,
          .direct_io = opts.direct_io,
-         .async = true,
+         .async = opts.async,
          .offload_submit = opts.offload_submit,
          .ioring = opts.ioring,
          .registered_buffers = opts.registered_buffers});
