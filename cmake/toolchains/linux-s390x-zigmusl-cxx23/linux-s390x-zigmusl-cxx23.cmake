@@ -9,9 +9,9 @@ set(CMAKE_SYSTEM_PROCESSOR s390x)
 # path relative to this file because cmake-re copies toolchain files into
 # its own environment directory, where a relative path resolves nowhere.
 find_program(BLAKE3PP_ZIG_CC s390x-linux-musl-clang
-  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../docker/wrappers/zig" REQUIRED NO_CACHE)
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../../docker/wrappers/zig" REQUIRED NO_CACHE)
 find_program(BLAKE3PP_ZIG_CXX s390x-linux-musl-clang++
-  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../docker/wrappers/zig" REQUIRED NO_CACHE)
+  HINTS "${CMAKE_CURRENT_LIST_DIR}/../../../docker/wrappers/zig" REQUIRED NO_CACHE)
 set(CMAKE_C_COMPILER "${BLAKE3PP_ZIG_CC}")
 set(CMAKE_CXX_COMPILER "${BLAKE3PP_ZIG_CXX}")
 set(CMAKE_CXX_STANDARD 23)
