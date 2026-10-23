@@ -60,20 +60,30 @@ On FreeBSD, with the base system's compiler (`pkg install cmake ninja`):
   ASLR (`proccontrol -m aslr -s disable`), so the preset exists for a
   toolchain where the runtime starts.
 
-FreeBSD amd64 can also be built *from Linux*, which is what CI does:
+FreeBSD can also be built *from Linux*, for either architecture, which
+is what CI does:
 
 - `freebsd-zig-cxx23`: zig's clang targeting `x86_64-freebsd.14.0`,
   built in the `zig` toolchain image like the static musl presets
   (`tools/tc linux-zigmusl-cxx23-static -- cmake --preset
   freebsd-zig-cxx23` runs it, since both presets live in that image).
-  Unlike those, it is **not** static and cannot be: zig refuses
-  `-static` for this target with *"libc of the specified target requires
+- `freebsd-arm64-zig-cxx23`: the same, targeting
+  `aarch64-freebsd.14.0`. It carries the arm64 kernels — `neon`,
+  `sve256`, `sve512` and `sve2_128` — which
+  `cmake/KernelVariants.cmake` registers from compiler probes the
+  moment the toolchain declares `CMAKE_SYSTEM_PROCESSOR aarch64`;
+  nothing in the toolchain file asks for them by name. Dispatch offers
+  the SVE ones only on a kernel that publishes `HWCAP_SVE`, which
+  FreeBSD does from 15.0; on 14.x the same binary takes `neon`.
+
+  Neither is static, and neither can be: zig refuses
+  `-static` for both targets with *"libc of the specified target requires
   dynamic linking"*, so the binaries link against `libc.so.7` and
   `libthr.so.3` and the ABI version in the triple becomes the floor —
   they run on FreeBSD 14.0 and newer. Nothing on the build host can
-  execute them, so the preset's `CMAKE_CROSSCOMPILING_EMULATOR` is empty
+  execute them, so the presets' `CMAKE_CROSSCOMPILING_EMULATOR` is empty
   and `ctest` runs nothing; `tools/freebsd-guest.sh` is what runs them,
-  by booting an actual FreeBSD under qemu/KVM:
+  by booting an actual FreeBSD under qemu:
 
   ```sh
   tools/freebsd-guest.sh prepare      # once: build the guest image
@@ -85,13 +95,25 @@ FreeBSD amd64 can also be built *from Linux*, which is what CI does:
   tools/freebsd-guest.sh stop
   ```
 
-  `prepare` needs `/dev/kvm`, `qemu`, `ovmf` and root for `nbd`; it
-  takes about a minute and the guest then boots to ssh in roughly
-  fifteen seconds. CI does not run `prepare` per build: the prepared
-  image is published to GHCR alongside the toolchain images and the
-  lane pulls it. The script's header explains why the guest configures
+  Put `FBSD_ARCH=arm64` in front of each of those for the arm64 guest;
+  it is one script and the two guests have different default
+  directories and ports, so both can exist in one checkout.
+
+  `prepare` needs `qemu`, root for `nbd`, and the EFI firmware for the
+  architecture (`ovmf` on amd64, `qemu-efi-aarch64` on arm64). The
+  amd64 guest also needs `/dev/kvm`: it takes about a minute to prepare
+  and boots to ssh in roughly fifteen seconds. The arm64 guest runs
+  under TCG — nothing can KVM an aarch64 guest on an x86 host, and
+  GitHub has no arm64 runner that exposes `/dev/kvm` — so it is slower
+  throughout: measured on a 16-core x86 box, about four and a half
+  minutes to prepare (of which a minute and a quarter is the download),
+  a hundred seconds to boot to ssh, and under a minute for the whole
+  test suite. CI does not run `prepare` per build: the prepared images
+  are published to GHCR alongside the toolchain images and the lanes
+  pull them. The script's header explains why the guest configures
   itself from the inside rather than being seeded offline (short
-  version: Linux cannot write UFS).
+  version: Linux cannot write UFS), and why the two architectures
+  differ in exactly four places.
 
 Without a preset, a bare `cmake -S . -B build` configures the C++20
 baseline with the default compiler.

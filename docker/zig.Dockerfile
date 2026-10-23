@@ -1,13 +1,15 @@
 # syntax=docker/dockerfile:1
 #
 # zig cc/c++ cross toolchain image for the linux-{,arm64-}zigmusl-cxx23-static
-# presets, the freebsd-zig-cxx23 preset and tools/make-release.sh. zig
-# lands on PATH (the monolith had it only at /opt/zig, reachable via $ZIG
-# alone); qemu-user runs the aarch64 and riscv64 test passes; the cross
-# binutils provide per-arch strip for the release packaging. The FreeBSD
-# binaries this image produces are not run here at all: ci boots them in
-# a qemu FreeBSD guest on the runner (tools/freebsd-guest.sh), because no
-# emulator persona on Linux serves a FreeBSD userland.
+# presets, the freebsd{,-arm64}-zig-cxx23 presets and
+# tools/make-release.sh. zig lands on PATH (the monolith had it only at
+# /opt/zig, reachable via $ZIG alone); qemu-user runs the aarch64 and
+# riscv64 test passes; the cross binutils provide per-arch strip for the
+# release packaging. The FreeBSD binaries this image produces are not
+# run here at all: ci boots them in qemu FreeBSD guests on the runner
+# (tools/freebsd-guest.sh), because no emulator persona on Linux serves
+# a FreeBSD userland -- not even for the arm64 one, where qemu-aarch64
+# would have the instruction set but not the system calls.
 FROM base
 
 ARG ZIG_VERSION=0.16.0
@@ -31,13 +33,16 @@ RUN set -eux; \
 # EXTERNAL_COMPILER) while zig builds everything else. Two compilers,
 # one fat binary, because no single compiler speaks every vector dialect.
 #
-# Host binutils is here for the FreeBSD lane's strip: zig ships no
+# Host binutils is here for the FreeBSD lanes' strip: zig ships no
 # strip of its own (`zig objcopy --strip-all` answers "unimplemented"
 # on 0.16) and the base image carries none, while the freebsd-zig-cxx23
 # binaries are 189 MB unstripped and 10 MB stripped, which is the
 # difference between a sensible artifact and a silly one. The target is
-# x86_64 ELF with a FreeBSD OSABI byte, which GNU strip handles without
-# knowing or caring that it is FreeBSD.
+# ELF with a FreeBSD OSABI byte, which GNU strip handles without
+# knowing or caring that it is FreeBSD; the arm64 FreeBSD binaries go
+# through binutils-aarch64-linux-gnu's strip, already above for the
+# musl lane, for the same reason and with the same indifference to the
+# OSABI byte.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-user binutils \
         binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
@@ -66,13 +71,18 @@ ARG ZIG_TARGETS="x86_64 aarch64 riscv64 powerpc64le s390x"
 # list because the musl loop's shape does not transfer: the triple carries
 # an ABI version rather than a libc name, -static is REFUSED for it ("libc
 # of the specified target requires dynamic linking", which is also why the
-# freebsd-zig-cxx23 toolchain file ships no -static), and nothing in this
-# image can execute the result, so the warm is compile-and-link only with
-# no run to confirm it. That costs the loop its end-to-end check and buys
-# the ci lane the same 23-26 s per target it buys the musl ones; the proof
-# that these bytes run is the qemu FreeBSD guest in ci, not a line here.
-# Both optimisation modes again, for the reason given above.
-ARG ZIG_FREEBSD_TARGETS="x86_64-freebsd.14.0"
+# freebsd{,-arm64}-zig-cxx23 toolchain files ship no -static), and
+# nothing in this image can execute the result, so the warm is
+# compile-and-link only with no run to confirm it. That costs the loop
+# its end-to-end check and buys the ci lanes the same 23-26 s per target
+# it buys the musl ones; the proof that these bytes run is the qemu
+# FreeBSD guests in ci, not a line here.
+# Both optimisation modes again, for the reason given above. Two targets
+# here and not one: x86_64 and aarch64 share no cached artefact at all
+# (zig keys the libc++ and compiler-rt builds on the target), so the
+# arm64 lane would pay the full cold cost on its first link without
+# this line.
+ARG ZIG_FREEBSD_TARGETS="x86_64-freebsd.14.0 aarch64-freebsd.14.0"
 COPY --chmod=0755 docker/wrappers/zig/musl-run /usr/local/bin/musl-run
 RUN set -eux; umask 000; \
     mkdir -p /opt/zig-cache; chmod 0777 /opt/zig-cache; \
@@ -106,7 +116,9 @@ RUN set -eux; \
     for user in vscode tipi tipi-rbe; do \
       printf '/* %s */ int main() { return 0; }\n' "${user}" > /tmp/probe-${user}.c; \
       su "${user}" -c "umask 000; ${arch}-linux-musl-clang -O2 -static /tmp/probe-${user}.c -o /tmp/probe-${user} && musl-run ${arch} /tmp/probe-${user}"; \
-      su "${user}" -c "umask 000; x86_64-freebsd-clang -O2 /tmp/probe-${user}.c -o /tmp/probe-${user}-fbsd"; \
+      for tgt in ${ZIG_FREEBSD_TARGETS}; do \
+        su "${user}" -c "umask 000; ${tgt%%.*}-clang -O2 /tmp/probe-${user}.c -o /tmp/probe-${user}-${tgt%%-*}-fbsd"; \
+      done; \
     done; \
     rm -f /tmp/probe*; \
     find /opt/zig-cache ! -perm -o=rw -exec chmod a+rwX {} +; \

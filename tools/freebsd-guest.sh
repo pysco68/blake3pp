@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
-# freebsd-guest.sh: the FreeBSD amd64 guest the ci lane runs its
-# cross-built binaries in. One recipe, five subcommands, used by
-# .github/workflows/toolchains.yml (which publishes the prepared image)
-# and .github/workflows/ci.yml (which boots it), and by hand on any
-# developer machine with KVM:
+# freebsd-guest.sh: the FreeBSD guests the ci lanes run their
+# cross-built binaries in. One recipe, two architectures, five
+# subcommands, used by .github/workflows/toolchains.yml (which publishes
+# the prepared images) and .github/workflows/ci.yml (which boots them),
+# and by hand on any developer machine with qemu:
 #
 #   tools/freebsd-guest.sh prepare   build the guest image, once
 #   tools/freebsd-guest.sh start     boot a throwaway overlay of it
 #   tools/freebsd-guest.sh wait      block until sshd answers
 #   tools/freebsd-guest.sh run ...   run a command in the guest
 #   tools/freebsd-guest.sh stop      ACPI powerdown, then kill
+#
+# Which guest is chosen by FBSD_ARCH, amd64 (the default) or arm64:
+#
+#   FBSD_ARCH=arm64 tools/freebsd-guest.sh prepare
+#
+# Everything else is one code path. The two architectures are the same
+# operating system configured the same way, and keeping them in one file
+# is what stops the second one from quietly rotting; the places they
+# genuinely differ are collected in the arch table below and explained
+# in "-- Why the two architectures differ" at the end of this header.
 #
 # There is no copy subcommand: `run` passes stdin through, so
 #
@@ -50,17 +60,16 @@
 # That turns out to be enough, because of one FreeBSD feature: loader.efi
 # reads /EFI/freebsd/loader.env off the ESP and imports it as loader
 # environment before it touches the root filesystem. So the offline
-# qemu-nbd step writes exactly one file there, setting
-# console="comconsole", and the guest's console moves to the serial line
-# on the very first boot without anything on the UFS side having
-# changed. From there the guest configures ITSELF: `prepare` boots it
-# once under KVM, logs in as root on that serial console (the plain
-# image leaves root's password empty and marks ttyu0 secure, which is
-# the documented way to use it), pipes a configuration script in, and
-# powers it down. A FreeBSD kernel writing its own UFS root is not an
+# qemu-nbd step writes exactly one file there, and the guest boots
+# straight to a usable serial console without anything on the UFS side
+# having changed. From there the guest configures ITSELF: `prepare`
+# boots it once, logs in as root on that serial console (the plain image
+# leaves root's password empty and marks ttyu0 secure, which is the
+# documented way to use it), pipes a configuration script in, and powers
+# it down. A FreeBSD kernel writing its own UFS root is not an
 # experimental kernel option; it is just FreeBSD.
 #
-# The one boot is why `prepare` needs KVM, and it is also why `prepare`
+# The one boot is why `prepare` is slow, and it is also why `prepare`
 # runs once per recipe change rather than once per ci run: its output is
 # published to GHCR as a toolchain image and every run pulls it.
 #
@@ -83,19 +92,112 @@
 # backing file is the base and boots that, so every run begins from
 # byte-identical state and a run that corrupts its filesystem costs the
 # next run nothing.
+#
+# -- Why the two architectures differ ----------------------------------
+#
+# Four things, and only four. Each of them cost real debugging time, so
+# each is stated where it is used as well as here.
+#
+# 1. ACCELERATION. amd64 runs under KVM on an x86 runner and refuses to
+#    run without it. arm64 cannot: GitHub has no arm64 runner that
+#    exposes /dev/kvm, and an x64 runner cannot KVM an arm64 guest --
+#    KVM virtualises, it does not translate. So the arm64 guest is TCG,
+#    and that, not any property of FreeBSD, is why it is the slower of
+#    the two lanes: roughly two minutes to boot and a hundred seconds
+#    for the suite, against seconds for its amd64 twin. That is cheap
+#    enough to run on every push, which is what it does.
+#
+# 2. FIRMWARE. amd64 needs OVMF for the FIRST boot alone, because the
+#    only way to give the stock image a serial console without writing
+#    its UFS root is a loader.env on the ESP and only the EFI loader
+#    reads that; afterwards the guest's own /boot/loader.conf says
+#    comconsole and every later boot is plain BIOS. arm64 has no BIOS at
+#    all -- UEFI is the only way an aarch64 machine boots -- so EVERY
+#    boot needs the AAVMF pair, a read-only CODE image and a WRITABLE
+#    copy of VARS (the firmware writes its variable store, and a
+#    read-only one wedges the boot). On Ubuntu they are
+#    /usr/share/AAVMF/AAVMF_CODE.fd (a symlink to the no-secboot
+#    variant) and /usr/share/AAVMF/AAVMF_VARS.fd, from the package
+#    qemu-efi-aarch64; both are already 64 MiB, which is the size
+#    -machine virt's pflash wants, so unlike OVMF's 2 MiB legacy pair
+#    there is nothing to pad.
+#
+# 3. WHERE THE ESP IS. Not a fixed partition index. On the amd64 release
+#    image it is partition 2; on the arm64 release image it is partition
+#    1. Nothing documents either as stable, so both architectures probe
+#    for the FAT partition instead of trusting an index -- see esp_find.
+#
+# 4. THE CONSOLE SETTING. amd64 has a VGA console to move AWAY from, so
+#    both loader.env and /boot/loader.conf set console="comconsole".
+#    arm64 under -machine virt -display none has no other console to
+#    begin with: the EFI firmware, the loader and the kernel all find
+#    the pl011 on their own, and naming a console explicitly can only
+#    take one away. So on arm64 those files carry the boot-speed
+#    settings and say nothing about the console.
 set -euo pipefail
 
-# The release the lane targets. 14.5-RELEASE is deliberately close to
-# the 14.0 ABI floor the cross-built artifact claims (see
-# cmake/toolchains/freebsd-zig-cxx23/), so the lane tests the claim
-# rather than testing a decade of forward compatibility.
-FBSD_VERSION="${FBSD_VERSION:-14.5-RELEASE}"
+# ------------------------------------------------------------- arch --
+# amd64 or arm64. Everything that differs between the two is resolved in
+# the table below and nowhere else.
+FBSD_ARCH="${FBSD_ARCH:-amd64}"
+case "${FBSD_ARCH}" in
+  amd64|arm64) ;;
+  *) printf '[freebsd-guest] error: FBSD_ARCH must be amd64 or arm64, not %s\n' "${FBSD_ARCH}" >&2; exit 1 ;;
+esac
+
+if [ "${FBSD_ARCH}" = amd64 ]; then
+  # 14.5-RELEASE is deliberately close to the 14.0 ABI floor the
+  # cross-built artifact claims (see cmake/toolchains/freebsd-zig-cxx23/),
+  # so the lane tests the claim rather than testing a decade of forward
+  # compatibility.
+  FBSD_VERSION="${FBSD_VERSION:-14.5-RELEASE}"
+  # The release tree's directory for this architecture and the infix in
+  # the image's own file name. They are not the same word, and neither
+  # of them is "amd64" on the other architecture.
+  FBSD_REL_DIR=amd64
+  FBSD_REL_INFIX=amd64
+  FBSD_QEMU=qemu-system-x86_64
+  FBSD_NAME=freebsd-guest
+  FBSD_SSH_PORT_DEFAULT=2222
+  # KVM, and only KVM: this lane exists to measure a real I/O backend on
+  # real timings, and the runner has the silicon for it.
+  FBSD_KVM_REQUIRED=1
+  # UEFI for the preparation boot alone; see the header, point 2.
+  FBSD_UEFI_ALWAYS=0
+  FBSD_BOOT_TIMEOUT_DEFAULT=300
+else
+  # 15.x, not 14.x, and this is the one deliberate divergence from the
+  # amd64 lane's "stay next to the ABI floor" rule. The SVE kernels this
+  # architecture carries are selected from HWCAP_SVE, and that bit is
+  # set only by a kernel that saves SVE state across a context switch,
+  # which FreeBSD gained in 15.0 (see src/dispatch/cpu_detect_arm.cpp).
+  # A 14.x guest would run the binaries correctly and take NEON, testing
+  # the ABI floor but covering none of the vector kernels; a 15.x guest
+  # covers the kernels, and the floor is still asserted by the binary
+  # loading at all, since nothing about it changed.
+  FBSD_VERSION="${FBSD_VERSION:-15.1-RELEASE}"
+  # Note both: the directory is "aarch64" and the file name says
+  # "arm64-aarch64". Guessing either from the other does not work.
+  FBSD_REL_DIR=aarch64
+  FBSD_REL_INFIX=arm64-aarch64
+  FBSD_QEMU=qemu-system-aarch64
+  FBSD_NAME=freebsd-arm64-guest
+  FBSD_SSH_PORT_DEFAULT=2322
+  FBSD_KVM_REQUIRED=0
+  FBSD_UEFI_ALWAYS=1
+  # TCG, so everything takes longer: ~2 min to the login prompt on a
+  # four-core runner. Generous enough that a loaded runner is still
+  # reported as slow rather than as broken.
+  FBSD_BOOT_TIMEOUT_DEFAULT=900
+fi
+
 FBSD_MIRROR="${FBSD_MIRROR:-https://download.freebsd.org/releases/VM-IMAGES}"
 
 # Where everything lives. Under build/ so a checkout stays clean and
-# .gitignore already covers it.
-FBSD_DIR="${FBSD_DIR:-build/freebsd-guest}"
-FBSD_IMAGE="${FBSD_IMAGE:-${FBSD_DIR}/freebsd-guest.qcow2}"
+# .gitignore already covers it. Per architecture, so the two guests can
+# exist side by side in one checkout.
+FBSD_DIR="${FBSD_DIR:-build/${FBSD_NAME}}"
+FBSD_IMAGE="${FBSD_IMAGE:-${FBSD_DIR}/${FBSD_NAME}.qcow2}"
 FBSD_OVERLAY="${FBSD_OVERLAY:-${FBSD_DIR}/overlay.qcow2}"
 FBSD_SERIAL="${FBSD_SERIAL:-${FBSD_DIR}/serial.log}"
 FBSD_MONITOR="${FBSD_MONITOR:-${FBSD_DIR}/monitor.sock}"
@@ -104,16 +206,17 @@ FBSD_SSH_KEY="${FBSD_SSH_KEY:-${FBSD_DIR}/id_ed25519}"
 
 # Guest shape and the loopback port its sshd is forwarded to. The port
 # is a variable because a developer box may already have a guest on the
-# obvious one.
-FBSD_SSH_PORT="${FBSD_SSH_PORT:-2222}"
+# obvious one, and it differs per architecture so that both guests can
+# run at once.
+FBSD_SSH_PORT="${FBSD_SSH_PORT:-${FBSD_SSH_PORT_DEFAULT}}"
 FBSD_SMP="${FBSD_SMP:-4}"
 FBSD_MEM="${FBSD_MEM:-4096}"
 FBSD_DISK="${FBSD_DISK:-12G}"
 
-# Timeouts, both generous: a cold runner boots slower than a desktop,
-# and a guest that is merely slow must not be reported as a guest that
-# is broken.
-FBSD_BOOT_TIMEOUT="${FBSD_BOOT_TIMEOUT:-300}"
+# Timeouts, both generous: a cold runner boots slower than a desktop, a
+# TCG guest slower than either, and a guest that is merely slow must not
+# be reported as a guest that is broken.
+FBSD_BOOT_TIMEOUT="${FBSD_BOOT_TIMEOUT:-${FBSD_BOOT_TIMEOUT_DEFAULT}}"
 FBSD_STOP_TIMEOUT="${FBSD_STOP_TIMEOUT:-60}"
 
 # The nbd device the offline steps borrow, and how to become root for
@@ -123,15 +226,42 @@ FBSD_STOP_TIMEOUT="${FBSD_STOP_TIMEOUT:-60}"
 FBSD_NBD="${FBSD_NBD:-/dev/nbd0}"
 if [ "$(id -u)" = 0 ]; then FBSD_SUDO="${FBSD_SUDO-}"; else FBSD_SUDO="${FBSD_SUDO-sudo}"; fi
 
-# OVMF, needed by `prepare` alone: the first boot has no /boot/loader.conf
-# of ours yet, so the serial console comes from the ESP's loader.env,
-# and only loader.efi reads that. Every later boot is plain BIOS,
-# because by then the guest's own /boot/loader.conf says comconsole.
-FBSD_OVMF_CODE="${FBSD_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
-FBSD_OVMF_VARS="${FBSD_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
+# Firmware. On amd64 this is OVMF and `prepare` alone reads it (header,
+# point 2). On arm64 it is the AAVMF pair and EVERY boot reads it, so
+# `start` needs it too. AAVMF_CODE.fd is a symlink to the no-secboot
+# build on Ubuntu, which is the one we want: a secure-boot firmware
+# would refuse FreeBSD's unsigned loader.
+if [ "${FBSD_ARCH}" = amd64 ]; then
+  FBSD_FW_CODE="${FBSD_FW_CODE:-${FBSD_OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}}"
+  FBSD_FW_VARS="${FBSD_FW_VARS:-${FBSD_OVMF_VARS:-/usr/share/OVMF/OVMF_VARS_4M.fd}}"
+  FBSD_FW_PKG="ovmf"
+else
+  FBSD_FW_CODE="${FBSD_FW_CODE:-/usr/share/AAVMF/AAVMF_CODE.fd}"
+  FBSD_FW_VARS="${FBSD_FW_VARS:-/usr/share/AAVMF/AAVMF_VARS.fd}"
+  FBSD_FW_PKG="qemu-efi-aarch64"
+fi
 
-say() { printf '[freebsd-guest] %s\n' "$*" >&2; }
-die() { printf '[freebsd-guest] error: %s\n' "$*" >&2; exit 1; }
+# The arm64 guest's SVE vector length, in 128-bit granules: 1 means a
+# 128-bit vector, which makes dispatch select sve2_128, the
+# configuration essentially all real Armv9 silicon has (Neoverse V2,
+# Grace, Graviton4). The probe behind that selection was validated by
+# hand at 128, 256 and 512 bits and with SVE off entirely, selecting
+# sve2_128, sve256, sve512 and neon respectively and rejecting every
+# length that did not match; the lane PINS one length rather than
+# sweeping them, because a lane should test the common case and a sweep
+# of four TCG boots would cost four times as much to learn what the
+# dispatch unit tests already assert.
+#
+# This is also the lane's guard against the setting being silently
+# ignored: qemu refuses to start on an unknown -cpu property (a
+# misspelling is an error, not a shrug), and the test job additionally
+# asserts that the kernel dispatch actually engaged is an SVE2 one. One
+# lock for "the knob still exists", one for "the knob still does
+# something".
+FBSD_SVE_VQ="${FBSD_SVE_VQ:-1}"
+
+say() { printf '[freebsd-guest:%s] %s\n' "${FBSD_ARCH}" "$*" >&2; }
+die() { printf '[freebsd-guest:%s] error: %s\n' "${FBSD_ARCH}" "$*" >&2; exit 1; }
 
 ssh_opts() {
   printf '%s\n' \
@@ -146,6 +276,38 @@ ssh_opts() {
     -p "${FBSD_SSH_PORT}"
 }
 
+# ---------------------------------------------------------- qemu args --
+# The machine, the accelerator and the processor model, which is where
+# the two architectures stop looking alike. Printed one per line and
+# read into an array by the callers, so a value may contain commas
+# without any word-splitting question.
+qemu_machine_args() {
+  if [ "${FBSD_ARCH}" = amd64 ]; then
+    # qemu's default i440fx machine, KVM, and the host's own CPU model:
+    # this lane is a measurement, so the guest should see the silicon.
+    printf '%s\n' -enable-kvm -cpu host
+  else
+    # -machine virt is the only sensible aarch64 board (no legacy
+    # anything, virtio for everything). thread=multi lets TCG use more
+    # than one host core for the guest's vCPUs, which is most of the
+    # difference between "slow" and "unusable".
+    #
+    # -cpu max is what carries SVE at all; sve-max-vq pins the vector
+    # length, see FBSD_SVE_VQ above. A wrong property name here is a
+    # hard qemu error rather than a default, which is deliberate.
+    printf '%s\n' -machine virt -accel "tcg,thread=multi" -cpu "max,sve-max-vq=${FBSD_SVE_VQ}"
+  fi
+}
+
+# The pflash pair, for the boots that need firmware. <vars file>, which
+# must already be a WRITABLE copy: the firmware stores its boot
+# variables there and a read-only one wedges the boot on arm64.
+qemu_firmware_args() {  # <vars copy>
+  printf '%s\n' \
+    -drive "if=pflash,format=raw,unit=0,readonly=on,file=${FBSD_FW_CODE}" \
+    -drive "if=pflash,format=raw,unit=1,file=$1"
+}
+
 # ---------------------------------------------------------------- nbd --
 # Connect the image at FBSD_NBD and mount its ESP. Both halves are
 # undone by nbd_detach, which every caller installs as a trap: a
@@ -153,21 +315,57 @@ ssh_opts() {
 # connect fail with a message about the device being busy, which reads
 # like a corrupt image rather than like leftover state.
 ESP_MNT=""
+ESP_PART=""
+
+# Which partition is the EFI System Partition. PROBED, never assumed:
+# it is partition 2 on the amd64 release image and partition 1 on the
+# arm64 one, the FreeBSD release engineering scripts document neither as
+# an interface, and a hardcoded index silently mounts the wrong thing or
+# fails with a message about a missing device. blkid is the cheap
+# answer; where it is missing, a read-only mount attempt is the same
+# question asked the slow way.
+esp_find() {
+  local p
+  for p in "${FBSD_NBD}"p*; do
+    [ -b "${p}" ] || continue
+    if command -v blkid > /dev/null 2>&1; then
+      case "$(${FBSD_SUDO} blkid -p -s TYPE -o value "${p}" 2> /dev/null)" in
+        vfat) printf '%s\n' "${p}"; return 0 ;;
+        ?*)   continue ;;   # a type we know and it is not FAT
+      esac
+    fi
+    local probe
+    probe=$(mktemp -d)
+    if ${FBSD_SUDO} mount -t vfat -o ro "${p}" "${probe}" 2> /dev/null; then
+      ${FBSD_SUDO} umount "${probe}" > /dev/null 2>&1 || true
+      rmdir "${probe}" > /dev/null 2>&1 || true
+      printf '%s\n' "${p}"
+      return 0
+    fi
+    rmdir "${probe}" > /dev/null 2>&1 || true
+  done
+  return 1
+}
+
 nbd_attach() {  # <qcow2>
   local img=$1
   ${FBSD_SUDO} modprobe nbd max_part=16
   ${FBSD_SUDO} qemu-nbd -d "${FBSD_NBD}" > /dev/null 2>&1 || true
   ${FBSD_SUDO} qemu-nbd -c "${FBSD_NBD}" -f qcow2 "${img}"
   # The kernel publishes the partition nodes asynchronously after the
-  # connect returns; waiting for the one we want beats a fixed sleep.
+  # connect returns, so the retry loop is the wait: it ends when the
+  # probe finds a FAT partition, which also covers the case of the ESP
+  # appearing after its neighbours.
   local i
   for i in $(seq 1 50); do
-    [ -b "${FBSD_NBD}p2" ] && break
+    ESP_PART=$(esp_find) && break
+    ESP_PART=""
     sleep 0.2
   done
-  [ -b "${FBSD_NBD}p2" ] || die "no partition 2 on ${FBSD_NBD}; is ${img} a FreeBSD VM image?"
+  [ -n "${ESP_PART}" ] || die "no FAT (EFI System) partition among ${FBSD_NBD}p*; is ${img} a FreeBSD ${FBSD_ARCH} VM image?"
+  say "ESP is ${ESP_PART}"
   ESP_MNT=$(mktemp -d)
-  ${FBSD_SUDO} mount -t vfat "${FBSD_NBD}p2" "${ESP_MNT}"
+  ${FBSD_SUDO} mount -t vfat "${ESP_PART}" "${ESP_MNT}"
 }
 
 nbd_detach() {
@@ -176,6 +374,7 @@ nbd_detach() {
     rmdir "${ESP_MNT}" > /dev/null 2>&1 || true
     ESP_MNT=""
   fi
+  ESP_PART=""
   ${FBSD_SUDO} qemu-nbd -d "${FBSD_NBD}" > /dev/null 2>&1 || true
 }
 
@@ -189,17 +388,33 @@ esp_put_key() {  # <qcow2> <pubkey file>
   nbd_detach
 }
 
+# The loader settings the two boots share. On amd64 the console has to
+# be moved to the serial line explicitly, because the image's default is
+# the VGA one the lane does not have. On arm64 there is nothing to move
+# it away from -- -machine virt -display none has no other console, and
+# firmware, loader and kernel all find the pl011 themselves -- so naming
+# one could only take the working console away.
+loader_settings() {
+  if [ "${FBSD_ARCH}" = amd64 ]; then
+    printf 'console="comconsole"\n'
+  fi
+  printf 'autoboot_delay="0"\nbeastie_disable="YES"\n'
+}
+
 # ------------------------------------------------------------ prepare --
 cmd_prepare() {
-  command -v qemu-system-x86_64 > /dev/null || die "qemu-system-x86_64 not found"
-  command -v qemu-img          > /dev/null || die "qemu-img not found"
-  command -v qemu-nbd          > /dev/null || die "qemu-nbd not found"
-  [ -r "${FBSD_OVMF_CODE}" ] || die "no OVMF firmware at ${FBSD_OVMF_CODE} (apt-get install ovmf), needed for the first boot's serial console"
-  [ -e /dev/kvm ] || die "no /dev/kvm; prepare boots the guest once and will not do it under TCG"
+  command -v "${FBSD_QEMU}" > /dev/null || die "${FBSD_QEMU} not found"
+  command -v qemu-img       > /dev/null || die "qemu-img not found"
+  command -v qemu-nbd       > /dev/null || die "qemu-nbd not found"
+  [ -r "${FBSD_FW_CODE}" ] || die "no EFI firmware at ${FBSD_FW_CODE} (apt-get install ${FBSD_FW_PKG}); the configuration boot needs the EFI loader to read the ESP's loader.env"
+  [ -r "${FBSD_FW_VARS}" ] || die "no EFI variable store at ${FBSD_FW_VARS} (apt-get install ${FBSD_FW_PKG})"
+  if [ "${FBSD_KVM_REQUIRED}" = 1 ]; then
+    [ -e /dev/kvm ] || die "no /dev/kvm; the amd64 guest boots under KVM and will not do it under TCG"
+  fi
 
   mkdir -p "${FBSD_DIR}"
-  local base="${FBSD_DIR}/download-${FBSD_VERSION}-amd64-ufs.qcow2"
-  local url="${FBSD_MIRROR}/${FBSD_VERSION}/amd64/Latest/FreeBSD-${FBSD_VERSION}-amd64-ufs.qcow2.xz"
+  local base="${FBSD_DIR}/download-${FBSD_VERSION}-${FBSD_REL_INFIX}-ufs.qcow2"
+  local url="${FBSD_MIRROR}/${FBSD_VERSION}/${FBSD_REL_DIR}/Latest/FreeBSD-${FBSD_VERSION}-${FBSD_REL_INFIX}-ufs.qcow2.xz"
 
   if [ ! -f "${base}" ]; then
     say "downloading ${url}"
@@ -221,31 +436,36 @@ cmd_prepare() {
   say "resized to ${FBSD_DISK}"
 
   # The one offline injection the host is capable of: the ESP, so the
-  # first boot's console is the serial line. See the header.
+  # first boot comes up the way the console driver below expects. See
+  # the header, and loader_settings for what goes in on each
+  # architecture.
   trap nbd_detach EXIT
   nbd_attach "${work}"
   ${FBSD_SUDO} mkdir -p "${ESP_MNT}/EFI/freebsd"
-  printf 'console="comconsole"\nautoboot_delay="0"\nbeastie_disable="YES"\n' \
-    | ${FBSD_SUDO} tee "${ESP_MNT}/EFI/freebsd/loader.env" > /dev/null
-  say "seeded ESP /EFI/freebsd/loader.env (serial console for the first boot)"
+  loader_settings | ${FBSD_SUDO} tee "${ESP_MNT}/EFI/freebsd/loader.env" > /dev/null
+  say "seeded ESP /EFI/freebsd/loader.env"
   nbd_detach
   trap - EXIT
 
   # Boot it once, UEFI so loader.env is read, and talk to the console
   # over a unix socket rather than a log file, because this boot is a
   # conversation and not a transcript.
-  local vars="${FBSD_DIR}/ovmf-vars.fd"
+  local vars="${FBSD_DIR}/efi-vars.fd"
   local consock="${FBSD_DIR}/prepare-console.sock"
   local prepare_log="${FBSD_DIR}/prepare-console.log"
-  cp -f "${FBSD_OVMF_VARS}" "${vars}"
+  cp -f "${FBSD_FW_VARS}" "${vars}"
+  chmod u+w "${vars}"
   rm -f "${consock}" "${prepare_log}"
 
+  local -a machine fw
+  mapfile -t machine < <(qemu_machine_args)
+  mapfile -t fw      < <(qemu_firmware_args "${vars}")
+
   say "booting once to configure the guest from the inside"
-  qemu-system-x86_64 -enable-kvm -cpu host -smp "${FBSD_SMP}" -m "${FBSD_MEM}" \
-    -drive if=pflash,format=raw,unit=0,readonly=on,file="${FBSD_OVMF_CODE}" \
-    -drive if=pflash,format=raw,unit=1,file="${vars}" \
+  "${FBSD_QEMU}" "${machine[@]}" -smp "${FBSD_SMP}" -m "${FBSD_MEM}" \
+    "${fw[@]}" \
     -drive file="${work}",if=virtio,format=qcow2,cache=unsafe \
-    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0,romfile= \
     -display none -serial "unix:${consock},server=on,wait=off" \
     -pidfile "${FBSD_DIR}/prepare.pid" -daemonize
 
@@ -253,6 +473,12 @@ cmd_prepare() {
   # script rather than as a sequence of typed commands so that it is
   # reviewable as a unit and so that a single sentinel reports whether
   # all of it succeeded.
+  # The heredoc is QUOTED, so nothing in it is expanded by this shell:
+  # the guest script is full of $ and backslashes that belong to the
+  # guest's shell, and an expanding heredoc turns one missed escape into
+  # a configuration that silently did something else. The two values
+  # that really do come from out here are spliced in afterwards, by
+  # name.
   local guest_script
   guest_script=$(cat <<'GUEST'
 set -eu
@@ -265,7 +491,7 @@ set -eu
 # the image's ifconfig_DEFAULT so the lane does not depend on a default
 # that a future release could restate differently.
 sysrc sshd_enable=YES
-sysrc hostname=blake3pp-freebsd
+sysrc hostname=blake3pp-freebsd-@ARCH@
 sysrc ifconfig_vtnet0=DHCP
 sysrc blake3ppkey_enable=YES
 # No crash dumps: the guest's swap partition is 1 GB and a dump there
@@ -279,14 +505,16 @@ sed -i '' -E 's/^#?[[:space:]]*PermitRootLogin.*/PermitRootLogin prohibit-passwo
 grep -q '^PermitRootLogin prohibit-password' /etc/ssh/sshd_config \
   || echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
 
-# The serial console and an immediate boot, now on the UFS side, so
-# every later boot gets them from plain BIOS without the ESP or OVMF.
-# The plain release image has no /boot/loader.conf of its own at all
-# (vmimage.subr writes one only for the ZFS variants), so create it
-# before editing it rather than letting sed fail on a missing file.
+# The same loader settings, now on the UFS side, so every later boot
+# gets them without the ESP. The plain release image has no
+# /boot/loader.conf of its own at all (vmimage.subr writes one only for
+# the ZFS variants), so create it before editing it rather than letting
+# sed fail on a missing file.
 touch /boot/loader.conf
 sed -i '' -E '/^(console|autoboot_delay|beastie_disable)=/d' /boot/loader.conf
-printf 'console="comconsole"\nautoboot_delay="0"\nbeastie_disable="YES"\n' >> /boot/loader.conf
+cat >> /boot/loader.conf <<'LOADEREOF'
+@LOADER_SETTINGS@
+LOADEREOF
 
 # The per-run key relay. The published image carries no key; this reads
 # whatever public key the host wrote onto the ESP and installs it before
@@ -317,23 +545,27 @@ blake3ppkey_start()
 	# The release image's own /etc/fstab already mounts the ESP at
 	# /boot/efi, so in the normal case there is nothing to mount. The
 	# explicit mount is the fallback for an image whose fstab lost that
-	# entry, and it is deliberately read-only.
+	# entry, and it is deliberately read-only. The device is SEARCHED
+	# FOR, not named: the ESP is partition 2 on the amd64 release image
+	# and partition 1 on the arm64 one, and this script is the same on
+	# both.
 	_src=/boot/efi
 	_mnt=""
 	if [ ! -f "${_src}/blake3pp/authorized_keys" ]; then
-		_dev=/dev/gpt/efiesp
-		[ -e "${_dev}" ] || _dev=/dev/vtbd0p2
-		if [ ! -e "${_dev}" ]; then
+		_mnt=/var/run/blake3ppkey
+		mkdir -p "${_mnt}"
+		_src=""
+		for _dev in /dev/gpt/efiesp /dev/vtbd0p1 /dev/vtbd0p2 /dev/vtbd0p3; do
+			[ -e "${_dev}" ] || continue
+			if mount -t msdosfs -o ro "${_dev}" "${_mnt}" 2>/dev/null; then
+				_src="${_mnt}"
+				break
+			fi
+		done
+		if [ -z "${_src}" ]; then
 			echo "blake3ppkey: no ESP found; leaving /root/.ssh alone"
 			return 0
 		fi
-		_mnt=/var/run/blake3ppkey
-		mkdir -p "${_mnt}"
-		if ! mount -t msdosfs -o ro "${_dev}" "${_mnt}" 2>/dev/null; then
-			echo "blake3ppkey: cannot mount ${_dev}; leaving /root/.ssh alone"
-			return 0
-		fi
-		_src="${_mnt}"
 	fi
 	if [ -f "${_src}/blake3pp/authorized_keys" ]; then
 		mkdir -p /root/.ssh
@@ -377,6 +609,8 @@ test ! -e /firstboot
 rm -rf /var/db/freebsd-update/* /var/cache/pkg/* /tmp/* 2>/dev/null || true
 GUEST
 )
+  guest_script=${guest_script//@ARCH@/${FBSD_ARCH}}
+  guest_script=${guest_script//@LOADER_SETTINGS@/$(loader_settings)}
 
   say "driving the guest console"
   if ! FBSD_GUEST_SCRIPT="${guest_script}" python3 - "${consock}" "${prepare_log}" "${FBSD_BOOT_TIMEOUT}" <<'PYEOF'
@@ -509,7 +743,13 @@ PYEOF
 # -------------------------------------------------------------- start --
 cmd_start() {
   [ -f "${FBSD_IMAGE}" ] || die "no prepared image at ${FBSD_IMAGE}; run 'prepare' or pull the published one"
-  [ -e /dev/kvm ] || die "no /dev/kvm; the lane is not worth running under TCG"
+  if [ "${FBSD_KVM_REQUIRED}" = 1 ]; then
+    [ -e /dev/kvm ] || die "no /dev/kvm; the amd64 lane is not worth running under TCG"
+  fi
+  if [ "${FBSD_UEFI_ALWAYS}" = 1 ]; then
+    [ -r "${FBSD_FW_CODE}" ] || die "no EFI firmware at ${FBSD_FW_CODE} (apt-get install ${FBSD_FW_PKG}); arm64 is UEFI only, there is no BIOS fallback"
+    [ -r "${FBSD_FW_VARS}" ] || die "no EFI variable store at ${FBSD_FW_VARS} (apt-get install ${FBSD_FW_PKG})"
+  fi
   mkdir -p "${FBSD_DIR}"
 
   # A throwaway keypair per boot. Generated here rather than by the
@@ -531,14 +771,31 @@ cmd_start() {
   trap - EXIT
   say "wrote this run's public key onto the overlay's ESP"
 
+  # Firmware, or not. On amd64 the prepared image's own
+  # /boot/loader.conf puts the console on the serial line, so OVMF has
+  # nothing left to contribute and the lane boots plain BIOS without the
+  # firmware files at all. On arm64 there IS no BIOS: UEFI is how the
+  # machine boots, so the pair goes in on every boot, with a fresh
+  # writable copy of the variable store per boot (the firmware falls
+  # back to the removable-media path \EFI\BOOT\BOOTAA64.EFI, which the
+  # release image provides, so a blank store costs nothing but is still
+  # a store the firmware can write).
+  local -a machine fw
+  mapfile -t machine < <(qemu_machine_args)
+  fw=()
+  if [ "${FBSD_UEFI_ALWAYS}" = 1 ]; then
+    local vars="${FBSD_DIR}/efi-vars.fd"
+    cp -f "${FBSD_FW_VARS}" "${vars}"
+    chmod u+w "${vars}"
+    mapfile -t fw < <(qemu_firmware_args "${vars}")
+  fi
+
   rm -f "${FBSD_SERIAL}" "${FBSD_MONITOR}" "${FBSD_PIDFILE}"
-  # BIOS, not UEFI: the prepared image's own /boot/loader.conf puts the
-  # console on the serial line, so OVMF has nothing left to contribute
-  # and the lane does without the firmware files.
-  qemu-system-x86_64 -enable-kvm -cpu host -smp "${FBSD_SMP}" -m "${FBSD_MEM}" \
+  "${FBSD_QEMU}" "${machine[@]}" -smp "${FBSD_SMP}" -m "${FBSD_MEM}" \
+    ${fw[@]+"${fw[@]}"} \
     -drive file="${FBSD_OVERLAY}",if=virtio,format=qcow2 \
     -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:${FBSD_SSH_PORT}-:22" \
-    -device virtio-net-pci,netdev=n0 \
+    -device virtio-net-pci,netdev=n0,romfile= \
     -display none \
     -serial "file:$(cd "$(dirname "${FBSD_SERIAL}")" && pwd)/$(basename "${FBSD_SERIAL}")" \
     -monitor "unix:${FBSD_MONITOR},server=on,wait=off" \
@@ -610,7 +867,7 @@ PYEOF
   rm -f "${FBSD_PIDFILE}"
 }
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
 [ $# -ge 1 ] || { usage; exit 1; }
 sub=$1; shift
