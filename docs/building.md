@@ -60,6 +60,39 @@ On FreeBSD, with the base system's compiler (`pkg install cmake ninja`):
   ASLR (`proccontrol -m aslr -s disable`), so the preset exists for a
   toolchain where the runtime starts.
 
+FreeBSD amd64 can also be built *from Linux*, which is what CI does:
+
+- `freebsd-zig-cxx23`: zig's clang targeting `x86_64-freebsd.14.0`,
+  built in the `zig` toolchain image like the static musl presets
+  (`tools/tc linux-zigmusl-cxx23-static -- cmake --preset
+  freebsd-zig-cxx23` runs it, since both presets live in that image).
+  Unlike those, it is **not** static and cannot be: zig refuses
+  `-static` for this target with *"libc of the specified target requires
+  dynamic linking"*, so the binaries link against `libc.so.7` and
+  `libthr.so.3` and the ABI version in the triple becomes the floor —
+  they run on FreeBSD 14.0 and newer. Nothing on the build host can
+  execute them, so the preset's `CMAKE_CROSSCOMPILING_EMULATOR` is empty
+  and `ctest` runs nothing; `tools/freebsd-guest.sh` is what runs them,
+  by booting an actual FreeBSD under qemu/KVM:
+
+  ```sh
+  tools/freebsd-guest.sh prepare      # once: build the guest image
+  tools/freebsd-guest.sh start
+  tools/freebsd-guest.sh wait
+  tar cf - -C build/freebsd-zig-cxx23 tests cli bench \
+    | tools/freebsd-guest.sh run 'mkdir -p /root/b3 && tar xf - -C /root/b3'
+  tools/freebsd-guest.sh run '/root/b3/tests/blake3pp_tests'
+  tools/freebsd-guest.sh stop
+  ```
+
+  `prepare` needs `/dev/kvm`, `qemu`, `ovmf` and root for `nbd`; it
+  takes about a minute and the guest then boots to ssh in roughly
+  fifteen seconds. CI does not run `prepare` per build: the prepared
+  image is published to GHCR alongside the toolchain images and the
+  lane pulls it. The script's header explains why the guest configures
+  itself from the inside rather than being seeded offline (short
+  version: Linux cannot write UFS).
+
 Without a preset, a bare `cmake -S . -B build` configures the C++20
 baseline with the default compiler.
 

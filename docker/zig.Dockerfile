@@ -1,10 +1,13 @@
 # syntax=docker/dockerfile:1
 #
-# zig cc/c++ musl toolchain image for the linux-{,arm64-}zigmusl-cxx23-static
-# presets and tools/make-release.sh. zig lands on PATH (the monolith had it
-# only at /opt/zig, reachable via $ZIG alone); qemu-user runs the aarch64 and
-# riscv64 test passes; the cross binutils provide per-arch strip for
-# the release packaging.
+# zig cc/c++ cross toolchain image for the linux-{,arm64-}zigmusl-cxx23-static
+# presets, the freebsd-zig-cxx23 preset and tools/make-release.sh. zig
+# lands on PATH (the monolith had it only at /opt/zig, reachable via $ZIG
+# alone); qemu-user runs the aarch64 and riscv64 test passes; the cross
+# binutils provide per-arch strip for the release packaging. The FreeBSD
+# binaries this image produces are not run here at all: ci boots them in
+# a qemu FreeBSD guest on the runner (tools/freebsd-guest.sh), because no
+# emulator persona on Linux serves a FreeBSD userland.
 FROM base
 
 ARG ZIG_VERSION=0.16.0
@@ -27,13 +30,22 @@ RUN set -eux; \
 # GCC-built object for that kernel (see cmake/ArchKernels.cmake,
 # EXTERNAL_COMPILER) while zig builds everything else. Two compilers,
 # one fat binary, because no single compiler speaks every vector dialect.
+#
+# Host binutils is here for the FreeBSD lane's strip: zig ships no
+# strip of its own (`zig objcopy --strip-all` answers "unimplemented"
+# on 0.16) and the base image carries none, while the freebsd-zig-cxx23
+# binaries are 189 MB unstripped and 10 MB stripped, which is the
+# difference between a sensible artifact and a silly one. The target is
+# x86_64 ELF with a FreeBSD OSABI byte, which GNU strip handles without
+# knowing or caring that it is FreeBSD.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        qemu-user binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
+        qemu-user binutils \
+        binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
         binutils-powerpc64le-linux-gnu \
         g++-riscv64-linux-gnu g++-s390x-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
-# Prewarm zig's global cache for every musl target the presets build.
+# Prewarm zig's global cache for every target the presets build.
 # REQUIRED, not an optimization: tc containers are --rm-ephemeral and so is
 # a remote execution sandbox, and without the cache zig's first LINK for a
 # target builds musl, compiler-rt and libc++ (measured: 23-26 s per
@@ -50,6 +62,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # arg so a per-target image is a bake entry away.
 ENV ZIG_GLOBAL_CACHE_DIR=/opt/zig-cache
 ARG ZIG_TARGETS="x86_64 aarch64 riscv64 powerpc64le s390x"
+# The non-musl, non-static half of the same prewarm. FreeBSD gets its own
+# list because the musl loop's shape does not transfer: the triple carries
+# an ABI version rather than a libc name, -static is REFUSED for it ("libc
+# of the specified target requires dynamic linking", which is also why the
+# freebsd-zig-cxx23 toolchain file ships no -static), and nothing in this
+# image can execute the result, so the warm is compile-and-link only with
+# no run to confirm it. That costs the loop its end-to-end check and buys
+# the ci lane the same 23-26 s per target it buys the musl ones; the proof
+# that these bytes run is the qemu FreeBSD guest in ci, not a line here.
+# Both optimisation modes again, for the reason given above.
+ARG ZIG_FREEBSD_TARGETS="x86_64-freebsd.14.0"
 COPY --chmod=0755 docker/wrappers/zig/musl-run /usr/local/bin/musl-run
 RUN set -eux; umask 000; \
     mkdir -p /opt/zig-cache; chmod 0777 /opt/zig-cache; \
@@ -59,6 +82,11 @@ RUN set -eux; umask 000; \
       zig c++ -target ${arch}-linux-musl -static /tmp/hello.cpp -o /tmp/hello-${arch}-dbg; \
       musl-run ${arch} /tmp/hello-${arch}; \
       musl-run ${arch} /tmp/hello-${arch}-dbg; \
+    done; \
+    for tgt in ${ZIG_FREEBSD_TARGETS}; do \
+      zig c++ -target ${tgt} -O2 /tmp/hello.cpp -o /tmp/hello-${tgt}; \
+      zig c++ -target ${tgt} /tmp/hello.cpp -o /tmp/hello-${tgt}-dbg; \
+      file /tmp/hello-${tgt} || true; \
     done; \
     rm -f /tmp/hello*; \
     find /opt/zig-cache ! -perm -o=rw -exec chmod a+rwX {} +; \
@@ -78,6 +106,7 @@ RUN set -eux; \
     for user in vscode tipi tipi-rbe; do \
       printf '/* %s */ int main() { return 0; }\n' "${user}" > /tmp/probe-${user}.c; \
       su "${user}" -c "umask 000; ${arch}-linux-musl-clang -O2 -static /tmp/probe-${user}.c -o /tmp/probe-${user} && musl-run ${arch} /tmp/probe-${user}"; \
+      su "${user}" -c "umask 000; x86_64-freebsd-clang -O2 /tmp/probe-${user}.c -o /tmp/probe-${user}-fbsd"; \
     done; \
     rm -f /tmp/probe*; \
     find /opt/zig-cache ! -perm -o=rw -exec chmod a+rwX {} +; \
