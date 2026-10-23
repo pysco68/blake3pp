@@ -212,6 +212,7 @@ int main(int argc, char** argv) {
     try {
       blake3pp::file_write_options wopts;
       wopts.direct_io = !no_direct;
+      wopts.async = !no_async;
       wopts.offload_submit = !inline_submit;
       wopts.ioring = !no_ioring;
       wopts.waive_zero_fill = waive_zero_fill;
