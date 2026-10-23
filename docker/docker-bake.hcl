@@ -45,7 +45,7 @@ variable "ZIG_VERSION"   { default = "0.16.0" }
 
 group "default" {
   targets = ["base", "base-debian13", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "ppc64le-gcc15",
-             "s390x-gcc15", "mips64el-gcc14", "zig", "emscripten"]
+             "s390x-gcc15", "mips64el-gcc14", "zig", "emscripten", "freebsd-guest"]
 }
 
 # One recipe instantiated per release. Pushed too (cheap) so CI matrix jobs
@@ -161,6 +161,22 @@ target "s390x-gcc15" {
   dockerfile = "docker/s390x-gcc15.Dockerfile"
   contexts   = { base = "target:base-2604" }
   tags       = tc_tags("s390x-gcc15")
+}
+
+# Not a toolchain: the prepared FreeBSD guest the ci lane runs the
+# cross-built amd64 binaries in, wrapped in an image so GHCR versions it
+# alongside everything else. It is in the default group on purpose, so
+# that ci.yml's "does every bake tag already exist in GHCR?" check sees
+# it and builds the images when this one is missing; leaving it out
+# would let that check pass while the lane's image did not exist.
+# Unlike every other target here it has no `base` context and runs no
+# compiler: the payload is one qcow2 that
+# .github/workflows/toolchains.yml produces with
+# tools/freebsd-guest.sh prepare in the step before the bake.
+target "freebsd-guest" {
+  context    = "."
+  dockerfile = "docker/freebsd-guest.Dockerfile"
+  tags       = tc_tags("freebsd-guest")
 }
 
 target "mips64el-gcc14" {

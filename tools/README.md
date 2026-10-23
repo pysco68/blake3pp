@@ -15,6 +15,7 @@ not here.
 | `preset-args.py` | Print the configure arguments a CMake preset stands for, for tools that do not read presets (cmake-re). |
 | `toolchain-image-tag.sh` | The content hash that names the toolchain images. |
 | `ci-test.sh` | The CI entry point: configure, build, audit and run the preset's full test matrix (every emulator configuration its architecture supports). |
+| `freebsd-guest.sh` | The FreeBSD amd64 guest the ci lane runs its cross-built binaries in: `prepare` builds the image (once), `start`/`wait`/`run`/`stop` drive it. Needs KVM; `run` passes stdin through, which is how files get in. |
 | `make-release.sh` | Assemble the static Linux release archives. |
 | `build-msan-libcxx.sh` | Build the MemorySanitizer-instrumented libc++ the msan preset links. |
 | `gen-test-vectors.py` | Turn the official BLAKE3 `test_vectors.json` into the C++ header the tests include. |
