@@ -40,10 +40,10 @@ check reads, and what has actually executed it.
 | `avx2` | AVX2 and OS YMM state | 8 | project provider | `cpuid(7,0).ebx[5]` + `XCR0` | native, same runners |
 | `avx512` | F, CD, VL, BW, DQ and OS ZMM state | 16 | project provider | five `cpuid(7,0).ebx` bits + `XCR0` | native where the runner's silicon has it; Intel SDE `-skx` on the Linux x86 lanes that do not. Not under SDE on the sanitizer lanes, and not on Windows |
 | `neon` | nothing: mandatory on AArch64 | 4 | project provider | none; presence of the kernel is the answer | native on Apple silicon and on arm64 Windows; the qemu `sve=off` pass; Neoverse N2. Pure `cl` builds none and ships scalar |
-| `sve256` | SVE, runtime VL exactly 256 | 8 | xsimd (pinned) | `HWCAP_SVE` + `prctl(PR_SVE_GET_VL)`; on Windows `IsProcessorFeaturePresent` + `rdvl` | qemu-user at VL=256; no hardware |
+| `sve256` | SVE, runtime VL exactly 256 | 8 | xsimd (pinned) | `HWCAP_SVE` + `prctl(PR_SVE_GET_VL)` on Linux; the same auxv bit through `elf_aux_info` + `rdvl` on FreeBSD; `IsProcessorFeaturePresent` + `rdvl` on Windows | qemu-user at VL=256; no hardware |
 | `sve512` | SVE, VL exactly 512 | 16 | xsimd (pinned) | as above | qemu-user at VL=512, the default on every arm64 lane; no hardware |
 | `sve2_128` | SVE2, VL exactly 128 | 4 | xsimd (pinned) | as above plus `HWCAP2_SVE2` | qemu-user at VL=128; real silicon, Neoverse N2 in CI and Neoverse V2 in the benchmarks |
-| `sve128`, `sve2_256`, `sve2_512` | the same, at the other lengths | 4, 8, 16 | xsimd (pinned) | as above | opt-in build (`BLAKE3PP_SVE_ALL_VARIANTS`), not in CI. No shipping silicon has these combinations, so an emulator is the only thing that ever selects them |
+| `sve128`, `sve2_256`, `sve2_512` | the same, at the other lengths | 4, 8, 16 | xsimd (pinned) | as above | opt-in build (`BLAKE3PP_SVE_ALL_VARIANTS`), not in CI. No shipping silicon has these combinations, so an emulator is the only thing that ever selects them. Each falls back gracefully to the same-length SVE1 kernel, which is why the set can wait for hardware: an SVE2 part at 256 selects `sve256` and loses only the XAR fused rotate. Fujitsu's Monaka (Armv9.3, reported as 256-bit SVE2, 2027) is the first announced part that would want `sve2_256`; `sve128` would need an SVE1-only core at the minimum length, which has never shipped |
 | `rvv128`, `rvv256`, `rvv512` | RVV 1.0, `vlenb` exactly 16/32/64 | 4, 8, 16 | xsimd (pinned) | hwprobe `IMA_EXT_0` V bit, then `vlenb` | the qemu VLEN matrix, though only at VLEN 128 (the `zvbb=false` pass; the wider qemu configurations have Zvbb on, so they select the twins); `rvv256` on real silicon, a SpacemiT K1 board |
 | `rvv128_zvbb`, `rvv256_zvbb`, `rvv512_zvbb` | the same plus Zvbb | 4, 8, 16 | xsimd (pinned) | hwprobe `ZVBB` (no HWCAP letter exists) + `vlenb` | qemu-user at VLEN 128 (the default), 256 and 512; no Zvbb silicon has run them |
 | `xthead` | XTheadVector, the draft RVV 0.7.1 encoding | 4 | none: hand-written intrinsics, sizeless types cannot back the facade | hwprobe vendor key (Linux 6.13+), else the trap-guarded probes behind `run_trap_probes()`, else `BLAKE3PP_ASSUME_XTHEADVECTOR=1` | opt-in build (`BLAKE3PP_XTHEAD_KERNEL`, on in the riscv64 musl preset). Mainline qemu cannot execute `th.*` at all; T-Head's qemu fork runs the freestanding verifier, and an SG2042 board runs it on 0.7.1 silicon |
@@ -113,6 +113,17 @@ Where that length comes from depends on the platform:
 - On Linux, from `prctl`.
 - On Windows, from `rdvl`. The platform reports whether SVE is present
   but not how wide it is.
+- On FreeBSD, from `rdvl` for the same reason. Presence comes from the
+  same `HWCAP_SVE` bit Linux publishes -- the bit positions are Arm's --
+  read with `elf_aux_info`, which answers a status code rather than a
+  value and so cannot report absence as a zero. The bit is set only by a
+  kernel that saves SVE state across a context switch, which FreeBSD
+  gained in 15.0: on 14.x the probe correctly finds no SVE and dispatch
+  takes NEON. Verified on a FreeBSD 15.1 arm64 guest under
+  qemu-system-aarch64, whose `-cpu max,sve-max-vq=N` makes the vector
+  length a dial: at 512, 256 and 128 bits dispatch selects `sve512`,
+  `sve256` and `sve2_128` and rejects the other two lengths, and with
+  `sve=off` it takes NEON -- each with the whole suite passing.
 
 Building them needs a compiler that accepts a fixed vector length.
 `clang-cl` accepts one, in its cc1 spelling; `cl` does not. An arm64
