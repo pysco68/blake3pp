@@ -45,7 +45,8 @@ variable "ZIG_VERSION"   { default = "0.16.0" }
 
 group "default" {
   targets = ["base", "base-debian13", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "ppc64le-gcc15",
-             "s390x-gcc15", "mips64el-gcc14", "zig", "emscripten", "freebsd-guest"]
+             "s390x-gcc15", "mips64el-gcc14", "zig", "emscripten",
+             "freebsd-guest", "freebsd-arm64-guest"]
 }
 
 # One recipe instantiated per release. Pushed too (cheap) so CI matrix jobs
@@ -163,20 +164,42 @@ target "s390x-gcc15" {
   tags       = tc_tags("s390x-gcc15")
 }
 
-# Not a toolchain: the prepared FreeBSD guest the ci lane runs the
-# cross-built amd64 binaries in, wrapped in an image so GHCR versions it
-# alongside everything else. It is in the default group on purpose, so
-# that ci.yml's "does every bake tag already exist in GHCR?" check sees
-# it and builds the images when this one is missing; leaving it out
-# would let that check pass while the lane's image did not exist.
-# Unlike every other target here it has no `base` context and runs no
+# Not toolchains: the prepared FreeBSD guests the ci lanes run the
+# cross-built binaries in, wrapped in images so GHCR versions them
+# alongside everything else. Both are in the default group on purpose,
+# so that ci.yml's "does every bake tag already exist in GHCR?" check
+# sees them and builds the images when either is missing; leaving one
+# out would let that check pass while a lane's image did not exist.
+# Unlike every other target here they have no `base` context and run no
 # compiler: the payload is one qcow2 that
 # .github/workflows/toolchains.yml produces with
 # tools/freebsd-guest.sh prepare in the step before the bake.
+#
+# Two targets rather than one matrix because the amd64 image is named
+# `freebsd-guest`, without an architecture, and renaming it to
+# `freebsd-amd64-guest` for symmetry would orphan the published image
+# and every tag of it already in GHCR for no gain. The asymmetry is in
+# the names only: one Dockerfile builds both, and GUEST_ARTIFACT is the
+# whole of the difference.
 target "freebsd-guest" {
   context    = "."
   dockerfile = "docker/freebsd-guest.Dockerfile"
+  args       = { GUEST_ARTIFACT = "freebsd-guest.qcow2" }
   tags       = tc_tags("freebsd-guest")
+}
+
+# The arm64 twin. A separate image because the payload is a whole other
+# operating system install for a whole other instruction set, and a
+# separate tag because ci pulls exactly one of them per lane. What it
+# buys that the amd64 one cannot: the NEON and SVE kernels, run on a
+# FreeBSD kernel. It is a TCG guest (no CI runner can KVM an aarch64
+# guest), which is why its lane is slower and why it is still cheap
+# enough to run on every push.
+target "freebsd-arm64-guest" {
+  context    = "."
+  dockerfile = "docker/freebsd-guest.Dockerfile"
+  args       = { GUEST_ARTIFACT = "freebsd-arm64-guest.qcow2" }
+  tags       = tc_tags("freebsd-arm64-guest")
 }
 
 target "mips64el-gcc14" {

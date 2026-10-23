@@ -193,6 +193,16 @@
       }
     },
     {
+      "name": "freebsd-arm64-zig-cxx23",
+      "displayName": "FreeBSD arm64 release, cross-built from Linux (zig + mimalloc; NEON + SVE, dynamic, 14.0 floor)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-arm64-zig-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-arm64-zig-cxx23/freebsd-arm64-zig-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "displayName": "Windows MSVC 2026, C++23 (run from a vcvars64 shell)",
       "generator": "Ninja",
@@ -474,6 +484,10 @@
       "configurePreset": "freebsd-zig-cxx23"
     },
     {
+      "name": "freebsd-arm64-zig-cxx23",
+      "configurePreset": "freebsd-arm64-zig-cxx23"
+    },
+    {
       "name": "windows-msvc2026-cxx23",
       "configurePreset": "windows-msvc2026-cxx23",
       "condition": {
@@ -681,6 +695,13 @@
     {
       "name": "freebsd-zig-cxx23",
       "configurePreset": "freebsd-zig-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "freebsd-arm64-zig-cxx23",
+      "configurePreset": "freebsd-arm64-zig-cxx23",
       "output": {
         "outputOnFailure": true
       }
