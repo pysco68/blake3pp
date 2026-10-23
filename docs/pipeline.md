@@ -30,8 +30,8 @@ every window that passes through them.
 ### read
 
 `read` is a sender over the fastest mechanism the platform and the
-filesystem allow -- io_uring, IoRing or IOCP, GCD, or a synchronous
-`pread` -- behind
+filesystem allow -- io_uring, IoRing or IOCP, GCD, POSIX AIO on a
+kqueue, or a synchronous `pread` -- behind
 one driver interface. Its `start()` queues the transfer and returns. It does
 not flush, because the driver loop flushes once per round and a whole
 batch of windows then reaches the OS in one call; and it does not

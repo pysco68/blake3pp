@@ -47,6 +47,19 @@ On a Mac:
 - `macos-clang22-cxx26`: Homebrew LLVM 22 against its bundled libc++
   (`brew install llvm`)
 
+On FreeBSD, with the base system's compiler (`pkg install cmake ninja`):
+
+- `freebsd-clang-cxx23`: the native preset (base clang and libc++, POSIX
+  AIO on a kqueue, `O_DIRECT`)
+- `freebsd-clang-cxx23-asan` and `freebsd-clang-cxx23-tsan`: the same
+  build under the base system's clang_rt runtimes, which is what
+  exercises the AIO backend's buffer lifetime and its one cross-thread
+  member (`wake()`) under a sanitizer. ASan works. TSan is built and not
+  run on 14.5-RELEASE (base clang 21.1.8): a TSan-instrumented binary
+  hangs before `main()` there, a ten-line one included, with and without
+  ASLR (`proccontrol -m aslr -s disable`), so the preset exists for a
+  toolchain where the runtime starts.
+
 Without a preset, a bare `cmake -S . -B build` configures the C++20
 baseline with the default compiler.
 

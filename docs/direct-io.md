@@ -17,6 +17,7 @@ caller, and when to turn it off.
 | Linux | io_uring | `O_DIRECT` |
 | Windows | IoRing (Windows 11) or IOCP | `FILE_FLAG_NO_BUFFERING` |
 | macOS | GCD (libdispatch) | `F_NOCACHE` |
+| FreeBSD | POSIX AIO (`lio_listio`) on a kqueue | `O_DIRECT` |
 
 Each is a per-open property. `src/io/posix_file.hpp` engages `O_DIRECT`
 by reopening the path a second time with the flag set, and keeps the
@@ -48,6 +49,44 @@ IoRing comparison needs, and the rung names below say which one ran. The
 entry points are resolved from `KernelBase.dll` at first use rather than
 linked, so a binary built against the Windows 11 SDK still loads on
 Windows 10.
+
+FreeBSD reaches the device through the one widely deployed Unix
+asynchronous file API that is not io_uring: POSIX AIO. `src/io/aio_backend.hpp`
+fills a `struct aiocb` per transfer, hands whole batches to the kernel
+with one `lio_listio(LIO_NOWAIT, ...)`, and asks for each completion as
+an `EVFILT_AIO` event on the context's kqueue
+(`aio_sigevent.sigev_notify = SIGEV_KEVENT`), so the loop is the same
+pull-style submit-and-reap io_uring's is. The AIO facility is the
+kernel's own, not a thread pool in the process: the requests are served
+by the `aiod` kernel threads whose count `vfs.aio.target_aio_procs` and
+`vfs.aio.max_aio_procs` bound, and `vfs.aio.max_aio_queue_per_proc`
+bounds how many a process may have outstanding. The context reads that
+last one at construction and cuts every batch to what is still free, so
+the limit shows up as fewer requests in flight rather than as a refusal;
+a limit of zero, or a kernel with no AIO at all, is the whole facility
+refused and the names below say so.
+
+`O_DIRECT` on FreeBSD is a hint rather than a mode. UFS honours it for
+page-aligned buffers, offsets and lengths, and quietly serves anything
+else through the cache. ZFS honours it from OpenZFS 2.3 under the
+dataset's `direct` property: `direct=standard` (the default there) serves
+requests whose offset and length are 4 KiB aligned and answers `EINVAL`
+for the rest, `direct=disabled` ignores the flag, `direct=always` takes
+every request. Releases before OpenZFS 2.3 have no such property and no
+direct path at all. Since neither the release nor the property is
+something a caller should have to know, the backend asks the file
+system instead: one page-sized `pread` through the direct descriptor at
+open, and an `EINVAL` degrades that file to buffered with the
+`" [direct: EINVAL]"` suffix on its name. Everything else -- a short
+read, an end-of-file zero -- is the descriptor being served.
+
+What the probe answers is whether the descriptor is *served*, which is
+all `O_DIRECT` has ever promised on a system where it is a hint: a
+dataset on OpenZFS 2.2 or older, or one with `direct=disabled`, takes
+the flag without complaint and reads through the ARC anyway, and the
+rung still reads `"aio+direct"`. On FreeBSD 14.5 (OpenZFS 2.2.9) that is
+exactly what happens, and `zfs get direct` there answers "invalid
+property": the release has no direct path to ask for.
 
 `file_io_options::registered_buffers` (default `false`) additionally
 registers the window arena and the file handle with the ring, so a
@@ -102,6 +141,12 @@ ring, a submit the kernel refused and a zero-length transfer. Nothing
 above the backend can tell a window's bytes arrived through one
 descriptor from arriving through two; both land in the same buffer.
 
+FreeBSD asks it with the same function under the same name:
+`piece_for()` in `src/io/aio_backend.hpp` picks the direct descriptor for
+the whole granules at a granule offset and the plain one for the rest,
+both as AIO requests, so a direct file's last window is as asynchronous
+as the others there too.
+
 Windows' `port_len()` asks the same question with one difference: the
 plain handle there is not overlapped and cannot be given to the port, so
 a `NO_BUFFERING` file's sub-granule rest -- at most 4095 bytes, once per
@@ -129,11 +174,13 @@ Every reader and writer names the rung it landed on:
   `blake3pp::read_backend(buffer.driver())` after an `update_file()` that
   was given a `trace_buffer` ([Performance tracing](tracing.md)). The
   spellings are `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
-  `"gcd+nocache"`, `"pread"`, `"readfile"` and `"stdio"`, with
-  `"+regbuf"` appended where the ring took the arena registration.
+  `"gcd+nocache"`, `"aio+direct"`, `"pread"`, `"readfile"` and
+  `"stdio"`, with `"+regbuf"` appended where the ring took the arena
+  registration.
 - `write_report::backend` names the write side the same way:
   `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
-  `"gcd-write+nocache"`, `"pwrite"`, `"writefile"`, or `"stdio"`, and on
+  `"gcd-write+nocache"`, `"aio+direct"`, `"pwrite"`, `"writefile"`, or
+  `"stdio"`, and on
   Windows adds how the preallocation
   was kept from zeroing ahead of the writes: `"+sparse"` or `"+validdata"`
   (next section).
@@ -150,7 +197,15 @@ is used directly rather than through the selector: `" [ioring: no api]"`,
 `" [ioring: version 1]"` or `" [ioring: CreateIoRing failed 0x...]"`, and
 a ring the selector asked for and could not have puts the same suffix on
 the completion port's names, as in `"iocp+direct [ioring: no api]"`, so a
-run on such a machine reads as what it is. A benchmark or a bug
+run on such a machine reads as what it is. FreeBSD's backend says it the
+same way, with the two things it needs named apart: `" [aio: EAGAIN]"`
+when the per-process AIO queue is closed
+(`vfs.aio.max_aio_queue_per_proc` at zero),
+`" [aio: ENOSYS, no kernel AIO]"` when the facility is not in the kernel
+at all, and `" [kqueue: errno N]"` when there was nowhere to deliver a
+completion to -- so the FreeBSD ladder reads `"aio+direct"`, `"aio"`,
+`"pread+direct"`, `"pread"`, with `" [direct: EINVAL]"` on a file whose
+filesystem refused the direct descriptor. A benchmark or a bug
 report
 therefore reads differently depending on which rung actually ran, never
 only the one that was asked for.

@@ -47,7 +47,7 @@ OPTIONS:
                               I/O window size in MiB
           --qd UINT [4]       I/O queue depth (the reader clamps it to its range)
           --no-direct         keep the OS page cache (no O_DIRECT)
-          --no-async          read synchronously (no io_uring/IOCP/GCD queue)
+          --no-async          read synchronously (no io_uring/IOCP/GCD/AIO queue)
           --inline-submit     issue reads inline in the submitting thread, not on io_uring's
                               workers
           --no-ioring         Windows: read through the completion port instead of the I/O
@@ -138,6 +138,7 @@ bypassing the page cache entirely:
 | Linux | io_uring + `O_DIRECT` |
 | Windows | IoRing (Windows 11) or IOCP + no buffering |
 | macOS | GCD + `F_NOCACHE` |
+| FreeBSD | POSIX AIO on a kqueue + `O_DIRECT` |
 
 `--no-direct`, `--no-async`, `--inline-submit` and, on Windows,
 `--no-ioring` switch those off one at a time, which is how the pipeline
@@ -150,6 +151,11 @@ trace settles: `--window`, `--qd`, `--threads`, `--no-direct` and
 `--inline-submit`, the same names on both, and the same pipeline
 underneath. `blake3ppgen -v` names the write backend that was engaged;
 that is as much as either tool says about the pipeline it ran.
+
+`blake3pp_bench_file` takes `--no-async` as well, which is how the
+platform's async engine gets measured against its synchronous rung on
+one device: the same windows, the same queue depth, served by `pread`
+instead.
 
 To see where a run's time actually goes, point `blake3pp_bench_file` at
 the same file with the same flags and add `--trace`:
