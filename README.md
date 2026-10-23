@@ -117,22 +117,49 @@ All of it, with the edge cases, in [the API](docs/api.md). Or
 amalgamated file on Compiler Explorer, hashing on one core and on all of
 them.
 
-## Architectures
+## Platforms
 
-This project's CI ships:
+One binary per platform carries every kernel listed for it and picks the
+best one the running CPU can execute; the I/O path is chosen the same
+way, per feature, at startup.
 
-|Platform | SIMD kernels|
-|---|---|
-| x64      | SSE4.2, AVX2 and AVX-512 |
-| aarch64  | NEON, fixed-length SVE and SVE2 |
-| riscv    | RVV 1.0 with Zvbb twins, and the T-Head draft dialect (opt-in) |
-| wasm     | SIMD128 |
-| ppc64    | VSX |
-| IBM z    | VXE |
-| MIPS     | MSA (emulator-tested only) |
-| everywhere | scalar |
+| platform | SIMD kernels | async I/O | cache bypass |
+|---|---|---|---|
+| Linux x64 | SSE4.2, AVX2, AVX-512 | io_uring | `O_DIRECT` |
+| Linux aarch64 | NEON, SVE 256/512, SVE2 128 | io_uring | `O_DIRECT` |
+| Linux riscv64 | RVV 1.0 at VLEN 128/256/512, each with a Zvbb twin; XTheadVector (draft 0.7.1) | io_uring | `O_DIRECT` |
+| Linux ppc64le | VSX | io_uring | `O_DIRECT` |
+| Linux s390x | VXE (z14+, **big-endian**) | io_uring | `O_DIRECT` |
+| Linux mips64el | MSA — emulator-tested only, never released | io_uring | `O_DIRECT` |
+| Windows x64 | SSE4.2, AVX2, AVX-512 | I/O ring (Windows 11) or IOCP | `FILE_FLAG_NO_BUFFERING` |
+| Windows arm64 | NEON, SVE 256/512, SVE2 128 under clang-cl; `cl` ships scalar alone | I/O ring or IOCP | `FILE_FLAG_NO_BUFFERING` |
+| macOS arm64 | NEON | GCD (libdispatch) | `F_NOCACHE` |
+| FreeBSD amd64 | SSE4.2, AVX2, AVX-512 | POSIX AIO on a kqueue | `O_DIRECT` |
+| FreeBSD arm64 | NEON, SVE 256/512, SVE2 128 | POSIX AIO on a kqueue | `O_DIRECT` |
+| wasm32 | SIMD128 | none: synchronous stdio | none |
+| any other POSIX | scalar, plus whatever its architecture has | none: synchronous `pread`/`pwrite` | `O_DIRECT` where the OS has it |
 
-More details can be found in [Architectures and kernels](docs/architectures.md).
+Every build also carries a scalar kernel as the last rung and as the
+oracle the wide kernels are tested against. Each feature degrades
+independently at runtime: an engine the OS refuses falls back to
+synchronous `pread`/`pwrite` and then to stdio, a filesystem that will
+not serve unbuffered reads is read through the cache, and the tools
+print the rung that actually ran rather than the one that was asked for.
+
+CI releases nine archives: the five static Linux ones, both Windows
+clang-cl zips, macOS arm64 and the wasm bundle. mips64el is built and
+emulator-tested on every run but never packaged, and the `cl` arm64
+build is compile-proven only. FreeBSD amd64 now has a full lane: every
+run cross-builds it with zig and then boots a real FreeBSD under
+qemu/KVM on the runner to run the suite, the I/O-rung digest checks and
+a bench on it — only the release archive is still missing. FreeBSD
+arm64 passes its whole suite too, but by hand, with neither a lane nor
+an archive.
+
+More details: [Architectures and kernels](docs/architectures.md) for the
+kernels, one row per variant with its runtime check, and
+[Direct I/O](docs/direct-io.md) for the engines and the exact names each
+rung reports.
 
 ## Documentation
 
