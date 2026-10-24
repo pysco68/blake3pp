@@ -58,7 +58,8 @@ SELECT = """
 """
 SUPPORT = ["src/blake3pp.cpp", "src/dispatch/dispatch.cpp",
            "src/dispatch/cpu_detect_x86.cpp",
-           "src/io/file_reader.cpp", "src/io_hash.cpp"]
+           "src/io/file_reader.cpp", "src/io/io_engines.cpp",
+           "src/io_hash.cpp"]
 PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/dispatch.hpp", "include/blake3pp/core.hpp",
           "include/blake3pp/trace.hpp",
@@ -70,7 +71,6 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
 
 
 GLOBAL = set()          # non-kernel internals: emitted once for the file
-
 
 # Definitions a single file cannot carry, and what to say where they
 # were. The file pipeline (detail/file_pipeline.hpp) is written against
@@ -229,6 +229,7 @@ def main():
 // {'=' * 70}"""
 
     arch_def = (REPO / "include/blake3pp/detail/arch.def").read_text()
+    io_engine_def = (REPO / "include/blake3pp/detail/io_engine.def").read_text()
     out = [f"""// blake3pp, amalgamated from {version()} by website/amalgamate.py.{notice}
 //
 // Two kernels: the scalar fallback, and {"BLAKE3PP_AMALGAM_NS"}, built for whatever
@@ -297,6 +298,8 @@ def main():
     for h in PUBLIC:
         text = (REPO / h).read_text().replace("#pragma once", "")
         text = text.replace("#include <blake3pp/detail/arch.def>", arch_def)
+        text = text.replace("#include <blake3pp/detail/io_engine.def>",
+                            io_engine_def)
         text = re.sub(r'#include [<"]blake3pp/[^>"]+[>"][^\n]*\n', "", text)
         out.append(text.rstrip() + "\n")
     # Variant-neutral, so once, before either kernel copy.
@@ -327,9 +330,12 @@ def main():
             text = drop_definition(text, head, why)
         text = text.replace('#include "blake3pp_version_stamp.hpp"', stamp)
         text = text.replace('#include "blake3pp_kernel_registry.inc"', registry)
-        # arch.def is an X-macro table, not a header: it is included at
-        # several places on purpose and each one must keep its copy.
+        # arch.def and io_engine.def are X-macro tables, not headers:
+        # each is included at several places on purpose and every one
+        # must keep its copy.
         text = text.replace("#include <blake3pp/detail/arch.def>", arch_def)
+        text = text.replace("#include <blake3pp/detail/io_engine.def>",
+                            io_engine_def)
         text = re.sub(r'#include [<"]blake3pp/[^>"]+[>"][^\n]*\n', "", text)
         text = re.sub(r'#include "kernel/kernel.hpp"[^\n]*\n', "", text)
         out.append(text)
