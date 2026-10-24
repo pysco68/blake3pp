@@ -43,10 +43,15 @@ RUN set -eux; \
 # through binutils-aarch64-linux-gnu's strip, already above for the
 # musl lane, for the same reason and with the same indifference to the
 # OSABI byte.
+#
+# binutils-loongarch64-linux-gnu is here for tools/objscan.py: no
+# llvm-objdump in this image and the host objdump is single-target, so
+# without it the kernel audit cannot disassemble the loongarch64 lane's
+# objects at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         qemu-user binutils \
         binutils-aarch64-linux-gnu binutils-riscv64-linux-gnu \
-        binutils-powerpc64le-linux-gnu \
+        binutils-powerpc64le-linux-gnu binutils-loongarch64-linux-gnu \
         g++-riscv64-linux-gnu g++-s390x-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
@@ -66,7 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # check layer below never re-records this one. ZIG_TARGETS is a build
 # arg so a per-target image is a bake entry away.
 ENV ZIG_GLOBAL_CACHE_DIR=/opt/zig-cache
-ARG ZIG_TARGETS="x86_64 aarch64 riscv64 powerpc64le s390x"
+ARG ZIG_TARGETS="x86_64 aarch64 riscv64 powerpc64le s390x loongarch64"
 # The non-musl, non-static half of the same prewarm. FreeBSD gets its own
 # list because the musl loop's shape does not transfer: the triple carries
 # an ABI version rather than a libc name, -static is REFUSED for it ("libc
@@ -82,6 +87,10 @@ ARG ZIG_TARGETS="x86_64 aarch64 riscv64 powerpc64le s390x"
 # (zig keys the libc++ and compiler-rt builds on the target), so the
 # arm64 lane would pay the full cold cost on its first link without
 # this line.
+#
+# loongarch64 is warmed a second time at -mno-lsx, the baseline flag its
+# toolchain file compiles and links with: it is part of zig's cache key,
+# and the set it selects is another 75 MB and 9 s (measured).
 ARG ZIG_FREEBSD_TARGETS="x86_64-freebsd.14.0 aarch64-freebsd.14.0"
 COPY --chmod=0755 docker/wrappers/zig/musl-run /usr/local/bin/musl-run
 RUN set -eux; umask 000; \
@@ -93,6 +102,10 @@ RUN set -eux; umask 000; \
       musl-run ${arch} /tmp/hello-${arch}; \
       musl-run ${arch} /tmp/hello-${arch}-dbg; \
     done; \
+    zig c++ -target loongarch64-linux-musl -mno-lsx -O2 -static /tmp/hello.cpp -o /tmp/hello-la; \
+    zig c++ -target loongarch64-linux-musl -mno-lsx -static /tmp/hello.cpp -o /tmp/hello-la-dbg; \
+    musl-run loongarch64 /tmp/hello-la; \
+    musl-run loongarch64 /tmp/hello-la-dbg; \
     for tgt in ${ZIG_FREEBSD_TARGETS}; do \
       zig c++ -target ${tgt} -O2 /tmp/hello.cpp -o /tmp/hello-${tgt}; \
       zig c++ -target ${tgt} /tmp/hello.cpp -o /tmp/hello-${tgt}-dbg; \

@@ -544,6 +544,11 @@ jobs:
           # emulator-tested here and flagged as such in the notes.
           - { preset: linux-ppc64le-zigmusl-cxx23-static, image: zig, artifact: ppc64le }
           - { preset: linux-s390x-zigmusl-cxx23-static, image: zig, artifact: s390x }
+          # LoongArch static musl, EMULATOR-ONLY: qemu-loongarch64 runs
+          # the whole suite at three capability levels (both vector
+          # units, LSX only, none; see tools/ci-test.sh), and no
+          # LoongArch silicon is reachable to run it on.
+          - { preset: linux-loongarch64-zigmusl-cxx23-static, image: zig, artifact: loongarch64 }
           # MIPS static: GCC rather than zig, because clang's MIPS backend
           # emits no MSA from the kernel's vector code (measured: zero
           # against GCC's 3514). Static glibc rather than musl for the same

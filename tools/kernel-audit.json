@@ -246,6 +246,46 @@
       }
     ]
   },
+  "loongarch64": {
+    "variants": [
+      {
+        "match": "scalar",
+        "forbid": [
+          {
+            "name": "LSX or LASX",
+            "operand": "\\$[xv]r\\d+\\b"
+          }
+        ]
+      },
+      {
+        "match": "lsx",
+        "require": {
+          "name": "LSX",
+          "operand": "\\$vr\\d+\\b"
+        },
+        "forbid": [
+          {
+            "name": "LASX",
+            "operand": "\\$xr\\d+\\b"
+          }
+        ]
+      },
+      {
+        "match": "lasx",
+        "require": {
+          "name": "LASX",
+          "operand": "\\$xr\\d+\\b"
+        }
+      }
+    ],
+    "binary": [
+      {
+        "name": "LSX or LASX",
+        "operand": "\\$[xv]r\\d+\\b",
+        "outside": "kern::(lsx|lasx)"
+      }
+    ]
+  },
   "mips64": {
     "variants": [
       {

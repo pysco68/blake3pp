@@ -131,6 +131,7 @@ way, per feature, at startup.
 | Linux ppc64le | VSX | io_uring | `O_DIRECT` |
 | Linux s390x | VXE (z14+, **big-endian**) | io_uring | `O_DIRECT` |
 | Linux mips64el | MSA — emulator-tested only, never released | io_uring | `O_DIRECT` |
+| Linux loongarch64 | LSX, LASX — emulator-tested only | io_uring | `O_DIRECT` |
 | Windows x64 | SSE4.2, AVX2, AVX-512 | I/O ring (Windows 11) or IOCP | `FILE_FLAG_NO_BUFFERING` |
 | Windows arm64 | NEON, SVE 256/512, SVE2 128 under clang-cl; `cl` ships scalar alone | I/O ring or IOCP | `FILE_FLAG_NO_BUFFERING` |
 | macOS arm64 | NEON | GCD (libdispatch) | `F_NOCACHE` |
@@ -146,7 +147,7 @@ synchronous `pread`/`pwrite` and then to stdio, a filesystem that will
 not serve unbuffered reads is read through the cache, and the tools
 print the rung that actually ran rather than the one that was asked for.
 
-CI releases eleven archives: the five static Linux ones, both Windows
+CI releases twelve archives: the six static Linux ones, both Windows
 clang-cl zips, macOS arm64, the wasm bundle and both FreeBSD tarballs.
 mips64el is built and emulator-tested on every run but never packaged,
 and the `cl` arm64 build is compile-proven only. Both FreeBSD

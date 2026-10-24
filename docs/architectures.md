@@ -7,11 +7,11 @@ the one that runs is chosen when the program starts. You do not pick, and
 you do not ship a build per processor.
 
 This page lists what each architecture gets, down to the runtime check and
-the test that covers it; the two targets where that story does not hold
-(MIPS, which no one has run on hardware, and wasm, where a fat binary is
-not possible at all); and, at the end, [the instruction sets that have no
-kernel](#what-has-no-kernel-and-what-it-would-take) and what each one
-would require.
+the test that covers it; the targets where that story does not hold
+(MIPS and LoongArch, which no one has run on hardware, and wasm, where a
+fat binary is not possible at all); and, at the end, [the instruction
+sets that have no kernel](#what-has-no-kernel-and-what-it-would-take)
+and what each one would require.
 
 ## What a build carries
 
@@ -23,6 +23,7 @@ would require.
 | POWER         | VSX |
 | IBM z         | VXE (z14+, **big-endian**) |
 | MIPS          | MSA (MIPS32r5/MIPS64r5+) — **emulator-tested only**, see below |
+| LoongArch     | LSX (128-bit), LASX (256-bit) — **emulator-tested only**, see below |
 | wasm          | SIMD128 (see [below](#the-wasm-build)) |
 
 Every build also carries a scalar kernel as a fallback.
@@ -50,6 +51,8 @@ check reads, and what has actually executed it.
 | `vsx` | VSX | 4 | xsimd (pinned) | `PPC_FEATURE_HAS_VSX` | qemu-user at POWER9 and POWER10; no hardware. Built at `power9`, the first flag spelling that probed clean |
 | `vxe` | z14 vector-enhancements-1 | 4 | xsimd (pinned), compiled by GCC — an external object when the primary compiler is not GCC | `HWCAP_S390_VXRS` and `HWCAP_S390_VXRS_EXT`, both required | qemu-user at `max` and at `vxeh=off` for the fallback; no hardware. The only big-endian variant: every word load and store byteswaps |
 | `msa` | MSA (MIPS32r5/MIPS64r5+) | 4 | GNU vector extensions at 16 bytes | `HWCAP_MIPS_MSA` | built and instruction-audited in CI, and the refusal path runs there; executing the kernel is a local qemu run, see below |
+| `lsx` | LoongArch LSX | 4 | GNU vector extensions at 16 bytes | `HWCAP_LOONGARCH_LSX` | qemu-loongarch64 at `max,lasx=off`; no hardware |
+| `lasx` | LoongArch LASX | 8 | GNU vector extensions at 32 bytes | `HWCAP_LOONGARCH_LASX` | qemu-loongarch64 at the default model, which is `la464`; no hardware |
 | `simd128` | wasm SIMD128 | 4 | project provider | reported unconditionally, see [below](#the-wasm-build) | node, in the emscripten lane |
 
 **Lanes** are 32-bit lanes, which is how many inputs the kernel hashes at
@@ -62,8 +65,9 @@ has a usable one, else `<experimental/simd>`, else xsimd;
 does so because the generic answer is wrong there: libstdc++'s
 `experimental::simd` SVE backend emits SVE in load-time initializers,
 which SIGILLs on non-SVE hardware and defeats the fat binary; no std
-provider has an RVV or MSA width at all; and GCC 16's `<simd>` deduces its
-native width from an x86-only traits table, so on every other target
+provider has an RVV, MSA, LSX or LASX width at all; and GCC 16's
+`<simd>` deduces its native width from an x86-only traits table, so on
+every other target
 `std::simd::vec<uint32_t>` is one lane wide. The kernel audit's
 require-rule (`tools/kernel-audit.json`) is what catches a variant that
 came out scalar under a facade that could not reach its ISA.
@@ -85,8 +89,9 @@ configuration only: one VL, one VLEN, one CPU model.
 
 That default pass runs with `QEMU_CPU` unset, which gives VL=512 on
 aarch64, VLEN=128 with V and Zvbb on riscv64, z14 vectors on s390x, and a
-POWER model new enough for the distribution's power9 userland on ppc64le —
-and, on mips64el, an r2-era core with no MSA at all.
+POWER model new enough for the distribution's power9 userland on ppc64le,
+and `la464` with both vector units on loongarch64 — and, on mips64el, an
+r2-era core with no MSA at all.
 
 ### What silicon has run a kernel
 
@@ -98,9 +103,9 @@ RISC-V boards: a JH7110 with no vector unit at all, a SpacemiT K1 for
 RISC-V board lanes are gated on repository variables, so an arbitrary CI
 run may contain none of them.
 
-POWER, IBM z and MIPS have no hardware lane at all. Their kernels are
-correct against the official vectors under qemu and carry no throughput
-number.
+POWER, IBM z, MIPS and LoongArch have no hardware lane at all. Their
+kernels are correct against the official vectors under qemu and carry no
+throughput number.
 
 ## SVE is pinned to one vector length
 
@@ -167,6 +172,34 @@ Two details follow from having no hardware and no other toolchain:
   dynamic section, and no `GLIBC_` version symbol, so this one carries no
   glibc floor either. A static glibc gives up NSS, which this tool never
   asks for.
+
+## LSX and LASX have never run on hardware either
+
+The two LoongArch kernels carry MSA's asterisk. Under qemu-loongarch64
+they match the official test vectors byte for byte against the x86-64
+result, and the dispatch ladder is exercised at every capability level
+the emulator can present: the default `la464` carries both vector units
+and selects `lasx`, `max,lasx=off` selects `lsx`, and
+`max,lsx=off,lasx=off` falls back to scalar. CI runs all three on every
+change, on the static musl preset whose binaries ship.
+
+No LoongArch silicon has run them, and none is reachable. They carry no
+throughput number.
+
+Two details follow from the toolchain, which is zig's clang and musl:
+
+- zig's loongarch64 baseline carries `+lsx`, where its riscv64 baseline
+  is plain `rv64gc` with no vector unit. Left alone it would put 128-bit
+  vector code in every translation unit, the scalar kernel and the
+  capability probe included, and the binary would fault on an LA64 part
+  without LSX. The toolchain file compiles everything `-mno-lsx`; the two
+  kernels raise the unit for their own TU.
+- Raising it takes the cc1 spelling, `-Xclang -target-feature -Xclang
+  +lsx`, which the registrar probes for first. Under this driver a later
+  `-mlsx` does not undo `-mno-lsx`, and `-mlasx` after `-mno-lsx`
+  produces a TU that predefines `__loongarch_asx` and
+  `__loongarch_simd_width` 256 and generates no vector instruction at
+  all. A feature-macro probe passes there; the kernel audit does not.
 
 ## The wasm build
 
@@ -259,8 +292,6 @@ kernel compiling.
 
 | target | vector size | clang 22 emits |
 |---|---|---|
-| `loongarch64` `-mlsx` | 16 B | LSX (`vadd.w`, `vxor.v`, `vslli.w`) |
-| `loongarch64` `-mlasx` | 32 B | LASX (`xvadd.w`, `xvor.v`) |
 | `mips64el` / `mipsisa64r6el` `-mmsa` | 16 B | MSA (`addv.w`, `xor.v`) |
 | `armv8.1-m.main+mve` | 16 B | MVE (`vadd.i32 q0`, `veor`) |
 | `aarch64_be` | 16 B | NEON, plus a `rev64`+`ext` pair around every memory access |
@@ -284,7 +315,6 @@ know the ISA's width too, and today only x86 does.
 | `mipsisa64r6el` | the probe above shows clang reaching MSA under the r6 target | unchanged | r6 is its own, non-backwards-compatible ISA: it needs its own sysroot and cross GCC, and a qemu CPU model that reports MSA. Which models do is unverified | Open, more work than the r5 flavours for the same zero hardware. |
 | `aarch64_be` | NEON through the facade, at the cost of a lane-order fixup per memory access (probe above) | unchanged: the same auxv and `prctl` path | GCC and LLVM both target it; no mainstream distribution ships an `aarch64_be` sysroot, so the cross toolchain would have to be built. qemu-user has the target | Open in principle, unattractive in practice: a self-built toolchain, a kernel whose loads pay `rev64`, and no reachable hardware. |
 | SVE and RVV above 512 bits | xsimd handles the types; the ceiling is this tree's | the exact-match checks already generalise: one more `vlenb`/VL value each | qemu can present VL and VLEN above 512 today | Open, and the one gap `arch.def` already names. 1024 bits is 32 lanes, above the 16 that `BLAKE3PP_MAX_SIMD_DEGREE` accepts, so it is new work in the kernel and in the subtree buffers, not a new row in a loop. No silicon above 512 bits exists to measure the result on, which is also why dispatch currently lands such a machine on scalar. |
-| LoongArch LSX / LASX | the vector-extension provider reaches both widths (probe above), 4 and 8 lanes; `__loongarch_simd_width` gives a clean feature probe. No SIMD library has a backend | `HWCAP_LOONGARCH_LSX` / `_LASX` on Linux, the same one-auxv-read shape as POWER and MIPS (general knowledge about the port, not something the tree has run) | GCC and clang both support the port and Debian has a `loong64` port to take a sysroot from; qemu-user has the target with LSX and LASX | The strongest candidate. It needs a registrar function, a `cpu_detect_loongarch.cpp`, two `arch.def` rows and a toolchain image — all shapes that already exist four times over. No cloud offers LoongArch, so without buying a board it would ship as emulator-only, exactly like MSA. |
 | Hexagon HVX | reachable, at 128-byte vectors (probe above) | nothing to read: HVX is not a feature of a host CPU a Linux process runs on | LLVM targets Hexagon and qemu-user has a Hexagon target with HVX | The interesting experiment that does not fit the library's model; see below. |
 | Arm Helium (MVE) | reachable, 128-bit, 4 lanes (probe above) | none, and none needed: an M-profile binary is built for its core | compilers yes; testing needs a system emulator running a board, not qemu-user | Open as a *freestanding* target, not as a dispatch target; see below. |
 | Arm SME / SME2 | no backend anywhere, and ZA tiles do not fit the facade's register model: it would be a hand-written kernel, like `xthead` | both Linux and Windows report SME presence through the same surfaces the SVE probe already uses, and the Windows SDK's SME feature ids arrived alongside the SVE ones the probe spells out | compilers yes; qemu-user emulates SME; recent phone cores have it, no CI machine does | Open as an experiment with an honest question in front of it: whether an outer-product unit helps a hash whose state is 16 words wide. Nothing here is measured. |
