@@ -1006,13 +1006,6 @@ inline constexpr std::size_t reducer_nodes = 256;
   return head % direct_alignment == 0;
 }
 
-// Buffer memory the pipeline spends on windows beyond the reads the
-// device sees, so that a pool has windows to work on while the device
-// serves the next ones. At 8 MiB windows this is 16 of them, twice what a
-// 16-thread pool needs with no device under it, and half of what a caller
-// asking for 64 MiB windows at queue depth 4 spends on its reads alone.
-inline constexpr std::size_t default_window_budget_bytes = std::size_t{128} << 20;
-
 // The geometry of one update_file() call, decided once from the hasher's
 // count, the file's size and the caller's requests and handed to the
 // driver, the file and the scope alike, so that no two of them round or
@@ -1066,13 +1059,24 @@ struct pipeline_plan {
 
 // file_bytes is the file's size, or zero when unknown: the window count
 // is then the budget's, and the open that follows reports why.
+//
+// window_budget_bytes widens the window objects the plan allocates
+// without touching the depth the device sees. Those windows are the
+// arena the pool draws its work from; read_plan_budget_bytes() resolves
+// the figure, and io_geometry.hpp carries what it buys and what it
+// costs. The arena is resident: a window is touched as soon as it is
+// read into, so a wide budget costs its own size in pages.
 [[nodiscard]] constexpr pipeline_plan plan_pipeline(
     std::uint64_t count, std::size_t window_bytes, unsigned queue_depth,
-    bool direct_io, std::uint64_t file_bytes) noexcept {
+    bool direct_io, std::uint64_t file_bytes,
+    std::size_t window_budget_bytes = 0) noexcept {
   const std::size_t window = rounded_window_bytes(window_bytes);
   const std::size_t head = first_window_bytes(count, window);
   const unsigned reads = clamp_queue_depth(queue_depth);
-  const std::size_t by_budget = default_window_budget_bytes / window;
+  const std::size_t by_budget =
+      (window_budget_bytes != 0 ? window_budget_bytes
+                                : default_window_budget_bytes) /
+      window;
   const auto windows = static_cast<unsigned>(std::clamp<std::size_t>(
       std::max<std::size_t>(reads, by_budget), reads, max_queue_depth));
   return {window, reads,

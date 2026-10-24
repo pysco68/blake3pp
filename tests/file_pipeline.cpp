@@ -2333,6 +2333,89 @@ TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the fi
   // An unknown size leaves the count to the budget; an empty file has
   // no windows at all.
   CHECK(plan_pipeline(0, 8 * mib, 4, false, 0).windows == 16);
+
+  // A window budget given explicitly replaces the standing one and
+  // moves nothing else: that is the arena the pool draws its work from,
+  // and the depth stays where the caller put it.
+  using blake3pp::detail::read_plan_budget_bytes;
+  {
+    const auto p = plan_pipeline(0, 8 * mib, 4, false, large,
+                                 read_plan_budget_bytes(32, 8 * mib));
+    CHECK(p.reads_in_flight == 4);
+    CHECK(p.windows == 16);
+    CHECK(p.window_bytes == 8 * mib);
+  }
+  // The same rule at a large window: 32 threads buy eight 64 MiB
+  // windows, where the standing 128 MiB budget alone buys two.
+  {
+    const auto p = plan_pipeline(0, 64 * mib, 4, false, large,
+                                 read_plan_budget_bytes(32, 64 * mib));
+    CHECK(p.reads_in_flight == 4);
+    CHECK(p.windows == (wide_windows ? 8 : default_window_budget_bytes / w64));
+  }
+  CHECK(plan_pipeline(0, 8 * mib, 4, false, large, 512 * mib).windows ==
+        std::min<unsigned>(64, max_queue_depth));
+  CHECK(plan_pipeline(0, 8 * mib, 4, false, large, 1024 * mib).windows ==
+        std::min<unsigned>(128, max_queue_depth));
+  if constexpr (wide_windows) {
+    CHECK(plan_pipeline(0, 64 * mib, 4, false, large, 1024 * mib).windows ==
+          16);
+  } else {
+    CHECK(plan_pipeline(0, 64 * mib, 4, false, large, 1024 * mib).windows ==
+          std::min<std::size_t>(1024 * mib / w64, max_queue_depth));
+  }
+  // Zero is the standing budget.
+  CHECK(plan_pipeline(0, 8 * mib, 4, false, large, 0).windows == 16);
+  // The requested depth is still the floor, and the file still the
+  // ceiling.
+  CHECK(plan_pipeline(0, 8 * mib, 12, false, large, 8 * mib).windows == 12);
+  CHECK(plan_pipeline(0, 64 * 1024, 4, false, 3 * 64 * 1024,
+                      read_plan_budget_bytes(32, 64 * 1024))
+            .windows == 3);
+}
+
+// The budget rule itself: a window count that follows the machine,
+// floored at the standing budget and capped where the measurements
+// stop.
+TEST_CASE("the read plan's window budget follows the thread count") {
+  using blake3pp::detail::default_window_budget_bytes;
+  using blake3pp::detail::max_window_budget_bytes;
+  using blake3pp::detail::read_plan_budget_bytes;
+  using blake3pp::detail::rounded_window_bytes;
+  using blake3pp::detail::threads_per_window;
+  constexpr std::size_t mib = std::size_t{1} << 20;
+  // The 64 MiB window the cases below name is what the platform's cap
+  // lets through: 64 MiB on 64-bit, 8 MiB on 32-bit size_t, where
+  // max_window_bytes is just under 16 MiB. The thread counts scale by the
+  // same ratio, so each case asserts the same budget in bytes on either
+  // width.
+  const std::size_t w64 = rounded_window_bytes(64 * mib);
+  const unsigned scaled = 32 * static_cast<unsigned>(64 * mib / w64);
+
+  // No thread count to offer: the floor, the standing budget.
+  CHECK(read_plan_budget_bytes() == default_window_budget_bytes);
+  CHECK(read_plan_budget_bytes(0, 64 * mib) == default_window_budget_bytes);
+  // One window per threads_per_window threads: at a 64 MiB window the
+  // standing budget buys two, and 32 threads buy eight.
+  CHECK(read_plan_budget_bytes(scaled, 64 * mib) ==
+        (scaled / threads_per_window) * w64);
+  CHECK(read_plan_budget_bytes(scaled, 64 * mib) == 512 * mib);
+  // At the default window the same count is already below the floor,
+  // so nothing moves there.
+  CHECK(read_plan_budget_bytes(32, 8 * mib) == default_window_budget_bytes);
+  CHECK(read_plan_budget_bytes(4, 8 * mib) == default_window_budget_bytes);
+  CHECK(read_plan_budget_bytes(4, 64 * mib) == default_window_budget_bytes);
+  // A wide machine asking for a wide window is bounded. The counts stop
+  // at 1024 threads: on 32-bit size_t, 2048 threads buy 512 windows of
+  // 8 MiB, 4 GiB, which wraps to zero before the ceiling applies.
+  const unsigned wide = std::min<unsigned>(256 * static_cast<unsigned>(64 * mib / w64), 1024);
+  CHECK(read_plan_budget_bytes(wide, 64 * mib) == max_window_budget_bytes);
+  const std::size_t w1g = rounded_window_bytes(1024 * mib);
+  const unsigned huge = std::min<unsigned>(1024 * static_cast<unsigned>(1024 * mib / w1g), 1024);
+  CHECK(read_plan_budget_bytes(huge, 1024 * mib) == max_window_budget_bytes);
+  // The window is rounded before it is counted, as everywhere else.
+  CHECK(read_plan_budget_bytes(scaled, 96 * mib) ==
+        read_plan_budget_bytes(scaled, 64 * mib));
 }
 
 // The two bounds, apart: with two reads allowed and eight windows, the

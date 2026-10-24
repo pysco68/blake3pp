@@ -896,6 +896,13 @@ int main(int argc, char** argv) {
     println(stdout,
             "null source: {:.2f} GiB, window {} MiB, qd {}, {} threads",
             null_gib, win >> 20, opts.queue_depth, threads);
+    // The arena the pool draws its work from, resolved the way every
+    // read entry point resolves it: from this machine's thread count.
+    const blake3pp::detail::pipeline_plan plan =
+        blake3pp::detail::plan_pipeline(
+            0, opts.window_bytes, opts.queue_depth, false, total,
+            blake3pp::detail::read_plan_budget_bytes(threads,
+                                                     opts.window_bytes));
 
     // The digest this must produce: the same bytes, hashed in memory.
     blake3pp::hasher expect;
@@ -919,9 +926,6 @@ int main(int argc, char** argv) {
         trace->clear();
       }
       const kernel_counters kernel_before = read_kernel_counters();
-      const blake3pp::detail::pipeline_plan plan =
-          blake3pp::detail::plan_pipeline(0, opts.window_bytes,
-                                          opts.queue_depth, false, total);
       null_driver drv({.async = true,
                        .offload_submit = opts.offload_submit,
                        .ioring = opts.ioring,
@@ -932,7 +936,7 @@ int main(int argc, char** argv) {
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
-          h, drv, nf, sched,
+          h, drv, nf, sched, plan,
           {.window_bytes = opts.window_bytes,
            .queue_depth = opts.queue_depth,
            .trace = io_opts.trace});

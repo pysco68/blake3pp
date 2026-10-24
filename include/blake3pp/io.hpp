@@ -59,10 +59,17 @@ struct file_io_options {
   /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
   /// multiple of chunk_size, minimum 64 KiB.
   std::size_t window_bytes = detail::default_window_bytes;
-  /// Windows in flight at once, four by default; clamped to [2, 256]. Each
-  /// costs window_bytes of arena plus its own tables, which is what the
-  /// ceiling guards (and BLAKE3PP_MAX_QUEUE_DEPTH moves); the measured
-  /// sweet spot on every device so far is four to eight.
+  /// Reads in flight at once, four by default; clamped to [2, 256]. Each
+  /// window costs window_bytes of arena plus its own tables, which is what
+  /// the ceiling guards (and BLAKE3PP_MAX_QUEUE_DEPTH moves). The
+  /// sequential forms allocate exactly this many windows.
+  ///
+  /// The forms that take a scheduler allocate more. The depth is what the
+  /// device sees; the window objects behind it are what the hash pool draws
+  /// work from while the device serves the next reads, and on a fast device
+  /// they are worth more than the depth is. Their number follows the
+  /// machine's thread count (detail::read_plan_budget_bytes), and
+  /// docs/pipeline.md carries the measurement.
   unsigned queue_depth = detail::default_queue_depth;
   /// Bypass the page cache where the platform supports it; degrades to
   /// buffered reads where it does not. A file below 512 KiB

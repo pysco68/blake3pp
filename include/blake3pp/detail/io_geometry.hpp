@@ -49,10 +49,29 @@ inline constexpr std::size_t min_window_bytes = 64 * 1024;
 // ordinary allocation.
 inline constexpr std::size_t default_window_bytes = 8 * 1024 * 1024;
 
-// The windows every read entry point keeps in flight by default. Two is
-// the minimum that overlaps a read with a hash; the measured sweet spot on
-// every device so far is four to eight, and past that a window costs its
-// arena without hiding more latency.
+// The windows every read entry point keeps in flight by default.
+//
+// Read throughput tracks the bytes in flight -- depth times window --
+// more closely than either axis on its own. Measured on a four-drive
+// PCIe 5 stripe (AMD EPYC 8124P, md raid0 over four NVMe, xfs, Linux
+// 7.0, 32 GiB file, best of 2 per cell): cells of equal product agree
+// within 0.8 GiB/s at 512 MiB in flight and within 1.0 at 1 GiB, but
+// only there -- the spread is 2.4 at 128 MiB and 3.6 at 256 MiB, so
+// the axes are redundant at the top of the surface and not across it.
+// Neither single-axis step from the 8 MiB x 4 default is worth taking:
+// 8 MiB x 16 reads 36.8 GiB/s and 64 MiB x 4 reads 37.2 against 37.4
+// for the default, while 8 MiB x 32 reads 40.8, +9.1%, on the same row.
+// The best cell is 64 MiB x 16 at 1 GiB in flight; past 2 GiB the
+// figure is flat to worse and the raw device rate declines. On a single
+// 9 GiB/s NVMe the 8-64 MiB x 4-32 grid lands within 9.02-9.04 GiB/s in
+// fifteen of sixteen cells, the sixteenth 8.88 at 64 MiB x qd 32, so
+// geometry buys nothing there.
+//
+// Four is therefore a starting point and not an optimum: it is what a
+// device that pays nothing for depth settles at, and 32 MiB in flight
+// is an arena any machine can spare. Where depth does pay it pays an
+// order of magnitude further out than this, and a caller that knows
+// its device states its own figure.
 inline constexpr unsigned default_queue_depth = 4;
 
 // The window the reader actually uses for a requested size: a power of
@@ -70,6 +89,114 @@ inline constexpr unsigned default_queue_depth = 4;
 // is hashed, and at most max_queue_depth.
 [[nodiscard]] constexpr unsigned clamp_queue_depth(unsigned requested) noexcept {
   return std::clamp(requested, 2u, max_queue_depth);
+}
+
+// Buffer memory a read plan spends on window objects, which is both the
+// reads the device has outstanding and the windows a pool has work in.
+//
+// This memory is RESIDENT. A window is touched as soon as it is read
+// into, and a run reaches the whole arena within the first few turns of
+// the queue, so the cost of a budget is the budget: a 1 GiB arena is a
+// gigabyte of pages, not a gigabyte of address space.
+//
+// What it buys is the pool being fed. The windows beyond the reads are
+// the work the hash side has in hand while the device serves the next
+// ones, and on a fast device they are worth more than the depth is.
+// Measured on the four-drive PCIe 5 stripe (AMD EPYC 8124P, md raid0
+// over four NVMe, xfs, Linux 7.0, 32 threads, 64 GiB file, the depth
+// held at four reads so the two axes are separate):
+//
+//   window   arena             GiB/s   pool busy
+//   64 MiB   256 MiB (4 win)    37.0     64%
+//   64 MiB   384 MiB (6 win)    41.5     76%
+//   64 MiB   512 MiB (8 win)    45.9     86%
+//   64 MiB     1 GiB (16 win)   45.6     85%
+//   64 MiB     2 GiB (32 win)   44.4     85%
+//    8 MiB    32 MiB (4 win)    30.2     53%
+//    8 MiB    64 MiB (8 win)    37.6     71%
+//    8 MiB   128 MiB (16 win)   38.9     75%
+//    8 MiB   256 MiB (32 win)   39.3     75%
+//    8 MiB     1 GiB (128 win)  38.9     76%
+//    8 MiB     2 GiB (256 win)  38.5     74%
+//
+// So the return flattens at a WINDOW COUNT and not at a number of
+// bytes: eight windows at 64 MiB and sixteen at 8 MiB, past which the
+// figure is flat and then declines. A byte budget alone gets that wrong
+// in one direction: divided by a large window it buys too few windows,
+// and 128 MiB at a 64 MiB window buys four, 19% below eight.
+//
+// The pool-busy column is the mechanism, and narrowing the pool is what
+// shows it. The same 8 MiB row on half the machine:
+//
+//   threads   arena              GiB/s   pool busy
+//        32    32 MiB (4 win)     30.2     54%
+//        32    64 MiB (8 win)     37.8     71%
+//        32   128 MiB (16 win)    38.9     75%
+//        32   256 MiB (32 win)    39.5     76%
+//        16    32 MiB (4 win)     31.0     88%
+//        16    64 MiB (8 win)     36.1     98%
+//        16   128 MiB (16 win)    35.0     99%
+//        16   256 MiB (32 win)    34.6     99%
+//
+// Sixteen threads are nearly saturated on four windows, are saturated on
+// eight and cannot use more. Thirty-two stand at 54% on four and keep
+// gaining to sixteen. The arena's job is to keep the consumer fed, so
+// its size is the consumer's question.
+//
+// (The 16-thread arms are the noisiest here: the two passes of the
+// eight-window cell read 34.6 and 37.5. The flatness above eight windows
+// survives that, the exact plateau figure does not.)
+//
+// Hence: one window per threads_per_window hardware threads, which keeps
+// a laptop from spending a server's arena, floored at 128 MiB
+// (default_window_budget_bytes). Together they land on the measured knee
+// at both window sizes -- eight windows at 64 MiB, sixteen at 8 MiB --
+// and on four threads they give the plan the floor alone gives, at any
+// window size.
+// The write side resolves its depth the same way
+// (resolve_write_queue_depth), and for the same reason: the parallelism
+// that has to be kept fed is the machine's, not the device's.
+//
+// Windows per thread is not itself constant -- a larger window is more
+// work, so fewer of them are needed -- which is why the floor and the
+// count are both there and the larger wins. Above the 32 threads
+// measured here the count is an extrapolation, and
+// max_window_budget_bytes is what bounds it.
+//
+// A device that is already saturated gains nothing from any of this. On
+// the single 9 GiB/s NVMe above the whole geometry grid is one number, so
+// there the arena is memory spent for no return.
+inline constexpr unsigned threads_per_window = 4;
+// The floor, and what a caller with no thread count to offer gets. At
+// the default 8 MiB window it is sixteen windows, the count the stripe's
+// own 8 MiB row flattens at.
+inline constexpr std::size_t default_window_budget_bytes =
+    std::size_t{128} << 20;
+// The ceiling. Past two gigabytes the stripe's read figure declines and
+// its raw device rate with it, so a wide machine asking for a wide
+// window is not given an arena nothing was measured to use.
+inline constexpr std::size_t max_window_budget_bytes = std::size_t{2} << 30;
+
+// The window budget a read plan is given: one window per
+// threads_per_window threads of `threads`, between the floor and the
+// ceiling. Every read entry point resolves it this way, so a plan made
+// from a caller's options is the same plan whichever entry point made
+// it.
+//
+// `threads` of zero is a caller with no pool size to offer -- a plan
+// made straight from an options struct, as the tests and the bench make
+// one -- and gets the floor.
+[[nodiscard]] constexpr std::size_t read_plan_budget_bytes(
+    unsigned threads = 0,
+    std::size_t window_bytes = default_window_bytes) noexcept {
+  if (threads == 0) {
+    return default_window_budget_bytes;
+  }
+  const std::size_t windows =
+      std::max<std::size_t>(1, threads / threads_per_window);
+  return std::clamp<std::size_t>(rounded_window_bytes(window_bytes) * windows,
+                                 default_window_budget_bytes,
+                                 max_window_budget_bytes);
 }
 
 // The size below which a message is small: a span of fewer bytes is

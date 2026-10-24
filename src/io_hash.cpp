@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 
 namespace blake3pp {
 
@@ -75,7 +76,9 @@ file_io_probe probe_file_io(const std::filesystem::path& path,
   const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
   const detail::pipeline_plan plan = detail::plan_pipeline(
       0, opts.window_bytes, opts.queue_depth, opts.direct_io,
-      size_ec ? 0 : static_cast<std::uint64_t>(size));
+      size_ec ? 0 : static_cast<std::uint64_t>(size),
+      detail::read_plan_budget_bytes(std::thread::hardware_concurrency(),
+                                     opts.window_bytes));
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
                          .ioring = opts.ioring,

@@ -23,8 +23,8 @@
 #include <filesystem>
 #include <span>
 #include <system_error>
-#include <type_traits>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #include <blake3pp/core.hpp>
@@ -180,9 +180,15 @@ void update_file(hasher& h, const std::filesystem::path& path,
   // cannot give leaves the count to the budget, and the open reports why.
   std::error_code size_ec;
   const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
+  // The plan's window objects are the arena the pool draws work from.
+  // Their number follows the machine's thread count
+  // (read_plan_budget_bytes), while the engine's queue is sized for the
+  // reads that can actually be outstanding, which is the depth.
   const detail::pipeline_plan plan = detail::plan_pipeline(
       h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io,
-      size_ec ? 0 : static_cast<std::uint64_t>(size));
+      size_ec ? 0 : static_cast<std::uint64_t>(size),
+      detail::read_plan_budget_bytes(std::thread::hardware_concurrency(),
+                                     opts.window_bytes));
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
                          .ioring = opts.ioring,
