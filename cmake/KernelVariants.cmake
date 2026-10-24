@@ -115,6 +115,8 @@ function(_blake3pp_register_x86_kernels)
     # xvec's x86 permute layer initialises __v32hi/__v64qi from __m512i,
     # which GCC 16 no longer converts implicitly; the flag restores the
     # GCC 13-15 behaviour for this one TU (clang is unaffected).
+    # include/xvec/x86/permute.hpp still has that shape at the xvec
+    # commit cmake/StdFeatures.cmake pins.
     blake3pp_add_kernel(avx512 ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq
       "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<STREQUAL:${BLAKE3PP_SIMD_PROVIDER},xvec>>:-flax-vector-conversions>")
   endif()

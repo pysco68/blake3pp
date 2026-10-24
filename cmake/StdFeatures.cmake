@@ -302,7 +302,7 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
   # (2026-09-12), which is what makes this provider stand alone.
   FetchContent_Declare(beman_execution
     GIT_REPOSITORY https://github.com/bemanproject/execution.git
-    GIT_TAG c55d8245bea73924a6509c77f68e85008572769a)
+    GIT_TAG 8e358c01f4f4435e06b0691de433f4b2a07367be) # main, 2026-09-22
   set(_blake3pp_beman_extension [=[
       set(BEMAN_USE_MODULES OFF CACHE BOOL "" FORCE)
       # beman gates its (large, occasionally non-compiling) test suite on
@@ -319,6 +319,11 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
     # src/execution/parallel_backend.cpp defines the replacement, so
     # beman's own default backend is built out: the program holds one
     # definition of query_parallel_scheduler_backend().
+    # At the pinned commit the option reaches consumers as
+    # BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND=0, and
+    # beman's headers default the macro to 1 when it is absent. Building
+    # the backend out therefore depends on that INTERFACE definition
+    # arriving on every blake3pp compile line.
     string(APPEND _blake3pp_beman_extension [=[
       set(BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND OFF CACHE BOOL "" FORCE)
     ]=])
@@ -365,7 +370,7 @@ endmacro()
 if(BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
   FetchContent_Declare(xvec
     GIT_REPOSITORY https://github.com/intel/xvec.git
-    GIT_TAG 0a2a1928b863ab1af530fa5be435b851e5084345) # master, 2026-09-14
+    GIT_TAG d876204b506ecb001d47e88ca0cc97ad61c34c26) # main, 2026-10-06
   FetchContent_MakeAvailable(xvec)
   add_library(xvec INTERFACE)
   add_library(xvec::xvec ALIAS xvec)
