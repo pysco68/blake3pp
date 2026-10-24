@@ -37,6 +37,9 @@
 #elif defined(__mips__)
 #define BLAKE3PP_CPU_DETECT_MIPS 1
 #define BLAKE3PP_HAS_CPU_DETECT 1
+#elif defined(__loongarch64)
+#define BLAKE3PP_CPU_DETECT_LOONGARCH 1
+#define BLAKE3PP_HAS_CPU_DETECT 1
 #endif
 
 #if defined(BLAKE3PP_TEST_PROBE_SHAPES)

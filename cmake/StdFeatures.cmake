@@ -302,7 +302,7 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
   # (2026-09-12), which is what makes this provider stand alone.
   FetchContent_Declare(beman_execution
     GIT_REPOSITORY https://github.com/bemanproject/execution.git
-    GIT_TAG c55d8245bea73924a6509c77f68e85008572769a)
+    GIT_TAG 8e358c01f4f4435e06b0691de433f4b2a07367be) # main, 2026-09-22
   set(_blake3pp_beman_extension [=[
       set(BEMAN_USE_MODULES OFF CACHE BOOL "" FORCE)
       # beman gates its (large, occasionally non-compiling) test suite on
@@ -319,6 +319,11 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
     # src/execution/parallel_backend.cpp defines the replacement, so
     # beman's own default backend is built out: the program holds one
     # definition of query_parallel_scheduler_backend().
+    # At the pinned commit the option reaches consumers as
+    # BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND=0, and
+    # beman's headers default the macro to 1 when it is absent. Building
+    # the backend out therefore depends on that INTERFACE definition
+    # arriving on every blake3pp compile line.
     string(APPEND _blake3pp_beman_extension [=[
       set(BEMAN_EXECUTION_WITH_DEFAULT_PARALLEL_SCHEDULER_BACKEND OFF CACHE BOOL "" FORCE)
     ]=])
@@ -365,7 +370,7 @@ endmacro()
 if(BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
   FetchContent_Declare(xvec
     GIT_REPOSITORY https://github.com/intel/xvec.git
-    GIT_TAG 0a2a1928b863ab1af530fa5be435b851e5084345) # master, 2026-09-14
+    GIT_TAG d876204b506ecb001d47e88ca0cc97ad61c34c26) # main, 2026-10-06
   FetchContent_MakeAvailable(xvec)
   add_library(xvec INTERFACE)
   add_library(xvec::xvec ALIAS xvec)
@@ -376,9 +381,31 @@ if(BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
 endif()
 
 # Last resort: the project-wide simd provider falls back to xsimd.
-if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD
-   AND NOT BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
-  _blake3pp_fetch_xsimd()
-  target_link_libraries(blake3pp_features INTERFACE xsimd)
-  target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XSIMD=1)
-endif()
+#
+# Resolved after blake3pp_register_kernels(), not here. src/kernel/
+# simd_facade.hpp is included from kernel translation units and nowhere
+# else, so the project-wide provider has a consumer only when some kernel
+# pins none of its own; which kernels exist is not known until they have
+# registered, which is long after this file runs. A build whose every
+# kernel is pinned (loongarch64: scalar plus two vector-extension kernels)
+# would otherwise clone and build xsimd, and put its include path and
+# BLAKE3PP_HAS_XSIMD on every compile line, for a header nothing includes.
+#
+# An explicitly named provider is resolved whether or not a kernel falls
+# back to it: BLAKE3PP_SIMD_PROVIDER=xsimd is also how the cross-compiling
+# toolchains make simd_provider() name the provider their pinned vector
+# kernel uses.
+macro(blake3pp_resolve_simd_provider)
+  if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD
+     AND NOT BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
+    get_property(_blake3pp_simd_needed GLOBAL PROPERTY
+      BLAKE3PP_KERNELS_NEED_SIMD_PROVIDER)
+    if(_blake3pp_simd_needed OR BLAKE3PP_SIMD_PROVIDER STREQUAL "xsimd")
+      _blake3pp_fetch_xsimd()
+      target_link_libraries(blake3pp_features INTERFACE xsimd)
+      target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XSIMD=1)
+    else()
+      message(STATUS "blake3pp: simd provider = none; every kernel pins its own")
+    endif()
+  endif()
+endmacro()

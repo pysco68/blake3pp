@@ -47,6 +47,74 @@ On a Mac:
 - `macos-clang22-cxx26`: Homebrew LLVM 22 against its bundled libc++
   (`brew install llvm`)
 
+On FreeBSD, with the base system's compiler (`pkg install cmake ninja`):
+
+- `freebsd-clang-cxx23`: the native preset (base clang and libc++, POSIX
+  AIO on a kqueue, `O_DIRECT`)
+- `freebsd-clang-cxx23-asan` and `freebsd-clang-cxx23-tsan`: the same
+  build under the base system's clang_rt runtimes, which is what
+  exercises the AIO backend's buffer lifetime and its one cross-thread
+  member (`wake()`) under a sanitizer. ASan works. TSan is built and not
+  run on 14.5-RELEASE (base clang 21.1.8): a TSan-instrumented binary
+  hangs before `main()` there, a ten-line one included, with and without
+  ASLR (`proccontrol -m aslr -s disable`), so the preset exists for a
+  toolchain where the runtime starts.
+
+FreeBSD can also be built *from Linux*, for either architecture, which
+is what CI does:
+
+- `freebsd-zig-cxx23`: zig's clang targeting `x86_64-freebsd.14.0`,
+  built in the `zig` toolchain image like the static musl presets
+  (`tools/tc linux-zigmusl-cxx23-static -- cmake --preset
+  freebsd-zig-cxx23` runs it, since both presets live in that image).
+- `freebsd-arm64-zig-cxx23`: the same, targeting
+  `aarch64-freebsd.14.0`. It carries the arm64 kernels — `neon`,
+  `sve256`, `sve512` and `sve2_128` — which
+  `cmake/KernelVariants.cmake` registers from compiler probes the
+  moment the toolchain declares `CMAKE_SYSTEM_PROCESSOR aarch64`;
+  nothing in the toolchain file asks for them by name. Dispatch offers
+  the SVE ones only on a kernel that publishes `HWCAP_SVE`, which
+  FreeBSD does from 15.0; on 14.x the same binary takes `neon`.
+
+  Neither is static, and neither can be: zig refuses
+  `-static` for both targets with *"libc of the specified target requires
+  dynamic linking"*, so the binaries link against `libc.so.7` and
+  `libthr.so.3` and the ABI version in the triple becomes the floor —
+  they run on FreeBSD 14.0 and newer. Nothing on the build host can
+  execute them, so the presets' `CMAKE_CROSSCOMPILING_EMULATOR` is empty
+  and `ctest` runs nothing; `tools/freebsd-guest.sh` is what runs them,
+  by booting an actual FreeBSD under qemu:
+
+  ```sh
+  tools/freebsd-guest.sh prepare      # once: build the guest image
+  tools/freebsd-guest.sh start
+  tools/freebsd-guest.sh wait
+  tar cf - -C build/freebsd-zig-cxx23 tests cli bench \
+    | tools/freebsd-guest.sh run 'mkdir -p /root/b3 && tar xf - -C /root/b3'
+  tools/freebsd-guest.sh run '/root/b3/tests/blake3pp_tests'
+  tools/freebsd-guest.sh stop
+  ```
+
+  Put `FBSD_ARCH=arm64` in front of each of those for the arm64 guest;
+  it is one script and the two guests have different default
+  directories and ports, so both can exist in one checkout.
+
+  `prepare` needs `qemu`, root for `nbd`, and the EFI firmware for the
+  architecture (`ovmf` on amd64, `qemu-efi-aarch64` on arm64). The
+  amd64 guest also needs `/dev/kvm`: it takes about a minute to prepare
+  and boots to ssh in roughly fifteen seconds. The arm64 guest runs
+  under TCG — nothing can KVM an aarch64 guest on an x86 host, and
+  GitHub has no arm64 runner that exposes `/dev/kvm` — so it is slower
+  throughout: measured on a 16-core x86 box, about four and a half
+  minutes to prepare (of which a minute and a quarter is the download),
+  a hundred seconds to boot to ssh, and under a minute for the whole
+  test suite. CI does not run `prepare` per build: the prepared images
+  are published to GHCR alongside the toolchain images and the lanes
+  pull them. The script's header explains why the guest configures
+  itself from the inside rather than being seeded offline (short
+  version: Linux cannot write UFS), and why the two architectures
+  differ in exactly four places.
+
 Without a preset, a bare `cmake -S . -B build` configures the C++20
 baseline with the default compiler.
 
@@ -54,7 +122,8 @@ The devcontainer carries only the default gcc/clang pair; every other preset
 runs inside its per-compiler toolchain image via `tools/tc <preset>`;
 see `docker/README.md` for the image matrix and its glibc-floor design.
 The cross presets (`linux-arm64-gcc15-cxx23`, `linux-riscv64-gcc15-cxx23`,
-and the static musl set `linux-{,arm64-,riscv64-,ppc64le-,s390x-}zigmusl-cxx23-static`)
+and the static musl set
+`linux-{,arm64-,riscv64-,ppc64le-,s390x-,loongarch64-}zigmusl-cxx23-static`)
 run their whole test suites under qemu-user with a selectable vector
 length, so one build exercises every SVE VL or RVV VLEN; the emulator
 recipes are in `docker/README.md` too. Two kernel sets are opt-in:
@@ -118,7 +187,8 @@ independent of the configure log:
 
 ```cpp
 blake3pp::simd_provider();       // "std::simd", "std::experimental::simd",
-                                  // "xsimd", or "none (scalar only)"
+                                  // "xsimd", "xvec", "none (scalar only)",
+                                  // or "none (kernels pin their own)"
 blake3pp::execution_provider();  // "std::execution", "beman.execution",
                                   // "stdexec", or "none"
 ```
@@ -132,9 +202,10 @@ instead of leaving it on `auto` --
 `linux-s390x-gcc15-cxx23` and the ppc64le/s390x zigmusl presets set it
 to `xsimd`, and `linux-mips64el-gcc14-cxx23` sets `std-experimental` --
 because each one's vector kernel already pins a provider for reasons
-specific to that ISA which `auto`'s probes cannot see, and leaving the
-project-wide variable on `auto` would make `simd_provider()` report a
-provider the kernel does not actually use.
+specific to that ISA which `auto`'s probes cannot see. On `auto` nothing
+would fall back to a project-wide provider, so none would be resolved and
+`simd_provider()` would answer `"none (kernels pin their own)"`; naming
+the provider the vector kernel uses is the more informative answer.
 
 Override either on a preset that does not need it to re-measure the
 choice.

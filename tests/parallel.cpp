@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/dispatch.hpp>
 #include <blake3pp/parallel.hpp>
 #include "kernel/kernel.hpp"  // max_simd_degree, for the static_assert below
@@ -345,7 +346,8 @@ namespace {
 struct stopping_scheduler {
   template <class Receiver>
   struct opstate {
-    using operation_state_concept = blake3pp::ex::operation_state_t;
+    using operation_state_concept =
+        blake3pp::detail::ex_compat::operation_state_tag;
     void start() noexcept { blake3pp::ex::set_stopped(std::move(rcvr)); }
     Receiver rcvr;
   };
@@ -356,7 +358,7 @@ struct stopping_scheduler {
     }
   };
   struct sender {
-    using sender_concept = blake3pp::ex::sender_t;
+    using sender_concept = blake3pp::detail::ex_compat::sender_tag;
     // Declares the value completion a real pool's sender has too, which
     // sync_wait requires, and only ever delivers the stopped one. Both
     // spellings are given. The static function is the standard's, the
@@ -374,7 +376,8 @@ struct stopping_scheduler {
     }
     static auto get_env() noexcept -> attrs { return {}; }
   };
-  using scheduler_concept = blake3pp::ex::scheduler_t;
+  using scheduler_concept =
+      blake3pp::detail::ex_compat::scheduler_tag;
   static auto schedule() noexcept -> sender { return {}; }
   // The standard's scheduler concept asks for this. A scheduler that runs
   // nothing promises the least.

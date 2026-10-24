@@ -27,7 +27,10 @@ void update_file(hasher& h, const std::filesystem::path& path,
                                     .queue_depth = opts.queue_depth,
                                     .direct_io = direct_io,
                                     .async = opts.async,
-                                    .offload_submit = opts.offload_submit});
+                                    .offload_submit = opts.offload_submit,
+                                    .ioring = opts.ioring,
+                                    .registered_buffers =
+                                        opts.registered_buffers});
   trace_buffer* const trace = opts.trace;
   std::uint64_t index = 0;
   for (;;) {
@@ -73,7 +76,10 @@ file_io_probe probe_file_io(const std::filesystem::path& path,
   const detail::pipeline_plan plan = detail::plan_pipeline(
       0, opts.window_bytes, opts.queue_depth, opts.direct_io,
       size_ec ? 0 : static_cast<std::uint64_t>(size));
-  detail::io_driver drv({opts.async, opts.offload_submit},
+  detail::io_driver drv({.async = opts.async,
+                         .offload_submit = opts.offload_submit,
+                         .ioring = opts.ioring,
+                         .registered_buffers = opts.registered_buffers},
                         plan.reads_in_flight);
   detail::io_driver::file file(drv, path, plan.direct_io);
   return {.file_bytes = file.size(),

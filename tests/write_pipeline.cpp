@@ -24,6 +24,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <blake3pp/detail/write_pipeline.hpp>
 #include <blake3pp/parallel.hpp>
 #include <blake3pp/parallel_backend.hpp>
@@ -289,6 +294,40 @@ TEST_CASE("a generated file is exactly what the generator described") {
     }
   }
 }
+
+#if defined(_WIN32)
+// NTFS zeroes ahead of every write that lands past the valid data length,
+// so a preallocated file is written sparse for the run and made plain
+// again at the trim; the waiver is taken only where the privilege is
+// held, which a test session does not have, and falls to sparse too.
+TEST_CASE("a preallocated write on Windows is sparse for the run and plain after") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::uint64_t size = 8 * win + 4321;
+  for (const bool waive : {false, true}) {
+    CAPTURE(waive);
+    const temp_path out;
+    const blake3pp::write_report r = blake3pp::write_file(
+        out.path, size, fill_from_offset, sched,
+        {.window_bytes = win, .waive_zero_fill = waive});
+    MESSAGE("write backend: " << r.backend);
+    CHECK(r.bytes == size);
+    const bool sparse = r.backend.ends_with("+sparse");
+    const bool valid = r.backend.ends_with("+validdata");
+    // One of the two on NTFS; a file system without sparse files names
+    // neither, which the message above shows.
+    CHECK((sparse || valid || !r.backend.starts_with("iocp")));
+    if (!waive) {
+      CHECK(!valid);
+    }
+    CHECK(size_of(out.path) == size);
+    CHECK(hash_of(out.path) == expected_digest(size));
+    const DWORD attrs = ::GetFileAttributesW(out.path.c_str());
+    REQUIRE(attrs != INVALID_FILE_ATTRIBUTES);
+    CHECK((attrs & FILE_ATTRIBUTE_SPARSE_FILE) == 0);
+  }
+}
+#endif
 
 // A generator that throws, on the pool, inside a window already counted in
 // flight: the chain carries the exception, the run stops, and write_file

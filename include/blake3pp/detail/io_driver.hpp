@@ -32,6 +32,14 @@ namespace blake3pp::detail {
 struct io_driver_options {
   bool async = true;           // use the OS's async engine at all
   bool offload_submit = true;  // io_uring: issue on io-wq (IOSQE_ASYNC)
+  // Windows: prefer the I/O ring (Windows 11) over the completion port
+  // where the machine has one; off selects the port. The engaged rung is
+  // in file::name().
+  bool ioring = true;
+  // Windows I/O ring: register the arena reserve() takes and the file
+  // handle with the ring rather than naming a pointer and a HANDLE per
+  // transfer.
+  bool registered_buffers = false;
 };
 
 
@@ -54,6 +62,8 @@ class io_driver {
     bool write = false;
     bool direct_io = false;
     std::uint64_t preallocate_bytes = 0;
+    // See file_write_options::waive_zero_fill.
+    bool waive_zero_fill = false;
   };
 
   // An open file bound to a driver. Destroy every file before its

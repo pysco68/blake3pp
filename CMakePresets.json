@@ -98,6 +98,16 @@
       }
     },
     {
+      "name": "linux-loongarch64-zigmusl-cxx23-static",
+      "displayName": "Static musl release (loongarch64, zig + mimalloc, LSX + LASX, qemu-loongarch64; EMULATOR-ONLY)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/linux-loongarch64-zigmusl-cxx23-static",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-loongarch64-zigmusl-cxx23/linux-loongarch64-zigmusl-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
       "name": "linux-zigmusl-cxx23-static",
       "displayName": "Static musl release (x86_64, zig + mimalloc)",
       "generator": "Ninja",
@@ -135,6 +145,71 @@
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23",
+      "displayName": "FreeBSD base Clang, C++23 (POSIX AIO on a kqueue)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-clang-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-clang-cxx23/freebsd-clang-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-asan",
+      "displayName": "FreeBSD base Clang, C++23 + ASan/UBSan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-clang-cxx23-asan",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-clang-cxx23-asan/freebsd-clang-cxx23-asan.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-tsan",
+      "displayName": "FreeBSD base Clang, C++23 + TSan",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-clang-cxx23-tsan",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-clang-cxx23-tsan/freebsd-clang-cxx23-tsan.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-zig-cxx23",
+      "displayName": "FreeBSD amd64 release, cross-built from Linux (zig + mimalloc; dynamic, 14.0 floor)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-zig-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-zig-cxx23/freebsd-zig-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "freebsd-arm64-zig-cxx23",
+      "displayName": "FreeBSD arm64 release, cross-built from Linux (zig + mimalloc; NEON + SVE, dynamic, 14.0 floor)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/freebsd-arm64-zig-cxx23",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/freebsd-arm64-zig-cxx23/freebsd-arm64-zig-cxx23.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
       }
     },
     {
@@ -370,6 +445,10 @@
       "configurePreset": "linux-s390x-zigmusl-cxx23-static"
     },
     {
+      "name": "linux-loongarch64-zigmusl-cxx23-static",
+      "configurePreset": "linux-loongarch64-zigmusl-cxx23-static"
+    },
+    {
       "name": "macos-appleclang-cxx23",
       "configurePreset": "macos-appleclang-cxx23",
       "condition": {
@@ -386,6 +465,41 @@
         "lhs": "${hostSystemName}",
         "rhs": "Darwin"
       }
+    },
+    {
+      "name": "freebsd-clang-cxx23",
+      "configurePreset": "freebsd-clang-cxx23",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-asan",
+      "configurePreset": "freebsd-clang-cxx23-asan",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-tsan",
+      "configurePreset": "freebsd-clang-cxx23-tsan",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-zig-cxx23",
+      "configurePreset": "freebsd-zig-cxx23"
+    },
+    {
+      "name": "freebsd-arm64-zig-cxx23",
+      "configurePreset": "freebsd-arm64-zig-cxx23"
     },
     {
       "name": "windows-msvc2026-cxx23",
@@ -554,6 +668,56 @@
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23",
+      "configurePreset": "freebsd-clang-cxx23",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-asan",
+      "configurePreset": "freebsd-clang-cxx23-asan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-clang-cxx23-tsan",
+      "configurePreset": "freebsd-clang-cxx23-tsan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "FreeBSD"
+      }
+    },
+    {
+      "name": "freebsd-zig-cxx23",
+      "configurePreset": "freebsd-zig-cxx23",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "freebsd-arm64-zig-cxx23",
+      "configurePreset": "freebsd-arm64-zig-cxx23",
+      "output": {
+        "outputOnFailure": true
       }
     },
     {

@@ -46,8 +46,12 @@
 
 #include "io/uring_backend.hpp"
 #endif
+#if defined(__FreeBSD__)
+#include "io/aio_backend.hpp"
+#endif
 #if defined(_WIN32)
 #include "io/iocp_backend.hpp"
+#include "io/ioring_backend.hpp"
 #endif
 #if defined(__APPLE__)
 #include "io/gcd_backend.hpp"
@@ -390,6 +394,13 @@ TEST_CASE("callbacks run only inside poll") {
         return io_impl::uring_context::file(c, f.path, io_impl::file_open_options{});
       });
 #endif
+#if defined(__FreeBSD__)
+  check_callback_discipline<io_impl::aio_context>(
+      "aio", [&](io_impl::aio_context& c) {
+        return io_impl::aio_context::file(c, f.path,
+                                          io_impl::file_open_options{});
+      });
+#endif
 #if defined(__unix__) || defined(__APPLE__)
   check_callback_discipline<io_impl::pread_context>(
       "pread", [&](io_impl::pread_context& c) {
@@ -400,6 +411,11 @@ TEST_CASE("callbacks run only inside poll") {
   check_callback_discipline<io_impl::iocp_context>(
       "iocp", [&](io_impl::iocp_context& c) {
         return io_impl::iocp_context::file(c, f.path, io_impl::file_open_options{});
+      });
+  check_callback_discipline<io_impl::ioring_context>(
+      "ioring", [&](io_impl::ioring_context& c) {
+        return io_impl::ioring_context::file(c, f.path,
+                                             io_impl::file_open_options{});
       });
 #endif
 #if defined(__APPLE__)
@@ -426,6 +442,15 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
       },
       expect);
 #endif
+#if defined(__FreeBSD__)
+  check_cancel_discipline<io_impl::aio_context>(
+      "aio",
+      [&](io_impl::aio_context& c) {
+        return io_impl::aio_context::file(c, f.path,
+                                          io_impl::file_open_options{});
+      },
+      expect);
+#endif
 #if defined(__unix__) || defined(__APPLE__)
   check_cancel_discipline<io_impl::pread_context>(
       "pread",
@@ -439,6 +464,13 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
       "iocp",
       [&](io_impl::iocp_context& c) {
         return io_impl::iocp_context::file(c, f.path, io_impl::file_open_options{});
+      },
+      expect);
+  check_cancel_discipline<io_impl::ioring_context>(
+      "ioring",
+      [&](io_impl::ioring_context& c) {
+        return io_impl::ioring_context::file(c, f.path,
+                                             io_impl::file_open_options{});
       },
       expect);
 #endif
@@ -526,6 +558,183 @@ TEST_CASE("an IOCP file closed with deferred transfers takes them with it") {
     CHECK(p.calls == 0);
   }
 }
+
+// The IoRing half of the unaligned-length contract: the same question the
+// port answers above, with the same two answers. A buffered overlapped
+// handle takes any length, so none of it is synchronous; a NO_BUFFERING
+// one takes the whole granules and the sub-granule rest finishes on the
+// plain handle, one synchronous piece per such file.
+TEST_CASE("IoRing: an unaligned length rides the ring but for a direct tail") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  constexpr std::size_t len = 2 * 4096 + 100;
+  const auto content = pattern(len, 44);
+  const temp_file f(content);
+  for (const bool direct : {false, true}) {
+    CAPTURE(direct);
+    io_impl::ioring_context ctx({}, 4);
+    io_impl::ioring_context::file file(
+        ctx, f.path, io_impl::file_open_options{.direct_io = direct});
+    MESSAGE("read through " << file.name());
+    const bool on_ring = file.name().starts_with("ioring");
+    const bool bypassing = file.name().find("direct") != std::string_view::npos;
+    std::vector<std::byte> got(len);
+    probe p;
+    io_impl::ioring_context::transfer op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, std::span(got), op);
+    ctx.flush();
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(!p.ec);
+    CHECK(got == content);
+    if (on_ring) {
+      CHECK(ctx.served_synchronously() == (bypassing ? 1u : 0u));
+    }
+  }
+}
+
+// A cancel on the ring is a submission of its own, and its completion
+// carries a userData that belongs to no transfer. Reaped as one it would
+// walk to an operation that does not exist, so it has to be dropped: the
+// cancelled read reports exactly once, the uncancelled one reports once,
+// and no later poll() produces a third callback. The canary is a transfer
+// that was never submitted -- if a sentinel completion were walked as an
+// operation, this is the shape of memory it would land in.
+TEST_CASE("IoRing: the cancel request's completion reports no operation") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const auto content = pattern(256 * 1024, 45);
+  const temp_file f(content);
+  io_impl::ioring_context ctx({}, 4);
+  io_impl::ioring_context::file file(ctx, f.path,
+                                     io_impl::file_open_options{});
+  std::vector<std::byte> a(128 * 1024);
+  std::vector<std::byte> b(128 * 1024);
+  probe pa;
+  probe pb;
+  probe canary;
+  io_impl::ioring_context::transfer op_a{};
+  io_impl::ioring_context::transfer op_b{};
+  io_impl::ioring_context::transfer never{};  // submitted to nothing
+  op_a.done = &probe::on_done;
+  op_a.owner = &pa;
+  op_b.done = &probe::on_done;
+  op_b.owner = &pb;
+  never.done = &probe::on_done;
+  never.owner = &canary;
+
+  ctx.submit_read(file, 0, std::span{a}, op_a);
+  ctx.submit_read(file, a.size(), std::span{b}, op_b);
+  ctx.flush();
+  ctx.cancel(op_a);
+  while (pa.calls + pb.calls < 2) {
+    ctx.poll(true);
+  }
+  CHECK(pa.calls == 1);
+  CHECK(pb.calls == 1);
+  CHECK(ctx.in_flight() == 0);
+  // The cancel's own completion is somewhere in this sweep, and none of
+  // these polls may turn it into a callback.
+  for (int i = 0; i < 8; ++i) {
+    CHECK(ctx.poll(false) == 0);
+  }
+  CHECK(pa.calls == 1);
+  CHECK(pb.calls == 1);
+  CHECK(canary.calls == 0);
+}
+
+// Registered buffers are an option, not a rung the caller can be given
+// without asking, and a ring that refuses the registration has to keep
+// reading. All three answers deliver the same bytes: registration asked
+// for and taken, not asked for at all, and asked for with a region no
+// ring can accept.
+TEST_CASE("IoRing: registration on, off and refused deliver the same bytes") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const auto content = pattern(300 * 1024 + 77, 46);
+  const temp_file f(content);
+  const auto expected = blake3pp::hash(content);
+  for (const bool registered : {false, true}) {
+    CAPTURE(registered);
+    io_impl::polled_reader_engine<io_impl::ioring_context> r(
+        f.path, {.window_bytes = 64 * 1024,
+                 .queue_depth = 2,
+                 .registered_buffers = registered});
+    MESSAGE("reader backend: " << r.backend_name());
+    blake3pp::hasher h;
+    while (auto w = r.next()) {
+      h.update(std::span<const std::byte>{w->data, w->bytes});
+      r.release(*w);
+    }
+    CHECK(h.finalize() == expected);
+  }
+  // A registration the ring cannot take: an empty region describes
+  // nothing. The transfers then name pointers, as every transfer outside
+  // a registered arena does, and the bytes are the same.
+  {
+    io_impl::ioring_context ctx({.registered_buffers = true}, 4);
+    ctx.register_arena({});
+    CHECK(!ctx.arena_registered());
+    io_impl::ioring_context::file file(ctx, f.path,
+                                       io_impl::file_open_options{});
+    std::vector<std::byte> got(content.size());
+    probe p;
+    io_impl::ioring_context::transfer op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, std::span{got}, op);
+    ctx.flush();
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(!p.ec);
+    CHECK(got == content);
+  }
+}
+
+// The reasons a ring could not be had are part of the ladder a tool
+// prints, and the machine that runs this suite is usually one that HAS a
+// ring, so the spellings are asserted on the composer rather than waited
+// for. A Windows 10 host reaches them through name() instead.
+TEST_CASE("IoRing: a refused ring names the reason") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  using refusal = io_impl::ioring_refusal;
+  CHECK(io_impl::no_ioring_suffix(refusal{}).empty());
+  CHECK(io_impl::no_ioring_suffix({refusal::no_api, 0, 0}) ==
+        " [ioring: no api]");
+  CHECK(io_impl::no_ioring_suffix({refusal::old_version, 1, 0}) ==
+        " [ioring: version 1]");
+  CHECK(io_impl::no_ioring_suffix({refusal::create_failed, 0, 0x80070057}) ==
+        " [ioring: CreateIoRing failed 0x80070057]");
+}
+
+// The ring's twin of the case above it: a file closed with transfers it
+// could not hand the ring must take them with it, because they name its
+// handles and its share of the count.
+TEST_CASE("an IoRing file closed with deferred transfers takes them with it") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const std::vector<std::byte> content(64 * 1024 + 100, std::byte{0x5d});
+  const temp_file f(content);
+  for (const bool async : {false, true}) {
+    CAPTURE(async);
+    io_impl::ioring_context ctx({.async = async}, 4);
+    std::array<std::byte, 100> buf{};  // below one NO_BUFFERING granule
+    io_impl::ioring_context::transfer op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    {
+      io_impl::ioring_context::file file(
+          ctx, f.path, io_impl::file_open_options{.direct_io = true});
+      ctx.submit_read(file, 0, std::span{buf}, op);
+      ctx.flush();
+      CHECK(ctx.in_flight() == 1);
+    }
+    CHECK(ctx.in_flight() == 0);
+    CHECK(ctx.poll(false) == 0);
+    CHECK(p.calls == 0);
+  }
+}
 #endif
 
 #if defined(__APPLE__)
@@ -589,6 +798,17 @@ TEST_CASE("a write reports only from poll, and lands what it was given") {
                                            .preallocate_bytes = len});
           });
 #endif
+#if defined(__FreeBSD__)
+      check_write_discipline<io_impl::aio_context>(
+          "aio", out.path, direct, len,
+          [&](io_impl::aio_context& c) {
+            return io_impl::aio_context::file(
+                c, out.path,
+                io_impl::file_open_options{.write = true,
+                                           .direct_io = direct,
+                                           .preallocate_bytes = len});
+          });
+#endif
 #if defined(__unix__) || defined(__APPLE__)
       check_write_discipline<io_impl::pread_context>(
           "pread", out.path, direct, len,
@@ -596,6 +816,17 @@ TEST_CASE("a write reports only from poll, and lands what it was given") {
             return io_impl::pread_context::file(
                 c, out.path,
                 io_impl::file_open_options{.write = true, .direct_io = direct});
+          });
+#endif
+#if defined(_WIN32)
+      check_write_discipline<io_impl::ioring_context>(
+          "ioring", out.path, direct, len,
+          [&](io_impl::ioring_context& c) {
+            return io_impl::ioring_context::file(
+                c, out.path,
+                io_impl::file_open_options{.write = true,
+                                           .direct_io = direct,
+                                           .preallocate_bytes = len});
           });
 #endif
       check_write_discipline<io_impl::stdio_context>(
@@ -619,6 +850,24 @@ TEST_CASE("an empty transfer completes from poll, not as an error") {
     io_impl::uring_context ctx({}, 4);
     io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
     io_impl::uring_context::transfer op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, {}, op);
+    CHECK(p.calls == 0);
+    while (p.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+    CHECK(ctx.in_flight() == 0);
+  }
+#endif
+#if defined(__FreeBSD__)
+  {
+    io_impl::aio_context ctx({}, 4);
+    io_impl::aio_context::file file(ctx, f.path, io_impl::file_open_options{});
+    io_impl::aio_context::transfer op{};
     probe p;
     op.done = &probe::on_done;
     op.owner = &p;
@@ -767,6 +1016,12 @@ TEST_CASE("two files share one context") {
     run(ctx);
   }
 #endif
+#if defined(__FreeBSD__)
+  {
+    io_impl::aio_context ctx({}, 4);
+    run(ctx);
+  }
+#endif
 #if defined(__unix__) || defined(__APPLE__)
   {
     io_impl::pread_context ctx({}, 4);
@@ -776,6 +1031,10 @@ TEST_CASE("two files share one context") {
 #if defined(_WIN32)
   {
     io_impl::iocp_context ctx({}, 4);
+    run(ctx);
+  }
+  {
+    io_impl::ioring_context ctx({}, 4);
     run(ctx);
   }
 #endif
@@ -927,6 +1186,188 @@ TEST_CASE("io_uring: giving up the ring mid-run leaves wake() working") {
 }
 #endif
 
+#if defined(__FreeBSD__)
+// The FreeBSD twin of the io_uring case above. A transfer the engine has
+// taken is counted in in_flight(), and the caller is owed its callback
+// whatever happens next: lio_listio can refuse a list outright (the
+// per-process AIO queue full, or closed), and the requests it refused
+// have to reach their callback another way, or in_flight() never comes
+// down and a blocking poll never returns. A working kernel cannot be
+// asked to refuse, so the recovery step is driven directly.
+TEST_CASE("aio: transfers the kernel would not take are served by poll()") {
+  constexpr std::size_t len = 16 * 1024;
+  const auto content = pattern(len, 41);
+  const temp_file f(content);
+
+  io_impl::aio_context ctx({}, 4);
+  io_impl::aio_context::file file(ctx, f.path, io_impl::file_open_options{});
+
+  std::vector<std::byte> got_a(len / 2);
+  std::vector<std::byte> got_b(len / 2);
+  probe pa;
+  probe pb;
+  io_impl::aio_context::transfer a{};
+  io_impl::aio_context::transfer b{};
+  a.done = &probe::on_done;
+  a.owner = &pa;
+  b.done = &probe::on_done;
+  b.owner = &pb;
+  ctx.submit_read(file, 0, std::span(got_a), a);
+  ctx.submit_read(file, len / 2, std::span(got_b), b);
+  CHECK(ctx.in_flight() == 2);
+
+  // What a refused lio_listio leaves behind, without one.
+  ctx.defer_pending();
+  CHECK(pa.calls == 0);
+  CHECK(pb.calls == 0);
+  CHECK(ctx.in_flight() == 2);
+
+  // One deferred transfer per poll, on the caller's thread, same as
+  // every other transfer this backend cannot queue.
+  std::size_t polls = 0;
+  while (pa.calls + pb.calls < 2) {
+    ctx.poll(true);
+    ++polls;
+    REQUIRE(polls < 8);
+  }
+  CHECK(!pa.ec);
+  CHECK(!pb.ec);
+  CHECK(ctx.in_flight() == 0);
+  CHECK(ctx.served_synchronously() == 2);
+  CHECK(std::equal(got_a.begin(), got_a.end(), content.begin()));
+  CHECK(std::equal(got_b.begin(), got_b.end(), content.begin() + len / 2));
+}
+
+// A length that is not a multiple of the direct-I/O granule is the last
+// read of almost every real file, and the whole read of a small one. It
+// rides the AIO queue in both directions: on the plain descriptor for a
+// buffered file, and for a direct one as the whole granules on the
+// direct descriptor followed by the rest on the plain one. None of it
+// reaches the synchronous path, which costs one device round trip per
+// poll().
+TEST_CASE("aio: an unaligned length rides the queue, buffered or direct") {
+  constexpr std::size_t len = 2 * 4096 + 100;
+  const auto content = pattern(len, 43);
+  for (const bool direct : {false, true}) {
+    CAPTURE(direct);
+    const temp_file f(content);
+    io_impl::aio_context ctx({}, 4);
+    if (!ctx.using_aio()) {
+      MESSAGE("no kernel AIO here (" << ctx.refusal() << "); nothing to check");
+      return;
+    }
+    {
+      io_impl::aio_context::file file(
+          ctx, f.path, io_impl::file_open_options{.direct_io = direct});
+      MESSAGE("read through " << file.name());
+      std::vector<std::byte> got(len);
+      probe p;
+      io_impl::aio_context::transfer op{};
+      op.done = &probe::on_done;
+      op.owner = &p;
+      ctx.submit_read(file, 0, std::span(got), op);
+      ctx.flush();
+      while (p.calls == 0) {
+        ctx.poll(true);
+      }
+      CHECK(!p.ec);
+      CHECK(got == content);
+      CHECK(ctx.served_synchronously() == 0);
+    }
+    // The write twin: the same shape lands through the same descriptors.
+    const temp_file w({});
+    {
+      io_impl::aio_context::file file(
+          ctx, w.path,
+          io_impl::file_open_options{.write = true, .direct_io = direct});
+      probe p;
+      io_impl::aio_context::transfer op{};
+      op.done = &probe::on_done;
+      op.owner = &p;
+      ctx.submit_write(file, 0, std::span<const std::byte>{content}, op);
+      ctx.flush();
+      while (p.calls == 0) {
+        ctx.poll(true);
+      }
+      CHECK(!p.ec);
+      CHECK(ctx.served_synchronously() == 0);
+      file.set_size(len);
+    }
+    std::ifstream in(w.path, std::ios::binary);
+    std::vector<char> landed((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+    REQUIRE(landed.size() == len);
+    CHECK(std::memcmp(landed.data(), content.data(), len) == 0);
+  }
+}
+
+// A file closed with transfers it could not hand to the kernel -- no AIO
+// at all, or a request the queue refused -- has to take them with it:
+// they name its descriptors and its share of the count.
+TEST_CASE("an aio file closed with deferred transfers takes them with it") {
+  const std::vector<std::byte> content(64 * 1024 + 100, std::byte{0x5e});
+  const temp_file f(content);
+  for (const bool async : {false, true}) {
+    CAPTURE(async);
+    io_impl::aio_context ctx({.async = async}, 4);
+    std::array<std::byte, 100> buf{};
+    io_impl::aio_context::transfer op{};
+    probe p;
+    op.done = &probe::on_done;
+    op.owner = &p;
+    {
+      io_impl::aio_context::file file(
+          ctx, f.path, io_impl::file_open_options{.direct_io = true});
+      ctx.submit_read(file, 0, std::span{buf}, op);
+      ctx.flush();
+      CHECK(ctx.in_flight() == 1);
+    }
+    CHECK(ctx.in_flight() == 0);
+    CHECK(ctx.poll(false) == 0);
+    CHECK(p.calls == 0);
+  }
+}
+
+// The per-process AIO queue bounds how many requests the kernel will
+// hold, and the context cuts each lio_listio batch to what is still free
+// rather than letting the kernel refuse one. A queue depth past the
+// limit therefore still completes, just with fewer requests out at once
+// -- which is the shape a host with vfs.aio.max_aio_queue_per_proc
+// lowered under the engine's depth has.
+TEST_CASE("aio: more transfers than the kernel queue holds still complete") {
+  constexpr std::size_t len = 4096;
+  constexpr unsigned count = 64;
+  const auto content = pattern(len * count, 47);
+  const temp_file f(content);
+  io_impl::aio_context ctx({}, 4);
+  io_impl::aio_context::file file(ctx, f.path, io_impl::file_open_options{});
+  std::vector<std::byte> got(len * count);
+  std::vector<probe> probes(count);
+  std::vector<io_impl::aio_context::transfer> ops(count);
+  for (unsigned i = 0; i < count; ++i) {
+    ops[i].done = &probe::on_done;
+    ops[i].owner = &probes[i];
+    ctx.submit_read(file, std::uint64_t{i} * len,
+                    std::span(got).subspan(std::size_t{i} * len, len), ops[i]);
+  }
+  CHECK(ctx.in_flight() == count);
+  std::size_t done = 0;
+  while (done < count) {
+    ctx.poll(true);
+    done = 0;
+    for (const auto& p : probes) {
+      done += static_cast<std::size_t>(p.calls);
+    }
+  }
+  for (const auto& p : probes) {
+    CHECK(p.calls == 1);
+    CHECK(!p.ec);
+  }
+  CHECK(ctx.in_flight() == 0);
+  CHECK(got == content);
+}
+#endif
+
 TEST_CASE("wake() releases a blocked poll from another thread") {
   const auto check = [](auto& ctx) {
     std::atomic<bool> entered{false};
@@ -952,6 +1393,12 @@ TEST_CASE("wake() releases a blocked poll from another thread") {
     check(ctx);
   }
 #endif
+#if defined(__FreeBSD__)
+  {
+    io_impl::aio_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
 #if defined(__unix__) || defined(__APPLE__)
   {
     io_impl::pread_context ctx({}, 4);
@@ -963,6 +1410,10 @@ TEST_CASE("wake() releases a blocked poll from another thread") {
     io_impl::iocp_context ctx({}, 4);
     check(ctx);
   }
+  {
+    io_impl::ioring_context ctx({}, 4);
+    check(ctx);
+  }
 #endif
 #if defined(__APPLE__)
   {
@@ -972,7 +1423,8 @@ TEST_CASE("wake() releases a blocked poll from another thread") {
 #endif
 }
 
-#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)
+#if defined(__linux__) || defined(_WIN32) || defined(__APPLE__) || \
+    defined(__FreeBSD__)
 // The destructor drains without completing anything into the caller's
 // hands: the pool outlives the context here, so a callback running from
 // teardown would be visible, and so would a kernel write into freed
@@ -982,6 +1434,8 @@ TEST_CASE("a context destroyed with reads in flight runs no callback") {
   using ctx_type = io_impl::uring_context;
 #elif defined(_WIN32)
   using ctx_type = io_impl::iocp_context;
+#elif defined(__FreeBSD__)
+  using ctx_type = io_impl::aio_context;
 #else
   using ctx_type = io_impl::gcd_context;
 #endif
@@ -1054,11 +1508,24 @@ TEST_CASE("drain() reaps owed reads without a callback and keeps the context usa
     io_impl::iocp_context::file file(ctx, f.path, io_impl::file_open_options{});
     check(ctx, file, file.name());
   }
+  {
+    io_impl::ioring_context ctx({}, 4);
+    io_impl::ioring_context::file file(ctx, f.path,
+                                       io_impl::file_open_options{});
+    check(ctx, file, file.name());
+  }
 #endif
 #if defined(__APPLE__)
   {
     io_impl::gcd_context ctx({}, 4);
     io_impl::gcd_context::file file(ctx, f.path, io_impl::file_open_options{});
+    check(ctx, file, file.name());
+  }
+#endif
+#if defined(__FreeBSD__)
+  {
+    io_impl::aio_context ctx({}, 4);
+    io_impl::aio_context::file file(ctx, f.path, io_impl::file_open_options{});
     check(ctx, file, file.name());
   }
 #endif
@@ -1094,12 +1561,18 @@ TEST_CASE("a context destroyed with a wake pending tears down cleanly") {
   check([] { return std::make_unique<io_impl::uring_context>(
                  io_impl::reader_context_options{}, 4u); });
 #endif
+#if defined(__FreeBSD__)
+  check([] { return std::make_unique<io_impl::aio_context>(
+                 io_impl::reader_context_options{}, 4u); });
+#endif
 #if defined(__unix__) || defined(__APPLE__)
   check([] { return std::make_unique<io_impl::pread_context>(
                  io_impl::reader_context_options{}, 4u); });
 #endif
 #if defined(_WIN32)
   check([] { return std::make_unique<io_impl::iocp_context>(
+                 io_impl::reader_context_options{}, 4u); });
+  check([] { return std::make_unique<io_impl::ioring_context>(
                  io_impl::reader_context_options{}, 4u); });
 #endif
 #if defined(__APPLE__)
@@ -1116,6 +1589,8 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
     bool async;
     bool offload;
     std::string name;
+    // Windows only: which of the two completion mechanisms was asked for.
+    bool ioring = true;
   };
   std::vector<row> rows;
 #if defined(__linux__)
@@ -1147,6 +1622,42 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
             {false, true, true, "pread" + why},
             {false, false, true, "pread"}};
   }
+#elif defined(__FreeBSD__)
+  // Two independent questions, probed once each. Whether the machine has
+  // AIO and a kqueue is a property of the host (the administrator can
+  // close the per-process AIO queue), and the fallback name carries the
+  // reason. Whether O_DIRECT is SERVED is a property of the filesystem
+  // the temporary file landed on, which is what the backend's own
+  // one-page probe answers at open: UFS takes it, a ZFS dataset whose
+  // `direct` property forbids this shape answers EINVAL and the file
+  // degrades to buffered with the suffix. Both spellings are the
+  // ladder's; which one applies here is not the platform's to say.
+  const io_impl::aio_context aio_probe(io_impl::reader_context_options{}, 4);
+  if (aio_probe.using_aio()) {
+    std::string direct_rung;
+    {
+      io_impl::aio_context c(io_impl::reader_context_options{}, 2);
+      const io_impl::aio_context::file probe_file(
+          c, f.path, io_impl::file_open_options{.direct_io = true});
+      direct_rung = std::string(probe_file.name());
+    }
+    CAPTURE(direct_rung);
+    CHECK((direct_rung == "aio+direct" ||
+           direct_rung == "aio [direct: EINVAL]"));
+    rows = {{true, true, true, direct_rung},
+            {false, true, true, "aio"},
+            {true, false, true, "pread+direct"},
+            {false, false, true, "pread"}};
+  } else {
+    const std::string why(aio_probe.refusal());
+    MESSAGE("no kernel AIO here" << why << ": testing the fallback ladder");
+    // async requested and refused carries the reason; not requested at
+    // all says nothing, which is the distinction the suffix exists for.
+    rows = {{true, true, true, "pread+direct" + why},
+            {true, false, true, "pread+direct"},
+            {false, true, true, "pread" + why},
+            {false, false, true, "pread"}};
+  }
 #elif defined(__APPLE__)
   // F_NOCACHE is per-fd and tolerates any alignment, so there is no
   // unaligned-tail rung: the ladder is GCD or not, cache or not.
@@ -1155,12 +1666,31 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
           {true, false, true, "pread+nocache"},
           {false, false, true, "pread"}};
 #elif defined(_WIN32)
-  // NO_BUFFERING and the port are per-open flags, so the ladder is the
-  // same shape: what engaged, and what it fell back to.
-  rows = {{true, true, true, "iocp+direct"},
-          {false, true, true, "iocp"},
-          {true, false, true, "readfile+direct"},
-          {false, false, true, "readfile"}};
+  // NO_BUFFERING and the overlapped handle are per-open flags, so the
+  // ladder is the same shape whichever mechanism carried it: what
+  // engaged, and what it fell back to. Which of the two is available is a
+  // property of the machine rather than of the platform -- Windows 10 and
+  // some virtual images have no ring -- so it is probed once and the
+  // ladder that actually applies here is the one expected.
+  const io_impl::ioring_context probe(io_impl::reader_context_options{}, 4);
+  if (probe.using_ring()) {
+    rows = {{true, true, true, "ioring+direct", true},
+            {false, true, true, "ioring", true},
+            {true, true, true, "iocp+direct", false},
+            {false, true, true, "iocp", false},
+            {true, false, true, "readfile+direct", true},
+            {false, false, true, "readfile", true}};
+  } else {
+    // The port carries the reason the ring was refused, so a run on
+    // such a machine reads as what it is rather than as one that never
+    // asked.
+    const std::string why = io_impl::no_ioring_suffix(probe.refusal());
+    MESSAGE("no I/O ring here (" << why << "): testing the port's ladder");
+    rows = {{true, true, true, "iocp+direct" + why, true},
+            {false, true, true, "iocp" + why, true},
+            {true, false, true, "readfile+direct", true},
+            {false, false, true, "readfile", true}};
+  }
 #else
   rows = {{false, false, true, ""}};
 #endif
@@ -1174,7 +1704,8 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
                  .queue_depth = 2,
                  .direct_io = r.direct,
                  .async = r.async,
-                 .offload_submit = r.offload});
+                 .offload_submit = r.offload,
+                 .ioring = r.ioring});
     CHECK(reader.backend() == r.name);
     // And the data is the same however it degraded.
     std::vector<std::byte> out;
@@ -1223,6 +1754,15 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
     });
   }
 #endif
+#if defined(__FreeBSD__)
+  {
+    io_impl::aio_context ctx({}, 4);
+    check(ctx, [&](io_impl::aio_context& c) {
+      return io_impl::aio_context::file(c, f.path,
+                                        io_impl::file_open_options{});
+    });
+  }
+#endif
 #if defined(__APPLE__)
   {
     io_impl::gcd_context ctx({}, 4);
@@ -1236,6 +1776,13 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
     io_impl::iocp_context ctx({}, 4);
     check(ctx, [&](io_impl::iocp_context& c) {
       return io_impl::iocp_context::file(c, f.path, io_impl::file_open_options{});
+    });
+  }
+  {
+    io_impl::ioring_context ctx({}, 4);
+    check(ctx, [&](io_impl::ioring_context& c) {
+      return io_impl::ioring_context::file(c, f.path,
+                                           io_impl::file_open_options{});
     });
   }
 #endif

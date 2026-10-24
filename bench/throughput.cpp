@@ -1013,22 +1013,22 @@ int main(int argc, char** argv) {
   // Pass 0 is the uncounted warmup, and the cooldown idles between passes
   // rather than between rows, as in the single-thread loop above.
   {
-    std::vector<par_row*> flat;
+    std::vector<par_row*> par_flat;
     for (par_row& r : par_rows) {
       if (r.fn) {
-        flat.push_back(&r);
+        par_flat.push_back(&r);
       }
     }
-    const bool progress = stderr_is_tty();
-    for (int pass = 0; pass <= reps && !flat.empty(); ++pass) {
+    for (int pass = 0; pass <= reps && !par_flat.empty(); ++pass) {
       cooldown();
       if (progress) {
         b3tool::print(stderr, "\r[parallel pass {}/{}{}] ", pass + 1, reps + 1,
                       pass == 0 ? ", warmup" : "");
         std::fflush(stderr);
       }
-      for (std::size_t i = 0; i < flat.size(); ++i) {
-        par_row& r = *flat[(i + static_cast<std::size_t>(pass)) % flat.size()];
+      for (std::size_t i = 0; i < par_flat.size(); ++i) {
+        par_row& r =
+            *par_flat[(i + static_cast<std::size_t>(pass)) % par_flat.size()];
         const auto t0 = std::chrono::steady_clock::now();
         r.d = r.fn();
         const auto t1 = std::chrono::steady_clock::now();

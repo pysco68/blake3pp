@@ -3,13 +3,12 @@
 /// @file
 /// File hashing at storage speed: the windowed pipeline that joins the
 /// file_reader to the compute engine. The reader uses io_uring +
-/// O_DIRECT, IOCP + NO_BUFFERING, or GCD + F_NOCACHE, whatever the
-/// platform allows.
+/// O_DIRECT, the I/O ring or IOCP + NO_BUFFERING, GCD + F_NOCACHE, or
+/// POSIX AIO + O_DIRECT, whatever the platform allows.
 ///
 /// While window i is being hashed, windows i+1..i+depth-1 are already
 /// streaming in. The queue-depth buffer ring is the backpressure
-/// mechanism, so the pipeline never allocates past setup, and never lets
-/// the device idle waiting for compute or the other way round.
+/// mechanism, so the pipeline allocates nothing past setup.
 ///
 /// The primitive is `update_file()`, which is `hasher::update()` with a file
 /// as the source. It streams into a caller-owned hasher and returns.
@@ -83,6 +82,16 @@ struct file_io_options {
   /// reported after the fact: read_backend(trace.driver()) for a read,
   /// write_report::backend for a write.
   bool async = true;
+  /// Windows: prefer the I/O ring (Windows 11, `ioringapi.h`) over the
+  /// completion port where the machine has one. Off selects the port,
+  /// which is also what a machine without a ring gets; the engaged rung
+  /// is reported after the fact and names which one ran.
+  bool ioring = true;
+  /// Windows I/O ring: register the window arena and the file handle with
+  /// the ring, so a transfer names a region index and a table slot
+  /// instead of a pointer and a HANDLE. Off by default, and silently
+  /// ignored where the ring refuses it or where no ring is in use.
+  bool registered_buffers = false;
   /// Where to record per-window timing (<blake3pp/trace.hpp>); nullptr
   /// records nothing, at the cost of one branch per window.
   ///
@@ -187,6 +196,12 @@ struct hash_file_options {
   /// Queue reads asynchronously where the platform offers it; see
   /// file_io_options.
   bool async = true;
+  /// Windows: prefer the I/O ring over the completion port; see
+  /// file_io_options.
+  bool ioring = true;
+  /// Windows I/O ring: register the arena and the file handle; see
+  /// file_io_options.
+  bool registered_buffers = false;
   /// Plain, keyed or key-derivation mode: `hash_mode::keyed(key)` or
   /// `hash_mode::derive_key(context)`, named as hasher spells them.
   ///
@@ -206,6 +221,8 @@ struct hash_file_options {
             .direct_io = direct_io,
             .offload_submit = offload_submit,
             .async = async,
+            .ioring = ioring,
+            .registered_buffers = registered_buffers,
             .trace = trace};
   }
 };
@@ -377,6 +394,39 @@ struct file_write_options {
   bool async = true;
   /// io_uring: issue on io-wq rather than inline in the submit call.
   bool offload_submit = true;
+  /// Windows: prefer the I/O ring (Windows 11, `ioringapi.h`) over the
+  /// completion port where the machine has one. Off selects the port,
+  /// which is also what a machine without a ring gets; the engaged rung
+  /// is reported after the fact and names which one ran.
+  bool ioring = true;
+  /// Windows I/O ring: register the window arena and the file handle with
+  /// the ring, so a transfer names a region index and a table slot
+  /// instead of a pointer and a HANDLE. Off by default, and silently
+  /// ignored where the ring refuses it or where no ring is in use.
+  bool registered_buffers = false;
+  /// Windows only: set the valid data length up front instead of making
+  /// the file sparse.
+  ///
+  /// NTFS zeroes every byte between a file's valid data length and a
+  /// write that lands beyond it, so that no reader sees the blocks a
+  /// deleted file left there; with several writes in flight that zeroing
+  /// is most of the write's cost. By default the writer makes the file
+  /// sparse for the duration of the run, which turns those gaps into holes
+  /// (read as zeros, nothing exposed), and clears the flag once the file is
+  /// complete. A run that fails leaves a sparse file with holes.
+  ///
+  /// This flag sets the valid data length to the preallocation up front
+  /// (SetFileValidData), which is faster still. It needs
+  /// SeManageVolumePrivilege, which the request enables on the PROCESS
+  /// token, and until the writes land the file exposes whatever its disk
+  /// blocks held before. Where the privilege is not held, the sparse route
+  /// is taken as if the flag were off.
+  ///
+  /// write_report::backend says which route ran: "+validdata", "+sparse",
+  /// or neither where the file system refused sparse files too. Unix
+  /// preallocates unwritten extents that read as zeros, and ignores the
+  /// flag.
+  bool waive_zero_fill = false;
   // No trace field, unlike file_io_options: the write pipeline keeps no
   // per-window records, so there would be nothing to record into.
 };
@@ -389,11 +439,13 @@ struct write_report {
   /// Which mechanism carried them, as the writer names it: the engine
   /// ("io_uring", "iocp", "gcd-write", or the synchronous "pwrite",
   /// "writefile", "stdio"), plus "+direct" or "+nocache" where the cache
-  /// bypass engaged; then " (inline submit)" where offload_submit was off,
-  /// and the reason where an asynchronous rung was asked for and refused.
-  /// So "io_uring+direct", "pwrite+direct [io_uring: ENOSYS, kernel too
-  /// old]", and so on. Owned by the report, because the writer that
-  /// composed it is gone by then.
+  /// bypass engaged; on Windows "+sparse" or "+validdata" for how the
+  /// preallocation was kept from zeroing ahead of the writes (see
+  /// file_write_options::waive_zero_fill); then " (inline submit)" where
+  /// offload_submit was off, and the reason where an asynchronous rung
+  /// was asked for and refused. So "io_uring+direct", "iocp+direct+sparse",
+  /// "pwrite+direct [io_uring: ENOSYS, kernel too old]", and so on. Owned
+  /// by the report, because the writer that composed it is gone by then.
   std::string backend;
 };
 
@@ -416,7 +468,10 @@ write_report write_sequential(const std::filesystem::path& path,
                       .direct_io = opts.direct_io,
                       .async = opts.async,
                       .offload_submit = opts.offload_submit,
-                      .preallocate_bytes = preallocate});
+                      .ioring = opts.ioring,
+                      .registered_buffers = opts.registered_buffers,
+                      .preallocate_bytes = preallocate,
+                      .waive_zero_fill = opts.waive_zero_fill});
   std::uint64_t done = 0;
   for (;;) {
     file_writer::buffer b = writer.acquire();

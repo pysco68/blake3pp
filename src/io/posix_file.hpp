@@ -66,6 +66,11 @@ struct posix_file {
 #endif
   }
 
+  // Gives up the O_DIRECT reopen, leaving the plain descriptor as the
+  // only one: for a backend that PROBES the descriptor at open and finds
+  // the filesystem will not serve it (FreeBSD's ZFS answers EINVAL).
+  void drop_direct() noexcept { direct_.reset(); }
+
   // Picks the fd for a synchronous positional transfer: direct only when
   // engaged AND the length keeps O_DIRECT's alignment contract.
   [[nodiscard]] int sync_fd(std::size_t len) const noexcept {

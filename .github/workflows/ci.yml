@@ -15,6 +15,23 @@
 # extra job for the windows-11-arm runners). macOS runs the appleclang
 # preset natively on the Apple-silicon macos-15 runners.
 #
+# FreeBSD is the one target OS that cannot be emulated at the process
+# level: no qemu-user persona serves a FreeBSD userland, so both FreeBSD
+# lanes cross-compile with zig in the toolchain-zig image and then boot
+# a whole FreeBSD under qemu on the runner to execute the result.
+# `freebsd-build` + `freebsd-test` do that for amd64 under KVM;
+# `freebsd-arm64-build` + `freebsd-arm64-test` do it for arm64 under
+# TCG, because no GitHub runner can KVM an aarch64 guest -- KVM
+# virtualises, it does not translate, and there is no arm64 runner with
+# /dev/kvm to translate on. TCG costs that lane about two minutes to
+# boot and a hundred seconds for the suite, which is why it is an
+# every-push lane like the ppc64le and s390x emulator lanes rather than
+# a gated one. Both guest images are published by toolchains.yml like
+# any other image, so the lanes pull versioned guests rather than
+# building them. Both ship: release.yml packages
+# blake3pp-<version>-freebsd-{amd64,arm64} from these binaries, the only
+# archives in the set that are dynamically linked.
+#
 # Every platform that runs natively also runs the FULL bench, one rep
 # (--reps 1 --cooldown 0), and uploads a bench-report-* artifact
 # (silicon identity, dispatch verdict, all rows) which release.yml folds
@@ -527,6 +544,11 @@ jobs:
           # emulator-tested here and flagged as such in the notes.
           - { preset: linux-ppc64le-zigmusl-cxx23-static, image: zig, artifact: ppc64le }
           - { preset: linux-s390x-zigmusl-cxx23-static, image: zig, artifact: s390x }
+          # LoongArch static musl, EMULATOR-ONLY: qemu-loongarch64 runs
+          # the whole suite at three capability levels (both vector
+          # units, LSX only, none; see tools/ci-test.sh), and no
+          # LoongArch silicon is reachable to run it on.
+          - { preset: linux-loongarch64-zigmusl-cxx23-static, image: zig, artifact: loongarch64 }
           # MIPS static: GCC rather than zig, because clang's MIPS backend
           # emits no MSA from the kernel's vector code (measured: zero
           # against GCC's 3514). Static glibc rather than musl for the same
@@ -611,6 +633,595 @@ jobs:
           name: xthead-verify
           retention-days: 3
           path: build/xthead-verify/xthead_verify
+
+  # FreeBSD amd64, cross-built here and RUN in a qemu guest in the job
+  # below. The only lane in this file whose target OS cannot be
+  # emulated at the process level: there is no qemu-user persona for a
+  # FreeBSD userland the way there is for aarch64 or riscv64 Linux, so
+  # a whole machine is the smallest unit that can execute these bytes.
+  #
+  # The build half is the `binaries` job with one preset and no ctest.
+  # ctest is skipped rather than configured away because the toolchain
+  # leaves CMAKE_CROSSCOMPILING_EMULATOR empty on purpose (see
+  # cmake/toolchains/freebsd-zig-cxx23/): nothing here can run the
+  # tests, the guest below can, and a ctest that silently ran zero
+  # tests would look exactly like a ctest that passed.
+  #
+  # zig links this target DYNAMICALLY and will not do otherwise ("libc
+  # of the specified target requires dynamic linking"), so unlike the
+  # musl legs these binaries are not self-contained; the ABI version in
+  # the triple, FreeBSD 14.0, is what they require of the guest.
+  freebsd-build:
+    name: freebsd-zig-cxx23 (cross build)
+    needs: [changes, images, environments]
+    if: ${{ !cancelled() && needs.environments.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ needs.changes.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    # The image's /bin/sh is dash, and these steps are written for bash.
+    defaults:
+      run:
+        shell: bash
+    env:
+      CMAKE_GENERATOR: Ninja
+      # The build driver (see the header) and cmake-re's process settings.
+      BLAKE3PP_CMAKE_RE: ${{ needs.changes.outputs.driver == 'cmake-re' && '1' || '0' }}
+      BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
+      TIPI_DISTRO_MODE: none
+      TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      # tipi's own build cache needs a tipi.build account this CI has
+      # not got, so every run ends in a failed upload. Read what is
+      # there, publish nothing.
+      TIPI_CACHE_CONSUME_ONLY: "ON"
+      TIPI_CACHE_FORCE_ENABLE: "OFF"
+      USER: runner
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-workspace
+        with:
+          cache-prefix: hfc-src2-linux-
+      - uses: ./.github/actions/setup-cmake-re
+        if: needs.changes.outputs.driver == 'cmake-re'
+        with:
+          preset: freebsd-zig-cxx23
+          image-tag: ${{ needs.changes.outputs.tag }}
+          rbe-service: ${{ secrets.RBE_SERVICE }}
+          rbe-tls-client-auth-key: ${{ secrets.RBE_TLS_CLIENT_AUTH_KEY }}
+          rbe-tls-client-auth-cert: ${{ secrets.RBE_TLS_CLIENT_AUTH_CERT }}
+          env-registry: ${{ vars.BLAKE3PP_RBE_ENV_REGISTRY }}
+          distributed: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' }}
+
+      # The same two driver branches tools/ci-test.sh has, inline
+      # because this lane wants its configure_and_build and not the
+      # emulator matrix that follows it there.
+      - name: Configure and build (cross, no ctest)
+        run: |
+          set -euo pipefail
+          preset=freebsd-zig-cxx23
+          if [ "${BLAKE3PP_CMAKE_RE}" = 1 ]; then
+            flags=${BLAKE3PP_CMAKE_RE_FLAGS:---host}
+            read -r -a args <<< "$(python3 tools/preset-args.py "${preset}")"
+            # shellcheck disable=SC2086  # one flag per word, on purpose
+            cmake-re ${flags} -S . "${args[@]}"
+            cmake-re --build "build/${preset}" ${flags} -j"$(nproc)"
+          else
+            cmake --preset "${preset}"
+            cmake --build "build/${preset}" -j"$(nproc)"
+          fi
+          file build/${preset}/cli/blake3ppsum
+
+      # Before the upload, because 189 MB of debug info has to cross the
+      # artifact store AND then the ssh pipe into the guest; stripped,
+      # the same five binaries are under 10 MB. Same candidate loop as
+      # the release job's packaging step, with plain GNU strip as the
+      # last resort: the target is x86_64 ELF carrying a FreeBSD OSABI
+      # byte, which BFD strips without caring which kernel it is for.
+      # zig ships no stripper of its own (`zig objcopy --strip-all`
+      # answers "unimplemented" on 0.17), which is why the zig image
+      # installs binutils.
+      - name: Strip the FreeBSD binaries
+        run: |
+          set -euo pipefail
+          STRIP=""
+          for c in llvm-strip llvm-strip-22 llvm-strip-20 llvm-strip-19 llvm-strip-18 strip; do
+            if command -v "$c" > /dev/null 2>&1; then STRIP="$c"; break; fi
+          done
+          [ -n "$STRIP" ] || { echo "::error::no stripper in the zig image"; exit 1; }
+          echo "stripping with ${STRIP}"
+          d=build/freebsd-zig-cxx23
+          "$STRIP" "$d"/tests/blake3pp_tests "$d"/cli/blake3ppsum "$d"/cli/blake3ppgen \
+                   "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file
+          ls -l "$d"/tests/blake3pp_tests "$d"/cli/blake3ppsum "$d"/cli/blake3ppgen \
+                "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file
+
+      - name: Upload FreeBSD binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-binaries-amd64
+          retention-days: 3
+          path: |
+            build/freebsd-zig-cxx23/tests/blake3pp_tests
+            build/freebsd-zig-cxx23/cli/blake3ppsum
+            build/freebsd-zig-cxx23/cli/blake3ppgen
+            build/freebsd-zig-cxx23/bench/blake3pp_bench
+            build/freebsd-zig-cxx23/bench/blake3pp_bench_file
+
+  # The other half: boot a real FreeBSD and run the bytes the job above
+  # produced. The guest image is NOT built here. It is prepared once by
+  # toolchains.yml (tools/freebsd-guest.sh prepare, which boots a stock
+  # release image under KVM and lets FreeBSD configure its own UFS
+  # root, because Linux cannot write UFS) and published to GHCR as
+  # toolchain-freebsd-guest at the same content tag as every other
+  # image in this run. So this job pulls a fixed, versioned guest
+  # rather than rebuilding one, and the rebuild happens exactly when
+  # tools/freebsd-guest.sh or the pinned release changes, since both
+  # feed tools/toolchain-image-tag.sh.
+  #
+  # It runs on the HOST runner and not in that image: it needs /dev/kvm
+  # for the guest and nbd plus mount on the host to hand the guest this
+  # run's ssh key, none of which a job container has. The image is a
+  # transport; `docker cp` takes the qcow2 out of it.
+  #
+  # What this proves that no other lane does: the POSIX-AIO-on-a-kqueue
+  # engine and FreeBSD's O_DIRECT, on a real FreeBSD kernel, against
+  # binaries built by a Linux container. Everything else about the
+  # library is already covered; this is the I/O backend's only
+  # non-emulated home.
+  freebsd-test:
+    name: freebsd-amd64 test+bench (qemu guest)
+    needs: [changes, freebsd-build]
+    # Same load-bearing pattern as neoverse-test-bench: the status
+    # function breaks the transitive skip-poisoning from the (almost
+    # always skipped) images job, which the implicit success() would
+    # otherwise let veto this job despite a green direct need.
+    if: ${{ !cancelled() && needs.freebsd-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      # GitHub's x64 runners expose /dev/kvm, but the runner user is not
+      # in the group that may open it. Without this the guest falls back
+      # to TCG, where the test binary takes minutes instead of seconds
+      # and the bench numbers mean nothing.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0660", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -aG kvm "$USER"
+          ls -l /dev/kvm
+      - name: Install qemu and the nbd tools
+        run: |
+          sudo apt-get update
+          # No ovmf and no xz here: both belong to `prepare`, which ran
+          # in toolchains.yml. This job boots an already-prepared image
+          # under plain BIOS and reads it straight out of the qcow2,
+          # whose compression is internal.
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils
+          sudo modprobe nbd max_part=16
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch the prepared guest image
+        env:
+          GUEST_IMAGE: ghcr.io/${{ github.repository }}/toolchain-freebsd-guest:${{ needs.changes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/freebsd-guest
+          t0=$(date +%s)
+          docker pull "${GUEST_IMAGE}"
+          echo "pull took $(( $(date +%s) - t0 ))s"
+          # FROM scratch, so there is nothing to run in it; a container
+          # is created only so that docker cp has something to copy out
+          # of, and removed immediately.
+          cid=$(docker create "${GUEST_IMAGE}" /nonexistent)
+          docker cp "${cid}:/freebsd-guest.qcow2" build/freebsd-guest/freebsd-guest.qcow2
+          docker rm "${cid}" > /dev/null
+          ls -lh build/freebsd-guest/freebsd-guest.qcow2
+          qemu-img info build/freebsd-guest/freebsd-guest.qcow2
+      - uses: actions/download-artifact@v8
+        with:
+          name: freebsd-binaries-amd64
+          path: freebsd-bin
+
+      - name: Boot the guest
+        run: |
+          chmod +x freebsd-bin/tests/* freebsd-bin/cli/* freebsd-bin/bench/*
+          sg kvm -c 'bash tools/freebsd-guest.sh start'
+          sg kvm -c 'bash tools/freebsd-guest.sh wait'
+      - name: What FreeBSD is this really
+        run: |
+          bash tools/freebsd-guest.sh run 'uname -a; sysctl -n hw.model hw.ncpu; df -h /'
+      # Through `run`'s stdin rather than scp, so there is one ssh
+      # configuration in this lane and not two.
+      - name: Copy the binaries into the guest
+        run: |
+          tar cf - -C freebsd-bin . \
+            | bash tools/freebsd-guest.sh run 'mkdir -p /root/b3 && tar xf - -C /root/b3 && chmod -R +x /root/b3 && ls -lR /root/b3'
+      - name: Test on a real FreeBSD kernel
+        run: bash tools/freebsd-guest.sh run 'cd /root/b3 && ./tests/blake3pp_tests'
+
+      # The digest is the invariant; the I/O rungs are the variable. If
+      # the AIO-on-kqueue reader, the O_DIRECT path, the synchronous
+      # fallback and the single-threaded path ever disagree, one of them
+      # is losing or reordering bytes, and that is a defect no unit test
+      # on Linux can find.
+      - name: Every I/O rung agrees on the digest
+        run: |
+          bash tools/freebsd-guest.sh run 'set -eu
+            cd /root/b3
+            ./cli/blake3ppgen --seed blake3pp-ci --length 256M --output /root/sample.bin
+            a=$(./cli/blake3ppsum             /root/sample.bin | cut -d" " -f1)
+            b=$(./cli/blake3ppsum --no-async  /root/sample.bin | cut -d" " -f1)
+            c=$(./cli/blake3ppsum --no-direct /root/sample.bin | cut -d" " -f1)
+            d=$(./cli/blake3ppsum --threads 1 /root/sample.bin | cut -d" " -f1)
+            printf "default     %s\n--no-async  %s\n--no-direct %s\n--threads 1 %s\n" "$a" "$b" "$c" "$d"
+            for x in "$b" "$c" "$d"; do
+              [ "$x" = "$a" ] || { echo "::error::FreeBSD I/O rungs disagree on the digest"; exit 1; }
+            done
+            # And the generator round trip: bytes written through the
+            # write pipeline, read back through the read pipeline.
+            ./cli/blake3ppgen --seed roundtrip --length 64M --output /root/rt.bin
+            e=$(./cli/blake3ppsum                       /root/rt.bin | cut -d" " -f1)
+            f=$(./cli/blake3ppsum --no-direct --no-async /root/rt.bin | cut -d" " -f1)
+            printf "roundtrip   %s\nroundtrip*  %s\n" "$e" "$f"
+            [ "$e" = "$f" ] || { echo "::error::FreeBSD generator round trip disagrees"; exit 1; }
+            echo "all rungs agree"'
+      # Which rung actually ran, in the log, every run. blake3ppsum
+      # --version reports the SIMD and execution providers; the I/O
+      # backend is named by the tools that engage one, so both are
+      # printed. Expect aio+direct: POSIX AIO on a kqueue, with
+      # O_DIRECT.
+      - name: Identity and the engaged I/O backend
+        run: |
+          bash tools/freebsd-guest.sh run 'cd /root/b3
+            ./cli/blake3ppsum --version
+            ./cli/blake3ppgen -v --seed probe --length 32M --output /root/probe.bin 2>&1 | tail -2
+            ./bench/blake3pp_bench_file /root/sample.bin --reps 1 --cooldown 0 | head -8'
+
+      - name: Bench report (FreeBSD amd64 under KVM on the runner)
+        run: |
+          { echo "== x86_64 FreeBSD, qemu/KVM guest on the GitHub ubuntu-latest runner, cross-built with zig =="
+            bash tools/freebsd-guest.sh run 'uname -sr; sysctl -n hw.model; sysctl -n hw.ncpu'
+            bash tools/freebsd-guest.sh run '/root/b3/cli/blake3ppsum --version'
+            bash tools/freebsd-guest.sh run '/root/b3/bench/blake3pp_bench --reps 1 --cooldown 0'
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-report-freebsd-amd64
+          path: bench-report.txt
+          retention-days: 7
+
+      # A guest that misbehaves is invisible from the host, so the
+      # console is dumped whenever anything above failed. `wait` already
+      # dumps it on its own timeout; this covers every later step.
+      - name: Serial console
+        if: failure()
+        run: |
+          echo "================ guest serial console ================"
+          cat build/freebsd-guest/serial.log || echo "(no serial log)"
+          echo "======================================================"
+      - name: Stop the guest
+        if: always()
+        run: bash tools/freebsd-guest.sh stop || true
+
+  # FreeBSD arm64: the same two-job shape as the amd64 pair above, and
+  # the comments there apply here too. What is worth saying separately
+  # is what this lane covers that nothing else in this file does. The
+  # amd64 FreeBSD lane proves the POSIX-AIO-on-a-kqueue engine on a
+  # foreign kernel; the Linux arm64 lanes prove the NEON and SVE kernels
+  # on a Linux one. Only here do the two meet: SVE dispatch, through
+  # FreeBSD's elf_aux_info auxv probe, on a FreeBSD kernel, from bytes a
+  # Linux container cross-compiled. That probe (added in
+  # src/dispatch/cpu_detect_arm.cpp) has no other automated home.
+  freebsd-arm64-build:
+    name: freebsd-arm64-zig-cxx23 (cross build)
+    needs: [changes, images, environments]
+    if: ${{ !cancelled() && needs.environments.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/${{ github.repository }}/toolchain-zig:${{ needs.changes.outputs.tag }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    # The image's /bin/sh is dash, and these steps are written for bash.
+    defaults:
+      run:
+        shell: bash
+    env:
+      CMAKE_GENERATOR: Ninja
+      BLAKE3PP_CMAKE_RE: ${{ needs.changes.outputs.driver == 'cmake-re' && '1' || '0' }}
+      BLAKE3PP_CMAKE_RE_FLAGS: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' && '--host --distributed' || '--host' }}
+      TIPI_DISTRO_MODE: none
+      TIPI_DISABLE_AR_RANLIB_DRIVER: "ON"
+      TIPI_CACHE_CONSUME_ONLY: "ON"
+      TIPI_CACHE_FORCE_ENABLE: "OFF"
+      USER: runner
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-workspace
+        with:
+          cache-prefix: hfc-src2-linux-
+      - uses: ./.github/actions/setup-cmake-re
+        if: needs.changes.outputs.driver == 'cmake-re'
+        with:
+          preset: freebsd-arm64-zig-cxx23
+          image-tag: ${{ needs.changes.outputs.tag }}
+          rbe-service: ${{ secrets.RBE_SERVICE }}
+          rbe-tls-client-auth-key: ${{ secrets.RBE_TLS_CLIENT_AUTH_KEY }}
+          rbe-tls-client-auth-cert: ${{ secrets.RBE_TLS_CLIENT_AUTH_CERT }}
+          env-registry: ${{ vars.BLAKE3PP_RBE_ENV_REGISTRY }}
+          distributed: ${{ needs.changes.outputs.cmake-re-mode == 'distributed' }}
+
+      - name: Configure and build (cross, no ctest)
+        run: |
+          set -euo pipefail
+          preset=freebsd-arm64-zig-cxx23
+          if [ "${BLAKE3PP_CMAKE_RE}" = 1 ]; then
+            flags=${BLAKE3PP_CMAKE_RE_FLAGS:---host}
+            read -r -a args <<< "$(python3 tools/preset-args.py "${preset}")"
+            # shellcheck disable=SC2086  # one flag per word, on purpose
+            cmake-re ${flags} -S . "${args[@]}"
+            cmake-re --build "build/${preset}" ${flags} -j"$(nproc)"
+          else
+            cmake --preset "${preset}"
+            cmake --build "build/${preset}" -j"$(nproc)"
+          fi
+          file build/${preset}/cli/blake3ppsum
+
+      # Which kernels the probe actually registered, in the log, before
+      # anything is shipped anywhere. cmake/KernelVariants.cmake decides
+      # this from compiler probes rather than from a list, so the
+      # honest way to assert "this build carries the arm64 kernels" is
+      # to look at what it built. A silent drop to neon+scalar -- a
+      # compiler that stopped accepting the -mcpu spelling, say -- would
+      # otherwise sail through every later step, since dispatch would
+      # simply select the best of what was there.
+      - name: The arm64 kernels are in this build
+        run: |
+          set -euo pipefail
+          d=build/freebsd-arm64-zig-cxx23
+          missing=0
+          for k in neon sve256 sve512 sve2_128; do
+            if [ -d "$d/CMakeFiles/blake3pp_kernel_${k}.dir" ]; then
+              echo "kernel ${k}: built"
+            else
+              echo "::error::the ${k} kernel was not registered for this build"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ]
+
+      # Before the upload, for the same reason as the amd64 lane: 189 MB
+      # of debug info has to cross the artifact store AND then the ssh
+      # pipe into the guest. The stripper candidates lead with the
+      # aarch64 cross binutils, because the host `strip` in this image
+      # is x86_64-only BFD and refuses an aarch64 object outright --
+      # unlike the amd64 FreeBSD case, where the FreeBSD OSABI byte was
+      # the only foreign thing about the file.
+      - name: Strip the FreeBSD arm64 binaries
+        run: |
+          set -euo pipefail
+          STRIP=""
+          for c in aarch64-linux-gnu-strip llvm-strip llvm-strip-22 llvm-strip-20 llvm-strip-19 llvm-strip-18; do
+            if command -v "$c" > /dev/null 2>&1; then STRIP="$c"; break; fi
+          done
+          [ -n "$STRIP" ] || { echo "::error::no aarch64-capable stripper in the zig image"; exit 1; }
+          echo "stripping with ${STRIP}"
+          d=build/freebsd-arm64-zig-cxx23
+          "$STRIP" "$d"/tests/blake3pp_tests "$d"/cli/blake3ppsum "$d"/cli/blake3ppgen \
+                   "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file
+          ls -l "$d"/tests/blake3pp_tests "$d"/cli/blake3ppsum "$d"/cli/blake3ppgen \
+                "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file
+
+      - name: Upload FreeBSD arm64 binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-binaries-arm64
+          retention-days: 3
+          path: |
+            build/freebsd-arm64-zig-cxx23/tests/blake3pp_tests
+            build/freebsd-arm64-zig-cxx23/cli/blake3ppsum
+            build/freebsd-arm64-zig-cxx23/cli/blake3ppgen
+            build/freebsd-arm64-zig-cxx23/bench/blake3pp_bench
+            build/freebsd-arm64-zig-cxx23/bench/blake3pp_bench_file
+
+  # The arm64 guest. Everything the amd64 test job's header says about
+  # where the image comes from holds here, with one substitution:
+  # toolchain-freebsd-arm64-guest, prepared by the same
+  # tools/freebsd-guest.sh with FBSD_ARCH=arm64.
+  #
+  # TCG, not KVM, and the honest reason is that there is no alternative:
+  # GitHub exposes /dev/kvm on its x64 runners and on none of its arm64
+  # ones, and an x64 host cannot KVM an aarch64 guest because KVM runs
+  # guest instructions on the host CPU. So this lane TRANSLATES every
+  # instruction, which is why its timeout is generous and its bench
+  # numbers are explicitly not comparable to anything. Measured on
+  # comparable hardware: ~2 min to boot, ~100 s for the suite. That is
+  # affordable on every push, which is what it does -- the same call the
+  # ppc64le and s390x qemu lanes make.
+  #
+  # The guest is pinned to a 15.x release where the amd64 one is pinned
+  # to 14.x, and that is not an oversight: FreeBSD only began saving SVE
+  # state across a context switch in 15.0, so a 14.x kernel sets no
+  # HWCAP_SVE bit and dispatch correctly takes NEON. A 14.x guest would
+  # test the ABI floor and none of the vector kernels. The floor is
+  # still asserted -- these binaries declare FreeBSD 14.0 and nothing
+  # about that changed -- it is just asserted by them loading.
+  freebsd-arm64-test:
+    name: freebsd-arm64 test+bench (qemu TCG guest)
+    needs: [changes, freebsd-arm64-build]
+    # Same load-bearing pattern as freebsd-test: the status function
+    # breaks the transitive skip-poisoning from the (almost always
+    # skipped) images job.
+    if: ${{ !cancelled() && needs.freebsd-arm64-build.result == 'success' }}
+    runs-on: ubuntu-latest
+    # Generous: a TCG boot plus a TCG suite plus a TCG bench, on a
+    # shared runner that may be busy.
+    timeout-minutes: 90
+    env:
+      FBSD_ARCH: arm64
+    steps:
+      - uses: actions/checkout@v7
+      # No "Enable KVM" step, unlike the amd64 lane: this guest does not
+      # use it and could not.
+      - name: Install qemu and the nbd tools
+        run: |
+          sudo apt-get update
+          # qemu-system-arm carries qemu-system-aarch64. qemu-efi-aarch64
+          # is NOT optional the way ovmf is for the amd64 lane: arm64 is
+          # UEFI only, there is no BIOS fallback, so every boot needs the
+          # AAVMF pair and not just the preparation boot.
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-arm qemu-utils qemu-efi-aarch64
+          sudo modprobe nbd max_part=16
+          ls -lL /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/AAVMF/AAVMF_VARS.fd
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch the prepared guest image
+        env:
+          GUEST_IMAGE: ghcr.io/${{ github.repository }}/toolchain-freebsd-arm64-guest:${{ needs.changes.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/freebsd-arm64-guest
+          t0=$(date +%s)
+          docker pull "${GUEST_IMAGE}"
+          echo "pull took $(( $(date +%s) - t0 ))s"
+          # FROM scratch, so there is nothing to run in it; a container
+          # is created only so that docker cp has something to copy out
+          # of, and removed immediately. The payload path is the same
+          # /freebsd-guest.qcow2 in both guest images; the tag above is
+          # what says which architecture this one is.
+          cid=$(docker create "${GUEST_IMAGE}" /nonexistent)
+          docker cp "${cid}:/freebsd-guest.qcow2" build/freebsd-arm64-guest/freebsd-arm64-guest.qcow2
+          docker rm "${cid}" > /dev/null
+          ls -lh build/freebsd-arm64-guest/freebsd-arm64-guest.qcow2
+          qemu-img info build/freebsd-arm64-guest/freebsd-arm64-guest.qcow2
+      - uses: actions/download-artifact@v8
+        with:
+          name: freebsd-binaries-arm64
+          path: freebsd-bin
+
+      - name: Boot the guest
+        run: |
+          chmod +x freebsd-bin/tests/* freebsd-bin/cli/* freebsd-bin/bench/*
+          t0=$(date +%s)
+          bash tools/freebsd-guest.sh start
+          bash tools/freebsd-guest.sh wait
+          echo "boot took $(( $(date +%s) - t0 ))s (TCG)"
+      - name: What FreeBSD is this really
+        run: |
+          bash tools/freebsd-guest.sh run 'uname -a; sysctl -n hw.model hw.ncpu; df -h /'
+      - name: Copy the binaries into the guest
+        run: |
+          tar cf - -C freebsd-bin . \
+            | bash tools/freebsd-guest.sh run 'mkdir -p /root/b3 && tar xf - -C /root/b3 && chmod -R +x /root/b3 && ls -lR /root/b3'
+      - name: Test on a real FreeBSD kernel
+        run: |
+          t0=$(date +%s)
+          bash tools/freebsd-guest.sh run 'cd /root/b3 && ./tests/blake3pp_tests'
+          echo "suite took $(( $(date +%s) - t0 ))s (TCG)"
+
+      # The coverage this lane exists for. tools/freebsd-guest.sh boots
+      # the guest with -cpu max,sve-max-vq=1, a 128-bit vector, so
+      # FreeBSD's auxv probe should report SVE present and rdvl should
+      # report 16 bytes, and dispatch should land on sve2_128. Asserting
+      # it is what makes the setting load-bearing rather than decorative:
+      # qemu already refuses an unknown -cpu property, so a RENAMED knob
+      # fails the boot, and this catches a knob that is still accepted
+      # but no longer does anything, as well as any regression in the
+      # FreeBSD branch of the probe itself.
+      - name: The engaged kernel is an SVE2 one
+        run: |
+          set -euo pipefail
+          bash tools/freebsd-guest.sh run '/root/b3/cli/blake3ppsum --version' | tee version.txt
+          sel=$(sed -n 's/.*(auto -> \(.*\))$/\1/p' version.txt | tail -1)
+          echo "dispatch selected: ${sel}"
+          case "${sel}" in
+            sve2_*) echo "an SVE2 kernel, as the guest's sve-max-vq promises" ;;
+            *) echo "::error::expected an SVE2 kernel on this guest, got '${sel}'"; exit 1 ;;
+          esac
+
+      # The digest is the invariant; the I/O rungs are the variable. If
+      # the AIO-on-kqueue reader, the O_DIRECT path, the synchronous
+      # fallback and the single-threaded path ever disagree, one of them
+      # is losing or reordering bytes, and that is a defect no unit test
+      # on Linux can find. Smaller samples than the amd64 lane's,
+      # because every byte of this is translated.
+      - name: Every I/O rung agrees on the digest
+        run: |
+          bash tools/freebsd-guest.sh run 'set -eu
+            cd /root/b3
+            ./cli/blake3ppgen --seed blake3pp-ci --length 64M --output /root/sample.bin
+            a=$(./cli/blake3ppsum             /root/sample.bin | cut -d" " -f1)
+            b=$(./cli/blake3ppsum --no-async  /root/sample.bin | cut -d" " -f1)
+            c=$(./cli/blake3ppsum --no-direct /root/sample.bin | cut -d" " -f1)
+            d=$(./cli/blake3ppsum --threads 1 /root/sample.bin | cut -d" " -f1)
+            printf "default     %s\n--no-async  %s\n--no-direct %s\n--threads 1 %s\n" "$a" "$b" "$c" "$d"
+            for x in "$b" "$c" "$d"; do
+              [ "$x" = "$a" ] || { echo "::error::FreeBSD arm64 I/O rungs disagree on the digest"; exit 1; }
+            done
+            # And the generator round trip: bytes written through the
+            # write pipeline, read back through the read pipeline.
+            ./cli/blake3ppgen --seed roundtrip --length 16M --output /root/rt.bin
+            e=$(./cli/blake3ppsum                       /root/rt.bin | cut -d" " -f1)
+            f=$(./cli/blake3ppsum --no-direct --no-async /root/rt.bin | cut -d" " -f1)
+            printf "roundtrip   %s\nroundtrip*  %s\n" "$e" "$f"
+            [ "$e" = "$f" ] || { echo "::error::FreeBSD arm64 generator round trip disagrees"; exit 1; }
+            echo "all rungs agree"'
+      # Which rung actually ran, in the log, every run. Expect
+      # aio+direct: POSIX AIO on a kqueue, with O_DIRECT, exactly as on
+      # the amd64 guest -- the I/O backend is chosen by the OS and knows
+      # nothing about the instruction set, and this is where that claim
+      # gets checked rather than assumed.
+      - name: The engaged I/O backend
+        run: |
+          set -euo pipefail
+          # Captured whole and grepped whole, then shown trimmed: the
+          # rung's name must be found wherever a tool chose to print it,
+          # not only in the last two lines a human wants to read.
+          bash tools/freebsd-guest.sh run 'cd /root/b3
+            ./cli/blake3ppgen -v --seed probe --length 8M --output /root/probe.bin
+            ./bench/blake3pp_bench_file /root/sample.bin --reps 1 --cooldown 0' \
+            > backend.txt 2>&1 || { cat backend.txt; exit 1; }
+          head -12 backend.txt
+          grep -q 'aio+direct' backend.txt \
+            || { echo "::error::expected the aio+direct rung on FreeBSD arm64"; cat backend.txt; exit 1; }
+
+      - name: Bench report (FreeBSD arm64 under TCG on the runner)
+        run: |
+          { echo "== aarch64 FreeBSD, qemu TCG guest on the GitHub ubuntu-latest runner, cross-built with zig =="
+            echo "(TCG: every instruction is translated. These numbers measure the emulator, not the kernels.)"
+            bash tools/freebsd-guest.sh run 'uname -sr; sysctl -n hw.model; sysctl -n hw.ncpu'
+            bash tools/freebsd-guest.sh run '/root/b3/cli/blake3ppsum --version'
+            bash tools/freebsd-guest.sh run '/root/b3/bench/blake3pp_bench --reps 1 --cooldown 0'
+          } | tee bench-report.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-report-freebsd-arm64
+          path: bench-report.txt
+          retention-days: 7
+
+      - name: Serial console
+        if: failure()
+        run: |
+          echo "================ guest serial console ================"
+          cat build/freebsd-arm64-guest/serial.log || echo "(no serial log)"
+          echo "======================================================"
+      - name: Stop the guest
+        if: always()
+        run: bash tools/freebsd-guest.sh stop || true
 
   # Windows, on the hosted runners; no toolchain image (those are Linux/
   # amd64); vswhere locates whatever VS the runner image ships and vcvars
