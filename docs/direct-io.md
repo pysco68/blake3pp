@@ -291,8 +291,13 @@ bet stops paying off, or actively costs, in a few shapes:
   different machines, so what the pair shows is a pre-7.0 kernel path
   that is gone on 7.0 rather than one device measured twice; whether a
   given kernel still in use has it is a question for that kernel.
-  Buffered above about 6 GiB/s is a separate open item, and
-  [Performance](performance.md#direct-against-buffered) has both.
+  Above that rate the buffered path was limited by this pipeline rather
+  than by any kernel, and is not any more: holding one window at a time
+  left one buffered read outstanding and so one io-wq worker copying, and
+  the same z3 machine on one kernel build reads 3.48 GiB/s raw buffered at
+  the old depth against 8.21 with several windows in flight, 91% of its
+  direct rate. [Performance](performance.md#direct-against-buffered) has
+  the pair.
   On Windows and on macOS the two measure the same, closely enough that an
   M4 Max reads 6.12 GiB/s buffered against 5.86 direct -- buffered 4%
   ahead of `F_NOCACHE`.

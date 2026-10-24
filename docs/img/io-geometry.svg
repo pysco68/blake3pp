@@ -13,15 +13,15 @@
   }
 </style>
 <text x="0" y="18" font-size="15" font-weight="600">Window size is a device property, not a CPU one</text>
-<text x="0" y="36" font-size="12" class="muted">parallel row at queue depth 4, cold cache before every repetition; the runs are named on the page</text>
+<text x="0" y="36" font-size="12" class="muted">parallel row at queue depth 4, cold cache before every repetition; the runs are named on the page; the stripe series is the 12ec998 capture, before the window-depth redesign</text>
 <rect x="60" y="47" width="10" height="10" fill="#e8590c" rx="2"/>
-<text x="75" y="56" font-size="12">4x PCIe 5 stripe</text>
-<rect x="209" y="47" width="10" height="10" fill="#1971c2" rx="2"/>
-<text x="224" y="56" font-size="12">z3 striped local SSD</text>
-<rect x="387" y="47" width="10" height="10" fill="#2f9e44" rx="2"/>
-<text x="402" y="56" font-size="12">EPYC Milan local disk</text>
-<rect x="572" y="47" width="10" height="10" fill="#9c36b5" rx="2"/>
-<text x="587" y="56" font-size="12">Apple M4 Max SSD</text>
+<text x="75" y="56" font-size="12">4x PCIe 5 stripe, kernel 7.0</text>
+<rect x="295" y="47" width="10" height="10" fill="#1971c2" rx="2"/>
+<text x="310" y="56" font-size="12">z3 striped local SSD</text>
+<rect x="473" y="47" width="10" height="10" fill="#2f9e44" rx="2"/>
+<text x="488" y="56" font-size="12">EPYC Milan local disk</text>
+<rect x="658" y="47" width="10" height="10" fill="#9c36b5" rx="2"/>
+<text x="673" y="56" font-size="12">Apple M4 Max SSD</text>
 <line class="grid" x1="60" y1="374.0" x2="830" y2="374.0"/>
 <text x="52" y="378.0" font-size="11" class="muted" text-anchor="end">0</text>
 <line class="grid" x1="60" y1="313.2" x2="830" y2="313.2"/>
