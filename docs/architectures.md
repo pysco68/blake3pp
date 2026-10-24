@@ -60,7 +60,9 @@ once. `BLAKE3PP_MAX_SIMD_DEGREE` accepts 1, 2, 4, 8 or 16, so 16 lanes —
 a 512-bit register — is the widest kernel the tree can hold.
 
 **Facade.** The project provider is `std::simd` where the standard library
-has a usable one, else `<experimental/simd>`, else xsimd;
+has a usable one, else `<experimental/simd>`, else xsimd, and none at all
+where every variant pins its own: the facade is the only consumer, so a
+build with no caller for it fetches no polyfill.
 `BLAKE3PP_SIMD_PROVIDER` overrides the choice. A variant that pins one
 does so because the generic answer is wrong there: libstdc++'s
 `experimental::simd` SVE backend emits SVE in load-time initializers,

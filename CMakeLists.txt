@@ -237,6 +237,12 @@ target_include_directories(blake3pp PUBLIC
 include(KernelVariants)
 blake3pp_register_kernels()
 
+# The project-wide simd provider of last resort, resolved now that the
+# registered kernels say whether anything falls back to it (see
+# cmake/StdFeatures.cmake). blake3pp_features is an INTERFACE target, so
+# the kernel objects created above still pick up what this adds.
+blake3pp_resolve_simd_provider()
+
 blake3pp_target_link_kernels(blake3pp)
 
 # The sizable process-wide parallel scheduler: one definition per program

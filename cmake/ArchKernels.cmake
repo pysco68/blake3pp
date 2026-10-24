@@ -215,6 +215,18 @@ if(BLAKE3PP_SUBTREE_FOLD)
     INTERFACE "BLAKE3PP_SUBTREE_FOLD=${_ak_fold_levels}")
 endif()
 
+# A kernel that pins none of the three per-TU providers compiles
+# src/kernel/simd_facade.hpp's fallback arms, which is the only way the
+# project-wide simd provider acquires a consumer: the facade is included
+# from kernel translation units and nowhere else. Record that here so
+# cmake/StdFeatures.cmake can resolve the provider of last resort after
+# registration instead of before it.
+function(_blake3pp_note_simd_provider_use provider)
+  if(provider STREQUAL "facade")
+    set_property(GLOBAL PROPERTY BLAKE3PP_KERNELS_NEED_SIMD_PROVIDER 1)
+  endif()
+endfunction()
+
 function(blake3pp_add_kernel ns)
   cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD;FORCE_VEXT"
     "SOURCE;EXTERNAL_COMPILER;VEXT_BYTES" "ARCH_FLAGS")
@@ -292,6 +304,7 @@ function(blake3pp_add_kernel ns)
   endif()
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
+  _blake3pp_note_simd_provider_use("${_ak_provider}")
 
     set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_OBJECT" "${_ak_obj}")
     return()
@@ -395,6 +408,7 @@ function(blake3pp_add_kernel ns)
   endif()
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
+  _blake3pp_note_simd_provider_use("${_ak_provider}")
 endfunction()
 
 # Attaches every registered kernel's objects to <target> and generates the
