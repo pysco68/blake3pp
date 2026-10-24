@@ -46,6 +46,14 @@ image_for() {
     linux-s390x-gcc15-*) echo s390x-gcc15 ;;
     linux-mips64el-gcc14-*) echo mips64el-gcc14 ;;
     *zigmusl*)            echo zig ;;
+    # The FreeBSD cross presets are in the zig image too; they miss the
+    # *zigmusl* glob because their triples carry an ABI version rather
+    # than a libc name. `ctest` finds nothing in these build trees on
+    # purpose (the toolchain leaves CMAKE_CROSSCOMPILING_EMULATOR empty:
+    # nothing here can execute a FreeBSD binary); tools/freebsd-guest.sh
+    # is what runs them.
+    freebsd-*zig-cxx23)   echo zig ;;
+    freebsd-clang-*)      die "the freebsd-clang presets are for a FreeBSD host's base system compiler, not a container (see docs/building.md); cross-build with freebsd-zig-cxx23 or freebsd-arm64-zig-cxx23 instead" ;;
     wasm32-*)             echo emscripten ;;
     windows-*)            die "windows presets are not containerized (build them natively or in CI)" ;;
     *)                    die "unknown preset '$1' (see tools/tc --list)" ;;
@@ -121,6 +129,7 @@ case "$1" in
       'linux-clang22-*'     "${REGISTRY}/toolchain-clang22:${TAG}" \
       'linux-arm64-gcc15-*' "${REGISTRY}/toolchain-arm64-gcc15:${TAG}" \
       '*zigmusl*'           "${REGISTRY}/toolchain-zig:${TAG}" \
+      'freebsd-*zig-cxx23'  "${REGISTRY}/toolchain-zig:${TAG}" \
       'wasm32-*'            "${REGISTRY}/toolchain-emscripten:${TAG}"
     exit 0 ;;
   --pull)

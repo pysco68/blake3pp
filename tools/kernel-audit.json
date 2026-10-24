@@ -226,7 +226,7 @@
         "forbid": [
           {
             "name": "z14/z15 vector",
-            "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)"
+            "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld$|vsrd$|vstrs|vcsfp|vcfps|vclfp|vcefp)"
           }
         ]
       },
@@ -241,8 +241,48 @@
     "binary": [
       {
         "name": "z14/z15 vector",
-        "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)",
+        "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld$|vsrd$|vstrs|vcsfp|vcfps|vclfp|vcefp)",
         "outside": "kern::vxe"
+      }
+    ]
+  },
+  "loongarch64": {
+    "variants": [
+      {
+        "match": "scalar",
+        "forbid": [
+          {
+            "name": "LSX or LASX",
+            "operand": "\\$[xv]r\\d+\\b"
+          }
+        ]
+      },
+      {
+        "match": "lsx",
+        "require": {
+          "name": "LSX",
+          "operand": "\\$vr\\d+\\b"
+        },
+        "forbid": [
+          {
+            "name": "LASX",
+            "operand": "\\$xr\\d+\\b"
+          }
+        ]
+      },
+      {
+        "match": "lasx",
+        "require": {
+          "name": "LASX",
+          "operand": "\\$xr\\d+\\b"
+        }
+      }
+    ],
+    "binary": [
+      {
+        "name": "LSX or LASX",
+        "operand": "\\$[xv]r\\d+\\b",
+        "outside": "kern::(lsx|lasx)"
       }
     ]
   },

@@ -12,7 +12,13 @@
 # Two stages: the two per-release base instantiations first, then a
 # per-image fan-out with one runner per toolchain image, each building FROM
 # the exact base tag pushed in this run, so all images of a distro cohort
-# share identical base layers even across runners. Layer cache lives
+# share identical base layers even across runners. One leg of that
+# fan-out, freebsd-guest and freebsd-arm64-guest, are not compiler
+# images at all but the prepared FreeBSD VMs the two cross lanes run
+# their binaries in; they ride along here so that there is one place
+# images are published from, and because the same content-addressed tag
+# makes them rebuild on exactly the same terms as everything else
+# (tools/freebsd-guest.sh is in the hash). Layer cache lives
 # registry-side (GHA's 10 GB cache is too small for this set). First
 # clang22 build is the long pole: the MSan libc++ stage compiles LLVM
 # runtimes from source (~60-90 min on 2 cores), cached afterwards.
@@ -119,6 +125,40 @@ jobs:
           - { target: mips64el-gcc14, rel: "debian13" }
           - { target: zig,         rel: "2604" }
           - { target: emscripten,  rel: "2604" }
+          # The odd ones out: packaged FreeBSD disk images rather than
+          # compilers. The `prepare` steps below produce the qcow2
+          # each one's Dockerfile copies; `rel` is carried only so the
+          # shared --set of the base context below stays uniform (these
+          # targets declare no base context and ignore it). `fbsd_arch`
+          # is what tools/freebsd-guest.sh dispatches on, and `kvm`
+          # says whether the preparation boot can be accelerated.
+          #
+          # freebsd_version is where each release is pinned, and it is
+          # pinned HERE rather than in the consuming workflow on
+          # purpose: this file is one of the inputs to
+          # tools/toolchain-image-tag.sh, so editing these lines mints a
+          # new content tag and the guest is rebuilt on the next run.
+          # A version named in ci.yml instead would change no tag at
+          # all, and the lane would quietly keep booting the old
+          # release while the log claimed the new one.
+          #
+          # The two versions differ, deliberately. 14.5-RELEASE sits
+          # just above the FreeBSD 14.0 ABI floor the cross-built
+          # binaries declare, which is the point for amd64: the lane
+          # tests that claim rather than testing a decade of forward
+          # compatibility. arm64 pins 15.1-RELEASE instead because
+          # FreeBSD only began saving SVE state across a context switch
+          # in 15.0, so a 14.x kernel publishes no HWCAP_SVE bit and
+          # that lane would cover none of its vector kernels (see
+          # src/dispatch/cpu_detect_arm.cpp). The floor is still tested
+          # there, by the binaries loading at all.
+          #
+          # The arm64 preparation boot is TCG: no GitHub runner can KVM
+          # an aarch64 guest. It costs about four minutes against the
+          # amd64 leg's one, which is affordable for something that
+          # runs once per recipe change.
+          - { target: freebsd-guest, rel: "2604", prepare: true, fbsd_arch: amd64, kvm: true, freebsd_version: "14.5-RELEASE" }
+          - { target: freebsd-arm64-guest, rel: "2604", prepare: true, fbsd_arch: arm64, kvm: false, freebsd_version: "15.1-RELEASE" }
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -127,6 +167,63 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Only for the guest legs. The preparation boots the guest once so
+      # that FreeBSD can write its own UFS root (Linux cannot: see the
+      # long comment in tools/freebsd-guest.sh), which is why this is a
+      # workflow step on the runner and not a RUN in the Dockerfile.
+      # GitHub's x64 runners expose /dev/kvm but leave the runner user
+      # out of the group that may open it; the arm64 leg skips this
+      # entirely, since nothing here can accelerate an aarch64 guest.
+      - name: Enable KVM for the guest preparation
+        if: matrix.prepare && matrix.kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0660", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo usermod -aG kvm "$USER"
+      - name: Prepare the FreeBSD ${{ matrix.fbsd_arch }} guest image
+        if: matrix.prepare
+        env:
+          FBSD_ARCH: ${{ matrix.fbsd_arch }}
+          FBSD_VERSION: ${{ matrix.freebsd_version }}
+          FBSD_DIR: ${{ runner.temp }}/freebsd-guest-${{ matrix.fbsd_arch }}
+          ARTIFACT: ${{ matrix.target }}.qcow2
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # The firmware packages are not symmetric. On amd64, ovmf is
+          # for the FIRST boot alone: the stock release image has no
+          # serial console, and the only way to give it one without
+          # writing its UFS root is a loader.env on the ESP, which only
+          # the EFI loader reads; every later boot of the prepared image
+          # is plain BIOS. On arm64 there is no BIOS at all, so
+          # qemu-efi-aarch64 is needed here AND by every boot in ci.yml.
+          if [ "${FBSD_ARCH}" = arm64 ]; then
+            sudo apt-get install -y --no-install-recommends \
+              qemu-system-arm qemu-utils qemu-efi-aarch64 xz-utils
+          else
+            sudo apt-get install -y --no-install-recommends \
+              qemu-system-x86 qemu-utils ovmf xz-utils
+          fi
+          sudo modprobe nbd max_part=16
+          # Into the build context, where the Dockerfile expects it,
+          # under the name its GUEST_ARTIFACT build arg names (the bake
+          # target's own name plus .qcow2, for both guests). The path is
+          # gitignored, and the content hash that tags this image covers
+          # the git SUBTREE, so an untracked artifact cannot perturb the
+          # tag: the recipe is the input, its output is not.
+          mkdir -p docker/.artifacts
+          # sg kvm only where there is a kvm group to join; under TCG it
+          # would be a second shell for nothing.
+          if [ "${{ matrix.kvm }}" = "true" ]; then
+            FBSD_IMAGE="${PWD}/docker/.artifacts/${ARTIFACT}" \
+              sg kvm -c 'bash tools/freebsd-guest.sh prepare'
+          else
+            FBSD_IMAGE="${PWD}/docker/.artifacts/${ARTIFACT}" \
+              bash tools/freebsd-guest.sh prepare
+          fi
+          ls -lh "docker/.artifacts/${ARTIFACT}"
       - name: Build and push ${{ matrix.target }}
         run: |
           TAG="${{ needs.ident.outputs.tag }}" \

@@ -67,7 +67,8 @@ On a Ryzen 7 PRO 6860Z (16 threads), 2 GiB, best of 3:
 
 `blake3pp_bench_file`, over a real file: `--reps`, `--cooldown`,
 `--window` (MiB), `--qd`, `--no-direct`, `--inline-submit`, `--threads`,
-`--seq-only`, `--trace PATH` with `--trace-agents`, `--io-sweep` (the
+`--no-ioring` and `--registered-buffers` (Windows: the completion port
+instead of the I/O ring, and the ring's buffer registration), `--seq-only`, `--trace PATH` with `--trace-agents`, `--io-sweep` (the
 window x qd pacing matrix), and `--make <MiB>` to create a file and use
 it. Without a device: `--null-source <GiB>` and `--null-sink <GiB>`.
 

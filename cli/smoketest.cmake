@@ -4,6 +4,13 @@
 #   cmake -DSUM=<path-to-blake3ppsum> -DWORK=<scratch-dir> -DCASE=<name>
 #         -P smoketest.cmake
 
+# Script mode starts from no policy at all, so a CMake that still has the
+# OLD behaviour of a policy this file depends on takes it: without this,
+# `IN_LIST` below is parsed as three arguments rather than an operator on
+# CMake 3.x, and every case fails before it runs a tool. The project's own
+# minimum, so the two cannot drift.
+cmake_minimum_required(VERSION 3.28)
+
 if(NOT DEFINED SUM OR NOT DEFINED WORK OR NOT DEFINED CASE)
   message(FATAL_ERROR "smoketest.cmake needs -DSUM, -DWORK and -DCASE")
 endif()

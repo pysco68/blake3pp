@@ -11,3 +11,10 @@ cmake/toolchains/*/*.container.lock
 # Built documentation site and its Python environment.
 _site/
 .venv-docs/
+
+# The prepared FreeBSD guest image: an input to docker/freebsd-guest.Dockerfile,
+# produced by tools/freebsd-guest.sh prepare and never committed (it is
+# 300-plus MB, and the content hash that tags the image covers the
+# recipe rather than its output).
+docker/.artifacts/*
+!docker/.artifacts/.gitkeep

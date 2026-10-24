@@ -813,7 +813,10 @@ int main(int argc, char** argv) {
   double null_gib = 0;
   double null_sink_gib = 0;
   bool inline_submit = false;
+  bool no_async = false;
   bool no_direct = false;
+  bool no_ioring = false;
+  bool registered_buffers = false;
   blake3pp::hash_file_options opts;
 
   CLI::App app{
@@ -836,9 +839,19 @@ int main(int argc, char** argv) {
       ->capture_default_str();
   app.add_flag("--no-direct", no_direct,
                "keep the OS page cache (no O_DIRECT)");
+  app.add_flag("--no-async", no_async,
+               "read synchronously (no io_uring/IOCP/GCD/AIO queue): the "
+               "comparison arm against the platform's async engine");
   app.add_flag("--inline-submit", inline_submit,
                "issue each read inline in the submitting thread instead of "
                "on io_uring's workers (IOSQE_ASYNC off)");
+  app.add_flag("--no-ioring", no_ioring,
+               "Windows: read through the completion port instead of the "
+               "I/O ring (the comparison arm)");
+  app.add_flag("--registered-buffers", registered_buffers,
+               "Windows I/O ring: register the window arena and the file "
+               "handle with the ring instead of naming a pointer and a "
+               "HANDLE per transfer");
   app.add_option("--threads", pool_threads,
                  "parallel-engine threads (1 = a one-thread pool; default: "
                  "all); diagnostic: sweep N-1/N/N+1 to test whether the "
@@ -874,7 +887,10 @@ int main(int argc, char** argv) {
   CLI11_PARSE(app, argc, argv);
 
   opts.direct_io = !no_direct;
+  opts.async = !no_async;
   opts.offload_submit = !inline_submit;
+  opts.ioring = !no_ioring;
+  opts.registered_buffers = registered_buffers;
   if (null_gib > 0) {
         const auto total =
         static_cast<std::uint64_t>(null_gib * 1024.0 * 1024.0 * 1024.0);
@@ -885,8 +901,13 @@ int main(int argc, char** argv) {
     std::vector<blake3pp::window_record> window_records;
     std::vector<blake3pp::agent_record> agent_records;
     std::optional<blake3pp::trace_buffer> trace;
-    blake3pp::file_io_options io_opts{opts.window_bytes, opts.queue_depth,
-                                      opts.direct_io, opts.offload_submit};
+    blake3pp::file_io_options io_opts{
+        .window_bytes = opts.window_bytes,
+        .queue_depth = opts.queue_depth,
+        .direct_io = opts.direct_io,
+        .offload_submit = opts.offload_submit,
+        .ioring = opts.ioring,
+        .registered_buffers = opts.registered_buffers};
     if (!trace_path.empty()) {
       const std::size_t n = static_cast<std::size_t>((total + win - 1) / win) + 1;
       window_records.resize(n);
@@ -926,7 +947,10 @@ int main(int argc, char** argv) {
       const blake3pp::detail::pipeline_plan plan =
           blake3pp::detail::plan_pipeline(0, opts.window_bytes,
                                           opts.queue_depth, false, total);
-      null_driver drv({/*async=*/true, opts.offload_submit},
+      null_driver drv({.async = true,
+                       .offload_submit = opts.offload_submit,
+                       .ioring = opts.ioring,
+                       .registered_buffers = opts.registered_buffers},
                       plan.reads_in_flight, total, null_filler,
                       plan.window_bytes * plan.windows);
       null_driver::file nf(drv);
@@ -994,8 +1018,11 @@ int main(int argc, char** argv) {
       // the clock.
       const unsigned windows = static_cast<unsigned>(std::min<std::uint64_t>(
           (total + win - 1) / win, opts.queue_depth));
-      null_driver drv({/*async=*/true, opts.offload_submit}, windows, total,
-                      null_filler, win * windows);
+      null_driver drv({.async = true,
+                       .offload_submit = opts.offload_submit,
+                       .ioring = opts.ioring,
+                       .registered_buffers = opts.registered_buffers},
+                      windows, total, null_filler, win * windows);
       null_driver::file nf(drv);
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_write_pipeline(
@@ -1029,8 +1056,13 @@ int main(int argc, char** argv) {
   {
     blake3pp::detail::file_reader probe(
         path.c_str(),
-        {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-         opts.offload_submit});
+        {.window_bytes = opts.window_bytes,
+         .queue_depth = opts.queue_depth,
+         .direct_io = opts.direct_io,
+         .async = opts.async,
+         .offload_submit = opts.offload_submit,
+         .ioring = opts.ioring,
+         .registered_buffers = opts.registered_buffers});
     bytes = probe.file_size();
     println(stdout, "file: {} ({:.1f} MiB), backend: {}, window {} MiB, qd {}",
             path, static_cast<double>(bytes) / (1024.0 * 1024.0),
@@ -1087,8 +1119,13 @@ int main(int argc, char** argv) {
   const double raw_s = best_cold_seconds(reps, cold, [&] {
     blake3pp::detail::file_reader r(
         path.c_str(),
-        {opts.window_bytes, opts.queue_depth, opts.direct_io, true,
-         opts.offload_submit});
+        {.window_bytes = opts.window_bytes,
+         .queue_depth = opts.queue_depth,
+         .direct_io = opts.direct_io,
+         .async = opts.async,
+         .offload_submit = opts.offload_submit,
+         .ioring = opts.ioring,
+         .registered_buffers = opts.registered_buffers});
     auto w = r.next();
     while (w.has_value()) {
       r.release(w.value());

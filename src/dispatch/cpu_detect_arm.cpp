@@ -7,14 +7,19 @@
 // because musl and older glibc headers do not spell them all. Windows
 // reports presence through IsProcessorFeaturePresent, whose SDK gained
 // ids for SVE, SVE2, SVE2.1 and the SME family in 10.0.26100; they are
-// written out here because older kits define none of them.
+// written out here because older kits define none of them. FreeBSD
+// carries the same auxv bits as Linux -- they are Arm's, not the
+// kernel's -- and reads them with elf_aux_info, which answers a status
+// code rather than a value and so cannot report "absent" as zero.
 //
-// Windows exposes no vector length, and dispatch selects a kernel by
-// exact length match, so the length comes from the hardware via rdvl.
-// .arch_extension holds the assembler's SVE window open around that one
-// instruction and closes it again, which keeps the rest of this
-// translation unit at the baseline: the file needs no SVE compile flag,
-// and no SVE instruction is reachable until the presence check passes.
+// Neither Windows nor FreeBSD exposes a vector length, and dispatch
+// selects a kernel by exact length match, so on both the length comes
+// from the hardware via rdvl. .arch_extension holds the assembler's SVE
+// window open around that one instruction and closes it again, which
+// keeps the rest of this translation unit at the baseline: the file
+// needs no SVE compile flag, and no SVE instruction is reachable until
+// the presence check passes -- which on every OS here means the kernel
+// said it saves SVE state, not merely that the CPU has the unit.
 
 #include "dispatch/cpu_detect.hpp"
 
@@ -47,6 +52,23 @@
 #endif
 #ifndef PR_SVE_VL_LEN_MASK
 #define PR_SVE_VL_LEN_MASK 0xffff
+#endif
+#elif defined(__FreeBSD__)
+#define BLAKE3PP_AARCH64_SVE 1
+#define BLAKE3PP_AARCH64_FREEBSD_SVE 1
+// <sys/auxv.h> alone: it declares elf_aux_info and pulls in
+// <machine/elf.h> for the HWCAP bits, in that order. Naming the machine
+// header here instead would break the build -- it needs the BSD type
+// names <sys/types.h> brings, which <sys/auxv.h> includes first.
+#include <sys/auxv.h>
+// Arm defines the HWCAP bit positions, so these are the Linux values;
+// spelled out because a base system older than its own SVE support
+// defines neither.
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1UL << 22)
+#endif
+#ifndef HWCAP2_SVE2
+#define HWCAP2_SVE2 (1UL << 1)
 #endif
 #endif
 
@@ -81,11 +103,11 @@ const sve_state& sve_probe() noexcept {
   }();
   return s;
 }
-#elif defined(BLAKE3PP_AARCH64_WINDOWS_SVE)
-// AArch64 MSVC has no inline assembler, so the length stays unknown
-// under it and no SVE kernel is selected. It builds none either: the
-// SVE variants need a compiler that accepts an SVE arch flag, which is
-// clang-cl here.
+#elif defined(BLAKE3PP_AARCH64_SVE)
+// The platforms that report presence and not length. AArch64 MSVC has
+// no inline assembler, so the length stays unknown under it and no SVE
+// kernel is selected. It builds none either: the SVE variants need a
+// compiler that accepts an SVE arch flag, which is clang-cl here.
 #if defined(__GNUC__) || defined(__clang__)
 unsigned sve_vl_bytes() noexcept {
   unsigned long long vl = 0;
@@ -96,7 +118,9 @@ unsigned sve_vl_bytes() noexcept {
 #else
 unsigned sve_vl_bytes() noexcept { return 0; }
 #endif
+#endif
 
+#if defined(BLAKE3PP_AARCH64_WINDOWS_SVE)
 const sve_state& sve_probe() noexcept {
   static const sve_state s = [] {
     sve_state st{};
@@ -105,6 +129,34 @@ const sve_state& sve_probe() noexcept {
       st.sve2 =
           IsProcessorFeaturePresent(PF_ARM_SVE2_INSTRUCTIONS_AVAILABLE) != 0;
       st.vl_bytes = sve_vl_bytes();
+    }
+    return st;
+  }();
+  return s;
+}
+#elif defined(BLAKE3PP_AARCH64_FREEBSD_SVE)
+const sve_state& sve_probe() noexcept {
+  static const sve_state s = [] {
+    sve_state st{};
+    // elf_aux_info answers 0 or an errno, and leaves the buffer alone on
+    // a vector the kernel does not carry, so the status is the question
+    // and an untouched zero is not an answer.
+    unsigned long hwcap = 0;
+    if (::elf_aux_info(AT_HWCAP, &hwcap, sizeof hwcap) != 0) {
+      return st;
+    }
+    if ((hwcap & HWCAP_SVE) == 0) {
+      // Either the CPU has no SVE or the kernel does not save its state
+      // across a context switch (FreeBSD gained that in 15.0). The bit
+      // is one answer to both, and the right one: without the kernel's
+      // half, the registers are not this thread's to keep.
+      return st;
+    }
+    st.sve = true;
+    st.vl_bytes = sve_vl_bytes();
+    unsigned long hwcap2 = 0;
+    if (::elf_aux_info(AT_HWCAP2, &hwcap2, sizeof hwcap2) == 0) {
+      st.sve2 = (hwcap2 & HWCAP2_SVE2) != 0;
     }
     return st;
   }();

@@ -172,8 +172,16 @@ class polled_reader_engine {
         qd_(clamp_queue_depth(opts.queue_depth)),
         slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * window_)),
-        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
+        ctx_(reader_context_options{.async = opts.async,
+                                    .offload_submit = opts.offload_submit,
+                                    .ioring = opts.ioring,
+                                    .registered_buffers =
+                                        opts.registered_buffers},
+             qd_),
         file_(ctx_, std::forward<FileArgs>(file_args)...) {
+    // The pool is one region, and a context that can register it wants it
+    // before the first transfer names a buffer inside it.
+    register_arena_if_supported(ctx_, pool());
     num_windows_ = (file_.size() + window_ - 1) / window_;
     const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
     for (unsigned s = 0; s < initial; ++s) {
@@ -251,11 +259,19 @@ class polled_writer_engine {
         preallocated_(opts.preallocate_bytes),
         slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
-        ctx_(reader_context_options{opts.async, opts.offload_submit}, qd_),
+        ctx_(reader_context_options{.async = opts.async,
+                                    .offload_submit = opts.offload_submit,
+                                    .ioring = opts.ioring,
+                                    .registered_buffers =
+                                        opts.registered_buffers},
+             qd_),
         file_(ctx_, path,
               file_open_options{.write = true,
                                 .direct_io = opts.direct_io,
-                                .preallocate_bytes = opts.preallocate_bytes}) {}
+                                .preallocate_bytes = opts.preallocate_bytes,
+                                .waive_zero_fill = opts.waive_zero_fill}) {
+    register_arena_if_supported(ctx_, {pool_.get(), std::size_t{qd_} * buffer_});
+  }
 
   [[nodiscard]] std::uint64_t bytes_written() const noexcept {
     return written_;

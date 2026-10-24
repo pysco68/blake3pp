@@ -76,7 +76,7 @@ run:
 
 | release | targets | toolchain |
 |---------|---------|-----------|
-| Linux, fully static | x86_64, aarch64, riscv64, ppc64le, s390x | zig (clang + musl) |
+| Linux, fully static | x86_64, aarch64, riscv64, ppc64le, s390x, loongarch64 | zig (clang + musl) |
 | Windows | x64 and arm64 | clang-cl from the VS toolset |
 | macOS | Apple silicon | Apple clang |
 | wasm | wasm32-simd128, node-runnable js+wasm pairs and the browser ES module | Emscripten |

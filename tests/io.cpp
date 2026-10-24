@@ -39,6 +39,12 @@
 #include "io/backend.hpp"
 #include "io/uring_backend.hpp"
 #endif
+#if defined(__FreeBSD__)
+#include "io/aio_backend.hpp"
+#endif
+#if defined(_WIN32)
+#include "io/ioring_backend.hpp"
+#endif
 
 namespace {
 
@@ -721,12 +727,22 @@ TEST_CASE("probe_file_io reports the open mode and the rung without reading") {
 TEST_CASE("an engaged backend is the platform's async engine, or says why not") {
 #if defined(__linux__)
   constexpr std::string_view engine = "io_uring";
+  constexpr std::string_view engine_alt = "";
 #elif defined(_WIN32)
+  // Windows has two async engines and picks between them at runtime, so
+  // either name is the platform's: the I/O ring where the machine has
+  // one, the completion port otherwise.
   constexpr std::string_view engine = "iocp";
+  constexpr std::string_view engine_alt = "ioring";
 #elif defined(__APPLE__)
   constexpr std::string_view engine = "gcd";
+  constexpr std::string_view engine_alt = "";
+#elif defined(__FreeBSD__)
+  constexpr std::string_view engine = "aio";
+  constexpr std::string_view engine_alt = "";
 #else
   constexpr std::string_view engine = "";
+  constexpr std::string_view engine_alt = "";
 #endif
   if constexpr (engine.empty()) {
     MESSAGE("no async engine on this platform; nothing to assert");
@@ -736,6 +752,8 @@ TEST_CASE("an engaged backend is the platform's async engine, or says why not") 
     // brackets, as uring_backend.hpp's no_uring_suffix() does.
     const auto engaged_or_explained = [&](std::string_view name) {
       return name.find(engine) != std::string_view::npos ||
+             (!engine_alt.empty() &&
+              name.find(engine_alt) != std::string_view::npos) ||
              name.find('[') != std::string_view::npos;
     };
 
@@ -1031,6 +1049,13 @@ TEST_CASE("engine templates drive the off-platform backends") {
   roundtrip_engines<io_impl::stdio_context>("stdio");
 #if defined(__unix__) || defined(__APPLE__)
   roundtrip_engines<io_impl::pread_context>("pread");
+#endif
+#if defined(_WIN32)
+  // The ring is the one backend the Windows selector reaches only at
+  // runtime, so the engines are driven over it here whatever this machine
+  // answered: a host without a ring runs the same round trip through the
+  // context's synchronous rung.
+  roundtrip_engines<io_impl::ioring_context>("ioring");
 #endif
 }
 

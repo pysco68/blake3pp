@@ -242,6 +242,22 @@ case "${preset}" in
       run_ctest msa Loongson-3A4000
     fi
     ;;
+  *loongarch64*)
+    # LSX and LASX are both optional in LA64 and qemu's default model
+    # (la464) carries both, so the matrix walks down: lasx=off leaves LSX
+    # alone, lsx=off removes the vector unit entirely. Each step must
+    # move the dispatch verdict one variant down and the suite must pass
+    # at every step.
+    #
+    # The toolchain pins -mno-lsx for everything but the two kernels:
+    # zig's loongarch64 baseline carries +lsx, and at that default the
+    # lsx=off pass SIGILLs before main.
+    run_ctest default
+    if full_emulator_matrix; then
+      run_ctest lsx-only "max,lasx=off"
+      run_ctest no-vector "max,lsx=off,lasx=off"
+    fi
+    ;;
   wasm32-*)
     run_ctest default
     ;;
