@@ -41,7 +41,7 @@ variable "CMAKE_VERSION" { default = "4.3.2" }
 variable "NINJA_VERSION" { default = "1.13.2" }
 variable "CMAKE_RE_VERSION" { default = "0.0.87" }
 variable "DOCKER_CLI_VERSION" { default = "28.3.3" }
-variable "ZIG_VERSION"   { default = "0.16.0" }
+variable "ZIG_VERSION"   { default = "0.17.0" }
 
 group "default" {
   targets = ["base", "base-debian13", "gcc", "clang", "arm64-gcc15", "riscv64-gcc15", "ppc64le-gcc15",

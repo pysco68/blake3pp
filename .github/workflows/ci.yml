@@ -716,7 +716,7 @@ jobs:
       # last resort: the target is x86_64 ELF carrying a FreeBSD OSABI
       # byte, which BFD strips without caring which kernel it is for.
       # zig ships no stripper of its own (`zig objcopy --strip-all`
-      # answers "unimplemented" on 0.16), which is why the zig image
+      # answers "unimplemented" on 0.17), which is why the zig image
       # installs binutils.
       - name: Strip the FreeBSD binaries
         run: |
