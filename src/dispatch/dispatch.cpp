@@ -17,6 +17,7 @@
 
 #include "blake3pp_version_stamp.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -232,9 +233,15 @@ std::string_view simd_provider() noexcept {
 #elif defined(BLAKE3PP_HAS_XSIMD)
   return "xsimd";
 #else
-  // No provider at all: a build whose only kernel is the scalar one, which
-  // needs none. The single-file amalgamation lands here below C++26.
-  return "none (scalar only)";
+  // No project-wide provider. Either the build carries the scalar kernel
+  // alone, which needs none (the single-file amalgamation lands here below
+  // C++26), or every compiled kernel pins its own provider and the build
+  // never resolved a project-wide one (loongarch64, whose two vector
+  // kernels pin the vector-extension provider). The registry separates the
+  // two, so neither answer can drift from what was built.
+  constexpr bool scalar_only = std::ranges::all_of(
+      registry, [](const registry_entry& e) { return e.a == arch::scalar; });
+  return scalar_only ? "none (scalar only)" : "none (kernels pin their own)";
 #endif
 }
 

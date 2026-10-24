@@ -90,9 +90,17 @@ registered under a vector name and dispatched to as though it were one
 (`src/kernel/kernel.cpp`). GCC 16's `<simd>` is the live example: its arch
 traits are compiled for x86 only, so off x86 the probe fails and `auto`
 passes over it.
-A build can also carry no SIMD provider at all: a scalar-only build
-(the single-file amalgamation below C++26, for instance) needs none,
-and `blake3pp::simd_provider()` reports `"none (scalar only)"`.
+A build can also carry no project-wide SIMD provider at all, in two
+ways. A scalar-only build (the single-file amalgamation below C++26, for
+instance) needs none, and `blake3pp::simd_provider()` reports
+`"none (scalar only)"`. A build whose every kernel pins a provider of its
+own needs none either: `simd_facade.hpp` is included from kernel
+translation units and nowhere else, so nothing falls back to the
+project-wide choice. The provider of last resort is therefore resolved
+after the kernels have registered and only when a kernel falls back to
+it; where none does, xsimd is not fetched, `BLAKE3PP_HAS_XSIMD` reaches
+no compile line, and `simd_provider()` reports
+`"none (kernels pin their own)"`.
 
 Two things override the project-wide choice for one kernel TU, both
 narrower mechanisms than the cache variable above:
@@ -115,7 +123,7 @@ narrower mechanisms than the cache variable above:
   runtime dispatch outright, so every SVE kernel variant pins xsimd
   (initializer-free there) regardless of the project-wide setting.
 
-Five cross-compiling toolchain files name a provider for the whole build
+Six cross-compiling toolchain files name a provider for the whole build
 rather than leaving it on `auto`, for a third reason again. The riscv64,
 ppc64le and s390x ones (two spellings each for ppc64le and s390x, GCC and
 zig/musl) say `xsimd`: none of those architectures has an
@@ -124,18 +132,20 @@ zig/musl) say `xsimd`: none of those architectures has an
 says `std-experimental` for the same reason in reverse, its MSA kernel
 having pinned the vector-extension provider. Naming the project-wide choice
 keeps `simd_provider()`'s answer truthful instead of reporting a provider
-the vector kernel does not actually use.
+the vector kernel does not actually use. A named provider is resolved even
+where no kernel falls back to it, so these six answers do not depend on
+which kernels a given configure registers.
 
-The loongarch64 one stays on `auto`, and the paragraph above is why that
-is worth saying. Its two kernels pin the vector-extension provider, which
-is mips64el's situation, but no legal value for `BLAKE3PP_SIMD_PROVIDER`
-states it there. `std` and `std-experimental` are a configure error on
-that toolchain, zig's libc++ having neither a usable `<simd>` nor a
-usable `<experimental/simd>`; `xsimd` and `xvec` name an unused polyfill
-exactly as `auto` already does. `simd_provider()` therefore answers
-`"xsimd"` on a loongarch64 build and no kernel uses it. Nothing else uses
-it either: preprocessing the three kernel translation units, `dispatch.cpp`
-and `blake3pp.cpp` shows zero xsimd headers reaching any of them.
+The loongarch64 one stays on `auto`, and it is the build the deferral
+above was written for. Its two vector kernels pin the vector-extension
+provider, which is mips64el's situation, but no legal value for
+`BLAKE3PP_SIMD_PROVIDER` states that there: `std` and `std-experimental`
+are a configure error on that toolchain, zig's libc++ having neither a
+usable `<simd>` nor a usable `<experimental/simd>`, and `xsimd` or `xvec`
+would fetch a polyfill no translation unit includes. On `auto` nothing
+falls back, so the build fetches no xsimd, carries `BLAKE3PP_HAS_XSIMD` on
+none of its compile lines, and `simd_provider()` answers
+`"none (kernels pin their own)"`.
 
 ## Execution providers
 

@@ -376,9 +376,31 @@ if(BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
 endif()
 
 # Last resort: the project-wide simd provider falls back to xsimd.
-if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD
-   AND NOT BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
-  _blake3pp_fetch_xsimd()
-  target_link_libraries(blake3pp_features INTERFACE xsimd)
-  target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XSIMD=1)
-endif()
+#
+# Resolved after blake3pp_register_kernels(), not here. src/kernel/
+# simd_facade.hpp is included from kernel translation units and nowhere
+# else, so the project-wide provider has a consumer only when some kernel
+# pins none of its own; which kernels exist is not known until they have
+# registered, which is long after this file runs. A build whose every
+# kernel is pinned (loongarch64: scalar plus two vector-extension kernels)
+# would otherwise clone and build xsimd, and put its include path and
+# BLAKE3PP_HAS_XSIMD on every compile line, for a header nothing includes.
+#
+# An explicitly named provider is resolved whether or not a kernel falls
+# back to it: BLAKE3PP_SIMD_PROVIDER=xsimd is also how the cross-compiling
+# toolchains make simd_provider() name the provider their pinned vector
+# kernel uses.
+macro(blake3pp_resolve_simd_provider)
+  if(NOT BLAKE3PP_HAS_STD_SIMD AND NOT BLAKE3PP_HAS_STD_EXPERIMENTAL_SIMD
+     AND NOT BLAKE3PP_SIMD_PROVIDER STREQUAL "xvec")
+    get_property(_blake3pp_simd_needed GLOBAL PROPERTY
+      BLAKE3PP_KERNELS_NEED_SIMD_PROVIDER)
+    if(_blake3pp_simd_needed OR BLAKE3PP_SIMD_PROVIDER STREQUAL "xsimd")
+      _blake3pp_fetch_xsimd()
+      target_link_libraries(blake3pp_features INTERFACE xsimd)
+      target_compile_definitions(blake3pp_features INTERFACE BLAKE3PP_HAS_XSIMD=1)
+    else()
+      message(STATUS "blake3pp: simd provider = none; every kernel pins its own")
+    endif()
+  endif()
+endmacro()
