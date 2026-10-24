@@ -170,7 +170,8 @@ add_library(blake3pp STATIC
   src/dispatch/cpu_detect_riscv.cpp
   src/dispatch/cpu_detect_ppc.cpp
   src/dispatch/cpu_detect_s390.cpp
-  src/dispatch/cpu_detect_mips.cpp)
+  src/dispatch/cpu_detect_mips.cpp
+  src/dispatch/cpu_detect_loongarch.cpp)
 if(BLAKE3PP_WITH_IO)
   target_sources(blake3pp PRIVATE
     src/io/file_reader.cpp

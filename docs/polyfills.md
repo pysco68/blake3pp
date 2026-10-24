@@ -103,9 +103,10 @@ narrower mechanisms than the cache variable above:
   its internal list does not cover (measured on MIPS64/MSA, GCC 14,
   where the same operations spelled over an explicit 16-byte
   vector-extension type compile to six MSA instructions instead of
-  none); xsimd has no backend there either. Ordinary compiler-driven
-  vectorization over a `vector_size` type reaches any ISA the compiler
-  itself targets, with no width guess to get wrong.
+  none); xsimd has no backend there either. LoongArch LSX and LASX are
+  the other customer, for the same two reasons. Ordinary
+  compiler-driven vectorization over a `vector_size` type reaches any
+  ISA the compiler itself targets, with no width guess to get wrong.
 - **An xsimd pin**, where a std provider is usable but wrong for a
   different reason: libstdc++'s `std::experimental::simd` SVE backend
   keeps index tables whose dynamic initializers are SVE instructions
@@ -124,6 +125,17 @@ says `std-experimental` for the same reason in reverse, its MSA kernel
 having pinned the vector-extension provider. Naming the project-wide choice
 keeps `simd_provider()`'s answer truthful instead of reporting a provider
 the vector kernel does not actually use.
+
+The loongarch64 one stays on `auto`, and the paragraph above is why that
+is worth saying. Its two kernels pin the vector-extension provider, which
+is mips64el's situation, but no legal value for `BLAKE3PP_SIMD_PROVIDER`
+states it there. `std` and `std-experimental` are a configure error on
+that toolchain, zig's libc++ having neither a usable `<simd>` nor a
+usable `<experimental/simd>`; `xsimd` and `xvec` name an unused polyfill
+exactly as `auto` already does. `simd_provider()` therefore answers
+`"xsimd"` on a loongarch64 build and no kernel uses it. Nothing else uses
+it either: preprocessing the three kernel translation units, `dispatch.cpp`
+and `blake3pp.cpp` shows zero xsimd headers reaching any of them.
 
 ## Execution providers
 
