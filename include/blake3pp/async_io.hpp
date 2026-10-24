@@ -429,20 +429,22 @@ class update_file_op final : public pipeline_node {
   // nothing else may touch it while this runs.
   update_file_op(basic_io_context<Budget>& ctx, hasher& h,
                  std::filesystem::path path, Sched sched,
-                 const file_io_options& opts, Tracer tracer, Receiver r)
+                 const file_io_options& opts, Tracer tracer,
+                 std::uint32_t file_index, Receiver r)
       : ctx_(&ctx),
         h_(&h),
         path_(std::move(path)),
         sched_(std::move(sched)),
         opts_(opts),
         tracer_(tracer),
+        file_index_(file_index),
         rcvr_(std::move(r)) {}
 
   // Over a hasher of its own, built from the call's options and
   // finalized into the value this completes with.
   update_file_op(basic_io_context<Budget>& ctx, std::filesystem::path path,
                  Sched sched, const hash_file_options& opts, Tracer tracer,
-                 Receiver r)
+                 std::uint32_t file_index, Receiver r)
       : ctx_(&ctx),
         own_h_(blake3pp::detail::make_hasher(opts, blake3pp::detail::resolve(opts.a))),
         h_(&*own_h_),
@@ -450,6 +452,7 @@ class update_file_op final : public pipeline_node {
         sched_(std::move(sched)),
         opts_(opts),
         tracer_(tracer),
+        file_index_(file_index),
         rcvr_(std::move(r)) {}
 
   update_file_op(const update_file_op&) = delete;
@@ -503,6 +506,7 @@ class update_file_op final : public pipeline_node {
                      blake3pp::detail::pipeline_options{
                          .window_bytes = cfg.window_bytes,
                          .queue_depth = cfg.queue_depth,
+                         .file_index = file_index_,
                          .stop_token = stop_.get_token()},
                      tracer_);
       cells_.emplace(scope_->count());
@@ -606,6 +610,7 @@ class update_file_op final : public pipeline_node {
   Sched sched_;
   file_io_options opts_;
   Tracer tracer_;
+  std::uint32_t file_index_;
   Receiver rcvr_;
   blake3pp::ex::inplace_stop_source stop_;
   blake3pp::detail::pipeline_plan plan_{};
@@ -659,15 +664,18 @@ class update_file_sender {
       blake3pp::ex::set_error_t(std::exception_ptr),
       blake3pp::ex::set_stopped_t());
 
+  // file_index is what this file's window records name as their file:
+  // the batch operation's slot index, zero for a file on its own.
   update_file_sender(basic_io_context<Budget>& ctx, hasher* h,
                      std::filesystem::path path, Sched sched, Options opts,
-                     Tracer tracer = Tracer{})
+                     Tracer tracer = Tracer{}, std::uint32_t file_index = 0)
       : ctx_(&ctx),
         h_(h),
         path_(std::move(path)),
         sched_(std::move(sched)),
         opts_(opts),
-        tracer_(tracer) {}
+        tracer_(tracer),
+        file_index_(file_index) {}
 
   [[nodiscard]] sender_env get_env() const noexcept {
     return {ctx_->scheduler()};
@@ -686,9 +694,11 @@ class update_file_sender {
                                Tracer>
   connect(Receiver r) const {
     if constexpr (std::is_void_v<Value>) {
-      return {*ctx_, *h_, path_, sched_, opts_, tracer_, std::move(r)};
+      return {*ctx_, *h_, path_, sched_, opts_, tracer_, file_index_,
+              std::move(r)};
     } else {
-      return {*ctx_, path_, sched_, opts_, tracer_, std::move(r)};
+      return {*ctx_, path_, sched_, opts_, tracer_, file_index_,
+              std::move(r)};
     }
   }
 
@@ -699,6 +709,7 @@ class update_file_sender {
   Sched sched_;
   Options opts_;
   Tracer tracer_;
+  std::uint32_t file_index_;
 };
 
 }  // namespace detail
@@ -973,7 +984,8 @@ class update_files_op final : public pipeline_node {
     operator child_op() const {
       return blake3pp::ex::connect(
           child_sender(*op->ctx_, &*s->h, op->paths_[s->index], op->sched_,
-                       op->opts_.io, op->tracer_),
+                       op->opts_.io, op->tracer_,
+                       static_cast<std::uint32_t>(s->index)),
           child_receiver{op, s});
     }
   };

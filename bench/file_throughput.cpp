@@ -77,6 +77,7 @@
 
 
 #include "tool_common.hpp"
+#include "trace_json.hpp"
 
 namespace {
 
@@ -326,13 +327,6 @@ kernel_deltas kernel_delta(const kernel_counters& before,
   return d;
 }
 
-// The record kinds as Chrome trace JSON, one complete ("X") event per
-// phase per window on tid 1 and, with agent records, one "compress" event
-// per record on a tid per CPU (100 + cpu; 99 where the CPU is unknown),
-// so the viewer shows the pipeline against the cores. ts and dur are in
-// microseconds as the format wants; epoch_ns at the top level is the
-// records' zero as absolute CLOCK_MONOTONIC nanoseconds, for joining with
-// timestamps other tools take on the same clock.
 // The pipeline with no device under it, and no bytes either.
 //
 // The file is VIRTUAL: it reports whatever size the run asks for, while
@@ -423,96 +417,34 @@ class null_driver {
 
 static_assert(blake3pp::detail::file_driver<null_driver>);
 
-bool write_chrome_trace(const std::string& path,
-                        const blake3pp::trace_buffer& trace,
-                        std::string_view process_name,
-                        unsigned pool_threads = 0) {
-  std::ofstream out(path);
-  if (!out.is_open()) {
-    return false;
+
+// The share of the wall clock during which at least one agent was
+// busy, from merged intervals, since agents overlap.
+[[nodiscard]] double idle_covered(std::span<const blake3pp::agent_record> agents,
+                                  double wall_ns) {
+  if (agents.empty() || wall_ns <= 0) {
+    return 0.0;
   }
-  const auto us = [](std::int64_t ns) {
-    return static_cast<double>(ns) / 1000.0;
-  };
-  out << std::format("{{\"epoch_ns\":{},\"displayTimeUnit\":\"ns\","
-                     "\"pool_threads\":{},\"traceEvents\":[\n",
-                     trace.epoch_ns(), pool_threads);
-  out << std::format("{{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,"
-                     "\"args\":{{\"name\":\"{}\"}}}},\n",
-                     process_name);
-  out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
-         "\"args\":{\"name\":\"driver\"}}";
-  // The driver's own track: one event over the whole run, carrying what
-  // that thread spent its time on. Windows go on the track of the window
-  // object that carried them, so several in flight read as parallel
-  // lanes rather than as one track nesting into itself.
-  const auto& d = trace.driver();
-  const auto windows = trace.windows();
-  if (d.iterations > 0 && !windows.empty()) {
-    const std::int64_t begin = windows.front().t_wait_begin;
-    const std::int64_t end = windows.back().t_released;
-    out << std::format(
-        ",\n{{\"name\":\"driver\",\"ph\":\"X\",\"pid\":1,\"tid\":1,"
-        "\"ts\":{:.3f},\"dur\":{:.3f},\"args\":{{\"busy_ns\":{},"
-        "\"parked_ns\":{},\"iterations\":{},\"polls\":{},"
-        "\"blocking_polls\":{},\"wakes\":{},\"queue_runs\":{},"
-        "\"admission_stalls\":{},\"max_pending\":{}}}}}",
-        us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
-        d.polls, d.blocking_polls, d.wakes, d.queue_runs, d.admission_stalls,
-        d.max_pending);
+  std::vector<std::pair<std::int64_t, std::int64_t>> iv;
+  iv.reserve(agents.size());
+  for (const auto& a : agents) {
+    iv.emplace_back(a.t_begin, a.t_begin + static_cast<std::int64_t>(a.busy_ns));
   }
-  std::map<std::uint32_t, bool> slots_named;
-  for (const auto& w : trace.windows()) {
-    const std::uint32_t tid = 10 + w.slot;
-    if (!slots_named[tid]) {
-      slots_named[tid] = true;
-      out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
-                         "\"pid\":1,\"tid\":{},\"args\":{{\"name\":"
-                         "\"window object {}\"}}}}",
-                         tid, w.slot);
-    }
-    const std::pair<const char*, std::pair<std::int64_t, std::int64_t>>
-        phases[] = {{"wait", {w.t_wait_begin, w.t_ready}},
-                    {"hash", {w.t_ready, w.t_joined}},
-                    {"absorb", {w.t_joined, w.t_absorbed}},
-                    {"release", {w.t_absorbed, w.t_released}}};
-    for (const auto& [name, span] : phases) {
-      out << std::format(",\n{{\"name\":\"{}\",\"ph\":\"X\",\"pid\":1,"
-                         "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
-                         "\"args\":{{\"window\":{},\"slot\":{},"
-                         "\"bytes\":{},\"last\":{},\"parallel\":{}}}}}",
-                         name, tid, us(span.first),
-                         us(span.second - span.first), w.index, w.slot,
-                         w.bytes,
-                         (w.flags & blake3pp::window_record::flag_last) != 0
-                             ? 1
-                             : 0,
-                         (w.flags & blake3pp::window_record::flag_parallel) != 0
-                             ? 1
-                             : 0);
+  std::sort(iv.begin(), iv.end());
+  double covered = 0;
+  std::int64_t cur_begin = iv.front().first;
+  std::int64_t cur_end = iv.front().second;
+  for (const auto& [b, e] : iv) {
+    if (b > cur_end) {
+      covered += static_cast<double>(cur_end - cur_begin);
+      cur_begin = b;
+      cur_end = e;
+    } else if (e > cur_end) {
+      cur_end = e;
     }
   }
-  std::map<std::uint32_t, bool> cpus_named;
-  for (const auto& a : trace.agents()) {
-    const std::uint32_t tid = a.cpu == ~std::uint32_t{0} ? 99 : 100 + a.cpu;
-    if (!cpus_named[tid]) {
-      cpus_named[tid] = true;
-      out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
-                         "\"pid\":1,\"tid\":{},\"args\":{{\"name\":\"{}\"}}}}",
-                         tid,
-                         tid == 99 ? std::string{"cpu ?"}
-                                   : std::format("cpu {}", a.cpu));
-    }
-    out << std::format(",\n{{\"name\":\"compress\",\"ph\":\"X\",\"pid\":1,"
-                       "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
-                       "\"args\":{{\"window\":{},\"parts\":{},"
-                       "\"min_part_ns\":{},\"max_part_ns\":{}}}}}",
-                       tid, us(a.t_begin),
-                       us(static_cast<std::int64_t>(a.busy_ns)), a.window,
-                       a.parts, a.min_part_ns, a.max_part_ns);
-  }
-  out << "\n]}\n";
-  return out.good();
+  covered += static_cast<double>(cur_end - cur_begin);
+  return covered / wall_ns;
 }
 
 // The per-row summary of one traced rep: where the wall time went, how
@@ -557,6 +489,48 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
           "    per window: wait {:5.1f}%  hash {:5.1f}%  absorb {:5.1f}%  "
           "release {:5.1f}%",
           pct(wait), pct(hash), pct(absorb), pct(release));
+
+  // The agent slices split by kind, as a line of text: a fold is three
+  // microseconds beside a compress of three hundred and seventy, so at
+  // any zoom where the compress slices are legible the folds are
+  // sub-pixel and the viewer does not draw them. The trace carries one
+  // fold record per window; their share is printed here.
+  if (const auto agents = trace.agents(); !agents.empty()) {
+    double compress_ns = 0;
+    double fold_ns = 0;
+    std::size_t compress_n = 0;
+    std::size_t fold_n = 0;
+    for (const auto& a : agents) {
+      if (a.parts == 0) {
+        fold_ns += static_cast<double>(a.busy_ns);
+        ++fold_n;
+      } else {
+        compress_ns += static_cast<double>(a.busy_ns);
+        ++compress_n;
+      }
+    }
+    const double agent_ns = compress_ns + fold_ns;
+    const auto share = [&](double ns) {
+      return agent_ns > 0 ? 100.0 * ns / agent_ns : 0.0;
+    };
+    println(stdout,
+            "    agent slices: compress {} ({:.1f} ms, {:4.1f}%)  fold {} "
+            "({:.1f} ms, {:4.1f}%)",
+            compress_n, compress_ns / 1e6, share(compress_ns), fold_n,
+            fold_ns / 1e6, share(fold_ns));
+    // And what those slices look like in the viewer, said as a number
+    // so nobody has to infer it from how empty the lanes are: the pool
+    // is busy for a fraction of the run whenever the device cannot feed
+    // it, which is most runs. A low occupancy here is the reader
+    // starving the pool, not the trace losing records.
+    if (threads > 0 && wall_ns > 0) {
+      println(stdout,
+              "    pool occupancy: {:4.1f}% of {} threads x wall; no agent "
+              "busy at all for {:4.1f}% of it",
+              100.0 * agent_ns / (wall_ns * threads), threads,
+              100.0 * (1.0 - idle_covered(agents, wall_ns)));
+    }
+  }
 
   // What the driver thread itself did, which is the number the compress
   // stage is judged against: a driver parked most of the time has room
@@ -977,7 +951,7 @@ int main(int argc, char** argv) {
                                             best),
                           &kernel);
       const std::string file = trace_file_name(trace_path, "null", false);
-      if (write_chrome_trace(file, *trace, "blake3pp_bench_file null",
+      if (b3tool::write_chrome_trace(file, *trace, "blake3pp_bench_file null",
                              threads)) {
         println(stdout, "    trace written to {}", file);
       }
@@ -1185,7 +1159,7 @@ int main(int argc, char** argv) {
           *trace, threads_for_trace, iowq_cpu_s,
           b3tool::gib_per_s(static_cast<std::size_t>(bytes), best), &kernel);
       const std::string file = trace_file_name(trace_path, label, !seq_only);
-      if (write_chrome_trace(file, *trace,
+      if (b3tool::write_chrome_trace(file, *trace,
                              std::format("blake3pp_bench_file {}", label),
                              threads_for_trace)) {
         println(stdout, "    trace written to {}", file);

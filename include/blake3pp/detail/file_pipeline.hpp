@@ -913,6 +913,9 @@ struct pipeline_options {
   // reads only its tracer, so a caller that constructs a scope passes
   // the policy and this field is not consulted.
   trace_buffer* trace = nullptr;
+  // What a window record names as its file: the file's index in a
+  // many-files operation, zero otherwise.
+  std::uint32_t file_index = 0;
   // Windows allowed in flight at once, capped to the window count; 0
   // means the window count. The tests run the whole matrix at 1 first,
   // where every insert arrives in file order, before letting the real
@@ -1391,6 +1394,7 @@ class window_scope
         file_(file),
         sched_(std::move(sched)),
         trace_(tracer.buffer()),
+        file_index_(opts.file_index),
         ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
         window_bytes_(plan.window_bytes),
         count_(std::min(plan.windows, host.pool().count())),
@@ -1919,7 +1923,8 @@ class window_scope
     const window_plan& p = w.plan;
     w.compress.prepare_edge(ops_, w.view().data() + p.head_bytes,
                             p.part_chunks, p.parts, p.first_chunk,
-                            h_.key_words(), h_.mode_flags(), trace_, w.index);
+                            h_.key_words(), h_.mode_flags(), trace_, w.index,
+                            file_index_);
     const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
     const ex::inplace_stop_token tok = stop_source_.get_token();
     return stamped<std::size_t>(
@@ -2186,7 +2191,7 @@ class window_scope
     const bool fanned =
         w.compress.prepare(ops_, w.at(), w.chunks,
                            w.plan.first_chunk, h_.key_words(), h_.mode_flags(),
-                           trace_, w.index);
+                           trace_, w.index, file_index_);
     // update_file only reaches the pipeline for windows big enough to fan
     // out; a window that is not is exactly what the fallback path exists
     // for.
@@ -2322,6 +2327,7 @@ class window_scope
       w.rec->flags = (w.last ? window_record::flag_last : 0) |
                      (w.short_first ? window_record::flag_short_first : 0);
       w.rec->slot = w.slot;
+      w.rec->file = file_index_;
       w.rec->t_wait_begin = trace_->now();
     }
   }
@@ -2374,6 +2380,7 @@ class window_scope
   typename D::file& file_;
   Scheduler sched_;
   trace_buffer* trace_ = nullptr;
+  std::uint32_t file_index_ = 0;
   const kern::kernel_ops* ops_ = nullptr;
   std::size_t window_bytes_ = 0;
   unsigned count_ = 0;            // window objects, and windows in flight at most

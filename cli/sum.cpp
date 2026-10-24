@@ -33,6 +33,7 @@
 #include <blake3pp/blake3pp.hpp>
 
 #include "tool_common.hpp"
+#include "trace_json.hpp"
 
 namespace {
 
@@ -46,6 +47,8 @@ struct options {
   std::size_t out_len = blake3pp::digest_size;
   std::string key_file;        // --keyed: path to 32 raw bytes or 64 hex
   std::string derive_context;  // --derive-key
+  std::string trace_path;      // --trace: Chrome trace JSON out
+  bool trace_agents = false;   // --trace-agents
   std::vector<std::string> files;
 };
 
@@ -216,19 +219,29 @@ class engine {
     std::vector<std::optional<result>> out(files.size());
     std::size_t next = 0;  // the next outcome to report
     int failures = 0;
-    auto work = blake3pp::async::async_update_files(
-        ctx, paths, pool_.scheduler(), {.io = opts_.io},
-        [this](std::size_t) { return blake3pp::make_hasher(opts_.io); },
-        [&](std::size_t i, blake3pp::hasher& h,
-            const blake3pp::async::file_outcome& o) noexcept {
-          out[i] = describe(o, h, out_lens[i]);
-          for (; next < out.size() && out[next].has_value(); ++next) {
-            if (!report(next, *out[next])) {
-              failures++;
+    // The tracer is a type the sender carries, so the two spellings are
+    // two instantiations of the same call.
+    const auto run = [&](auto tracer) {
+      auto work = blake3pp::async::async_update_files(
+          ctx, paths, pool_.scheduler(), {.io = opts_.io},
+          [this](std::size_t) { return blake3pp::make_hasher(opts_.io); },
+          [&](std::size_t i, blake3pp::hasher& h,
+              const blake3pp::async::file_outcome& o) noexcept {
+            out[i] = describe(o, h, out_lens[i]);
+            for (; next < out.size() && out[next].has_value(); ++next) {
+              if (!report(next, *out[next])) {
+                failures++;
+              }
             }
-          }
-        });
-    blake3pp::async::sync_wait(ctx, std::move(work));
+          },
+          tracer);
+      blake3pp::async::sync_wait(ctx, std::move(work));
+    };
+    if (opts_.io.trace != nullptr) {
+      run(blake3pp::buffer_tracer{opts_.io.trace});
+    } else {
+      run(blake3pp::null_tracer{});
+    }
     return failures;
   }
 
@@ -431,6 +444,8 @@ int main(int argc, char** argv) {
   app.add_flag("--no-async", no_async, "read synchronously (no io_uring/IOCP/GCD queue)");
   app.add_flag("--inline-submit", inline_submit, "issue reads inline in the submitting thread, not on io_uring's workers");
   app.add_flag("--no-ioring", no_ioring, "Windows: read through the completion port instead of the I/O ring");
+  auto* trace_opt = app.add_option("--trace", o.trace_path, "record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)");
+  app.add_flag("--trace-agents", o.trace_agents, "with --trace: also record each pool agent's part of every window")->needs(trace_opt);
   app.add_option("files", o.files, "files to hash (or checksum lists)");
 
   CLI11_PARSE(app, argc, argv);
@@ -451,6 +466,31 @@ int main(int argc, char** argv) {
 
   int failures = 0;
   try {
+    // Trace storage is sized from the files up front: one record per
+    // window of each, with a spare for the short first window, and a size
+    // the filesystem will not give counts as two windows. The buffer
+    // outlives the engine, whose operations record into it; stdin and
+    // checksum lists are not traced.
+    std::vector<blake3pp::window_record> window_records;
+    std::vector<blake3pp::agent_record> agent_records;
+    std::optional<blake3pp::trace_buffer> trace;
+    if (!o.trace_path.empty()) {
+      const std::size_t window =
+          blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
+      std::size_t windows = 0;
+      for (const auto& f : o.files) {
+        std::error_code ec;
+        const std::uintmax_t size =
+            f == "-" ? 0 : std::filesystem::file_size(f, ec);
+        windows += ec ? 2 : static_cast<std::size_t>(size / window) + 2;
+      }
+      window_records.resize(windows);
+      if (o.trace_agents) {
+        agent_records.resize(windows * o.threads);
+      }
+      trace.emplace(std::span{window_records}, std::span{agent_records});
+      o.io.trace = &*trace;
+    }
     engine eng(o);
     if (o.files.empty()) {
       o.files.emplace_back("-");
@@ -488,6 +528,25 @@ int main(int argc, char** argv) {
           println(stderr, "blake3ppsum: {}: {}", f, e.what());
           failures++;
         }
+      }
+    }
+    if (trace) {
+      if (b3tool::write_chrome_trace(o.trace_path, *trace, "blake3ppsum",
+                                     o.threads)) {
+        println(stderr,
+                "blake3ppsum: trace: {} window records{}{}, JSON to {}",
+                trace->windows().size(),
+                o.trace_agents
+                    ? std::format(" and {} agent records",
+                                  trace->agents().size())
+                    : std::string{},
+                trace->dropped_windows() > 0
+                    ? std::format(" ({} dropped)", trace->dropped_windows())
+                    : std::string{},
+                o.trace_path);
+      } else {
+        println(stderr, "blake3ppsum: could not write {}", o.trace_path);
+        failures++;
       }
     }
   } catch (const std::exception& e) {

@@ -329,6 +329,41 @@ TEST_CASE("a preallocated write on Windows is sparse for the run and plain after
 }
 #endif
 
+// The write side records like the read side: one record per window with
+// the write's stages in the same stamps, admitted before filled, filled
+// before landed, landed before released; and one agent record per fill
+// when agent storage is given.
+TEST_CASE("a traced write_file records every window's stages") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::uint64_t size = 6 * win + 4321;
+  const std::size_t windows = (size + win - 1) / win;
+  std::vector<blake3pp::window_record> records(windows + 1);
+  std::vector<blake3pp::agent_record> agents(windows + 1);
+  blake3pp::trace_buffer trace(records, agents);
+  const temp_path out;
+  blake3pp::write_file(out.path, size, fill_from_offset, sched,
+                       {.window_bytes = win, .queue_depth = 3, .trace = &trace});
+  CHECK(hash_of(out.path) == expected_digest(size));
+  REQUIRE(trace.windows().size() == windows);
+  bool last_seen = false;
+  std::uint64_t bytes = 0;
+  for (const blake3pp::window_record& w : trace.windows()) {
+    CHECK(w.t_ready >= w.t_wait_begin);
+    CHECK(w.t_joined >= w.t_ready);
+    CHECK(w.t_absorbed >= w.t_joined);
+    CHECK(w.t_released >= w.t_absorbed);
+    CHECK(w.agents_active == 1);
+    CHECK(w.slot < 3);
+    bytes += w.bytes;
+    last_seen = last_seen || (w.flags & blake3pp::window_record::flag_last) != 0;
+  }
+  CHECK(bytes == size);
+  CHECK(last_seen);
+  CHECK(trace.agents().size() == windows);
+  CHECK(trace.driver().iterations > 0);
+}
+
 // A generator that throws, on the pool, inside a window already counted in
 // flight: the chain carries the exception, the run stops, and write_file
 // rethrows it. Nothing is submitted for that window before the fill, so the

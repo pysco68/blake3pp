@@ -69,12 +69,17 @@ struct window_record {
   /// this is the track a window's phases belong on when several are in
   /// flight; zero on the sequential path, which has one.
   std::uint32_t slot;
-  /// Zero.
-  std::uint32_t reserved;
+  /// The file's index in a many-files operation (async_update_files),
+  /// which fills one buffer with every file's windows; zero for a single
+  /// file.
+  std::uint32_t file;
 };
 
-/// One bulk invocation that compressed at least one part of a window.
-/// Opt-in: written only when the trace_buffer was given agent storage.
+/// One piece of a window's work on one agent: a bulk invocation that
+/// compressed at least one part, or the fold of the window's chaining
+/// values that ran on the agent that finished last (parts == 0), or on
+/// the write side one window's fill. Opt-in: written only when the
+/// trace_buffer was given agent storage.
 struct agent_record {
   /// window_record::index of the window this belongs to.
   std::uint64_t window;
@@ -86,15 +91,16 @@ struct agent_record {
   std::uint64_t min_part_ns;
   /// The longest part this invocation compressed.
   std::uint64_t max_part_ns;
-  /// Parts this invocation compressed.
+  /// Parts this invocation compressed; zero marks the fold that followed
+  /// the bulk, whose busy_ns is the fold's own time.
   std::uint32_t parts;
   /// Chunks per part (the same for every part of a window).
   std::uint32_t part_chunks;
   /// The CPU the invocation ran on at t_begin (sched_getcpu() on Linux);
   /// UINT32_MAX where the platform cannot say.
   std::uint32_t cpu;
-  /// Zero.
-  std::uint32_t reserved;
+  /// window_record::file of the window this belongs to.
+  std::uint32_t file;
 };
 
 /// What the thread driving the pipeline spent its own time on.

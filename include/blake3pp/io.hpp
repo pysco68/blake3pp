@@ -427,8 +427,12 @@ struct file_write_options {
   /// preallocates unwritten extents that read as zeros, and ignores the
   /// flag.
   bool waive_zero_fill = false;
-  // No trace field, unlike file_io_options: the write pipeline keeps no
-  // per-window records, so there would be nothing to record into.
+  /// Where to record per-window timing (<blake3pp/trace.hpp>) in the
+  /// forms that take a scheduler; nullptr records nothing, and the
+  /// sequential forms record nothing either. The stamps carry the write
+  /// side's stages: admitted, fill begun on an agent, fill done, write
+  /// landed, released. Not owned: the buffer outlives the call.
+  trace_buffer* trace = nullptr;
 };
 
 /// What a write_file() run did.

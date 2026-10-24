@@ -137,16 +137,24 @@ The rest describes the window:
 | `agent_busy_ns` | summed over the agents that took part: nanoseconds compressing |
 | `agents_active` | bulk invocations that compressed at least one part |
 | `slot` | which window object carried it — the track its phases belong on when several are in flight; 0 on the sequential path, which has one |
+| `file` | the file's index in a many-files operation (`async_update_files`), which fills one buffer with every file's windows; 0 for a single file |
 | `flags` | `flag_parallel` (fanned out over the scheduler), `flag_last` (reaches the end of the file), `flag_short_first` (the short window that brings a part-way hasher back onto a window boundary) |
 
 ### `agent_record`
 
-One bulk invocation over a window's parts: which window, when it started
-(`t_begin`), how long it was busy, how many parts it took, the shortest
-and longest of those parts, the chunks per part, and the CPU it was on at
-`t_begin` (`sched_getcpu()` on Linux, `UINT32_MAX` where the platform
-cannot say). Bytes compressed is `parts * part_chunks * chunk_size`, which
-over `busy_ns` is that invocation's effective rate.
+One piece of a window's work on one agent. For a bulk invocation over
+the window's parts: which window and file, when it started (`t_begin`),
+how long it was busy, how many parts it took, the shortest and longest of
+those parts, the chunks per part, and the CPU it was on at `t_begin`
+(`sched_getcpu()` on Linux, `UINT32_MAX` where the platform cannot say).
+Bytes compressed is `parts * part_chunks * chunk_size`, which over
+`busy_ns` is that invocation's effective rate. A record with `parts == 0`
+is the fold of the window's chaining values, which runs on the agent
+that finished the bulk last, and its `busy_ns` is the fold's own time; on
+the write side a record is one window's fill. In the Chrome trace each
+of these is a slice on its CPU's lane, named `compress`, `fold` or
+`fill`, with a flow arrow from the window's compute phase on the
+pipeline side, so selecting either end highlights the other.
 
 ### `driver_stats`
 
@@ -201,9 +209,13 @@ nothing to compress.
 
 `blake3pp_bench_file` is the worked example: it sizes the storage, prints
 a per-window summary and writes the run as Chrome trace JSON.
-`blake3ppsum` and `blake3ppgen` expose no tracing of their own; what they
-expose are the knobs a trace settles. See
-[Command-line tools](tools.md#tracing).
+`blake3ppsum --trace PATH` records the same way over its own path, the
+batch of files through `async_update_files`, every file's windows in one
+buffer with the file's index on each record. `blake3ppgen --trace PATH`
+records the write side on its pipelined path: the same five stamps, read
+as admitted, fill begun on an agent, fill done, write landed, released,
+which the JSON names `queue`, `fill`, `write` and `release`. Both take
+`--trace-agents`. See [Command-line tools](tools.md#tracing).
 
 ```
 --trace PATH      record per-window timing; summarize the last rep of each

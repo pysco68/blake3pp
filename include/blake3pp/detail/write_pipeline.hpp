@@ -48,6 +48,9 @@ struct write_options {
   // Resolved by the caller (resolve_write_queue_depth); a zero here is
   // clamped to the minimum like any other request.
   unsigned queue_depth = sequential_write_queue_depth;
+  // Where to record one window_record per window, with the write side's
+  // meaning of the stamps (trace.hpp); nullptr records nothing.
+  trace_buffer* trace = nullptr;
   ex::inplace_stop_token stop_token{};
 };
 
@@ -91,9 +94,11 @@ class write_scope
         window_bytes_(rounded_window_bytes(opts.window_bytes)),
         count_(plan_windows(total, window_bytes_, opts.queue_depth)),
         in_flight_cap_(clamp_queue_depth(opts.queue_depth)),
+        trace_(opts.trace),
         opts_stop_token_(opts.stop_token),
         windows_(std::make_unique<window[]>(count_)) {
     drv.reserve(count_, window_bytes_);
+    loop_.record_into(trace_);
     for (unsigned i = count_; i > 0; --i) {
       window& w = windows_[i - 1];
       w.slot = i - 1;
@@ -184,6 +189,7 @@ class write_scope
     unsigned slot = 0;
     bool writing = false;
     bool cancel_asked = false;
+    window_record* rec = nullptr;
   };
 
   struct scope_env {
@@ -253,9 +259,41 @@ class write_scope
   //
   // Nothing is submitted for this window before the fill, so a throw owes
   // the driver nothing.
-  void fill_window(window& w) { fill_(w.buffer.first(w.bytes), w.offset); }
+  void fill_window(window& w) {
+    // On an agent: the fill's two stamps, and with agent recording on,
+    // one agent record for the fill -- one part, on this CPU.
+    if (w.rec != nullptr) {
+      w.rec->t_ready = trace_->now();
+    }
+    fill_(w.buffer.first(w.bytes), w.offset);
+    if (w.rec != nullptr) {
+      const std::int64_t t_end = trace_->now();
+      w.rec->t_joined = t_end;
+      w.rec->agents_active = 1;
+      w.rec->agent_busy_ns = static_cast<std::uint64_t>(t_end - w.rec->t_ready);
+      if (agent_record* const a = trace_->claim_agent(); a != nullptr) {
+        a->window = w.rec->index;
+        a->file = 0;
+        a->t_begin = w.rec->t_ready;
+        a->busy_ns = w.rec->agent_busy_ns;
+        a->parts = 1;
+        a->min_part_ns = a->max_part_ns = w.rec->agent_busy_ns;
+        a->cpu = ~std::uint32_t{0};
+#if defined(__linux__)
+        if (const int c = ::sched_getcpu(); c >= 0) {
+          a->cpu = static_cast<std::uint32_t>(c);
+        }
+#endif
+      }
+    }
+  }
 
-  void landed(window& w) noexcept { w.writing = false; }
+  void landed(window& w) noexcept {
+    w.writing = false;
+    if (w.rec != nullptr) {
+      w.rec->t_absorbed = trace_->now();
+    }
+  }
 
   template <class Cells, class ConnectOne>
   void run_windows(Cells& cells, ConnectOne) {
@@ -296,6 +334,15 @@ class write_scope
     w.offset = next_offset_;
     w.bytes = static_cast<std::size_t>(
         std::min<std::uint64_t>(window_bytes_, total_ - next_offset_));
+    w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
+    if (w.rec != nullptr) {
+      *w.rec = window_record{};
+      w.rec->index = w.offset / window_bytes_;
+      w.rec->bytes = w.bytes;
+      w.rec->slot = w.slot;
+      w.rec->flags = w.offset + w.bytes == total_ ? window_record::flag_last : 0;
+      w.rec->t_wait_begin = trace_->now();
+    }
     const window_storage storage =
         loop_.driver().window_storage_for(file_, w.slot, w.offset, w.bytes);
     // A write needs somewhere to generate INTO, so a driver that hands out
@@ -351,6 +398,10 @@ class write_scope
   void finish_window(window& w) noexcept {
     w.writing = false;
     --in_flight_;
+    if (w.rec != nullptr) {
+      w.rec->t_released = trace_->now();
+      w.rec = nullptr;
+    }
     push_free(&w);
     settle();
   }
@@ -388,6 +439,7 @@ class write_scope
   std::size_t window_bytes_;
   unsigned count_;
   unsigned in_flight_cap_;
+  trace_buffer* trace_ = nullptr;
   ex::inplace_stop_token opts_stop_token_;
   std::unique_ptr<window[]> windows_;
 

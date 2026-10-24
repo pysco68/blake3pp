@@ -556,27 +556,38 @@ TEST_CASE("agent records account for every part of their window") {
     std::uint64_t parts = 0;
     std::uint64_t busy = 0;
     std::uint32_t active = 0;
+    std::uint32_t folds = 0;
     for (const auto& a : trace.agents()) {
       if (a.window != w.index) {
+        continue;
+      }
+      CHECK(a.file == 0);
+      CHECK(a.part_chunks == 16);
+      CHECK(a.t_begin >= w.t_ready);
+      CHECK(a.t_begin + static_cast<std::int64_t>(a.busy_ns) <= w.t_joined);
+      if (a.parts == 0) {
+        // The fold, on the agent that finished the bulk last: one per
+        // fanned-out window, after every bulk record's work.
+        ++folds;
+        CHECK(a.min_part_ns == 0);
+        CHECK(a.max_part_ns == 0);
         continue;
       }
       ++active;
       parts += a.parts;
       busy += a.busy_ns;
-      CHECK(a.parts >= 1);
-      CHECK(a.part_chunks == 16);
       CHECK(a.min_part_ns <= a.max_part_ns);
       const std::uint64_t floor_ns = a.min_part_ns * a.parts;
       CHECK(floor_ns <= a.busy_ns);
-      CHECK(a.t_begin >= w.t_ready);
-      CHECK(a.t_begin + static_cast<std::int64_t>(a.busy_ns) <= w.t_joined);
     }
     if (w.flags & blake3pp::window_record::flag_parallel) {
       CHECK(parts == w.bytes / blake3pp::chunk_size / 16);
       CHECK(busy == w.agent_busy_ns);
       CHECK(active == w.agents_active);
+      CHECK(folds == 1);
     } else {
       CHECK(active == 0);
+      CHECK(folds == 0);
     }
   }
 }

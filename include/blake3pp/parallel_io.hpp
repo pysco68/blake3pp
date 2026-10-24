@@ -114,7 +114,8 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
   detail::run_write_pipeline(drv, file, std::forward<Scheduler>(sched),
                              std::forward<Fill>(fill), size,
                              {.window_bytes = opts.window_bytes,
-                              .queue_depth = depth});
+                              .queue_depth = depth,
+                              .trace = opts.trace});
   return {.bytes = size, .backend = std::string(file.name())};
 }
 

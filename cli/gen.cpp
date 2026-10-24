@@ -35,6 +35,7 @@
 #include <blake3pp/parallel_io.hpp>
 
 #include "tool_common.hpp"
+#include "trace_json.hpp"
 
 namespace {
 
@@ -104,6 +105,8 @@ int main(int argc, char** argv) {
   bool inline_submit = false;
   bool no_ioring = false;
   bool waive_zero_fill = false;
+  std::string trace_path;
+  bool trace_agents = false;
   std::size_t window_mib = 0;
   unsigned qd = 0;
   bool verbose = false;
@@ -133,6 +136,8 @@ int main(int argc, char** argv) {
   app.add_flag("--inline-submit", inline_submit, "with --output: issue writes inline in the submitting thread, not on io_uring's workers")->needs(output_opt);
   app.add_flag("--no-ioring", no_ioring, "with --output, Windows: write through the completion port instead of the I/O ring")->needs(output_opt);
   app.add_flag("--waive-zero-fill", waive_zero_fill, "with --output, Windows: set the valid data length up front instead of writing a sparse file (needs the volume-maintenance privilege; exposes stale disk blocks until written)")->needs(output_opt);
+  auto* trace_opt = app.add_option("--trace", trace_path, "with --output and --length, on the pipelined path: record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)")->needs(output_opt);
+  app.add_flag("--trace-agents", trace_agents, "with --trace: also record which CPU filled each window, and for how long")->needs(trace_opt);
   app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 4 MiB per generator thread, so every fill fans out fully)")->needs(output_opt);
   app.add_option("--qd", qd, "with --output: write buffers in flight (default: one per generator thread, or 2 with --threads 1; the writer clamps it to its range)")->needs(output_opt);
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
@@ -216,13 +221,29 @@ int main(int argc, char** argv) {
       wopts.offload_submit = !inline_submit;
       wopts.ioring = !no_ioring;
       wopts.waive_zero_fill = waive_zero_fill;
-      // One window per thread, so every core has a window to generate
-      // into, each the size one task used to fill. The depth is the
-      // pool's own size rather than the library's automatic one, which
-      // counts the machine's threads and not this pool's.
+      // One window per thread, each one segment, so every thread has a
+      // window to generate into. The depth is this pool's size: the
+      // library's automatic depth counts the machine's threads.
       wopts.window_bytes = window_mib > 0 ? window_mib * 1024 * 1024 : segment;
       wopts.queue_depth = qd > 0 ? qd : threads;
       const std::uint64_t total = *remaining.total();
+      // One record per window, and with --trace-agents one agent record
+      // per window, since a fill is one agent's work.
+      std::vector<blake3pp::window_record> window_records;
+      std::vector<blake3pp::agent_record> agent_records;
+      std::optional<blake3pp::trace_buffer> trace;
+      if (!trace_path.empty()) {
+        const std::size_t window =
+            blake3pp::detail::rounded_window_bytes(wopts.window_bytes);
+        const std::size_t windows =
+            static_cast<std::size_t>((total + window - 1) / window) + 1;
+        window_records.resize(windows);
+        if (trace_agents) {
+          agent_records.resize(windows);
+        }
+        trace.emplace(std::span{window_records}, std::span{agent_records});
+        wopts.trace = &*trace;
+      }
       const blake3pp::write_report report = blake3pp::write_file(
           output, total,
           [&stream, seek](std::span<std::byte> out,
@@ -236,6 +257,20 @@ int main(int argc, char** argv) {
         println(stderr, "blake3ppgen: write backend: {} (pipeline)",
                 report.backend);
       }
+      if (trace) {
+        if (b3tool::write_chrome_trace(trace_path, *trace, "blake3ppgen",
+                                       threads, /*write_side=*/true)) {
+          println(stderr, "blake3ppgen: trace: {} window records{}, JSON to {}",
+                  trace->windows().size(),
+                  trace_agents ? std::format(" and {} agent records",
+                                             trace->agents().size())
+                               : std::string{},
+                  trace_path);
+        } else {
+          println(stderr, "blake3ppgen: could not write {}", trace_path);
+          return b3tool::exit_failure;
+        }
+      }
     } catch (const std::exception& e) {
       println(stderr, "blake3ppgen: {}", e.what());
       return b3tool::exit_failure;
@@ -244,6 +279,11 @@ int main(int argc, char** argv) {
   }
 
   if (output != "-") {
+    if (!trace_path.empty()) {
+      println(stderr,
+              "blake3ppgen: --trace records the pipelined path only (a known "
+              "--length and more than one thread); nothing written");
+    }
     // File sink, sequential: the generator fills one of the writer's
     // O_DIRECT-aligned buffers at a time and the next fills while the
     // device drains this one. This is the path for a one-thread pool, and

@@ -52,6 +52,10 @@ OPTIONS:
                               workers
           --no-ioring         Windows: read through the completion port instead of the I/O
                               ring
+          --trace TEXT        record per-window timing and write it as Chrome trace JSON to
+                              PATH (open in ui.perfetto.dev)
+          --trace-agents Needs: --trace
+                              with --trace: also record each pool agent's part of every window
 ```
 
 ```bash
@@ -104,6 +108,13 @@ OPTIONS:
                               with --output, Windows: set the valid data length up front
                               instead of writing a sparse file (needs the volume-maintenance
                               privilege; exposes stale disk blocks until written)
+          --trace TEXT Needs: --output
+                              with --output and --length, on the pipelined path: record
+                              per-window timing and write it as Chrome trace JSON to PATH (open
+                              in ui.perfetto.dev)
+          --trace-agents Needs: --trace
+                              with --trace: also record which CPU filled each window, and for
+                              how long
           --window UINT Needs: --output
                               with --output: write buffer size in MiB (default: 4 MiB per
                               generator thread, so every fill fans out fully)
@@ -146,8 +157,11 @@ gets measured against itself.
 
 ## Tracing
 
-Neither tool records a trace of its own. What they expose are the knobs a
-trace settles: `--window`, `--qd`, `--threads`, `--no-direct` and
+Both tools record their run as Chrome trace JSON with `--trace PATH` (and
+`--trace-agents`): `blake3ppsum` its batch path, a directory of files as
+their windows across the context's window objects; `blake3ppgen` its
+pipelined write path, each window's queue, fill, write and release. What
+they also expose are the knobs a trace settles: `--window`, `--qd`, `--threads`, `--no-direct` and
 `--inline-submit`, the same names on both, and the same pipeline
 underneath. `blake3ppgen -v` names the write backend that was engaged;
 that is as much as either tool says about the pipeline it ran.
