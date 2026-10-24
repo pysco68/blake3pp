@@ -12,7 +12,7 @@
 # would have the instruction set but not the system calls.
 FROM base
 
-ARG ZIG_VERSION=0.16.0
+ARG ZIG_VERSION=0.17.0
 RUN set -eux; \
     curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
       -o /tmp/zig.tar.xz; \
@@ -35,7 +35,7 @@ RUN set -eux; \
 #
 # Host binutils is here for the FreeBSD lanes' strip: zig ships no
 # strip of its own (`zig objcopy --strip-all` answers "unimplemented"
-# on 0.16) and the base image carries none, while the freebsd-zig-cxx23
+# on 0.17) and the base image carries none, while the freebsd-zig-cxx23
 # binaries are 189 MB unstripped and 10 MB stripped, which is the
 # difference between a sensible artifact and a silly one. The target is
 # ELF with a FreeBSD OSABI byte, which GNU strip handles without

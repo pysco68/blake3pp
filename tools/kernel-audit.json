@@ -226,7 +226,7 @@
         "forbid": [
           {
             "name": "z14/z15 vector",
-            "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)"
+            "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld$|vsrd$|vstrs|vcsfp|vcfps|vclfp|vcefp)"
           }
         ]
       },
@@ -241,7 +241,7 @@
     "binary": [
       {
         "name": "z14/z15 vector",
-        "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld|vsrd|vstrs|vcsfp|vcfps|vclfp|vcefp)",
+        "mnemonic": "^(vlbr|vstbr|vlbrrep|vllebrz|vlebr|vstebr|vnx|vnn|voc|vmsl|vbperm|vfmin|vfmax|vfnms|vfnma|vlrl|vstrl|vsld$|vsrd$|vstrs|vcsfp|vcfps|vclfp|vcefp)",
         "outside": "kern::vxe"
       }
     ]
