@@ -505,6 +505,27 @@ class ioring_context {
 #endif
   }
 
+  // This context's rung and the one it degrades to, declared for the
+  // ladder walk in src/io/io_engines.cpp. Note that this is the ladder
+  // INSIDE one ioring_context -- a ring it cannot have leaves its own
+  // transfers on ReadFile. windows_context composes a second one on top,
+  // putting the completion port between the two, and declares that.
+  static constexpr io_engine rung_engine = io_engine::ioring;
+  using rung_below = win_sync_rung;
+
+  // Settled unless the machine might hand over a ring next time. An
+  // absent API and a version below 3 are properties of this Windows; a
+  // CreateIoRing or event failure is a resource error, and a caller that
+  // asks again may well get one.
+  [[nodiscard]] rung_verdict engaged_rung() const noexcept {
+    if (use_ring_) {
+      return {rung_engine, true};
+    }
+    const ioring_refusal::kind why = refusal().why;
+    return {rung_below::rung_engine,
+            why == ioring_refusal::no_api || why == ioring_refusal::old_version};
+  }
+
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    transfer& op) {
     arm(op, f, off, buf.size());

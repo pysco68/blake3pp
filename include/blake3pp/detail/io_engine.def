@@ -1,0 +1,72 @@
+// The one list of I/O engines. The public enum, the two name strings
+// and the preference order are all generated from it, the same way
+// detail/arch.def generates the kernel variants. Define
+// BLAKE3PP_IO_ENGINE(enumerator, "read", "write", rank, async) and
+// include this file; there is no include guard, on purpose.
+//
+// Two orders live here, and they are not the same order:
+//   * LINE ORDER is ABI order. The enum's underlying values follow it,
+//     so entries are APPEND-ONLY: never reorder, never insert, never
+//     remove.
+//   * RANK is the preference, lower wins, unique (asserted in
+//     src/io/io_engines.cpp). Ranks are spaced by 10, so a reordering
+//     is a one-number edit with no ABI consequence. Most of the ranking
+//     is within a platform: src/io/backend_select.hpp compiles one
+//     native engine per OS plus the synchronous rung it degrades to.
+//     Windows is the exception, carrying both the ring and the port,
+//     and the ring is preferred.
+//
+// The two names are what the backends' own name_for() builds a rung
+// name from, read side and write side (src/io/*_backend.hpp). They are
+// API: `file_io_probe::backend` and `write_report::backend` have always
+// been spelled this way, and to_string() says the same words from this
+// table. A backend may decorate the name -- "+direct", "+nocache",
+// "+regbuf", " [io_uring: ENOSYS, kernel too old]" -- after the engine
+// token; the token itself is what is here.
+//
+// `async` marks the engines a caller gives up with --no-async: the ones
+// that hand a transfer to the OS and collect a completion later. It is
+// a column rather than something inferred from the rank so that the
+// tools' --no-async help text can be built from it.
+//
+// The /// comments are the enumerators' documentation; they attach to
+// the enum's members through the macro expansion.
+
+/// Linux io_uring: submission and completion queues shared with the
+/// kernel, O_DIRECT where the filesystem grants it. Available where
+/// io_uring_setup() succeeds -- a kernel new enough, and no seccomp or
+/// container policy blocking it.
+BLAKE3PP_IO_ENGINE(io_uring, "io_uring", "io_uring", 10, 1)
+/// Windows I/O ring (ioringapi.h, Windows 11): the submission-queue
+/// model io_uring introduced. Available at IORING_VERSION_3 and above;
+/// older Windows falls to the completion port.
+BLAKE3PP_IO_ENGINE(ioring, "ioring", "ioring", 20, 1)
+/// Windows I/O completion port: overlapped handles against one port.
+/// Every Windows that runs this code has one, so it is the platform's
+/// async floor rather than a rung that can be refused.
+BLAKE3PP_IO_ENGINE(iocp, "iocp", "iocp", 30, 1)
+/// macOS Grand Central Dispatch: each transfer a block on a concurrent
+/// queue, with F_NOCACHE for the bypass. The write side spells itself
+/// "gcd-write": reads and writes take different paths through
+/// libdispatch, and a trace has to tell them apart.
+BLAKE3PP_IO_ENGINE(gcd, "gcd", "gcd-write", 40, 1)
+/// FreeBSD POSIX AIO (lio_listio) with completions on a kqueue.
+/// Available where the kqueue opens and the per-process queue is open
+/// (vfs.aio.max_aio_queue_per_proc non-zero and the facility in the
+/// kernel). It is the one async engine a stock install can refuse
+/// outright, and the one whose refusal an administrator can undo while
+/// the process runs.
+BLAKE3PP_IO_ENGINE(aio, "aio", "aio", 50, 1)
+/// Synchronous positional POSIX I/O: pread/pwrite on the calling
+/// thread, with the O_DIRECT reopen where the platform offers it. Every
+/// POSIX async engine degrades to this, and it is the whole engine on a
+/// POSIX system with none of them.
+BLAKE3PP_IO_ENGINE(posix_sync, "pread", "pwrite", 60, 0)
+/// Synchronous Windows I/O: ReadFile/WriteFile on the calling thread,
+/// with FILE_FLAG_NO_BUFFERING where it was asked for and granted. Both
+/// Windows async engines degrade to this.
+BLAKE3PP_IO_ENGINE(win_sync, "readfile", "writefile", 70, 0)
+/// Buffered C stdio: the portable floor for a platform with none of the
+/// above (wasm, say). Nothing degrades to it; it is the fixed answer
+/// where it is the only engine compiled.
+BLAKE3PP_IO_ENGINE(stdio, "stdio", "stdio", 80, 0)

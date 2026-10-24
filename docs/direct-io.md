@@ -163,7 +163,16 @@ instead, automatically: asking for `direct_io = true` and having it
 refused is not an error, and nothing throws because the device could not
 be bypassed. Which rung was engaged is reported after the fact.
 
-Every reader and writer names the rung it landed on:
+Every reader and writer names the rung it landed on. A name starts
+with an engine token and continues with the decorations that open
+earned. The token comes from `include/blake3pp/detail/io_engine.def`,
+which also generates the `blake3pp::io_engine` enum and
+`to_string()`; `compiled_io_engines()`, `available_io_engines()` and
+`best_io_engine()` give the same words without opening anything. The
+spellings below document the decorations. Code that compares a token
+should get it from `to_string()`, not from this page. The cache bypass
+and whether one open kept its engine need a path: that is
+`probe_file_io()`. See [the API reference](api.md).
 
 - `blake3pp::probe_file_io(path, opts)` answers before any read: it opens
   the file as `update_file()` would, returns the plan's geometry, whether
@@ -186,7 +195,7 @@ Every reader and writer names the rung it landed on:
   (next section).
 
 `"stdio"` is not a rung anything degrades to: it is the fixed answer on
-platforms with none of the three async engines (wasm), and on no other
+platforms with none of the five async engines (wasm), and on no other
 platform. `" (inline submit)"` is appended on
 Linux when `offload_submit` was turned off. When the async engine itself
 was asked for and refused, not just the cache bypass -- a kernel too old
@@ -282,8 +291,13 @@ bet stops paying off, or actively costs, in a few shapes:
   different machines, so what the pair shows is a pre-7.0 kernel path
   that is gone on 7.0 rather than one device measured twice; whether a
   given kernel still in use has it is a question for that kernel.
-  Buffered above about 6 GiB/s is a separate open item, and
-  [Performance](performance.md#direct-against-buffered) has both.
+  Above that rate the buffered path was limited by this pipeline rather
+  than by any kernel, and is not any more: holding one window at a time
+  left one buffered read outstanding and so one io-wq worker copying, and
+  the same z3 machine on one kernel build reads 3.48 GiB/s raw buffered at
+  the old depth against 8.21 with several windows in flight, 91% of its
+  direct rate. [Performance](performance.md#direct-against-buffered) has
+  the pair.
   On Windows and on macOS the two measure the same, closely enough that an
   M4 Max reads 6.12 GiB/s buffered against 5.86 direct -- buffered 4%
   ahead of `F_NOCACHE`.

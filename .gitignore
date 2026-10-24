@@ -18,3 +18,7 @@ _site/
 # recipe rather than its output).
 docker/.artifacts/*
 !docker/.artifacts/.gitkeep
+
+# Claude Code's working directory: agent worktrees and session scratch,
+# created and removed by tooling. Nothing in it belongs to the project.
+.claude/

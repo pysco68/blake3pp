@@ -1146,7 +1146,7 @@ jobs:
         run: |
           set -euo pipefail
           bash tools/freebsd-guest.sh run '/root/b3/cli/blake3ppsum --version' | tee version.txt
-          sel=$(sed -n 's/.*(auto -> \(.*\))$/\1/p' version.txt | tail -1)
+          sel=$(sed -n 's/^variants: .*(auto -> \(.*\))$/\1/p' version.txt | tail -1)
           echo "dispatch selected: ${sel}"
           case "${sel}" in
             sve2_*) echo "an SVE2 kernel, as the guest's CPU model promises" ;;

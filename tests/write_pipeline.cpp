@@ -13,6 +13,7 @@
 #include <chrono>
 #include <filesystem>
 #include <random>
+#include <ratio>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,7 @@
 #include <blake3pp/parallel.hpp>
 #include <blake3pp/parallel_backend.hpp>
 #include <blake3pp/parallel_io.hpp>
+#include <blake3pp/trace.hpp>
 
 #include "test_schedulers.hpp"
 #include <doctest/doctest.h>
@@ -87,15 +89,23 @@ struct temp_path {
   return ec ? ~std::uintmax_t{0} : n;
 }
 
-// A driver with no device under it, for the cases a real one only
-// produces by luck: completion out of order, a short write, a failure at
-// one chosen window.
+// A scripted driver, for the cases a real one only produces by luck:
+// completion out of order, a short write, a failure or a stop at one
+// chosen window, and optionally a modelled device under the sink.
 struct write_script {
   std::vector<unsigned> order{};   // preference by window index
   std::size_t piece_bytes = 0;     // 0 writes a window in one go
   int fail_at_window = -1;
   int stop_at_window = -1;
   blake3pp::ex::inplace_stop_source* stop_source = nullptr;
+  // A device under the sink, instead of writes that land the instant
+  // they are polled. One FIFO server holding each write for service_ns,
+  // plus a propagation delay of (knee - 1) service times, so the rate
+  // rises with the writes in flight up to `knee` and is flat above it.
+  // Zero service is no device at all, which is what every other case
+  // wants.
+  std::int64_t service_ns = 0;
+  unsigned knee = 1;
 };
 
 class fake_write_driver {
@@ -133,7 +143,7 @@ class fake_write_driver {
 
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
                     detail::io_op& op) {
-    queued_.push_back(write{&op, off, buf, 0});
+    queued_.push_back(write{&op, off, buf, 0, false, device_ready()});
     op.live = true;  // the driver owes this one a callback now
   }
 
@@ -150,6 +160,9 @@ class fake_write_driver {
     }
     const std::size_t pick = choose();
     write& w = queued_[pick];
+    if (!await_device(w)) {
+      return 0;
+    }
     const auto index = static_cast<unsigned>(w.off / window_);
     if (script_.stop_at_window >= 0 && script_.stop_source != nullptr &&
         index == static_cast<unsigned>(script_.stop_at_window)) {
@@ -227,7 +240,53 @@ class fake_write_driver {
     std::span<const std::byte> buf;
     std::size_t done;
     bool cancelled = false;
+    // When the modelled device would land this one; 0 for no device.
+    std::int64_t ready = 0;
   };
+
+  [[nodiscard]] static std::int64_t device_now() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  // When a write submitted now would land: the server takes it as soon
+  // as it is free, holds it for service_ns, and the completion arrives
+  // a propagation delay later. Assigned at submission, which is what
+  // makes the service of several writes overlap and the rate rise with
+  // the depth. Zero means no device: the write lands on the next poll.
+  [[nodiscard]] std::int64_t device_ready() noexcept {
+    if (script_.service_ns <= 0) {
+      return 0;
+    }
+    const std::int64_t latency =
+        static_cast<std::int64_t>(script_.knee > 1 ? script_.knee - 1 : 0) *
+        script_.service_ns;
+    const std::int64_t start = std::max(device_now(), server_free_);
+    server_free_ = start + script_.service_ns;
+    return server_free_ + latency;
+  }
+
+  // Holds a completion back until the device would have it. False
+  // leaves the write queued for a later poll. The order script is not
+  // combined with a device: the server is FIFO, so submission order is
+  // completion order.
+  bool await_device(const write& w) {
+    if (w.ready == 0) {
+      return true;
+    }
+    const std::int64_t left = w.ready - device_now();
+    if (left > 0) {
+      // One service time at most. Sleeping the whole way would park the
+      // driver thread through the rounds that admit the next windows,
+      // which caps the concurrency at whatever one sleep allows and
+      // makes the modelled device's depth meaningless.
+      std::this_thread::sleep_for(
+          std::chrono::nanoseconds(std::min(left, script_.service_ns)));
+      return false;
+    }
+    return true;
+  }
 
   [[nodiscard]] std::size_t choose() const noexcept {
     std::size_t best = 0;
@@ -259,6 +318,8 @@ class fake_write_driver {
   std::size_t stride_ = 0;
   std::uint64_t final_size_ = ~std::uint64_t{0};
   std::vector<write> queued_;
+  // The modelled device's one server: when it is next free.
+  std::int64_t server_free_ = 0;
   std::mutex m_;
   std::condition_variable cv_;
   bool woken_ = false;
@@ -328,6 +389,41 @@ TEST_CASE("a preallocated write on Windows is sparse for the run and plain after
   }
 }
 #endif
+
+// The write side records like the read side: one record per window with
+// the write's stages in the same stamps, admitted before filled, filled
+// before landed, landed before released; and one agent record per fill
+// when agent storage is given.
+TEST_CASE("a traced write_file records every window's stages") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::uint64_t size = 6 * win + 4321;
+  const std::size_t windows = (size + win - 1) / win;
+  std::vector<blake3pp::window_record> records(windows + 1);
+  std::vector<blake3pp::agent_record> agents(windows + 1);
+  blake3pp::trace_buffer trace(records, agents);
+  const temp_path out;
+  blake3pp::write_file(out.path, size, fill_from_offset, sched,
+                       {.window_bytes = win, .queue_depth = 3, .trace = &trace});
+  CHECK(hash_of(out.path) == expected_digest(size));
+  REQUIRE(trace.windows().size() == windows);
+  bool last_seen = false;
+  std::uint64_t bytes = 0;
+  for (const blake3pp::window_record& w : trace.windows()) {
+    CHECK(w.t_ready >= w.t_wait_begin);
+    CHECK(w.t_joined >= w.t_ready);
+    CHECK(w.t_absorbed >= w.t_joined);
+    CHECK(w.t_released >= w.t_absorbed);
+    CHECK(w.agents_active == 1);
+    CHECK(w.slot < 3);
+    bytes += w.bytes;
+    last_seen = last_seen || (w.flags & blake3pp::window_record::flag_last) != 0;
+  }
+  CHECK(bytes == size);
+  CHECK(last_seen);
+  CHECK(trace.agents().size() == windows);
+  CHECK(trace.driver().iterations > 0);
+}
 
 // A generator that throws, on the pool, inside a window already counted in
 // flight: the chain carries the exception, the run stops, and write_file
@@ -407,6 +503,26 @@ TEST_CASE("an automatic write depth follows the threads within the budget") {
   // A request outranks the budget: the caller stated it.
   CHECK(resolve_write_queue_depth(64, 64 * mib, 32) == 64);
   static_assert(resolve_write_queue_depth(0, 8 * mib, 32) == 32);
+}
+
+// The depth the device sees is the depth the caller asked for, and the
+// run reports it back the way a read run does.
+TEST_CASE("a fixed write depth is the depth, start to finish") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::uint64_t size = 96 * win;
+
+  blake3pp::trace_buffer trace{std::span<blake3pp::window_record>{}};
+  fake_write_driver drv(size, win, {});
+  fake_write_driver::file f(drv);
+  detail::run_write_pipeline(drv, f, sched, fill_from_offset, size,
+                             {.window_bytes = win,
+                              .queue_depth = 4,
+                              .trace = &trace});
+  CHECK(drv.final_size() == size);
+  const auto& d = trace.driver();
+  CHECK(d.queue_depth_final == 4);
+  CHECK(d.queue_depth_peak == 4);
 }
 
 // The sequential forms take the same generator without a scheduler: the
@@ -650,6 +766,106 @@ TEST_CASE("a real write pipeline stops mid-file with writes in flight") {
     }
   }
   MESSAGE("stopped mid-file on " << stopped << " of " << attempts);
+}
+
+// --- The diagnosis blake3ppgen prints (blake3pp::diagnose_write) -----------
+//
+// The write side's readings differ from the read side's. The pool FILLS
+// windows and the device drains them, so the arena and the queue depth
+// are the same number (one window is one fill task) and there is no
+// arena reading: the two candidates share those windows, and the reading
+// is which held them longer. As on the read side, the runs here assert
+// the geometry and the counters, and tests/diagnosis.cpp the readings.
+namespace {
+
+template <class Scheduler>
+[[nodiscard]] blake3pp::diagnosis diagnose_write_run(
+    Scheduler sched, std::size_t win, std::uint64_t size, unsigned depth,
+    unsigned threads, write_script script = {}) {
+  blake3pp::trace_buffer trace{std::span<blake3pp::window_record>{}};
+  fake_write_driver drv(size, win, script);
+  fake_write_driver::file f(drv);
+  const auto t0 = std::chrono::steady_clock::now();
+  detail::run_write_pipeline(drv, f, std::move(sched), fill_from_offset, size,
+                             {.window_bytes = win,
+                              .queue_depth = depth,
+                              .trace = &trace});
+  const double wall_ns = std::chrono::duration<double, std::nano>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+  REQUIRE(drv.final_size() == size);
+  return blake3pp::diagnose_write(trace.driver(), wall_ns, threads, win);
+}
+
+// doctest streams a const char* as a pointer, so the line is built as a
+// string first.
+void report_write(const char* name, const blake3pp::diagnosis& r) {
+  const auto pct = [](double v) {
+    return std::to_string(static_cast<int>(100.0 * v)) + "%";
+  };
+  const std::string line =
+      std::string(name) + ": " + blake3pp::to_string(r.label) + " (fill " +
+      pct(r.fill_busy) + " of depth " + std::to_string(r.depth) +
+      ", device " + pct(r.device_busy) + ", queued " + pct(r.device_queued) +
+      ")";
+  MESSAGE(line);
+}
+
+}  // namespace
+
+TEST_CASE("a sink faster than the generator feeds the diagnosis coherent counters") {
+  // The device takes a window the instant it is polled, so the windows
+  // in flight spend their lives being filled, by one agent. The reading,
+  // generator-limited, compares the fill's and the device's shares of the
+  // wall clock, which load moves; it is asserted in tests/diagnosis.cpp
+  // against hand-built counters. The run asserts the geometry and that
+  // the counters cohere.
+  b3test::one_thread_pool pool;
+  constexpr std::size_t win = 256 * 1024;
+  const std::uint64_t size = 48 * win;
+
+  const auto r = diagnose_write_run(pool.get_scheduler(), win, size, 4, 1);
+  report_write("instant sink", r);
+  CHECK(r.arena_is_depth);
+  CHECK(r.depth == 4);
+  CHECK(r.measured());
+  CHECK(r.transfers == 48u);
+  CHECK(r.fill_busy > 0.0);
+  CHECK(r.fill_busy <= 1.0);
+  CHECK(r.device_busy >= 0.0);
+  CHECK(r.device_busy <= 1.0);
+}
+
+TEST_CASE("a slow sink feeds the diagnosis coherent counters on the write side") {
+  // One server holding each write for 8 ms against the whole pool
+  // generating. The reading, device-limited, turns on the device's queue
+  // share and on the fill's and the device's shares of the wall clock,
+  // which load moves; it is asserted in tests/diagnosis.cpp. The run
+  // asserts the geometry, the counters, and the floor the device model
+  // guarantees.
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  constexpr std::int64_t service_ns = 8'000'000;
+  const std::uint64_t size = 48 * win;
+
+  const auto r =
+      diagnose_write_run(sched, win, size, 2,
+                         std::thread::hardware_concurrency(),
+                         {.service_ns = service_ns, .knee = 1});
+  report_write("slow sink", r);
+  CHECK(r.arena_is_depth);
+  CHECK(r.depth == 2);
+  CHECK(r.measured());
+  CHECK(r.long_enough());
+  CHECK(r.transfers == 48u);
+  // A write is timed from the moment it is handed to the driver, and
+  // the device holds it at least one service time: load can only add.
+  CHECK(r.min_service_ns >= static_cast<std::uint64_t>(service_ns));
+  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.fill_busy >= 0.0);
+  CHECK(r.fill_busy <= 1.0);
+  CHECK(r.device_busy > 0.0);
+  CHECK(r.device_busy <= 1.0);
 }
 
 }  // TEST_SUITE

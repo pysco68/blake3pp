@@ -23,6 +23,10 @@ namespace blake3pp::detail::io_impl {
 // backend.hpp supplies the deferred list, the poll loop and the wake).
 class pread_source {
  public:
+  // The engine this source is, for sync_context's rung declaration; the
+  // word name() below spells, from the one table that spells it.
+  static constexpr io_engine rung_engine = io_engine::posix_sync;
+
   pread_source(const std::filesystem::path& path,
                const file_open_options& how)
       : write_(how.write) {

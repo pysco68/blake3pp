@@ -37,6 +37,7 @@ add_executable(blake3pp_tests
   subtree_fold.cpp
   tree_reducer.cpp
   contracts.cpp
+  diagnosis.cpp
   unwinder.cpp
   "${vectors_hpp}")
 # The io suite tests hash_file and the backend engines; without the

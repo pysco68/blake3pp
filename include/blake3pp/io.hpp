@@ -35,6 +35,7 @@
 #include <array>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -58,10 +59,17 @@ struct file_io_options {
   /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
   /// multiple of chunk_size, minimum 64 KiB.
   std::size_t window_bytes = detail::default_window_bytes;
-  /// Windows in flight at once, four by default; clamped to [2, 256]. Each
-  /// costs window_bytes of arena plus its own tables, which is what the
-  /// ceiling guards (and BLAKE3PP_MAX_QUEUE_DEPTH moves); the measured
-  /// sweet spot on every device so far is four to eight.
+  /// Reads in flight at once, four by default; clamped to [2, 256]. Each
+  /// window costs window_bytes of arena plus its own tables, which is what
+  /// the ceiling guards (and BLAKE3PP_MAX_QUEUE_DEPTH moves). The
+  /// sequential forms allocate exactly this many windows.
+  ///
+  /// The forms that take a scheduler allocate more. The depth is what the
+  /// device sees; the window objects behind it are what the hash pool draws
+  /// work from while the device serves the next reads, and on a fast device
+  /// they are worth more than the depth is. Their number follows the
+  /// machine's thread count (detail::read_plan_budget_bytes), and
+  /// docs/pipeline.md carries the measurement.
   unsigned queue_depth = detail::default_queue_depth;
   /// Bypass the page cache where the platform supports it; degrades to
   /// buffered reads where it does not. A file below 512 KiB
@@ -76,11 +84,14 @@ struct file_io_options {
   /// whenever they can, so this asks for the hand-off explicitly. Ignored
   /// where the platform has no such notion.
   bool offload_submit = true;
-  /// Queue reads asynchronously (io_uring, IOCP, GCD) where the platform
-  /// offers it; off reads them synchronously inside the same poll, which is
-  /// what a platform offering none does anyway. Which rung was engaged is
-  /// reported after the fact: read_backend(trace.driver()) for a read,
-  /// write_report::backend for a write.
+  /// Queue reads asynchronously where the platform offers it; off reads
+  /// them synchronously inside the same poll, which is what a platform
+  /// with no async engine does anyway. The engines this gives up are
+  /// the ones is_async() marks; for a given build,
+  /// compiled_io_engines() filtered by is_async() names them. Which
+  /// rung was engaged is reported after the fact:
+  /// read_backend(trace.driver()) for a read, write_report::backend for
+  /// a write.
   bool async = true;
   /// Windows: prefer the I/O ring (Windows 11, `ioringapi.h`) over the
   /// completion port where the machine has one. Off selects the port,
@@ -336,11 +347,17 @@ struct file_io_probe {
   /// and to a size the filesystem would not give.
   bool direct_io = false;
   /// The rung the open landed on, spelled as write_report::backend is:
-  /// "io_uring+direct", "iocp", "gcd+nocache", "pread", "readfile",
-  /// "stdio", with " (inline submit)" where offload_submit was off and the
-  /// reason appended where the async engine was asked for and refused.
+  /// an engine token as to_string(io_engine) gives it ("io_uring",
+  /// "ioring", "iocp", "gcd", "aio", "pread", "readfile", "stdio"),
+  /// then "+direct" or "+nocache" where the cache bypass engaged, then
+  /// " (inline submit)" where offload_submit was off and the reason
+  /// appended where the async engine was asked for and refused.
   /// Where the bypass was asked for and the filesystem declined it, this
   /// says so by naming the buffered rung while direct_io above is true.
+  ///
+  /// The leading token is an engine name: to_string(io_engine) spells the
+  /// same words from the same table, so `backend` and best_io_engine()
+  /// agree for a file that got what a fresh open engages.
   std::string backend;
 };
 
@@ -366,6 +383,102 @@ struct file_io_probe {
                                           std::error_code& ec,
                                           const file_io_options& opts = {}) noexcept;
 
+/// An I/O engine: the mechanism that moves a window of bytes between
+/// the device and memory.
+///
+/// A build carries one native engine per platform plus the synchronous
+/// rung it degrades to, except on Windows, which carries both the I/O
+/// ring and the completion port and chooses when a context opens.
+/// compiled_io_engines() lists what this binary has,
+/// available_io_engines() those the running kernel grants, and
+/// best_io_engine() the one a fresh open uses. None of the three needs
+/// a path; probe_file_io() is for what does.
+///
+/// The enumerators, their two name spellings and the preference order
+/// come from detail/io_engine.def, which documents each entry. Its line
+/// order is the ABI order and is append-only.
+enum class io_engine : std::uint8_t {
+#define BLAKE3PP_IO_ENGINE(enumerator, read_name, write_name, rank, async) \
+  enumerator,
+#include <blake3pp/detail/io_engine.def>
+#undef BLAKE3PP_IO_ENGINE
+};
+
+/// Which half of an engine a name is being asked for.
+///
+/// Three engines spell the two directions differently: "pread" against
+/// "pwrite", "readfile" against "writefile", and "gcd" against
+/// "gcd-write", because reads and writes take different paths through
+/// libdispatch. Pass it to to_string() where the bytes went the other
+/// way; the default is the read spelling.
+enum class io_direction : std::uint8_t { read, write };
+
+/// True if the engine is in this binary and the running kernel grants
+/// it, which is the same as saying available_io_engines() names it.
+///
+/// There is no os_supports() beside this, as there is a cpu_supports()
+/// beside the dispatch twin: the code that asks the kernel about an
+/// engine is the backend itself, so a build without that backend has
+/// nothing to ask with.
+/// @param e  Any engine.
+[[nodiscard]] bool is_available(io_engine e) noexcept;
+
+/// The engine a fresh open uses on this machine, which is
+/// available_io_engines().front().
+///
+/// One FILE may still land lower: a filesystem can refuse the cache
+/// bypass, and a length the engine will not take asynchronously goes
+/// down a rung. probe_file_io() reports that, for a path.
+[[nodiscard]] io_engine best_io_engine() noexcept;
+
+/// The engines in this binary, best-first, ending with the synchronous
+/// rung the others degrade to.
+///
+/// The list is the degradation ladder itself, read off the backend
+/// types the platform selected: each declares the engine it is and the
+/// rung it defers to. An engine appears only if its code is really
+/// here, so Windows reports the ring and the port where it has both,
+/// and the port alone where <ioringapi.h> was not in the SDK.
+[[nodiscard]] std::span<const io_engine> compiled_io_engines() noexcept;
+
+/// The engines this kernel grants, best-first; never empty, and its
+/// front() is best_io_engine().
+///
+/// Answered by constructing the platform's own context with the
+/// smallest resources it will take and reading back which rung it
+/// engaged. The answer is kept only where the backend says it cannot
+/// change: a kernel without io_uring will not grow one, but a setup
+/// refused because the descriptor table was full is true only of that
+/// moment, and the next call probes again.
+[[nodiscard]] std::span<const io_engine> available_io_engines() noexcept;
+
+/// The engine's canonical lowercase name, the word a `backend` string
+/// starts with: "io_uring", "ioring", "iocp", "gcd", "aio", "pread",
+/// "readfile", "stdio", and the write spellings beside them.
+/// @param e  Any engine.
+/// @param d  Which half; reads by default.
+[[nodiscard]] const char* to_string(
+    io_engine e, io_direction d = io_direction::read) noexcept;
+
+/// Parses a name from to_string(), in either direction. Takes both
+/// spellings because the engine token of a `backend` string does not
+/// say which way the bytes went.
+/// @param name  An engine name, as to_string() spells it.
+/// @return The engine, or std::nullopt for any other string.
+[[nodiscard]] std::optional<io_engine> io_engine_from_string(
+    std::string_view name) noexcept;
+
+/// True where the engine hands a transfer to the OS and collects a
+/// completion later, false for the rungs that transfer on the calling
+/// thread.
+///
+/// These are the engines file_io_options::async and
+/// file_write_options::async give up. Filter compiled_io_engines() by
+/// this to name them for a build, as the tools do for their --no-async
+/// help text.
+/// @param e  Any engine.
+[[nodiscard]] bool is_async(io_engine e) noexcept;
+
 /// Knobs for write_file(): the geometry of a generated file.
 ///
 /// On the write side the windows in flight are the whole parallelism,
@@ -388,9 +501,11 @@ struct file_write_options {
   unsigned queue_depth = detail::default_write_queue_depth;
   /// Bypass the page cache where the platform can.
   bool direct_io = true;
-  /// Queue writes asynchronously (io_uring, IOCP, GCD) where the platform
-  /// offers it; off writes synchronously, as a platform that offers none
-  /// does anyway.
+  /// Queue writes asynchronously where the platform offers it; off
+  /// writes synchronously, as a platform with no async engine does
+  /// anyway. The engines this gives up are the ones is_async() marks;
+  /// for a given build, compiled_io_engines() filtered by is_async()
+  /// names them.
   bool async = true;
   /// io_uring: issue on io-wq rather than inline in the submit call.
   bool offload_submit = true;
@@ -427,8 +542,12 @@ struct file_write_options {
   /// preallocates unwritten extents that read as zeros, and ignores the
   /// flag.
   bool waive_zero_fill = false;
-  // No trace field, unlike file_io_options: the write pipeline keeps no
-  // per-window records, so there would be nothing to record into.
+  /// Where to record per-window timing (<blake3pp/trace.hpp>) in the
+  /// forms that take a scheduler; nullptr records nothing, and the
+  /// sequential forms record nothing either. The stamps carry the write
+  /// side's stages: admitted, fill begun on an agent, fill done, write
+  /// landed, released. Not owned: the buffer outlives the call.
+  trace_buffer* trace = nullptr;
 };
 
 /// What a write_file() run did.
@@ -436,14 +555,19 @@ struct write_report {
   /// Bytes written: the size that was asked for, or what the generator
   /// produced before it stopped.
   std::uint64_t bytes = 0;
-  /// Which mechanism carried them, as the writer names it: the engine
-  /// ("io_uring", "iocp", "gcd-write", or the synchronous "pwrite",
-  /// "writefile", "stdio"), plus "+direct" or "+nocache" where the cache
-  /// bypass engaged; on Windows "+sparse" or "+validdata" for how the
-  /// preallocation was kept from zeroing ahead of the writes (see
-  /// file_write_options::waive_zero_fill); then " (inline submit)" where
-  /// offload_submit was off, and the reason where an asynchronous rung
-  /// was asked for and refused. So "io_uring+direct", "iocp+direct+sparse",
+  /// Which mechanism carried them, as the writer names it, in order:
+  ///
+  /// - the engine, in the write spelling to_string(e, io_direction::write)
+  ///   gives ("io_uring", "ioring", "iocp", "gcd-write", "aio", or the
+  ///   synchronous "pwrite", "writefile", "stdio");
+  /// - "+direct" or "+nocache" where the cache bypass engaged;
+  /// - on Windows, "+sparse" or "+validdata" for how the preallocation was
+  ///   kept from zeroing ahead of the writes (see
+  ///   file_write_options::waive_zero_fill);
+  /// - " (inline submit)" where offload_submit was off;
+  /// - the reason, where an asynchronous rung was asked for and refused.
+  ///
+  /// So "io_uring+direct", "iocp+direct+sparse",
   /// "pwrite+direct [io_uring: ENOSYS, kernel too old]", and so on. Owned
   /// by the report, because the writer that composed it is gone by then.
   std::string backend;

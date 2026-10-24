@@ -47,6 +47,9 @@ inline std::int64_t tell64(std::FILE* f) noexcept {
 // The source half of the synchronous contract; see pread_source.
 class stdio_source {
  public:
+  // See pread_source: the engine this source is.
+  static constexpr io_engine rung_engine = io_engine::stdio;
+
   stdio_source(const std::filesystem::path& path,
                const file_open_options& how) {
     stream_.reset(std::fopen(path.string().c_str(), how.write ? "wb" : "rb"));

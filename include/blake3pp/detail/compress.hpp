@@ -159,6 +159,7 @@ static_assert(sizeof(std::array<std::uint32_t, 8>) == stack_budget::bytes_per_pa
 struct part_trace {
   trace_buffer* buf;
   std::uint64_t window;
+  std::uint32_t file;
   std::uint32_t part_chunks;
   std::atomic<std::uint64_t> busy_ns{0};
   std::atomic<std::uint32_t> active{0};
@@ -265,6 +266,7 @@ template <bool Traced, class Scheduler, stack_budget Budget,
              if (per_agent) {
                if (agent_record* const r = buf.claim_agent()) {
                  r->window = pt->window;
+                 r->file = pt->file;
                  r->t_begin = t_begin;
                  r->busy_ns = busy;
                  r->min_part_ns = min_ns;
@@ -327,7 +329,7 @@ struct window_compress {
   part_cvs<Budget> cvs{};
   std::atomic<std::size_t> next{0};   // the agents pull their parts from here
   std::array<std::uint32_t, 8> cv{};  // where the fold leaves the window's CV
-  part_trace pt{nullptr, 0, 0};
+  part_trace pt{nullptr, 0, 0, 0};
 
   // The grouped reduction of a full window (fold_group_parts). Each part
   // leaves its `width` chaining values in lanes, at i * width; the agent
@@ -365,7 +367,8 @@ struct window_compress {
                              std::size_t chunks, std::uint64_t counter,
                              std::span<const std::uint32_t, 8> k,
                              std::uint32_t f, trace_buffer* buf,
-                             std::uint64_t window_id) {
+                             std::uint64_t window_id,
+                             std::uint32_t file_id = 0) {
     require(chunks > 0 && std::has_single_bit(chunks),
             "window_compress::prepare(): a window that is not a power-of-two "
             "number of chunks");
@@ -373,7 +376,7 @@ struct window_compress {
     if (p >= chunks) {
       return false;
     }
-    set_window(o, d, counter, p, chunks / p, k, f, buf, window_id);
+    set_window(o, d, counter, p, chunks / p, k, f, buf, window_id, file_id);
     grouped = true;
     group = std::min(fold_group_parts, n_parts);
     width = simd_degree(o);
@@ -394,7 +397,8 @@ struct window_compress {
                     std::size_t part_chunks, std::size_t parts,
                     std::uint64_t counter,
                     std::span<const std::uint32_t, 8> k, std::uint32_t f,
-                    trace_buffer* buf, std::uint64_t window_id) {
+                    trace_buffer* buf, std::uint64_t window_id,
+                    std::uint32_t file_id = 0) {
     // Checked in every build: the table is a fixed Budget.parts() entries
     // inside this object, and a part past the end writes through the
     // members that follow it. The two callers derive `parts` from the
@@ -403,7 +407,8 @@ struct window_compress {
     require(parts <= Budget.parts(),
             "window_compress::prepare_edge(): more parts than the stack "
             "budget's table holds");
-    set_window(o, d, counter, part_chunks, parts, k, f, buf, window_id);
+    set_window(o, d, counter, part_chunks, parts, k, f, buf, window_id,
+               file_id);
     grouped = false;
   }
 
@@ -411,7 +416,7 @@ struct window_compress {
                   std::uint64_t counter, std::size_t part_chunks,
                   std::size_t parts, std::span<const std::uint32_t, 8> k,
                   std::uint32_t f, trace_buffer* buf,
-                  std::uint64_t window_id) noexcept {
+                  std::uint64_t window_id, std::uint32_t file_id) noexcept {
     ops = o;
     data = d;
     chunk_counter = counter;
@@ -423,6 +428,7 @@ struct window_compress {
     next.store(0, std::memory_order_relaxed);
     pt.buf = buf;
     pt.window = window_id;
+    pt.file = file_id;
     pt.part_chunks = static_cast<std::uint32_t>(part_chunks);
     pt.busy_ns.store(0, std::memory_order_relaxed);
     pt.active.store(0, std::memory_order_relaxed);
@@ -482,6 +488,45 @@ struct window_compress {
 // thread never touches it either. The window chain around this sender
 // does not know what is inside it, which makes this the one place a
 // different compress stage would go.
+// The fold's own agent record: claimed when the fold ends, with
+// parts == 0 to tell it from a bulk invocation, on the agent that ran it.
+// Nothing happens with a null trace or without agent storage.
+class fold_timer {
+ public:
+  explicit fold_timer(part_trace* pt) noexcept
+      : pt_(pt != nullptr && pt->buf != nullptr && pt->buf->wants_agents()
+                ? pt
+                : nullptr),
+        t_begin_(pt_ != nullptr ? pt_->buf->now() : 0) {}
+  fold_timer(const fold_timer&) = delete;
+  fold_timer& operator=(const fold_timer&) = delete;
+  ~fold_timer() {
+    if (pt_ == nullptr) {
+      return;
+    }
+    if (agent_record* const r = pt_->buf->claim_agent()) {
+      const std::int64_t t_end = pt_->buf->now();
+      r->window = pt_->window;
+      r->file = pt_->file;
+      r->t_begin = t_begin_;
+      r->busy_ns = static_cast<std::uint64_t>(t_end - t_begin_);
+      r->min_part_ns = r->max_part_ns = 0;
+      r->parts = 0;
+      r->part_chunks = pt_->part_chunks;
+      r->cpu = ~std::uint32_t{0};
+#if defined(__linux__)
+      if (const int c = ::sched_getcpu(); c >= 0) {
+        r->cpu = static_cast<std::uint32_t>(c);
+      }
+#endif
+    }
+  }
+
+ private:
+  part_trace* pt_;
+  std::int64_t t_begin_;
+};
+
 template <bool Traced, stack_budget Budget, class Scheduler,
           class Token = ex::never_stop_token>
 [[nodiscard]] auto compress_on(Scheduler& sched, window_compress<Budget>& w,
@@ -501,6 +546,7 @@ template <bool Traced, stack_budget Budget, class Scheduler,
            // Every group pairs with a sibling all the way up: the window
            // is a power-of-two number of chunks and part and group are
            // powers of two, so the group count is one too.
+           const fold_timer timer(Traced ? &w.pt : nullptr);
            const std::size_t n = w.fold_inputs();
            assert(std::has_single_bit(n));
            if (n == 1) {
@@ -533,6 +579,7 @@ template <bool Traced, stack_budget Budget, class Scheduler,
                                     Token tok = {}) {
   return part_bulk_sender<Traced>(sched, w, tok) |
          ex::then([&w, out]() {
+           const fold_timer timer(Traced ? &w.pt : nullptr);
            return fold_aligned_runs(
                w.ops, w.key, w.flags,
                cv_run{std::span(w.cvs).first(w.n_parts), 0, w.n_parts,

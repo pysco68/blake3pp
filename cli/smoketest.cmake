@@ -355,6 +355,90 @@ elseif(CASE STREQUAL "gen_errors")
     endif()
   endforeach()
 
+elseif(CASE STREQUAL "engines")
+  # The engine introspection, end to end. --version prints the list the
+  # library derives from its own degradation ladder; the --no-async help
+  # text is built from that list by b3tool::no_async_note(). The two must
+  # agree, so a new engine cannot leave the help text behind.
+  run_sum(ver res ARGS --version)
+  if(NOT res EQUAL 0)
+    message(FATAL_ERROR "--version failed (rc=${res}): ${ver}")
+  endif()
+  if(NOT ver MATCHES "io engines:([^\n]*)\\(auto -> ([a-z0-9_]+)\\)")
+    message(FATAL_ERROR "--version prints no io engines line:\n${ver}")
+  endif()
+  set(engines_line "${CMAKE_MATCH_1}")
+  set(auto_engine "${CMAKE_MATCH_2}")
+  string(REPLACE "[no os support]" " " engines_plain "${engines_line}")
+  string(REGEX MATCHALL "[a-z0-9_]+" engine_list "${engines_plain}")
+  if(engine_list STREQUAL "")
+    message(FATAL_ERROR "io engines line names nothing: ${engines_line}")
+  endif()
+  # What auto resolves to has to be one of them, and has to be one the
+  # machine grants.
+  if(NOT auto_engine IN_LIST engine_list)
+    message(FATAL_ERROR "auto -> ${auto_engine}, not in ${engine_list}")
+  endif()
+  if(engines_line MATCHES "${auto_engine}\\[no os support\\]")
+    message(FATAL_ERROR "auto -> ${auto_engine}, reported unsupported")
+  endif()
+  # The last engine is the synchronous rung everything degrades to, and
+  # no kernel refuses it.
+  list(GET engine_list -1 floor_engine)
+  if(engines_line MATCHES "${floor_engine}\\[no os support\\]")
+    message(FATAL_ERROR "the floor ${floor_engine} is reported unsupported")
+  endif()
+
+  # The async engines are the ones above the first synchronous rung
+  # (src/io/io_engines.cpp static_asserts that nothing async sits below
+  # one). These three spellings are the whole of the synchronous side;
+  # tests/io.cpp holds the same three against is_async().
+  set(sync_names pread readfile stdio)
+  set(expect_async "")
+  foreach(e IN LISTS engine_list)
+    if(e IN_LIST sync_names)
+      break()
+    endif()
+    list(APPEND expect_async "${e}")
+  endforeach()
+
+  run_sum(help res ARGS --help)
+  if(NOT res EQUAL 0)
+    message(FATAL_ERROR "--help failed (rc=${res}): ${help}")
+  endif()
+  if(NOT help MATCHES "\\(no ([a-z0-9_/-]+) queue\\)")
+    message(FATAL_ERROR "--no-async help names no engines:\n${help}")
+  endif()
+  string(REPLACE "/" ";" note_names "${CMAKE_MATCH_1}")
+  if(expect_async STREQUAL "")
+    # No async engine in this build: the note says so in those words.
+    if(NOT note_names STREQUAL "async")
+      message(FATAL_ERROR "no async engine compiled, but --no-async says "
+                          "'${note_names}'")
+    endif()
+  elseif(NOT note_names STREQUAL "${expect_async}")
+    message(FATAL_ERROR "--no-async names '${note_names}', the build carries "
+                        "'${expect_async}'")
+  endif()
+
+  # The generator says the same thing in the write spellings, which
+  # differ for exactly one engine ("gcd-write").
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --help
+    OUTPUT_VARIABLE gen_help ERROR_VARIABLE gen_err RESULT_VARIABLE res)
+  if(NOT gen_help MATCHES "\\(no ([a-z0-9_/-]+) queue\\)")
+    message(FATAL_ERROR "gen --no-async names no engines:\n${gen_help}")
+  endif()
+  string(REPLACE "/" ";" gen_names "${CMAKE_MATCH_1}")
+  set(gen_read "")
+  foreach(n IN LISTS gen_names)
+    string(REGEX REPLACE "-write$" "" n "${n}")
+    list(APPEND gen_read "${n}")
+  endforeach()
+  if(NOT expect_async STREQUAL "" AND NOT gen_read STREQUAL "${expect_async}")
+    message(FATAL_ERROR "gen --no-async names '${gen_names}', the build "
+                        "carries '${expect_async}'")
+  endif()
+
 else()
   message(FATAL_ERROR "unknown CASE '${CASE}'")
 endif()

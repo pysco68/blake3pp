@@ -137,16 +137,24 @@ The rest describes the window:
 | `agent_busy_ns` | summed over the agents that took part: nanoseconds compressing |
 | `agents_active` | bulk invocations that compressed at least one part |
 | `slot` | which window object carried it — the track its phases belong on when several are in flight; 0 on the sequential path, which has one |
+| `file` | the file's index in a many-files operation (`async_update_files`), which fills one buffer with every file's windows; 0 for a single file |
 | `flags` | `flag_parallel` (fanned out over the scheduler), `flag_last` (reaches the end of the file), `flag_short_first` (the short window that brings a part-way hasher back onto a window boundary) |
 
 ### `agent_record`
 
-One bulk invocation over a window's parts: which window, when it started
-(`t_begin`), how long it was busy, how many parts it took, the shortest
-and longest of those parts, the chunks per part, and the CPU it was on at
-`t_begin` (`sched_getcpu()` on Linux, `UINT32_MAX` where the platform
-cannot say). Bytes compressed is `parts * part_chunks * chunk_size`, which
-over `busy_ns` is that invocation's effective rate.
+One piece of a window's work on one agent. For a bulk invocation over
+the window's parts: which window and file, when it started (`t_begin`),
+how long it was busy, how many parts it took, the shortest and longest of
+those parts, the chunks per part, and the CPU it was on at `t_begin`
+(`sched_getcpu()` on Linux, `UINT32_MAX` where the platform cannot say).
+Bytes compressed is `parts * part_chunks * chunk_size`, which over
+`busy_ns` is that invocation's effective rate. A record with `parts == 0`
+is the fold of the window's chaining values, which runs on the agent
+that finished the bulk last, and its `busy_ns` is the fold's own time; on
+the write side a record is one window's fill. In the Chrome trace each
+of these is a slice on its CPU's lane, named `compress`, `fold` or
+`fill`, with a flow arrow from the window's compute phase on the
+pipeline side, so selecting either end highlights the other.
 
 ### `driver_stats`
 
@@ -166,7 +174,49 @@ thread is the bottleneck.
 | `max_pending` | the most subtrees the reducer held at once: how far ahead of the tree the reads ran |
 | `max_reads_in_flight` | the most reads submitted and not yet landed: what the device saw |
 | `max_windows_in_flight` | the most windows reading, on the pool or waiting to reduce |
+| `transfers_landed`, `transfer_bytes` | windows whose transfer landed, and the bytes they moved |
+| `device_wait_ns` | summed per-window time the device had the transfer, with nothing of the pipeline's own in it |
+| `starved_ns` | the pipeline unable to use a window it already held: reading, no free window; writing, nothing to write |
+| `queue_depth_final`, `queue_depth_peak` | the depth the run ended on and the deepest it reached |
+| `agent_busy_ns` | summed over every window and agent: the pool compressing on a read run, filling on a write one |
+| `device_wait_min_ns` | the shortest of those per-transfer times: the device with nothing queued ahead of it |
 | `read_backend` | the rung the reads engaged, through `read_backend(d)` |
+
+The four transfer counters are kept on every run, traced or not, and a
+write run fills them as a read run does. They cost two clock reads per
+window. `agent_busy_ns` is collected the same way -- for a buffer with no
+window storage at all -- because the pool's busy share is the hash side's
+answer to the question the device counters answer for the device, and a
+caller may want it without paying for one record per window. It costs one
+relaxed add per window on a read run, and two clock reads and an add on a
+write one.
+
+`starved_ns` is NOT a measure of how starved the pool was on a read run.
+It counts "bytes left and no free window", which can only fire where the
+arena is no wider than the queue depth, and it fires there even when the
+run is purely hash-limited: a 64 MiB x depth 16 arm at 96% `agent_busy_ns`
+still showed 1.33 s of it. Read it as "the arena is not wider than the
+depth" and use `agent_busy_ns` for the hash side. Writing, it is the clean
+signal it reads like, because there the windows in flight are the
+generator's parallelism.
+
+`parked_ns` sums waiting for a transfer and waiting for a window. That
+answers "is the driver the bottleneck" and neither end on its own, so
+`device_wait_ns` and `starved_ns` separate the two.
+
+`device_wait_ns / transfers_landed` is the device's mean per-window
+latency. Against `device_wait_min_ns` the same mean says how queued the
+device was: a mean at the depth times the minimum is a queue that was full
+for the run, and a mean at the minimum is a device that served every
+transfer alone and had capacity to spare. The absolute latency says
+neither on its own, since a queue's latency is proportional to its depth
+by construction.
+
+`queue_depth_final` is the geometry to pass back as `queue_depth` to
+repeat a run.
+
+Fields are appended to `driver_stats`, never inserted, because a caller
+may read it out of a build it did not compile.
 
 `read_backend(d)` is how the read side's degradation becomes visible to a
 caller: `"io_uring+direct"` when everything was granted, `"io_uring"` when
@@ -197,12 +247,58 @@ records at all.
 not compression: reading, waiting, and the stretches where a core had
 nothing to compress.
 
+## Asking the library
+
+`<blake3pp/trace.hpp>` does the same arithmetic the tools print. Pass a
+finished run's `driver_stats` and the wall clock measured around the call:
+
+```cpp
+#include <blake3pp/trace.hpp>
+
+std::vector<blake3pp::window_record> windows(count);
+blake3pp::trace_buffer trace(windows);
+
+const auto t0 = std::chrono::steady_clock::now();
+blake3pp::update_file(h, path, {.trace = &trace});
+const double wall_ns = std::chrono::duration<double, std::nano>(
+    std::chrono::steady_clock::now() - t0).count();
+
+const blake3pp::diagnosis d = blake3pp::diagnose_read(
+    trace.driver(), wall_ns, threads, planned_windows, window_bytes);
+std::println("{}", blake3pp::to_string(d.label));
+```
+
+`diagnose_write()` is the write side's equivalent and takes no window
+count, because there the arena and the queue depth are one number. Both
+report and neither tunes: nothing in them runs a second geometry, predicts
+a rate or recommends a number. The readings are
+`blake3pp::bottleneck` and the strings `to_string()` returns are the ones
+in [Diagnosing a run](tools.md#diagnosing-a-run). Both are API: the
+enumerators are appended, never reordered or renamed, and a string changes
+only when the value it names changes meaning.
+
+`bands` is the policy each share is read against, and the caller may pass
+its own. A figure that lands between the bands gets no label: `label` is
+`bottleneck::undecided` and `first` and `second` name the two candidates.
+`measured()` says whether anything landed, `long_enough()` whether the run
+turned its queue over the four times a reading needs.
+
+`bottleneck::in_flight` is asserted against the test suite's synthetic
+device only; that device is the only source known to produce it.
+
 ## In the tools
 
 `blake3pp_bench_file` is the worked example: it sizes the storage, prints
 a per-window summary and writes the run as Chrome trace JSON.
-`blake3ppsum` and `blake3ppgen` expose no tracing of their own; what they
-expose are the knobs a trace settles. See
+`blake3ppsum --trace PATH` records the same way over its own path, the
+batch of files through `async_update_files`, every file's windows in one
+buffer with the file's index on each record. `blake3ppgen --trace PATH`
+records the write side on its pipelined path: the same five stamps, read
+as admitted, fill begun on an agent, fill done, write landed, released,
+which the JSON names `queue`, `fill`, `write` and `release`. Both take
+`--trace-agents`. Both also take `--diag`, which reads the same run off
+`driver_stats` alone and names the side that was the constraint; see
+[Diagnosing a run](tools.md#diagnosing-a-run). See
 [Command-line tools](tools.md#tracing).
 
 ```
@@ -234,6 +330,7 @@ null           84.0 GiB/s   (8390e37432eb3939...)  [digest matches the in-memory
   trace (last rep): 2048 windows (2048 fanned out, 0 dropped), wall 0.190 s
     per window: wait  18.5%  hash 1337.2%  absorb 155.1%  release   0.1%
     driver busy   4.0% of its own 0.190 s, 870 iterations, 869 polls (814 blocking, 284 woken), 2048 completions, 0 admission stalls, reducer held at most 21, at most 4 reads and 16 windows in flight
+    queue depth: settled at 4 (peak 4); device 0.002 ms per window over 2048 transfers, starved 0.185 s
     median per window: submit->read      2.4 us  read->cv   1296.4 us  cv->reduced     32.0 us
     pool busy  79.3% of 32 threads, 23.5 agents active per fanned window
     io-wq cpu = 0.00 cores (worker threads' cpu / wall); machine (/proc/stat): user 23.67 nice 0.00 sys 0.85 idle 6.51 iowait 0.00 irq 0.00 softirq 0.00 steal 0.00 cores
@@ -243,8 +340,11 @@ Line by line. All 2048 windows fanned out and none was dropped, so the
 storage was sized right. The `hash` share of 1337% is sixteen windows'
 worth of overlap, not an error: each window spent 1.3 ms being compressed
 while fifteen others did the same. `absorb` overlaps the same way. `wait` at
-18.5% is the source handing back buffers it never read. The driver was busy
-4.0% of its own time, so the loop is not the limit. `pool busy 79.3% of 32
+18.5% is the source handing back buffers it never read. The queue depth
+line says the device was free and the pipeline was not: 0.002 ms per
+window against 0.185 s starved, which is the hash behind a source with
+nothing to do, and the depth stayed at the four it was given. The driver
+was busy 4.0% of its own time, so the loop is not the limit. `pool busy 79.3% of 32
 threads` is the number that is: the agents' summed compress time over
 threads × wall, which is as close to the machine as this engine gets. The
 23.5 agents per window beside it is how many invocations found parts left
@@ -291,6 +391,7 @@ parallel       2.14 GiB/s   (1ec8ab3adeac66e7...)  [102% of raw]
   trace (last rep): 128 windows (128 fanned out, 0 dropped), wall 0.468 s
     per window: wait 396.1%  hash  13.5%  absorb   1.2%  release   0.0%
     driver busy   0.6% of its own 0.468 s, 253 iterations, 252 polls (252 blocking, 125 woken), 128 completions, 0 admission stalls, reducer held at most 16, at most 4 reads and 6 windows in flight
+    queue depth: settled at 4 (peak 4); device 14.295 ms per window over 128 transfers, starved 0.000 s
     median per window: submit->read  14295.1 us  read->cv    489.4 us  cv->reduced     44.5 us
     pool busy   1.0% of 32 threads, 12.4 agents active per fanned window
     io-wq cpu = 0.04 cores (worker threads' cpu / wall); machine (/proc/stat): user 0.70 nice 0.00 sys 1.13 idle 28.61 iowait 0.96 irq 0.00 softirq 0.00 steal 0.00 cores
@@ -335,31 +436,41 @@ and does not in every container.
 ### The Chrome trace
 
 `--trace PATH` writes the same rep as Chrome trace JSON. Open it in
-[Perfetto](https://ui.perfetto.dev/) or `chrome://tracing`:
+[Perfetto](https://ui.perfetto.dev/) or `chrome://tracing`. The excerpt
+below is from `--null-source 1 --trace-agents` on a 16-thread Ryzen 7 PRO
+6860Z:
 
 ```json
-{"epoch_ns":177415647362187,"displayTimeUnit":"ns","pool_threads":32,"traceEvents":[
-{"name":"process_name","ph":"M","pid":1,"args":{"name":"blake3pp_bench_file null"}},
-{"name":"thread_name","ph":"M","pid":1,"tid":1,"args":{"name":"driver"}},
-{"name":"driver","ph":"X","pid":1,"tid":1,"ts":244016.924,"dur":29103.355,"args":{"busy_ns":2564772,"parked_ns":26531260,"iterations":161,"polls":160,"blocking_polls":146,"wakes":68,"queue_runs":256,"admission_stalls":0,"max_pending":17}},
-{"name":"thread_name","ph":"M","pid":1,"tid":10,"args":{"name":"window object 0"}},
-{"name":"wait","ph":"X","pid":1,"tid":10,"ts":244016.924,"dur":877.162,"args":{"window":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
-{"name":"thread_name","ph":"M","pid":1,"tid":10,"args":{"name":"window object 0"}},
-{"name":"hash","ph":"X","pid":1,"tid":10,"ts":244894.086,"dur":1203.918,"args":{"window":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
+{"epoch_ns":192008835809839,"displayTimeUnit":"ns","pool_threads":16,"traceEvents":[
+{"name":"process_name","ph":"M","pid":0,"args":{"name":"blake3pp_bench_file null driver"}},
+{"name":"process_name","ph":"M","pid":1,"args":{"name":"blake3pp_bench_file null pipeline, by window object"}},
+{"name":"thread_name","ph":"M","pid":0,"tid":0,"args":{"name":"driver loop"}},
+{"name":"driver","ph":"X","pid":0,"tid":0,"ts":396742.233,"dur":59698.481,"args":{"busy_ns":1466112,"parked_ns":58216577,"iterations":79,"polls":78,"blocking_polls":67,"wakes":31,"queue_runs":128,"admission_stalls":0,"max_pending":16,"transfers_landed":128,"transfer_bytes":1073741824,"device_wait_ns":5578858,"starved_ns":52436831,"queue_depth_final":4,"queue_depth_peak":4,"agent_busy_ns":870175522,"device_wait_min_ns":501}},
+{"name":"thread_name","ph":"M","pid":1,"tid":0,"args":{"name":"window object"}},
+{"name":"wait","ph":"X","pid":1,"tid":0,"ts":396742.233,"dur":1075.721,"args":{"window":0,"file":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
+{"name":"hash","ph":"X","pid":1,"tid":0,"ts":397817.954,"dur":6654.003,"args":{"window":0,"file":0,"slot":0,"bytes":8388608,"last":0,"parallel":1}},
+{"name":"process_name","ph":"M","pid":2,"args":{"name":"blake3pp_bench_file null pool agents, by cpu"}},
+{"name":"thread_name","ph":"M","pid":2,"tid":7,"args":{"name":"cpu"}},
+{"name":"compress","ph":"X","pid":2,"tid":7,"ts":398007.344,"dur":878.913,"args":{"window":3,"file":0,"parts":74,"min_part_ns":7945,"max_part_ns":46822}},
+{"name":"compress","cat":"window","ph":"s","id":1,"pid":1,"tid":3,"ts":397892.613},
+{"name":"compress","cat":"window","ph":"f","bp":"e","id":1,"pid":2,"tid":7,"ts":398007.345},
+{"name":"agents busy","ph":"C","pid":2,"tid":0,"ts":398007.344,"args":{"busy":1}},
 ```
 
-| track | holds |
-|---|---|
-| `tid` 1, "driver" | one event over the whole run, carrying `driver_stats` in `args` |
-| `tid` 10 + `slot`, "window object N" | the `wait`, `hash`, `absorb` and `release` events of every window that object carried |
-| `tid` 100 + cpu (99 unknown), "cpu N" | one `compress` event per agent record, with its parts and part extremes |
+| process | track | holds |
+|---|---|---|
+| `pid` 0, "driver" | `tid` 0, "driver loop" | one event over the whole run, carrying `driver_stats` in `args` |
+| `pid` 1, "pipeline, by window object" | `tid` = `slot`, "window object" | the `wait`, `hash`, `absorb` and `release` events of every window that object carried |
+| `pid` 2, "pool agents, by cpu" | `tid` = cpu (99 unknown), "cpu" | one `compress`, `fold` or `fill` event per agent record, with its parts and part extremes, and an "agents busy" counter |
 
 Windows go on the track of the window object that carried them rather
 than on one shared track, so several in flight read as parallel lanes
-instead of as one track nesting into itself. The agent tracks put the
-cores directly under the pipeline, which is where a window waiting on one
-straggling part is visible as such. `ts` and `dur` are microseconds, as
-the format wants.
+instead of as one track nesting into itself. Each agent slice has a flow
+arrow from its window's compute phase (`"ph":"s"` on the window object's
+track, `"ph":"f"` on the cpu's), so selecting either end highlights the
+other. The "agents busy" counter is the number of agents at work at
+each change point, which shows a starved pool as such rather than as
+empty lanes. `ts` and `dur` are microseconds, as the format wants.
 
 ### Pairing with perf
 

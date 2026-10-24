@@ -257,8 +257,45 @@ room for everything this window will insert.
 The first two bounds are separate on purpose. The device wants a few large
 reads in flight; the pool wants windows to work on while the device serves
 the next ones. One number cannot serve both, so `queue_depth` is what the
-device sees and a byte budget -- 128 MiB by default, which is 16 windows at
-the default 8 MiB -- is what buys the windows behind it.
+device sees and a window budget is what buys the windows behind it.
+
+On a fast device the budget is the larger of the two levers. Measured on
+the four-drive PCIe 5 stripe (32 threads, 64 GiB file, cold, the depth
+held at four reads so the two axes are separate):
+
+| window | arena | GiB/s | pool busy |
+| --- | --- | --- | --- |
+| 64 MiB | 256 MiB (4 windows) | 37.0 | 64% |
+| 64 MiB | 384 MiB (6 windows) | 41.5 | 76% |
+| 64 MiB | 512 MiB (8 windows) | 45.9 | 86% |
+| 64 MiB | 1 GiB (16 windows) | 45.6 | 85% |
+| 64 MiB | 2 GiB (32 windows) | 44.4 | 85% |
+| 8 MiB | 32 MiB (4 windows) | 30.2 | 53% |
+| 8 MiB | 64 MiB (8 windows) | 37.6 | 71% |
+| 8 MiB | 128 MiB (16 windows) | 38.9 | 75% |
+| 8 MiB | 256 MiB (32 windows) | 39.3 | 75% |
+| 8 MiB | 1 GiB (128 windows) | 38.9 | 76% |
+| 8 MiB | 2 GiB (256 windows) | 38.5 | 74% |
+
+Each figure is the mean of a forward and a backward pass of the ladder.
+Moving four reads to sixteen inside a 1 GiB arena, by contrast, is worth
+1.4 GiB/s -- inside the repeatability floor. The pool-busy column is the
+mechanism: with only the reads to work on, the hash pool stands idle for a
+third of its 32 threads waiting for the device.
+
+The return flattens at a window count rather than at a number of bytes --
+eight windows at 64 MiB, sixteen at 8 MiB -- and that is what a byte
+budget alone gets wrong: divided by a 64 MiB window, 128 MiB buys four
+windows, 19% below eight. Narrowing the pool shows whose appetite it is. On
+sixteen threads the same 8 MiB row saturates at eight windows and gains
+nothing above it, the pool sitting at 98%, where 32 threads stand at 54%
+on four windows and keep gaining to sixteen.
+
+So the count follows the pool it feeds: one window per four hardware
+threads, floored at 128 MiB and capped at 2 GiB, past which the stripe's
+figure declines. A device that is already
+saturated gains nothing from any of it, and on one of those the arena is
+memory spent for no return.
 
 The third bound is why the pipeline cannot reach a state where no window
 may start. A full window reserves the one node it will insert; an edge

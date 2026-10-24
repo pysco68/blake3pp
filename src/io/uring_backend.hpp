@@ -592,6 +592,31 @@ class uring_context {
   // open descriptor. ~uring drains again and finds nothing.
   ~uring_context() { drain(); }
 
+  // This context's rung and the one it degrades to, declared for the
+  // ladder walk in src/io/io_engines.cpp. The rung below is a
+  // declaration and not an object: a ring that could not be had leaves
+  // every transfer on the deferred_ list, served by posix_file's pread
+  // inside poll(), which is code rather than a thing with a name.
+  static constexpr io_engine rung_engine = io_engine::io_uring;
+  using rung_below = posix_sync_rung;
+
+  // Which of the two this context engaged -- the engine question it can
+  // answer with no file in hand, where name_for() below answers the same
+  // question with one.
+  //
+  // A refusal is settled only when the kernel is the reason. ENOSYS says
+  // io_uring is not in this kernel and EPERM says a policy forbids it;
+  // EMFILE or ENOMEM say the ring could not be set up at this moment, and
+  // a caller that asks again after closing something may get the ring,
+  // which is why best_io_engine() may re-probe.
+  [[nodiscard]] rung_verdict engaged_rung() const noexcept {
+    if (use_uring_) {
+      return {rung_engine, true};
+    }
+    return {rung_below::rung_engine,
+            async_requested_ && !refusal_may_lift(ring_.setup_errno)};
+  }
+
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    transfer& op) {
     arm(op, f, off);

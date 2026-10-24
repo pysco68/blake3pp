@@ -569,6 +569,21 @@ class iocp_context {
     return served_synchronously_;
   }
 
+  // This context's rung and the one it degrades to, declared for the
+  // ladder walk in src/io/io_engines.cpp.
+  static constexpr io_engine rung_engine = io_engine::iocp;
+  using rung_below = win_sync_rung;
+
+  // A constructed iocp_context HAS a port: the constructor throws
+  // otherwise, so there is no such thing as one that quietly fell to
+  // ReadFile. The only way this answers the synchronous rung is a caller
+  // who said --no-async, and that is a statement about the caller rather
+  // than about the machine, which is what leaves it unsettled.
+  [[nodiscard]] rung_verdict engaged_rung() const noexcept {
+    return async_requested_ ? rung_verdict{rung_engine, true}
+                            : rung_verdict{rung_below::rung_engine, false};
+  }
+
   // Cancels what every open file still has on the port, reaps all of it
   // without reporting any, and forgets the deferred list. CancelIoEx
   // bounds the wait: every cancelled request completes, successfully or

@@ -6,10 +6,13 @@
 // not the hash, is the limit.
 //
 //   blake3pp_bench_file <FILE> [--reps N] [--window MiB] [--qd N]
-//                       [--no-direct] [--seq-only] [--cooldown S]
+//                       [--no-direct] [--no-async] [--threads N]
+//                       [--seq-only] [--cooldown S]
 //                       [--trace PATH [--trace-agents]]
 //   blake3pp_bench_file <FILE> --io-sweep   # window x qd pacing matrix
+//   blake3pp_bench_file --null-source <GiB> # read pipeline, no device
 //   blake3pp_bench_file --null-sink <GiB>   # write pipeline, no device
+//                       [--null-rate GiB/s [--null-knee QD]]  # modelled device
 //   blake3pp_bench_file --make <MiB>   # create a test file and use it
 //
 // Note: with direct I/O the page cache is bypassed, so repetitions measure
@@ -42,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -77,6 +81,7 @@
 
 
 #include "tool_common.hpp"
+#include "trace_json.hpp"
 
 namespace {
 
@@ -326,13 +331,36 @@ kernel_deltas kernel_delta(const kernel_counters& before,
   return d;
 }
 
-// The record kinds as Chrome trace JSON, one complete ("X") event per
-// phase per window on tid 1 and, with agent records, one "compress" event
-// per record on a tid per CPU (100 + cpu; 99 where the CPU is unknown),
-// so the viewer shows the pipeline against the cores. ts and dur are in
-// microseconds as the format wants; epoch_ns at the top level is the
-// records' zero as absolute CLOCK_MONOTONIC nanoseconds, for joining with
-// timestamps other tools take on the same clock.
+// A device to put under the null driver, so a control law can be shown
+// a knee that was chosen rather than measured.
+//
+// One FIFO server with a fixed service time per window plus a fixed
+// propagation delay: a transfer starts when the server is free, holds
+// it for `service_ns`, and lands `latency_ns` later. At depth d the
+// steady-state rate is min(d x window / (service + latency), window /
+// service), so throughput rises linearly to a knee at
+// 1 + latency / service and is flat above it. `knee` names that depth
+// and the latency follows from it.
+struct null_device {
+  double rate_gib_s = 0.0;  // 0: complete immediately, no device at all
+  unsigned knee = 1;
+  std::int64_t service_ns = 0;
+  std::int64_t latency_ns = 0;
+
+  [[nodiscard]] bool active() const noexcept { return rate_gib_s > 0.0; }
+
+  void settle(std::size_t window_bytes) noexcept {
+    if (!active()) {
+      return;
+    }
+    const double bytes_per_ns = rate_gib_s * 1024.0 * 1024.0 * 1024.0 / 1e9;
+    service_ns = static_cast<std::int64_t>(
+        std::max(1.0, static_cast<double>(window_bytes) / bytes_per_ns));
+    latency_ns = static_cast<std::int64_t>(knee > 1 ? knee - 1 : 0) *
+                 service_ns;
+  }
+};
+
 // The pipeline with no device under it, and no bytes either.
 //
 // The file is VIRTUAL: it reports whatever size the run asks for, while
@@ -347,6 +375,9 @@ kernel_deltas kernel_delta(const kernel_counters& before,
 //
 // The completion half is memory_driver's, because a source with nothing
 // to read has exactly one job -- report from poll() and not before.
+// Given a null_device it paces those reports instead, so the synthetic
+// arms can be run against a device whose knee was chosen rather than
+// measured.
 class null_driver {
  public:
   // The pool is sized and faulted in at construction, before the caller
@@ -355,8 +386,9 @@ class null_driver {
   // windows, which is exactly the shape of a pipeline regression that is
   // not one.
   null_driver(const blake3pp::detail::io_driver_options&, unsigned,
-              std::uint64_t size, std::byte filler, std::size_t pool_bytes)
-      : size_(size), pool_(pool_bytes, filler) {}
+              std::uint64_t size, std::byte filler, std::size_t pool_bytes,
+              null_device dev = {})
+      : size_(size), dev_(dev), pool_(pool_bytes, filler) {}
   null_driver(const null_driver&) = delete;
   null_driver& operator=(const null_driver&) = delete;
 
@@ -391,128 +423,164 @@ class null_driver {
     return {slice, std::span<const std::byte>(slice)};
   }
 
-  void submit_read(file& f, std::uint64_t, std::span<std::byte>,
+  void submit_read(file& f, std::uint64_t, std::span<std::byte> buf,
                    blake3pp::detail::io_op& op) noexcept {
-    reads_.push(op, &f);
+    submit(f, buf.size(), op);
   }
   // The sink half: the bytes are already where they were generated, so
   // the only work is reporting from poll() and not before.
-  void submit_write(file& f, std::uint64_t, std::span<const std::byte>,
+  void submit_write(file& f, std::uint64_t, std::span<const std::byte> buf,
                     blake3pp::detail::io_op& op) noexcept {
-    reads_.push(op, &f);
+    submit(f, buf.size(), op);
   }
   void flush() noexcept {}
-  std::size_t poll(bool block) { return reads_.poll(block); }
-  void wake() noexcept { reads_.wake(); }
-  void cancel(blake3pp::detail::io_op& op) noexcept { reads_.cancel(op); }
-  [[nodiscard]] std::size_t in_flight() const noexcept {
-    return reads_.in_flight();
+
+  std::size_t poll(bool block) {
+    if (!dev_.active()) {
+      return reads_.poll(block);
+    }
+    release_ready();
+    if (block && reads_.in_flight() == 0 && !timed_.empty()) {
+      wait_until(timed_.front().ready);
+      release_ready();
+    }
+    // Only ever park on the waiter with nothing of the device's own
+    // still to land: the waiter is woken by the pool, not by the clock.
+    return reads_.poll(block && timed_.empty());
   }
-  void drain() noexcept { reads_.drain(); }
+
+  void wake() noexcept { reads_.wake(); }
+  void cancel(blake3pp::detail::io_op& op) noexcept {
+    for (auto it = timed_.begin(); it != timed_.end(); ++it) {
+      if (it->op == &op) {
+        reads_.push(op, it->owner);
+        timed_.erase(it);
+        break;
+      }
+    }
+    reads_.cancel(op);
+  }
+  [[nodiscard]] std::size_t in_flight() const noexcept {
+    return reads_.in_flight() + timed_.size();
+  }
+  void drain() noexcept {
+    release_all();
+    reads_.drain();
+  }
   // Nothing here is in the OS's hands; one file's share is its own queued
   // operations, as on the memory driver.
-  void drain(file& f) noexcept { reads_.drain(&f); }
+  void drain(file& f) noexcept {
+    release_all();
+    reads_.drain(&f);
+  }
 
  private:
+  struct timed_op {
+    blake3pp::detail::io_op* op;
+    const void* owner;
+    std::int64_t ready;
+  };
+
+  [[nodiscard]] static std::int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void submit(file& f, std::size_t bytes, blake3pp::detail::io_op& op) noexcept {
+    if (!dev_.active()) {
+      reads_.push(op, &f);
+      return;
+    }
+    // One server, FIFO, so the ready times this produces are already in
+    // order and the queue is a plain deque.
+    const double share = dev_.service_ns == 0 || window_stride_ == 0
+                             ? 1.0
+                             : static_cast<double>(bytes) /
+                                   static_cast<double>(window_stride_);
+    const auto service =
+        static_cast<std::int64_t>(static_cast<double>(dev_.service_ns) * share);
+    const std::int64_t start = std::max(now_ns(), server_free_);
+    server_free_ = start + service;
+    timed_.push_back({&op, &f, server_free_ + dev_.latency_ns});
+    op.live = true;
+  }
+
+  void release_ready() noexcept {
+    const std::int64_t t = now_ns();
+    while (!timed_.empty() && timed_.front().ready <= t) {
+      reads_.push(*timed_.front().op, timed_.front().owner);
+      timed_.pop_front();
+    }
+  }
+
+  void release_all() noexcept {
+    while (!timed_.empty()) {
+      reads_.push(*timed_.front().op, timed_.front().owner);
+      timed_.pop_front();
+    }
+  }
+
+  // Waits for one completion, in slices no longer than a service time:
+  // sleeping the whole way would park the driver thread through the
+  // rounds that admit the next windows, which caps the concurrency at
+  // whatever one sleep allows. Spins for the last microsecond, which is
+  // what keeps a service time of a few hundred microseconds from being
+  // quantised by the scheduler's timer slack.
+  void wait_until(std::int64_t ready) const noexcept {
+    const std::int64_t slice = std::max<std::int64_t>(dev_.service_ns, 1000);
+    const std::int64_t left = ready - now_ns();
+    if (left <= 0) {
+      return;
+    }
+    if (left > 2000) {
+      std::this_thread::sleep_for(
+          std::chrono::nanoseconds(std::min(left - 1000, slice)));
+    } else {
+      std::this_thread::yield();
+    }
+  }
+
   std::uint64_t size_;
   std::byte filler_{};
   std::size_t window_stride_ = 0;
+  null_device dev_{};
+  std::int64_t server_free_ = 0;
+  std::deque<timed_op> timed_;
   std::vector<std::byte> pool_;
   blake3pp::detail::queued_reads reads_;
 };
 
 static_assert(blake3pp::detail::file_driver<null_driver>);
 
-bool write_chrome_trace(const std::string& path,
-                        const blake3pp::trace_buffer& trace,
-                        std::string_view process_name,
-                        unsigned pool_threads = 0) {
-  std::ofstream out(path);
-  if (!out.is_open()) {
-    return false;
+
+// The share of the wall clock during which at least one agent was
+// busy, from merged intervals, since agents overlap.
+[[nodiscard]] double idle_covered(std::span<const blake3pp::agent_record> agents,
+                                  double wall_ns) {
+  if (agents.empty() || wall_ns <= 0) {
+    return 0.0;
   }
-  const auto us = [](std::int64_t ns) {
-    return static_cast<double>(ns) / 1000.0;
-  };
-  out << std::format("{{\"epoch_ns\":{},\"displayTimeUnit\":\"ns\","
-                     "\"pool_threads\":{},\"traceEvents\":[\n",
-                     trace.epoch_ns(), pool_threads);
-  out << std::format("{{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,"
-                     "\"args\":{{\"name\":\"{}\"}}}},\n",
-                     process_name);
-  out << "{\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":1,"
-         "\"args\":{\"name\":\"driver\"}}";
-  // The driver's own track: one event over the whole run, carrying what
-  // that thread spent its time on. Windows go on the track of the window
-  // object that carried them, so several in flight read as parallel
-  // lanes rather than as one track nesting into itself.
-  const auto& d = trace.driver();
-  const auto windows = trace.windows();
-  if (d.iterations > 0 && !windows.empty()) {
-    const std::int64_t begin = windows.front().t_wait_begin;
-    const std::int64_t end = windows.back().t_released;
-    out << std::format(
-        ",\n{{\"name\":\"driver\",\"ph\":\"X\",\"pid\":1,\"tid\":1,"
-        "\"ts\":{:.3f},\"dur\":{:.3f},\"args\":{{\"busy_ns\":{},"
-        "\"parked_ns\":{},\"iterations\":{},\"polls\":{},"
-        "\"blocking_polls\":{},\"wakes\":{},\"queue_runs\":{},"
-        "\"admission_stalls\":{},\"max_pending\":{}}}}}",
-        us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
-        d.polls, d.blocking_polls, d.wakes, d.queue_runs, d.admission_stalls,
-        d.max_pending);
+  std::vector<std::pair<std::int64_t, std::int64_t>> iv;
+  iv.reserve(agents.size());
+  for (const auto& a : agents) {
+    iv.emplace_back(a.t_begin, a.t_begin + static_cast<std::int64_t>(a.busy_ns));
   }
-  std::map<std::uint32_t, bool> slots_named;
-  for (const auto& w : trace.windows()) {
-    const std::uint32_t tid = 10 + w.slot;
-    if (!slots_named[tid]) {
-      slots_named[tid] = true;
-      out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
-                         "\"pid\":1,\"tid\":{},\"args\":{{\"name\":"
-                         "\"window object {}\"}}}}",
-                         tid, w.slot);
-    }
-    const std::pair<const char*, std::pair<std::int64_t, std::int64_t>>
-        phases[] = {{"wait", {w.t_wait_begin, w.t_ready}},
-                    {"hash", {w.t_ready, w.t_joined}},
-                    {"absorb", {w.t_joined, w.t_absorbed}},
-                    {"release", {w.t_absorbed, w.t_released}}};
-    for (const auto& [name, span] : phases) {
-      out << std::format(",\n{{\"name\":\"{}\",\"ph\":\"X\",\"pid\":1,"
-                         "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
-                         "\"args\":{{\"window\":{},\"slot\":{},"
-                         "\"bytes\":{},\"last\":{},\"parallel\":{}}}}}",
-                         name, tid, us(span.first),
-                         us(span.second - span.first), w.index, w.slot,
-                         w.bytes,
-                         (w.flags & blake3pp::window_record::flag_last) != 0
-                             ? 1
-                             : 0,
-                         (w.flags & blake3pp::window_record::flag_parallel) != 0
-                             ? 1
-                             : 0);
+  std::sort(iv.begin(), iv.end());
+  double covered = 0;
+  std::int64_t cur_begin = iv.front().first;
+  std::int64_t cur_end = iv.front().second;
+  for (const auto& [b, e] : iv) {
+    if (b > cur_end) {
+      covered += static_cast<double>(cur_end - cur_begin);
+      cur_begin = b;
+      cur_end = e;
+    } else if (e > cur_end) {
+      cur_end = e;
     }
   }
-  std::map<std::uint32_t, bool> cpus_named;
-  for (const auto& a : trace.agents()) {
-    const std::uint32_t tid = a.cpu == ~std::uint32_t{0} ? 99 : 100 + a.cpu;
-    if (!cpus_named[tid]) {
-      cpus_named[tid] = true;
-      out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
-                         "\"pid\":1,\"tid\":{},\"args\":{{\"name\":\"{}\"}}}}",
-                         tid,
-                         tid == 99 ? std::string{"cpu ?"}
-                                   : std::format("cpu {}", a.cpu));
-    }
-    out << std::format(",\n{{\"name\":\"compress\",\"ph\":\"X\",\"pid\":1,"
-                       "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
-                       "\"args\":{{\"window\":{},\"parts\":{},"
-                       "\"min_part_ns\":{},\"max_part_ns\":{}}}}}",
-                       tid, us(a.t_begin),
-                       us(static_cast<std::int64_t>(a.busy_ns)), a.window,
-                       a.parts, a.min_part_ns, a.max_part_ns);
-  }
-  out << "\n]}\n";
-  return out.good();
+  covered += static_cast<double>(cur_end - cur_begin);
+  return covered / wall_ns;
 }
 
 // The per-row summary of one traced rep: where the wall time went, how
@@ -558,6 +626,48 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
           "release {:5.1f}%",
           pct(wait), pct(hash), pct(absorb), pct(release));
 
+  // The agent slices split by kind, as a line of text: a fold is three
+  // microseconds beside a compress of three hundred and seventy, so at
+  // any zoom where the compress slices are legible the folds are
+  // sub-pixel and the viewer does not draw them. The trace carries one
+  // fold record per window; their share is printed here.
+  if (const auto agents = trace.agents(); !agents.empty()) {
+    double compress_ns = 0;
+    double fold_ns = 0;
+    std::size_t compress_n = 0;
+    std::size_t fold_n = 0;
+    for (const auto& a : agents) {
+      if (a.parts == 0) {
+        fold_ns += static_cast<double>(a.busy_ns);
+        ++fold_n;
+      } else {
+        compress_ns += static_cast<double>(a.busy_ns);
+        ++compress_n;
+      }
+    }
+    const double agent_ns = compress_ns + fold_ns;
+    const auto share = [&](double ns) {
+      return agent_ns > 0 ? 100.0 * ns / agent_ns : 0.0;
+    };
+    println(stdout,
+            "    agent slices: compress {} ({:.1f} ms, {:4.1f}%)  fold {} "
+            "({:.1f} ms, {:4.1f}%)",
+            compress_n, compress_ns / 1e6, share(compress_ns), fold_n,
+            fold_ns / 1e6, share(fold_ns));
+    // And what those slices look like in the viewer, said as a number
+    // so nobody has to infer it from how empty the lanes are: the pool
+    // is busy for a fraction of the run whenever the device cannot feed
+    // it, which is most runs. A low occupancy here is the reader
+    // starving the pool, not the trace losing records.
+    if (threads > 0 && wall_ns > 0) {
+      println(stdout,
+              "    pool occupancy: {:4.1f}% of {} threads x wall; no agent "
+              "busy at all for {:4.1f}% of it",
+              100.0 * agent_ns / (wall_ns * threads), threads,
+              100.0 * (1.0 - idle_covered(agents, wall_ns)));
+    }
+  }
+
   // What the driver thread itself did, which is the number the compress
   // stage is judged against: a driver parked most of the time has room
   // for more work, one that is busy is the ceiling.
@@ -577,6 +687,15 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
             driver_ns / 1e9, d.iterations, d.polls, d.blocking_polls,
             d.wakes, d.queue_runs, d.admission_stalls, d.max_pending,
             d.max_reads_in_flight, d.max_windows_in_flight);
+    if (d.transfers_landed > 0) {
+      println(stdout,
+              "    queue depth: settled at {} (peak {}); device {:.3f} ms per "
+              "window over {} transfers, starved {:.3f} s",
+              d.queue_depth_final, d.queue_depth_peak,
+              static_cast<double>(d.device_wait_ns) /
+                  static_cast<double>(d.transfers_landed) / 1e6,
+              d.transfers_landed, static_cast<double>(d.starved_ns) / 1e9);
+    }
   }
 
   // Per-window latencies, as medians: with windows overlapping, an
@@ -817,6 +936,8 @@ int main(int argc, char** argv) {
   bool no_direct = false;
   bool no_ioring = false;
   bool registered_buffers = false;
+  double null_rate = 0;
+  unsigned null_knee = 1;
   blake3pp::hash_file_options opts;
 
   CLI::App app{
@@ -837,11 +958,21 @@ int main(int argc, char** argv) {
   app.add_option("--qd", opts.queue_depth,
                  "I/O queue depth (the reader clamps it to its range)")
       ->capture_default_str();
+  app.add_option("--null-rate", null_rate,
+                 "give the synthetic source or sink a device of this many "
+                 "GiB/s instead of completing immediately")
+      ->check(CLI::PositiveNumber);
+  app.add_option("--null-knee", null_knee,
+                 "the queue depth at which that device saturates: its "
+                 "propagation delay is set to (knee - 1) service times, so "
+                 "throughput rises to this depth and is flat above it")
+      ->check(CLI::Range(1u, 1024u));
   app.add_flag("--no-direct", no_direct,
                "keep the OS page cache (no O_DIRECT)");
   app.add_flag("--no-async", no_async,
-               "read synchronously (no io_uring/IOCP/GCD/AIO queue): the "
-               "comparison arm against the platform's async engine");
+               std::format("read synchronously ({}): the comparison arm "
+                           "against the platform's async engine",
+                           b3tool::no_async_note()));
   app.add_flag("--inline-submit", inline_submit,
                "issue each read inline in the submitting thread instead of "
                "on io_uring's workers (IOSQE_ASYNC off)");
@@ -908,6 +1039,8 @@ int main(int argc, char** argv) {
         .offload_submit = opts.offload_submit,
         .ioring = opts.ioring,
         .registered_buffers = opts.registered_buffers};
+    null_device dev{.rate_gib_s = null_rate, .knee = null_knee};
+    dev.settle(win);
     if (!trace_path.empty()) {
       const std::size_t n = static_cast<std::size_t>((total + win - 1) / win) + 1;
       window_records.resize(n);
@@ -921,6 +1054,21 @@ int main(int argc, char** argv) {
     println(stdout,
             "null source: {:.2f} GiB, window {} MiB, qd {}, {} threads",
             null_gib, win >> 20, opts.queue_depth, threads);
+    if (dev.active()) {
+      println(stdout,
+              "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
+              "{:.3f} ms latency)",
+              dev.rate_gib_s, dev.knee,
+              static_cast<double>(dev.service_ns) / 1e6,
+              static_cast<double>(dev.latency_ns) / 1e6);
+    }
+    // The arena the pool draws its work from, resolved the way every
+    // read entry point resolves it: from this machine's thread count.
+    const blake3pp::detail::pipeline_plan plan =
+        blake3pp::detail::plan_pipeline(
+            0, opts.window_bytes, opts.queue_depth, false, total,
+            blake3pp::detail::read_plan_budget_bytes(threads,
+                                                     opts.window_bytes));
 
     // The digest this must produce: the same bytes, hashed in memory.
     blake3pp::hasher expect;
@@ -944,20 +1092,17 @@ int main(int argc, char** argv) {
         trace->clear();
       }
       const kernel_counters kernel_before = read_kernel_counters();
-      const blake3pp::detail::pipeline_plan plan =
-          blake3pp::detail::plan_pipeline(0, opts.window_bytes,
-                                          opts.queue_depth, false, total);
       null_driver drv({.async = true,
                        .offload_submit = opts.offload_submit,
                        .ioring = opts.ioring,
                        .registered_buffers = opts.registered_buffers},
                       plan.reads_in_flight, total, null_filler,
-                      plan.window_bytes * plan.windows);
+                      plan.window_bytes * plan.windows, dev);
       null_driver::file nf(drv);
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
-          h, drv, nf, sched,
+          h, drv, nf, sched, plan,
           {.window_bytes = opts.window_bytes,
            .queue_depth = opts.queue_depth,
            .trace = io_opts.trace});
@@ -977,7 +1122,7 @@ int main(int argc, char** argv) {
                                             best),
                           &kernel);
       const std::string file = trace_file_name(trace_path, "null", false);
-      if (write_chrome_trace(file, *trace, "blake3pp_bench_file null",
+      if (b3tool::write_chrome_trace(file, *trace, "blake3pp_bench_file null",
                              threads)) {
         println(stdout, "    trace written to {}", file);
       }
@@ -996,9 +1141,22 @@ int main(int argc, char** argv) {
         blake3pp::detail::rounded_window_bytes(opts.window_bytes);
     const unsigned threads =
         pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
+    null_device dev{.rate_gib_s = null_rate, .knee = null_knee};
+    dev.settle(win);
+    const unsigned start_depth = blake3pp::detail::resolve_write_queue_depth(
+        opts.queue_depth, opts.window_bytes, threads);
     println(stdout,
             "null sink: {:.2f} GiB, window {} MiB, qd {}, {} threads",
-            null_sink_gib, win >> 20, opts.queue_depth, threads);
+            null_sink_gib, win >> 20, start_depth, threads);
+    if (dev.active()) {
+      println(stdout,
+              "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
+              "{:.3f} ms latency)",
+              dev.rate_gib_s, dev.knee,
+              static_cast<double>(dev.service_ns) / 1e6,
+              static_cast<double>(dev.latency_ns) / 1e6);
+    }
+    blake3pp::trace_buffer sink_trace{std::span<blake3pp::window_record>{}};
 
     // The same generator blake3ppgen uses, so the fill costs what it
     // costs there: an extended output seeks in O(1), so each window
@@ -1017,12 +1175,12 @@ int main(int argc, char** argv) {
       // reserve() is a no-op and no first-touch page fault lands inside
       // the clock.
       const unsigned windows = static_cast<unsigned>(std::min<std::uint64_t>(
-          (total + win - 1) / win, opts.queue_depth));
+          (total + win - 1) / win, start_depth));
       null_driver drv({.async = true,
                        .offload_submit = opts.offload_submit,
                        .ioring = opts.ioring,
                        .registered_buffers = opts.registered_buffers},
-                      windows, total, null_filler, win * windows);
+                      windows, total, null_filler, win * windows, dev);
       null_driver::file nf(drv);
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_write_pipeline(
@@ -1034,12 +1192,25 @@ int main(int argc, char** argv) {
           },
           total,
           {.window_bytes = opts.window_bytes,
-           .queue_depth = opts.queue_depth});
+           .queue_depth = start_depth,
+           .trace = &sink_trace,
+           .generator_threads = threads});
       const auto t1 = std::chrono::steady_clock::now();
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
     println(stdout, "{:<10} {}", "null sink",
             b3tool::rate(static_cast<std::size_t>(total), best));
+    {
+      const auto& d = sink_trace.driver();
+      println(stdout,
+              "  device: {:.3f} ms per window over {} writes, generator "
+              "starved {:.3f} s",
+              d.transfers_landed > 0
+                  ? static_cast<double>(d.device_wait_ns) /
+                        static_cast<double>(d.transfers_landed) / 1e6
+                  : 0.0,
+              d.transfers_landed, static_cast<double>(d.starved_ns) / 1e9);
+    }
     return 0;
   }
 
@@ -1185,7 +1356,7 @@ int main(int argc, char** argv) {
           *trace, threads_for_trace, iowq_cpu_s,
           b3tool::gib_per_s(static_cast<std::size_t>(bytes), best), &kernel);
       const std::string file = trace_file_name(trace_path, label, !seq_only);
-      if (write_chrome_trace(file, *trace,
+      if (b3tool::write_chrome_trace(file, *trace,
                              std::format("blake3pp_bench_file {}", label),
                              threads_for_trace)) {
         println(stdout, "    trace written to {}", file);

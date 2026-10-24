@@ -2,15 +2,24 @@
 
 [← blake3pp](../README.md)
 
-Two utilities build alongside the library, in top-level builds only.
+Two utilities build alongside the library, by default in top-level builds
+only (`BLAKE3PP_BUILD_CLI`).
 `blake3ppsum` hashes files the way `sha256sum` does. `blake3ppgen` produces
 reproducible test data at the speed of your disk. Both are built on the
-library this documents, so they are also worked examples of it.
+library documented here, so they are also worked examples of it.
 
-The help below is what the tools print. Two parts of it depend on the
-machine rather than on the documentation, and are shown as placeholders:
-the variants a build carries, and the core count a thread default picks
-up.
+The help below is what the tools print, with three placeholders for the
+parts that depend on the build or the machine:
+
+- the variants a build carries;
+- the core count a thread default picks up;
+- the async I/O engines a build carries. `--no-async` names them from
+  `blake3pp::compiled_io_engines()`: `io_uring` on Linux, `ioring/iocp`
+  on Windows, `gcd` (`gcd-write` on the write side) on macOS, `aio` on
+  FreeBSD, and `async` where the platform has no async engine to turn
+  off.
+
+See [the API reference](api.md) for the introspection calls behind it.
 
 ## blake3ppsum
 
@@ -47,11 +56,18 @@ OPTIONS:
                               I/O window size in MiB
           --qd UINT [4]       I/O queue depth (the reader clamps it to its range)
           --no-direct         keep the OS page cache (no O_DIRECT)
-          --no-async          read synchronously (no io_uring/IOCP/GCD/AIO queue)
+          --no-async          read synchronously (no <this build's async engines> queue)
           --inline-submit     issue reads inline in the submitting thread, not on io_uring's
                               workers
           --no-ioring         Windows: read through the completion port instead of the I/O
                               ring
+          --trace TEXT        record per-window timing and write it as Chrome trace JSON to
+                              PATH (open in ui.perfetto.dev)
+          --trace-agents Needs: --trace
+                              with --trace: also record each pool agent's part of every window
+          --diag              report on stderr which side limited the run (the hash, the
+                              device, or the window arena between them); one FILE or '-', on
+                              the pipelined path
 ```
 
 ```bash
@@ -93,7 +109,8 @@ OPTIONS:
           --no-direct Needs: --output
                               with --output: no direct I/O (write through the page cache)
           --no-async Needs: --output
-                              with --output: no async queue (synchronous writes)
+                              with --output: write synchronously (no <this build's async
+                              engines> queue)
           --inline-submit Needs: --output
                               with --output: issue writes inline in the submitting thread, not
                               on io_uring's workers
@@ -104,6 +121,16 @@ OPTIONS:
                               with --output, Windows: set the valid data length up front
                               instead of writing a sparse file (needs the volume-maintenance
                               privilege; exposes stale disk blocks until written)
+          --trace TEXT Needs: --output
+                              with --output and --length, on the pipelined path: record
+                              per-window timing and write it as Chrome trace JSON to PATH (open
+                              in ui.perfetto.dev)
+          --trace-agents Needs: --trace
+                              with --trace: also record which CPU filled each window, and for
+                              how long
+          --diag Needs: --output
+                              report on stderr which side limited the run (the generator or the
+                              device); needs --output and --length on the pipelined path
           --window UINT Needs: --output
                               with --output: write buffer size in MiB (default: 4 MiB per
                               generator thread, so every fill fans out fully)
@@ -126,12 +153,12 @@ blake3ppgen --seed run42 --length 32G --output f.bin --window 64 --qd 8
 ### Where the time goes
 
 Generation runs lanes-parallel in the kernel, and `--threads` fans
-segments across cores using that same O(1) seek. Which leaves the sink as
+segments across cores using that same O(1) seek, which leaves the sink as
 the bottleneck.
 
-`--output` removes even that. The stream is generated straight into the
-write buffers and leaves through the platform's own direct path,
-bypassing the page cache entirely:
+`--output` removes the sink as well: the stream is generated straight into
+the write buffers and leaves through the platform's own direct path,
+bypassing the page cache.
 
 | OS | writer |
 |----|--------|
@@ -141,13 +168,15 @@ bypassing the page cache entirely:
 | FreeBSD | POSIX AIO on a kqueue + `O_DIRECT` |
 
 `--no-direct`, `--no-async`, `--inline-submit` and, on Windows,
-`--no-ioring` switch those off one at a time, which is how the pipeline
-gets measured against itself.
+`--no-ioring` switch those off one at a time.
 
 ## Tracing
 
-Neither tool records a trace of its own. What they expose are the knobs a
-trace settles: `--window`, `--qd`, `--threads`, `--no-direct` and
+Both tools record their run as Chrome trace JSON with `--trace PATH` (and
+`--trace-agents`): `blake3ppsum` its batch path, a directory of files as
+their windows across the context's window objects; `blake3ppgen` its
+pipelined write path, each window's queue, fill, write and release. What
+they also expose are the knobs a trace settles: `--window`, `--qd`, `--threads`, `--no-direct` and
 `--inline-submit`, the same names on both, and the same pipeline
 underneath. `blake3ppgen -v` names the write backend that was engaged;
 that is as much as either tool says about the pipeline it ran.
@@ -155,7 +184,8 @@ that is as much as either tool says about the pipeline it ran.
 `blake3pp_bench_file` takes `--no-async` as well, which is how the
 platform's async engine gets measured against its synchronous rung on
 one device: the same windows, the same queue depth, served by `pread`
-instead.
+(`ReadFile` on Windows) instead. Its help text names the engines the
+same derived way the other two do.
 
 To see where a run's time actually goes, point `blake3pp_bench_file` at
 the same file with the same flags and add `--trace`:
@@ -171,6 +201,96 @@ fraction, and with `--trace-agents` an effective rate per CPU.
 [Performance tracing](tracing.md) explains the records, the summary and
 the trace file, and [Where a window's time goes](https://github.com/pysco68/blake3pp/blob/main/bench/README.md)
 has the bench's remaining rows.
+
+## Diagnosing a run
+
+`--diag` reports which side of the pipeline constrained the run that just
+finished, from the counters in `driver_stats`
+(see [Performance tracing](tracing.md#driver_stats)). The reading itself is
+`blake3pp::diagnose_read()` and `blake3pp::diagnose_write()` in
+`<blake3pp/trace.hpp>`, which any caller can use on its own runs; see
+[Asking the library](tracing.md#asking-the-library). The tools add the
+formatting.
+
+```
+$ blake3ppsum --diag big.iso
+diagnosis: device-limited
+  pool busy        2.0% of 16 threads
+  arena          6 of 16 windows in flight, 8 MiB each (128 MiB), wider than the queue depth of 4
+  in flight      4 x 8 MiB = 32 MiB outstanding at the device
+  device         16.082 ms per window over 256 reads (min 7.122 ms, 4.0 of 4 queued)
+  the pool had a window whenever it wanted one and still did not saturate, and the device's queue was full at 32 MiB outstanding: it is the wall at this geometry.
+```
+
+Four figures and a reading.
+
+- **Pool busy** — the compute pool's share of its own capacity.
+- **Arena** — the window objects the plan allocated, and whether they
+  outnumber the queue depth. The windows beyond the reads are what the pool
+  draws on while the device serves the next ones.
+- **In flight** — the queue depth times the window. This is what the device
+  was answering, and a device's rate depends on it, so read the verdict as a
+  statement about this geometry rather than about the device.
+- **Device** — the mean time a transfer spent at the device, the shortest
+  such time, and how full its queue was. The mean needs the minimum beside
+  it, because a queue's latency rises with its depth by construction.
+
+| reading | what it means |
+|---|---|
+| `hash-limited` | the pool was saturated; no I/O geometry moves it |
+| `device-limited` | the pool had a window whenever it wanted one, did not saturate, and the device's queue was full at the bytes in flight |
+| `arena-limited` | neither end was busy and the run held every window it had, with the arena no wider than the queue |
+| `in-flight-limited` | neither end was busy, the arena was wider than the queue, and the device served every read as if it were alone |
+| `generator-limited` | writing: the windows spent more of the run being filled than being written |
+
+Where a figure sits inside the band that separates two readings, no label is
+given: the report names both candidates and prints the figures.
+
+```
+$ blake3ppsum --diag --no-direct --threads 2 big.iso
+diagnosis: hash-limited
+  pool busy       96.3% of 2 threads
+  arena          16 of 16 windows in flight, 8 MiB each (128 MiB), wider than the queue depth of 4
+  in flight      4 x 8 MiB = 32 MiB outstanding at the device
+  device         1.829 ms per window over 256 reads (min 838.5 us, 2.6 of 4 queued)
+  the pool was saturated: the hash is the constraint and I/O geometry will not move it.
+
+$ blake3ppsum --diag --no-direct --window 8 --qd 16 big.iso
+diagnosis: arena-limited
+  pool busy       41.0% of 16 threads
+  arena          16 of 16 windows in flight, 8 MiB each (128 MiB), no wider than the queue depth of 16
+  in flight      16 x 8 MiB = 128 MiB outstanding at the device
+  device         3.084 ms per window over 256 reads (min 633.8 us, 10.9 of 16 queued)
+  the pool idled waiting for a window while the device was not queued.
+```
+
+`in-flight-limited` has not been seen on real hardware so far. It is
+asserted against the test suite's synthetic device, which models what would
+produce it: a device that reports slowly and serves quickly, so that no
+transfer ever queues behind another. More windows would not help such a
+run; the lever would be the depth or the window.
+
+On the write side the arena and the depth are one number: a window is a fill
+task, so the windows in flight are the generator's parallelism and the
+device's queue together. That leaves two readings, and the report names the
+direction.
+
+```
+$ blake3ppgen --seed s --length 2G --output out.bin --diag
+diagnosis: device-limited (write side)
+  generator        2.8% of the 16 windows in flight (2.8% of 16 threads)
+  windows        16 in flight, 4 MiB each (64 MiB); the arena and the depth are one number here
+  device         15.083 ms per window over 512 writes (min 1.301 ms), holding  93.9% of the windows
+  the device held a full queue for the run: it is the wall.
+```
+
+`--diag` describes a single run. `blake3ppsum` takes exactly one FILE, not
+`-` and not `--check`; `blake3ppgen` needs `--output` and `--length`, which
+selects the pipelined path. A run too short to turn its queue over four
+times reports that instead of a reading.
+
+The captures above are from a 16-thread Zen 5 machine under WSL2, on its
+virtual disk, through the page cache where `--no-direct` appears.
 
 ## The allocator
 

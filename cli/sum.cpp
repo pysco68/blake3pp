@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cctype>
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -21,6 +23,7 @@
 #include <iostream>
 #include <iterator>
 #include <optional>
+#include <ratio>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -32,12 +35,17 @@
 #include <CLI/CLI.hpp>
 #include <blake3pp/blake3pp.hpp>
 
+#include "diagnosis_report.hpp"
 #include "tool_common.hpp"
+#include "trace_json.hpp"
 
 namespace {
 
 using b3tool::print;
 using b3tool::println;
+using b3tool::undiagnosable;
+using b3tool::reading_label;
+using b3tool::service_label;
 
 struct options {
   blake3pp::hash_file_options io;
@@ -46,6 +54,9 @@ struct options {
   std::size_t out_len = blake3pp::digest_size;
   std::string key_file;        // --keyed: path to 32 raw bytes or 64 hex
   std::string derive_context;  // --derive-key
+  std::string trace_path;      // --trace: Chrome trace JSON out
+  bool trace_agents = false;   // --trace-agents
+  bool diag = false;           // --diag: what limited the run
   std::vector<std::string> files;
 };
 
@@ -67,6 +78,16 @@ std::string version_text() {
                      blake3pp::to_string(a));
     }
   }
+  // The I/O engines in the same form: those the build carries, which of
+  // them this kernel grants, and what a fresh open engages. Whether a
+  // given FILE keeps the engine and bypasses the cache needs an open;
+  // probe_file_io() answers that.
+  std::string engines;
+  for (const auto e : blake3pp::compiled_io_engines()) {
+    std::format_to(std::back_inserter(engines), " {}{}",
+                   blake3pp::to_string(e),
+                   blake3pp::is_available(e) ? "" : "[no os support]");
+  }
   std::string text = std::format(
       "blake3ppsum (blake3pp {})\n"
       "simd provider: {}\n"
@@ -79,6 +100,8 @@ std::string version_text() {
     std::format_to(std::back_inserter(text),
                    "\ncpu also supports:{} (not compiled in)", uncompiled);
   }
+  std::format_to(std::back_inserter(text), "\nio engines:{} (auto -> {})",
+                 engines, blake3pp::to_string(blake3pp::best_io_engine()));
   return text;
 }
 
@@ -172,13 +195,25 @@ class engine {
     const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
     const bool worth_a_pool =
         size_ec || size >= blake3pp::detail::min_pipeline_bytes;
+    const auto t0 = std::chrono::steady_clock::now();
     if (pool_.parallel() && worth_a_pool) {
       blake3pp::update_file(h, path, pool_.scheduler(), opts_.io);
+      pipelined_ = true;
     } else {
       blake3pp::update_file(h, path, opts_.io);
+      pipelined_ = false;
     }
+    wall_ns_ = std::chrono::duration<double, std::nano>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
     return finish(h);
   }
+
+  // The last file's wall clock, and whether it took the pipeline. --diag
+  // reads both: a run on the sequential path has no driver and no
+  // counters to read.
+  [[nodiscard]] double wall_ns() const noexcept { return wall_ns_; }
+  [[nodiscard]] bool pipelined() const noexcept { return pipelined_; }
 
   // Whether hash_many() would do anything the per-file loop does not.
   // Standard input has no file to hand to a context, and one file needs
@@ -216,19 +251,29 @@ class engine {
     std::vector<std::optional<result>> out(files.size());
     std::size_t next = 0;  // the next outcome to report
     int failures = 0;
-    auto work = blake3pp::async::async_update_files(
-        ctx, paths, pool_.scheduler(), {.io = opts_.io},
-        [this](std::size_t) { return blake3pp::make_hasher(opts_.io); },
-        [&](std::size_t i, blake3pp::hasher& h,
-            const blake3pp::async::file_outcome& o) noexcept {
-          out[i] = describe(o, h, out_lens[i]);
-          for (; next < out.size() && out[next].has_value(); ++next) {
-            if (!report(next, *out[next])) {
-              failures++;
+    // The tracer is a type the sender carries, so the two spellings are
+    // two instantiations of the same call.
+    const auto run = [&](auto tracer) {
+      auto work = blake3pp::async::async_update_files(
+          ctx, paths, pool_.scheduler(), {.io = opts_.io},
+          [this](std::size_t) { return blake3pp::make_hasher(opts_.io); },
+          [&](std::size_t i, blake3pp::hasher& h,
+              const blake3pp::async::file_outcome& o) noexcept {
+            out[i] = describe(o, h, out_lens[i]);
+            for (; next < out.size() && out[next].has_value(); ++next) {
+              if (!report(next, *out[next])) {
+                failures++;
+              }
             }
-          }
-        });
-    blake3pp::async::sync_wait(ctx, std::move(work));
+          },
+          tracer);
+      blake3pp::async::sync_wait(ctx, std::move(work));
+    };
+    if (opts_.io.trace != nullptr) {
+      run(blake3pp::buffer_tracer{opts_.io.trace});
+    } else {
+      run(blake3pp::null_tracer{});
+    }
     return failures;
   }
 
@@ -326,7 +371,97 @@ class engine {
 
   options opts_;
   b3tool::compute_pool pool_;
+  double wall_ns_ = 0.0;
+  bool pipelined_ = false;
 };
+
+// --diag: what the run that just happened was limited by, from the
+// counters it kept. One line of reading, four of figures, and, where the
+// arena was the constraint, the default plan's arithmetic at this
+// machine's thread count. The last line states what a plan would
+// allocate; it predicts no rate.
+void report_read_diagnosis(const blake3pp::diagnosis& r, unsigned threads,
+                           unsigned hw_threads) {
+  if (const auto why = undiagnosable(r, "blake3ppsum", "reads",
+                                     "nothing to read -- the file went down the sequential "
+                   "path, which has no driver to report");
+      why) {
+    println(stderr, "{}", *why);
+    return;
+  }
+  println(stderr, "diagnosis: {}", reading_label(r));
+  println(stderr, "  pool busy      {:5.1f}% of {} threads",
+          100.0 * r.pool_busy, threads);
+  println(stderr,
+          "  arena          {} of {} windows in flight, {} each ({}), {} the "
+          "queue depth of {}",
+          r.windows_used, r.windows_planned,
+          b3tool::bytes_label(r.window_bytes),
+          b3tool::bytes_label(r.windows_planned * r.window_bytes),
+          r.arena_is_depth ? "no wider than" : "wider than", r.depth);
+  // The bytes outstanding at the device, as depth times window. A
+  // device's rate depends on them: one four-drive PCIe 5 stripe reads
+  // 38.8 GiB/s through the pipeline at the default 32 MiB outstanding
+  // and 46.9 at 1 GiB. A device reading needs this figure beside it.
+  println(stderr, "  in flight      {} x {} = {} outstanding at the device",
+          r.depth, b3tool::bytes_label(r.window_bytes),
+          b3tool::bytes_label(r.bytes_in_flight));
+  println(stderr,
+          "  device         {} per window over {} reads (min {}, {:.1f} of {} "
+          "queued)",
+          service_label(r.mean_service_ns), r.transfers,
+          service_label(static_cast<double>(r.min_service_ns)),
+          r.device_queued * static_cast<double>(r.depth), r.depth);
+  switch (r.label) {
+    case blake3pp::bottleneck::hash:
+      println(stderr,
+              "  the pool was saturated: the hash is the constraint and I/O "
+              "geometry will not move it.");
+      break;
+    case blake3pp::bottleneck::device:
+      // Named at the geometry: a full queue is the device's answer at
+      // the bytes this run kept outstanding, which is not its ceiling
+      // (see the in-flight line above).
+      println(stderr,
+              "  the pool had a window whenever it wanted one and still did "
+              "not saturate, and the device's queue was full at {} "
+              "outstanding: it is the wall at this geometry.",
+              b3tool::bytes_label(r.bytes_in_flight));
+      break;
+    case blake3pp::bottleneck::arena:
+      println(stderr,
+              "  the pool idled waiting for a window while the device was not "
+              "queued.");
+      break;
+    case blake3pp::bottleneck::in_flight:
+      println(stderr,
+              "  the pool had windows to spare and the device served every "
+              "read as if it were alone: what the run never had more of is "
+              "the {} outstanding, which is the depth times the window.",
+              b3tool::bytes_label(r.bytes_in_flight));
+      break;
+    case blake3pp::bottleneck::generator:
+    case blake3pp::bottleneck::undecided:
+      break;
+  }
+  if (r.label == blake3pp::bottleneck::arena ||
+      r.second == blake3pp::bottleneck::arena) {
+    // The default budget rule at this machine's thread count:
+    // update_file() over a scheduler resolves it from
+    // hardware_concurrency(), not from --threads. Printed only where it
+    // would allocate more windows than this run had; otherwise the arena
+    // line already says it.
+    const std::size_t budget =
+        blake3pp::detail::read_plan_budget_bytes(hw_threads, r.window_bytes);
+    const std::size_t windows = budget / r.window_bytes;
+    if (windows > r.windows_planned) {
+      println(stderr,
+              "  at {} hardware threads a {} window plans {} windows ({}).",
+              hw_threads, b3tool::bytes_label(r.window_bytes), windows,
+              b3tool::bytes_label(budget));
+    }
+  }
+}
 
 // Verifies "<hex>  <name>" lines of any (even) digest length; also accepts
 // the '*' binary marker.
@@ -428,9 +563,12 @@ int main(int argc, char** argv) {
       ->capture_default_str();
 
   app.add_flag("--no-direct", no_direct, "keep the OS page cache (no O_DIRECT)");
-  app.add_flag("--no-async", no_async, "read synchronously (no io_uring/IOCP/GCD queue)");
+  app.add_flag("--no-async", no_async, std::format("read synchronously ({})", b3tool::no_async_note()));
   app.add_flag("--inline-submit", inline_submit, "issue reads inline in the submitting thread, not on io_uring's workers");
   app.add_flag("--no-ioring", no_ioring, "Windows: read through the completion port instead of the I/O ring");
+  auto* trace_opt = app.add_option("--trace", o.trace_path, "record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)");
+  app.add_flag("--trace-agents", o.trace_agents, "with --trace: also record each pool agent's part of every window")->needs(trace_opt);
+  app.add_flag("--diag", o.diag, "report on stderr which side limited the run (the hash, the device, or the window arena between them); one FILE, on the pipelined path");
   app.add_option("files", o.files, "files to hash (or checksum lists)");
 
   CLI11_PARSE(app, argc, argv);
@@ -449,8 +587,51 @@ int main(int argc, char** argv) {
     return b3tool::exit_usage;
   }
 
+  // --diag reads the counters of one run. A batch or a checksum list
+  // would sum several runs into one record, so the combination is a
+  // usage error.
+  if (o.diag && (o.check || o.files.size() != 1 || o.files.front() == "-")) {
+    println(stderr,
+            "blake3ppsum: --diag describes one file's run: give exactly one "
+            "FILE, and not '-' or --check");
+    return b3tool::exit_usage;
+  }
+
   int failures = 0;
   try {
+    // Trace storage is sized from the files up front: one record per
+    // window of each, with a spare for the short first window, and a size
+    // the filesystem will not give counts as two windows. The buffer
+    // outlives the engine, whose operations record into it; stdin and
+    // checksum lists are not traced.
+    std::vector<blake3pp::window_record> window_records;
+    std::vector<blake3pp::agent_record> agent_records;
+    std::optional<blake3pp::trace_buffer> trace;
+    // --diag needs no per-window storage: every figure it reads is in
+    // driver_stats, which a buffer with an empty window span still
+    // collects, at a few clock reads per window and two per agent and no
+    // allocation.
+    if (o.diag && o.trace_path.empty()) {
+      trace.emplace(std::span<blake3pp::window_record>{});
+      o.io.trace = &*trace;
+    }
+    if (!o.trace_path.empty()) {
+      const std::size_t window =
+          blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
+      std::size_t windows = 0;
+      for (const auto& f : o.files) {
+        std::error_code ec;
+        const std::uintmax_t size =
+            f == "-" ? 0 : std::filesystem::file_size(f, ec);
+        windows += ec ? 2 : static_cast<std::size_t>(size / window) + 2;
+      }
+      window_records.resize(windows);
+      if (o.trace_agents) {
+        agent_records.resize(windows * o.threads);
+      }
+      trace.emplace(std::span{window_records}, std::span{agent_records});
+      o.io.trace = &*trace;
+    }
     engine eng(o);
     if (o.files.empty()) {
       o.files.emplace_back("-");
@@ -488,6 +669,48 @@ int main(int argc, char** argv) {
           println(stderr, "blake3ppsum: {}: {}", f, e.what());
           failures++;
         }
+      }
+    }
+    if (o.diag) {
+      const std::size_t window =
+          blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
+      const unsigned hw_threads = b3tool::default_threads();
+      std::error_code size_ec;
+      const std::uintmax_t size =
+          std::filesystem::file_size(o.files.front(), size_ec);
+      // The same plan the entry point made: the window count is what
+      // the arena figure is read against, and it comes out of the one
+      // budget rule.
+      const blake3pp::detail::pipeline_plan plan =
+          blake3pp::detail::plan_pipeline(
+              0, o.io.window_bytes, o.io.queue_depth, o.io.direct_io,
+              size_ec ? 0 : static_cast<std::uint64_t>(size),
+              blake3pp::detail::read_plan_budget_bytes(
+                  hw_threads, o.io.window_bytes));
+      report_read_diagnosis(
+          eng.pipelined()
+              ? blake3pp::diagnose_read(trace->driver(), eng.wall_ns(), o.threads,
+                                      plan.windows, window)
+              : blake3pp::diagnosis{},
+          o.threads, hw_threads);
+    }
+    if (trace && !o.trace_path.empty()) {
+      if (b3tool::write_chrome_trace(o.trace_path, *trace, "blake3ppsum",
+                                     o.threads)) {
+        println(stderr,
+                "blake3ppsum: trace: {} window records{}{}, JSON to {}",
+                trace->windows().size(),
+                o.trace_agents
+                    ? std::format(" and {} agent records",
+                                  trace->agents().size())
+                    : std::string{},
+                trace->dropped_windows() > 0
+                    ? std::format(" ({} dropped)", trace->dropped_windows())
+                    : std::string{},
+                o.trace_path);
+      } else {
+        println(stderr, "blake3ppsum: could not write {}", o.trace_path);
+        failures++;
       }
     }
   } catch (const std::exception& e) {
