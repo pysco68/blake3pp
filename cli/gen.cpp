@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
@@ -132,7 +133,7 @@ int main(int argc, char** argv) {
   output_opt->excludes(hex_flag);
 
   app.add_flag("--no-direct", no_direct, "with --output: no direct I/O (write through the page cache)")->needs(output_opt);
-  app.add_flag("--no-async", no_async, "with --output: no async queue (synchronous writes)")->needs(output_opt);
+  app.add_flag("--no-async", no_async, std::format("with --output: write synchronously ({})", b3tool::no_async_note(blake3pp::io_direction::write)))->needs(output_opt);
   app.add_flag("--inline-submit", inline_submit, "with --output: issue writes inline in the submitting thread, not on io_uring's workers")->needs(output_opt);
   app.add_flag("--no-ioring", no_ioring, "with --output, Windows: write through the completion port instead of the I/O ring")->needs(output_opt);
   app.add_flag("--waive-zero-fill", waive_zero_fill, "with --output, Windows: set the valid data length up front instead of writing a sparse file (needs the volume-maintenance privilege; exposes stale disk blocks until written)")->needs(output_opt);

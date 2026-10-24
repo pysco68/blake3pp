@@ -54,6 +54,8 @@
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/detail/file_writer.hpp>
 
+#include "io/engine_rung.hpp"
+
 namespace blake3pp::detail::io_impl {
 
 [[noreturn]] inline void throw_errno(const char* what) {
@@ -507,6 +509,16 @@ class sync_context {
     std::size_t queued_ = 0;
     file* next_open_ = nullptr;  // the context's list, for its own drain
   };
+
+  // The rung this is, declared for the ladder walk in
+  // src/io/io_engines.cpp. A synchronous context has nothing under it and
+  // nothing can refuse it, so its verdict is always settled. The source
+  // names the engine, as its name() spells the file's backend string.
+  static constexpr io_engine rung_engine = Source::rung_engine;
+  using rung_below = void;
+  [[nodiscard]] rung_verdict engaged_rung() const noexcept {
+    return {rung_engine, true};
+  }
 
   sync_context(const reader_context_options&, unsigned) noexcept {}
   sync_context(const sync_context&) = delete;

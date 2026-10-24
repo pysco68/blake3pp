@@ -439,6 +439,26 @@ class aio_context {
     return refusal_;
   }
 
+  // This context's rung and the one it degrades to; see
+  // uring_context::engaged_rung().
+  static constexpr io_engine rung_engine = io_engine::aio;
+  using rung_below = posix_sync_rung;
+
+  // A refused AIO is never settled here, unlike a refused io_uring on
+  // Linux. Every reason the constructor can record is something an
+  // administrator or another process can undo while this one runs: the
+  // queue limit is the tunable
+  // vfs.aio.max_aio_queue_per_proc, the facility itself is a kernel
+  // module that can be loaded (the sysctl's absence is how that reads
+  // from here), and a kqueue that could not be opened is a descriptor
+  // this process may get back. So the verdict is re-probed each time it
+  // is asked for, and a machine that turns AIO on stops being reported
+  // as a pread machine.
+  [[nodiscard]] rung_verdict engaged_rung() const noexcept {
+    return use_aio_ ? rung_verdict{rung_engine, true}
+                    : rung_verdict{rung_below::rung_engine, false};
+  }
+
   // Every transfer the kernel has not been offered is taken back and
   // given to the synchronous rung, which is what a flush the kernel
   // refuses outright leaves behind. The contract's promise that a

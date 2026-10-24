@@ -10,6 +10,7 @@
 #include <format>
 #include <fstream>
 #include <ios>
+#include <optional>
 #include <ostream>
 #include <random>
 #include <span>
@@ -42,9 +43,17 @@
 #if defined(__FreeBSD__)
 #include "io/aio_backend.hpp"
 #endif
+#if defined(__APPLE__)
+#include "io/gcd_backend.hpp"
+#endif
 #if defined(_WIN32)
+#include "io/iocp_backend.hpp"
 #include "io/ioring_backend.hpp"
 #endif
+// The platform's own choice, which is what the engine list is read off:
+// the tests below ask the selected context what rung it engaged and
+// hold the public list to the answer.
+#include "io/backend_select.hpp"
 
 namespace {
 
@@ -79,6 +88,27 @@ struct temp_file {
   }
   static inline int counter = 0;
 };
+
+// Every io_engine enumerator, expanded from the canonical table rather
+// than written out. Nothing public hands this list out -- an engine no
+// build here can reach is not a fact about this machine, and the API
+// reports only what is true of it -- but the table's own rows still
+// have to be checked, and a test that re-typed the enum would be the
+// very drift the table exists to stop.
+constexpr blake3pp::io_engine every_io_engine[] = {
+#define BLAKE3PP_IO_ENGINE(enumerator, read_name, write_name, rank, async) \
+  blake3pp::io_engine::enumerator,
+#include <blake3pp/detail/io_engine.def>
+#undef BLAKE3PP_IO_ENGINE
+};
+
+// The leading engine name of a `backend` string, with every decoration
+// the backends append cut off: "+direct", "+nocache", "+regbuf",
+// " (inline submit)", " [io_uring: ENOSYS, kernel too old]". What is
+// left is one io_engine's own spelling, which is what to_string() gives.
+std::string engine_token(std::string_view backend) {
+  return std::string(backend.substr(0, backend.find_first_of("+ ")));
+}
 
 TEST_SUITE("io") {
 
@@ -721,77 +751,388 @@ TEST_CASE("probe_file_io reports the open mode and the rung without reading") {
   CHECK(pm.file_bytes == 0);
 }
 
-// The engaged rung, asserted rather than merely printed.
-//
-// backend() exists so a degradation is visible, and every layer takes
-// trouble to keep it accurate -- but a name nobody checks buys nothing.
-// Both of the platform backends have shipped in a state where the async
-// path could never engage and every test still passed on the bytes: the
-// Windows writer opened its two handles with share modes that could only
-// collide, and the whole suite stayed green while every write went down
-// the synchronous rung.
-//
-// So: with async asked for and direct I/O out of the picture, the name
-// must either name the platform's async engine or say why it could not
-// be had. A silent fallback fails here, which is the point; a fallback
-// that explains itself passes, because that is the contract.
-TEST_CASE("an engaged backend is the platform's async engine, or says why not") {
-#if defined(__linux__)
-  constexpr std::string_view engine = "io_uring";
-  constexpr std::string_view engine_alt = "";
-#elif defined(_WIN32)
-  // Windows has two async engines and picks between them at runtime, so
-  // either name is the platform's: the I/O ring where the machine has
-  // one, the completion port otherwise.
-  constexpr std::string_view engine = "iocp";
-  constexpr std::string_view engine_alt = "ioring";
-#elif defined(__APPLE__)
-  constexpr std::string_view engine = "gcd";
-  constexpr std::string_view engine_alt = "";
-#elif defined(__FreeBSD__)
-  constexpr std::string_view engine = "aio";
-  constexpr std::string_view engine_alt = "";
-#else
-  constexpr std::string_view engine = "";
-  constexpr std::string_view engine_alt = "";
-#endif
-  if constexpr (engine.empty()) {
-    MESSAGE("no async engine on this platform; nothing to assert");
-    return;
-  } else {
-    // A degradation the backend could explain carries the reason in
-    // brackets, as uring_backend.hpp's no_uring_suffix() does.
-    const auto engaged_or_explained = [&](std::string_view name) {
-      return name.find(engine) != std::string_view::npos ||
-             (!engine_alt.empty() &&
-              name.find(engine_alt) != std::string_view::npos) ||
-             name.find('[') != std::string_view::npos;
-    };
+// The engine table itself: every enumerator has two real names and both
+// of them come back. A .def row with a copy-pasted name, or a to_string()
+// that forgot a case, fails here rather than in a user's log.
+TEST_CASE("every io_engine round-trips through both of its names") {
+  const std::span<const blake3pp::io_engine> all{every_io_engine};
+  REQUIRE(!all.empty());
+  constexpr auto wr = blake3pp::io_direction::write;
 
+  for (const auto e : all) {
+    const std::string_view r = blake3pp::to_string(e);
+    const std::string_view w = blake3pp::to_string(e, wr);
+    CAPTURE(r);
+    CAPTURE(w);
+    CHECK(!r.empty());
+    CHECK(!w.empty());
+    CHECK(r != "unknown");
+    CHECK(w != "unknown");
+    const auto from_read = blake3pp::io_engine_from_string(r);
+    const auto from_write = blake3pp::io_engine_from_string(w);
+    REQUIRE(from_read.has_value());
+    REQUIRE(from_write.has_value());
+    CHECK(static_cast<int>(*from_read) == static_cast<int>(e));
+    CHECK(static_cast<int>(*from_write) == static_cast<int>(e));
+  }
+
+  // from_string() can only be an inverse if no two engines spell
+  // themselves alike -- and not just column by column. It parses EITHER
+  // column, because the engine token of a `backend` string does not say
+  // which way the bytes went, so one engine's write spelling colliding
+  // with another's read spelling would resolve a real name to the wrong
+  // enumerator. "pwrite" meaning posix_sync and "gcd-write" meaning gcd
+  // is what keeps that from happening; a .def row that spelled the GCD
+  // write side "pwrite" would be caught here and nowhere else.
+  for (const auto a : all) {
+    for (const auto b : all) {
+      if (a == b) {
+        continue;
+      }
+      CAPTURE(blake3pp::to_string(a));
+      CAPTURE(blake3pp::to_string(b));
+      CHECK(std::string_view(blake3pp::to_string(a)) !=
+            std::string_view(blake3pp::to_string(b)));
+      CHECK(std::string_view(blake3pp::to_string(a, wr)) !=
+            std::string_view(blake3pp::to_string(b, wr)));
+      CHECK(std::string_view(blake3pp::to_string(a, wr)) !=
+            std::string_view(blake3pp::to_string(b)));
+    }
+  }
+
+  CHECK(!blake3pp::io_engine_from_string("").has_value());
+  CHECK(!blake3pp::io_engine_from_string("no_such_engine").has_value());
+}
+
+// The preference rank of each engine, from the same table the library
+// reads: the ladder's order is a claim about these, and the claim is
+// worth checking from outside the translation unit that makes it.
+constexpr unsigned engine_rank(blake3pp::io_engine e) {
+  switch (e) {
+#define BLAKE3PP_IO_ENGINE(enumerator, read_name, write_name, rank, async) \
+  case blake3pp::io_engine::enumerator:                                    \
+    return (rank);
+#include <blake3pp/detail/io_engine.def>
+#undef BLAKE3PP_IO_ENGINE
+  }
+  return 0;
+}
+
+// Whether a list contains an engine, spelled once.
+bool carries(std::span<const blake3pp::io_engine> list,
+             blake3pp::io_engine e) {
+  return std::ranges::find(list, e) != list.end();
+}
+
+// The same invariants the dispatch side has, on the I/O enum, plus the
+// two the ladder adds: the compiled list descends the preference order
+// because it IS the chain of what-defers-to-what, and the available
+// list is a SUFFIX of it rather than any old subset -- a context
+// engaged the rung it did because everything above was refused and
+// everything below is what it would have degraded to in turn. A
+// filtered-but-not-suffix answer would mean the ladder and the kernel
+// disagree about which way is down.
+TEST_CASE("io engine introspection: the ladder, what it grants, the best") {
+  const auto compiled = blake3pp::compiled_io_engines();
+  const auto available = blake3pp::available_io_engines();
+  REQUIRE(!compiled.empty());
+  REQUIRE(!available.empty());
+
+  std::string names;
+  for (const auto e : compiled) {
+    names += std::format(" {}{}", blake3pp::to_string(e),
+                         blake3pp::is_available(e) ? "" : "[no os support]");
+  }
+  MESSAGE("compiled io engines:"
+          << names << " (auto -> "
+          << std::string(blake3pp::to_string(blake3pp::best_io_engine()))
+          << ")");
+
+  // A ladder descends: each rung is ranked strictly below the one above
+  // it, which is both "best-first" and "no engine named twice".
+  for (std::size_t i = 1; i < compiled.size(); ++i) {
+    CAPTURE(blake3pp::to_string(compiled[i - 1]));
+    CAPTURE(blake3pp::to_string(compiled[i]));
+    CHECK(engine_rank(compiled[i]) > engine_rank(compiled[i - 1]));
+  }
+
+  // Nothing asynchronous hangs below a synchronous rung, so a refusal
+  // anywhere on the ladder lands on a rung that does the transfer on
+  // the calling thread.
+  bool seen_sync = false;
+  for (const auto e : compiled) {
+    CAPTURE(blake3pp::to_string(e));
+    CHECK(!(seen_sync && blake3pp::is_async(e)));
+    seen_sync = seen_sync || !blake3pp::is_async(e);
+  }
+
+  // available is the ladder from the engaged rung down -- position and
+  // contents, not merely membership.
+  const auto at = std::ranges::find(compiled, blake3pp::best_io_engine());
+  REQUIRE(at != compiled.end());
+  CHECK(std::ranges::equal(
+      available, compiled.subspan(
+                     static_cast<std::size_t>(at - compiled.begin()))));
+  CHECK(static_cast<int>(blake3pp::best_io_engine()) ==
+        static_cast<int>(available.front()));
+
+  // is_available() answers for the whole enum, not just the compiled
+  // part: an engine this build does not carry is not available however
+  // much the OS would like it.
+  for (const auto e : every_io_engine) {
+    CAPTURE(blake3pp::to_string(e));
+    CHECK(blake3pp::is_available(e) == carries(available, e));
+    if (!carries(compiled, e)) {
+      CHECK(!blake3pp::is_available(e));
+    }
+  }
+
+  // The floor: the worst compiled engine is a synchronous one, and no
+  // kernel refuses it, which is why available_io_engines() is never
+  // empty.
+  CHECK(!blake3pp::is_async(compiled.back()));
+  CHECK(blake3pp::is_available(compiled.back()));
+
+  // The verdict does not move under the library's own I/O. Real opens
+  // in between are the interesting part: the probe constructs a context
+  // of exactly the kind a hash does, so a verdict that flapped would
+  // make two --version runs of the same process disagree.
+  const auto before = blake3pp::best_io_engine();
+  {
     const auto content = make_input(256 * 1024);
-    {
-      const temp_file f(content);
-      blake3pp::detail::file_reader r(
-          f.path, {.direct_io = false, .async = true});
-      const std::string_view name = r.backend();
-      CAPTURE(name);
-      CHECK(engaged_or_explained(name));
+    const temp_file f(content);
+    (void)blake3pp::hash_file(f.path);
+  }
+  CHECK(static_cast<int>(blake3pp::best_io_engine()) ==
+        static_cast<int>(before));
+  CHECK(std::ranges::equal(blake3pp::available_io_engines(), available));
+}
+
+// is_async() is the column --no-async is built from, so it is worth a
+// positive assertion rather than only a negative one: the five engines
+// that hand a transfer to the OS, and the three that do it on the
+// calling thread, named here so that flipping a column in the .def
+// fails a test instead of quietly changing a help string.
+TEST_CASE("is_async marks the engines that hand the transfer to the OS") {
+  CHECK(blake3pp::is_async(blake3pp::io_engine::io_uring));
+  CHECK(blake3pp::is_async(blake3pp::io_engine::ioring));
+  CHECK(blake3pp::is_async(blake3pp::io_engine::iocp));
+  CHECK(blake3pp::is_async(blake3pp::io_engine::gcd));
+  CHECK(blake3pp::is_async(blake3pp::io_engine::aio));
+  CHECK(!blake3pp::is_async(blake3pp::io_engine::posix_sync));
+  CHECK(!blake3pp::is_async(blake3pp::io_engine::win_sync));
+  CHECK(!blake3pp::is_async(blake3pp::io_engine::stdio));
+
+  // The half that ties the column to behaviour: a reader told not to be
+  // asynchronous lands on a rung is_async() calls synchronous. Without
+  // this the column could be a fiction that only the help text reads.
+  const auto content = make_input(256 * 1024);
+  const temp_file f(content);
+  blake3pp::detail::file_reader r(f.path,
+                                  {.direct_io = false, .async = false});
+  const auto e = blake3pp::io_engine_from_string(engine_token(r.backend()));
+  CAPTURE(r.backend());
+  REQUIRE(e.has_value());
+  CHECK(!blake3pp::is_async(*e));
+}
+
+// The engine token of a real open is exactly the name best_io_engine()
+// gives it. This ties the enumeration to the strings the tools print, and
+// fails if a backend is added without a row in io_engine.def.
+//
+// The case names no engine to expect. Whatever this kernel grants (the
+// ring, the port, libdispatch, AIO, or the synchronous rung because the
+// async one was refused), the two answers are produced by different code,
+// one by a backend's name_for() and the other by the .def table and a
+// throwaway context, and have to agree.
+TEST_CASE("a probe's engine token is the name best_io_engine() gives") {
+  const auto expected =
+      std::string(blake3pp::to_string(blake3pp::best_io_engine()));
+  CAPTURE(expected);
+
+  const auto large = make_input(1024 * 1024);
+  const temp_file fl(large);
+  const auto pl = blake3pp::probe_file_io(fl.path);
+  CAPTURE(pl.backend);
+  REQUIRE(!pl.backend.empty());
+  CHECK(engine_token(pl.backend) == expected);
+
+  const auto parsed = blake3pp::io_engine_from_string(engine_token(pl.backend));
+  REQUIRE(parsed.has_value());
+  CHECK(static_cast<int>(*parsed) ==
+        static_cast<int>(blake3pp::best_io_engine()));
+
+  // The decorations move with the open; the engine does not. A file too
+  // small for the bypass and a caller who refused it land on the same
+  // engine as the direct open above.
+  const auto small = make_input(100 * 1000);
+  const temp_file fsm(small);
+  CHECK(engine_token(blake3pp::probe_file_io(fsm.path).backend) == expected);
+  CHECK(engine_token(blake3pp::probe_file_io(fl.path, {.direct_io = false})
+                         .backend) == expected);
+
+  // The write side names itself from the same table. It is held to the
+  // weaker claim -- an engine this build carries -- because a write can
+  // lose the engine for reasons a read cannot (a share mode, a length
+  // the engine will not take), and that is the per-file half.
+  const temp_file out({});
+  const blake3pp::write_report wrote = blake3pp::write_file(
+      out.path, 256 * 1024,
+      [](std::span<std::byte> buf, std::uint64_t) {
+        std::ranges::fill(buf, std::byte{0x5a});
+      });
+  CAPTURE(wrote.backend);
+  const auto w = blake3pp::io_engine_from_string(engine_token(wrote.backend));
+  REQUIRE(w.has_value());
+  CHECK(std::ranges::find(blake3pp::compiled_io_engines(), *w) !=
+        blake3pp::compiled_io_engines().end());
+}
+
+// The oracle that ties the published list to the backends actually
+// linked, which is the thing a hand-written list could never have.
+//
+// Every context in src/io/ declares two compile-time facts -- the
+// engine it IS and the rung it defers to -- and
+// blake3pp::compiled_io_engines() is nothing but the chain of those
+// from the platform's own context. A declaration is still a sentence
+// someone wrote, so this checks it against the OTHER place the same
+// backend spells its engine: the name() it writes into a file's
+// `backend` string, composed by its own name_for() and never by this
+// table. The two are produced by different code from different inputs
+// and have to agree, for every backend this platform links and not
+// only the one it selects.
+//
+// Asking twice is what makes it cover the whole ladder: with asynchrony
+// requested, a context lands on its top rung or on the one below
+// depending on the kernel; with --no-async it lands on the rung below
+// by construction, which is how the floor gets checked on a machine
+// that has the async engine.
+template <class Ctx>
+void check_rung_declaration(const char* what, const fs::path& path) {
+  namespace io_impl = blake3pp::detail::io_impl;
+  CAPTURE(what);
+  for (const bool async : {true, false}) {
+    CAPTURE(async);
+    const io_impl::reader_context_options opts{.async = async};
+    Ctx ctx(opts, 4);
+    const typename Ctx::file f(ctx, path, io_impl::file_open_options{});
+    const blake3pp::io_engine engaged = ctx.engaged_rung().engine;
+    const std::string name(f.name());
+    CAPTURE(name);
+    CHECK(engine_token(name) == std::string(blake3pp::to_string(engaged)));
+    const auto parsed = blake3pp::io_engine_from_string(engine_token(name));
+    REQUIRE(parsed.has_value());
+    CHECK(static_cast<int>(*parsed) == static_cast<int>(engaged));
+    if (!async) {
+      CHECK(!blake3pp::is_async(engaged));
     }
-    {
-      const temp_file f({});  // placeholder path; the writer recreates it
-      blake3pp::detail::file_writer w(
-          f.path, {.buffer_bytes = 64 * 1024,
-                   .queue_depth = 2,
-                   .direct_io = false,
-                   .async = true});
-      const std::string_view name = w.backend();
-      CAPTURE(name);
-      CHECK(engaged_or_explained(name));
-      auto b = w.acquire();
-      std::memcpy(b.data, content.data(), 4096);
-      w.submit(b, 4096);
-      w.finish();
-    }
+  }
+}
+
+TEST_CASE("every linked backend names the rung it declares") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const auto content = make_input(256 * 1024);
+  const temp_file f(content);
+
+  check_rung_declaration<io_impl::stdio_context>("stdio", f.path);
+#if defined(__unix__) || defined(__APPLE__)
+  check_rung_declaration<io_impl::pread_context>("pread", f.path);
+#endif
+#if defined(__linux__)
+  check_rung_declaration<io_impl::uring_context>("uring", f.path);
+#endif
+#if defined(__FreeBSD__)
+  check_rung_declaration<io_impl::aio_context>("aio", f.path);
+#endif
+#if defined(__APPLE__)
+  check_rung_declaration<io_impl::gcd_context>("gcd", f.path);
+#endif
+#if defined(_WIN32)
+  check_rung_declaration<io_impl::iocp_context>("iocp", f.path);
+  check_rung_declaration<io_impl::ioring_context>("ioring", f.path);
+#endif
+  // The one the list is actually read off. On most platforms this is
+  // one of the above again; on Windows it is the composition of two of
+  // them, which is the case the list has to get right.
+  check_rung_declaration<io_impl::native_io_context>("native", f.path);
+
+  // And the list against that context: what a fresh context engages is
+  // what best_io_engine() reports, with the public call told the answer
+  // by nothing but its own probe. A probe that reported the floor
+  // unconditionally fails this on every machine that has an async
+  // engine.
+  {
+    const io_impl::native_io_context ctx(io_impl::reader_context_options{}, 4);
+    CAPTURE(blake3pp::to_string(ctx.engaged_rung().engine));
+    CHECK(carries(blake3pp::compiled_io_engines(),
+                  ctx.engaged_rung().engine));
+    CHECK(static_cast<int>(ctx.engaged_rung().engine) ==
+          static_cast<int>(blake3pp::best_io_engine()));
+  }
+  // The bottom of the list is the rung the native context falls to when
+  // nothing is asked of the OS -- the claim compiled_io_engines() makes
+  // by ending where it does.
+  {
+    const io_impl::native_io_context ctx(
+        io_impl::reader_context_options{.async = false}, 4);
+    CAPTURE(blake3pp::to_string(ctx.engaged_rung().engine));
+    CHECK(static_cast<int>(ctx.engaged_rung().engine) ==
+          static_cast<int>(blake3pp::compiled_io_engines().back()));
+  }
+}
+
+// The engaged rung, asserted.
+//
+// backend() exists so a degradation is visible. An async path that can
+// never engage passes every test on the bytes: a Windows writer whose
+// two handles' share modes collide sends every write down the
+// synchronous rung and still writes the right file.
+//
+// With async asked for and direct I/O out of the picture, the name must
+// either name the engine this kernel grants or say why it could not be
+// had. A silent fallback fails here; a fallback that explains itself
+// passes.
+//
+// Which engine that is comes from blake3pp::best_io_engine(), so the
+// case needs no list of platform engines of its own.
+TEST_CASE("an engaged backend is the engine this kernel grants, or says why not") {
+  const std::string engine =
+      blake3pp::to_string(blake3pp::best_io_engine());
+  const std::string engine_write = blake3pp::to_string(
+      blake3pp::best_io_engine(), blake3pp::io_direction::write);
+  CAPTURE(engine);
+
+  // A degradation the backend could explain carries the reason in
+  // brackets, as uring_backend.hpp's no_uring_suffix() does.
+  const auto engaged_or_explained = [](std::string_view name,
+                                       std::string_view expect) {
+    return name.find(expect) != std::string_view::npos ||
+           name.find('[') != std::string_view::npos;
+  };
+
+  const auto content = make_input(256 * 1024);
+  {
+    const temp_file f(content);
+    blake3pp::detail::file_reader r(
+        f.path, {.direct_io = false, .async = true});
+    const std::string_view name = r.backend();
+    CAPTURE(name);
+    CHECK(engaged_or_explained(name, engine));
+  }
+  {
+    const temp_file f({});  // placeholder path; the writer recreates it
+    blake3pp::detail::file_writer w(
+        f.path, {.buffer_bytes = 64 * 1024,
+                 .queue_depth = 2,
+                 .direct_io = false,
+                 .async = true});
+    const std::string_view name = w.backend();
+    CAPTURE(name);
+    CHECK(engaged_or_explained(name, engine_write));
+    auto b = w.acquire();
+    std::memcpy(b.data, content.data(), 4096);
+    w.submit(b, 4096);
+    w.finish();
   }
 }
 

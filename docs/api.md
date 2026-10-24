@@ -160,10 +160,10 @@ hashing:
 
 Each feature degrades independently at runtime: a file the filesystem will
 not open for direct I/O is read buffered, and an engine the OS refuses
-reads synchronously inside the same poll. Which of the three engines a
-build has is decided at compile time -- as is the stdio fallback, which is
-for platforms with none of them (wasm) rather than a rung anything
-degrades to. The rung that was engaged is reported after the fact, with the
+reads synchronously inside the same poll. Which engines a build has is
+decided at compile time and reported by `compiled_io_engines()` (below)
+-- the stdio fallback included, which is for platforms with none of the
+above (wasm) rather than a rung anything degrades to. The rung that was engaged is reported after the fact, with the
 reason appended when an asynchronous engine was asked for and refused:
 `write_report::backend` for a write, and
 `blake3pp::read_backend(trace.driver())` for a read given a `trace_buffer`.
@@ -191,6 +191,32 @@ p.backend;     // "io_uring+direct", "iocp", "pread", ...
 p.direct_io;   // what was asked of the filesystem
 p.windows;     // windows the pipeline would keep in flight
 ```
+
+`probe_file_io()` needs a path because the cache bypass depends on the
+filesystem. The engine does not -- it is fixed by the build and the
+kernel -- so these calls answer without opening anything:
+
+```cpp
+blake3pp::compiled_io_engines();   // the engines in this binary
+blake3pp::available_io_engines();  // those this kernel grants
+blake3pp::best_io_engine();        // what a fresh open will use
+blake3pp::is_available(e);         // in the binary and granted here
+blake3pp::is_async(e);             // true for the engines --no-async gives up
+blake3pp::to_string(e);            // "io_uring", "pread", ...
+blake3pp::to_string(e, blake3pp::io_direction::write);  // "pwrite", ...
+```
+
+Both lists are best-first, and `available_io_engines().front()` is
+`best_io_engine()`. The enum and the names come from
+`include/blake3pp/detail/io_engine.def`, as `arch` comes from
+`arch.def`.
+
+`to_string()` gives the same word a `backend` string starts with, so
+the engine token of a `probe_file_io()` result equals
+`to_string(best_io_engine())` for a file that got what a fresh open
+gets. `blake3ppsum --version` prints the compiled list, which of them
+this machine grants and which `auto` picks; the tools build their
+`--no-async` help text from `is_async()`.
 
 `hash_file()` is the one-shot form. `update_file()` is the primitive
 underneath it: `hasher::update()` with a file as the source. It streams

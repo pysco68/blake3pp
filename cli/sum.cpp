@@ -70,6 +70,16 @@ std::string version_text() {
                      blake3pp::to_string(a));
     }
   }
+  // The I/O engines in the same form: those the build carries, which of
+  // them this kernel grants, and what a fresh open engages. Whether a
+  // given FILE keeps the engine and bypasses the cache needs an open;
+  // probe_file_io() answers that.
+  std::string engines;
+  for (const auto e : blake3pp::compiled_io_engines()) {
+    std::format_to(std::back_inserter(engines), " {}{}",
+                   blake3pp::to_string(e),
+                   blake3pp::is_available(e) ? "" : "[no os support]");
+  }
   std::string text = std::format(
       "blake3ppsum (blake3pp {})\n"
       "simd provider: {}\n"
@@ -82,6 +92,8 @@ std::string version_text() {
     std::format_to(std::back_inserter(text),
                    "\ncpu also supports:{} (not compiled in)", uncompiled);
   }
+  std::format_to(std::back_inserter(text), "\nio engines:{} (auto -> {})",
+                 engines, blake3pp::to_string(blake3pp::best_io_engine()));
   return text;
 }
 
@@ -441,7 +453,7 @@ int main(int argc, char** argv) {
       ->capture_default_str();
 
   app.add_flag("--no-direct", no_direct, "keep the OS page cache (no O_DIRECT)");
-  app.add_flag("--no-async", no_async, "read synchronously (no io_uring/IOCP/GCD queue)");
+  app.add_flag("--no-async", no_async, std::format("read synchronously ({})", b3tool::no_async_note()));
   app.add_flag("--inline-submit", inline_submit, "issue reads inline in the submitting thread, not on io_uring's workers");
   app.add_flag("--no-ioring", no_ioring, "Windows: read through the completion port instead of the I/O ring");
   auto* trace_opt = app.add_option("--trace", o.trace_path, "record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)");

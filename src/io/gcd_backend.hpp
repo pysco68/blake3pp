@@ -200,6 +200,19 @@ class gcd_context {
     pump_.destroy();
   }
 
+  // This context's rung and the one it degrades to; see
+  // uring_context::engaged_rung().
+  static constexpr io_engine rung_engine = io_engine::gcd;
+  using rung_below = posix_sync_rung;
+
+  // libdispatch is part of the platform, so the only way a dispatch
+  // group fails to be created is that the allocation failed -- which is
+  // a fact about this moment and never settled.
+  [[nodiscard]] rung_verdict engaged_rung() const noexcept {
+    return use_gcd_ ? rung_verdict{rung_engine, true}
+                    : rung_verdict{rung_below::rung_engine, false};
+  }
+
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    transfer& op) {
     arm(op, f, off, buf.size());

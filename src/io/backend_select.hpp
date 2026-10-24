@@ -102,6 +102,10 @@ class windows_context {
     if (opts.ioring) {
       ring_.emplace(opts, max_inflight);
       if (!ring_->using_ring()) {
+        // Taken before the ring goes: whether the reason it was refused
+        // is this Windows (settled) or this moment (not), which is what
+        // keeps best_io_engine() from remembering a resource failure.
+        ring_refusal_settled_ = ring_->engaged_rung().settled;
         // A ring that could not be had leaves the port as the better of
         // the two fallbacks: the ring context's own ladder would serve
         // every transfer synchronously. The reason goes onto the port's
@@ -191,6 +195,38 @@ class windows_context {
     }
   }
 
+#if defined(BLAKE3PP_HAS_IORING_API)
+  // The ring is in this binary, so it is the top of the ladder and the
+  // completion port is the rung a refused ring degrades to -- which is
+  // the composition two members below, declared.
+  static constexpr io_engine rung_engine = io_engine::ioring;
+  using rung_below = iocp_context;
+#else
+  // <ioringapi.h> was not in the SDK this was built against:
+  // ioring_context compiles to a context that refuses every ring, the
+  // constructor below therefore never keeps one, and the ring is not an
+  // engine this binary carries. The ladder is then the port's own,
+  // forwarded so the two cannot drift, and a build without the SDK
+  // header does not report an engine it lacks.
+  static constexpr io_engine rung_engine = iocp_context::rung_engine;
+  using rung_below = iocp_context::rung_below;
+#endif
+
+  // Which of the two this context chose, decided once at construction --
+  // the same answer file::name() gives below, from the same two members
+  // and in the same shape.
+  //
+  // A port is not evidence that the ring is permanently out of reach: a
+  // CreateIoRing or event failure is a resource error, so the verdict is
+  // settled only where the ring's own refusal was.
+  [[nodiscard]] rung_verdict engaged_rung() const noexcept {
+    if (ring_) {
+      return ring_->engaged_rung();
+    }
+    const rung_verdict port = port_->engaged_rung();
+    return {port.engine, port.settled && ring_refusal_settled_};
+  }
+
   // Only the ring has anything to do with the arena; the port's absence
   // of this member is why register_arena_if_supported() exists.
   void register_arena(std::span<std::byte> arena) noexcept {
@@ -224,6 +260,10 @@ class windows_context {
   std::optional<ioring_context> ring_;
   std::optional<iocp_context> port_;
   std::string ring_refusal_;  // the suffix the port's files carry, or empty
+  // Whether the ring's refusal is a standing fact; false while no ring
+  // was asked for, since a caller who declined one says nothing about
+  // the machine.
+  bool ring_refusal_settled_ = false;
 };
 
 static_assert(io_context<windows_context>);

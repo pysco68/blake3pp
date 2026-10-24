@@ -7,10 +7,16 @@ Two utilities build alongside the library, in top-level builds only.
 reproducible test data at the speed of your disk. Both are built on the
 library this documents, so they are also worked examples of it.
 
-The help below is what the tools print. Two parts of it depend on the
-machine rather than on the documentation, and are shown as placeholders:
-the variants a build carries, and the core count a thread default picks
-up.
+The help below is what the tools print. Three parts of it depend on the
+build or the machine rather than on the documentation, and are shown as
+placeholders: the variants a build carries, the core count a thread
+default picks up, and the async I/O engines a build carries. The last is
+not written down anywhere: `--no-async` names the engines from
+`blake3pp::compiled_io_engines()`, so it says `io_uring` on Linux,
+`ioring/iocp` on Windows, `gcd` (`gcd-write` on the write side) on
+macOS, `aio` on FreeBSD, and `async` where the platform has no async
+engine to turn off. See [the API reference](api.md) for the
+introspection calls behind it.
 
 ## blake3ppsum
 
@@ -47,7 +53,7 @@ OPTIONS:
                               I/O window size in MiB
           --qd UINT [4]       I/O queue depth (the reader clamps it to its range)
           --no-direct         keep the OS page cache (no O_DIRECT)
-          --no-async          read synchronously (no io_uring/IOCP/GCD/AIO queue)
+          --no-async          read synchronously (no <this build's async engines> queue)
           --inline-submit     issue reads inline in the submitting thread, not on io_uring's
                               workers
           --no-ioring         Windows: read through the completion port instead of the I/O
@@ -97,7 +103,8 @@ OPTIONS:
           --no-direct Needs: --output
                               with --output: no direct I/O (write through the page cache)
           --no-async Needs: --output
-                              with --output: no async queue (synchronous writes)
+                              with --output: write synchronously (no <this build's async
+                              engines> queue)
           --inline-submit Needs: --output
                               with --output: issue writes inline in the submitting thread, not
                               on io_uring's workers
@@ -169,7 +176,8 @@ that is as much as either tool says about the pipeline it ran.
 `blake3pp_bench_file` takes `--no-async` as well, which is how the
 platform's async engine gets measured against its synchronous rung on
 one device: the same windows, the same queue depth, served by `pread`
-instead.
+(`ReadFile` on Windows) instead. Its help text names the engines the
+same derived way the other two do.
 
 To see where a run's time actually goes, point `blake3pp_bench_file` at
 the same file with the same flags and add `--trace`:

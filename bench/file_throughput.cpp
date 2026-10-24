@@ -814,8 +814,9 @@ int main(int argc, char** argv) {
   app.add_flag("--no-direct", no_direct,
                "keep the OS page cache (no O_DIRECT)");
   app.add_flag("--no-async", no_async,
-               "read synchronously (no io_uring/IOCP/GCD/AIO queue): the "
-               "comparison arm against the platform's async engine");
+               std::format("read synchronously ({}): the comparison arm "
+                           "against the platform's async engine",
+                           b3tool::no_async_note()));
   app.add_flag("--inline-submit", inline_submit,
                "issue each read inline in the submitting thread instead of "
                "on io_uring's workers (IOSQE_ASYNC off)");
