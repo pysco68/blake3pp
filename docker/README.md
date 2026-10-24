@@ -26,7 +26,7 @@ unsupported and unneeded.
 | `toolchain-ppc64le-gcc15` | 26.04 | (ppc64le sysroot) | `linux-ppc64le-gcc15-*` | qemu-ppc64le (`QEMU_CPU=power8/9/10`) |
 | `toolchain-mips64el-gcc14` | Debian 13 | (mips64el sysroot) | `linux-mips64el-gcc14-*` | qemu-mips64el (`QEMU_CPU` unset = no MSA, `Loongson-3A4000` = MSA) |
 | `toolchain-s390x-gcc15` | 26.04 | (s390x sysroot) | `linux-s390x-gcc15-*` | qemu-s390x (big-endian; `QEMU_CPU=max,vxeh=off` for the scalar fallback) |
-| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64, ppc64le, s390x), `tools/make-release.sh` | qemu-user, aarch64+riscv64 binutils strip, zig cache prewarmed for all five musl targets (world-writable; `musl-run <arch> <binary>` runs a static binary through qemu when foreign), the zig wrappers (docker/wrappers/zig) on PATH as `<triple>-clang`/`-clang++` |
+| `toolchain-zig` | 26.04 | n/a (static musl) | `*zigmusl*` (x86_64, aarch64, riscv64, ppc64le, s390x, loongarch64), `tools/make-release.sh` | qemu-user (`QEMU_CPU=max,lasx=off` / `max,lsx=off,lasx=off` for the loongarch64 fallbacks), aarch64+riscv64+loongarch64 binutils, zig cache prewarmed for all six musl targets and for loongarch64's `-mno-lsx` baseline (world-writable; `musl-run <arch> <binary>` runs a static binary through qemu when foreign), the zig wrappers (docker/wrappers/zig) on PATH as `<triple>-clang`/`-clang++` |
 | `toolchain-emscripten` | 26.04 | n/a (wasm) | `wasm32-*` | node; the apt package's frozen sysroot cache covers pthread/wasm-eh/simd; `wasm32-emscripten-clang`/`-clang++` wrap emcc/em++ under names reclient's dependency scanner accepts (the toolchain's Platform/Emscripten.cmake shim selects them) |
 
 Registry: `ghcr.io/pysco68/blake3pp/toolchain-<name>`. The canonical tag

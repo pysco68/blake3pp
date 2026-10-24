@@ -15,8 +15,9 @@ caller, and when to turn it off.
 | OS | async engine | cache-bypass flag |
 |----|--------------|--------------------|
 | Linux | io_uring | `O_DIRECT` |
-| Windows | IOCP | `FILE_FLAG_NO_BUFFERING` |
+| Windows | IoRing (Windows 11) or IOCP | `FILE_FLAG_NO_BUFFERING` |
 | macOS | GCD (libdispatch) | `F_NOCACHE` |
+| FreeBSD | POSIX AIO (`lio_listio`) on a kqueue | `O_DIRECT` |
 
 Each is a per-open property. `src/io/posix_file.hpp` engages `O_DIRECT`
 by reopening the path a second time with the flag set, and keeps the
@@ -25,14 +26,73 @@ whatever the direct one cannot carry. Darwin has no `O_DIRECT`;
 `src/io/gcd_backend.hpp` instead flips `F_NOCACHE` on the single
 descriptor with `fcntl`, per-fd rather than per-open. Windows carries two
 independent per-open flags, `FILE_FLAG_NO_BUFFERING` and
-`FILE_FLAG_OVERLAPPED` (the port); `src/io/iocp_backend.hpp` asks for
-both together on the first reopen and, if that is refused, asks again
-for the port alone before falling back further. The port is kept on its
+`FILE_FLAG_OVERLAPPED` (the asynchronous handle); `src/io/iocp_backend.hpp`
+and `src/io/ioring_backend.hpp` both ask for the two together on the
+first reopen and, if that is refused, ask again for the asynchronous
+handle alone before falling back further. The asynchrony is kept on its
 own deliberately: `NO_BUFFERING` is usually what a filesystem (SMB
 shares, some virtual volumes) actually rejects, and buffered-but-async
 reads measure within noise of direct-and-async ones on Windows, so
 giving up both together for a refusal that only concerned one of them
 would discard the half that still works.
+
+Windows has two completion mechanisms, so it is the one platform whose
+backend is chosen at runtime. An I/O ring (`ioringapi.h`, Windows 11) is
+the submission-queue model io_uring introduced: entries are built into a
+queue the application owns, one `SubmitIoRing` hands a whole batch to the
+kernel, and completions are popped from a second queue. Where the machine
+offers `IORING_VERSION_3` -- reads, writes, cancel and registration --
+`src/io/backend_select.hpp` takes it; everything older gets the completion
+port. `file_io_options::ioring` and `file_write_options::ioring` (both
+default `true`) choose the port instead, which is what the IOCP-against-
+IoRing comparison needs, and the rung names below say which one ran. The
+entry points are resolved from `KernelBase.dll` at first use rather than
+linked, so a binary built against the Windows 11 SDK still loads on
+Windows 10.
+
+FreeBSD reaches the device through the one widely deployed Unix
+asynchronous file API that is not io_uring: POSIX AIO. `src/io/aio_backend.hpp`
+fills a `struct aiocb` per transfer, hands whole batches to the kernel
+with one `lio_listio(LIO_NOWAIT, ...)`, and asks for each completion as
+an `EVFILT_AIO` event on the context's kqueue
+(`aio_sigevent.sigev_notify = SIGEV_KEVENT`), so the loop is the same
+pull-style submit-and-reap io_uring's is. The AIO facility is the
+kernel's own, not a thread pool in the process: the requests are served
+by the `aiod` kernel threads whose count `vfs.aio.target_aio_procs` and
+`vfs.aio.max_aio_procs` bound, and `vfs.aio.max_aio_queue_per_proc`
+bounds how many a process may have outstanding. The context reads that
+last one at construction and cuts every batch to what is still free, so
+the limit shows up as fewer requests in flight rather than as a refusal;
+a limit of zero, or a kernel with no AIO at all, is the whole facility
+refused and the names below say so.
+
+`O_DIRECT` on FreeBSD is a hint rather than a mode. UFS honours it for
+page-aligned buffers, offsets and lengths, and quietly serves anything
+else through the cache. ZFS honours it from OpenZFS 2.3 under the
+dataset's `direct` property: `direct=standard` (the default there) serves
+requests whose offset and length are 4 KiB aligned and answers `EINVAL`
+for the rest, `direct=disabled` ignores the flag, `direct=always` takes
+every request. Releases before OpenZFS 2.3 have no such property and no
+direct path at all. Since neither the release nor the property is
+something a caller should have to know, the backend asks the file
+system instead: one page-sized `pread` through the direct descriptor at
+open, and an `EINVAL` degrades that file to buffered with the
+`" [direct: EINVAL]"` suffix on its name. Everything else -- a short
+read, an end-of-file zero -- is the descriptor being served.
+
+What the probe answers is whether the descriptor is *served*, which is
+all `O_DIRECT` has ever promised on a system where it is a hint: a
+dataset on OpenZFS 2.2 or older, or one with `direct=disabled`, takes
+the flag without complaint and reads through the ARC anyway, and the
+rung still reads `"aio+direct"`. On FreeBSD 14.5 (OpenZFS 2.2.9) that is
+exactly what happens, and `zfs get direct` there answers "invalid
+property": the release has no direct path to ask for.
+
+`file_io_options::registered_buffers` (default `false`) additionally
+registers the window arena and the file handle with the ring, so a
+transfer names a region index and a table slot instead of a pointer and a
+`HANDLE`. A ring that refuses either keeps serving pointer refs, and a
+transfer into a buffer outside the arena uses one anyway.
 
 Bypassing the cache means every transfer does real device work: a page
 the kernel already held will not save a second trip, and a drive earning
@@ -81,6 +141,12 @@ ring, a submit the kernel refused and a zero-length transfer. Nothing
 above the backend can tell a window's bytes arrived through one
 descriptor from arriving through two; both land in the same buffer.
 
+FreeBSD asks it with the same function under the same name:
+`piece_for()` in `src/io/aio_backend.hpp` picks the direct descriptor for
+the whole granules at a granule offset and the plain one for the rest,
+both as AIO requests, so a direct file's last window is as asynchronous
+as the others there too.
+
 Windows' `port_len()` asks the same question with one difference: the
 plain handle there is not overlapped and cannot be given to the port, so
 a `NO_BUFFERING` file's sub-granule rest -- at most 4095 bytes, once per
@@ -107,11 +173,17 @@ Every reader and writer names the rung it landed on:
 - During or after a hash the rung reaches a caller through the trace:
   `blake3pp::read_backend(buffer.driver())` after an `update_file()` that
   was given a `trace_buffer` ([Performance tracing](tracing.md)). The
-  spellings are `"io_uring+direct"`, `"iocp+direct"`, `"gcd+nocache"`,
-  `"pread"`, `"readfile"` and `"stdio"`.
+  spellings are `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
+  `"gcd+nocache"`, `"aio+direct"`, `"pread"`, `"readfile"` and
+  `"stdio"`, with `"+regbuf"` appended where the ring took the arena
+  registration.
 - `write_report::backend` names the write side the same way:
-  `"io_uring+direct"`, `"iocp+direct"`, `"gcd-write+nocache"`, `"pwrite"`,
-  `"writefile"`, or `"stdio"`.
+  `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
+  `"gcd-write+nocache"`, `"aio+direct"`, `"pwrite"`, `"writefile"`, or
+  `"stdio"`, and on
+  Windows adds how the preallocation
+  was kept from zeroing ahead of the writes: `"+sparse"` or `"+validdata"`
+  (next section).
 
 `"stdio"` is not a rung anything degrades to: it is the fixed answer on
 platforms with none of the three async engines (wasm), and on no other
@@ -120,9 +192,58 @@ Linux when `offload_submit` was turned off. When the async engine itself
 was asked for and refused, not just the cache bypass -- a kernel too old
 for io_uring, or io_uring blocked by seccomp policy -- the Linux backend
 appends why: `" [io_uring: EPERM, blocked by policy]"` or
-`" [io_uring: ENOSYS, kernel too old]"`. A benchmark or a bug report
+`" [io_uring: ENOSYS, kernel too old]"`. The ring does the same where it
+is used directly rather than through the selector: `" [ioring: no api]"`,
+`" [ioring: version 1]"` or `" [ioring: CreateIoRing failed 0x...]"`, and
+a ring the selector asked for and could not have puts the same suffix on
+the completion port's names, as in `"iocp+direct [ioring: no api]"`, so a
+run on such a machine reads as what it is. FreeBSD's backend says it the
+same way, with the two things it needs named apart: `" [aio: EAGAIN]"`
+when the per-process AIO queue is closed
+(`vfs.aio.max_aio_queue_per_proc` at zero),
+`" [aio: ENOSYS, no kernel AIO]"` when the facility is not in the kernel
+at all, and `" [kqueue: errno N]"` when there was nowhere to deliver a
+completion to -- so the FreeBSD ladder reads `"aio+direct"`, `"aio"`,
+`"pread+direct"`, `"pread"`, with `" [direct: EINVAL]"` on a file whose
+filesystem refused the direct descriptor. A benchmark or a bug
+report
 therefore reads differently depending on which rung actually ran, never
 only the one that was asked for.
+
+## Preallocation on NTFS
+
+A write that extends a file serializes on its allocation, which collapses
+an asynchronous direct queue to one write at a time, so every writer here
+preallocates the whole file at the open. On Windows that leaves a second
+cost: NTFS keeps a *valid data length* per file, and every write that
+lands beyond it makes NTFS zero the bytes in between first, so that no
+reader ever sees the blocks a deleted file left there. With several
+windows in flight their completions land out of order, every one of them
+past the valid data length, and the zeroing is most of the write's cost:
+measured on a PCIe 4 NVMe, 2.2-2.4 GiB/s at the automatic depth where the
+device writes 5.9.
+
+Two ways out, and the writer takes them in this order:
+
+- **The valid data length set up front** (`SetFileValidData`), asked for
+  with `file_write_options::waive_zero_fill`. Nothing is zeroed and
+  nothing is zeroed later: 4.4-5.6 GiB/s at the automatic depth on the
+  same drive. It needs `SeManageVolumePrivilege`, which the request
+  enables on the process token, and until the writes land the file
+  exposes whatever its disk blocks held before -- which is what the
+  privilege gates, and why this is never the default. Reported as
+  `"+validdata"`.
+- **A sparse file**, the default, and the fallback where the privilege is
+  not held. The file is made sparse before the preallocation, so the gaps
+  stay holes that read as zeros instead of being written, and the flag is
+  cleared once the file is complete, leaving a plain file: 4.5-4.8 GiB/s
+  at the automatic depth. A run that fails leaves a sparse file with
+  holes where no window landed. Reported as `"+sparse"`.
+
+A file system that refuses sparse files gets neither, and the writer
+runs with the zeroing; the report then names the rung alone. Unix file
+systems preallocate unwritten extents that read as zeros at no cost, so
+none of this exists there.
 
 ## When direct I/O is the wrong choice
 

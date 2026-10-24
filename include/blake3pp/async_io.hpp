@@ -106,6 +106,16 @@ struct io_context_options {
   /// Issue reads on the kernel's I/O worker threads; see
   /// file_io_options.
   bool offload_submit = true;
+  /// Windows: prefer the I/O ring (Windows 11, `ioringapi.h`) over the
+  /// completion port where the machine has one. Off selects the port,
+  /// which is also what a machine without a ring gets; the engaged rung
+  /// is reported after the fact and names which one ran.
+  bool ioring = true;
+  /// Windows I/O ring: register the window arena and the file handle with
+  /// the ring, so a transfer names a region index and a table slot
+  /// instead of a pointer and a HANDLE. Off by default, and silently
+  /// ignored where the ring refuses it or where no ring is in use.
+  bool registered_buffers = false;
 };
 
 namespace detail {
@@ -162,7 +172,11 @@ class basic_io_context {
                                               /*file_bytes=*/0)),
         // Every window holds at most one read, so the pool's size is
         // also the most the driver can ever have outstanding.
-        drv_({/*async=*/true, opts.offload_submit}, pool_windows(opts, plan_)),
+        drv_({.async = true,
+              .offload_submit = opts.offload_submit,
+              .ioring = opts.ioring,
+              .registered_buffers = opts.registered_buffers},
+             pool_windows(opts, plan_)),
         host_(drv_, pool_windows(opts, plan_), plan_.window_bytes) {}
 
   basic_io_context(const basic_io_context&) = delete;

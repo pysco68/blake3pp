@@ -71,13 +71,48 @@ jobs:
           done
           [ -n "$STRIP" ] || echo "::warning::no llvm-strip on runner; shipping unstripped linux binaries"
 
-          for arch in x86_64 aarch64 riscv64 ppc64le s390x; do
+          for arch in x86_64 aarch64 riscv64 ppc64le s390x loongarch64; do
             src="ci-binaries/static-binaries-${arch}"
             if [ ! -d "$src" ]; then
               echo "::error::ci run produced no ${arch} static binaries"
               exit 1
             fi
             pkg="blake3pp-${VERSION}-linux-${arch}-static"
+            stage="release/${pkg}"
+            mkdir -p "$stage"
+            cp "$src"/cli/blake3ppsum "$src"/cli/blake3ppgen \
+               "$src"/bench/blake3pp_bench "$src"/bench/blake3pp_bench_file \
+               "$stage"/
+            chmod +x "$stage"/*
+            [ -z "$STRIP" ] || "$STRIP" "$stage"/*
+            cp README.md "$stage"/
+            tar -C release -czf "release/${pkg}.tar.gz" "$pkg"
+            rm -rf "$stage"
+          done
+
+          # FreeBSD, both architectures. Same shape as the Linux loop
+          # above and a different claim: these are the only archives
+          # here that are DYNAMICALLY linked, because zig refuses
+          # -static for every FreeBSD target ("libc of the specified
+          # target requires dynamic linking" -- FreeBSD ships no static
+          # libc it will link). They need libc.so.7 and libthr.so.3 from
+          # the base system, and the ABI version zig stamped into them,
+          # FreeBSD 14.0, is the floor: they load on 14.0 and anything
+          # newer. The notes below say so where a user will read it.
+          #
+          # ci already stripped these in the build job (they cross the
+          # artifact store and then an ssh pipe into a guest, and 189 MB
+          # of debug info does neither cheaply); the strip here is the
+          # same belt-and-braces the Linux loop applies, and llvm-strip
+          # takes a FreeBSD-OSABI ELF of either architecture without
+          # comment.
+          for arch in amd64 arm64; do
+            src="ci-binaries/freebsd-binaries-${arch}"
+            if [ ! -d "$src" ]; then
+              echo "::error::ci run produced no freebsd ${arch} binaries"
+              exit 1
+            fi
+            pkg="blake3pp-${VERSION}-freebsd-${arch}"
             stage="release/${pkg}"
             mkdir -p "$stage"
             cp "$src"/cli/blake3ppsum "$src"/cli/blake3ppgen \
@@ -265,7 +300,7 @@ jobs:
             # The heredoc is indented to satisfy the YAML block scalar;
             # sed strips exactly that indent back off.
             sed -e 's/^          //' << 'NOTES'
-          Each archive ships `blake3ppsum`, `blake3ppgen`, and the benchmarks. All carry runtime SIMD dispatch: one binary, every listed kernel, the best one selected on the machine it runs on.
+          Each archive ships `blake3ppsum`, `blake3ppgen`, and the benchmarks. All carry runtime SIMD dispatch: one binary, every listed kernel, the best one selected on the machine it runs on. The Linux archives are statically linked and the FreeBSD ones are not: zig refuses `-static` for every FreeBSD target (*"libc of the specified target requires dynamic linking"* - FreeBSD ships no static libc it will link against), so the two FreeBSD archives need `libc.so.7` and `libthr.so.3` from the base system and **require FreeBSD 14.0 or newer**. That floor is the ABI version in the cross triple, which is what selects the system headers and is stamped into the binary; it is set to the oldest supported release rather than to whatever the build host had, so the archives run on every FreeBSD still receiving security fixes.
 
           | archive | platform | SIMD kernels | validated on |
           |---|---|---|---|
@@ -274,14 +309,18 @@ jobs:
           | `linux-riscv64-static` | Linux riscv64, static | rvv128-512 (+Zvbb twins), xthead (RVV 0.7.1, GCC-built object) | qemu VLEN matrix; Cloud-V boards when the lane runs |
           | `linux-ppc64le-static` | Linux POWER, static | vsx (POWER9) | qemu only - no hardware lane yet |
           | `linux-s390x-static` | Linux IBM z, static, **big-endian** | vxe (z14, GCC-built object) | qemu only - no hardware lane yet |
+          | `linux-loongarch64-static` | Linux LoongArch LA64, static | lsx (128-bit) / lasx (256-bit) | qemu only - no LoongArch silicon has run it |
           | `windows-x86_64-clangcl` | Windows x64 | sse42 / avx2 / avx512 | native runner; IOCP + direct I/O |
           | `windows-arm64-clangcl` | Windows arm64 (cross-built) | neon / sve256 / sve512 / sve2_128 | windows-11-arm runner when the lane runs |
           | `macos-arm64` | macOS Apple silicon | neon; GCD + F_NOCACHE I/O | native runner |
+          | `freebsd-amd64` | FreeBSD amd64, **dynamic**, 14.0+ | sse42 / avx2 / avx512 | a FreeBSD 14.5 guest under qemu/KVM on the runner: whole suite, the I/O-rung digest agreement and a bench, on a real kernel |
+          | `freebsd-arm64` | FreeBSD arm64, **dynamic**, 14.0+ | neon / sve256 / sve512 / sve2_128 | a FreeBSD 15.1 guest under qemu TCG (no CI runner can KVM an arm64 guest): the same checks, plus an assertion that dispatch engaged an SVE2 kernel. SVE needs a 15.0+ kernel to be offered at all; on 14.x the same binary takes neon |
           | `wasm32-simd128` | node >= 16 (js+wasm pairs) and browsers (the `blake3pp-web-simd128` ES module) | simd128 | node on the runner |
 
           Notes:
           - The static Linux binaries have no glibc coupling and no dynamic loader - one file per architecture, runs on any distro.
           - The static binaries are built with zig (clang + musl - the easiest fully-static route). Two kernels exceed what that toolchain can express - LLVM never merged XTheadVector, and its s390x backend scalarizes the z14 vector ops - so the riscv64 and s390x archives link those two kernel objects from GCC instead.
+          - The FreeBSD binaries are built with the same zig, cross-compiled from a Linux container, and are the exception to "static": see above. Nothing on the build host can execute them, so neither one is shipped on a compile alone - each is run in a FreeBSD guest in the ci run these archives come from.
           - `blake3ppsum --version` prints the compiled variants, the dispatch verdict for the running machine, and any variants the CPU supports that the build does not carry.
           NOTES
             if ls bench-reports/*/bench-report.txt > /dev/null 2>&1; then

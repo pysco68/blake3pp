@@ -1,8 +1,8 @@
 # The static Linux binaries
 
-Every release ships five fully static Linux archives, one per
-architecture: x86_64, aarch64, riscv64, ppc64le and s390x. A sixth
-target, mips64el, is built the same way in CI but not released: GCC
+Every release ships six fully static Linux archives, one per
+architecture: x86_64, aarch64, riscv64, ppc64le, s390x and loongarch64.
+A seventh target, mips64el, is built the same way in CI but not released: GCC
 against a static glibc rather than zig against musl, equally standalone
 and equally free of a glibc floor, but emulator-tested only (see
 [Architectures and kernels](architectures.md#msa-has-never-run-on-hardware)). Each released archive
@@ -36,11 +36,12 @@ container.
 
 ## How: zig's toolchain as the cross compiler
 
-The static presets (`linux-{,arm64-,riscv64-,ppc64le-,s390x-}zigmusl-`
-`cxx23-static`) build with zig's bundled clang (`zig cc`) targeting
-`<arch>-linux-musl`. zig ships musl headers and sources for every
-supported target, so a single toolchain cross-builds all five
-architectures with no per-architecture sysroots to assemble. The
+The static presets
+(`linux-{,arm64-,riscv64-,ppc64le-,s390x-,loongarch64-}zigmusl-cxx23-static`)
+build with zig's bundled clang (`zig cc`) targeting `<arch>-linux-musl`.
+zig ships musl headers and sources for every supported target, so a
+single toolchain cross-builds all six architectures with no
+per-architecture sysroots to assemble. The
 toolchain files live in `cmake/toolchains/linux-*zigmusl*/` and
 document the zig-specific plumbing (wrapper scripts, linker-probe
 workarounds) in place.
@@ -151,3 +152,14 @@ Mixing two compilers' output is safe here for three reasons:
 The riscv64 archive carries the `xthead` kernel by default, which is
 what lets a T-Head board (SG2042, C906/C910 class) run the draft-0.7.1
 vector path from the standard release artifact.
+
+## The loongarch64 archive is emulator-tested only
+
+It is built and tested the way the other five are, and nothing has run
+it on LoongArch silicon: the whole suite passes under qemu-loongarch64
+at three capability levels, and that is the extent of it. See
+[Architectures and kernels](architectures.md#lsx-and-lasx-have-never-run-on-hardware-either),
+which also covers the one toolchain quirk the lane carries: zig's
+loongarch64 baseline enables LSX, so the archive is compiled `-mno-lsx`
+and the two kernels raise the vector unit for their own translation
+unit.

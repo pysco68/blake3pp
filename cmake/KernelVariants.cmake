@@ -115,6 +115,8 @@ function(_blake3pp_register_x86_kernels)
     # xvec's x86 permute layer initialises __v32hi/__v64qi from __m512i,
     # which GCC 16 no longer converts implicitly; the flag restores the
     # GCC 13-15 behaviour for this one TU (clang is unaffected).
+    # include/xvec/x86/permute.hpp still has that shape at the xvec
+    # commit cmake/StdFeatures.cmake pins.
     blake3pp_add_kernel(avx512 ARCH_FLAGS -mavx512f -mavx512cd -mavx512vl -mavx512bw -mavx512dq
       "$<$<AND:$<CXX_COMPILER_ID:GNU>,$<STREQUAL:${BLAKE3PP_SIMD_PROVIDER},xvec>>:-flax-vector-conversions>")
   endif()
@@ -480,6 +482,74 @@ function(_blake3pp_register_mips_kernels)
   endif()
 endfunction()
 
+function(_blake3pp_register_loongarch_kernels)
+  # LoongArch LSX (128-bit) and LASX (256-bit), both through the
+  # vector-extension provider: xsimd has no LoongArch backend and no std
+  # provider knows the ISA's width, the same situation MSA is in. Two
+  # widths, so two variants, each compiling the kernel at its own
+  # register size.
+  #
+  # EMULATOR-ONLY. Correctness is validated byte-identical against the
+  # x86 golden vectors under qemu-loongarch64; no LoongArch silicon has
+  # ever run these kernels, and every throughput number for them would be
+  # a qemu number.
+  _blake3pp_decline_on_msvc_frontend()
+  # Raising the vector unit back above the toolchain's baseline needs the
+  # cc1 spelling here, not -mlsx/-mlasx. The toolchain file compiles
+  # everything -mno-lsx (zig's loongarch64 baseline carries +lsx, which
+  # would put vector code in the scalar kernel and in dispatch itself),
+  # and under zig 0.17's driver a later -mlsx does not undo it: for a
+  # -mno-lsx/-mlsx pair the driver emits "-lsx" to cc1 whatever the order
+  # on the command line, and for -mno-lsx with -mlasx it emits a feature
+  # sequence that leaves LSX off while STILL predefining __loongarch_asx
+  # and __loongarch_simd_width 256. The first spelling only declines; the
+  # second compiles a kernel that calls itself 256-bit and carries no
+  # vector instruction. -Xclang -target-feature lands after everything
+  # else and is the state cc1 ends on, measured both ways on the object.
+  #
+  # The -m spellings stay as the second candidate: GCC and a non-zig
+  # clang honour them in order, and they reject -Xclang outright, so the
+  # probe picks the right one per compiler.
+  #
+  # clang and GCC both predefine __loongarch_sx / __loongarch_asx and set
+  # __loongarch_simd_width to the register width in bits, which is the
+  # question the provider needs answered. Here those macros are necessary
+  # and not sufficient, per the paragraph above; the kernel audit on the
+  # emitted object is what confirms a variant is vectorized.
+  set(_blake3pp_lsx_smoke [=[
+    #if !(defined(__loongarch_sx) && __loongarch_simd_width >= 128)
+    #error no lsx
+    #endif
+    int main() { return 0; }
+  ]=])
+  blake3pp_probe_flag_candidates(_lsx_flags BLAKE3PP_COMPILER_LSX
+    SOURCE "${_blake3pp_lsx_smoke}"
+    CANDIDATES "-Xclang|-target-feature|-Xclang|+lsx" "-mlsx")
+  if(_lsx_flags)
+    # SHELL: keeps the pair together: CMake de-duplicates identical
+    # compile options, and a bare list would have the second -Xclang
+    # dropped and +lsx arrive as a source file name.
+    string(REPLACE "|" " " _lsx_flags "${_lsx_flags}")
+    blake3pp_add_kernel(lsx FORCE_VEXT VEXT_BYTES 16
+      ARCH_FLAGS "SHELL:${_lsx_flags}")
+  endif()
+  set(_blake3pp_lasx_smoke [=[
+    #if !(defined(__loongarch_asx) && __loongarch_simd_width >= 256)
+    #error no lasx
+    #endif
+    int main() { return 0; }
+  ]=])
+  blake3pp_probe_flag_candidates(_lasx_flags BLAKE3PP_COMPILER_LASX
+    SOURCE "${_blake3pp_lasx_smoke}"
+    CANDIDATES "-Xclang|-target-feature|-Xclang|+lsx|-Xclang|-target-feature|-Xclang|+lasx"
+               "-mlasx")
+  if(_lasx_flags)
+    string(REPLACE "|" " " _lasx_flags "${_lasx_flags}")
+    blake3pp_add_kernel(lasx FORCE_VEXT VEXT_BYTES 32
+      ARCH_FLAGS "SHELL:${_lasx_flags}")
+  endif()
+endfunction()
+
 function(_blake3pp_register_s390x_kernels)
   # IBM z vector-enhancements-1 (z14) through the xsimd facade, the
   # first BIG-ENDIAN SIMD target. BLAKE3 is defined little-endian; the
@@ -563,6 +633,8 @@ function(blake3pp_register_kernels)
     _blake3pp_register_s390x_kernels()
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(mips64el|mipsel|mips64|mips)$")
     _blake3pp_register_mips_kernels()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(loongarch64)$")
+    _blake3pp_register_loongarch_kernels()
   elseif(EMSCRIPTEN)
     _blake3pp_register_wasm_kernels()
   endif()

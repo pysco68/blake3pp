@@ -215,6 +215,18 @@ if(BLAKE3PP_SUBTREE_FOLD)
     INTERFACE "BLAKE3PP_SUBTREE_FOLD=${_ak_fold_levels}")
 endif()
 
+# A kernel that pins none of the three per-TU providers compiles
+# src/kernel/simd_facade.hpp's fallback arms, which is the only way the
+# project-wide simd provider acquires a consumer: the facade is included
+# from kernel translation units and nowhere else. Record that here so
+# cmake/StdFeatures.cmake can resolve the provider of last resort after
+# registration instead of before it.
+function(_blake3pp_note_simd_provider_use provider)
+  if(provider STREQUAL "facade")
+    set_property(GLOBAL PROPERTY BLAKE3PP_KERNELS_NEED_SIMD_PROVIDER 1)
+  endif()
+endfunction()
+
 function(blake3pp_add_kernel ns)
   cmake_parse_arguments(PARSE_ARGV 1 AK "FORCE_SCALAR;FORCE_XSIMD;FORCE_VEXT"
     "SOURCE;EXTERNAL_COMPILER;VEXT_BYTES" "ARCH_FLAGS")
@@ -250,9 +262,12 @@ function(blake3pp_add_kernel ns)
     # the customer: clang scalarizes xsimd's VXE ops, GCC emits real
     # vector code including verllf hardware rotates).
     if(AK_FORCE_XSIMD)
-      # Registration can run before the hermetic fetch has set
-      # xsimd_SOURCE_DIR; the populated source tree in the shared cache
-      # is content-addressed and equally authoritative.
+      # Registration runs before the project-wide provider is resolved,
+      # so the kernel fetches xsimd itself, as the in-tree ones do. The
+      # hermetic fetch may leave xsimd_SOURCE_DIR unset; the populated
+      # source tree in the shared cache is content-addressed and equally
+      # authoritative.
+      _blake3pp_fetch_xsimd()
       set(_ak_xsimd_inc "")
       if(xsimd_SOURCE_DIR)
         set(_ak_xsimd_inc "${xsimd_SOURCE_DIR}/include")
@@ -292,6 +307,7 @@ function(blake3pp_add_kernel ns)
   endif()
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
+  _blake3pp_note_simd_provider_use("${_ak_provider}")
 
     set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_OBJECT" "${_ak_obj}")
     return()
@@ -395,6 +411,7 @@ function(blake3pp_add_kernel ns)
   endif()
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
   set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
+  _blake3pp_note_simd_provider_use("${_ak_provider}")
 endfunction()
 
 # Attaches every registered kernel's objects to <target> and generates the

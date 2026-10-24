@@ -98,3 +98,13 @@ BLAKE3PP_ARCH(vxe, "vxe", 176)
 /// EMULATOR-ONLY: validated under qemu against the golden vectors, never
 /// on MSA silicon.
 BLAKE3PP_ARCH(msa, "msa", 177)
+/// LoongArch LSX, 128-bit lanes. Built through the vector-extension
+/// provider: no std provider deduces a width on this target and xsimd has
+/// no LoongArch backend. Optional in LA64 and detected through
+/// HWCAP_LOONGARCH_LSX.
+/// EMULATOR-ONLY: validated under qemu against the golden vectors, never
+/// on LoongArch silicon.
+BLAKE3PP_ARCH(lsx, "lsx", 179)
+/// LoongArch LASX, 256-bit lanes, same provider and the same asterisk as
+/// lsx. Detected through HWCAP_LOONGARCH_LASX.
+BLAKE3PP_ARCH(lasx, "lasx", 178)

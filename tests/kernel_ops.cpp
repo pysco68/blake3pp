@@ -79,7 +79,8 @@ TEST_CASE("arch introspection invariants") {
   CHECK(!blake3pp::version().empty());
   const std::string_view simd = blake3pp::simd_provider();
   CHECK((simd == "std::simd" || simd == "std::experimental::simd" ||
-         simd == "xsimd" || simd == "xvec"));
+         simd == "xsimd" || simd == "xvec" ||
+         simd == "none (scalar only)" || simd == "none (kernels pin their own)"));
   const std::string_view exec = blake3pp::execution_provider();
   CHECK((exec == "std::execution" || exec == "beman.execution" ||
          exec == "stdexec"));

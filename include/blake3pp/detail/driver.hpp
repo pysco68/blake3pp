@@ -91,19 +91,24 @@ struct io_op {
   const void* owed_by = nullptr;
 
   // Sized for whatever transfer type the native backend derives from
-  // transfer_base (uring_context::transfer, iocp_context::transfer or
-  // gcd_context::transfer -- src/io/{uring,iocp,gcd}_backend.hpp): only
-  // one of those is ever compiled, so no header here can sizeof/alignof
-  // all three to take their max. Measured on this build (Linux, io_uring)
-  // by the "op storage" case in tests/file_pipeline.cpp: the real
-  // transfer is 104 bytes aligned to 8, leaving 56 bytes of headroom for
-  // the other backends' larger fields (Windows' OVERLAPPED among them).
+  // transfer_base (uring_context::transfer, aio_context::transfer,
+  // iocp_context::transfer or gcd_context::transfer --
+  // src/io/{uring,aio,iocp,gcd}_backend.hpp): only one of those is ever
+  // compiled, so no header here can sizeof/alignof all of them to take
+  // their max. Measured by the "op storage" case in
+  // tests/file_pipeline.cpp, which prints what the build actually has:
+  // the real transfer is 104 bytes aligned to 8 on Linux and on FreeBSD,
+  // leaving 56 bytes of headroom for the other backends' larger fields
+  // (Windows' OVERLAPPED among them). What keeps FreeBSD's inside it is
+  // that its 160-byte struct aiocb lives in the CONTEXT's request pool
+  // rather than in the operation; src/io/aio_backend.hpp says why the
+  // contract requires that anyway.
   // A backend that outgrows these numbers fails the static_assert in
   // emplace_native() below instead of overrunning storage silently, and
   // native_op_layout() reports the real size for that failure to quote.
-  // Could be derived as sizeof/alignof of a union of the three transfer
-  // types instead of asserted, at the cost of pulling every backend's
-  // header into every TU that only needs the concept.
+  // Could be derived as sizeof/alignof of a union of the transfer types
+  // instead of asserted, at the cost of pulling every backend's header
+  // into every TU that only needs the concept.
   static constexpr std::size_t storage_size = 160;
   static constexpr std::size_t storage_align = 16;
   alignas(storage_align) std::byte storage[storage_size];

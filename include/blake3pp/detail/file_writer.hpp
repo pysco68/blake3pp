@@ -59,6 +59,13 @@ struct file_writer_options {
   // rather than inline in the submit call, the reader's offload_submit for
   // the producer side; see src/io/uring_backend.hpp.
   bool offload_submit = true;
+  // Windows: prefer the I/O ring (Windows 11) over the completion port
+  // where the machine has one; off selects the port. The engaged rung is
+  // in backend().
+  bool ioring = true;
+  // Windows I/O ring: register the arena and the file handle with the
+  // ring rather than naming a pointer and a HANDLE per transfer.
+  bool registered_buffers = false;
   // Preallocate this many bytes at construction when the total is known.
   // This matters enormously for async direct I/O: writes that EXTEND the
   // file serialize on the inode lock (each waits out journal + allocation),
@@ -66,6 +73,8 @@ struct file_writer_options {
   // same role is played by SetEndOfFile. finish() trims the file back to
   // the bytes actually written.
   std::uint64_t preallocate_bytes = 0;
+  // See file_write_options::waive_zero_fill (io.hpp).
+  bool waive_zero_fill = false;
 };
 
 class file_writer {

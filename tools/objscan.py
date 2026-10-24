@@ -63,12 +63,13 @@ import sys
 # ---------------------------------------------------------------- formats
 
 ELF_MACHINES = {62: "x86_64", 183: "aarch64", 243: "riscv64", 21: "ppc64", 22: "s390x",
-                8: "mips64"}
+                8: "mips64", 258: "loongarch64"}
 PE_MACHINES = {0x8664: "x86_64", 0xAA64: "aarch64"}
 MACHO_CPUTYPES = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
 BINUTILS_PREFIX = {"aarch64": "aarch64-linux-gnu-", "riscv64": "riscv64-linux-gnu-",
                    "ppc64": "powerpc64le-linux-gnu-", "s390x": "s390x-linux-gnu-",
-                   "mips64": "mips64el-linux-gnuabi64-"}
+                   "mips64": "mips64el-linux-gnuabi64-",
+                   "loongarch64": "loongarch64-linux-gnu-"}
 
 
 def identify(path):
@@ -214,8 +215,11 @@ def disassemble(path, objdump, arch):
             elif insn.callee is None and is_call.match(insn.mnemonic) and insn.operands in names:
                 insn.callee = names[insn.operands]
             # RISC-V's call is an auipc/jalr pair whose relocation sits on
-            # the auipc; the jalr takes it over.
-            if insn.callee is None and prev is not None and prev.mnemonic == "auipc" and prev.callee:
+            # the auipc; the jalr takes it over. LoongArch's medium code
+            # model spells the same thing pcaddu18i/jirl, relocation on
+            # the pcaddu18i.
+            if insn.callee is None and prev is not None and prev.callee \
+                    and prev.mnemonic in ("auipc", "pcaddu18i"):
                 insn.callee = prev.callee
             prev = insn
         # An AArch64 call through the GOT (Mach-O: adrp x16, sym@GOTPAGE;
@@ -349,6 +353,10 @@ VECTOR = {
     # MSA is the only thing on MIPS with $w registers; its mnemonics are
     # suffixed rather than prefixed and .d/.w collide with scalar FP.
     "mips64": (None, r"\$w\d+\b"),
+    # LSX mnemonics start with v and LASX with xv; nothing in the scalar
+    # base ISA does. The operand form is what the per-variant rules need
+    # anyway, since $vr and $xr are what separate the two widths.
+    "loongarch64": (r"^x?v[a-z]", r"\$[xv]r\d+\b"),
 }
 # Control flow inside a function (loops) and out of it (calls).
 BRANCH = {
@@ -358,6 +366,7 @@ BRANCH = {
     "ppc64": r"^b(?!l$|lrl?$|ctrl?$|l[+-]$)",
     "s390x": r"^(j\w*|br|brcl?|brctg?|bc|c[lg]?[ir]?j\w*)$",
     "mips64": r"^(b(?!al$)[a-z]*|j)$",
+    "loongarch64": r"^b(?!l$)[a-z]*$",
 }
 CALL = {
     "x86_64": r"^call",
@@ -366,6 +375,7 @@ CALL = {
     "ppc64": r"^(bl|bctrl|bl[+-])$",
     "s390x": r"^(brasl?|basr|bas)$",
     "mips64": r"^(jal|jalr|bal)$",
+    "loongarch64": r"^(bl|jirl)$",
 }
 # A memory operand through the stack pointer (or the frame pointer).
 STACK = {
@@ -375,6 +385,8 @@ STACK = {
     "ppc64": r"\(r?1\)|\(r?31\)",
     "s390x": r"\(%r1[15]\)",
     "mips64": r"\((sp|s8|fp)\)",
+    # LoongArch base+offset operands carry no parentheses: `vst $vr0, $sp, 16`.
+    "loongarch64": r"\$(sp|fp|r3|r22)\b",
 }
 
 

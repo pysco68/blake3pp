@@ -208,7 +208,10 @@ class engine {
                                      .queue_depth = opts_.io.queue_depth,
                                      .arena_bytes = 128u << 20,
                                      .direct_io = opts_.io.direct_io,
-                                     .offload_submit = opts_.io.offload_submit});
+                                     .offload_submit = opts_.io.offload_submit,
+                                     .ioring = opts_.io.ioring,
+                                     .registered_buffers =
+                                         opts_.io.registered_buffers});
     const std::vector<std::filesystem::path> paths(files.begin(), files.end());
     std::vector<std::optional<result>> out(files.size());
     std::size_t next = 0;  // the next outcome to report
@@ -392,6 +395,7 @@ int main(int argc, char** argv) {
   bool no_direct = false;
   bool no_async = false;
   bool inline_submit = false;
+  bool no_ioring = false;
 
   CLI::App app{
       "Print or check BLAKE3 checksums.\n"
@@ -426,6 +430,7 @@ int main(int argc, char** argv) {
   app.add_flag("--no-direct", no_direct, "keep the OS page cache (no O_DIRECT)");
   app.add_flag("--no-async", no_async, "read synchronously (no io_uring/IOCP/GCD queue)");
   app.add_flag("--inline-submit", inline_submit, "issue reads inline in the submitting thread, not on io_uring's workers");
+  app.add_flag("--no-ioring", no_ioring, "Windows: read through the completion port instead of the I/O ring");
   app.add_option("files", o.files, "files to hash (or checksum lists)");
 
   CLI11_PARSE(app, argc, argv);
@@ -433,6 +438,7 @@ int main(int argc, char** argv) {
   o.io.direct_io = !no_direct;
   o.io.async = !no_async;
   o.io.offload_submit = !inline_submit;
+  o.io.ioring = !no_ioring;
   if (!blake3pp::is_available(o.io.a)) {
     println(stderr, "blake3ppsum: arch '{}' not available on this machine (auto -> {})", blake3pp::to_string(o.io.a), blake3pp::to_string(blake3pp::best_available()));
     return b3tool::exit_usage;
