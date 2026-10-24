@@ -187,7 +187,8 @@ independent of the configure log:
 
 ```cpp
 blake3pp::simd_provider();       // "std::simd", "std::experimental::simd",
-                                  // "xsimd", or "none (scalar only)"
+                                  // "xsimd", "xvec", "none (scalar only)",
+                                  // or "none (kernels pin their own)"
 blake3pp::execution_provider();  // "std::execution", "beman.execution",
                                   // "stdexec", or "none"
 ```
@@ -201,9 +202,10 @@ instead of leaving it on `auto` --
 `linux-s390x-gcc15-cxx23` and the ppc64le/s390x zigmusl presets set it
 to `xsimd`, and `linux-mips64el-gcc14-cxx23` sets `std-experimental` --
 because each one's vector kernel already pins a provider for reasons
-specific to that ISA which `auto`'s probes cannot see, and leaving the
-project-wide variable on `auto` would make `simd_provider()` report a
-provider the kernel does not actually use.
+specific to that ISA which `auto`'s probes cannot see. On `auto` nothing
+would fall back to a project-wide provider, so none would be resolved and
+`simd_provider()` would answer `"none (kernels pin their own)"`; naming
+the provider the vector kernel uses is the more informative answer.
 
 Override either on a preset that does not need it to re-measure the
 choice.

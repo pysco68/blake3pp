@@ -108,8 +108,10 @@ bool run_trap_probes() noexcept;
 /// stamp; see blake3ppsum --version).
 [[nodiscard]] std::string_view version() noexcept;
 /// Which SIMD facade backs this build of the library: "std::simd",
-/// "std::experimental::simd", "xsimd", or "none (scalar only)" where the
-/// build has no facade at all and carries the scalar kernel alone.
+/// "std::experimental::simd", "xsimd", "xvec", or one of two "none"
+/// answers where the build resolved no project-wide provider: "none
+/// (scalar only)" when it carries the scalar kernel alone, and "none
+/// (kernels pin their own)" when every compiled kernel names its own.
 [[nodiscard]] std::string_view simd_provider() noexcept;
 /// Which sender/receiver implementation backs this build of the library:
 /// "std::execution", "beman.execution" or "stdexec", or "none" where the
