@@ -146,15 +146,18 @@ synchronous `pread`/`pwrite` and then to stdio, a filesystem that will
 not serve unbuffered reads is read through the cache, and the tools
 print the rung that actually ran rather than the one that was asked for.
 
-CI releases nine archives: the five static Linux ones, both Windows
-clang-cl zips, macOS arm64 and the wasm bundle. mips64el is built and
-emulator-tested on every run but never packaged, and the `cl` arm64
-build is compile-proven only. FreeBSD amd64 now has a full lane: every
-run cross-builds it with zig and then boots a real FreeBSD under
-qemu/KVM on the runner to run the suite, the I/O-rung digest checks and
-a bench on it — only the release archive is still missing. FreeBSD
-arm64 passes its whole suite too, but by hand, with neither a lane nor
-an archive.
+CI releases eleven archives: the five static Linux ones, both Windows
+clang-cl zips, macOS arm64, the wasm bundle and both FreeBSD tarballs.
+mips64el is built and emulator-tested on every run but never packaged,
+and the `cl` arm64 build is compile-proven only. Both FreeBSD
+architectures have a full lane: every run cross-builds them with zig
+and then boots a real FreeBSD under qemu on the runner to run the
+suite, the I/O-rung digest checks and a bench on it — amd64 under KVM
+on a 14.x guest, arm64 under TCG on a 15.x one, because no CI runner
+can KVM an aarch64 guest and because FreeBSD only publishes the SVE
+capability bit from 15.0 on. The FreeBSD archives are the only ones
+here that are dynamically linked (zig refuses `-static` for that
+target) and they require FreeBSD 14.0 or newer.
 
 More details: [Architectures and kernels](docs/architectures.md) for the
 kernels, one row per variant with its runtime check, and
