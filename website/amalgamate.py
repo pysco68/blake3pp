@@ -36,7 +36,6 @@ INCLUDE = re.compile(r'^#include "((?:kernel|core|io|dispatch)/[^"]+)"[^\n]*$', 
 # blake3pp::kern::BLAKE3PP_ARCH_NS and is pasted once per variant.
 SHARED = {"kernel/kernel.hpp", "kernel/force_inline.hpp",
           "kernel/endian.hpp"}
-# Everything the library needs beyond the kernels, in link order.
 # The kernel is registered under a real variant name because dispatch
 # gates on that name: registering AVX-512 code as "avx2" would enable it
 # on a machine that cannot run it. So the emitted file insists that the
@@ -56,8 +55,12 @@ SELECT = """
 #define BLAKE3PP_AMALGAM_NS simd128
 #endif
 """
+# Everything the library needs beyond the kernels, in link order.
+# src/diagnosis.cpp reads driver_stats and nothing else, so unlike
+# probe_file_io() below it needs no execution provider. Its declarations
+# are in the public trace.hpp, and without it each would be a link error.
 SUPPORT = ["src/blake3pp.cpp", "src/dispatch/dispatch.cpp",
-           "src/dispatch/cpu_detect_x86.cpp",
+           "src/dispatch/cpu_detect_x86.cpp", "src/diagnosis.cpp",
            "src/io/file_reader.cpp", "src/io/io_engines.cpp",
            "src/io_hash.cpp"]
 PUBLIC = ["include/blake3pp/detail/contract.hpp",

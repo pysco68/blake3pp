@@ -14,6 +14,11 @@
 /// wrong digest. The finest timed unit is one part, a subtree of at least
 /// 16 chunks; nothing below that is instrumented.
 ///
+/// diagnose_read() and diagnose_write(), at the end of this header,
+/// read a finished run's driver_stats and say which side of the
+/// pipeline it was waiting on. Call either once per run; neither
+/// formats nor prints.
+///
 /// Standard library only, C++20.
 
 #include <algorithm>
@@ -410,5 +415,243 @@ concept tracer = std::is_nothrow_copy_constructible_v<T> &&
 
 static_assert(tracer<null_tracer>);
 static_assert(tracer<buffer_tracer>);
+
+// --- Reading a finished run off its counters --------------------------------
+//
+// driver_stats says where a run's time went; these say which side of the
+// pipeline the run was waiting on. One call at the end of a run, never
+// per window; the bodies are in src/diagnosis.cpp.
+
+/// What a finished pipeline run was limited by.
+///
+/// The first four are read runs, the fifth is the write side's name for
+/// the first, and `undecided` carries two candidates the run could not
+/// separate (diagnosis::first and diagnosis::second).
+///
+/// Enumerators are appended, never inserted, reordered or renamed, the
+/// same rule detail/arch.def and detail/io_engine.def follow: a caller
+/// may switch over this against a library build it did not compile.
+enum class bottleneck {
+  /// The pool was saturated. The hash is the constraint and I/O geometry
+  /// will not move it.
+  hash,
+  /// The device's queue was full for the run, at the bytes the run kept
+  /// outstanding (diagnosis::bytes_in_flight).
+  device,
+  /// Neither end was busy and the run ran out of windows: every window
+  /// the pool holds is a transfer slot the device cannot use.
+  arena,
+  /// Neither end was busy, the arena was wider than the queue, and the
+  /// device served every transfer as if it were alone, so what the run
+  /// never had more of is bytes outstanding.
+  ///
+  /// Only the test suite's synthetic device is known to produce it.
+  in_flight,
+  /// Writing: the pool could not fill windows fast enough to keep the
+  /// device busy.
+  generator,
+  /// No reading: the run was too short to read, had nothing to read, or
+  /// landed between two candidates.
+  undecided,
+};
+
+/// `b` as text: "hash-limited", "device-limited", "arena-limited",
+/// "in-flight-limited", "generator-limited", "undecided".
+///
+/// These strings are API. They are what blake3ppsum and blake3ppgen
+/// print under --diag, alongside the read-backend strings of
+/// read_backend(), which are already read out of benchmark output by
+/// hand and by script. A string changes only when the value it names
+/// changes meaning.
+[[nodiscard]] const char* to_string(bottleneck b) noexcept;
+
+/// The bands a share of a resource is read in.
+///
+/// Every entry point below takes these, so a caller can set its own.
+/// They are not calibrated on a thread count: 64% pool-busy is a starving
+/// pool on 32 threads while 88% on 16 is already near its ceiling, so a
+/// single cut on the pool figure misreads a small machine. The bands apply
+/// to each side separately and the reading comes from comparing the two,
+/// which is scale-free. Where a figure lands between the bands the run
+/// gets no label.
+struct bands {
+  /// At or above this a resource was the wall for the run.
+  double saturated = 0.90;
+  /// Below this it plainly was not.
+  double idle = 0.80;
+  /// Two shares closer than this are the same figure.
+  double tie = 0.05;
+};
+
+/// The figures a reading is made from, and the reading.
+struct diagnosis {
+  bottleneck label = bottleneck::undecided;
+  /// With `label == undecided`, the two the run could not separate.
+  bottleneck first = bottleneck::undecided;
+  bottleneck second = bottleneck::undecided;
+
+  /// Compressing (reading) or filling (writing), over the pool's whole
+  /// capacity for the run: 1.0 is every thread busy start to finish.
+  double pool_busy = 0.0;
+  /// Writing, the same time over the windows in flight rather than over
+  /// the machine: one window is one fill task, so this is the share of
+  /// the generator's actual parallelism that was used.
+  double fill_busy = 0.0;
+  /// How full the device's queue was, as a share of the depth in force.
+  /// 1.0 is a queue that was full for the run, so the device's latency
+  /// is at its ceiling here and the device is the wall; 1/depth is a
+  /// device that served every transfer alone and had capacity to spare.
+  ///
+  /// Measured as the summed transfer time over the depth times the
+  /// wall clock -- the average transfers outstanding, over the slots
+  /// there were -- with one correction. A device whose mean
+  /// per-transfer time is its own minimum never put one transfer
+  /// behind another, however many were outstanding at it: it is
+  /// propagating rather than working, its server has capacity to
+  /// spare, and concurrency rather than the device is what the run is
+  /// short of. That case reads as the one unqueued slot it is.
+  ///
+  /// The minimum is why the mean is readable at all: a queue's latency
+  /// is proportional to its depth by construction, so a latency
+  /// compared against anything but its own unqueued value says
+  /// nothing.
+  ///
+  /// The minimum alone is not enough either. A device that saturates
+  /// below the depth in force serves no transfer alone after the first,
+  /// so its mean sits well under depth times the minimum while its queue
+  /// is full the whole run. The mean over the minimum is therefore the
+  /// no-queueing test, and the share of slots is the how-queued measure.
+  double device_queued = 0.0;
+  /// Writing, the share of the windows in flight the device held, which
+  /// is directly comparable with fill_busy: a window is either being
+  /// filled or being written, so the two shares are of the same thing.
+  /// Not set on the read side, where the pool's capacity and the
+  /// device's queue are separate resources with no common denominator.
+  double device_busy = 0.0;
+  /// The driver with a window it could not use. Reading this is
+  /// structural and says little (see driver_stats::starved_ns); writing
+  /// it is the generator being behind.
+  double starved = 0.0;
+
+  std::uint64_t transfers = 0;
+  double mean_service_ns = 0.0;
+  std::uint64_t min_service_ns = 0;
+  std::uint64_t depth = 0;
+  std::uint64_t windows_used = 0;
+  std::uint64_t windows_planned = 0;
+  std::size_t window_bytes = 0;
+  /// Bytes the run kept outstanding at the device: the depth times the
+  /// window. This is the quantity a device responds to, and the depth
+  /// alone does not state it -- a full queue of four 8 MiB reads is
+  /// 32 MiB outstanding and a full queue of four 64 MiB reads is 256,
+  /// and a striped volume answers the two differently. Measured on a
+  /// four-drive PCIe 5 stripe with no hashing in the picture, reading
+  /// 64 GiB cold through O_DIRECT: 36.5-38.0 GiB/s at 32 MiB
+  /// outstanding, 46.4-46.7 at 256 MiB, 53.8-53.9 at 1 GiB. So a
+  /// device-limited reading is a reading at this number, and a reader
+  /// who is not told it cannot tell a device at its ceiling from a
+  /// device answering a narrow geometry.
+  std::uint64_t bytes_in_flight = 0;
+  /// The device never put one transfer behind another: its mean
+  /// per-transfer time is within the tie band of its own minimum. Its
+  /// server had capacity to spare whatever its queue looked like, so
+  /// concurrency rather than the device is what the run was short of.
+  bool device_unqueued = false;
+  /// Reading: the run filled its arena and the arena is no wider than
+  /// the queue depth, so every window the pool holds is a read slot the
+  /// device cannot use. Always true on the write side, where the two
+  /// are the same number.
+  bool arena_is_depth = false;
+
+  /// Whether there was anything to read: a run with no transfer landed
+  /// never reached the pipeline.
+  [[nodiscard]] constexpr bool measured() const noexcept {
+    return transfers > 0;
+  }
+
+  /// Whether the run turned its queue over often enough to be read. A
+  /// run of a few transfers is its own ramp and drain: the first
+  /// transfers are served alone and the last leave the queue emptying,
+  /// so every share here is a transient. Four turns of the queue is
+  /// the floor.
+  [[nodiscard]] constexpr bool long_enough() const noexcept {
+    return measured() && transfers >= 4 * (depth > 0 ? depth : 1);
+  }
+};
+
+/// A read run's reading.
+///
+/// Three facts decide it, in this order: the pool's busy share, the
+/// device's queue, and whether the arena is wider than that queue.
+///
+/// The third is a relation and not a size. The windows beyond the reads
+/// are what the pool draws on while the device serves the next ones, so
+/// where there are none the pool runs dry whenever a window is out.
+/// That is also the only case driver_stats::starved_ns can fire in,
+/// which is why that counter reads "the arena is not wider than the
+/// depth" and not "the pool starved" -- a purely hash-limited run shows
+/// most of its wall clock in it.
+///
+/// It is read last because a device whose queue was full for the run is
+/// the wall whatever the arena's width: widening the arena then only
+/// buffers. So the arena reading is what is left when neither end was
+/// busy and every window the run had was out.
+///
+/// Where the arena was NOT the run's bound and neither end was busy,
+/// the fourth reading applies: the device served every transfer as if
+/// it were alone, so what the run never had more of is bytes
+/// outstanding -- the depth times the window.
+///
+/// Each figure has a band it is read in, and a run that lands in one
+/// gets no label: the two candidates are named instead. A figure near
+/// its ceiling without reaching it does not say which of itself and the
+/// arena the run was waiting on, and on a narrow machine the answer is
+/// often neither.
+///
+/// @code
+/// std::vector<blake3pp::window_record> windows(count);
+/// blake3pp::trace_buffer trace(windows);
+/// const auto t0 = std::chrono::steady_clock::now();
+/// blake3pp::update_file(h, path, {.trace = &trace});
+/// const double wall_ns = std::chrono::duration<double, std::nano>(
+///     std::chrono::steady_clock::now() - t0).count();
+/// const auto d = blake3pp::diagnose_read(trace.driver(), wall_ns, threads,
+///                                        planned, window_bytes);
+/// std::puts(blake3pp::to_string(d.label));
+/// @endcode
+///
+/// @param d          The run's counters.
+/// @param wall_ns    Wall clock the caller measured around the call.
+/// @param threads    The compute pool's width.
+/// @param planned    Window objects the plan allocated, which is the
+///                   arena's width in windows.
+/// @param window     Bytes per window, after the pipeline's rounding.
+/// @param b          The bands each share is read in.
+[[nodiscard]] diagnosis diagnose_read(const driver_stats& d, double wall_ns,
+                                      unsigned threads, unsigned planned,
+                                      std::size_t window,
+                                      bands b = {}) noexcept;
+
+/// A write run's reading.
+///
+/// The directions are not symmetrical. Writing, the pool FILLS windows
+/// and the device drains them, and one window is one fill task, so the
+/// windows in flight are the generator's parallelism as well as the
+/// device's queue -- the arena and the depth are the same number and
+/// there is no third reading between them. The two candidates are the
+/// generator and the device, and they share the same windows, so their
+/// shares sum to at most one and the reading is which of them held the
+/// windows longer.
+///
+/// The windows in flight come from driver_stats::queue_depth_final.
+///
+/// @param d          The run's counters.
+/// @param wall_ns    Wall clock the caller measured around the call.
+/// @param threads    The compute pool's width.
+/// @param window     Bytes per window, after the pipeline's rounding.
+/// @param b          The bands each share is read in.
+[[nodiscard]] diagnosis diagnose_write(const driver_stats& d, double wall_ns,
+                                       unsigned threads, std::size_t window,
+                                       bands b = {}) noexcept;
 
 }  // namespace blake3pp

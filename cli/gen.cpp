@@ -37,13 +37,16 @@
 #include <CLI/CLI.hpp>
 #include <blake3pp/parallel_io.hpp>
 
-#include "diagnosis.hpp"
+#include "diagnosis_report.hpp"
 #include "tool_common.hpp"
 #include "trace_json.hpp"
 
 namespace {
 
 using b3tool::println;
+using b3tool::undiagnosable;
+using b3tool::reading_label;
+using b3tool::service_label;
 
 // Parses "123", "16K", "8M", "2G", "1T" (binary units); "inf" is nullopt.
 std::optional<std::uint64_t> parse_size(const std::string& text) {
@@ -110,30 +113,15 @@ class budget {
 // Writing, it is only counted where the depth is at least the
 // generator's parallelism, which is the configuration a
 // generator-limited run is NOT in.
-void report_write_diagnosis(const b3tool::diagnosis& r, unsigned threads) {
-  const auto service = [](double ns) {
-    return ns >= 1e6 ? std::format("{:.3f} ms", ns / 1e6)
-                     : std::format("{:.1f} us", ns / 1e3);
-  };
-  if (!r.measured()) {
-    println(stderr,
-            "blake3ppgen: diagnosis: nothing was written through the "
-            "pipeline, so there is no run to describe");
+void report_write_diagnosis(const blake3pp::diagnosis& r, unsigned threads) {
+  if (const auto why = undiagnosable(r, "blake3ppgen", "writes",
+                                     "nothing was written through the pipeline, so there is "
+                   "no run to describe");
+      why) {
+    println(stderr, "{}", *why);
     return;
   }
-  if (!r.long_enough()) {
-    println(stderr,
-            "blake3ppgen: diagnosis: {} writes at a depth of {} is this run's "
-            "own ramp and drain, not a measurement of either end",
-            r.transfers, r.depth);
-    return;
-  }
-  println(stderr, "diagnosis: {} (write side)",
-          r.label == b3tool::reading::undecided
-              ? std::format("{} or {}, this run does not separate them",
-                            b3tool::to_string(r.first),
-                            b3tool::to_string(r.second))
-              : b3tool::to_string(r.label));
+  println(stderr, "diagnosis: {} (write side)", reading_label(r));
   println(stderr,
           "  generator      {:5.1f}% of the {} windows in flight "
           "({:.1f}% of {} threads)",
@@ -146,11 +134,11 @@ void report_write_diagnosis(const b3tool::diagnosis& r, unsigned threads) {
   println(stderr,
           "  device         {} per window over {} writes (min {}), holding "
           "{:5.1f}% of the windows",
-          service(r.mean_service_ns), r.transfers,
-          service(static_cast<double>(r.min_service_ns)),
+          service_label(r.mean_service_ns), r.transfers,
+          service_label(static_cast<double>(r.min_service_ns)),
           100.0 * r.device_busy);
   switch (r.label) {
-    case b3tool::reading::generator_limited:
+    case blake3pp::bottleneck::generator:
       println(stderr,
               "  the windows spent more of the run being filled than being "
               "written; one window is one fill task, so the windows in "
@@ -165,13 +153,14 @@ void report_write_diagnosis(const b3tool::diagnosis& r, unsigned threads) {
                       0, r.window_bytes, threads) *
                   r.window_bytes));
       break;
-    case b3tool::reading::device_limited:
+    case blake3pp::bottleneck::device:
       println(stderr,
               "  the device held a full queue for the run: it is the wall.");
       break;
-    case b3tool::reading::hash_limited:
-    case b3tool::reading::arena_limited:
-    case b3tool::reading::undecided:
+    case blake3pp::bottleneck::hash:
+    case blake3pp::bottleneck::arena:
+    case blake3pp::bottleneck::in_flight:
+    case blake3pp::bottleneck::undecided:
       break;
   }
 }
@@ -359,7 +348,7 @@ int main(int argc, char** argv) {
       }
       if (diag) {
         report_write_diagnosis(
-            b3tool::diagnose_write(
+            blake3pp::diagnose_write(
                 trace->driver(), wall_ns, threads,
                 blake3pp::detail::rounded_window_bytes(wopts.window_bytes)),
             threads);

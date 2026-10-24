@@ -35,7 +35,7 @@
 #include <CLI/CLI.hpp>
 #include <blake3pp/blake3pp.hpp>
 
-#include "diagnosis.hpp"
+#include "diagnosis_report.hpp"
 #include "tool_common.hpp"
 #include "trace_json.hpp"
 
@@ -43,6 +43,9 @@ namespace {
 
 using b3tool::print;
 using b3tool::println;
+using b3tool::undiagnosable;
+using b3tool::reading_label;
+using b3tool::service_label;
 
 struct options {
   blake3pp::hash_file_options io;
@@ -373,37 +376,20 @@ class engine {
 };
 
 // --diag: what the run that just happened was limited by, from the
-// counters it kept. One line of reading, three of figures, and -- where
-// the arena was the constraint -- the default plan's arithmetic at this
-// machine's thread count, which is checkable with a calculator.
-//
-// Nothing here measures a second geometry or predicts a rate. The last
-// line says what a plan WOULD allocate, not what it would deliver.
-void report_read_diagnosis(const b3tool::diagnosis& r, unsigned threads,
+// counters it kept. One line of reading, four of figures, and, where the
+// arena was the constraint, the default plan's arithmetic at this
+// machine's thread count. The last line states what a plan would
+// allocate; it predicts no rate.
+void report_read_diagnosis(const blake3pp::diagnosis& r, unsigned threads,
                            unsigned hw_threads) {
-  const auto service = [](double ns) {
-    return ns >= 1e6 ? std::format("{:.3f} ms", ns / 1e6)
-                     : std::format("{:.1f} us", ns / 1e3);
-  };
-  if (!r.measured()) {
-    println(stderr,
-            "blake3ppsum: diagnosis: nothing to read -- the file went down "
-            "the sequential path, which has no driver to report");
+  if (const auto why = undiagnosable(r, "blake3ppsum", "reads",
+                                     "nothing to read -- the file went down the sequential "
+                   "path, which has no driver to report");
+      why) {
+    println(stderr, "{}", *why);
     return;
   }
-  if (!r.long_enough()) {
-    println(stderr,
-            "blake3ppsum: diagnosis: {} reads at a depth of {} is this run's "
-            "own ramp and drain, not a measurement of either end",
-            r.transfers, r.depth);
-    return;
-  }
-  println(stderr, "diagnosis: {}",
-          r.label == b3tool::reading::undecided
-              ? std::format("{} or {}, this run does not separate them",
-                            b3tool::to_string(r.first),
-                            b3tool::to_string(r.second))
-              : b3tool::to_string(r.label));
+  println(stderr, "diagnosis: {}", reading_label(r));
   println(stderr, "  pool busy      {:5.1f}% of {} threads",
           100.0 * r.pool_busy, threads);
   println(stderr,
@@ -413,35 +399,53 @@ void report_read_diagnosis(const b3tool::diagnosis& r, unsigned threads,
           b3tool::bytes_label(r.window_bytes),
           b3tool::bytes_label(r.windows_planned * r.window_bytes),
           r.arena_is_depth ? "no wider than" : "wider than", r.depth);
+  // The bytes outstanding at the device, as depth times window. A
+  // device's rate depends on them: one four-drive PCIe 5 stripe reads
+  // 38.8 GiB/s through the pipeline at the default 32 MiB outstanding
+  // and 46.9 at 1 GiB. A device reading needs this figure beside it.
+  println(stderr, "  in flight      {} x {} = {} outstanding at the device",
+          r.depth, b3tool::bytes_label(r.window_bytes),
+          b3tool::bytes_label(r.bytes_in_flight));
   println(stderr,
           "  device         {} per window over {} reads (min {}, {:.1f} of {} "
           "queued)",
-          service(r.mean_service_ns), r.transfers,
-          service(static_cast<double>(r.min_service_ns)),
+          service_label(r.mean_service_ns), r.transfers,
+          service_label(static_cast<double>(r.min_service_ns)),
           r.device_queued * static_cast<double>(r.depth), r.depth);
   switch (r.label) {
-    case b3tool::reading::hash_limited:
+    case blake3pp::bottleneck::hash:
       println(stderr,
               "  the pool was saturated: the hash is the constraint and I/O "
               "geometry will not move it.");
       break;
-    case b3tool::reading::device_limited:
+    case blake3pp::bottleneck::device:
+      // Named at the geometry: a full queue is the device's answer at
+      // the bytes this run kept outstanding, which is not its ceiling
+      // (see the in-flight line above).
       println(stderr,
               "  the pool had a window whenever it wanted one and still did "
-              "not saturate, and the device's queue was full: it is the "
-              "wall.");
+              "not saturate, and the device's queue was full at {} "
+              "outstanding: it is the wall at this geometry.",
+              b3tool::bytes_label(r.bytes_in_flight));
       break;
-    case b3tool::reading::arena_limited:
+    case blake3pp::bottleneck::arena:
       println(stderr,
               "  the pool idled waiting for a window while the device was not "
               "queued.");
       break;
-    case b3tool::reading::generator_limited:
-    case b3tool::reading::undecided:
+    case blake3pp::bottleneck::in_flight:
+      println(stderr,
+              "  the pool had windows to spare and the device served every "
+              "read as if it were alone: what the run never had more of is "
+              "the {} outstanding, which is the depth times the window.",
+              b3tool::bytes_label(r.bytes_in_flight));
+      break;
+    case blake3pp::bottleneck::generator:
+    case blake3pp::bottleneck::undecided:
       break;
   }
-  if (r.label == b3tool::reading::arena_limited ||
-      r.second == b3tool::reading::arena_limited) {
+  if (r.label == blake3pp::bottleneck::arena ||
+      r.second == blake3pp::bottleneck::arena) {
     // The default budget rule at this machine's thread count:
     // update_file() over a scheduler resolves it from
     // hardware_concurrency(), not from --threads. Printed only where it
@@ -685,9 +689,9 @@ int main(int argc, char** argv) {
                   hw_threads, o.io.window_bytes));
       report_read_diagnosis(
           eng.pipelined()
-              ? b3tool::diagnose_read(trace->driver(), eng.wall_ns(), o.threads,
+              ? blake3pp::diagnose_read(trace->driver(), eng.wall_ns(), o.threads,
                                       plan.windows, window)
-              : b3tool::diagnosis{},
+              : blake3pp::diagnosis{},
           o.threads, hw_threads);
     }
     if (trace && !o.trace_path.empty()) {

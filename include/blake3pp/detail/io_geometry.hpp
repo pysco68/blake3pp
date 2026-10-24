@@ -47,6 +47,11 @@ inline constexpr std::size_t min_window_bytes = 64 * 1024;
 // already in memory. Large enough that one window is several subtrees of
 // real work per core, small enough that queue_depth of them is an
 // ordinary allocation.
+//
+// A striped volume reads a larger window faster at this depth. That gain
+// is the device's: default_queue_depth below carries the no-hashing
+// control arm that shows it, and read_plan_budget_bytes carries what a
+// larger window would cost in resident arena.
 inline constexpr std::size_t default_window_bytes = 8 * 1024 * 1024;
 
 // The windows every read entry point keeps in flight by default.
@@ -63,15 +68,25 @@ inline constexpr std::size_t default_window_bytes = 8 * 1024 * 1024;
 // for the default, while 8 MiB x 32 reads 40.8, +9.1%, on the same row.
 // The best cell is 64 MiB x 16 at 1 GiB in flight; past 2 GiB the
 // figure is flat to worse and the raw device rate declines. On a single
-// 9 GiB/s NVMe the 8-64 MiB x 4-32 grid lands within 9.02-9.04 GiB/s in
-// fifteen of sixteen cells, the sixteenth 8.88 at 64 MiB x qd 32, so
-// geometry buys nothing there.
+// 9 GiB/s local NVMe (GCP z3-highmem-22) the 8-64 MiB x 4-32 grid lands
+// within 9.02-9.04 GiB/s in fifteen of sixteen cells, the sixteenth 8.88
+// at 64 MiB x qd 32, so geometry buys nothing there.
 //
-// Four is therefore a starting point and not an optimum: it is what a
-// device that pays nothing for depth settles at, and 32 MiB in flight
-// is an arena any machine can spare. Where depth does pay it pays an
-// order of magnitude further out than this, and a caller that knows
-// its device states its own figure.
+// What a smaller window costs on the stripe is the device's, and the
+// no-hashing control arm shows it. Reading 64 GiB cold through O_DIRECT
+// with no hash anywhere in the run, the device alone delivers
+// 36.5-38.0 GiB/s at an 8 MiB window and depth 4 and 46.4-46.7 at a
+// 64 MiB window and the same depth -- 32 MiB against 256 MiB
+// outstanding. The pipeline over it reads 38.0-39.3 and 45.1-45.9, which
+// is 102-106% and 97-99% of those controls, with the driver thread busy
+// 2-7% of its own time at either size. So the window is worth 25% to the
+// DEVICE at a depth of four, and a larger default window would recover
+// nothing of the pipeline's.
+//
+// Four is therefore a starting point: a device that gains nothing from
+// depth settles there, and 32 MiB in flight is an arena any machine can
+// spare. Where depth does pay, it pays an order of magnitude further out,
+// and a caller that knows its device states its own figure.
 inline constexpr unsigned default_queue_depth = 4;
 
 // The window the reader actually uses for a requested size: a power of

@@ -30,12 +30,11 @@
 #include <windows.h>
 #endif
 
-#include "diagnosis.hpp"
-
 #include <blake3pp/detail/write_pipeline.hpp>
 #include <blake3pp/parallel.hpp>
 #include <blake3pp/parallel_backend.hpp>
 #include <blake3pp/parallel_io.hpp>
+#include <blake3pp/trace.hpp>
 
 #include "test_schedulers.hpp"
 #include <doctest/doctest.h>
@@ -769,17 +768,18 @@ TEST_CASE("a real write pipeline stops mid-file with writes in flight") {
   MESSAGE("stopped mid-file on " << stopped << " of " << attempts);
 }
 
-// --- The diagnosis blake3ppgen prints (tooling/diagnosis.hpp) --------------
+// --- The diagnosis blake3ppgen prints (blake3pp::diagnose_write) -----------
 //
-// The write side's readings are not the read side's. The pool FILLS
+// The write side's readings differ from the read side's. The pool FILLS
 // windows and the device drains them, so the arena and the queue depth
-// are the same number -- one window is one fill task -- and there is no
-// arena reading between them: the two candidates share those windows
-// and the reading is which held them longer.
+// are the same number (one window is one fill task) and there is no
+// arena reading: the two candidates share those windows, and the reading
+// is which held them longer. As on the read side, the runs here assert
+// the geometry and the counters, and tests/diagnosis.cpp the readings.
 namespace {
 
 template <class Scheduler>
-[[nodiscard]] b3tool::diagnosis diagnose_write_run(
+[[nodiscard]] blake3pp::diagnosis diagnose_write_run(
     Scheduler sched, std::size_t win, std::uint64_t size, unsigned depth,
     unsigned threads, write_script script = {}) {
   blake3pp::trace_buffer trace{std::span<blake3pp::window_record>{}};
@@ -794,17 +794,17 @@ template <class Scheduler>
                              std::chrono::steady_clock::now() - t0)
                              .count();
   REQUIRE(drv.final_size() == size);
-  return b3tool::diagnose_write(trace.driver(), wall_ns, threads, win);
+  return blake3pp::diagnose_write(trace.driver(), wall_ns, threads, win);
 }
 
 // doctest streams a const char* as a pointer, so the line is built as a
 // string first.
-void report_write(const char* name, const b3tool::diagnosis& r) {
+void report_write(const char* name, const blake3pp::diagnosis& r) {
   const auto pct = [](double v) {
     return std::to_string(static_cast<int>(100.0 * v)) + "%";
   };
   const std::string line =
-      std::string(name) + ": " + b3tool::to_string(r.label) + " (fill " +
+      std::string(name) + ": " + blake3pp::to_string(r.label) + " (fill " +
       pct(r.fill_busy) + " of depth " + std::to_string(r.depth) +
       ", device " + pct(r.device_busy) + ", queued " + pct(r.device_queued) +
       ")";
@@ -813,10 +813,13 @@ void report_write(const char* name, const b3tool::diagnosis& r) {
 
 }  // namespace
 
-TEST_CASE("a sink faster than the generator reads as generator-limited") {
+TEST_CASE("a sink faster than the generator feeds the diagnosis coherent counters") {
   // The device takes a window the instant it is polled, so the windows
-  // in flight spend their lives being filled. One agent makes that the
-  // whole run.
+  // in flight spend their lives being filled, by one agent. The reading,
+  // generator-limited, compares the fill's and the device's shares of the
+  // wall clock, which load moves; it is asserted in tests/diagnosis.cpp
+  // against hand-built counters. The run asserts the geometry and that
+  // the counters cohere.
   b3test::one_thread_pool pool;
   constexpr std::size_t win = 256 * 1024;
   const std::uint64_t size = 48 * win;
@@ -824,33 +827,45 @@ TEST_CASE("a sink faster than the generator reads as generator-limited") {
   const auto r = diagnose_write_run(pool.get_scheduler(), win, size, 4, 1);
   report_write("instant sink", r);
   CHECK(r.arena_is_depth);
-  CHECK(r.fill_busy > r.device_busy);
-  CHECK(r.label == b3tool::reading::generator_limited);
+  CHECK(r.depth == 4);
+  CHECK(r.measured());
+  CHECK(r.transfers == 48u);
+  CHECK(r.fill_busy > 0.0);
+  CHECK(r.fill_busy <= 1.0);
+  CHECK(r.device_busy >= 0.0);
+  CHECK(r.device_busy <= 1.0);
 }
 
-TEST_CASE("a slow sink reads as device-limited on the write side") {
-  // One server holding each write for 200 us against the whole pool
-  // generating: every window the run holds is queued at the device.
+TEST_CASE("a slow sink feeds the diagnosis coherent counters on the write side") {
+  // One server holding each write for 8 ms against the whole pool
+  // generating. The reading, device-limited, turns on the device's queue
+  // share and on the fill's and the device's shares of the wall clock,
+  // which load moves; it is asserted in tests/diagnosis.cpp. The run
+  // asserts the geometry, the counters, and the floor the device model
+  // guarantees.
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
+  constexpr std::int64_t service_ns = 8'000'000;
   const std::uint64_t size = 48 * win;
 
-  // The same device and the same margins as the read side's case: eight
-  // milliseconds of one server per window against a generator that
-  // needs under two even sanitized, and forty-eight transfers at depth
-  // two so the first unqueued transfer is a fiftieth of the run.
   const auto r =
       diagnose_write_run(sched, win, size, 2,
                          std::thread::hardware_concurrency(),
-                         {.service_ns = 8'000'000, .knee = 1});
+                         {.service_ns = service_ns, .knee = 1});
   report_write("slow sink", r);
-  // The comparison is the reading on this side, and not an absolute
-  // figure for the device: a window is either being filled or being
-  // written, so with d windows at most d-1 of them can be at the
-  // device at once and the queue cannot read full at a shallow depth.
-  CHECK(r.fill_busy < 0.1);
-  CHECK(r.device_busy > r.fill_busy);
-  CHECK(r.label == b3tool::reading::device_limited);
+  CHECK(r.arena_is_depth);
+  CHECK(r.depth == 2);
+  CHECK(r.measured());
+  CHECK(r.long_enough());
+  CHECK(r.transfers == 48u);
+  // A write is timed from the moment it is handed to the driver, and
+  // the device holds it at least one service time: load can only add.
+  CHECK(r.min_service_ns >= static_cast<std::uint64_t>(service_ns));
+  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.fill_busy >= 0.0);
+  CHECK(r.fill_busy <= 1.0);
+  CHECK(r.device_busy > 0.0);
+  CHECK(r.device_busy <= 1.0);
 }
 
 }  // TEST_SUITE

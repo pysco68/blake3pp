@@ -46,13 +46,12 @@
 
 #include "test_schedulers.hpp"
 
-#include "diagnosis.hpp"
-
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/parallel.hpp>
 #include <blake3pp/parallel_io.hpp>
+#include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
 namespace {
@@ -2717,7 +2716,7 @@ TEST_CASE("several files hash as one message, every one on the pool") {
   CHECK(short_first == 2);
 }
 
-// --- The diagnosis the tools print (tooling/diagnosis.hpp) ------------------
+// --- The diagnosis the tools print (blake3pp::diagnose_read) ----------------
 //
 // One case per reading, each produced by the synthetic source rather
 // than described to the function: the device model under fake_driver is
@@ -2730,10 +2729,10 @@ namespace {
 // Runs one file through the pipeline and reads the run off its
 // counters, with the wall clock taken where a tool would take it.
 template <class Scheduler>
-[[nodiscard]] b3tool::diagnosis diagnose_run(
+[[nodiscard]] blake3pp::diagnosis diagnose_run(
     Scheduler sched, std::span<const std::byte> content,
     const blake3pp::detail::pipeline_plan& plan, unsigned threads,
-    fake_script script = {}, b3tool::bands bands = {}) {
+    fake_script script = {}, blake3pp::bands bands = {}) {
   blake3pp::trace_buffer trace{std::span<blake3pp::window_record>{}};
   fake_driver drv(content, plan.window_bytes, script);
   fake_driver::file f(drv);
@@ -2752,7 +2751,7 @@ template <class Scheduler>
                              std::chrono::steady_clock::now() - t0)
                              .count();
   REQUIRE(h.finalize() == blake3pp::hash(content));
-  return b3tool::diagnose_read(trace.driver(), wall_ns, threads, plan.windows,
+  return blake3pp::diagnose_read(trace.driver(), wall_ns, threads, plan.windows,
                                plan.window_bytes, bands);
 }
 
@@ -2764,47 +2763,64 @@ template <class Scheduler>
 
 // doctest streams a const char* as a pointer, so the line is built as a
 // string first.
-void report(const char* name, const b3tool::diagnosis& r) {
+void report(const char* name, const blake3pp::diagnosis& r) {
   const auto pct = [](double v) {
     return std::to_string(static_cast<int>(100.0 * v)) + "%";
   };
   const std::string line =
-      std::string(name) + ": " + b3tool::to_string(r.label) + " (pool " +
+      std::string(name) + ": " + blake3pp::to_string(r.label) + " (pool " +
       pct(r.pool_busy) + ", device queued " + pct(r.device_queued) + ", " +
       std::to_string(r.windows_used) + " of " +
       std::to_string(r.windows_planned) + " windows, depth " +
-      std::to_string(r.depth) + ", starved " + pct(r.starved) + ")";
+      std::to_string(r.depth) + ", " +
+      std::to_string(r.bytes_in_flight >> 10) + " KiB in flight, starved " +
+      pct(r.starved) + ")";
   MESSAGE(line);
 }
 
 }  // namespace
 
-TEST_CASE("a narrow arena over a fast device reads as arena-limited") {
-  // Every window the pool holds is a read slot the device cannot use,
-  // because the plan allocated no more windows than the queue has
-  // reads. The machine's whole pool hashes a 64 KiB window in
-  // microseconds, so the hash is nowhere near the constraint.
+TEST_CASE("a narrow arena feeds the diagnosis coherent counters") {
+  // What a real-timed run can assert is that the pipeline hands the
+  // diagnosis numbers that agree with the geometry it was given. It
+  // cannot assert the reading: `arena-limited` here turns on
+  // unqueued(), which is `mean <= min * (1 + tie)` with tie at 5%, and
+  // no run on a real clock can promise a mean within 5% of its own
+  // minimum. qemu-aarch64 read 0.587 of the queue occupied where the
+  // correction gives 1/depth, on a device whose propagation was 4 ms --
+  // 5% of which is 200 us, less than an emulated machine spends on
+  // scheduling noise.
+  //
+  // The readings themselves are asserted in tests/diagnosis.cpp against
+  // hand-built driver_stats, where the inputs are exact. The two cases
+  // below do assert a reading, and may: theirs turn on gross
+  // differences -- an 8 ms service time, a saturated pool -- rather than
+  // on a tie band.
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
   const auto content = pattern(32 * win, 211);
   const blake3pp::detail::pipeline_plan plan{win, 4, 4, 0, false};
 
-  // A device that propagates rather than works: one window per 20 us of
-  // server time, but two hundred of those before a result comes back.
-  // Its server is therefore idle 90% of the run while all four windows
-  // are outstanding at it, which is the case a share of the wall clock
-  // would read as a saturated device and the mean over the minimum
-  // reads correctly -- every read was served alone.
   const auto r = diagnose_run(sched, content, plan, suite_pool_threads(),
                               {.service_ns = 20'000, .knee = 200});
   report("narrow arena", r);
+
+  // The geometry, which the plan fixes and no clock touches.
   CHECK(r.arena_is_depth);
   CHECK(r.windows_used == 4);
   CHECK(r.windows_planned == 4);
-  // Every read served alone: the mean latency is the minimum, so one of
-  // the four queue slots was busy on average.
-  CHECK(r.device_queued < 0.4);
-  CHECK(r.label == b3tool::reading::arena_limited);
+  CHECK(r.bytes_in_flight == 4u * win);
+
+  // The counters reached the diagnosis and cohere: every window landed,
+  // the device was timed, and a minimum cannot exceed its own mean.
+  CHECK(r.measured());
+  CHECK(r.transfers == 32u);
+  CHECK(r.min_service_ns > 0);
+  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.pool_busy >= 0.0);
+  CHECK(r.pool_busy <= 1.0);
+  CHECK(r.device_queued > 0.0);
+  CHECK(r.device_queued <= 1.0);
 }
 
 TEST_CASE("a slow device under a wide arena reads as device-limited") {
@@ -2837,7 +2853,7 @@ TEST_CASE("a slow device under a wide arena reads as device-limited") {
   report("slow device", r);
   CHECK_FALSE(r.arena_is_depth);
   CHECK(r.device_queued > 0.9);
-  CHECK(r.label == b3tool::reading::device_limited);
+  CHECK(r.label == blake3pp::bottleneck::device);
 }
 
 TEST_CASE("a device faster than the pool reads as hash-limited") {
@@ -2871,7 +2887,7 @@ TEST_CASE("a device faster than the pool reads as hash-limited") {
   report("zero-copy source", r);
   CHECK_FALSE(r.arena_is_depth);
   CHECK(r.pool_busy > 0.80);
-  CHECK(r.label == b3tool::reading::hash_limited);
+  CHECK(r.label == blake3pp::bottleneck::hash);
   // And the trap the reading must not fall into: starved_ns is most of
   // this run, because a pool that is the constraint leaves the driver
   // with no free window most of the time. It is not a pool-starvation
@@ -2879,10 +2895,37 @@ TEST_CASE("a device faster than the pool reads as hash-limited") {
   CHECK(r.starved > 0.5);
 }
 
-TEST_CASE("a run with nothing landed has no reading to give") {
-  const b3tool::diagnosis empty;
-  CHECK_FALSE(empty.measured());
-  CHECK(empty.label == b3tool::reading::undecided);
+TEST_CASE("a wide arena feeds the diagnosis coherent counters") {
+  // The companion to the narrow-arena case above, with the arena four
+  // times the queue, and bounded the same way: it asserts the geometry
+  // and that the counters cohere. The reading, `in-flight-limited`, turns
+  // on unqueued(), the 5% band around the minimum, which a real clock
+  // under load does not hold. It is asserted in tests/diagnosis.cpp
+  // against hand-built driver_stats.
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const auto content = pattern(48 * win, 213);
+  const blake3pp::detail::pipeline_plan plan{win, 4, 16, 0, false};
+
+  const auto r = diagnose_run(sched, content, plan, suite_pool_threads(),
+                              {.service_ns = 2'000'000, .knee = 16});
+  report("wide arena", r);
+
+  // The geometry the plan fixes.
+  CHECK_FALSE(r.arena_is_depth);
+  CHECK(r.windows_planned == 16);
+  CHECK(r.windows_used <= 16);
+  CHECK(r.bytes_in_flight == 4u * win);
+
+  // The counters reached the diagnosis and cohere.
+  CHECK(r.measured());
+  CHECK(r.transfers == 48u);
+  CHECK(r.min_service_ns > 0);
+  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.pool_busy >= 0.0);
+  CHECK(r.pool_busy <= 1.0);
+  CHECK(r.device_queued > 0.0);
+  CHECK(r.device_queued <= 1.0);
 }
 
 }  // TEST_SUITE

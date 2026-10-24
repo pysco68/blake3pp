@@ -164,6 +164,11 @@ option(BLAKE3PP_WITH_IO "Build the file I/O layer (hash_file and friends)" ON)
 
 add_library(blake3pp STATIC
   src/blake3pp.cpp
+  # Reading a finished pipeline run off its driver_stats. Unconditional,
+  # like the declarations in <blake3pp/trace.hpp>: it names nothing from
+  # the file-I/O layer, so a BLAKE3PP_WITH_IO=OFF build still offers it
+  # to a caller with counters of its own.
+  src/diagnosis.cpp
   src/dispatch/dispatch.cpp
   src/dispatch/cpu_detect_x86.cpp
   src/dispatch/cpu_detect_arm.cpp

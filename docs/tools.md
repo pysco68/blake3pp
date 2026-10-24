@@ -2,21 +2,24 @@
 
 [← blake3pp](../README.md)
 
-Two utilities build alongside the library, in top-level builds only.
+Two utilities build alongside the library, by default in top-level builds
+only (`BLAKE3PP_BUILD_CLI`).
 `blake3ppsum` hashes files the way `sha256sum` does. `blake3ppgen` produces
 reproducible test data at the speed of your disk. Both are built on the
-library this documents, so they are also worked examples of it.
+library documented here, so they are also worked examples of it.
 
-The help below is what the tools print. Three parts of it depend on the
-build or the machine rather than on the documentation, and are shown as
-placeholders: the variants a build carries, the core count a thread
-default picks up, and the async I/O engines a build carries. The last is
-not written down anywhere: `--no-async` names the engines from
-`blake3pp::compiled_io_engines()`, so it says `io_uring` on Linux,
-`ioring/iocp` on Windows, `gcd` (`gcd-write` on the write side) on
-macOS, `aio` on FreeBSD, and `async` where the platform has no async
-engine to turn off. See [the API reference](api.md) for the
-introspection calls behind it.
+The help below is what the tools print, with three placeholders for the
+parts that depend on the build or the machine:
+
+- the variants a build carries;
+- the core count a thread default picks up;
+- the async I/O engines a build carries. `--no-async` names them from
+  `blake3pp::compiled_io_engines()`: `io_uring` on Linux, `ioring/iocp`
+  on Windows, `gcd` (`gcd-write` on the write side) on macOS, `aio` on
+  FreeBSD, and `async` where the platform has no async engine to turn
+  off.
+
+See [the API reference](api.md) for the introspection calls behind it.
 
 ## blake3ppsum
 
@@ -150,12 +153,12 @@ blake3ppgen --seed run42 --length 32G --output f.bin --window 64 --qd 8
 ### Where the time goes
 
 Generation runs lanes-parallel in the kernel, and `--threads` fans
-segments across cores using that same O(1) seek. Which leaves the sink as
+segments across cores using that same O(1) seek, which leaves the sink as
 the bottleneck.
 
-`--output` removes even that. The stream is generated straight into the
-write buffers and leaves through the platform's own direct path,
-bypassing the page cache entirely:
+`--output` removes the sink as well: the stream is generated straight into
+the write buffers and leaves through the platform's own direct path,
+bypassing the page cache.
 
 | OS | writer |
 |----|--------|
@@ -165,8 +168,7 @@ bypassing the page cache entirely:
 | FreeBSD | POSIX AIO on a kqueue + `O_DIRECT` |
 
 `--no-direct`, `--no-async`, `--inline-submit` and, on Windows,
-`--no-ioring` switch those off one at a time, which is how the pipeline
-gets measured against itself.
+`--no-ioring` switch those off one at a time.
 
 ## Tracing
 
@@ -202,58 +204,76 @@ has the bench's remaining rows.
 
 ## Diagnosing a run
 
-`--diag` reports which side of the pipeline was the constraint on the run
-that just happened, from counters the run already kept. It costs no
-allocation and no per-window storage: every figure comes out of
-`driver_stats` (see [Performance tracing](tracing.md#driver_stats)).
+`--diag` reports which side of the pipeline constrained the run that just
+finished, from the counters in `driver_stats`
+(see [Performance tracing](tracing.md#driver_stats)). The reading itself is
+`blake3pp::diagnose_read()` and `blake3pp::diagnose_write()` in
+`<blake3pp/trace.hpp>`, which any caller can use on its own runs; see
+[Asking the library](tracing.md#asking-the-library). The tools add the
+formatting.
 
 ```
 $ blake3ppsum --diag big.iso
 diagnosis: device-limited
-  pool busy        1.9% of 16 threads
+  pool busy        2.0% of 16 threads
   arena          6 of 16 windows in flight, 8 MiB each (128 MiB), wider than the queue depth of 4
-  device         16.679 ms per window over 256 reads (min 9.845 ms, 4.0 of 4 queued)
-  the pool had a window whenever it wanted one and still did not saturate, and the device's queue was full: it is the wall.
+  in flight      4 x 8 MiB = 32 MiB outstanding at the device
+  device         16.082 ms per window over 256 reads (min 7.122 ms, 4.0 of 4 queued)
+  the pool had a window whenever it wanted one and still did not saturate, and the device's queue was full at 32 MiB outstanding: it is the wall at this geometry.
 ```
 
-Three figures and a reading. **Pool busy** is the compute pool's share of
-its own capacity. **Arena** is the window objects the plan allocated and
-whether they outnumber the queue depth — the windows beyond the reads are
-what the pool draws on while the device serves the next ones. **Device** is
-the mean time a transfer spent at the device, the shortest such time, and
-how full its queue was; the minimum is what makes the mean readable, since
-a queue's latency is proportional to its depth by construction.
+Four figures and a reading.
+
+- **Pool busy** — the compute pool's share of its own capacity.
+- **Arena** — the window objects the plan allocated, and whether they
+  outnumber the queue depth. The windows beyond the reads are what the pool
+  draws on while the device serves the next ones.
+- **In flight** — the queue depth times the window. This is what the device
+  was answering, and a device's rate depends on it, so read the verdict as a
+  statement about this geometry rather than about the device.
+- **Device** — the mean time a transfer spent at the device, the shortest
+  such time, and how full its queue was. The mean needs the minimum beside
+  it, because a queue's latency rises with its depth by construction.
 
 | reading | what it means |
 |---|---|
 | `hash-limited` | the pool was saturated; no I/O geometry moves it |
-| `device-limited` | the pool had a window whenever it wanted one, did not saturate, and the device's queue was full |
+| `device-limited` | the pool had a window whenever it wanted one, did not saturate, and the device's queue was full at the bytes in flight |
 | `arena-limited` | neither end was busy and the run held every window it had, with the arena no wider than the queue |
+| `in-flight-limited` | neither end was busy, the arena was wider than the queue, and the device served every read as if it were alone |
 | `generator-limited` | writing: the windows spent more of the run being filled than being written |
 
-A figure that lands near its ceiling without reaching it gets no label: the
-run names the two readings it cannot separate and prints the figures.
+Where a figure sits inside the band that separates two readings, no label is
+given: the report names both candidates and prints the figures.
 
 ```
 $ blake3ppsum --diag --no-direct --threads 2 big.iso
 diagnosis: hash-limited
-  pool busy       95.6% of 2 threads
+  pool busy       96.3% of 2 threads
   arena          16 of 16 windows in flight, 8 MiB each (128 MiB), wider than the queue depth of 4
-  device         1.531 ms per window over 256 reads (min 559.2 us, 2.2 of 4 queued)
+  in flight      4 x 8 MiB = 32 MiB outstanding at the device
+  device         1.829 ms per window over 256 reads (min 838.5 us, 2.6 of 4 queued)
   the pool was saturated: the hash is the constraint and I/O geometry will not move it.
 
 $ blake3ppsum --diag --no-direct --window 8 --qd 16 big.iso
 diagnosis: arena-limited
-  pool busy       34.5% of 16 threads
+  pool busy       41.0% of 16 threads
   arena          16 of 16 windows in flight, 8 MiB each (128 MiB), no wider than the queue depth of 16
-  device         3.977 ms per window over 256 reads (min 864.0 us, 11.2 of 16 queued)
+  in flight      16 x 8 MiB = 128 MiB outstanding at the device
+  device         3.084 ms per window over 256 reads (min 633.8 us, 10.9 of 16 queued)
   the pool idled waiting for a window while the device was not queued.
 ```
 
-On the write side the arena and the depth are the same number — one window
-is one fill task, so the windows in flight are the generator's parallelism
-and the device's queue at once — so there are two readings rather than
-three, and the report says which direction it is describing:
+`in-flight-limited` has not been seen on real hardware so far. It is
+asserted against the test suite's synthetic device, which models what would
+produce it: a device that reports slowly and serves quickly, so that no
+transfer ever queues behind another. More windows would not help such a
+run; the lever would be the depth or the window.
+
+On the write side the arena and the depth are one number: a window is a fill
+task, so the windows in flight are the generator's parallelism and the
+device's queue together. That leaves two readings, and the report names the
+direction.
 
 ```
 $ blake3ppgen --seed s --length 2G --output out.bin --diag
@@ -264,12 +284,13 @@ diagnosis: device-limited (write side)
   the device held a full queue for the run: it is the wall.
 ```
 
-`--diag` describes one run: `blake3ppsum` takes exactly one FILE, not `-`
-and not `--check`, and `blake3ppgen` needs `--output` and `--length` on the
-pipelined path. A run too short to turn its queue over four times reports
-that instead of a reading. The captures above are from a 16-thread Zen 5
-machine under WSL2, on its virtual disk and through the page cache where
-`--no-direct` appears.
+`--diag` describes a single run. `blake3ppsum` takes exactly one FILE, not
+`-` and not `--check`; `blake3ppgen` needs `--output` and `--length`, which
+selects the pipelined path. A run too short to turn its queue over four
+times reports that instead of a reading.
+
+The captures above are from a 16-thread Zen 5 machine under WSL2, on its
+virtual disk, through the page cache where `--no-direct` appears.
 
 ## The allocator
 

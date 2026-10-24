@@ -247,6 +247,45 @@ records at all.
 not compression: reading, waiting, and the stretches where a core had
 nothing to compress.
 
+## Asking the library
+
+`<blake3pp/trace.hpp>` does the same arithmetic the tools print. Pass a
+finished run's `driver_stats` and the wall clock measured around the call:
+
+```cpp
+#include <blake3pp/trace.hpp>
+
+std::vector<blake3pp::window_record> windows(count);
+blake3pp::trace_buffer trace(windows);
+
+const auto t0 = std::chrono::steady_clock::now();
+blake3pp::update_file(h, path, {.trace = &trace});
+const double wall_ns = std::chrono::duration<double, std::nano>(
+    std::chrono::steady_clock::now() - t0).count();
+
+const blake3pp::diagnosis d = blake3pp::diagnose_read(
+    trace.driver(), wall_ns, threads, planned_windows, window_bytes);
+std::println("{}", blake3pp::to_string(d.label));
+```
+
+`diagnose_write()` is the write side's equivalent and takes no window
+count, because there the arena and the queue depth are one number. Both
+report and neither tunes: nothing in them runs a second geometry, predicts
+a rate or recommends a number. The readings are
+`blake3pp::bottleneck` and the strings `to_string()` returns are the ones
+in [Diagnosing a run](tools.md#diagnosing-a-run). Both are API: the
+enumerators are appended, never reordered or renamed, and a string changes
+only when the value it names changes meaning.
+
+`bands` is the policy each share is read against, and the caller may pass
+its own. A figure that lands between the bands gets no label: `label` is
+`bottleneck::undecided` and `first` and `second` name the two candidates.
+`measured()` says whether anything landed, `long_enough()` whether the run
+turned its queue over the four times a reading needs.
+
+`bottleneck::in_flight` is asserted against the test suite's synthetic
+device only; that device is the only source known to produce it.
+
 ## In the tools
 
 `blake3pp_bench_file` is the worked example: it sizes the storage, prints
