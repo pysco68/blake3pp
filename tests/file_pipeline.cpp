@@ -1,13 +1,17 @@
-// The sender/receiver ground the file pipeline stands on: can this
-// build's provider host a custom sender, a custom scheduler and their
-// operation states, and do they compose with then, let_value and
-// continues_on?
+// The file pipeline, from the sender/receiver ground it stands on up to
+// the counters the run diagnosis reads.
 //
-// These are conformance cases, not pipeline cases. They exist because
-// the answer differs per provider and the diagnostics when it goes wrong
-// name provider internals rather than the sender at fault; see
-// <blake3pp/detail/ex_compat.hpp>, whose rules each come from one of the
-// failures below.
+// The first cases are conformance cases. They ask whether this build's
+// provider hosts a custom sender, a custom scheduler and their operation
+// states, and whether those compose with then, let_value and
+// continues_on. The answer differs per provider, and the diagnostics
+// when it goes wrong name provider internals instead of the sender at
+// fault. Each rule in <blake3pp/detail/ex_compat.hpp> comes from one of
+// the failures below.
+//
+// The rest drive the io driver, the window scope and
+// run_window_pipeline(), mostly over fake_driver, whose completion order,
+// failures and device model each case sets.
 
 #include <cstdio>
 #include <exception>
@@ -37,9 +41,12 @@
 #include <fstream>
 #include <ios>
 #include <random>
+#include <ratio>
 #include <vector>
 
 #include "test_schedulers.hpp"
+
+#include "diagnosis.hpp"
 
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/detail/file_pipeline.hpp>
@@ -373,12 +380,12 @@ struct temp_file {
   static inline int counter = 0;
 };
 
-// A driver with no device under it: the file is a span of bytes, and the
-// test decides in what order, in how many pieces and how successfully
-// the reads finish. Everything the pipeline depends on that a real
-// device would only produce by luck -- out-of-order completion, a read
-// that takes several polls, a failure at one particular window -- is a
-// parameter here.
+// A scripted driver: the file is a span of bytes, and the test decides
+// in what order, in how many pieces and how successfully the reads
+// finish, and whether a modelled device holds them. What a real device
+// would only produce by luck (out-of-order completion, a read that takes
+// several polls, a failure at one particular window) is a parameter
+// here.
 struct fake_script {
   // Preference order by window index; a queued read whose index is not
   // named completes after every named one, in submission order.
@@ -415,6 +422,18 @@ struct fake_script {
   // Polls between that request and the failure at fail_at_window, for
   // the case where the two race.
   int fail_after_stop_polls = 0;
+  // A device under the driver, instead of reads that land the instant
+  // they are polled. One FIFO server holding each read for service_ns,
+  // plus a propagation delay of (knee - 1) service times, so the rate
+  // rises with the reads in flight up to `knee` and is flat above it.
+  // Zero service is no device at all, which is what every other case
+  // wants.
+  std::int64_t service_ns = 0;
+  unsigned knee = 1;
+  // A source that costs nothing: every window views the content where
+  // it already is and no read copies a byte, as the bench's --null-source
+  // does. The pool then spends the run on the compress alone.
+  bool zero_copy = false;
 };
 
 class fake_driver {
@@ -444,7 +463,7 @@ class fake_driver {
             static_cast<std::uint64_t>(script_.bad_alloc_at_window)) {
       throw std::bad_alloc();
     }
-    queued_.push_back(read{&op, off, buf, 0, false, 0});
+    queued_.push_back(read{&op, off, buf, 0, false, 0, device_ready()});
     op.live = true;  // the driver owes this one a callback now
   }
 
@@ -467,6 +486,9 @@ class fake_driver {
     }
     const std::size_t pick = choose();
     read& r = queued_[pick];
+    if (!await_device(r)) {
+      return 0;
+    }
     if (script_.stop_at_window >= 0 && script_.stop_source != nullptr &&
         r.off / window_bytes_ ==
             static_cast<std::uint64_t>(script_.stop_at_window)) {
@@ -499,8 +521,10 @@ class fake_driver {
     const std::size_t want = r.buf.size() - r.filled;
     const std::size_t take =
         script_.piece_bytes == 0 ? want : std::min(script_.piece_bytes, want);
-    std::memcpy(r.buf.data() + r.filled,
-                content_.data() + r.off + r.filled, take);
+    if (!script_.zero_copy) {
+      std::memcpy(r.buf.data() + r.filled,
+                  content_.data() + r.off + r.filled, take);
+    }
     r.filled += take;
     if (r.filled < r.buf.size()) {
       return 0;  // still owed: the read takes another poll
@@ -559,16 +583,30 @@ class fake_driver {
   static constexpr std::size_t guard_bytes = 4096;
   static constexpr std::byte guard_fill{0xA5};
 
+  // Idempotent, like the real drivers': a second call for the same
+  // geometry keeps the arena it has. A correct run never writes into
+  // the guard, so there is nothing to re-fill, and a case that times a
+  // run can pay for the arena before its clock starts instead of inside
+  // the window scope's constructor.
   void reserve(unsigned windows, std::size_t window_bytes) {
-    arena_bytes_ = window_bytes * windows;
+    const std::size_t want = window_bytes * windows;
+    if (want != arena_bytes_ || pool_.size() != want + guard_bytes) {
+      arena_bytes_ = want;
+      pool_.assign(want + guard_bytes, guard_fill);
+    }
     window_stride_ = window_bytes;
-    pool_.assign(arena_bytes_ + guard_bytes, guard_fill);
   }
 
   [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
-      file&, unsigned slot, std::uint64_t, std::size_t bytes) noexcept {
+      file&, unsigned slot, std::uint64_t off, std::size_t bytes) noexcept {
     const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
                                      bytes};
+    if (script_.zero_copy) {
+      // The window is read where the bytes already are. The slot's own
+      // buffer is still handed out as the read target so the guard below
+      // still covers an overrun; nothing ever writes into it.
+      return {slice, content_.subspan(static_cast<std::size_t>(off), bytes)};
+    }
     return {slice, std::span<const std::byte>(slice)};
   }
 
@@ -592,7 +630,53 @@ class fake_driver {
     std::size_t filled;
     bool cancelled = false;
     unsigned cancel_polls = 0;
+    // When the modelled device would land this one; 0 for no device.
+    std::int64_t ready = 0;
   };
+
+  [[nodiscard]] static std::int64_t device_now() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  // When a read submitted now would land: the server takes it as soon
+  // as it is free, holds it for service_ns, and the result arrives a
+  // propagation delay later. Assigned at submission, which is what makes
+  // the service of several reads overlap and the rate rise with the
+  // depth. Zero means no device: the read lands on the next poll.
+  [[nodiscard]] std::int64_t device_ready() noexcept {
+    if (script_.service_ns <= 0) {
+      return 0;
+    }
+    const std::int64_t latency =
+        static_cast<std::int64_t>(script_.knee > 1 ? script_.knee - 1 : 0) *
+        script_.service_ns;
+    const std::int64_t start = std::max(device_now(), server_free_);
+    server_free_ = start + script_.service_ns;
+    return server_free_ + latency;
+  }
+
+  // Holds a completion back until the device would have it. False
+  // leaves the read queued for a later poll. The order script is not
+  // combined with a device: the server is FIFO, so submission order is
+  // completion order.
+  bool await_device(const read& r) {
+    if (r.ready == 0) {
+      return true;
+    }
+    const std::int64_t left = r.ready - device_now();
+    if (left > 0) {
+      // One service time at most. Sleeping the whole way would park the
+      // driver thread through the rounds that admit the next windows,
+      // which caps the concurrency at whatever one sleep allows and
+      // makes the modelled device's depth meaningless.
+      std::this_thread::sleep_for(
+          std::chrono::nanoseconds(std::min(left, script_.service_ns)));
+      return false;
+    }
+    return true;
+  }
 
   // The queued read the script prefers: lowest rank wins, and a read the
   // script does not name ranks after every one it does.
@@ -624,6 +708,8 @@ class fake_driver {
   script script_;
   std::vector<read> queued_;
   std::vector<std::byte> pool_;
+  // The modelled device's one server: when it is next free.
+  std::int64_t server_free_ = 0;
   std::mutex m_;
   std::condition_variable cv_;
   bool woken_ = false;
@@ -2418,6 +2504,61 @@ TEST_CASE("the read plan's window budget follows the thread count") {
         read_plan_budget_bytes(scaled, 64 * mib));
 }
 
+// The depth the device sees is the depth the caller asked for, and the
+// run reports it back: driver_stats::queue_depth_final is what a
+// caller reads a geometry off.
+TEST_CASE("the read depth is the depth, start to finish") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 96 * win;
+  const auto content = pattern(len, 132);
+
+  blake3pp::trace_buffer trace{std::span<blake3pp::window_record>{}};
+  fake_driver drv(content, win);
+  fake_driver::file f(drv);
+  blake3pp::hasher h;
+  blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+      h, drv, f, sched,
+      {.window_bytes = win, .queue_depth = 4, .trace = &trace});
+  CHECK(h.finalize() == blake3pp::hash(content));
+
+  const auto& d = trace.driver();
+  CHECK(d.queue_depth_final == 4);
+  CHECK(d.queue_depth_peak == 4);
+  CHECK(d.max_reads_in_flight <= 4);
+}
+
+TEST_CASE("the pool wait is counted when the hash is behind the device") {
+  // The signal the law holds on, measured on the real path rather than
+  // fed in: four window objects against a file of thirty-two windows,
+  // a driver that completes at once and a pool that sleeps per node, so
+  // the driver finds the pool empty with bytes still to read. A
+  // predicate that cannot be satisfied leaves this at zero.
+  b3test::one_thread_pool pool(std::chrono::milliseconds(2));
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 32 * win;
+  const auto content = pattern(len, 133);
+
+  blake3pp::trace_buffer trace{std::span<blake3pp::window_record>{}};
+  fake_driver drv(content, win);
+  fake_driver::file f(drv);
+  blake3pp::hasher h;
+  blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+      h, drv, f, pool.get_scheduler(),
+      blake3pp::detail::pipeline_plan{.window_bytes = win,
+                                      .reads_in_flight = 2,
+                                      .windows = 4,
+                                      .head_bytes = 0,
+                                      .direct_io = false},
+      {.window_bytes = win, .queue_depth = 2, .trace = &trace});
+  CHECK(h.finalize() == blake3pp::hash(content));
+  const auto& d = trace.driver();
+  CHECK(d.starved_ns > 0);
+  // The device's time is counted apart from the starvation.
+  CHECK(d.transfers_landed == 32);
+  CHECK(d.device_wait_ns > 0);
+}
+
 // The two bounds, apart: with two reads allowed and eight windows, the
 // device never sees a third read while the pool, held slow by a
 // one-thread scheduler that sleeps per node, fills every window object.
@@ -2574,6 +2715,174 @@ TEST_CASE("several files hash as one message, every one on the pool") {
   CHECK(fanned >= 3 * std::size(sizes));
   // Two of the three files start off the grid.
   CHECK(short_first == 2);
+}
+
+// --- The diagnosis the tools print (tooling/diagnosis.hpp) ------------------
+//
+// One case per reading, each produced by the synthetic source rather
+// than described to the function: the device model under fake_driver is
+// the same one --null-rate/--null-knee drive in the bench, so a fast
+// device with a narrow arena, a slow device with a wide one, and a
+// device far faster than a one-agent pool each pin one regime. What is
+// asserted is the READING, never the wording the tools wrap it in.
+namespace {
+
+// Runs one file through the pipeline and reads the run off its
+// counters, with the wall clock taken where a tool would take it.
+template <class Scheduler>
+[[nodiscard]] b3tool::diagnosis diagnose_run(
+    Scheduler sched, std::span<const std::byte> content,
+    const blake3pp::detail::pipeline_plan& plan, unsigned threads,
+    fake_script script = {}, b3tool::bands bands = {}) {
+  blake3pp::trace_buffer trace{std::span<blake3pp::window_record>{}};
+  fake_driver drv(content, plan.window_bytes, script);
+  fake_driver::file f(drv);
+  blake3pp::hasher h;
+  // The arena before the clock, as a tool's process pays for its own
+  // before it opens the file, so its first-touch pass stays outside the
+  // measured region.
+  drv.reserve(plan.windows, plan.window_bytes);
+  const auto t0 = std::chrono::steady_clock::now();
+  blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+      h, drv, f, std::move(sched), plan,
+      {.window_bytes = plan.window_bytes,
+       .queue_depth = plan.reads_in_flight,
+       .trace = &trace});
+  const double wall_ns = std::chrono::duration<double, std::nano>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+  REQUIRE(h.finalize() == blake3pp::hash(content));
+  return b3tool::diagnose_read(trace.driver(), wall_ns, threads, plan.windows,
+                               plan.window_bytes, bands);
+}
+
+// The width the suite's scheduler was sized to (tests/main.cpp), which
+// is what a pool-busy share has to be taken over here.
+[[nodiscard]] unsigned suite_pool_threads() noexcept {
+  return std::min(4u, std::max(2u, std::thread::hardware_concurrency()));
+}
+
+// doctest streams a const char* as a pointer, so the line is built as a
+// string first.
+void report(const char* name, const b3tool::diagnosis& r) {
+  const auto pct = [](double v) {
+    return std::to_string(static_cast<int>(100.0 * v)) + "%";
+  };
+  const std::string line =
+      std::string(name) + ": " + b3tool::to_string(r.label) + " (pool " +
+      pct(r.pool_busy) + ", device queued " + pct(r.device_queued) + ", " +
+      std::to_string(r.windows_used) + " of " +
+      std::to_string(r.windows_planned) + " windows, depth " +
+      std::to_string(r.depth) + ", starved " + pct(r.starved) + ")";
+  MESSAGE(line);
+}
+
+}  // namespace
+
+TEST_CASE("a narrow arena over a fast device reads as arena-limited") {
+  // Every window the pool holds is a read slot the device cannot use,
+  // because the plan allocated no more windows than the queue has
+  // reads. The machine's whole pool hashes a 64 KiB window in
+  // microseconds, so the hash is nowhere near the constraint.
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const auto content = pattern(32 * win, 211);
+  const blake3pp::detail::pipeline_plan plan{win, 4, 4, 0, false};
+
+  // A device that propagates rather than works: one window per 20 us of
+  // server time, but two hundred of those before a result comes back.
+  // Its server is therefore idle 90% of the run while all four windows
+  // are outstanding at it, which is the case a share of the wall clock
+  // would read as a saturated device and the mean over the minimum
+  // reads correctly -- every read was served alone.
+  const auto r = diagnose_run(sched, content, plan, suite_pool_threads(),
+                              {.service_ns = 20'000, .knee = 200});
+  report("narrow arena", r);
+  CHECK(r.arena_is_depth);
+  CHECK(r.windows_used == 4);
+  CHECK(r.windows_planned == 4);
+  // Every read served alone: the mean latency is the minimum, so one of
+  // the four queue slots was busy on average.
+  CHECK(r.device_queued < 0.4);
+  CHECK(r.label == b3tool::reading::arena_limited);
+}
+
+TEST_CASE("a slow device under a wide arena reads as device-limited") {
+  // The arena is twice the queue, so the pool always has a window to
+  // take and the starvation the reading above turns on cannot happen.
+  // The device serves one window per 200 us through a single server,
+  // which no 64 KiB hash competes with.
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const auto content = pattern(48 * win, 212);
+  const blake3pp::detail::pipeline_plan plan{win, 2, 8, 0, false};
+
+  // Eight milliseconds of one server per window. The margin is over the
+  // pool, and it is sized for the slowest build this runs in: sanitized,
+  // the suite's four agents take about 1.4 ms of wall clock to consume a
+  // 64 KiB window, nearly all of it scheduler hand-off rather than
+  // compress, so eight is about six times what the consumer needs. The
+  // device is therefore the constraint at any hash speed this suite is
+  // built at, and the case passes in the plain and the sanitized lane
+  // for the same reason rather than by landing either side of a band.
+  //
+  // The transfer count and the depth are the other half of that. A run
+  // of N transfers at depth d cannot read fuller than 1 - (d-1)/2N,
+  // because the first d-1 transfers are served with nothing queued
+  // ahead of them: 24 transfers at depth 4 caps at 0.94 and read 0.92
+  // plain and 0.89 sanitized, which is the ramp and not the device.
+  // Forty-eight at depth 2 caps at 0.99.
+  const auto r = diagnose_run(sched, content, plan, suite_pool_threads(),
+                              {.service_ns = 8'000'000, .knee = 1});
+  report("slow device", r);
+  CHECK_FALSE(r.arena_is_depth);
+  CHECK(r.device_queued > 0.9);
+  CHECK(r.label == b3tool::reading::device_limited);
+}
+
+TEST_CASE("a device faster than the pool reads as hash-limited") {
+  // One agent, a device that lands a read the moment it is polled, and
+  // a wide arena so that agent never waits for bytes. Everything the
+  // run spends is then the compress, which is what the reading says.
+  // The source costs nothing: no read copies a byte, so everything the
+  // run spends is the compress. A copying source cannot produce this
+  // reading at all -- its own memory traffic is the same order as the
+  // hash's -- which is why the bench's --null-source exists.
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 4 * 1024 * 1024;
+  // A kilobyte past a window multiple, so the last window -- the one the
+  // hasher takes whole, on the driver's own thread -- is a kilobyte and
+  // not four megabytes of serial tail inside the measurement.
+  const auto content = pattern(64 * win + 1024, 213);
+  const blake3pp::detail::pipeline_plan plan{win, 4, 6, 0, false};
+
+  // The band is this case's own, and lower than the one the tools read
+  // against. Pool busy is a share of the whole machine, which a test
+  // does not have: measured on an idle sixteen-thread box this run
+  // reads 0.95, and a second copy of the suite running beside it takes
+  // that to 0.88. The reading is right either way -- a pool that is
+  // sharing the machine is not saturated -- but the case is about the
+  // rule and not about owning the box, so it states the band it reads
+  // against. The production band is what the captures in
+  // docs/tools.md exercise.
+  const auto r =
+      diagnose_run(sched, content, plan, suite_pool_threads(),
+                   {.zero_copy = true}, {.saturated = 0.80, .idle = 0.70});
+  report("zero-copy source", r);
+  CHECK_FALSE(r.arena_is_depth);
+  CHECK(r.pool_busy > 0.80);
+  CHECK(r.label == b3tool::reading::hash_limited);
+  // And the trap the reading must not fall into: starved_ns is most of
+  // this run, because a pool that is the constraint leaves the driver
+  // with no free window most of the time. It is not a pool-starvation
+  // measure, and a reading built on it would call this arena-limited.
+  CHECK(r.starved > 0.5);
+}
+
+TEST_CASE("a run with nothing landed has no reading to give") {
+  const b3tool::diagnosis empty;
+  CHECK_FALSE(empty.measured());
+  CHECK(empty.label == b3tool::reading::undecided);
 }
 
 }  // TEST_SUITE

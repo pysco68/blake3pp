@@ -458,6 +458,19 @@ template <class F>
   return std::format("{:8.{}f} {:>5}", v, decimals, units[u]);
 }
 
+// A byte count in the largest binary unit it is a whole number of:
+// "64 MiB", "1 GiB", "768 KiB". For geometry figures, which are always
+// powers of two, so there is nothing to round.
+[[nodiscard]] inline std::string bytes_label(std::uint64_t bytes) {
+  static constexpr const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+  std::size_t u = 0;
+  while (bytes >= 1024 && bytes % 1024 == 0 && u + 1 < std::size(units)) {
+    bytes /= 1024;
+    ++u;
+  }
+  return std::format("{} {}", bytes, units[u]);
+}
+
 [[nodiscard]] inline double gib_per_s(std::size_t bytes,
                                       double seconds) noexcept {
   return static_cast<double>(bytes) / seconds / (1024.0 * 1024.0 * 1024.0);

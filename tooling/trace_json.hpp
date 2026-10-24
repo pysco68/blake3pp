@@ -73,10 +73,17 @@ inline bool write_chrome_trace(const std::string& path,
         "\"ts\":{:.3f},\"dur\":{:.3f},\"args\":{{\"busy_ns\":{},"
         "\"parked_ns\":{},\"iterations\":{},\"polls\":{},"
         "\"blocking_polls\":{},\"wakes\":{},\"queue_runs\":{},"
-        "\"admission_stalls\":{},\"max_pending\":{}}}}}",
+        "\"admission_stalls\":{},\"max_pending\":{},"
+        "\"transfers_landed\":{},\"transfer_bytes\":{},"
+        "\"device_wait_ns\":{},\"starved_ns\":{},"
+        "\"queue_depth_final\":{},"
+        "\"queue_depth_peak\":{},\"agent_busy_ns\":{},"
+        "\"device_wait_min_ns\":{}}}}}",
         us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
         d.polls, d.blocking_polls, d.wakes, d.queue_runs, d.admission_stalls,
-        d.max_pending);
+        d.max_pending, d.transfers_landed, d.transfer_bytes,
+        d.device_wait_ns, d.starved_ns, d.queue_depth_final,
+        d.queue_depth_peak, d.agent_busy_ns, d.device_wait_min_ns);
   }
   std::map<std::uint32_t, bool> slots_named;
   for (const auto& w : trace.windows()) {

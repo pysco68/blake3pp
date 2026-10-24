@@ -118,7 +118,10 @@ struct driver_stats {
   /// reaping, running completions and inserting into the reducer.
   std::uint64_t busy_ns;
   /// Nanoseconds the driver spent inside a blocking poll, waiting for a
-  /// read or for a window to come back from the pool.
+  /// read or for a window to come back from the pool. The two waits are
+  /// summed: this field answers whether the driver thread is the
+  /// bottleneck, and for that it does not matter which of them it was
+  /// waiting on. device_wait_ns and starved_ns separate them.
   std::uint64_t parked_ns;
   /// Times round the loop: one drain, one round of starts, one flush and
   /// one poll each.
@@ -153,6 +156,65 @@ struct driver_stats {
   /// referenced, so it outlives the file. Read it through
   /// read_backend(), which trims the padding.
   std::array<char, 56> read_backend;
+  // Fields are appended, never inserted: a caller that reads this out of
+  // a build it did not compile reads it by offset.
+  /// Windows whose transfer landed: reads on a read run, writes on a
+  /// write one. Counted on every run, traced or not.
+  std::uint64_t transfers_landed;
+  /// Bytes those transfers moved.
+  std::uint64_t transfer_bytes;
+  /// Summed per-window time the device had the transfer, with nothing of
+  /// the pipeline's own in it: t_ready - t_wait_begin on a read, the
+  /// submission to the completion on a write. Divided by
+  /// transfers_landed it is the mean per-window latency; divided again
+  /// by the depth in force it is the interval between windows. Counted
+  /// on every run.
+  std::uint64_t device_wait_ns;
+  /// Nanoseconds the pipeline could not use a window it already had,
+  /// for the one reason more depth cannot fix. Reading, that is bytes
+  /// left and no free window on the pool -- the hash behind the device.
+  /// Writing, it is the opposite event: the driver with nothing to
+  /// write because every window is still being generated. Counted on
+  /// every run.
+  ///
+  /// Reading, this is NOT a measure of how starved the pool was. It
+  /// counts "no free window", which fires structurally whenever the
+  /// arena is no wider than the queue depth, so it is nonzero on a run
+  /// that is purely hash-limited: a 64 MiB x depth 16 arm at 96%
+  /// agent_busy_ns still showed 1.33 s of it. Read it as "the arena is
+  /// not wider than the depth" and use agent_busy_ns for the hash
+  /// side. Writing it is the clean signal it reads like, because there
+  /// the windows in flight are the generator's parallelism.
+  std::uint64_t starved_ns;
+  /// The queue depth the run finished on: the geometry to pass back as
+  /// queue_depth to repeat it.
+  std::uint64_t queue_depth_final;
+  /// The deepest queue depth the run reached.
+  std::uint64_t queue_depth_peak;
+  /// Summed over every window and every agent that took part:
+  /// nanoseconds the pool spent compressing on a read run, filling on
+  /// a write one. Divided by the wall clock and the thread count it is
+  /// the pool's busy share, which is the hash side's answer to the
+  /// question device_wait_ns answers for the device. Counted on every
+  /// run that passes a trace buffer, whether or not it asked for
+  /// per-window records.
+  ///
+  /// starved_ns is not the same measure and does not substitute for
+  /// it: see the note on that field.
+  std::uint64_t agent_busy_ns;
+  /// The shortest of those per-transfer times, which is the device
+  /// serving one transfer with nothing queued ahead of it. Zero when
+  /// nothing landed.
+  ///
+  /// It is what makes the mean readable. A queue's latency is
+  /// proportional to its depth by construction, so device_wait_ns /
+  /// transfers_landed alone cannot say whether the device was the
+  /// constraint: against this it can. A mean at depth times this is a
+  /// queue that was full for the run, and the device is the wall; a mean
+  /// at this is a device that served every transfer alone and had
+  /// capacity to spare, whatever the mean's absolute size. Counted on
+  /// every run, at one comparison per transfer.
+  std::uint64_t device_wait_min_ns;
 };
 
 /// The engaged read rung as text; empty when nothing recorded one.

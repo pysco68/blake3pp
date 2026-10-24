@@ -21,12 +21,14 @@
 //     without first copying it into memory.
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <format>
 #include <optional>
+#include <ratio>
 #include <span>
 #include <string>
 #include <system_error>
@@ -35,6 +37,7 @@
 #include <CLI/CLI.hpp>
 #include <blake3pp/parallel_io.hpp>
 
+#include "diagnosis.hpp"
 #include "tool_common.hpp"
 #include "trace_json.hpp"
 
@@ -90,6 +93,89 @@ class budget {
   std::optional<std::uint64_t> left_;
 };
 
+// --diag: which side of the write pipeline was the constraint, from
+// the counters the run kept.
+//
+// The directions are not symmetrical. Reading, the pool consumes
+// windows the device produces and the arena between them is a third
+// number. Writing, the pool PRODUCES windows the device drains, and one
+// window is one fill task, so the windows in flight are the generator's
+// parallelism and the device's queue at once -- one number, and no
+// arena reading separate from it. So the two candidates share the same
+// windows and the reading is which of them held them longer.
+//
+// starved_ns is not printed on either side. Reading, it counts "no free
+// window", which a run whose pool is the constraint spends most of its
+// wall clock in, so it is not the pool-starvation measure it reads like.
+// Writing, it is only counted where the depth is at least the
+// generator's parallelism, which is the configuration a
+// generator-limited run is NOT in.
+void report_write_diagnosis(const b3tool::diagnosis& r, unsigned threads) {
+  const auto service = [](double ns) {
+    return ns >= 1e6 ? std::format("{:.3f} ms", ns / 1e6)
+                     : std::format("{:.1f} us", ns / 1e3);
+  };
+  if (!r.measured()) {
+    println(stderr,
+            "blake3ppgen: diagnosis: nothing was written through the "
+            "pipeline, so there is no run to describe");
+    return;
+  }
+  if (!r.long_enough()) {
+    println(stderr,
+            "blake3ppgen: diagnosis: {} writes at a depth of {} is this run's "
+            "own ramp and drain, not a measurement of either end",
+            r.transfers, r.depth);
+    return;
+  }
+  println(stderr, "diagnosis: {} (write side)",
+          r.label == b3tool::reading::undecided
+              ? std::format("{} or {}, this run does not separate them",
+                            b3tool::to_string(r.first),
+                            b3tool::to_string(r.second))
+              : b3tool::to_string(r.label));
+  println(stderr,
+          "  generator      {:5.1f}% of the {} windows in flight "
+          "({:.1f}% of {} threads)",
+          100.0 * r.fill_busy, r.depth, 100.0 * r.pool_busy, threads);
+  println(stderr,
+          "  windows        {} in flight, {} each ({}); the arena and the "
+          "depth are one number here",
+          r.depth, b3tool::bytes_label(r.window_bytes),
+          b3tool::bytes_label(r.depth * r.window_bytes));
+  println(stderr,
+          "  device         {} per window over {} writes (min {}), holding "
+          "{:5.1f}% of the windows",
+          service(r.mean_service_ns), r.transfers,
+          service(static_cast<double>(r.min_service_ns)),
+          100.0 * r.device_busy);
+  switch (r.label) {
+    case b3tool::reading::generator_limited:
+      println(stderr,
+              "  the windows spent more of the run being filled than being "
+              "written; one window is one fill task, so the windows in "
+              "flight are the generator's parallelism.");
+      println(stderr,
+              "  at {} threads a {} window plans depth {} ({} in flight).",
+              threads, b3tool::bytes_label(r.window_bytes),
+              blake3pp::detail::resolve_write_queue_depth(0, r.window_bytes,
+                                                          threads),
+              b3tool::bytes_label(
+                  blake3pp::detail::resolve_write_queue_depth(
+                      0, r.window_bytes, threads) *
+                  r.window_bytes));
+      break;
+    case b3tool::reading::device_limited:
+      println(stderr,
+              "  the device held a full queue for the run: it is the wall.");
+      break;
+    case b3tool::reading::hash_limited:
+    case b3tool::reading::arena_limited:
+    case b3tool::reading::undecided:
+      break;
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -108,6 +194,7 @@ int main(int argc, char** argv) {
   bool waive_zero_fill = false;
   std::string trace_path;
   bool trace_agents = false;
+  bool diag = false;
   std::size_t window_mib = 0;
   unsigned qd = 0;
   bool verbose = false;
@@ -139,6 +226,7 @@ int main(int argc, char** argv) {
   app.add_flag("--waive-zero-fill", waive_zero_fill, "with --output, Windows: set the valid data length up front instead of writing a sparse file (needs the volume-maintenance privilege; exposes stale disk blocks until written)")->needs(output_opt);
   auto* trace_opt = app.add_option("--trace", trace_path, "with --output and --length, on the pipelined path: record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)")->needs(output_opt);
   app.add_flag("--trace-agents", trace_agents, "with --trace: also record which CPU filled each window, and for how long")->needs(trace_opt);
+  app.add_flag("--diag", diag, "report on stderr which side limited the run (the generator or the device); needs --output and --length on the pipelined path")->needs(output_opt);
   app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 4 MiB per generator thread, so every fill fans out fully)")->needs(output_opt);
   app.add_option("--qd", qd, "with --output: write buffers in flight (default: one per generator thread, or 2 with --threads 1; the writer clamps it to its range)")->needs(output_opt);
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
@@ -233,6 +321,13 @@ int main(int argc, char** argv) {
       std::vector<blake3pp::window_record> window_records;
       std::vector<blake3pp::agent_record> agent_records;
       std::optional<blake3pp::trace_buffer> trace;
+      // --diag reads driver_stats only, which a buffer with no window
+      // storage still collects: two clock reads and one relaxed add per
+      // window, and no allocation.
+      if (diag && trace_path.empty()) {
+        trace.emplace(std::span<blake3pp::window_record>{});
+        wopts.trace = &*trace;
+      }
       if (!trace_path.empty()) {
         const std::size_t window =
             blake3pp::detail::rounded_window_bytes(wopts.window_bytes);
@@ -245,6 +340,7 @@ int main(int argc, char** argv) {
         trace.emplace(std::span{window_records}, std::span{agent_records});
         wopts.trace = &*trace;
       }
+      const auto t0 = std::chrono::steady_clock::now();
       const blake3pp::write_report report = blake3pp::write_file(
           output, total,
           [&stream, seek](std::span<std::byte> out,
@@ -254,11 +350,21 @@ int main(int argc, char** argv) {
             blake3pp::fill(r, out);
           },
           pool.scheduler(), wopts);
+      const double wall_ns = std::chrono::duration<double, std::nano>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
       if (verbose) {
         println(stderr, "blake3ppgen: write backend: {} (pipeline)",
                 report.backend);
       }
-      if (trace) {
+      if (diag) {
+        report_write_diagnosis(
+            b3tool::diagnose_write(
+                trace->driver(), wall_ns, threads,
+                blake3pp::detail::rounded_window_bytes(wopts.window_bytes)),
+            threads);
+      }
+      if (trace && !trace_path.empty()) {
         if (b3tool::write_chrome_trace(trace_path, *trace, "blake3ppgen",
                                        threads, /*write_side=*/true)) {
           println(stderr, "blake3ppgen: trace: {} window records{}, JSON to {}",
@@ -284,6 +390,11 @@ int main(int argc, char** argv) {
       println(stderr,
               "blake3ppgen: --trace records the pipelined path only (a known "
               "--length and more than one thread); nothing written");
+    }
+    if (diag) {
+      println(stderr,
+              "blake3ppgen: --diag describes the pipelined path only (a known "
+              "--length and more than one thread); nothing reported");
     }
     // File sink, sequential: the generator fills one of the writer's
     // O_DIRECT-aligned buffers at a time and the next fills while the

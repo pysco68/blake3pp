@@ -61,16 +61,30 @@ On a Ryzen 7 PRO 6860Z (16 threads), 2 GiB, best of 3:
 | 64 MiB x qd 8 | 16.8 | | 4 MiB x qd 16 | 18.5 |
 | 64 MiB x qd 16 | 16.9 | | | |
 
+## A modelled device under the null source and sink
+
+`--null-rate R` gives `--null-source` and `--null-sink` a device of R
+GiB/s in place of immediate completion: one FIFO server with a fixed
+service time per window and a propagation delay of `--null-knee` minus
+one service times, so throughput rises linearly with the queue depth up
+to the knee and is flat above it. The run prints the service time and
+latency it derived. It shows how the pipeline and `--diag`'s counters
+behave against a device whose shape is known.
+
 ## The flags
 
 `--help` is authoritative; this is the map.
 
 `blake3pp_bench_file`, over a real file: `--reps`, `--cooldown`,
-`--window` (MiB), `--qd`, `--no-direct`, `--inline-submit`, `--threads`,
-`--no-ioring` and `--registered-buffers` (Windows: the completion port
-instead of the I/O ring, and the ring's buffer registration), `--seq-only`, `--trace PATH` with `--trace-agents`, `--io-sweep` (the
-window x qd pacing matrix), and `--make <MiB>` to create a file and use
-it. Without a device: `--null-source <GiB>` and `--null-sink <GiB>`.
+`--window` (MiB), `--qd`, `--no-direct`, `--no-async` (the synchronous
+rung, against the platform's async engine), `--inline-submit`,
+`--threads`, `--no-ioring` and `--registered-buffers` (Windows: the
+completion port instead of the I/O ring, and the ring's buffer
+registration), `--seq-only`, `--trace PATH` with `--trace-agents`,
+`--io-sweep` (the window x qd pacing matrix), and `--make <MiB>` to
+create a file and use it. Without a device: `--null-source <GiB>` and
+`--null-sink <GiB>`, with `--null-rate` and `--null-knee` for a modelled
+device.
 
 `blake3pp_bench`, in memory: `--size` (MiB), `--reps`, `--cooldown`,
 `--pin`, `--threads`, and a list of SIMD variants to

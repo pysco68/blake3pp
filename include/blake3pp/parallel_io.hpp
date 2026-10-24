@@ -19,6 +19,7 @@
 /// Same shape as io.hpp: `update_file()` is the primitive, `hash_file()` the
 /// one-shot convenience, each with a throwing and a std::error_code form.
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -98,8 +99,13 @@ template <class Scheduler, class Fill>
 write_report write_file(const std::filesystem::path& path, std::uint64_t size,
                         Fill&& fill, Scheduler&& sched,
                         const file_write_options& opts = {}) {
+  // The machine's width, which is what the automatic depth is one
+  // window per, and what the scope is told the generator's parallelism
+  // is. A caller whose pool is narrower than the machine states its
+  // own depth (file_write_options::queue_depth).
+  const unsigned threads = std::thread::hardware_concurrency();
   const unsigned depth = detail::resolve_write_queue_depth(
-      opts.queue_depth, opts.window_bytes, std::thread::hardware_concurrency());
+      opts.queue_depth, opts.window_bytes, threads);
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
                          .ioring = opts.ioring,
@@ -115,7 +121,8 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
                              std::forward<Fill>(fill), size,
                              {.window_bytes = opts.window_bytes,
                               .queue_depth = depth,
-                              .trace = opts.trace});
+                              .trace = opts.trace,
+                              .generator_threads = threads});
   return {.bytes = size, .backend = std::string(file.name())};
 }
 

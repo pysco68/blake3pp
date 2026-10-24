@@ -561,6 +561,36 @@ TEST_CASE("window records are complete, in order and consistent") {
   }
 }
 
+TEST_CASE("the read counters are kept whether or not a window is recorded") {
+  // driver_stats reports these whether or not the caller asked for
+  // per-window records: a buffer with no window storage records nothing
+  // per window and still has to come back with the device's time in
+  // it.
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t window = 64 * 1024;
+  const std::size_t len = 9 * window;
+  const auto content = make_input(len);
+  const temp_file f(content);
+
+  blake3pp::trace_buffer trace({});
+  const blake3pp::file_io_options opts{.window_bytes = window,
+                                       .queue_depth = 3,
+                                       .trace = &trace};
+  blake3pp::hasher h;
+  blake3pp::update_file(h, f.path, sched, opts);
+  CHECK(h.finalize() == blake3pp::hash(content));
+
+  const auto& d = trace.driver();
+  CHECK(trace.windows().empty());
+  CHECK(trace.dropped_windows() == window_count(len, window));
+  CHECK(d.transfers_landed > 0);
+  CHECK(d.transfer_bytes == len);
+  CHECK(d.device_wait_ns > 0);
+  // The depth is the request, start to finish.
+  CHECK(d.queue_depth_final == 3);
+  CHECK(d.queue_depth_peak == 3);
+}
+
 TEST_CASE("agent records account for every part of their window") {
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t window = 256 * 1024;  // 256 chunks, 16 parts

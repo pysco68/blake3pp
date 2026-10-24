@@ -6,10 +6,13 @@
 // not the hash, is the limit.
 //
 //   blake3pp_bench_file <FILE> [--reps N] [--window MiB] [--qd N]
-//                       [--no-direct] [--seq-only] [--cooldown S]
+//                       [--no-direct] [--no-async] [--threads N]
+//                       [--seq-only] [--cooldown S]
 //                       [--trace PATH [--trace-agents]]
 //   blake3pp_bench_file <FILE> --io-sweep   # window x qd pacing matrix
+//   blake3pp_bench_file --null-source <GiB> # read pipeline, no device
 //   blake3pp_bench_file --null-sink <GiB>   # write pipeline, no device
+//                       [--null-rate GiB/s [--null-knee QD]]  # modelled device
 //   blake3pp_bench_file --make <MiB>   # create a test file and use it
 //
 // Note: with direct I/O the page cache is bypassed, so repetitions measure
@@ -42,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -327,6 +331,36 @@ kernel_deltas kernel_delta(const kernel_counters& before,
   return d;
 }
 
+// A device to put under the null driver, so a control law can be shown
+// a knee that was chosen rather than measured.
+//
+// One FIFO server with a fixed service time per window plus a fixed
+// propagation delay: a transfer starts when the server is free, holds
+// it for `service_ns`, and lands `latency_ns` later. At depth d the
+// steady-state rate is min(d x window / (service + latency), window /
+// service), so throughput rises linearly to a knee at
+// 1 + latency / service and is flat above it. `knee` names that depth
+// and the latency follows from it.
+struct null_device {
+  double rate_gib_s = 0.0;  // 0: complete immediately, no device at all
+  unsigned knee = 1;
+  std::int64_t service_ns = 0;
+  std::int64_t latency_ns = 0;
+
+  [[nodiscard]] bool active() const noexcept { return rate_gib_s > 0.0; }
+
+  void settle(std::size_t window_bytes) noexcept {
+    if (!active()) {
+      return;
+    }
+    const double bytes_per_ns = rate_gib_s * 1024.0 * 1024.0 * 1024.0 / 1e9;
+    service_ns = static_cast<std::int64_t>(
+        std::max(1.0, static_cast<double>(window_bytes) / bytes_per_ns));
+    latency_ns = static_cast<std::int64_t>(knee > 1 ? knee - 1 : 0) *
+                 service_ns;
+  }
+};
+
 // The pipeline with no device under it, and no bytes either.
 //
 // The file is VIRTUAL: it reports whatever size the run asks for, while
@@ -341,6 +375,9 @@ kernel_deltas kernel_delta(const kernel_counters& before,
 //
 // The completion half is memory_driver's, because a source with nothing
 // to read has exactly one job -- report from poll() and not before.
+// Given a null_device it paces those reports instead, so the synthetic
+// arms can be run against a device whose knee was chosen rather than
+// measured.
 class null_driver {
  public:
   // The pool is sized and faulted in at construction, before the caller
@@ -349,8 +386,9 @@ class null_driver {
   // windows, which is exactly the shape of a pipeline regression that is
   // not one.
   null_driver(const blake3pp::detail::io_driver_options&, unsigned,
-              std::uint64_t size, std::byte filler, std::size_t pool_bytes)
-      : size_(size), pool_(pool_bytes, filler) {}
+              std::uint64_t size, std::byte filler, std::size_t pool_bytes,
+              null_device dev = {})
+      : size_(size), dev_(dev), pool_(pool_bytes, filler) {}
   null_driver(const null_driver&) = delete;
   null_driver& operator=(const null_driver&) = delete;
 
@@ -385,32 +423,130 @@ class null_driver {
     return {slice, std::span<const std::byte>(slice)};
   }
 
-  void submit_read(file& f, std::uint64_t, std::span<std::byte>,
+  void submit_read(file& f, std::uint64_t, std::span<std::byte> buf,
                    blake3pp::detail::io_op& op) noexcept {
-    reads_.push(op, &f);
+    submit(f, buf.size(), op);
   }
   // The sink half: the bytes are already where they were generated, so
   // the only work is reporting from poll() and not before.
-  void submit_write(file& f, std::uint64_t, std::span<const std::byte>,
+  void submit_write(file& f, std::uint64_t, std::span<const std::byte> buf,
                     blake3pp::detail::io_op& op) noexcept {
-    reads_.push(op, &f);
+    submit(f, buf.size(), op);
   }
   void flush() noexcept {}
-  std::size_t poll(bool block) { return reads_.poll(block); }
-  void wake() noexcept { reads_.wake(); }
-  void cancel(blake3pp::detail::io_op& op) noexcept { reads_.cancel(op); }
-  [[nodiscard]] std::size_t in_flight() const noexcept {
-    return reads_.in_flight();
+
+  std::size_t poll(bool block) {
+    if (!dev_.active()) {
+      return reads_.poll(block);
+    }
+    release_ready();
+    if (block && reads_.in_flight() == 0 && !timed_.empty()) {
+      wait_until(timed_.front().ready);
+      release_ready();
+    }
+    // Only ever park on the waiter with nothing of the device's own
+    // still to land: the waiter is woken by the pool, not by the clock.
+    return reads_.poll(block && timed_.empty());
   }
-  void drain() noexcept { reads_.drain(); }
+
+  void wake() noexcept { reads_.wake(); }
+  void cancel(blake3pp::detail::io_op& op) noexcept {
+    for (auto it = timed_.begin(); it != timed_.end(); ++it) {
+      if (it->op == &op) {
+        reads_.push(op, it->owner);
+        timed_.erase(it);
+        break;
+      }
+    }
+    reads_.cancel(op);
+  }
+  [[nodiscard]] std::size_t in_flight() const noexcept {
+    return reads_.in_flight() + timed_.size();
+  }
+  void drain() noexcept {
+    release_all();
+    reads_.drain();
+  }
   // Nothing here is in the OS's hands; one file's share is its own queued
   // operations, as on the memory driver.
-  void drain(file& f) noexcept { reads_.drain(&f); }
+  void drain(file& f) noexcept {
+    release_all();
+    reads_.drain(&f);
+  }
 
  private:
+  struct timed_op {
+    blake3pp::detail::io_op* op;
+    const void* owner;
+    std::int64_t ready;
+  };
+
+  [[nodiscard]] static std::int64_t now_ns() noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void submit(file& f, std::size_t bytes, blake3pp::detail::io_op& op) noexcept {
+    if (!dev_.active()) {
+      reads_.push(op, &f);
+      return;
+    }
+    // One server, FIFO, so the ready times this produces are already in
+    // order and the queue is a plain deque.
+    const double share = dev_.service_ns == 0 || window_stride_ == 0
+                             ? 1.0
+                             : static_cast<double>(bytes) /
+                                   static_cast<double>(window_stride_);
+    const auto service =
+        static_cast<std::int64_t>(static_cast<double>(dev_.service_ns) * share);
+    const std::int64_t start = std::max(now_ns(), server_free_);
+    server_free_ = start + service;
+    timed_.push_back({&op, &f, server_free_ + dev_.latency_ns});
+    op.live = true;
+  }
+
+  void release_ready() noexcept {
+    const std::int64_t t = now_ns();
+    while (!timed_.empty() && timed_.front().ready <= t) {
+      reads_.push(*timed_.front().op, timed_.front().owner);
+      timed_.pop_front();
+    }
+  }
+
+  void release_all() noexcept {
+    while (!timed_.empty()) {
+      reads_.push(*timed_.front().op, timed_.front().owner);
+      timed_.pop_front();
+    }
+  }
+
+  // Waits for one completion, in slices no longer than a service time:
+  // sleeping the whole way would park the driver thread through the
+  // rounds that admit the next windows, which caps the concurrency at
+  // whatever one sleep allows. Spins for the last microsecond, which is
+  // what keeps a service time of a few hundred microseconds from being
+  // quantised by the scheduler's timer slack.
+  void wait_until(std::int64_t ready) const noexcept {
+    const std::int64_t slice = std::max<std::int64_t>(dev_.service_ns, 1000);
+    const std::int64_t left = ready - now_ns();
+    if (left <= 0) {
+      return;
+    }
+    if (left > 2000) {
+      std::this_thread::sleep_for(
+          std::chrono::nanoseconds(std::min(left - 1000, slice)));
+    } else {
+      std::this_thread::yield();
+    }
+  }
+
   std::uint64_t size_;
   std::byte filler_{};
   std::size_t window_stride_ = 0;
+  null_device dev_{};
+  std::int64_t server_free_ = 0;
+  std::deque<timed_op> timed_;
   std::vector<std::byte> pool_;
   blake3pp::detail::queued_reads reads_;
 };
@@ -551,6 +687,15 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
             driver_ns / 1e9, d.iterations, d.polls, d.blocking_polls,
             d.wakes, d.queue_runs, d.admission_stalls, d.max_pending,
             d.max_reads_in_flight, d.max_windows_in_flight);
+    if (d.transfers_landed > 0) {
+      println(stdout,
+              "    queue depth: settled at {} (peak {}); device {:.3f} ms per "
+              "window over {} transfers, starved {:.3f} s",
+              d.queue_depth_final, d.queue_depth_peak,
+              static_cast<double>(d.device_wait_ns) /
+                  static_cast<double>(d.transfers_landed) / 1e6,
+              d.transfers_landed, static_cast<double>(d.starved_ns) / 1e9);
+    }
   }
 
   // Per-window latencies, as medians: with windows overlapping, an
@@ -791,6 +936,8 @@ int main(int argc, char** argv) {
   bool no_direct = false;
   bool no_ioring = false;
   bool registered_buffers = false;
+  double null_rate = 0;
+  unsigned null_knee = 1;
   blake3pp::hash_file_options opts;
 
   CLI::App app{
@@ -811,6 +958,15 @@ int main(int argc, char** argv) {
   app.add_option("--qd", opts.queue_depth,
                  "I/O queue depth (the reader clamps it to its range)")
       ->capture_default_str();
+  app.add_option("--null-rate", null_rate,
+                 "give the synthetic source or sink a device of this many "
+                 "GiB/s instead of completing immediately")
+      ->check(CLI::PositiveNumber);
+  app.add_option("--null-knee", null_knee,
+                 "the queue depth at which that device saturates: its "
+                 "propagation delay is set to (knee - 1) service times, so "
+                 "throughput rises to this depth and is flat above it")
+      ->check(CLI::Range(1u, 1024u));
   app.add_flag("--no-direct", no_direct,
                "keep the OS page cache (no O_DIRECT)");
   app.add_flag("--no-async", no_async,
@@ -883,6 +1039,8 @@ int main(int argc, char** argv) {
         .offload_submit = opts.offload_submit,
         .ioring = opts.ioring,
         .registered_buffers = opts.registered_buffers};
+    null_device dev{.rate_gib_s = null_rate, .knee = null_knee};
+    dev.settle(win);
     if (!trace_path.empty()) {
       const std::size_t n = static_cast<std::size_t>((total + win - 1) / win) + 1;
       window_records.resize(n);
@@ -896,6 +1054,14 @@ int main(int argc, char** argv) {
     println(stdout,
             "null source: {:.2f} GiB, window {} MiB, qd {}, {} threads",
             null_gib, win >> 20, opts.queue_depth, threads);
+    if (dev.active()) {
+      println(stdout,
+              "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
+              "{:.3f} ms latency)",
+              dev.rate_gib_s, dev.knee,
+              static_cast<double>(dev.service_ns) / 1e6,
+              static_cast<double>(dev.latency_ns) / 1e6);
+    }
     // The arena the pool draws its work from, resolved the way every
     // read entry point resolves it: from this machine's thread count.
     const blake3pp::detail::pipeline_plan plan =
@@ -931,7 +1097,7 @@ int main(int argc, char** argv) {
                        .ioring = opts.ioring,
                        .registered_buffers = opts.registered_buffers},
                       plan.reads_in_flight, total, null_filler,
-                      plan.window_bytes * plan.windows);
+                      plan.window_bytes * plan.windows, dev);
       null_driver::file nf(drv);
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
@@ -975,9 +1141,22 @@ int main(int argc, char** argv) {
         blake3pp::detail::rounded_window_bytes(opts.window_bytes);
     const unsigned threads =
         pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
+    null_device dev{.rate_gib_s = null_rate, .knee = null_knee};
+    dev.settle(win);
+    const unsigned start_depth = blake3pp::detail::resolve_write_queue_depth(
+        opts.queue_depth, opts.window_bytes, threads);
     println(stdout,
             "null sink: {:.2f} GiB, window {} MiB, qd {}, {} threads",
-            null_sink_gib, win >> 20, opts.queue_depth, threads);
+            null_sink_gib, win >> 20, start_depth, threads);
+    if (dev.active()) {
+      println(stdout,
+              "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
+              "{:.3f} ms latency)",
+              dev.rate_gib_s, dev.knee,
+              static_cast<double>(dev.service_ns) / 1e6,
+              static_cast<double>(dev.latency_ns) / 1e6);
+    }
+    blake3pp::trace_buffer sink_trace{std::span<blake3pp::window_record>{}};
 
     // The same generator blake3ppgen uses, so the fill costs what it
     // costs there: an extended output seeks in O(1), so each window
@@ -996,12 +1175,12 @@ int main(int argc, char** argv) {
       // reserve() is a no-op and no first-touch page fault lands inside
       // the clock.
       const unsigned windows = static_cast<unsigned>(std::min<std::uint64_t>(
-          (total + win - 1) / win, opts.queue_depth));
+          (total + win - 1) / win, start_depth));
       null_driver drv({.async = true,
                        .offload_submit = opts.offload_submit,
                        .ioring = opts.ioring,
                        .registered_buffers = opts.registered_buffers},
-                      windows, total, null_filler, win * windows);
+                      windows, total, null_filler, win * windows, dev);
       null_driver::file nf(drv);
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_write_pipeline(
@@ -1013,12 +1192,25 @@ int main(int argc, char** argv) {
           },
           total,
           {.window_bytes = opts.window_bytes,
-           .queue_depth = opts.queue_depth});
+           .queue_depth = start_depth,
+           .trace = &sink_trace,
+           .generator_threads = threads});
       const auto t1 = std::chrono::steady_clock::now();
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
     println(stdout, "{:<10} {}", "null sink",
             b3tool::rate(static_cast<std::size_t>(total), best));
+    {
+      const auto& d = sink_trace.driver();
+      println(stdout,
+              "  device: {:.3f} ms per window over {} writes, generator "
+              "starved {:.3f} s",
+              d.transfers_landed > 0
+                  ? static_cast<double>(d.device_wait_ns) /
+                        static_cast<double>(d.transfers_landed) / 1e6
+                  : 0.0,
+              d.transfers_landed, static_cast<double>(d.starved_ns) / 1e9);
+    }
     return 0;
   }
 

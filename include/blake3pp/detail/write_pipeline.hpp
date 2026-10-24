@@ -24,6 +24,8 @@
 //
 // Internal to the library. Names an execution provider.
 
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +53,14 @@ struct write_options {
   // Where to record one window_record per window, with the write side's
   // meaning of the stamps (trace.hpp); nullptr records nothing.
   trace_buffer* trace = nullptr;
+  // Fills the scheduler can run at once, which is the generator's own
+  // parallelism. One window is one fill task, so below this depth the
+  // pool has threads with nothing to fill and the device's idle time is
+  // the depth's own doing rather than the device waiting on the
+  // generator; see note_generator_wait(). Zero means unknown, and the
+  // depth is then taken as the parallelism, which is what it is
+  // wherever the caller let resolve_write_queue_depth() pick it.
+  unsigned generator_threads = 0;
   ex::inplace_stop_token stop_token{};
 };
 
@@ -93,7 +103,11 @@ class write_scope
         total_(total),
         window_bytes_(rounded_window_bytes(opts.window_bytes)),
         count_(plan_windows(total, window_bytes_, opts.queue_depth)),
-        in_flight_cap_(clamp_queue_depth(opts.queue_depth)),
+        in_flight_cap_(
+            std::min(clamp_queue_depth(opts.queue_depth), count_)),
+        generator_threads_(opts.generator_threads != 0
+                               ? opts.generator_threads
+                               : in_flight_cap_),
         trace_(opts.trace),
         opts_stop_token_(opts.stop_token),
         windows_(std::make_unique<window[]>(count_)) {
@@ -179,10 +193,26 @@ class write_scope
     file_.set_size(total_);
   }
 
+  // What the run did, in the same fields a read run fills.
+  void report(driver_stats& d) const noexcept {
+    d.transfers_landed = transfers_landed_;
+    d.transfer_bytes = transfer_bytes_;
+    d.device_wait_ns = device_wait_ns_;
+    d.starved_ns = starved_ns_;
+    d.queue_depth_final = in_flight_cap_;
+    d.queue_depth_peak = in_flight_cap_;
+    d.agent_busy_ns = fill_busy_ns_.load(std::memory_order_relaxed);
+    d.device_wait_min_ns = transfers_landed_ > 0 ? device_min_ns_ : 0;
+  }
+
  private:
   struct window {
     std::span<std::byte> buffer;
     io_op op{};
+    // When the write was handed to the driver, on steady_clock. Kept
+    // whether or not a trace buffer was given: the device counters are
+    // the landing minus this.
+    std::int64_t t_write_begin = 0;
     window* next_free = nullptr;
     std::uint64_t offset = 0;
     std::size_t bytes = 0;
@@ -242,6 +272,7 @@ class write_scope
                          [this, &w] { fill_window(w); }),
                 loop_.scheduler())),
             [this, &w] {
+              w.t_write_begin = steady_now_ns();
               return loop_.write(file_, w.offset,
                                  std::span<const std::byte>(w.buffer.data(),
                                                             w.bytes),
@@ -262,15 +293,28 @@ class write_scope
   void fill_window(window& w) {
     // On an agent: the fill's two stamps, and with agent recording on,
     // one agent record for the fill -- one part, on this CPU.
+    //
+    // The two stamps are taken for a trace buffer with no per-window
+    // storage too, because the generator's busy share is what says
+    // whether the pool or the device is the constraint and a caller
+    // may want that without one record per window. Two clock reads and
+    // one relaxed add per window; nothing at all without a buffer.
+    if (trace_ == nullptr) {
+      fill_(w.buffer.first(w.bytes), w.offset);
+      return;
+    }
+    const std::int64_t t_begin = trace_->now();
     if (w.rec != nullptr) {
-      w.rec->t_ready = trace_->now();
+      w.rec->t_ready = t_begin;
     }
     fill_(w.buffer.first(w.bytes), w.offset);
+    const std::int64_t t_end = trace_->now();
+    fill_busy_ns_.fetch_add(static_cast<std::uint64_t>(t_end - t_begin),
+                            std::memory_order_relaxed);
     if (w.rec != nullptr) {
-      const std::int64_t t_end = trace_->now();
       w.rec->t_joined = t_end;
       w.rec->agents_active = 1;
-      w.rec->agent_busy_ns = static_cast<std::uint64_t>(t_end - w.rec->t_ready);
+      w.rec->agent_busy_ns = static_cast<std::uint64_t>(t_end - t_begin);
       if (agent_record* const a = trace_->claim_agent(); a != nullptr) {
         a->window = w.rec->index;
         a->file = 0;
@@ -290,8 +334,15 @@ class write_scope
 
   void landed(window& w) noexcept {
     w.writing = false;
+    const std::int64_t t = steady_now_ns();
+    ++transfers_landed_;
+    transfer_bytes_ += w.bytes;
+    const auto service = static_cast<std::uint64_t>(
+        std::max<std::int64_t>(0, t - w.t_write_begin));
+    device_wait_ns_ += service;
+    device_min_ns_ = std::min(device_min_ns_, service);
     if (w.rec != nullptr) {
-      w.rec->t_absorbed = trace_->now();
+      w.rec->t_absorbed = t - trace_->epoch_ns();
     }
   }
 
@@ -323,6 +374,7 @@ class write_scope
         status_.outstanding = in_flight_;
         ex::start(*cells[w->slot]);
       }
+      note_generator_wait();
       settle();
     }, [this] { this->report_stall(); });
   }
@@ -353,6 +405,45 @@ class write_scope
             "the write pipeline needs a driver that owns window buffers");
     w.buffer = storage.read_into;
     next_offset_ += w.bytes;
+  }
+
+  // The write side's one stall more depth cannot help: the driver has
+  // no write outstanding while the run still owes bytes, so every
+  // window the run holds is being generated and the device is idle
+  // waiting for one.
+  //
+  // This is the opposite event from the read side's, not the same one.
+  // There an empty window pool means the hash is behind; here an empty
+  // pool is the steady state, because generation outruns any device.
+  //
+  // It is counted only at and above the generator's own parallelism.
+  // One window is one fill task, so the depth is how many fills run at
+  // once as well as how many writes do: below the pool's width the
+  // device is idle because the depth left threads with nothing to
+  // fill, which is the depth's own doing and not the generator failing
+  // to keep up. driver_stats::starved_ns is the time lost for a reason
+  // more depth cannot fix, so that stretch does not belong in it. At
+  // and above the width the generator is already as parallel as the
+  // pool can make it and the signal means what it says.
+  void note_generator_wait() noexcept {
+    const bool starved = in_flight_cap_ >= generator_threads_ &&
+                         loop_.driver().in_flight() == 0 &&
+                         !stop_requested() && next_offset_ < total_;
+    if (starved) {
+      if (starved_at_ == 0) {
+        starved_at_ = steady_now_ns();
+      }
+      return;
+    }
+    note_generator_wait_end();
+  }
+
+  void note_generator_wait_end() noexcept {
+    if (starved_at_ != 0) {
+      starved_ns_ += static_cast<std::uint64_t>(
+          std::max<std::int64_t>(0, steady_now_ns() - starved_at_));
+      starved_at_ = 0;
+    }
   }
 
   [[noreturn]] void report_stall() const {
@@ -439,6 +530,9 @@ class write_scope
   std::size_t window_bytes_;
   unsigned count_;
   unsigned in_flight_cap_;
+  // Fills the scheduler runs at once (write_options::generator_threads),
+  // or the depth where the caller did not say.
+  unsigned generator_threads_;
   trace_buffer* trace_ = nullptr;
   ex::inplace_stop_token opts_stop_token_;
   std::unique_ptr<window[]> windows_;
@@ -446,7 +540,21 @@ class write_scope
 
   window* free_ = nullptr;
   std::uint64_t next_offset_ = 0;
-
+  // What the device did, kept on every run.
+  std::uint64_t transfers_landed_ = 0;
+  std::uint64_t transfer_bytes_ = 0;
+  std::uint64_t device_wait_ns_ = 0;
+  std::uint64_t starved_ns_ = 0;
+  // The generator's summed fill time over the run. Written by the
+  // agent that filled a window, read by the driver after everything
+  // has joined, so it is atomic where the other counters are not.
+  std::atomic<std::uint64_t> fill_busy_ns_{0};
+  // The shortest transfer the device served, which is its latency with
+  // nothing queued ahead. One comparison per landed write.
+  std::uint64_t device_min_ns_ = ~std::uint64_t{0};
+  // When the driver last went idle with bytes still owed; zero when it
+  // is not. One clock read per transition, not per round.
+  std::int64_t starved_at_ = 0;
 };
 
 // Generates one file on this thread, fanning the fills out over sched.
@@ -460,6 +568,9 @@ void run_write_pipeline(D& drv, typename D::file& file, Scheduler&& sched,
       scope(drv, file, std::forward<Scheduler>(sched),
             std::forward<Fill>(fill), total, opts);
   scope.run();
+  if (opts.trace != nullptr) {
+    scope.report(opts.trace->driver());
+  }
 }
 
 }  // namespace blake3pp::detail

@@ -53,7 +53,12 @@ if(BLAKE3PP_WITH_IO)
 endif()
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"
-  "${PROJECT_SOURCE_DIR}/src")
+  "${PROJECT_SOURCE_DIR}/src"
+  # tooling/diagnosis.hpp: the reading the CLI tools print is asserted
+  # here, so the arithmetic is one piece of code and not two. The header
+  # is standard library only and names no CLI11 or <format>, which is
+  # what lets this target take it without the tooling dependencies.
+  "${PROJECT_SOURCE_DIR}/tooling")
 # A sanitized build runs the reducer's property cases tens of times
 # slower, to the point where one case takes minutes and a timeout can no
 # longer tell a stall from work. Those lanes run a prefix of the same

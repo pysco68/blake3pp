@@ -246,6 +246,10 @@ inline constexpr unsigned sequential_write_queue_depth = 2;
 // The depth a write over a scheduler uses: the requested one, clamped
 // like every other, or for a request of zero one window per thread of
 // `threads`, bounded so that depth x window stays within the budget.
+//
+// One window's fill is sequential and one window is one fill task, so
+// the depth is the generator's parallelism as well as the device's
+// queue: below the thread count the pool is under-used.
 [[nodiscard]] constexpr unsigned resolve_write_queue_depth(
     unsigned requested, std::size_t window_bytes, unsigned threads) noexcept {
   if (requested != 0) {

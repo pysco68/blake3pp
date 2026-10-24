@@ -71,6 +71,7 @@
 #include <atomic>
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -902,6 +903,16 @@ class pipeline_scope_base {
 // --------------------------------------------------------------------
 // The bounded scope.
 
+// steady_clock in nanoseconds, absolute. The trace's own scale is this
+// minus its epoch, so a traced run reads the clock once per event and
+// not twice. Both pipelines keep their transfer counters on this scale,
+// because they are kept whether or not a trace buffer was passed.
+[[nodiscard]] inline std::int64_t steady_now_ns() noexcept {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 // What the scope needs that the public options do not already say.
 struct pipeline_options {
   // The requests plan_pipeline() rounds and clamps; the scope itself
@@ -1164,6 +1175,12 @@ struct pipeline_window {
   std::uint64_t chunks = 0;
   std::size_t bytes = 0;
   window_record* rec = nullptr;
+  // When the pipeline asked the driver for this window's bytes, on
+  // steady_clock. Kept whether or not a trace buffer was given: the
+  // device counters driver_stats reports are differences of this and
+  // the landing, and a counter that only worked for a tracing caller
+  // would be a different pipeline from the one everyone else runs.
+  std::int64_t t_read_begin = 0;
   // The pool's free list and the scope's list of what it currently
   // holds. A window is on exactly one of them, never both.
   pipeline_window* next_free = nullptr;
@@ -1554,6 +1571,9 @@ class window_scope
     // stage; the watch is done before anything is reported.
     watch.reset();
 
+    // A run that ends while the pool is empty has an open starved
+    // interval, and the counter is reported from here.
+    note_pool_wait_end();
     if (trace_ != nullptr) {
       driver_stats& d = trace_->driver();
       // The rung is the file's, which closes with the run: copied here so a
@@ -1563,6 +1583,14 @@ class window_scope
       d.max_pending = max_pending_;
       d.max_reads_in_flight = max_reading_;
       d.max_windows_in_flight = max_windows_;
+      d.transfers_landed = transfers_landed_;
+      d.transfer_bytes = transfer_bytes_;
+      d.device_wait_ns = device_wait_ns_;
+      d.starved_ns = starved_ns_;
+      d.queue_depth_final = reads_in_flight_;
+      d.queue_depth_peak = reads_in_flight_;
+      d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
+      d.device_wait_min_ns = transfers_landed_ > 0 ? device_min_ns_ : 0;
     }
     if (eptr_) {
       return outcome::exception;
@@ -1770,6 +1798,7 @@ class window_scope
           ex::start(*(w->last ? cells.last_read : cells.first_read));
         }
       }
+      note_pool_wait();
       // A stop that arrives with nothing in flight ends the run here.
       // Without this the loop would reach the stall report, which exists
       // for a pipeline nobody can wake, and this one is over.
@@ -1982,6 +2011,39 @@ class window_scope
                         }));
     } else {
       return stopped_if<Value>(tok, std::forward<Stage>(stage));
+    }
+  }
+
+  // The one stall more depth cannot help: bytes left to read, a free
+  // read slot, and no window on the pool. That is the hash behind the
+  // device, and the windows already in flight are buffering rather than
+  // reading. Timed on the transitions, so a starved stretch costs two
+  // clock reads however many rounds it spans.
+  //
+  // The windows in flight are not part of this. An empty pool means
+  // every window this run may hold is already out, so a term comparing
+  // the count against its cap would be false wherever the rest is true,
+  // and the counter would stay at zero on every run.
+  void note_pool_wait() noexcept {
+    const bool starved = pool_.empty() && !stop_requested() &&
+                         next_offset_ < file_bytes_ &&
+                         reading_ < reads_in_flight_;
+    if (starved) {
+      if (pool_starved_at_ == 0) {
+        pool_starved_at_ = steady_now_ns();
+      }
+      return;
+    }
+    note_pool_wait_end();
+  }
+
+  // Closes an open starved interval, from the round that ends it or
+  // from the end of the run.
+  void note_pool_wait_end() noexcept {
+    if (pool_starved_at_ != 0) {
+      starved_ns_ += static_cast<std::uint64_t>(
+          std::max<std::int64_t>(0, steady_now_ns() - pool_starved_at_));
+      pool_starved_at_ = 0;
     }
   }
 
@@ -2324,6 +2386,11 @@ class window_scope
   }
 
   void claim_record(window& w) noexcept {
+    // Unconditional: the device counters are differences of this
+    // timestamp and the one read_landed() takes, so they cannot be a
+    // tracing caller's privilege. Two clock reads per window, which at
+    // an 8 MiB window and 46 GiB/s is about 12,000 a second.
+    w.t_read_begin = steady_now_ns();
     w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
     if (w.rec != nullptr) {
       w.rec->index = w.index;
@@ -2332,7 +2399,7 @@ class window_scope
                      (w.short_first ? window_record::flag_short_first : 0);
       w.rec->slot = w.slot;
       w.rec->file = file_index_;
-      w.rec->t_wait_begin = trace_->now();
+      w.rec->t_wait_begin = w.t_read_begin - trace_->epoch_ns();
     }
   }
 
@@ -2341,8 +2408,15 @@ class window_scope
   void read_landed(window& w) noexcept {
     w.view_ready = true;
     release_read_slot(w);
+    const std::int64_t t = steady_now_ns();
+    ++transfers_landed_;
+    transfer_bytes_ += w.bytes;
+    const auto service =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(0, t - w.t_read_begin));
+    device_wait_ns_ += service;
+    device_min_ns_ = std::min(device_min_ns_, service);
     if (w.rec != nullptr) {
-      w.rec->t_ready = trace_->now();
+      w.rec->t_ready = t - trace_->epoch_ns();
     }
   }
 
@@ -2362,10 +2436,18 @@ class window_scope
   }
 
   void stamp_agents(window& w) noexcept {
+    const std::uint64_t busy =
+        w.compress.pt.busy_ns.load(std::memory_order_relaxed);
+    // Outside the record check: the pool's busy share is what says
+    // whether the hash is the constraint, and a caller may want it
+    // without paying for one record per window. The window's agents
+    // have already summed their own time into this counter, so this is
+    // one relaxed add per fanned window on the agent that finished it;
+    // the driver reads it back once, in end().
+    agent_busy_ns_.fetch_add(busy, std::memory_order_relaxed);
     if (w.rec != nullptr) {
       w.rec->t_joined = trace_->now();
-      w.rec->agent_busy_ns =
-          w.compress.pt.busy_ns.load(std::memory_order_relaxed);
+      w.rec->agent_busy_ns = busy;
       w.rec->agents_active =
           w.compress.pt.active.load(std::memory_order_relaxed);
       w.rec->flags |= window_record::flag_parallel;
@@ -2420,6 +2502,23 @@ class window_scope
   std::size_t in_flight_nodes_ = 0;
   std::uint64_t admission_stalls_ = 0;
   std::size_t max_pending_ = 0;
+  // What the device did, kept on every run. They are the reason the two
+  // window timestamps are unconditional.
+  std::uint64_t transfers_landed_ = 0;
+  std::uint64_t transfer_bytes_ = 0;
+  std::uint64_t device_wait_ns_ = 0;
+  std::uint64_t starved_ns_ = 0;
+  // The pool's summed compress time over the run. Written by the agent
+  // that finished a window, read by the driver after everything has
+  // joined, so it is atomic where the other counters above are not.
+  std::atomic<std::uint64_t> agent_busy_ns_{0};
+  // The shortest transfer the device served, which is its latency with
+  // nothing queued ahead. One comparison per landed read.
+  std::uint64_t device_min_ns_ = ~std::uint64_t{0};
+  // When the pipeline last found the pool empty with work to start;
+  // zero when it is not starved. One clock read per transition, not per
+  // round.
+  std::int64_t pool_starved_at_ = 0;
 };
 
 // The connected chains of one run: one cell per window the scope may

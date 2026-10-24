@@ -62,6 +62,9 @@ OPTIONS:
                               PATH (open in ui.perfetto.dev)
           --trace-agents Needs: --trace
                               with --trace: also record each pool agent's part of every window
+          --diag              report on stderr which side limited the run (the hash, the
+                              device, or the window arena between them); one FILE or '-', on
+                              the pipelined path
 ```
 
 ```bash
@@ -122,6 +125,9 @@ OPTIONS:
           --trace-agents Needs: --trace
                               with --trace: also record which CPU filled each window, and for
                               how long
+          --diag Needs: --output
+                              report on stderr which side limited the run (the generator or the
+                              device); needs --output and --length on the pipelined path
           --window UINT Needs: --output
                               with --output: write buffer size in MiB (default: 4 MiB per
                               generator thread, so every fill fans out fully)
@@ -193,6 +199,77 @@ fraction, and with `--trace-agents` an effective rate per CPU.
 [Performance tracing](tracing.md) explains the records, the summary and
 the trace file, and [Where a window's time goes](https://github.com/pysco68/blake3pp/blob/main/bench/README.md)
 has the bench's remaining rows.
+
+## Diagnosing a run
+
+`--diag` reports which side of the pipeline was the constraint on the run
+that just happened, from counters the run already kept. It costs no
+allocation and no per-window storage: every figure comes out of
+`driver_stats` (see [Performance tracing](tracing.md#driver_stats)).
+
+```
+$ blake3ppsum --diag big.iso
+diagnosis: device-limited
+  pool busy        1.9% of 16 threads
+  arena          6 of 16 windows in flight, 8 MiB each (128 MiB), wider than the queue depth of 4
+  device         16.679 ms per window over 256 reads (min 9.845 ms, 4.0 of 4 queued)
+  the pool had a window whenever it wanted one and still did not saturate, and the device's queue was full: it is the wall.
+```
+
+Three figures and a reading. **Pool busy** is the compute pool's share of
+its own capacity. **Arena** is the window objects the plan allocated and
+whether they outnumber the queue depth — the windows beyond the reads are
+what the pool draws on while the device serves the next ones. **Device** is
+the mean time a transfer spent at the device, the shortest such time, and
+how full its queue was; the minimum is what makes the mean readable, since
+a queue's latency is proportional to its depth by construction.
+
+| reading | what it means |
+|---|---|
+| `hash-limited` | the pool was saturated; no I/O geometry moves it |
+| `device-limited` | the pool had a window whenever it wanted one, did not saturate, and the device's queue was full |
+| `arena-limited` | neither end was busy and the run held every window it had, with the arena no wider than the queue |
+| `generator-limited` | writing: the windows spent more of the run being filled than being written |
+
+A figure that lands near its ceiling without reaching it gets no label: the
+run names the two readings it cannot separate and prints the figures.
+
+```
+$ blake3ppsum --diag --no-direct --threads 2 big.iso
+diagnosis: hash-limited
+  pool busy       95.6% of 2 threads
+  arena          16 of 16 windows in flight, 8 MiB each (128 MiB), wider than the queue depth of 4
+  device         1.531 ms per window over 256 reads (min 559.2 us, 2.2 of 4 queued)
+  the pool was saturated: the hash is the constraint and I/O geometry will not move it.
+
+$ blake3ppsum --diag --no-direct --window 8 --qd 16 big.iso
+diagnosis: arena-limited
+  pool busy       34.5% of 16 threads
+  arena          16 of 16 windows in flight, 8 MiB each (128 MiB), no wider than the queue depth of 16
+  device         3.977 ms per window over 256 reads (min 864.0 us, 11.2 of 16 queued)
+  the pool idled waiting for a window while the device was not queued.
+```
+
+On the write side the arena and the depth are the same number — one window
+is one fill task, so the windows in flight are the generator's parallelism
+and the device's queue at once — so there are two readings rather than
+three, and the report says which direction it is describing:
+
+```
+$ blake3ppgen --seed s --length 2G --output out.bin --diag
+diagnosis: device-limited (write side)
+  generator        2.8% of the 16 windows in flight (2.8% of 16 threads)
+  windows        16 in flight, 4 MiB each (64 MiB); the arena and the depth are one number here
+  device         15.083 ms per window over 512 writes (min 1.301 ms), holding  93.9% of the windows
+  the device held a full queue for the run: it is the wall.
+```
+
+`--diag` describes one run: `blake3ppsum` takes exactly one FILE, not `-`
+and not `--check`, and `blake3ppgen` needs `--output` and `--length` on the
+pipelined path. A run too short to turn its queue over four times reports
+that instead of a reading. The captures above are from a 16-thread Zen 5
+machine under WSL2, on its virtual disk and through the page cache where
+`--no-direct` appears.
 
 ## The allocator
 
