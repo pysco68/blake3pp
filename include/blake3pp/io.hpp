@@ -22,8 +22,9 @@
 /// dispatch.hpp and io.hpp compile against the standard library alone.
 /// Reads still overlap hashing here (the reader is asynchronous); what is
 /// sequential is the compute. The scheduler-taking overloads, which fan
-/// each window out over cores, live in parallel_io.hpp, the one public
-/// header that needs stdexec/beman/std::execution.
+/// each window out over cores, and update_stream() for pipes and standard
+/// input live in parallel_io.hpp, the one public header that needs
+/// stdexec/beman/std::execution.
 ///
 /// std::filesystem::path is the path currency throughout (string literals
 /// and std::string convert implicitly). Each entry point follows the

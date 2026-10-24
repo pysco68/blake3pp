@@ -18,8 +18,12 @@
 ///
 /// Same shape as io.hpp: `update_file()` is the primitive, `hash_file()` the
 /// one-shot convenience, each with a throwing and a std::error_code form.
+/// `update_stream()` feeds a hasher from a pipe, a socket or standard
+/// input through the same pipeline.
 
 #include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -31,6 +35,7 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/file_reader.hpp>
+#include <blake3pp/detail/pipe_driver.hpp>
 #include <blake3pp/detail/write_pipeline.hpp>
 #include <blake3pp/io.hpp>
 #include <blake3pp/parallel.hpp>
@@ -274,6 +279,182 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
                                const hash_file_options& opts = {}) noexcept {
   return detail::with_error_code(ec, [&] {
     return hash_file<Budget>(path, std::forward<Scheduler>(sched), opts);
+  });
+}
+
+namespace detail {
+
+// One part of the window grid, in bytes: the alignment every window a
+// stream ends early is rounded down to, which is what keeps such a
+// window a run of whole, aligned parts.
+template <stack_budget Budget>
+[[nodiscard]] constexpr std::size_t stream_flush_quantum(
+    std::size_t window_bytes) noexcept {
+  return part_chunks<Budget>(window_bytes / chunk_size) * chunk_size;
+}
+
+// The geometry a stream runs on.
+//
+// A stream has one position, so exactly one window is being filled at
+// any moment: the depth the device sees is one, and that is the depth
+// the diagnosis reads the stream's own share against. The window count
+// is what lets the pool and the reducer run ahead of the fill, not what
+// a device's queue is given.
+//
+// Separate from update_stream() so a test can drive a scripted reader
+// through the same geometry the shipped path uses.
+[[nodiscard]] inline pipeline_plan plan_stream(std::uint64_t count,
+                                               std::size_t window_bytes,
+                                               unsigned windows) noexcept {
+  const std::size_t window = rounded_window_bytes(window_bytes);
+  return {.window_bytes = window,
+          .reads_in_flight = 1,
+          .windows = windows != 0 ? std::clamp(windows, 2u, max_queue_depth)
+                                  : default_stream_windows,
+          .head_bytes = first_window_bytes(count, window),
+          .direct_io = false,
+          .ends_message = true,
+          .streaming = true};
+}
+
+}  // namespace detail
+
+/// A stream handle: a file descriptor where the platform has those, a
+/// HANDLE on Windows. `blake3pp::standard_input()` is this process's own.
+using stream_handle = detail::native_stream;
+
+/// This process's standard input as a stream handle.
+[[nodiscard]] inline stream_handle standard_input() noexcept {
+  return detail::standard_input();
+}
+
+/// What update_stream() takes.
+struct stream_io_options {
+  /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
+  /// multiple of chunk_size, minimum 64 KiB. A producer that keeps up
+  /// fills every one of them.
+  std::size_t window_bytes = detail::default_window_bytes;
+  /// Window objects the run allocates, which is how many may be in
+  /// flight -- one being filled, the rest on the pool or waiting to
+  /// reduce. Zero takes the default; a stream fills one at a time, so
+  /// there is nothing here for a device's queue to buy.
+  unsigned windows = 0;
+  /// How long a window may sit unfinished before what has arrived is
+  /// hashed anyway. Zero derives it from the window size and
+  /// detail::pipe_fast_producer_bytes_per_s, which is the figure that
+  /// decides which producers are "behind": one window at that rate.
+  std::chrono::nanoseconds flush_after{0};
+  /// Ask the OS for this much stream buffer (Linux: F_SETPIPE_SZ). Zero
+  /// leaves it alone. A larger buffer is what keeps an 8 MiB window from
+  /// being a hundred hand-offs through a 64 KiB pipe; the request is
+  /// clamped by the system's own ceiling and the figure in force comes
+  /// back in stream_report.
+  std::size_t stream_buffer_bytes = 1u << 20;
+  /// Where to record per-window timing, or null for none; the same
+  /// buffer file_io_options::trace takes.
+  trace_buffer* trace = nullptr;
+};
+
+/// What one update_stream() run did.
+struct stream_report {
+  /// Bytes the stream delivered.
+  std::uint64_t bytes = 0;
+  /// Windows the run hashed.
+  std::uint64_t windows = 0;
+  /// Of those, the ones the flush deadline ended early because the
+  /// producer had not filled them. Zero is a producer that kept up with
+  /// the grid; anything else says the run was waiting on the producer.
+  std::uint64_t short_flushes = 0;
+  /// The window the run settled on, and how many it allocated: the
+  /// figures diagnose_read() is read against.
+  std::size_t window_bytes = 0;
+  unsigned windows_planned = 0;
+  /// The stream buffer in force, or zero where the platform has no such
+  /// knob.
+  std::size_t stream_buffer_bytes = 0;
+};
+
+/// Streams an unseekable source -- a pipe, a socket, standard input --
+/// into a hasher with every window fanned out over a scheduler.
+///
+/// Same contract as update_file() in every respect the hasher can see: h
+/// keeps its mode, stays open for more input and for every finalize
+/// form, and the digest is the one the same bytes produce through any
+/// other path. What differs is the geometry, because a stream has none
+/// to plan from: its length is known only when it ends, and a window is
+/// however much of it arrived.
+///
+/// The reader fills one window on this thread while the pool hashes the
+/// ones before it, which is the overlap a push API cannot have. A
+/// producer that keeps up fills every window and the run is bounded by
+/// the hash or by the stream itself; a producer that does not has its
+/// windows ended early at the flush deadline, so the pool is fed rather
+/// than stalled and the wait is bounded. Either way `--diag`'s device
+/// side is the stream: there is no other device in the picture.
+///
+/// @pre The hasher sits on a window boundary: count() is a multiple of
+///      the rounded window size, which every fresh hasher is. A hasher
+///      part-way through one cannot be brought onto the grid from a
+///      stream, because the window that would do it is the one window a
+///      stream cannot promise to fill.
+/// @tparam Budget     What a window's part table may take; see
+///                    stack_budget.
+/// @tparam Scheduler  Any std::execution-style scheduler.
+/// @param h       The hasher to stream into.
+/// @param handle  The stream to read; standard_input() for stdin.
+/// @param sched   Where the subtree reductions run.
+/// @param opts    The geometry and the flush deadline.
+/// @return What the run did; see stream_report.
+/// @throws std::system_error on a read failure, std::logic_error for a
+///         hasher off the window grid, and whatever the execution provider
+///         raises. A producer that dies cannot be told from one that
+///         closed its end: both read as the end of the stream.
+template <stack_budget Budget = default_stack_budget, class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
+                            const stream_io_options& opts = {}) {
+  const detail::pipeline_plan plan =
+      detail::plan_stream(h.count(), opts.window_bytes, opts.windows);
+  const std::size_t window = plan.window_bytes;
+  detail::pipe_driver drv(
+      detail::stream_reader{handle},
+      {.flush_after = opts.flush_after,
+       .flush_quantum = detail::stream_flush_quantum<Budget>(window),
+       .widen_to = opts.stream_buffer_bytes});
+  detail::pipe_driver::file file(drv);
+  detail::run_window_pipeline<Budget>(
+      h, drv, file, std::forward<Scheduler>(sched), plan,
+      {.window_bytes = window,
+       .trace = opts.trace,
+       .stop_token = detail::blocking_stop_token()});
+  return {.bytes = drv.bytes_read(),
+          .windows = drv.windows_filled(),
+          .short_flushes = drv.timer_flushes(),
+          .window_bytes = window,
+          .windows_planned = plan.windows,
+          .stream_buffer_bytes = drv.widened_to()};
+}
+
+/// update_stream() reporting failure through ec instead of throwing.
+///
+/// A read failure arrives as its own error code. Anything else reads as
+/// not_enough_memory, as in every ec overload here: an allocation failure,
+/// whatever the execution provider raises, and a hasher off the window
+/// grid. A caller that needs to tell them apart takes the throwing form.
+/// @param h       The hasher to stream into.
+/// @param handle  The stream to read.
+/// @param sched   Where the subtree reductions run.
+/// @param ec      Cleared on success; the error otherwise.
+/// @param opts    The geometry and the flush deadline.
+/// @return What the run did, or a default report when ec is set.
+template <stack_budget Budget = default_stack_budget, class Scheduler>
+  requires ex::scheduler<std::remove_cvref_t<Scheduler>>
+stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
+                            std::error_code& ec,
+                            const stream_io_options& opts = {}) noexcept {
+  return detail::with_error_code(ec, [&] {
+    return update_stream<Budget>(h, handle, std::forward<Scheduler>(sched),
+                                 opts);
   });
 }
 

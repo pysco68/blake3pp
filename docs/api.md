@@ -272,6 +272,48 @@ which halved the pipeline there, 22 against 41 GiB/s. The
 submit inline (`--inline-submit` in the tools), and the writer behind
 `blake3ppgen --output` takes the same option.
 
+#### A stream instead of a file
+
+`update_stream()` is `update_file()` over a source that cannot be
+seeked: a pipe, a socket, standard input. Its geometry is not planned,
+because a stream has none to plan from — its length is known only when
+it ends, and a window is however much of it arrived.
+
+```cpp
+#include <blake3pp/parallel_io.hpp>
+
+blake3pp::hasher h;
+auto r = blake3pp::update_stream(h, blake3pp::standard_input(),
+                                 pool.get_scheduler());
+auto d = h.finalize();
+```
+
+The reader fills one window on the calling thread while the pool hashes
+the ones before it. A producer that keeps up fills every window, and the
+run is bounded by the hash or by the stream itself. A producer that does
+not has its windows ended early at a flush deadline — one window at
+512 MiB/s, so a producer at or above that never reaches it — and what
+arrived is hashed as a run of subtrees rather than waited for. The
+`stream_report` the call returns says how many windows ended that way.
+
+**On Windows this call is correct but slow, and `blake3ppsum -` does not
+use it.** The deadline needs a read that waits with a timeout, which
+`poll()` is; a Windows anonymous pipe -- what a shell's `|` creates -- has
+no readiness notification to wait on, so the deadline is enforced by
+sleeping, and a reader that stops draining stalls the producer behind a
+4 KiB pipe buffer. Measured with clang-cl: 0.28 MiB/s against 58.7 for the
+sequential path on the same producer, with throughput pinned at one sleep
+tick per window whatever the deadline is set to. Windows needs the
+deadline owned by a thread other than the one draining; until then the
+tool keeps the sequential path there. See
+tasks/blake3pp-stream-reader-no-clock.md.
+
+The hasher must sit on a window boundary, which every fresh one does; a
+hasher part-way through a window cannot be brought onto the grid from a
+stream, because the window that would do it is the one window a stream
+cannot promise to fill. `--diag` reads a stream run like any other, with
+the stream as the device.
+
 ### Writing a file
 
 The reverse direction is `write_file()`: a generator fills windows, the

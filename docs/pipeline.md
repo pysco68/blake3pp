@@ -9,10 +9,11 @@ of them. What follows is that chain stage by stage, why each stage sits
 where it does, and the rules that let completions arrive in whatever order
 the device and the pool produce them with no lock on the hash.
 
-The same engine runs `update_file()`, the scheduler-taking `hash()` over a
-buffer in memory, `write_file()` and the senders in
-[`<blake3pp/async_io.hpp>`](async.md). What differs between them is the
-driver underneath and who owns the window storage.
+The same engine runs `update_file()`, `update_stream()` over a pipe or
+standard input, the scheduler-taking `hash()` over a buffer in memory,
+`write_file()` and the senders in [`<blake3pp/async_io.hpp>`](async.md).
+What differs between them is the driver underneath and who owns the window
+storage.
 
 ## The shape of one window
 

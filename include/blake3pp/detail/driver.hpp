@@ -3,11 +3,12 @@
 // The vocabulary a source of windows has to speak, and nothing that
 // speaks it.
 //
-// Two drivers model this: io_driver, the platform's reader behind a
-// pimpl, and memory_driver, a span the pipeline reads views out of.
-// Neither is named here on purpose -- a caller that only wants the
-// in-memory path must not pull in the file I/O layer to get the concept,
-// and the async context hosts both without preferring one.
+// Three drivers model this: io_driver, the platform's reader behind a
+// pimpl; memory_driver, a span the pipeline reads views out of; and
+// pipe_driver, a stream it fills windows from. None is named here: a
+// caller that only wants the in-memory path must not pull in the file I/O
+// layer to get the concept, and the async context hosts the first two
+// without preferring one.
 //
 // Internal to the library. Standard library only, and no execution
 // provider: the concept is about reads, not about senders.

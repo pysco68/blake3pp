@@ -173,13 +173,16 @@ bypassing the page cache.
 ## Tracing
 
 Both tools record their run as Chrome trace JSON with `--trace PATH` (and
-`--trace-agents`): `blake3ppsum` its batch path, a directory of files as
-their windows across the context's window objects; `blake3ppgen` its
-pipelined write path, each window's queue, fill, write and release. What
-they also expose are the knobs a trace settles: `--window`, `--qd`, `--threads`, `--no-direct` and
-`--inline-submit`, the same names on both, and the same pipeline
-underneath. `blake3ppgen -v` names the write backend that was engaged;
-that is as much as either tool says about the pipeline it ran.
+`--trace-agents`). `blake3ppsum` records the files it hashes; several
+files hashed together show their windows across the context's window
+objects. Its trace storage is sized from the FILE arguments, so standard
+input gets two window records and the rest are counted as dropped.
+`blake3ppgen` records its pipelined write path, each window's queue,
+fill, write and release. The knobs a trace settles are `--window`,
+`--qd`, `--threads`, `--no-direct` and `--inline-submit`, with the same
+names on both tools and the same pipeline underneath. `blake3ppgen -v`
+names the write backend that was engaged, and `--diag`
+([below](#diagnosing-a-run)) reads a run's counters.
 
 `blake3pp_bench_file` takes `--no-async` as well, which is how the
 platform's async engine gets measured against its synchronous rung on
@@ -284,10 +287,13 @@ diagnosis: device-limited (write side)
   the device held a full queue for the run: it is the wall.
 ```
 
-`--diag` describes a single run. `blake3ppsum` takes exactly one FILE, not
-`-` and not `--check`; `blake3ppgen` needs `--output` and `--length`, which
+`--diag` describes a single run. `blake3ppsum` takes exactly one FILE or
+`-`, not `--check`; `blake3ppgen` needs `--output` and `--length`, which
 selects the pipelined path. A run too short to turn its queue over four
-times reports that instead of a reading.
+times reports that instead of a reading. On `-` the device is the stream:
+a producer that cannot keep up reads as device-limited, and the line
+below the diagnosis says how many windows the flush deadline ended
+early.
 
 The captures above are from a 16-thread Zen 5 machine under WSL2, on its
 virtual disk, through the page cache where `--no-direct` appears.

@@ -160,11 +160,12 @@ class engine {
     }
   }
 
-  // Hex of the requested output length over stdin or a file. Files stream
-  // through the library's pipeline (async windowed reads, multi-core when
-  // a pool exists); stdin has no file to hand over, so it is read in
-  // buffers into a parallel_hasher when a pool exists, the plain hasher
-  // otherwise. Either way the mode comes from the options.
+  // Hex of the requested output length over stdin or a file. Both go
+  // through the library's pipeline when a pool exists -- a file through
+  // the platform's async reader, stdin through the stream driver, which
+  // fills one window on this thread while the pool hashes the ones
+  // before it. Without a pool each is read into the plain hasher. Either
+  // way the mode comes from the options.
   std::string hash_hex(const std::string& path, std::size_t out_len) {
     std::vector<std::byte> out(out_len);
     const auto finish = [&](const auto& h) {
@@ -172,13 +173,36 @@ class engine {
       return blake3pp::to_hex(out);
     };
     if (path == "-") {
-      if (pool_.parallel()) {
-        auto ph = make_parallel_hasher();
-        read_stdin_into(ph);
-        return finish(ph);
-      }
       blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
-      read_stdin_into(h);
+      const auto t0 = std::chrono::steady_clock::now();
+      // POSIX only. The stream driver's contract is a read bounded by a
+      // deadline, which poll() expresses in one call. Windows anonymous
+      // pipes -- what a shell's `|` creates -- have no readiness
+      // notification at all: not a waitable handle, no overlapped I/O on
+      // a CreatePipe handle, and PeekNamedPipe polls rather than waits.
+      // The deadline therefore has to be enforced by sleeping, and a
+      // reader that stops draining stalls the producer behind a 4 KiB
+      // buffer: measured on clang-cl, 0.28 MiB/s against the sequential
+      // path's 58.7 on the same producer, with throughput pinned at one
+      // sleep tick per window whatever the deadline. Windows needs the
+      // deadline owned by a thread that is not the one draining, which
+      // is a different structure; until then it keeps the sequential
+      // path, which reads 3.7-6.2 GiB/s there.
+#if !defined(_WIN32)
+      if (pool_.parallel()) {
+        stream_ = blake3pp::update_stream(
+            h, blake3pp::standard_input(), pool_.scheduler(),
+            {.window_bytes = opts_.io.window_bytes, .trace = opts_.io.trace});
+        pipelined_ = true;
+      } else
+#endif
+      {
+        read_stdin_into(h);
+        pipelined_ = false;
+      }
+      wall_ns_ = std::chrono::duration<double, std::nano>(
+                     std::chrono::steady_clock::now() - t0)
+                     .count();
       return finish(h);
     }
     blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
@@ -214,6 +238,11 @@ class engine {
   // counters to read.
   [[nodiscard]] double wall_ns() const noexcept { return wall_ns_; }
   [[nodiscard]] bool pipelined() const noexcept { return pipelined_; }
+  // What the last stdin run did, for the geometry --diag reads its
+  // figures against. Zeroed unless a stream was hashed.
+  [[nodiscard]] const blake3pp::stream_report& stream() const noexcept {
+    return stream_;
+  }
 
   // Whether hash_many() would do anything the per-file loop does not.
   // Standard input has no file to hand to a context, and one file needs
@@ -338,24 +367,6 @@ class engine {
     return r;
   }
 
-  blake3pp::parallel_hasher<blake3pp::parallel_scheduler_t>
-  make_parallel_hasher() {
-    const blake3pp::parallel_hasher_options popts{.a = opts_.io.a};
-    // parallel_hasher takes its mode through a constructor, so the options'
-    // mode is read back rather than handed over.
-    switch (opts_.io.mode.which()) {
-      case blake3pp::hash_mode::kind::derive_key:
-        return blake3pp::parallel_hasher{pool_.scheduler(),
-                                         opts_.io.mode.context(), popts};
-      case blake3pp::hash_mode::kind::keyed:
-        return blake3pp::parallel_hasher{pool_.scheduler(),
-                                         opts_.io.mode.key(), popts};
-      case blake3pp::hash_mode::kind::plain:
-        break;
-    }
-    return blake3pp::parallel_hasher{pool_.scheduler(), popts};
-  }
-
   template <class Sink>
   static void read_stdin_into(Sink& sink) {
     std::vector<std::byte> buf(b3tool::stream_buffer_bytes);
@@ -371,6 +382,7 @@ class engine {
 
   options opts_;
   b3tool::compute_pool pool_;
+  blake3pp::stream_report stream_{};
   double wall_ns_ = 0.0;
   bool pipelined_ = false;
 };
@@ -568,7 +580,7 @@ int main(int argc, char** argv) {
   app.add_flag("--no-ioring", no_ioring, "Windows: read through the completion port instead of the I/O ring");
   auto* trace_opt = app.add_option("--trace", o.trace_path, "record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)");
   app.add_flag("--trace-agents", o.trace_agents, "with --trace: also record each pool agent's part of every window")->needs(trace_opt);
-  app.add_flag("--diag", o.diag, "report on stderr which side limited the run (the hash, the device, or the window arena between them); one FILE, on the pipelined path");
+  app.add_flag("--diag", o.diag, "report on stderr which side limited the run (the hash, the device, or the window arena between them); one FILE or '-', on the pipelined path");
   app.add_option("files", o.files, "files to hash (or checksum lists)");
 
   CLI11_PARSE(app, argc, argv);
@@ -590,20 +602,22 @@ int main(int argc, char** argv) {
   // --diag reads the counters of one run. A batch or a checksum list
   // would sum several runs into one record, so the combination is a
   // usage error.
-  if (o.diag && (o.check || o.files.size() != 1 || o.files.front() == "-")) {
+  if (o.diag && (o.check || o.files.size() > 1)) {
     println(stderr,
-            "blake3ppsum: --diag describes one file's run: give exactly one "
-            "FILE, and not '-' or --check");
+            "blake3ppsum: --diag describes one run: give at most one FILE, "
+            "and not --check");
     return b3tool::exit_usage;
   }
 
   int failures = 0;
   try {
-    // Trace storage is sized from the files up front: one record per
-    // window of each, with a spare for the short first window, and a size
-    // the filesystem will not give counts as two windows. The buffer
-    // outlives the engine, whose operations record into it; stdin and
-    // checksum lists are not traced.
+    // Trace storage is sized from the FILE arguments up front: one record
+    // per window of each, with a spare for the short first window, and a
+    // size the filesystem will not give counts as two windows. Standard
+    // input therefore gets two records, and with --check the list files
+    // are sized rather than the files they name; records past the storage
+    // are counted as dropped. The buffer outlives the engine, whose
+    // operations record into it.
     std::vector<blake3pp::window_record> window_records;
     std::vector<blake3pp::agent_record> agent_records;
     std::optional<blake3pp::trace_buffer> trace;
@@ -672,27 +686,45 @@ int main(int argc, char** argv) {
       }
     }
     if (o.diag) {
-      const std::size_t window =
-          blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
       const unsigned hw_threads = b3tool::default_threads();
-      std::error_code size_ec;
-      const std::uintmax_t size =
-          std::filesystem::file_size(o.files.front(), size_ec);
-      // The same plan the entry point made: the window count is what
-      // the arena figure is read against, and it comes out of the one
-      // budget rule.
-      const blake3pp::detail::pipeline_plan plan =
-          blake3pp::detail::plan_pipeline(
-              0, o.io.window_bytes, o.io.queue_depth, o.io.direct_io,
-              size_ec ? 0 : static_cast<std::uint64_t>(size),
-              blake3pp::detail::read_plan_budget_bytes(
-                  hw_threads, o.io.window_bytes));
+      std::size_t window = 0;
+      unsigned windows = 0;
+      if (o.files.front() == "-") {
+        // The stream's geometry as the run settled it. A stream fills one
+        // window at a time, so the device side of the diagnosis is the
+        // stream itself.
+        window = eng.stream().window_bytes;
+        windows = eng.stream().windows_planned;
+      } else {
+        // The plan update_file() made, from the same budget rule: the
+        // arena figure is read against its window count.
+        window = blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
+        std::error_code size_ec;
+        const std::uintmax_t size =
+            std::filesystem::file_size(o.files.front(), size_ec);
+        windows = blake3pp::detail::plan_pipeline(
+                      0, o.io.window_bytes, o.io.queue_depth, o.io.direct_io,
+                      size_ec ? 0 : static_cast<std::uint64_t>(size),
+                      blake3pp::detail::read_plan_budget_bytes(
+                          hw_threads, o.io.window_bytes))
+                      .windows;
+      }
       report_read_diagnosis(
           eng.pipelined()
               ? blake3pp::diagnose_read(trace->driver(), eng.wall_ns(), o.threads,
-                                      plan.windows, window)
+                                      windows, window)
               : blake3pp::diagnosis{},
           o.threads, hw_threads);
+      if (o.files.front() == "-" && eng.pipelined() &&
+          eng.stream().short_flushes > 0) {
+        // The one thing about a stream run the diagnosis cannot show:
+        // the producer left windows unfinished, and the deadline hashed
+        // what had arrived rather than waiting for the rest.
+        println(stderr,
+                "  stream         {} of {} windows ended early at the flush "
+                "deadline",
+                eng.stream().short_flushes, eng.stream().windows);
+      }
     }
     if (trace && !o.trace_path.empty()) {
       if (b3tool::write_chrome_trace(o.trace_path, *trace, "blake3ppsum",

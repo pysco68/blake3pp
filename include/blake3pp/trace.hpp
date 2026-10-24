@@ -2,10 +2,11 @@
 
 /// @file
 /// Where a file pipeline's time goes: one record per I/O window, and on
-/// request one per working agent per window. update_file() fills them
-/// when a trace_buffer is set in its options and never otherwise, at a
-/// cost of one branch per window; with a buffer set, a handful of clock
-/// reads per window and per agent.
+/// request one per working agent per window. update_file(),
+/// update_stream() and write_file() over a scheduler fill them when a
+/// trace_buffer is set in their options and never otherwise, at a cost of
+/// one branch per window; with a buffer set, a handful of clock reads per
+/// window and per agent.
 ///
 /// The library records; it never allocates, formats or writes. The
 /// caller provides the storage, reads it back after the call, and turns
@@ -46,6 +47,17 @@ struct window_record {
   /// Bit in flags: the short window that brings a hasher already
   /// part-way through a message back onto a window boundary.
   static constexpr std::uint32_t flag_short_first = 1u << 2;
+  /// Bit in flags: the window reached the tree as the decomposition of
+  /// a run of parts rather than as one subtree, because it is neither a
+  /// whole window of the grid nor one that starts where a node of that
+  /// size may start.
+  ///
+  /// Only a stream sets it (blake3ppsum's `-`): a producer that had not
+  /// filled a window when the flush deadline passed ends it early, and
+  /// the window after that one is short in turn, bringing the grid back
+  /// onto its boundary. Both carry this. How many windows the deadline
+  /// itself ended is stream_report::short_flushes.
+  static constexpr std::uint32_t flag_part_run = 1u << 3;
 
   /// Position of the window within this call, from 0.
   std::uint64_t index;
@@ -67,7 +79,7 @@ struct window_record {
   std::uint64_t agent_busy_ns;
   /// Bulk invocations that compressed at least one part.
   std::uint32_t agents_active;
-  /// flag_parallel, flag_last, flag_short_first.
+  /// flag_parallel, flag_last, flag_short_first, flag_part_run.
   std::uint32_t flags;
   /// Which window object -- buffer, part table and operation cell --
   /// carried this window. The pipeline reuses a fixed set of them, so
@@ -242,14 +254,15 @@ static_assert(std::is_trivially_copyable_v<window_record>);
 static_assert(std::is_trivially_copyable_v<agent_record>);
 static_assert(std::is_trivially_copyable_v<driver_stats>);
 
-/// Caller-owned storage for the records of one or more update_file()
-/// calls, handed in through file_io_options::trace.
+/// Caller-owned storage for the records of one or more pipeline runs,
+/// handed in through the options' `trace` field (file_io_options,
+/// stream_io_options, file_write_options).
 ///
 /// Records are claimed in order until the storage is full; every claim
 /// beyond that is counted as a drop. Window records are claimed by the
 /// thread driving the pipeline; agent records by any thread, through one
 /// atomic increment. A claimed record has exactly one writer, and nothing
-/// reads the records until the update_file() call has returned.
+/// reads the records until the call has returned.
 ///
 /// @code
 /// std::vector<blake3pp::window_record> windows(file_bytes / window_bytes + 1);

@@ -28,8 +28,10 @@ file(MAKE_DIRECTORY "${WORK}")
 # cases that are about thread counts pass their own.
 set(SMOKE_THREADS 4)
 
+# ERR_VAR names a variable to receive stderr, which is where --diag and
+# the usage errors report.
 function(run_sum out_var result_var)
-  cmake_parse_arguments(RS "" "STDIN" "ARGS" ${ARGN})
+  cmake_parse_arguments(RS "" "STDIN;ERR_VAR" "ARGS" ${ARGN})
   if(NOT "--threads" IN_LIST RS_ARGS)
     list(APPEND RS_ARGS --threads ${SMOKE_THREADS})
   endif()
@@ -46,6 +48,9 @@ function(run_sum out_var result_var)
     RESULT_VARIABLE res)
   set(${out_var} "${out}" PARENT_SCOPE)
   set(${result_var} "${res}" PARENT_SCOPE)
+  if(RS_ERR_VAR)
+    set(${RS_ERR_VAR} "${err}" PARENT_SCOPE)
+  endif()
 endfunction()
 
 if(CASE STREQUAL "version")
@@ -64,9 +69,9 @@ elseif(CASE STREQUAL "empty_stdin")
   endif()
 
 elseif(CASE STREQUAL "stdin_parallel")
-  # A multi-window stream on stdin hashes through parallel_hasher when a
-  # pool runs; it must agree with the sequential read and with the file
-  # pipeline over the same bytes.
+  # A multi-window stream on stdin runs the window pipeline over the
+  # stream driver when a pool exists; it must agree with the sequential
+  # read and with the file pipeline over the same bytes.
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed stdin --length 20000000
     --threads ${SMOKE_THREADS}
     OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
@@ -79,6 +84,35 @@ elseif(CASE STREQUAL "stdin_parallel")
   if(NOT r0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0 OR NOT res3 EQUAL 0
      OR NOT par_hex STREQUAL seq_hex OR NOT par_hex STREQUAL file_hex)
     message(FATAL_ERROR "stdin digests diverge: par=${par_hex} seq=${seq_hex} file=${file_hex}")
+  endif()
+
+elseif(CASE STREQUAL "stdin_diag")
+  # --diag over a stream: the stream driver supplies the counters, so a
+  # diagnosis is printed. The reading depends on the machine and is not
+  # asserted.
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed diag --length 20000000
+    --threads ${SMOKE_THREADS}
+    OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
+  run_sum(out res ERR_VAR err
+    ARGS --diag --window 1 --threads 4 - STDIN "${WORK}/stream")
+  if(NOT r0 EQUAL 0 OR NOT res EQUAL 0)
+    message(FATAL_ERROR "--diag over a stream failed (rc=${res}): ${err}")
+  endif()
+  if(NOT err MATCHES "diagnosis:" OR NOT err MATCHES "pool busy")
+    message(FATAL_ERROR "--diag over a stream reported nothing: ${err}")
+  endif()
+  if(err MATCHES "sequential path")
+    message(FATAL_ERROR "--diag over a stream found no driver: ${err}")
+  endif()
+  # Standard input with no FILE given is the same one run.
+  run_sum(out res3 ERR_VAR err3 ARGS --diag --window 1 STDIN "${WORK}/stream")
+  if(NOT res3 EQUAL 0 OR NOT err3 MATCHES "diagnosis:")
+    message(FATAL_ERROR "--diag over implicit standard input failed (rc=${res3}): ${err3}")
+  endif()
+  # One run only, still: a checksum list is several.
+  run_sum(out res2 ERR_VAR err2 ARGS --diag --check -)
+  if(res2 EQUAL 0)
+    message(FATAL_ERROR "--diag --check was accepted")
   endif()
 
 elseif(CASE STREQUAL "check_roundtrip")
