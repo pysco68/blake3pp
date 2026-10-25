@@ -316,6 +316,30 @@ template <stack_budget Budget>
           .streaming = true};
 }
 
+// Whether a stream hands a window over when the producer runs dry before
+// filling it. The stream's platform policy lives here; the driver takes
+// it as an option and has no platform fork, so both shapes are tested on
+// every platform.
+//
+// POSIX hands over. Without it a full 8 MiB window is eight 1 MiB writes
+// away before the pool sees any of it, where a half-window hand-over
+// starts the pool after four. Measured at 2 GiB from a page-cache file,
+// six counterbalanced rounds per cell, without the hand-over: `dd bs=1M`
+// into the stdin path is 12% slower on Linux (0 of 6 pairs won), and on
+// an M2 `cat`, `dd bs=1M` and `dd bs=64k` are 7.9-18.7% slower.
+//
+// Windows does not. Its pipe cannot be widened and holds about one
+// producer write, so the producer paces every window either way, and the
+// hand-over only splits each window into two fan-outs and two reducer
+// inserts.
+[[nodiscard]] constexpr bool stream_hands_over_early() noexcept {
+#if defined(_WIN32)
+  return false;
+#else
+  return true;
+#endif
+}
+
 }  // namespace detail
 
 /// A stream handle: a file descriptor where the platform has those, a
@@ -419,7 +443,8 @@ stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
   detail::pipe_driver drv(
       detail::stream_reader{handle},
       {.flush_quantum = detail::stream_flush_quantum<Budget>(window),
-       .widen_to = opts.stream_buffer_bytes});
+       .widen_to = opts.stream_buffer_bytes,
+       .early_hand_over = detail::stream_hands_over_early()});
   detail::pipe_driver::file file(drv);
   detail::run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched), plan,

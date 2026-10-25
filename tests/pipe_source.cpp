@@ -102,6 +102,7 @@ class scripted_reader {
     if (out.empty()) {
       return {};
     }
+    asks_.push_back(out.size());
     std::size_t moved = 0;
     for (;;) {
       while (next_ < script_.size() && script_[next_].bytes == 0 &&
@@ -142,10 +143,23 @@ class scripted_reader {
     }
   }
 
-  // The cap this reader reads under, which the driver asks within.
+  // The cap this reader reads under, which the driver asks within. It
+  // steps down after the first read when `shrink_bound_to` is set, which
+  // is how a test sees whether the driver asks for it per read or caches
+  // it for the window.
   [[nodiscard]] std::size_t read_bound() const noexcept {
+    if (shrink_bound_to != 0 && !asks_.empty()) {
+      return shrink_bound_to;
+    }
     return max_ == ~std::size_t{0} ? 0 : max_;
   }
+
+  // Every ask this reader was handed, in order.
+  [[nodiscard]] const std::vector<std::size_t>& asks() const noexcept {
+    return asks_;
+  }
+
+  std::size_t shrink_bound_to = 0;
 
   std::size_t widen(std::size_t) noexcept { return 0; }
 
@@ -159,6 +173,7 @@ class scripted_reader {
   std::size_t at_ = 0;
   std::size_t next_ = 0;
   std::uint64_t dries_ = 0;
+  std::vector<std::size_t> asks_;
 };
 
 using test_driver = detail::basic_pipe_driver<scripted_reader>;
@@ -180,21 +195,35 @@ struct outcome {
   std::vector<blake3pp::window_record> records;
 };
 
+// How a scripted run is shaped. `early_hand_over` is stated by every
+// case that depends on it instead of taken from the platform default, so
+// both shapes are exercised on every platform: update_stream() picks the
+// shipped default, and the driver only obeys.
+struct stream_run {
+  std::size_t window_bytes = 64 * 1024;
+  std::size_t max_per_call = ~std::size_t{0};
+  unsigned windows = 0;
+  bool early_hand_over = true;
+};
+
 // The shipped geometry over a scripted reader: plan_stream() and
 // stream_flush_quantum() are the same ones update_stream() uses, so what
 // runs here is the path blake3ppsum takes, with the arrivals scripted.
 outcome run_stream(std::span<const std::byte> bytes,
                    std::vector<scripted_reader::step> script,
-                   std::size_t window_bytes = 64 * 1024,
-                   std::size_t max_per_call = ~std::size_t{0},
-                   unsigned windows = 0) {
+                   const stream_run& how = {}) {
+  const std::size_t window_bytes = how.window_bytes;
+  const std::size_t max_per_call = how.max_per_call;
+  const unsigned windows = how.windows;
+  const bool early_hand_over = how.early_hand_over;
   auto sched = blake3pp::get_parallel_scheduler();
   blake3pp::hasher h;
   const detail::pipeline_plan plan =
       detail::plan_stream(h.count(), window_bytes, windows);
   test_driver drv(
       scripted_reader{bytes, std::move(script), max_per_call},
-      {.flush_quantum = detail::stream_flush_quantum<budget>(plan.window_bytes)});
+      {.flush_quantum = detail::stream_flush_quantum<budget>(plan.window_bytes),
+       .early_hand_over = early_hand_over});
   test_driver::file f(drv);
   outcome out;
   out.records.resize(bytes.size() / 1024 + 64);
@@ -442,24 +471,24 @@ TEST_CASE("an empty stream is the empty digest") {
 TEST_CASE("a stream delivered in dribbles still hashes correctly") {
   // The reader declares a 1 KiB read bound, so a window takes dozens of
   // calls and the driver asks within the bound every time: the fill
-  // loop's own arithmetic, with no hand-over in the picture. A bound is
-  // not a dry stream, which is the distinction the shipped Windows
-  // reader depends on -- every one of its reads is capped.
+  // loop's own arithmetic, with no hand-over in the picture. A read cut
+  // short by the bound is not a dry stream, which the Windows reader
+  // depends on once its ask bound has been learnt.
   const auto bytes = pattern(200 * 1024 + 511, 23);
-  const outcome o = run_stream(bytes, all_at_once(bytes.size()), 64 * 1024,
-                               1024);
+  const outcome o = run_stream(bytes, all_at_once(bytes.size()),
+                               {.max_per_call = 1024});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.short_flushes == 0);
 }
 
 TEST_CASE("the shipped read bound does not fragment a stream") {
-  // 1 MiB is the bound the Windows reader asks within, and a window is
-  // eight of them: a producer that keeps up must still fill whole
-  // windows, or the bound would be paying for hand-overs it was meant to
-  // avoid.
+  // A 1 MiB bound under an 8 MiB window, a bound the Windows reader's
+  // ask can settle on: a producer that keeps up must still fill whole
+  // windows.
   const auto bytes = pattern(3 * 1024 * 1024 + 7, 24);
   const outcome o = run_stream(bytes, all_at_once(bytes.size()),
-                               8 * 1024 * 1024, 1024 * 1024);
+                               {.window_bytes = 8 * 1024 * 1024,
+                                .max_per_call = 1024 * 1024});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == bytes.size());
   CHECK(o.short_flushes == 0);
@@ -487,9 +516,11 @@ TEST_CASE("an empty stream ends a window early and the short run still folds") {
   // Fails if the hand-over never happens, and fails with a wrong digest
   // if a short run is decomposed wrongly.
   const auto bytes = pattern(300 * 1024, 31);
-  const outcome o = run_stream(bytes, {{.bytes = 40 * 1024},
-                                       {.dry = true},
-                                       {.bytes = bytes.size() - 40 * 1024}});
+  const outcome o = run_stream(bytes,
+                               {{.bytes = 40 * 1024},
+                                {.dry = true},
+                                {.bytes = bytes.size() - 40 * 1024}},
+                               {.early_hand_over = true});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == bytes.size());
   CHECK(window_lengths(o) ==
@@ -516,7 +547,7 @@ TEST_CASE("a dribbling producer hands a window over before it is full") {
     script.push_back({.dry = true});
   }
   test_driver drv(scripted_reader{bytes, std::move(script)},
-                  {.flush_quantum = 16 * 1024});
+                  {.flush_quantum = 16 * 1024, .early_hand_over = true});
   test_driver::file f(drv);
   drv.reserve(4, 64 * 1024);
 
@@ -543,8 +574,8 @@ TEST_CASE("a stream that runs dry on every window still hashes correctly") {
     script.push_back({.bytes = std::min<std::size_t>(37 * 1024, len - at)});
     script.push_back({.dry = true});
   }
-  const outcome o = run_stream(bytes, std::move(script), 64 * 1024,
-                               ~std::size_t{0}, 4);
+  const outcome o = run_stream(bytes, std::move(script),
+                               {.windows = 4, .early_hand_over = true});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == len);
   CHECK(o.short_flushes > 4);
@@ -558,9 +589,11 @@ TEST_CASE("an empty stream with less than a flush in hand waits instead") {
   // proof that the producer is not waiting on this reader, so the fill
   // blocks and the window ends on its byte count after all.
   const auto bytes = pattern(130 * 1024, 33);
-  const outcome o = run_stream(bytes, {{.bytes = 20 * 1024},
-                                       {.dry = true},
-                                       {.bytes = bytes.size() - 20 * 1024}});
+  const outcome o = run_stream(bytes,
+                               {{.bytes = 20 * 1024},
+                                {.dry = true},
+                                {.bytes = bytes.size() - 20 * 1024}},
+                               {.early_hand_over = true});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.short_flushes == 0);
 }
@@ -576,9 +609,11 @@ TEST_CASE("a window that filled but whose read-ahead has not arrived") {
   // The one hand-over in the run is the stream's end, 32 KiB of the
   // 44 KiB remainder, as in the case above.
   const auto bytes = pattern(300 * 1024, 34);
-  const outcome o = run_stream(bytes, {{.bytes = 64 * 1024},
-                                       {.dry = true},
-                                       {.bytes = bytes.size() - 64 * 1024}});
+  const outcome o = run_stream(bytes,
+                               {{.bytes = 64 * 1024},
+                                {.dry = true},
+                                {.bytes = bytes.size() - 64 * 1024}},
+                               {.early_hand_over = true});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == bytes.size());
   CHECK(window_lengths(o) ==
@@ -593,7 +628,8 @@ TEST_CASE("a producer that stops mid-window and closes") {
   // so the end lands on a window the driver never asked the grid for.
   const auto bytes = pattern(40 * 1024, 35);
   const outcome o =
-      run_stream(bytes, {{.bytes = bytes.size()}, {.dry = true}});
+      run_stream(bytes, {{.bytes = bytes.size()}, {.dry = true}},
+                 {.early_hand_over = true});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == bytes.size());
   CHECK(o.short_flushes == 1);
@@ -606,17 +642,21 @@ TEST_CASE("half the window is the floor for handing one over") {
   // a reader faster than its producer from turning every buffer's worth
   // into a round trip through the pool.
   const auto bytes = pattern(600 * 1024, 37);
-  const outcome under = run_stream(bytes, {{.bytes = 80 * 1024},
-                                           {.dry = true},
-                                           {.bytes = bytes.size() - 80 * 1024}},
-                                   256 * 1024);
+  const outcome under = run_stream(bytes,
+                                   {{.bytes = 80 * 1024},
+                                    {.dry = true},
+                                    {.bytes = bytes.size() - 80 * 1024}},
+                                   {.window_bytes = 256 * 1024,
+                                    .early_hand_over = true});
   CHECK(under.digest == blake3pp::hash(bytes));
   CHECK(under.short_flushes == 0);
 
-  const outcome over = run_stream(bytes, {{.bytes = 200 * 1024},
-                                          {.dry = true},
-                                          {.bytes = bytes.size() - 200 * 1024}},
-                                  256 * 1024);
+  const outcome over = run_stream(bytes,
+                                  {{.bytes = 200 * 1024},
+                                   {.dry = true},
+                                   {.bytes = bytes.size() - 200 * 1024}},
+                                  {.window_bytes = 256 * 1024,
+                                   .early_hand_over = true});
   CHECK(over.digest == blake3pp::hash(bytes));
   CHECK(over.bytes == bytes.size());
   CHECK(over.short_flushes == 1);
@@ -635,12 +675,203 @@ TEST_CASE("a producer that runs dry after every write still hashes correctly") {
     script.push_back({.dry = true});
   }
   const outcome o =
-      run_stream(bytes, std::move(script), 64 * 1024, ~std::size_t{0}, 4);
+      run_stream(bytes, std::move(script),
+                 {.windows = 4, .early_hand_over = true});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == len);
   CHECK(o.short_flushes > 0);
   CHECK(part_run_records(o) >= o.short_flushes);
 }
+
+// ------------------------------------------------------------------
+// Two exits: with the early hand-over off, a window ends when it is full
+// or when the stream ends, and a dry stream is waited for. The same
+// scripts as above, so the difference is the option and nothing else.
+
+TEST_CASE("without the early hand-over a dry stream is waited for") {
+  // The script that hands over twice above. Off, the 40 KiB in hand
+  // waits for the rest, every window but the last is the whole 64 KiB,
+  // and the stream's 44 KiB remainder is the last window.
+  const auto bytes = pattern(300 * 1024, 31);
+  const outcome o = run_stream(bytes,
+                               {{.bytes = 40 * 1024},
+                                {.dry = true},
+                                {.bytes = bytes.size() - 40 * 1024}},
+                               {.early_hand_over = false});
+  CHECK(o.digest == blake3pp::hash(bytes));
+  CHECK(o.bytes == bytes.size());
+  CHECK(window_lengths(o) ==
+        std::vector<std::uint64_t>{64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024,
+                                   44 * 1024});
+  CHECK(o.short_flushes == 0);
+}
+
+TEST_CASE("without the early hand-over a dribbling producer fills the window") {
+  // The direct form of the case above it: 40 KiB arrives, the stream is
+  // empty, and the window still comes back whole.
+  const auto bytes = pattern(300 * 1024, 38);
+  std::vector<scripted_reader::step> script;
+  for (std::size_t at = 0; at < bytes.size(); at += 40 * 1024) {
+    script.push_back({.bytes = std::min<std::size_t>(40 * 1024,
+                                                     bytes.size() - at)});
+    script.push_back({.dry = true});
+  }
+  test_driver drv(scripted_reader{bytes, std::move(script)},
+                  {.flush_quantum = 16 * 1024, .early_hand_over = false});
+  test_driver::file f(drv);
+  drv.reserve(4, 64 * 1024);
+
+  const detail::window_storage w0 = drv.window_storage_for(f, 0, 0, 64 * 1024);
+  CHECK(w0.view.size() == 64 * 1024);
+  CHECK(std::ranges::equal(w0.view, std::span(bytes).first(64 * 1024)));
+  CHECK(f.size() == detail::streaming_size);
+  CHECK(drv.short_flushes() == 0);
+  CHECK(drv.windows_filled() == 1);
+}
+
+TEST_CASE("without the early hand-over a stream dry on every window hashes") {
+  // The scripts that keep the grid off its boundary when the hand-over is
+  // on. Off, the grid never leaves it: no window is a run of parts.
+  for (const std::size_t burst : {std::size_t{4096}, std::size_t{37 * 1024}}) {
+    CAPTURE(burst);
+    const std::size_t len = 1024 * 1024;
+    const auto bytes = pattern(len, 32);
+    std::vector<scripted_reader::step> script;
+    for (std::size_t at = 0; at < len; at += burst) {
+      script.push_back({.bytes = std::min(burst, len - at)});
+      script.push_back({.dry = true});
+    }
+    const outcome o = run_stream(bytes, std::move(script),
+                                 {.windows = 4, .early_hand_over = false});
+    CHECK(o.digest == blake3pp::hash(bytes));
+    CHECK(o.bytes == len);
+    CHECK(o.short_flushes == 0);
+    CHECK(o.windows == len / (64 * 1024));
+    CHECK(part_run_records(o) == 0);
+  }
+}
+
+TEST_CASE("the read bound is asked for before every read") {
+  // On Windows the bound is an observation that moves between reads, so
+  // the driver must not hold the one it had at the start of the window.
+  // The reader answers 32 KiB before its first read and 8 KiB after it.
+  const auto bytes = pattern(200 * 1024, 39);
+  scripted_reader reader{bytes, all_at_once(bytes.size()), 32 * 1024};
+  reader.shrink_bound_to = 8 * 1024;
+  test_driver drv(std::move(reader), {.flush_quantum = 16 * 1024});
+  test_driver::file f(drv);
+  drv.reserve(4, 64 * 1024);
+
+  const detail::window_storage w0 = drv.window_storage_for(f, 0, 0, 64 * 1024);
+  CHECK(w0.view.size() == 64 * 1024);
+  CHECK(std::ranges::equal(w0.view, std::span(bytes).first(64 * 1024)));
+  const std::vector<std::size_t>& asks = drv.reader().asks();
+  REQUIRE(asks.size() >= 2);
+  CHECK(asks[0] == 32 * 1024);
+  CHECK(std::all_of(asks.begin() + 1, asks.end(),
+                    [](std::size_t a) { return a <= 8 * 1024; }));
+  CHECK(drv.short_flushes() == 0);
+}
+
+#if defined(_WIN32)
+TEST_CASE("the Windows ask bound follows what the reads deliver") {
+  using bound_t = detail::read_ask_bound;
+  constexpr std::size_t K = 1024;
+  constexpr std::size_t M = 1024 * 1024;
+  constexpr unsigned n = bound_t::window_reads;
+
+  SUBCASE("a run starts unbounded and a short read measures the queue") {
+    bound_t b;
+    CHECK(b.bound() == 0);
+    b.note(8 * M, 256 * K);
+    CHECK(b.bound() == 256 * K);
+  }
+  SUBCASE("a producer that fills the whole ask is never bounded") {
+    bound_t b;
+    for (unsigned i = 0; i < 4 * n; ++i) {
+      b.note(8 * M, 8 * M);
+    }
+    CHECK(b.bound() == 0);
+  }
+  SUBCASE("a window's remainder capping the ask teaches nothing") {
+    bound_t b;
+    b.note(8 * M, 1 * M);
+    for (unsigned i = 0; i < 4 * n; ++i) {
+      b.note(4 * K, 4 * K);  // asked less than the bound, came back whole
+    }
+    CHECK(b.bound() == 1 * M);
+  }
+  SUBCASE("growth is probed for after a full window of capped reads") {
+    bound_t b;
+    b.note(8 * M, 256 * K);
+    for (unsigned i = 0; i + 1 < n; ++i) {
+      b.note(256 * K, 256 * K);
+    }
+    CHECK(b.bound() == 256 * K);
+    b.note(256 * K, 256 * K);
+    CHECK(b.bound() == 512 * K);
+    // The probe over-asks once and the short read brings it back.
+    b.note(512 * K, 256 * K);
+    CHECK(b.bound() == 256 * K);
+  }
+  SUBCASE("a producer that speeds up is followed by doubling") {
+    bound_t b;
+    b.note(8 * M, 8 * K);
+    unsigned reads = 0;
+    while (b.bound() < 1 * M && reads < 64 * n) {
+      b.note(b.bound(), b.bound());  // the queue fills every ask
+      ++reads;
+    }
+    CHECK(b.bound() >= 1 * M);
+    CHECK(reads == 7 * n);  // 8 KiB to 1 MiB is seven doublings
+  }
+  SUBCASE("a producer that slows down is followed within the window") {
+    bound_t b;
+    b.note(8 * M, 1 * M);
+    for (unsigned i = 0; i + 1 < n; ++i) {
+      b.note(1 * M, 8 * K);
+      CHECK(b.bound() == 1 * M);  // still remembers the large read
+    }
+    // The large read is still one of the last `n` short ones until a
+    // full window of small ones has replaced it.
+    b.note(1 * M, 8 * K);
+    CHECK(b.bound() == 8 * K);
+  }
+  SUBCASE("an observation rounds up to a power of two") {
+    bound_t b;
+    b.note(8 * M, 6138);  // what a 4 KiB producer's reads average
+    CHECK(b.bound() == 8 * K);
+  }
+  SUBCASE("a bound a byte short of the producer's write does not collapse") {
+    // The one-byte read-ahead shifts the reads off the write boundaries.
+    // A rule that learned only from short reads saw a full read of
+    // W - 1 and a short read of 1 for every write, and fell to one byte.
+    constexpr std::size_t W = 1 * M;
+    bound_t b;
+    b.note(8 * M, W - 1);
+    std::size_t pending = 1;  // the write's byte the read-ahead left
+    for (int i = 0; i < 400; ++i) {
+      const std::size_t ask = b.bound();
+      REQUIRE(ask != 0);
+      const std::size_t got = std::min(ask, pending);
+      pending -= got;
+      if (pending == 0) {
+        pending = W;  // the producer's next write
+      }
+      b.note(ask, got);
+      CHECK(b.bound() >= W);
+    }
+  }
+  SUBCASE("one short read at a window boundary does not collapse it") {
+    bound_t b;
+    for (unsigned i = 0; i < n; ++i) {
+      b.note(2 * M, 1 * M);
+    }
+    b.note(1 * M, 3 * K);  // the remainder's short read
+    CHECK(b.bound() == 1 * M);
+  }
+}
+#endif
 
 // ------------------------------------------------------------------
 // The real reader, end to end.

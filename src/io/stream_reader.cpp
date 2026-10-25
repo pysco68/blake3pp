@@ -67,6 +67,10 @@ native_stream standard_input() noexcept { return STDIN_FILENO; }
 
 #if defined(_WIN32)
 
+std::size_t stream_reader::read_bound() const noexcept {
+  return ask_bound_.bound();
+}
+
 // A blocking read is all this needs, and it is safe to make because an
 // anonymous pipe is a byte-mode pipe: the read returns with whatever
 // arrived rather than waiting for the count it asked for.
@@ -76,7 +80,8 @@ native_stream standard_input() noexcept { return STDIN_FILENO; }
 // instead of taking its whole write: measured at 4.1 to 4.8 syscalls per
 // producer write, against 1.0 here, with one empty-pipe observation per
 // write. The ask is bounded by stream_reader::read_bound() instead,
-// which is a bound on the range and not on the queue.
+// which follows what earlier reads delivered (read_ask_bound) and is a
+// bound on the range, not a reading of the queue.
 //
 // Nor does it watch the stream before the read, which is what the POSIX
 // branch below does and what stream_watch exists for. On Windows the
@@ -128,6 +133,8 @@ stream_reader::result stream_reader::read_some(std::span<std::byte> out) {
   if (moved == 0) {
     return {.bytes = 0, .eof = true};
   }
+  ask_bound_.note(static_cast<std::size_t>(want),
+                  static_cast<std::size_t>(moved));
   return {.bytes = static_cast<std::size_t>(moved), .eof = false};
 }
 
@@ -211,6 +218,10 @@ struct posix_watch_platform {
 };
 
 }  // namespace
+
+// Nothing to bound: a read() copies min(asked, queued) and leaves the
+// rest of the range untouched, so an ask costs only what it returns.
+std::size_t stream_reader::read_bound() const noexcept { return 0; }
 
 void stream_reader::wait_readable() {
 #if defined(__APPLE__) || defined(__EMSCRIPTEN__)

@@ -79,10 +79,13 @@
 // src/io/stream_reader.cpp.
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <ranges>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -221,6 +224,80 @@ class stream_watch {
   counters stats_{};
 };
 
+#if defined(_WIN32)
+// The bound on a read's ask, learned from what the reads return.
+//
+// A Windows ReadFile is priced by the range it asks for (see
+// stream_reader::read_bound()), so asking for range a read cannot fill
+// costs time, and asking for too little costs a whole further ReadFile.
+// The bound errs high: it is the largest of the last eight observations
+// rounded up to a power of two, and it falls only once eight reads in a
+// row have shown a smaller queue.
+//
+// An observation is what a read returned, unless the window's remainder
+// capped the ask and the read came back whole: that read says nothing
+// about the queue. Reads the bound capped are observations too. The
+// rounding keeps the bound from collapsing. The one-byte read-ahead moves
+// the reads off the producer's write boundaries, so the bound can settle
+// a byte short of a write; each write then takes a full read and a
+// one-byte one, and a rule that learned only from those reads falls to a
+// single byte.
+//
+// Eight is the window. Every window boundary produces a read the
+// remainder caps, so the bound has to survive that; eight also bounds how
+// long a producer that slows down leaves the bound too high.
+//
+// Growth has to be probed for, because the ask caps what a read can
+// return and an observation can therefore never exceed the bound. Eight
+// reads in a row that the bound capped and that came back whole double
+// it: one over-asked read in nine, and the only way a producer that
+// speeds up is noticed.
+//
+// A run starts unbounded, so the first read asks for the whole window
+// remainder and measures the queue from what comes back: one over-asked
+// read per stream. A producer that fills every ask leaves the bound at
+// zero, and the stream is never bounded.
+class read_ask_bound {
+ public:
+  static constexpr unsigned window_reads = 8;
+
+  // Zero means unbounded: ask for the whole window remainder.
+  [[nodiscard]] std::size_t bound() const noexcept { return bound_; }
+
+  // One read, by what it asked for and what it returned.
+  void note(std::size_t asked, std::size_t got) noexcept {
+    const bool whole = got == asked;
+    if (whole && (bound_ == 0 || asked < bound_)) {
+      // Unbounded and filled, or capped by the window's remainder: the
+      // queue held at least the ask, and that is all this read shows.
+      return;
+    }
+    recent_[at_ % window_reads] = got;
+    ++at_;
+    const std::size_t seen = *std::ranges::max_element(recent_);
+    bound_ = seen > max_bound ? max_bound : std::bit_ceil(seen);
+    if (!whole) {
+      capped_ = 0;
+      return;
+    }
+    if (++capped_ < window_reads) {
+      return;
+    }
+    capped_ = 0;
+    bound_ = bound_ > max_bound / 2 ? max_bound : bound_ * 2;
+  }
+
+ private:
+  // Large enough never to bind a real window; small enough for bit_ceil.
+  static constexpr std::size_t max_bound = std::size_t{1} << 40;
+
+  std::array<std::size_t, window_reads> recent_{};
+  unsigned at_ = 0;
+  unsigned capped_ = 0;
+  std::size_t bound_ = 0;
+};
+#endif
+
 // The platform's read, behind a compiled seam.
 //
 // One call reads what is already there rather than what was asked for:
@@ -260,45 +337,28 @@ class stream_reader {
   [[nodiscard]] const stream_watch& watch() const noexcept { return watch_; }
 
   // The most one read may usefully be asked for, or zero where asking
-  // for the whole remainder costs nothing.
+  // for the whole remainder costs nothing. Asked before every read,
+  // because on Windows it is an observation and not a constant.
   //
   // A Windows ReadFile is priced by the range it asks for rather than by
-  // the bytes it returns, so an ask of a whole 8 MiB window pays for 8
-  // MiB of range in order to receive a pipe's worth. A pipe's buffer is
-  // also the most one read of it can ever return, so an ask past it buys
-  // nothing: the bound is a Windows anonymous pipe's real capacity, 1
-  // MiB. GetNamedPipeInfo is not asked for it -- it answers 4096 on a
-  // handle whose buffer is 1 MiB.
-  //
-  // Measured on this pipe, 2 GiB through the stdin path, against the
-  // bound in MiB/s at six producer write sizes (4 KiB to 4 MiB): 256 KiB
-  // gives 1026 2507 5357 8870 7186 7468 and 1 MiB gives 973 2260 5010
-  // 7497 10708 10587. A smaller bound is up to 15% better where the
-  // writes are small and a third slower where they are large, because
-  // the ask is then a quarter of what is queued.
+  // the bytes it returns: in a sweep of fixed bounds, a 256 KiB bound beat
+  // a 1 MiB one at small producer writes and lost at large ones.
+  // read_ask_bound above is the rule that keeps the ask near what the
+  // pipe delivers.
   //
   // A POSIX read() copies min(asked, queued) and never touches the rest
   // of the range, so there is no range to pay for and a bound would only
   // cut one call into several. It would also change what the loop hands
   // over: an ask the queue can fill comes back whole, which sends the
-  // loop round again instead of flushing, so whole windows go out where
-  // half ones did. Measured on Linux, 2 GiB through a 1 MiB pipe at
-  // 8 MiB windows, a 1 MiB bound against no bound over six interleaved
-  // runs each: level at 512 B and 4 KiB producer writes, and 7% down
-  // where the producer keeps up, at 256 full windows against 512 of
-  // which half were flushed short.
-  [[nodiscard]] static constexpr std::size_t read_bound() noexcept {
-#if defined(_WIN32)
-    return 1024 * 1024;
-#else
-    return 0;
-#endif
-  }
+  // loop round again instead of flushing. Measured on Linux, a 1 MiB bound
+  // was 7% slower than none where the producer keeps up. POSIX therefore
+  // answers zero.
+  [[nodiscard]] std::size_t read_bound() const noexcept;
 
   // Asks the OS for a larger stream buffer, which on Linux is what
   // keeps an 8 MiB window from being 128 hand-offs through a 64 KiB
   // pipe. Best effort: the answer is the buffer in force afterwards, or
-  // zero where the platform has no such knob.
+  // zero where the platform has no such knob or the handle is not a pipe.
   std::size_t widen(std::size_t bytes) noexcept;
 
  private:
@@ -308,6 +368,9 @@ class stream_reader {
 
   native_stream h_;
   stream_watch watch_;
+#if defined(_WIN32)
+  read_ask_bound ask_bound_;
+#endif
 };
 
 // This process's standard input as a stream handle.
@@ -323,6 +386,15 @@ struct pipe_driver_options {
   std::size_t flush_quantum = 0;
   // Ask the OS for this much stream buffer. Zero leaves it alone.
   std::size_t widen_to = 0;
+  // Hand a window over when the producer runs dry before filling it,
+  // instead of waiting for the rest of it. Off leaves fill() two exits
+  // rather than three: a window ends when it is full, or when the stream
+  // does.
+  //
+  // On by default here. The shipped value is per platform and is set in
+  // parallel_io.hpp (stream_hands_over_early); the driver has no platform
+  // fork.
+  bool early_hand_over = true;
 };
 
 // A stream as a file_driver, over any reader with stream_reader's shape.
@@ -337,7 +409,8 @@ class basic_pipe_driver {
                              const pipe_driver_options& opts = {})
       : reader_(std::move(reader)),
         quantum_(opts.flush_quantum == 0 ? chunk_size : opts.flush_quantum),
-        widen_to_(opts.widen_to) {
+        widen_to_(opts.widen_to),
+        early_hand_over_(opts.early_hand_over) {
     require(quantum_ % chunk_size == 0,
             "pipe_driver: a flush quantum that is not a multiple of the "
             "chunk size");
@@ -374,7 +447,12 @@ class basic_pipe_driver {
     windows_ = windows;
     window_bytes_ = window_bytes;
     carry_.resize(2 * quantum_);
-    least_ = std::max(2 * quantum_, window_bytes / 2 / quantum_ * quantum_);
+    // Two exits are expressed as a floor no window can reach, so the
+    // fill loop needs no branch of its own for them.
+    least_ = early_hand_over_
+                 ? std::max(2 * quantum_,
+                            window_bytes / 2 / quantum_ * quantum_)
+                 : ~std::size_t{0};
     if (widen_to_ != 0) {
       widened_ = reader_.widen(widen_to_);
     }
@@ -461,12 +539,14 @@ class basic_pipe_driver {
       return 0;
     }
     std::size_t got = take_carry(out);
-    const std::size_t bound = reader_.read_bound();
     bool proved = false;  // a byte past the window is in hand
     while (!eof_ && !proved) {
       const std::span<std::byte> space =
           got < n ? out.subspan(got)
                   : std::span<std::byte>(&probe_, 1);
+      // Asked per read rather than once per window: on Windows the bound
+      // is what the reads have shown the pipe delivers, so it moves.
+      const std::size_t bound = reader_.read_bound();
       const std::size_t ask =
           bound == 0 ? space.size() : std::min(space.size(), bound);
       const typename Reader::result r = reader_.read_some(space.first(ask));
@@ -594,6 +674,7 @@ class basic_pipe_driver {
   std::size_t least_ = 0;
   std::size_t widen_to_ = 0;
   std::size_t widened_ = 0;
+  bool early_hand_over_ = true;
   unsigned windows_ = 0;
   std::size_t window_bytes_ = 0;
   std::size_t carry_len_ = 0;
