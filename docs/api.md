@@ -291,22 +291,19 @@ auto d = h.finalize();
 The reader fills one window on the calling thread while the pool hashes
 the ones before it. A producer that keeps up fills every window, and the
 run is bounded by the hash or by the stream itself. A producer that does
-not has its windows ended early at a flush deadline — one window at
-512 MiB/s, so a producer at or above that never reaches it — and what
-arrived is hashed as a run of subtrees rather than waited for. The
-`stream_report` the call returns says how many windows ended that way.
+not has its windows ended when the stream runs dry with at least half a
+window in hand, and what arrived is hashed as a run of subtrees rather
+than waited for. The `stream_report` the call returns says how many
+windows ended that way.
 
-**On Windows this call is correct but slow, and `blake3ppsum -` does not
-use it.** The deadline needs a read that waits with a timeout, which
-`poll()` is; a Windows anonymous pipe -- what a shell's `|` creates -- has
-no readiness notification to wait on, so the deadline is enforced by
-sleeping, and a reader that stops draining stalls the producer behind a
-4 KiB pipe buffer. Measured with clang-cl: 0.28 MiB/s against 58.7 for the
-sequential path on the same producer, with throughput pinned at one sleep
-tick per window whatever the deadline is set to. Windows needs the
-deadline owned by a thread other than the one draining; until then the
-tool keeps the sequential path there. See
-tasks/blake3pp-stream-reader-no-clock.md.
+The hand-over condition is an observable rather than a clock: the fill
+blocks for the first bytes, drains what is queued without blocking, and
+gives the window up on an empty stream. An empty stream is proof that the
+producer is not waiting on the reader, so blocking for its next write is
+free, and the producer is never left blocked on a pipe nobody is
+draining. Half a window is the floor because a hand-over costs a round
+trip through the pool and what it buys is overlap, so a short prefix is
+not worth one. The behaviour is the same on every platform.
 
 The hasher must sit on a window boundary, which every fresh one does; a
 hasher part-way through a window cannot be brought onto the grid from a

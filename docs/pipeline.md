@@ -121,6 +121,10 @@ are usually not:
   driver the moment the read lands, which is what puts the hasher on the
   boundary the nodes are numbered from. What follows is whole parts aligned
   in the message's own chunk space, like any other window's.
+- **A stream's early windows.** `update_stream()` may end a window when the
+  producer runs dry, at a whole number of parts, and the window after it
+  asks only for the distance back to the grid. Both are runs of parts.
+  Unlike the other two, any number of them can be in flight.
 
 An edge window with at least two whole parts therefore runs the same chain,
 but what comes back is not one chaining value: it is the canonical

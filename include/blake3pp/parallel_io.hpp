@@ -22,7 +22,6 @@
 /// input through the same pipeline.
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -339,11 +338,6 @@ struct stream_io_options {
   /// reduce. Zero takes the default; a stream fills one at a time, so
   /// there is nothing here for a device's queue to buy.
   unsigned windows = 0;
-  /// How long a window may sit unfinished before what has arrived is
-  /// hashed anyway. Zero derives it from the window size and
-  /// detail::pipe_fast_producer_bytes_per_s, which is the figure that
-  /// decides which producers are "behind": one window at that rate.
-  std::chrono::nanoseconds flush_after{0};
   /// Ask the OS for this much stream buffer (Linux: F_SETPIPE_SZ). Zero
   /// leaves it alone. A larger buffer is what keeps an 8 MiB window from
   /// being a hundred hand-offs through a 64 KiB pipe; the request is
@@ -361,9 +355,9 @@ struct stream_report {
   std::uint64_t bytes = 0;
   /// Windows the run hashed.
   std::uint64_t windows = 0;
-  /// Of those, the ones the flush deadline ended early because the
-  /// producer had not filled them. Zero is a producer that kept up with
-  /// the grid; anything else says the run was waiting on the producer.
+  /// Of those, the ones that ended early because the producer ran dry
+  /// before filling them. Zero is a producer that kept up with the grid;
+  /// anything else says the run was waiting on the producer.
   std::uint64_t short_flushes = 0;
   /// The window the run settled on, and how many it allocated: the
   /// figures diagnose_read() is read against.
@@ -388,9 +382,11 @@ struct stream_report {
 /// ones before it, which is the overlap a push API cannot have. A
 /// producer that keeps up fills every window and the run is bounded by
 /// the hash or by the stream itself; a producer that does not has its
-/// windows ended early at the flush deadline, so the pool is fed rather
-/// than stalled and the wait is bounded. Either way `--diag`'s device
-/// side is the stream: there is no other device in the picture.
+/// windows ended when the stream runs dry with half of one in hand, so
+/// the pool is fed rather
+/// than stalled and the producer is never left blocked on a full pipe.
+/// Either way `--diag`'s device side is the stream: there is no other
+/// device in the picture.
 ///
 /// @pre The hasher sits on a window boundary: count() is a multiple of
 ///      the rounded window size, which every fresh hasher is. A hasher
@@ -403,7 +399,7 @@ struct stream_report {
 /// @param h       The hasher to stream into.
 /// @param handle  The stream to read; standard_input() for stdin.
 /// @param sched   Where the subtree reductions run.
-/// @param opts    The geometry and the flush deadline.
+/// @param opts    The geometry.
 /// @return What the run did; see stream_report.
 /// @throws std::system_error on a read failure, std::logic_error for a
 ///         hasher off the window grid, and whatever the execution provider
@@ -418,8 +414,7 @@ stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
   const std::size_t window = plan.window_bytes;
   detail::pipe_driver drv(
       detail::stream_reader{handle},
-      {.flush_after = opts.flush_after,
-       .flush_quantum = detail::stream_flush_quantum<Budget>(window),
+      {.flush_quantum = detail::stream_flush_quantum<Budget>(window),
        .widen_to = opts.stream_buffer_bytes});
   detail::pipe_driver::file file(drv);
   detail::run_window_pipeline<Budget>(
@@ -429,7 +424,7 @@ stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
        .stop_token = detail::blocking_stop_token()});
   return {.bytes = drv.bytes_read(),
           .windows = drv.windows_filled(),
-          .short_flushes = drv.timer_flushes(),
+          .short_flushes = drv.short_flushes(),
           .window_bytes = window,
           .windows_planned = plan.windows,
           .stream_buffer_bytes = drv.widened_to()};
@@ -445,7 +440,7 @@ stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
 /// @param handle  The stream to read.
 /// @param sched   Where the subtree reductions run.
 /// @param ec      Cleared on success; the error otherwise.
-/// @param opts    The geometry and the flush deadline.
+/// @param opts    The geometry.
 /// @return What the run did, or a default report when ec is set.
 template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>

@@ -292,8 +292,8 @@ diagnosis: device-limited (write side)
 selects the pipelined path. A run too short to turn its queue over four
 times reports that instead of a reading. On `-` the device is the stream:
 a producer that cannot keep up reads as device-limited, and the line
-below the diagnosis says how many windows the flush deadline ended
-early.
+below the diagnosis says how many windows ended early because the
+producer ran dry.
 
 The captures above are from a 16-thread Zen 5 machine under WSL2, on its
 virtual disk, through the page cache where `--no-direct` appears.

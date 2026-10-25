@@ -175,28 +175,12 @@ class engine {
     if (path == "-") {
       blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
       const auto t0 = std::chrono::steady_clock::now();
-      // POSIX only. The stream driver's contract is a read bounded by a
-      // deadline, which poll() expresses in one call. Windows anonymous
-      // pipes -- what a shell's `|` creates -- have no readiness
-      // notification at all: not a waitable handle, no overlapped I/O on
-      // a CreatePipe handle, and PeekNamedPipe polls rather than waits.
-      // The deadline therefore has to be enforced by sleeping, and a
-      // reader that stops draining stalls the producer behind a 4 KiB
-      // buffer: measured on clang-cl, 0.28 MiB/s against the sequential
-      // path's 58.7 on the same producer, with throughput pinned at one
-      // sleep tick per window whatever the deadline. Windows needs the
-      // deadline owned by a thread that is not the one draining, which
-      // is a different structure; until then it keeps the sequential
-      // path, which reads 3.7-6.2 GiB/s there.
-#if !defined(_WIN32)
       if (pool_.parallel()) {
         stream_ = blake3pp::update_stream(
             h, blake3pp::standard_input(), pool_.scheduler(),
             {.window_bytes = opts_.io.window_bytes, .trace = opts_.io.trace});
         pipelined_ = true;
-      } else
-#endif
-      {
+      } else {
         read_stdin_into(h);
         pipelined_ = false;
       }
@@ -718,11 +702,11 @@ int main(int argc, char** argv) {
       if (o.files.front() == "-" && eng.pipelined() &&
           eng.stream().short_flushes > 0) {
         // The one thing about a stream run the diagnosis cannot show:
-        // the producer left windows unfinished, and the deadline hashed
-        // what had arrived rather than waiting for the rest.
+        // the producer left windows unfinished, and what had arrived was
+        // hashed rather than waited for.
         println(stderr,
-                "  stream         {} of {} windows ended early at the flush "
-                "deadline",
+                "  stream         {} of {} windows ended early: the producer "
+                "ran dry",
                 eng.stream().short_flushes, eng.stream().windows);
       }
     }

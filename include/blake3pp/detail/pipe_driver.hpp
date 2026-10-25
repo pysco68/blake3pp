@@ -25,9 +25,16 @@
 //
 //   * the window's byte count -- the normal case, and the only one a
 //     producer that keeps up ever reaches;
-//   * the flush deadline -- a producer that is behind must not stall
-//     the pool or grow its latency without bound;
+//   * the stream running dry with at least half a window in hand -- a
+//     producer that is behind must not stall the pool;
 //   * end of stream -- the last window, of whatever length.
+//
+// The hand-over condition is an observable and not a clock. The fill
+// blocks for the first bytes, drains what is queued without blocking,
+// and gives the window up when the stream is empty: an empty stream is
+// proof that the producer is not waiting on this reader, so blocking for
+// its next write costs nothing, while a reader that stopped draining a
+// FULL one would stall it.
 //
 // A short flush is a multiple of the flush quantum (one part of the
 // window grid), which is what keeps every extent a run of whole,
@@ -48,7 +55,6 @@
 // src/io/stream_reader.cpp.
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -72,30 +78,6 @@ using native_stream = void*;
 using native_stream = int;
 #endif
 
-// The slowest producer this calls fast, in bytes per second.
-//
-// The flush deadline is one window at this rate, so a producer at or
-// above it fills every window before the timer can fire and pays
-// nothing for the timer's existence. The figure is a floor, not a
-// tuning constant: 512 MiB/s is above a SATA SSD's sequential read and
-// far above what a decompressor, a network transfer or a generator
-// script delivers, while a producer below it is already an order of
-// magnitude behind the hash -- the Z13 streams 6.9 GiB/s through the
-// slowest path measured -- so fragmenting its windows costs nothing
-// real and buys a bounded wait.
-inline constexpr std::uint64_t pipe_fast_producer_bytes_per_s = 512u << 20;
-
-// The flush deadline for a window of window_bytes: how long a producer
-// may leave a window unfinished before what has arrived is hashed
-// anyway.
-[[nodiscard]] constexpr std::chrono::nanoseconds pipe_flush_after(
-    std::size_t window_bytes) noexcept {
-  return std::chrono::nanoseconds{
-      static_cast<std::int64_t>(static_cast<std::uint64_t>(window_bytes) *
-                                1'000'000'000u /
-                                pipe_fast_producer_bytes_per_s)};
-}
-
 // A stream's size while it is still arriving: what file::size() reports
 // until the end has been seen, and what the scope reads as "no end
 // yet". It is BLAKE3's own message ceiling, so the geometry arithmetic
@@ -105,28 +87,26 @@ inline constexpr std::uint64_t streaming_size = ~std::uint64_t{0};
 // The platform's read, behind a compiled seam.
 //
 // One call reads what is already there rather than what was asked for:
-// a stream's bytes arrive in the producer's own units, and a reader
-// that insisted on a full window could not honour a deadline.
+// a stream's bytes arrive in the producer's own units, and a reader that
+// insisted on a full window could not hand one over early.
 class stream_reader {
  public:
   struct result {
     std::size_t bytes = 0;
     // The producer closed its end: nothing further will arrive.
     bool eof = false;
-    // The deadline passed with nothing more available. Not an error,
-    // and `bytes` may still be non-zero.
-    bool timed_out = false;
   };
 
   explicit stream_reader(native_stream handle) noexcept : h_(handle) {}
 
   // Reads into `out`, returning as soon as anything arrives.
   //
-  // `deadline_ns` is a steady_clock point in nanoseconds, or
-  // no_deadline to wait as long as it takes.
+  // `blocking` waits for the first byte, which is a wait on the
+  // producer's own write. Without it the call takes only what is already
+  // queued and reports an empty stream as zero bytes with `eof` unset,
+  // which is the driver's signal to hand the window over.
   // @throws std::system_error on a read failure.
-  [[nodiscard]] result read_some(std::span<std::byte> out,
-                                 std::int64_t deadline_ns);
+  [[nodiscard]] result read_some(std::span<std::byte> out, bool blocking);
 
   // Asks the OS for a larger stream buffer, which on Linux is what
   // keeps an 8 MiB window from being 128 hand-offs through a 64 KiB
@@ -134,28 +114,28 @@ class stream_reader {
   // zero where the platform has no such knob.
   std::size_t widen(std::size_t bytes) noexcept;
 
-  static constexpr std::int64_t no_deadline = -1;
-
  private:
   native_stream h_;
+#if defined(_WIN32)
+  // The most one read may be asked for, or zero until the handle has
+  // been asked and for a handle with no answer.
+  //
+  // A Windows read locks the whole requested range of the caller's
+  // buffer before it transfers anything, so asking for a window's worth
+  // in order to receive a pipe's worth is paid for in the lock rather
+  // than in the bytes: measured on an 8 MiB window through a 4 KiB
+  // pipe, 439 MiB/s against 799 at a 1 MiB window and 150 at 32 MiB.
+  // A pipe's own buffer is the most one read of it can return.
+  std::size_t read_bound_ = 0;
+  bool bound_known_ = false;
+#endif
 };
 
 // This process's standard input as a stream handle.
 [[nodiscard]] native_stream standard_input() noexcept;
 
-// Now, as the deadlines are expressed.
-[[nodiscard]] inline std::int64_t stream_now_ns() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
 // What the driver is allowed to do with a stream.
 struct pipe_driver_options {
-  // How long a window may sit unfinished before what has arrived is
-  // flushed short. Zero takes pipe_flush_after(window_bytes), which is
-  // resolved in reserve() once the window size is known.
-  std::chrono::nanoseconds flush_after{0};
   // The alignment every short flush is rounded down to, in bytes: one
   // part of the window grid, which the caller computes from its stack
   // budget (part_chunks<Budget>). Zero takes one chunk, which is legal
@@ -169,14 +149,14 @@ struct pipe_driver_options {
 // A stream as a file_driver, over any reader with stream_reader's shape.
 //
 // The reader is a template parameter so the tests can script arrivals,
-// deadlines and the end of the stream without a second process: the
+// an empty stream and the end of one without a second process: the
 // shipped driver is the alias below it.
 template <class Reader>
 class basic_pipe_driver {
  public:
   explicit basic_pipe_driver(Reader reader,
                              const pipe_driver_options& opts = {})
-      : reader_(std::move(reader)), flush_after_(opts.flush_after),
+      : reader_(std::move(reader)),
         quantum_(opts.flush_quantum == 0 ? chunk_size : opts.flush_quantum),
         widen_to_(opts.widen_to) {
     require(quantum_ % chunk_size == 0,
@@ -215,9 +195,7 @@ class basic_pipe_driver {
     windows_ = windows;
     window_bytes_ = window_bytes;
     carry_.resize(2 * quantum_);
-    if (flush_after_.count() == 0) {
-      flush_after_ = pipe_flush_after(window_bytes);
-    }
+    least_ = std::max(2 * quantum_, window_bytes / 2 / quantum_ * quantum_);
     if (widen_to_ != 0) {
       widened_ = reader_.widen(widen_to_);
     }
@@ -268,21 +246,18 @@ class basic_pipe_driver {
   void drain(file& f) noexcept { reads_.drain(&f); }
 
   // What the fills did, for a caller that wants to know whether the
-  // deadline ever had to fire. Reported rather than traced: a short
-  // flush is the one thing about this driver a caller cannot see from
-  // the digest.
+  // producer ever ran dry mid-window. Reported rather than traced: a
+  // short flush is the one thing about this driver a caller cannot see
+  // from the digest.
   [[nodiscard]] std::uint64_t windows_filled() const noexcept {
     return windows_filled_;
   }
-  [[nodiscard]] std::uint64_t timer_flushes() const noexcept {
-    return timer_flushes_;
+  [[nodiscard]] std::uint64_t short_flushes() const noexcept {
+    return short_flushes_;
   }
   [[nodiscard]] std::uint64_t bytes_read() const noexcept { return total_; }
   // The stream buffer the OS granted, or zero where it was not asked.
   [[nodiscard]] std::size_t widened_to() const noexcept { return widened_; }
-  [[nodiscard]] std::chrono::nanoseconds flush_after() const noexcept {
-    return flush_after_;
-  }
 
  private:
   // One window's bytes, and how many of them there are.
@@ -297,38 +272,47 @@ class basic_pipe_driver {
       return 0;
     }
     std::size_t got = take_carry(out);
-    std::int64_t deadline = deadline_from_now();
+    // The first read of a window waits; every one after it takes what is
+    // queued and nothing more, so that an empty stream is observed
+    // rather than guessed at.
+    bool blocking = true;
     bool proved = false;  // a byte past the window is in hand
     while (!eof_ && !proved) {
       const std::span<std::byte> space =
           got < n ? out.subspan(got)
                   : std::span<std::byte>(&probe_, 1);
-      const typename Reader::result r = reader_.read_some(space, deadline);
+      const typename Reader::result r = reader_.read_some(space, blocking);
       if (r.eof) {
         eof_ = true;
         break;
       }
-      if (got < n) {
-        got += r.bytes;
-      } else {
-        proved = r.bytes != 0;
-      }
-      if (r.timed_out && !proved) {
-        // The producer is behind. A prefix that is a whole number of
-        // parts can be hashed now; what is left stays in hand, which is
-        // also what proves the flushed prefix is not the last window.
-        const std::size_t flushed = flushable(got, n);
+      if (r.bytes == 0) {
+        // The stream ran dry. A prefix that is a whole number of parts
+        // can be hashed now; what is left stays in hand, which is also
+        // what proves the flushed prefix is not the last window. The
+        // floor is compared first because a producer that dribbles takes
+        // this branch on every write, and below the floor there is
+        // nothing to compute.
+        const std::size_t flushed = got < least_ ? 0 : flushable(got, n);
         if (flushed > 0) {
           keep_carry(out, flushed, got);
-          ++timer_flushes_;
+          ++short_flushes_;
           ++windows_filled_;
           total_ += flushed;
           return flushed;
         }
-        // Less than a flush is worth: a producer this far behind is
-        // better waited for than fragmented.
-        deadline = deadline_from_now();
+        // Below the floor, waiting beats fragmenting: an empty stream
+        // is a producer that is not waiting on this reader, so the
+        // block that follows costs nothing.
+        blocking = true;
+        continue;
       }
+      if (got < n) {
+        got += r.bytes;
+      } else {
+        proved = true;
+      }
+      blocking = false;
     }
     if (proved) {
       carry_[0] = probe_;
@@ -345,10 +329,6 @@ class basic_pipe_driver {
     }
     total_ += got;
     return got;
-  }
-
-  [[nodiscard]] std::int64_t deadline_from_now() const noexcept {
-    return stream_now_ns() + flush_after_.count();
   }
 
   // The carry from the previous window, which belongs at the front of
@@ -375,9 +355,27 @@ class basic_pipe_driver {
   // One part stays in hand because a flush must be provably not the
   // message's end, and two parts of the ASK stay unflushed because the
   // window after this one gets the remainder of the ask -- the grid
-  // brings itself back to its boundary that way -- and a window of one
-  // part is a round trip through the pool for 16 KiB. Zero means
-  // nothing worth flushing: the fill waits instead.
+  // brings itself back to its boundary that way. Zero means nothing
+  // worth flushing: the fill waits instead.
+  //
+  // Half the GRID's window is the floor, whatever this ask is. A
+  // hand-over costs a round trip through the pool and what it buys is
+  // the overlap between hashing the prefix and reading the rest, so a
+  // short prefix is not worth one. An empty stream is not rare: a reader
+  // faster than its producer empties it once per buffer, and the buffer
+  // is a fraction of the window (1 MiB on Linux once widened, 16 KiB on
+  // Darwin).
+  //
+  // The floor is taken from the grid rather than from `n` because the
+  // ask after a short flush is the remainder of the window, and half of
+  // THAT would halve again on every flush: the asks would cascade down
+  // to one part. Against the grid, the window that brings the grid back
+  // to its boundary cannot be flushed at all -- its ask is below the
+  // floor -- so it fills, and a run alternates between a flushed window
+  // and a whole one.
+  //
+  // Behind a producer that runs dry, a 2 GiB stream at 8 MiB windows
+  // runs on Linux as 512 windows, 256 of them flushed short.
   [[nodiscard]] std::size_t flushable(std::size_t got,
                                       std::size_t n) const noexcept {
     std::size_t whole = got / quantum_ * quantum_;
@@ -385,7 +383,7 @@ class basic_pipe_driver {
       whole = whole >= quantum_ ? whole - quantum_ : 0;
     }
     whole = std::min(whole, n >= 4 * quantum_ ? n - 2 * quantum_ : 0);
-    return whole >= 2 * quantum_ ? whole : 0;
+    return whole >= least_ ? whole : 0;
   }
 
   // What a short flush leaves behind, for the window after it.
@@ -402,8 +400,8 @@ class basic_pipe_driver {
   queued_reads reads_;
   std::vector<std::byte> arena_;
   std::vector<std::byte> carry_;
-  std::chrono::nanoseconds flush_after_{0};
   std::size_t quantum_ = chunk_size;
+  std::size_t least_ = 0;
   std::size_t widen_to_ = 0;
   std::size_t widened_ = 0;
   unsigned windows_ = 0;
@@ -413,7 +411,7 @@ class basic_pipe_driver {
   std::uint64_t size_ = streaming_size;
   std::uint64_t total_ = 0;
   std::uint64_t windows_filled_ = 0;
-  std::uint64_t timer_flushes_ = 0;
+  std::uint64_t short_flushes_ = 0;
   bool eof_ = false;
 };
 

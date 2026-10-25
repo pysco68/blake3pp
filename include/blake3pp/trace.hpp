@@ -52,11 +52,11 @@ struct window_record {
   /// whole window of the grid nor one that starts where a node of that
   /// size may start.
   ///
-  /// Only a stream sets it (blake3ppsum's `-`): a producer that had not
-  /// filled a window when the flush deadline passed ends it early, and
-  /// the window after that one is short in turn, bringing the grid back
-  /// onto its boundary. Both carry this. How many windows the deadline
-  /// itself ended is stream_report::short_flushes.
+  /// Only a stream sets it (blake3ppsum's `-`): a producer that ran dry
+  /// before filling a window ends it early, and the window after that one
+  /// is short in turn, bringing the grid back onto its boundary. Both
+  /// carry this. How many windows ended that way is
+  /// stream_report::short_flushes.
   static constexpr std::uint32_t flag_part_run = 1u << 3;
 
   /// Position of the window within this call, from 0.

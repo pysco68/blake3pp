@@ -4,18 +4,18 @@
 // driver that windows one stays a standard-library header the pipeline
 // can include.
 //
-// The contract is "return as soon as anything arrives, and never past
-// the deadline". That is a wait with a timeout followed by a read, in
-// that order, because a read that blocked would own the thread past the
-// deadline and the deadline is what keeps a pool fed by a slow producer
-// from stalling.
+// The contract is "return what has arrived". A blocking call waits for
+// the first byte and wakes on the producer's own write; a non-blocking
+// one takes what is already queued and reports an empty stream as zero
+// bytes and no end. The driver drains with the second form and hands the
+// window over when the stream runs dry, so there is no clock here and no
+// moment at which a full pipe is left undrained.
 
 #include <blake3pp/detail/pipe_driver.hpp>
 
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
-#include <cstdint>
 #include <span>
 #include <system_error>
 
@@ -39,57 +39,75 @@ native_stream standard_input() noexcept { return STDIN_FILENO; }
 
 #if defined(_WIN32)
 
-// Windows has no readiness wait for an anonymous pipe, so the wait is
-// PeekNamedPipe and a sleep: the peek says how much is queued without
-// consuming it, and a pipe whose writers have all closed fails it with
+// PeekNamedPipe says how much is queued without consuming it, which is
+// how a non-blocking read is expressed on a handle that has no such
+// mode; a pipe whose writers have all closed fails it with
 // ERROR_BROKEN_PIPE, which is this platform's end of stream.
+//
+// A blocking read is safe to make because an anonymous pipe is a
+// byte-mode pipe: the read returns with whatever arrived rather than
+// waiting for the count it asked for. The count still has to be bounded
+// -- see stream_reader::read_bound_ -- because the range a read asks for
+// is locked whether the bytes come or not.
 stream_reader::result stream_reader::read_some(std::span<std::byte> out,
-                                               std::int64_t deadline_ns) {
+                                               bool blocking) {
   if (out.empty()) {
     return {};
   }
-  for (;;) {
-    DWORD avail = 0;
-    if (PeekNamedPipe(h_, nullptr, 0, nullptr, &avail, nullptr) == 0) {
-      const DWORD err = GetLastError();
-      if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF) {
-        return {.bytes = 0, .eof = true, .timed_out = false};
-      }
-      // Not a pipe (a redirected file, a console): read it directly and
-      // let the read report the end.
-      if (err == ERROR_INVALID_FUNCTION || err == ERROR_INVALID_HANDLE) {
-        avail = static_cast<DWORD>(
-            std::min<std::size_t>(out.size(), 0xFFFF'FFFFu));
-      } else {
-        throw std::system_error(static_cast<int>(err), std::system_category(),
-                                "reading a stream");
-      }
+  const auto want_all = [&] {
+    return static_cast<DWORD>(std::min<std::size_t>(out.size(), 0xFFFF'FFFFu));
+  };
+  DWORD want = want_all();
+  DWORD avail = 0;
+  if (PeekNamedPipe(h_, nullptr, 0, nullptr, &avail, nullptr) == 0) {
+    const DWORD err = GetLastError();
+    if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF) {
+      return {.bytes = 0, .eof = true};
     }
-    if (avail != 0) {
-      DWORD moved = 0;
-      const DWORD want = static_cast<DWORD>(
-          std::min<std::size_t>(out.size(), static_cast<std::size_t>(avail)));
-      if (ReadFile(h_, out.data(), want, &moved, nullptr) == 0) {
-        const DWORD err = GetLastError();
-        if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF) {
-          return {.bytes = 0, .eof = true, .timed_out = false};
-        }
-        throw std::system_error(static_cast<int>(err), std::system_category(),
-                                "reading a stream");
-      }
-      if (moved == 0) {
-        return {.bytes = 0, .eof = true, .timed_out = false};
-      }
-      return {.bytes = static_cast<std::size_t>(moved),
-              .eof = false,
-              .timed_out = false};
+    // Not a pipe (a redirected file, a console): nothing to peek, and a
+    // read of one does not leave a producer blocked. Read it directly
+    // and let the read report the end.
+    if (err != ERROR_INVALID_FUNCTION && err != ERROR_INVALID_HANDLE) {
+      throw std::system_error(static_cast<int>(err), std::system_category(),
+                              "reading a stream");
     }
-    if (deadline_ns != no_deadline && stream_now_ns() >= deadline_ns) {
-      return {.bytes = 0, .eof = false, .timed_out = true};
+  } else if (avail == 0) {
+    if (!blocking) {
+      return {.bytes = 0, .eof = false};
     }
-    // Nothing queued and time left: the only wait a pipe offers.
-    Sleep(1);
+    // Nothing queued, so there is no count to ask for: bound the read
+    // by what the pipe can hold, because the read returns with whatever
+    // arrives and the range it asked for is locked either way.
+    if (!bound_known_) {
+      DWORD in = 0;
+      DWORD out_buf = 0;
+      read_bound_ =
+          GetNamedPipeInfo(h_, nullptr, &out_buf, &in, nullptr) != 0
+              ? static_cast<std::size_t>(in != 0 ? in : out_buf)
+              : 0;
+      bound_known_ = true;
+    }
+    if (read_bound_ != 0) {
+      want = static_cast<DWORD>(
+          std::min<std::size_t>(out.size(), read_bound_));
+    }
+  } else {
+    want = static_cast<DWORD>(
+        std::min<std::size_t>(out.size(), static_cast<std::size_t>(avail)));
   }
+  DWORD moved = 0;
+  if (ReadFile(h_, out.data(), want, &moved, nullptr) == 0) {
+    const DWORD err = GetLastError();
+    if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF) {
+      return {.bytes = 0, .eof = true};
+    }
+    throw std::system_error(static_cast<int>(err), std::system_category(),
+                            "reading a stream");
+  }
+  if (moved == 0) {
+    return {.bytes = 0, .eof = true};
+  }
+  return {.bytes = static_cast<std::size_t>(moved), .eof = false};
 }
 
 std::size_t stream_reader::widen(std::size_t) noexcept {
@@ -101,21 +119,17 @@ std::size_t stream_reader::widen(std::size_t) noexcept {
 #else
 
 stream_reader::result stream_reader::read_some(std::span<std::byte> out,
-                                               std::int64_t deadline_ns) {
+                                               bool blocking) {
   if (out.empty()) {
     return {};
   }
   for (;;) {
-    if (deadline_ns != no_deadline) {
-      // Readiness first, so the read below cannot own the thread past
-      // the deadline.
-      const std::int64_t left = deadline_ns - stream_now_ns();
+    if (!blocking) {
+      // The descriptor may well be blocking -- stdin usually is -- so
+      // readiness is asked before the read rather than inferred from
+      // EAGAIN afterwards.
       pollfd pfd{.fd = h_, .events = POLLIN, .revents = 0};
-      const int ms = left <= 0
-                         ? 0
-                         : static_cast<int>(std::min<std::int64_t>(
-                               (left + 999'999) / 1'000'000, 3600'000));
-      const int ready = ::poll(&pfd, 1, ms);
+      const int ready = ::poll(&pfd, 1, 0);
       if (ready < 0) {
         if (errno == EINTR) {
           continue;
@@ -124,26 +138,30 @@ stream_reader::result stream_reader::read_some(std::span<std::byte> out,
                                 "waiting on a stream");
       }
       if (ready == 0) {
-        return {.bytes = 0, .eof = false, .timed_out = true};
+        return {.bytes = 0, .eof = false};
       }
     }
     const auto n = ::read(h_, out.data(), out.size());
     if (n > 0) {
-      return {.bytes = static_cast<std::size_t>(n),
-              .eof = false,
-              .timed_out = false};
+      return {.bytes = static_cast<std::size_t>(n), .eof = false};
     }
     if (n == 0) {
-      return {.bytes = 0, .eof = true, .timed_out = false};
+      return {.bytes = 0, .eof = true};
     }
     if (errno == EINTR) {
       continue;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // A non-blocking descriptor whose poll() lost the race, or one
-      // handed over non-blocking by the caller's shell.
-      if (deadline_ns != no_deadline && stream_now_ns() >= deadline_ns) {
-        return {.bytes = 0, .eof = false, .timed_out = true};
+      if (!blocking) {
+        // A readiness poll that lost its race: the stream is dry again.
+        return {.bytes = 0, .eof = false};
+      }
+      // A descriptor the caller's shell handed over non-blocking: wait
+      // for readiness instead of spinning on it.
+      pollfd pfd{.fd = h_, .events = POLLIN, .revents = 0};
+      if (::poll(&pfd, 1, -1) < 0 && errno != EINTR) {
+        throw std::system_error(errno, std::generic_category(),
+                                "waiting on a stream");
       }
       continue;
     }
