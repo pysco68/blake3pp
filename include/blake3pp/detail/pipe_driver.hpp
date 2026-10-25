@@ -517,6 +517,11 @@ class basic_pipe_driver {
   [[nodiscard]] std::size_t widened_to() const noexcept { return widened_; }
   // The reader, for what it counted (stream_reader::watch()).
   [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
+  // Whether a window may end when the stream runs dry, as this driver
+  // was configured.
+  [[nodiscard]] bool hands_over_early() const noexcept {
+    return early_hand_over_;
+  }
 
  private:
   // One window's bytes, and how many of them there are.

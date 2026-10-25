@@ -287,13 +287,21 @@ diagnosis: device-limited (write side)
   the device held a full queue for the run: it is the wall.
 ```
 
-`--diag` describes a single run. `blake3ppsum` takes exactly one FILE or
-`-`, not `--check`; `blake3ppgen` needs `--output` and `--length`, which
-selects the pipelined path. A run too short to turn its queue over four
-times reports that instead of a reading. On `-` the device is the stream:
-a producer that cannot keep up reads as device-limited, and the line
-below the diagnosis says how many windows ended early because the
-producer ran dry.
+`--diag` describes a single run on the pipelined path. `blake3ppsum`
+takes exactly one FILE or `-`, not `--check`, and more than one thread;
+a FILE below the pipeline's minimum size is hashed sequentially and has
+nothing to report. `blake3ppgen` needs `--output`, `--length` and more
+than one thread. A run too short to turn its queue over four times
+reports that instead of a reading. Where the engine holds fewer
+transfers than the queue depth, an extra line gives the engine's count
+and each transfer's wait for a slot.
+
+On `-` the device is the stream: a producer that cannot keep up reads as
+device-limited. Lines below the diagnosis give the stream's windows and
+how many ended early because the producer ran dry (where early hand-over
+is on), the pipe buffer the OS granted, what the stream watch did (where
+the platform watches the stream), and on Windows the bound on a read's
+ask.
 
 The captures above are from a 16-thread Zen 5 machine under WSL2, on its
 virtual disk, through the page cache where `--no-direct` appears.

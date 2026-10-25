@@ -713,15 +713,15 @@ int main(int argc, char** argv) {
                                       windows, window)
               : blake3pp::diagnosis{},
           o.threads, hw_threads);
-      if (o.files.front() == "-" && eng.pipelined() &&
-          eng.stream().short_flushes > 0) {
-        // The one thing about a stream run the diagnosis cannot show:
-        // the producer left windows unfinished, and what had arrived was
-        // hashed rather than waited for.
-        println(stderr,
-                "  stream         {} of {} windows ended early: the producer "
-                "ran dry",
-                eng.stream().short_flushes, eng.stream().windows);
+      if (o.files.front() == "-" && eng.pipelined()) {
+        // What the diagnosis cannot show about a stream run: how the
+        // windows ended, the pipe buffer the OS granted, and what the
+        // reader did before each read.
+        for (const auto& line : b3tool::stream_lines(
+                 eng.stream(),
+                 [](std::uint64_t n) { return b3tool::bytes_label(n); })) {
+          println(stderr, "{}", line);
+        }
       }
     }
     if (trace && !o.trace_path.empty()) {

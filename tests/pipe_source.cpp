@@ -23,6 +23,7 @@
 // below happens at a byte offset the case chose.
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -905,8 +906,52 @@ TEST_CASE("update_stream over a real pipe matches the sequential hasher") {
       CHECK(h.finalize() == blake3pp::hash(bytes));
       CHECK(r.bytes == len);
       CHECK(r.window_bytes == blake3pp::detail::default_window_bytes);
+      // The report's account of the run, from the counters: every
+      // window was filled or ended by the stream's end unless the
+      // driver may hand over early, and what the reader reports about
+      // the watch and the pipe is the platform's.
+      CHECK(r.early_hand_over == blake3pp::detail::stream_hands_over_early());
+      if (!r.early_hand_over) {
+        CHECK(r.short_flushes == 0);
+      }
+      CHECK(r.short_flushes <= r.windows);
+      CHECK(r.watch.caught + r.watch.slept <= r.watch.probes);
+      if (!r.watch.measured) {
+        CHECK(r.watch.probes == 0);
+      }
+#if defined(__linux__)
+      CHECK(r.stream_buffer_reported);
+      CHECK(r.stream_buffer_bytes >= 64 * 1024);
+      CHECK(r.watch.measured);
+#elif defined(__APPLE__)
+      CHECK_FALSE(r.stream_buffer_reported);
+      CHECK_FALSE(r.watch.measured);
+#elif defined(_WIN32)
+      CHECK_FALSE(r.stream_buffer_reported);
+      CHECK_FALSE(r.watch.measured);
+      // The ask bound is learnt from reads that come back short, so a
+      // stream this small may end before one does; when it has been
+      // learnt it is a power of two, as read_ask_bound promises.
+      if (r.read_ask_bound_bytes != 0) {
+        CHECK(std::has_single_bit(r.read_ask_bound_bytes));
+      }
+#endif
     }
   }
+}
+
+TEST_CASE("a reader without a watch or an ask bound reports neither") {
+  // The scripted reader has no watch() and its read_bound() is a
+  // constant: the report takes what a reader has and says nothing about
+  // the rest, which is what a platform without the facility gets.
+  const auto bytes = pattern(3 * 64 * 1024, 17);
+  test_driver drv(scripted_reader{bytes, all_at_once(bytes.size())},
+                  {.flush_quantum = 16 * 1024});
+  const auto w = detail::watch_report_of(drv.reader());
+  CHECK_FALSE(w.measured);
+  CHECK(w.probes == 0);
+  CHECK(detail::read_ask_bound_of(drv.reader()) == drv.reader().read_bound());
+  CHECK(drv.hands_over_early());
 }
 
 // ------------------------------------------------------------------

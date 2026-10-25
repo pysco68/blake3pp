@@ -22,6 +22,7 @@
 /// input through the same pipeline.
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -392,9 +393,69 @@ struct stream_report {
   std::size_t window_bytes = 0;
   unsigned windows_planned = 0;
   /// The stream buffer in force, or zero where the platform has no such
-  /// knob.
+  /// knob; stream_buffer_reported says which.
   std::size_t stream_buffer_bytes = 0;
+  /// Whether stream_buffer_bytes is a figure the platform reported
+  /// (Linux: the pipe buffer F_GETPIPE_SZ returned) or a zero that
+  /// means it cannot be asked.
+  bool stream_buffer_reported = false;
+  /// Whether a window could end when the stream ran dry with at least
+  /// half a window in hand. False means every window filled or reached
+  /// the end of the stream.
+  bool early_hand_over = false;
+  /// What the readiness watch before each read did, where the platform
+  /// has one. All zero and `measured` false where it does not.
+  struct watch_report {
+    /// The platform watches an empty stream before sleeping on it.
+    bool measured = false;
+    /// Readiness probes made, the one that opens every wait included.
+    std::uint64_t probes = 0;
+    /// Waits that a probe ended before the budget ran out.
+    std::uint64_t caught = 0;
+    /// Waits that reached the sleep.
+    std::uint64_t slept = 0;
+    /// The watch budget in force when the run ended, in nanoseconds.
+    std::int64_t budget_ns = 0;
+  } watch;
+  /// The most one read may ask for, as it stood at the end of the run.
+  /// Windows only, where the bound follows what earlier reads returned.
+  /// Zero means unbounded: every read asks for the whole window remainder,
+  /// which is always the case on POSIX and on Windows for a producer that
+  /// filled every ask.
+  std::size_t read_ask_bound_bytes = 0;
 };
+
+namespace detail {
+
+// The parts of a stream_report that come from the reader. Each is taken
+// only from a reader that has the member, so the scripted readers in the
+// tests compile without them. The shipped reader has both members on every
+// platform, and reports zero where it does not use them.
+template <class Reader>
+[[nodiscard]] stream_report::watch_report watch_report_of(
+    const Reader& r) noexcept {
+  stream_report::watch_report w{};
+  if constexpr (requires { r.watch().stats().probes; }) {
+    const auto& watch = r.watch();
+    w.measured = watch.stats().probes > 0;
+    w.probes = watch.stats().probes;
+    w.caught = watch.stats().caught;
+    w.slept = watch.stats().slept;
+    w.budget_ns = watch.budget();
+  }
+  return w;
+}
+
+template <class Reader>
+[[nodiscard]] std::size_t read_ask_bound_of(const Reader& r) noexcept {
+  if constexpr (requires { { r.read_bound() } -> std::convertible_to<std::size_t>; }) {
+    return r.read_bound();
+  } else {
+    return 0;
+  }
+}
+
+}  // namespace detail
 
 /// Streams an unseekable source -- a pipe, a socket, standard input --
 /// into a hasher with every window fanned out over a scheduler.
@@ -456,7 +517,11 @@ stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
           .short_flushes = drv.short_flushes(),
           .window_bytes = window,
           .windows_planned = plan.windows,
-          .stream_buffer_bytes = drv.widened_to()};
+          .stream_buffer_bytes = drv.widened_to(),
+          .stream_buffer_reported = drv.widened_to() != 0,
+          .early_hand_over = drv.hands_over_early(),
+          .watch = detail::watch_report_of(drv.reader()),
+          .read_ask_bound_bytes = detail::read_ask_bound_of(drv.reader())};
 }
 
 /// update_stream() reporting failure through ec instead of throwing.
