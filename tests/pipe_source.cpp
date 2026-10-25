@@ -68,10 +68,19 @@ std::vector<std::byte> pattern(std::size_t len, std::uint32_t seed) {
 // A reader whose arrivals are a script: how many bytes come next, or a
 // moment with the stream empty, or the end of the stream.
 //
-// A `dry` step is what a real producer pausing looks like to the driver:
-// a non-blocking read of it returns nothing, and a blocking one waits
-// through it for the step after. That is what makes a short flush land
-// at a chosen offset instead of wherever a real producer happened to be.
+// One call takes everything the script has queued, up to what it was
+// asked for, and stops at a `dry` step, as a real blocking read of a
+// pipe does; the driver's short-read signal depends on that. A `dry` step
+// reached with bytes already in hand ends the call short of its ask, the
+// way an emptied pipe does. Reached with nothing in hand, it is a pause
+// the call waits through, the way a blocking read waits for the
+// producer's next write. A short flush therefore lands at a byte offset
+// the case chose.
+//
+// `max_per_call` is declared as the reader's own read bound, so the
+// driver bounds its ask by it rather than being told a short read: that
+// is the shipped Windows reader's shape, where every read is capped and
+// none of the caps is a dry stream.
 class scripted_reader {
  public:
   struct step {
@@ -88,39 +97,53 @@ class scripted_reader {
                   std::size_t max_per_call = ~std::size_t{0})
       : src_(source), script_(std::move(script)), max_(max_per_call) {}
 
-  [[nodiscard]] result read_some(std::span<std::byte> out, bool blocking) {
+  [[nodiscard]] result read_some(std::span<std::byte> out) {
     if (out.empty()) {
       return {};
     }
+    std::size_t moved = 0;
     for (;;) {
       while (next_ < script_.size() && script_[next_].bytes == 0 &&
              !script_[next_].dry) {
         ++next_;
       }
       if (next_ >= script_.size()) {
-        return {.bytes = 0, .eof = true};
+        // The script is spent: the end of the stream, unless this call
+        // has bytes to report first.
+        return moved > 0 ? result{.bytes = moved, .eof = false}
+                         : result{.bytes = 0, .eof = true};
       }
       step& s = script_[next_];
       if (s.dry) {
         ++next_;
         ++dries_;
-        if (blocking) {
-          // A blocking read waits for the producer's next write, which
-          // is the step after this one.
-          continue;
+        if (moved > 0) {
+          // An emptied queue: the call comes back short of its ask.
+          return {.bytes = moved, .eof = false};
         }
-        return {.bytes = 0, .eof = false};
+        // Nothing in hand, so the read waits for the producer's next
+        // write, which is the step after this one.
+        continue;
       }
       const std::size_t n =
-          std::min({s.bytes, out.size(), max_, src_.size() - at_});
+          std::min({s.bytes, out.size() - moved, src_.size() - at_});
       if (n == 0) {
-        return {.bytes = 0, .eof = true};
+        return moved > 0 ? result{.bytes = moved, .eof = false}
+                         : result{.bytes = 0, .eof = true};
       }
-      std::memcpy(out.data(), src_.data() + at_, n);
+      std::memcpy(out.data() + moved, src_.data() + at_, n);
       at_ += n;
       s.bytes -= n;
-      return {.bytes = n, .eof = false};
+      moved += n;
+      if (moved == out.size()) {
+        return {.bytes = moved, .eof = false};
+      }
     }
+  }
+
+  // The cap this reader reads under, which the driver asks within.
+  [[nodiscard]] std::size_t read_bound() const noexcept {
+    return max_ == ~std::size_t{0} ? 0 : max_;
   }
 
   std::size_t widen(std::size_t) noexcept { return 0; }
@@ -184,6 +207,18 @@ outcome run_stream(std::span<const std::byte> bytes,
   out.bytes = drv.bytes_read();
   out.records.resize(trace.windows().size());
   return out;
+}
+
+// What each window's length was, in order: the sharpest statement of
+// what a stream shape did, because a hand-over is a window that came
+// out shorter than the grid asked for.
+std::vector<std::uint64_t> window_lengths(const outcome& o) {
+  std::vector<std::uint64_t> v;
+  v.reserve(o.records.size());
+  for (const blake3pp::window_record& r : o.records) {
+    v.push_back(r.bytes);
+  }
+  return v;
 }
 
 std::size_t part_run_records(const outcome& o) {
@@ -306,12 +341,27 @@ TEST_CASE("a stream window is as long as the stream made it") {
   CHECK(f.size() == detail::streaming_size);
   CHECK(std::ranges::equal(w0.view, std::span(bytes).first(64 * 1024)));
 
-  // What is left is shorter than the ask, and with it the end arrives.
-  const detail::window_storage w1 =
-      drv.window_storage_for(f, 1, 64 * 1024, 64 * 1024);
-  CHECK(w1.view.size() == 100 * 1024 - 64 * 1024);
+  // What is left is shorter than the ask, so every window after the
+  // first is as long as the stream made it and the last one brings the
+  // end with it. The tail of a stream reads exactly like a producer that
+  // ran dry (a read short of its ask), so it may arrive as more than one
+  // window. No byte may be lost or reordered.
+  std::size_t at = 64 * 1024;
+  unsigned slot = 1;
+  for (;;) {
+    const detail::window_storage w =
+        drv.window_storage_for(f, slot % 4, at, 64 * 1024);
+    if (w.view.empty()) {
+      break;
+    }
+    CHECK(w.view.size() <= 64 * 1024);
+    CHECK(std::ranges::equal(w.view, std::span(bytes).subspan(at,
+                                                              w.view.size())));
+    at += w.view.size();
+    ++slot;
+  }
+  CHECK(at == 100 * 1024);
   CHECK(f.size() == 100 * 1024);
-  CHECK(std::ranges::equal(w1.view, std::span(bytes).subspan(64 * 1024)));
 }
 
 TEST_CASE("a stream reports its reads only from poll") {
@@ -389,14 +439,30 @@ TEST_CASE("an empty stream is the empty digest") {
 }
 
 TEST_CASE("a stream delivered in dribbles still hashes correctly") {
-  // Every read_some() returns at most one chunk, so a window takes
-  // dozens of calls, and the stream is never empty between them: the
-  // fill loop's own arithmetic, with no hand-over in the picture.
+  // The reader declares a 1 KiB read bound, so a window takes dozens of
+  // calls and the driver asks within the bound every time: the fill
+  // loop's own arithmetic, with no hand-over in the picture. A bound is
+  // not a dry stream, which is the distinction the shipped Windows
+  // reader depends on -- every one of its reads is capped.
   const auto bytes = pattern(200 * 1024 + 511, 23);
   const outcome o = run_stream(bytes, all_at_once(bytes.size()), 64 * 1024,
                                1024);
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.short_flushes == 0);
+}
+
+TEST_CASE("the shipped read bound does not fragment a stream") {
+  // 1 MiB is the bound the Windows reader asks within, and a window is
+  // eight of them: a producer that keeps up must still fill whole
+  // windows, or the bound would be paying for hand-overs it was meant to
+  // avoid.
+  const auto bytes = pattern(3 * 1024 * 1024 + 7, 24);
+  const outcome o = run_stream(bytes, all_at_once(bytes.size()),
+                               8 * 1024 * 1024, 1024 * 1024);
+  CHECK(o.digest == blake3pp::hash(bytes));
+  CHECK(o.bytes == bytes.size());
+  CHECK(o.short_flushes == 0);
+  CHECK(part_run_records(o) == 0);
 }
 
 // ------------------------------------------------------------------
@@ -410,18 +476,58 @@ TEST_CASE("an empty stream ends a window early and the short run still folds") {
   // grid until one brings it back, and each of those reaches the tree as
   // the decomposition of a run of parts rather than as one subtree.
   //
-  // Fails if the hand-over never happens (short_flushes would be zero),
-  // and fails with a wrong digest if a short run is decomposed wrongly.
+  // The run ends with a second hand-over, at the end of the stream: the
+  // last read came back short of its ask because there was nothing more
+  // to come. A paused producer gives the same observation, and the two
+  // cannot be told apart until the read after it reports the end.
+  // 32 KiB of the 44 KiB remainder goes out as whole parts and the 12 KiB
+  // left is the last window.
+  //
+  // Fails if the hand-over never happens, and fails with a wrong digest
+  // if a short run is decomposed wrongly.
   const auto bytes = pattern(300 * 1024, 31);
   const outcome o = run_stream(bytes, {{.bytes = 40 * 1024},
                                        {.dry = true},
                                        {.bytes = bytes.size() - 40 * 1024}});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == bytes.size());
-  CHECK(o.short_flushes == 1);
-  // Two windows are runs of parts rather than subtrees: the one that
-  // ended early, and the one that brings the grid back to its boundary.
-  CHECK(part_run_records(o) == 2);
+  CHECK(window_lengths(o) ==
+        std::vector<std::uint64_t>{32 * 1024, 32 * 1024, 64 * 1024, 64 * 1024,
+                                   64 * 1024, 32 * 1024, 12 * 1024});
+  CHECK(o.short_flushes == 2);
+  // Windows that are runs of parts rather than one subtree: the one that
+  // ended early, the one that brings the grid back to its boundary, and
+  // the hand-over at the end of the stream.
+  CHECK(part_run_records(o) == 3);
+}
+
+TEST_CASE("a dribbling producer hands a window over before it is full") {
+  // The hand-over itself: the stream has not ended (the driver has
+  // 260 KiB of it still to come and says so through size()), and the
+  // first window comes back shorter than the 64 KiB that was asked for.
+  // A reader that waited for the byte count would hold the pool idle
+  // through every pause a slow producer takes.
+  const auto bytes = pattern(300 * 1024, 38);
+  std::vector<scripted_reader::step> script;
+  for (std::size_t at = 0; at < bytes.size(); at += 40 * 1024) {
+    script.push_back({.bytes = std::min<std::size_t>(40 * 1024,
+                                                     bytes.size() - at)});
+    script.push_back({.dry = true});
+  }
+  test_driver drv(scripted_reader{bytes, std::move(script)},
+                  {.flush_quantum = 16 * 1024});
+  test_driver::file f(drv);
+  drv.reserve(4, 64 * 1024);
+
+  const detail::window_storage w0 = drv.window_storage_for(f, 0, 0, 64 * 1024);
+  // 40 KiB arrived of a 64 KiB ask, and two whole parts of it go out.
+  CHECK(w0.view.size() == 32 * 1024);
+  CHECK(std::ranges::equal(w0.view, std::span(bytes).first(32 * 1024)));
+  // The end of the stream is nowhere in sight: this was a hand-over and
+  // not a last window.
+  CHECK(f.size() == detail::streaming_size);
+  CHECK(drv.short_flushes() == 1);
+  CHECK(drv.windows_filled() == 1);
 }
 
 TEST_CASE("a stream that runs dry on every window still hashes correctly") {
@@ -459,15 +565,24 @@ TEST_CASE("an empty stream with less than a flush in hand waits instead") {
 }
 
 TEST_CASE("a window that filled but whose read-ahead has not arrived") {
-  // The window's byte count is reached and the stream is dry, so the
-  // byte that would prove the window is not the message's end is not
-  // there. Two parts stay in hand instead, and the prefix goes out.
+  // The window's byte count is reached by a read that came back whole,
+  // so nothing yet says the stream is dry, and the byte that proves the
+  // window is not the message's end is read for on its own. That read
+  // blocks, and the window goes out at its full length: it has all its
+  // bytes, and a stream with nothing in it is a producer that is not
+  // waiting on this reader, so there is nothing the wait gives up.
+  //
+  // The one hand-over in the run is the stream's end, 32 KiB of the
+  // 44 KiB remainder, as in the case above.
   const auto bytes = pattern(300 * 1024, 34);
   const outcome o = run_stream(bytes, {{.bytes = 64 * 1024},
                                        {.dry = true},
                                        {.bytes = bytes.size() - 64 * 1024}});
   CHECK(o.digest == blake3pp::hash(bytes));
   CHECK(o.bytes == bytes.size());
+  CHECK(window_lengths(o) ==
+        std::vector<std::uint64_t>{64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024,
+                                   32 * 1024, 12 * 1024});
   CHECK(o.short_flushes == 1);
 }
 

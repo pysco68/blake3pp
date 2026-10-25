@@ -29,12 +29,34 @@
 //     producer that is behind must not stall the pool;
 //   * end of stream -- the last window, of whatever length.
 //
-// The hand-over condition is an observable and not a clock. The fill
-// blocks for the first bytes, drains what is queued without blocking,
-// and gives the window up when the stream is empty: an empty stream is
-// proof that the producer is not waiting on this reader, so blocking for
-// its next write costs nothing, while a reader that stopped draining a
-// FULL one would stall it.
+// The hand-over condition is an observable and not a clock. Every read
+// blocks, and a read that comes back short of what it asked for is the
+// hand-over signal, which costs no call of its own.
+//
+// Blocking there does not stall the producer: a stream with nothing in
+// it is a producer that is not waiting on this reader, while a reader
+// that stopped draining a FULL one would stall it. It is not free,
+// though. A readiness probe reports an empty queue without sleeping,
+// and a blocking read learns the same fact by sleeping. Dropping the
+// probe therefore trades calls for wake-ups: measured on Linux at
+// 512-byte producer writes, 32% fewer syscalls and 32% more voluntary
+// context switches, for 3.6% of wall clock. At 4 KiB writes it is 2.3%,
+// and at a producer that keeps up it is nothing -- not because the
+// stream stays full, since a 1 MiB pipe cannot fill an 8 MiB ask and
+// so nearly every read drains it, but because it refills at once and
+// the block returns immediately. What buys the cost back is Windows,
+// where the probe has no non-blocking form at all.
+//
+// A short read means the queue was emptied by it whatever the ask, since
+// a read takes everything queued up to what it asked for. The ask
+// governs the other branch: a read that comes back WHOLE may have left
+// something behind, so the loop reads on rather than handing over. POSIX
+// asks for the whole window remainder, which no stream buffer fills, so
+// that branch is never taken there and every read reports a drained
+// queue; Windows caps the ask at Reader::read_bound(), where it is
+// taken. The window lengths come out the same either way: 2 GiB through
+// a 1 MiB pipe at 8 MiB windows gives 512 windows, 256 of them flushed
+// short, with the cap and without it.
 //
 // A short flush is a multiple of the flush quantum (one part of the
 // window grid), which is what keeps every extent a run of whole,
@@ -99,14 +121,51 @@ class stream_reader {
 
   explicit stream_reader(native_stream handle) noexcept : h_(handle) {}
 
-  // Reads into `out`, returning as soon as anything arrives.
+  // Reads into `out`, waiting for the producer's next write if the
+  // stream is empty and returning as soon as anything arrives.
   //
-  // `blocking` waits for the first byte, which is a wait on the
-  // producer's own write. Without it the call takes only what is already
-  // queued and reports an empty stream as zero bytes with `eof` unset,
-  // which is the driver's signal to hand the window over.
+  // A count short of `out.size()` is the stream running dry: the queue
+  // held less than was asked for, so there is nothing further to take
+  // until the producer writes again. That is the driver's hand-over
+  // signal, and it comes out of the read the driver was making anyway.
   // @throws std::system_error on a read failure.
-  [[nodiscard]] result read_some(std::span<std::byte> out, bool blocking);
+  [[nodiscard]] result read_some(std::span<std::byte> out);
+
+  // The most one read may usefully be asked for, or zero where asking
+  // for the whole remainder costs nothing.
+  //
+  // A Windows ReadFile is priced by the range it asks for rather than by
+  // the bytes it returns, so an ask of a whole 8 MiB window pays for 8
+  // MiB of range in order to receive a pipe's worth. A pipe's buffer is
+  // also the most one read of it can ever return, so an ask past it buys
+  // nothing: the bound is a Windows anonymous pipe's real capacity, 1
+  // MiB. GetNamedPipeInfo is not asked for it -- it answers 4096 on a
+  // handle whose buffer is 1 MiB.
+  //
+  // Measured on this pipe, 2 GiB through the stdin path, against the
+  // bound in MiB/s at six producer write sizes (4 KiB to 4 MiB): 256 KiB
+  // gives 1026 2507 5357 8870 7186 7468 and 1 MiB gives 973 2260 5010
+  // 7497 10708 10587. A smaller bound is up to 15% better where the
+  // writes are small and a third slower where they are large, because
+  // the ask is then a quarter of what is queued.
+  //
+  // A POSIX read() copies min(asked, queued) and never touches the rest
+  // of the range, so there is no range to pay for and a bound would only
+  // cut one call into several. It would also change what the loop hands
+  // over: an ask the queue can fill comes back whole, which sends the
+  // loop round again instead of flushing, so whole windows go out where
+  // half ones did. Measured on Linux, 2 GiB through a 1 MiB pipe at
+  // 8 MiB windows, a 1 MiB bound against no bound over six interleaved
+  // runs each: level at 512 B and 4 KiB producer writes, and 7% down
+  // where the producer keeps up, at 256 full windows against 512 of
+  // which half were flushed short.
+  [[nodiscard]] static constexpr std::size_t read_bound() noexcept {
+#if defined(_WIN32)
+    return 1024 * 1024;
+#else
+    return 0;
+#endif
+  }
 
   // Asks the OS for a larger stream buffer, which on Linux is what
   // keeps an 8 MiB window from being 128 hand-offs through a 64 KiB
@@ -116,19 +175,6 @@ class stream_reader {
 
  private:
   native_stream h_;
-#if defined(_WIN32)
-  // The most one read may be asked for, or zero until the handle has
-  // been asked and for a handle with no answer.
-  //
-  // A Windows read locks the whole requested range of the caller's
-  // buffer before it transfers anything, so asking for a window's worth
-  // in order to receive a pipe's worth is paid for in the lock rather
-  // than in the bytes: measured on an 8 MiB window through a 4 KiB
-  // pipe, 439 MiB/s against 799 at a 1 MiB window and 150 at 32 MiB.
-  // A pipe's own buffer is the most one read of it can return.
-  std::size_t read_bound_ = 0;
-  bool bound_known_ = false;
-#endif
 };
 
 // This process's standard input as a stream handle.
@@ -266,53 +312,62 @@ class basic_pipe_driver {
   // handed over as a subtree once a byte beyond it is known to exist,
   // and that byte becomes the first of the next window. The three ways
   // out are the three ways a window ends.
+  //
+  // Every read blocks, and every read asks for as much of what is left
+  // of the window as the platform prices fairly. No call returns
+  // nothing: a read brings back a buffer's worth or a producer's
+  // backlog, and one short of its ask carries the dry signal the
+  // hand-over wants without a call of its own. Measured on Linux over
+  // 2 GiB, the loop reads 2304 times behind a producer that keeps up and
+  // 1.65 million times behind 4.19 million 512-byte writes.
   [[nodiscard]] std::size_t fill(std::span<std::byte> out) {
     const std::size_t n = out.size();
     if (eof_ && carry_len_ == 0) {
       return 0;
     }
     std::size_t got = take_carry(out);
-    // The first read of a window waits; every one after it takes what is
-    // queued and nothing more, so that an empty stream is observed
-    // rather than guessed at.
-    bool blocking = true;
+    const std::size_t bound = reader_.read_bound();
     bool proved = false;  // a byte past the window is in hand
     while (!eof_ && !proved) {
       const std::span<std::byte> space =
           got < n ? out.subspan(got)
                   : std::span<std::byte>(&probe_, 1);
-      const typename Reader::result r = reader_.read_some(space, blocking);
+      const std::size_t ask =
+          bound == 0 ? space.size() : std::min(space.size(), bound);
+      const typename Reader::result r = reader_.read_some(space.first(ask));
       if (r.eof) {
         eof_ = true;
         break;
       }
-      if (r.bytes == 0) {
-        // The stream ran dry. A prefix that is a whole number of parts
-        // can be hashed now; what is left stays in hand, which is also
-        // what proves the flushed prefix is not the last window. The
-        // floor is compared first because a producer that dribbles takes
-        // this branch on every write, and below the floor there is
-        // nothing to compute.
-        const std::size_t flushed = got < least_ ? 0 : flushable(got, n);
-        if (flushed > 0) {
-          keep_carry(out, flushed, got);
-          ++short_flushes_;
-          ++windows_filled_;
-          total_ += flushed;
-          return flushed;
-        }
-        // Below the floor, waiting beats fragmenting: an empty stream
-        // is a producer that is not waiting on this reader, so the
-        // block that follows costs nothing.
-        blocking = true;
+      if (got == n) {
+        // The window has its bytes; one past it is all that is wanted.
+        proved = r.bytes > 0;
         continue;
       }
-      if (got < n) {
-        got += r.bytes;
-      } else {
-        proved = true;
+      got += r.bytes;
+      if (r.bytes == ask) {
+        // The ask came back whole, so the queue may hold more: read on
+        // without asking whether it does.
+        continue;
       }
-      blocking = false;
+      // The stream ran dry. A prefix that is a whole number of parts
+      // can be hashed now; what is left stays in hand, which is also
+      // what proves the flushed prefix is not the last window. The
+      // floor is compared first because a producer that dribbles takes
+      // this branch on every write, and below the floor there is
+      // nothing to compute.
+      const std::size_t flushed = got < least_ ? 0 : flushable(got, n);
+      if (flushed > 0) {
+        keep_carry(out, flushed, got);
+        ++short_flushes_;
+        ++windows_filled_;
+        total_ += flushed;
+        return flushed;
+      }
+      // Below the floor, waiting beats fragmenting. The read that
+      // follows may sleep, which is what a dribbling producer costs
+      // here, but it holds nothing up: a dry stream is a producer that
+      // is not waiting on this reader.
     }
     if (proved) {
       carry_[0] = probe_;
