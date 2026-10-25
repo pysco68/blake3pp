@@ -9,10 +9,11 @@ of them. What follows is that chain stage by stage, why each stage sits
 where it does, and the rules that let completions arrive in whatever order
 the device and the pool produce them with no lock on the hash.
 
-The same engine runs `update_file()`, the scheduler-taking `hash()` over a
-buffer in memory, `write_file()` and the senders in
-[`<blake3pp/async_io.hpp>`](async.md). What differs between them is the
-driver underneath and who owns the window storage.
+The same engine runs `update_file()`, `update_stream()` over a pipe or
+standard input, the scheduler-taking `hash()` over a buffer in memory,
+`write_file()` and the senders in [`<blake3pp/async_io.hpp>`](async.md).
+What differs between them is the driver underneath and who owns the window
+storage.
 
 ## The shape of one window
 
@@ -31,11 +32,13 @@ every window that passes through them.
 
 `read` is a sender over the fastest mechanism the platform and the
 filesystem allow -- io_uring, IoRing or IOCP, GCD, POSIX AIO on a
-kqueue, or a synchronous `pread` -- behind
-one driver interface. Its `start()` queues the transfer and returns. It does
-not flush, because the driver loop flushes once per round and a whole
-batch of windows then reaches the OS in one call; and it does not
-complete, because the backends call back only from inside `poll()`.
+kqueue, or a synchronous `pread` -- behind one driver interface. Its
+`start()` queues the transfer and returns. It does not flush, because the
+driver loop flushes once per round and a whole batch of windows then
+reaches the OS in one call; and it does not complete, because the backends
+call back only from inside `poll()`. A synchronous transfer is performed
+on up to four I/O threads of the backend's own, so the driving thread
+does not block in a read, and it is still reported from `poll()`.
 
 The value completion carries the window's bytes: the backends read exactly
 what was asked for or report an error, so a window that completes is whole.
@@ -120,6 +123,10 @@ are usually not:
   driver the moment the read lands, which is what puts the hasher on the
   boundary the nodes are numbered from. What follows is whole parts aligned
   in the message's own chunk space, like any other window's.
+- **A stream's early windows.** `update_stream()` may end a window when the
+  producer runs dry, at a whole number of parts, and the window after it
+  asks only for the distance back to the grid. Both are runs of parts.
+  Unlike the other two, any number of them can be in flight.
 
 An edge window with at least two whole parts therefore runs the same chain,
 but what comes back is not one chaining value: it is the canonical

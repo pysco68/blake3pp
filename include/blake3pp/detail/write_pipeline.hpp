@@ -197,12 +197,21 @@ class write_scope
   void report(driver_stats& d) const noexcept {
     d.transfers_landed = transfers_landed_;
     d.transfer_bytes = transfer_bytes_;
-    d.device_wait_ns = device_wait_ns_;
     d.starved_ns = starved_ns_;
     d.queue_depth_final = in_flight_cap_;
     d.queue_depth_peak = in_flight_cap_;
     d.agent_busy_ns = fill_busy_ns_.load(std::memory_order_relaxed);
-    d.device_wait_min_ns = transfers_landed_ > 0 ? device_min_ns_ : 0;
+    // As on the read side: the device's own time is the performer's to
+    // report, and this thread's own span stands only where no performer
+    // can say.
+    const device_service svc = device_service_of(loop_.driver());
+    d.device_depth = svc.depth;
+    d.lane_wait_ns = svc.lane_wait_ns;
+    const bool attributed = svc.device.transfers > 0;
+    d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns_;
+    d.device_wait_min_ns = attributed
+                               ? svc.device.min_ns
+                               : (transfers_landed_ > 0 ? device_min_ns_ : 0);
   }
 
  private:

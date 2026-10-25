@@ -62,7 +62,7 @@ SELECT = """
 SUPPORT = ["src/blake3pp.cpp", "src/dispatch/dispatch.cpp",
            "src/dispatch/cpu_detect_x86.cpp", "src/diagnosis.cpp",
            "src/io/file_reader.cpp", "src/io/io_engines.cpp",
-           "src/io_hash.cpp"]
+           "src/io/stream_reader.cpp", "src/io_hash.cpp"]
 PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/dispatch.hpp", "include/blake3pp/core.hpp",
           "include/blake3pp/trace.hpp",
@@ -70,6 +70,13 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/detail/io_geometry.hpp",
           "include/blake3pp/detail/file_reader.hpp",
           "include/blake3pp/detail/file_writer.hpp",
+          # The stream driver and the completion half it borrows. They are
+          # pasted here, not left to the parallel block's stripped
+          # includes: update_stream() is the one entry point there whose
+          # definition is compiled, and a reader who enabled the provider
+          # would otherwise reach it as a link error.
+          "include/blake3pp/detail/memory_driver.hpp",
+          "include/blake3pp/detail/pipe_driver.hpp",
           "include/blake3pp/io.hpp"]
 
 

@@ -2,10 +2,11 @@
 
 /// @file
 /// Where a file pipeline's time goes: one record per I/O window, and on
-/// request one per working agent per window. update_file() fills them
-/// when a trace_buffer is set in its options and never otherwise, at a
-/// cost of one branch per window; with a buffer set, a handful of clock
-/// reads per window and per agent.
+/// request one per working agent per window. update_file(),
+/// update_stream() and write_file() over a scheduler fill them when a
+/// trace_buffer is set in their options and never otherwise, at a cost of
+/// one branch per window; with a buffer set, a handful of clock reads per
+/// window and per agent.
 ///
 /// The library records; it never allocates, formats or writes. The
 /// caller provides the storage, reads it back after the call, and turns
@@ -46,6 +47,17 @@ struct window_record {
   /// Bit in flags: the short window that brings a hasher already
   /// part-way through a message back onto a window boundary.
   static constexpr std::uint32_t flag_short_first = 1u << 2;
+  /// Bit in flags: the window reached the tree as the decomposition of
+  /// a run of parts rather than as one subtree, because it is neither a
+  /// whole window of the grid nor one that starts where a node of that
+  /// size may start.
+  ///
+  /// Only a stream sets it (blake3ppsum's `-`): a producer that ran dry
+  /// before filling a window ends it early, and the window after that one
+  /// is short in turn, bringing the grid back onto its boundary. Both
+  /// carry this. How many windows ended that way is
+  /// stream_report::short_flushes.
+  static constexpr std::uint32_t flag_part_run = 1u << 3;
 
   /// Position of the window within this call, from 0.
   std::uint64_t index;
@@ -67,7 +79,7 @@ struct window_record {
   std::uint64_t agent_busy_ns;
   /// Bulk invocations that compressed at least one part.
   std::uint32_t agents_active;
-  /// flag_parallel, flag_last, flag_short_first.
+  /// flag_parallel, flag_last, flag_short_first, flag_part_run.
   std::uint32_t flags;
   /// Which window object -- buffer, part table and operation cell --
   /// carried this window. The pipeline reuses a fixed set of them, so
@@ -168,12 +180,29 @@ struct driver_stats {
   std::uint64_t transfers_landed;
   /// Bytes those transfers moved.
   std::uint64_t transfer_bytes;
-  /// Summed per-window time the device had the transfer, with nothing of
-  /// the pipeline's own in it: t_ready - t_wait_begin on a read, the
-  /// submission to the completion on a write. Divided by
-  /// transfers_landed it is the mean per-window latency; divided again
-  /// by the depth in force it is the interval between windows. Counted
-  /// on every run.
+  /// Summed nanoseconds the device had the transfers, stamped by whoever
+  /// performed each one: submission to completion for an asynchronous
+  /// engine, and around the transfer itself on a thread of the driver's
+  /// own, which leaves that thread's own queueing outside (lane_wait_ns).
+  ///
+  /// NOT a span of the pipeline's timeline. Admission-to-landing contains
+  /// the device's time but is not it, and the difference goes both ways:
+  /// it overstates wherever a transfer waits in a queue of the driver's,
+  /// and understates wherever a driver fills a window before the pipeline
+  /// asks for it. The per-window spans are in the window records, under
+  /// their own names.
+  ///
+  /// A driver that cannot attribute (a span in memory, a stream) leaves
+  /// the admission-to-landing span here instead, and device_depth is then
+  /// zero.
+  ///
+  /// NEVER divide this by the wall clock. Transfers overlap the
+  /// pipeline's own work by design -- read-ahead means the transfer for
+  /// window k+1 runs while the pool hashes window k -- so the sum exceeds
+  /// the wall clock legitimately and a share of it is meaningless. Divide
+  /// by transfers_landed for the mean per-transfer latency, and by the
+  /// wall clock TIMES device_depth for how full the device's queue was,
+  /// which is what diagnosis::device_queued is.
   std::uint64_t device_wait_ns;
   /// Nanoseconds the pipeline could not use a window it already had,
   /// for the one reason more depth cannot fix. Reading, that is bytes
@@ -209,7 +238,7 @@ struct driver_stats {
   std::uint64_t agent_busy_ns;
   /// The shortest of those per-transfer times, which is the device
   /// serving one transfer with nothing queued ahead of it. Zero when
-  /// nothing landed.
+  /// nothing landed, and zero where the driver cannot attribute.
   ///
   /// It is what makes the mean readable. A queue's latency is
   /// proportional to its depth by construction, so device_wait_ns /
@@ -220,6 +249,22 @@ struct driver_stats {
   /// capacity to spare, whatever the mean's absolute size. Counted on
   /// every run, at one comparison per transfer.
   std::uint64_t device_wait_min_ns;
+  /// The most transfers the I/O engine could have at the device at once:
+  /// the queue depth in force where an asynchronous engine carried the
+  /// run, and the threads serving the synchronous rung where it did not
+  /// (one on Windows, whose synchronous threads share one handle). Zero
+  /// where the driver cannot say, and the depth in force stands.
+  ///
+  /// What the device's queue is read against, so a rung that serves four
+  /// transfers at a time is not reported as a full queue of thirty-two.
+  /// Counted on every run.
+  std::uint64_t device_depth;
+  /// Nanoseconds transfers spent waiting for one of those threads before
+  /// they started, with none of the device in it. Nonzero only where the
+  /// transfers were served by threads of the driver's own, and a measure
+  /// of too few of them rather than of a device that is the wall: the
+  /// device's time is already outside this. Counted on every run.
+  std::uint64_t lane_wait_ns;
 };
 
 /// The engaged read rung as text; empty when nothing recorded one.
@@ -242,14 +287,15 @@ static_assert(std::is_trivially_copyable_v<window_record>);
 static_assert(std::is_trivially_copyable_v<agent_record>);
 static_assert(std::is_trivially_copyable_v<driver_stats>);
 
-/// Caller-owned storage for the records of one or more update_file()
-/// calls, handed in through file_io_options::trace.
+/// Caller-owned storage for the records of one or more pipeline runs,
+/// handed in through the options' `trace` field (file_io_options,
+/// stream_io_options, file_write_options).
 ///
 /// Records are claimed in order until the storage is full; every claim
 /// beyond that is counted as a drop. Window records are claimed by the
 /// thread driving the pipeline; agent records by any thread, through one
 /// atomic increment. A claimed record has exactly one writer, and nothing
-/// reads the records until the update_file() call has returned.
+/// reads the records until the call has returned.
 ///
 /// @code
 /// std::vector<blake3pp::window_record> windows(file_bytes / window_bytes + 1);
@@ -497,7 +543,29 @@ struct diagnosis {
   /// the machine: one window is one fill task, so this is the share of
   /// the generator's actual parallelism that was used.
   double fill_busy = 0.0;
-  /// How full the device's queue was, as a share of the depth in force.
+  /// The transfers the I/O engine could have at the device at once,
+  /// which is what device_queued is a share OF.
+  ///
+  /// The same as `depth` wherever an asynchronous engine carried the run:
+  /// the queue the pipeline asked for is the queue the device got. Lower
+  /// where threads of the driver's own carried it, because then the
+  /// device sees as many transfers as there are threads however deep the
+  /// pipeline queued -- and a run read against `depth` there would be
+  /// reported as a full queue the device never had.
+  unsigned device_depth = 0;
+  /// Nanoseconds a transfer waited for one of those threads before it
+  /// started, per transfer. None of the device is in it, so this is the
+  /// measure of too few threads and not of a device that is the wall,
+  /// and it is directly comparable with mean_service_ns: the two are the
+  /// wait and the work of the same transfer. Zero wherever an
+  /// asynchronous engine carried the run.
+  ///
+  /// Per transfer rather than as a share of the wall clock, because the
+  /// waits of transfers queued together overlap: their sum exceeds the
+  /// wall clock whenever more than one is waiting, so a share of it means
+  /// nothing.
+  double mean_lane_wait_ns = 0.0;
+  /// How full the device's queue was, as a share of device_depth.
   /// 1.0 is a queue that was full for the run, so the device's latency
   /// is at its ceiling here and the device is the wall; 1/depth is a
   /// device that served every transfer alone and had capacity to spare.

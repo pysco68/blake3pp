@@ -159,12 +159,15 @@ hashing:
 | FreeBSD | POSIX AIO (`lio_listio`) on a kqueue | `O_DIRECT` |
 
 Each feature degrades independently at runtime: a file the filesystem will
-not open for direct I/O is read buffered, and an engine the OS refuses
-reads synchronously inside the same poll. Which engines a build has is
-decided at compile time and reported by `compiled_io_engines()` (below)
--- the stdio fallback included, which is for platforms with none of the
-above (wasm) rather than a rung anything degrades to. The rung that was engaged is reported after the fact, with the
-reason appended when an asynchronous engine was asked for and refused:
+not open for direct I/O is read buffered, and a transfer the asynchronous
+engine refuses is performed synchronously on a few I/O threads of the
+library's own, then reported from the same poll. Which engines a build has
+is decided at compile time and reported by `compiled_io_engines()`
+(below). That list includes the stdio fallback, which serves platforms
+with none of the engines above (wasm); nothing degrades to it.
+
+The rung that was engaged is reported after the fact, with the reason
+appended when an asynchronous engine was asked for and refused:
 `write_report::backend` for a write, and
 `blake3pp::read_backend(trace.driver())` for a read given a `trace_buffer`.
 
@@ -271,6 +274,45 @@ which halved the pipeline there, 22 against 41 GiB/s. The
 `offload_submit` option turns the hand-off off for callers who want the
 submit inline (`--inline-submit` in the tools), and the writer behind
 `blake3ppgen --output` takes the same option.
+
+#### A stream instead of a file
+
+`update_stream()` is `update_file()` over a source that cannot be
+seeked: a pipe, a socket, standard input. Its geometry is not planned,
+because a stream has none to plan from — its length is known only when
+it ends, and a window is however much of it arrived.
+
+```cpp
+#include <blake3pp/parallel_io.hpp>
+
+blake3pp::hasher h;
+auto r = blake3pp::update_stream(h, blake3pp::standard_input(),
+                                 pool.get_scheduler());
+auto d = h.finalize();
+```
+
+The reader fills one window on the calling thread while the pool hashes
+the ones before it. A producer that keeps up fills every window, and the
+run is bounded by the hash or by the stream itself. A producer that does
+not has its windows ended when the stream runs dry with at least half a
+window in hand, and what arrived is hashed as a run of subtrees rather
+than waited for. The `stream_report` the call returns says how many
+windows ended that way.
+
+The hand-over condition is an observable rather than a clock: the fill
+blocks for the first bytes, drains what is queued without blocking, and
+gives the window up on an empty stream. An empty stream is proof that the
+producer is not waiting on the reader, so blocking for its next write is
+free, and the producer is never left blocked on a pipe nobody is
+draining. Half a window is the floor because a hand-over costs a round
+trip through the pool and what it buys is overlap, so a short prefix is
+not worth one. The behaviour is the same on every platform.
+
+The hasher must sit on a window boundary, which every fresh one does; a
+hasher part-way through a window cannot be brought onto the grid from a
+stream, because the window that would do it is the one window a stream
+cannot promise to fill. `--diag` reads a stream run like any other, with
+the stream as the device.
 
 ### Writing a file
 

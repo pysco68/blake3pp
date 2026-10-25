@@ -887,8 +887,7 @@ TEST_CASE("io engine introspection: the ladder, what it grants, the best") {
   }
 
   // Nothing asynchronous hangs below a synchronous rung, so a refusal
-  // anywhere on the ladder lands on a rung that does the transfer on
-  // the calling thread.
+  // anywhere on the ladder lands on a synchronous rung.
   bool seen_sync = false;
   for (const auto e : compiled) {
     CAPTURE(blake3pp::to_string(e));
@@ -938,11 +937,10 @@ TEST_CASE("io engine introspection: the ladder, what it grants, the best") {
   CHECK(std::ranges::equal(blake3pp::available_io_engines(), available));
 }
 
-// is_async() is the column --no-async is built from, so it is worth a
-// positive assertion rather than only a negative one: the five engines
-// that hand a transfer to the OS, and the three that do it on the
-// calling thread, named here so that flipping a column in the .def
-// fails a test instead of quietly changing a help string.
+// is_async() is the column --no-async is built from, so both answers are
+// asserted: the five engines that hand a transfer to the OS, and the
+// three synchronous ones. Flipping a column in the .def fails this
+// test.
 TEST_CASE("is_async marks the engines that hand the transfer to the OS") {
   CHECK(blake3pp::is_async(blake3pp::io_engine::io_uring));
   CHECK(blake3pp::is_async(blake3pp::io_engine::ioring));

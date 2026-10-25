@@ -20,10 +20,12 @@ facility, and it is in the umbrella header.
 | `agent_record` | bulk invocation that compressed at least one part, per window | the agent itself, opt-in |
 | `driver_stats` | run | the driver thread, pipeline path only |
 
-Tracing covers file input: `update_file()` and `hash_file()`, sequential
-and over a scheduler. In-memory hashing is not instrumented, and neither
-is the experimental [many-files layer](async.md). The finest timed unit is
-one part, a subtree of at least 16 chunks; nothing below that is timed.
+Tracing covers the file pipeline: `update_file()` and `hash_file()`,
+sequential and over a scheduler, `update_stream()`, `write_file()` over a
+scheduler, and the senders of the experimental
+[many-files layer](async.md). In-memory hashing is not instrumented. The
+finest timed unit is one part, a subtree of at least 16 chunks; nothing
+below that is timed.
 
 The sequential window loop has no driver thread, so it fills window
 records and leaves `driver_stats` zeroed. Agent records exist only where
@@ -138,7 +140,7 @@ The rest describes the window:
 | `agents_active` | bulk invocations that compressed at least one part |
 | `slot` | which window object carried it — the track its phases belong on when several are in flight; 0 on the sequential path, which has one |
 | `file` | the file's index in a many-files operation (`async_update_files`), which fills one buffer with every file's windows; 0 for a single file |
-| `flags` | `flag_parallel` (fanned out over the scheduler), `flag_last` (reaches the end of the file), `flag_short_first` (the short window that brings a part-way hasher back onto a window boundary) |
+| `flags` | `flag_parallel` (fanned out over the scheduler), `flag_last` (reaches the end of the file), `flag_short_first` (the short window that brings a part-way hasher back onto a window boundary), `flag_part_run` (a stream window that reached the tree as a run of parts: one the producer left short, or the one after it that brings the grid back) |
 
 ### `agent_record`
 
@@ -175,11 +177,13 @@ thread is the bottleneck.
 | `max_reads_in_flight` | the most reads submitted and not yet landed: what the device saw |
 | `max_windows_in_flight` | the most windows reading, on the pool or waiting to reduce |
 | `transfers_landed`, `transfer_bytes` | windows whose transfer landed, and the bytes they moved |
-| `device_wait_ns` | summed per-window time the device had the transfer, with nothing of the pipeline's own in it |
+| `device_wait_ns` | summed per-window time the device had the transfer, stamped by whoever performed it; where the driver cannot attribute (memory, a stream), the admission-to-landing span |
 | `starved_ns` | the pipeline unable to use a window it already held: reading, no free window; writing, nothing to write |
 | `queue_depth_final`, `queue_depth_peak` | the depth the run ended on and the deepest it reached |
 | `agent_busy_ns` | summed over every window and agent: the pool compressing on a read run, filling on a write one |
 | `device_wait_min_ns` | the shortest of those per-transfer times: the device with nothing queued ahead of it |
+| `device_depth` | the most transfers the engine could have at the device at once: the queue depth on an asynchronous engine, the I/O threads on the synchronous rung (one on Windows); 0 where the driver cannot say |
+| `lane_wait_ns` | time transfers waited for one of those I/O threads before they started; nonzero only where those threads served transfers |
 | `read_backend` | the rung the reads engaged, through `read_backend(d)` |
 
 The four transfer counters are kept on every run, traced or not, and a

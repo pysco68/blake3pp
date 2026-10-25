@@ -19,9 +19,11 @@ target_link_libraries(blake3ppgen PRIVATE
   blake3pp::node_program)
 
 # Smoke tests, driven by CMake script mode so they run identically on
-# every platform (no shell): known-answer for the empty input via stdin,
-# and the --check round trip including corruption detection.
-foreach(case version engines empty_stdin stdin_parallel check_roundtrip
+# every platform (no shell). They cover known answers, --check round
+# trips with corruption detection, the key forms, the stream and --diag
+# paths, the generator's determinism, seek and --output, and the usage
+# errors (see smoketest.cmake).
+foreach(case version engines empty_stdin stdin_parallel stdin_diag check_roundtrip
     check_batched length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
     gen_output gen_seed_file sum_errors key_forms gen_errors)

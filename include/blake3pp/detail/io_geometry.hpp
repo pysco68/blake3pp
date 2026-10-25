@@ -106,6 +106,15 @@ inline constexpr unsigned default_queue_depth = 4;
   return std::clamp(requested, 2u, max_queue_depth);
 }
 
+// Window objects a stream's run allocates.
+//
+// A stream has one position, so exactly one window is ever being filled:
+// depth buys nothing here, and the count is only what lets the pool and
+// the reducer run ahead of the fill. Four is one being filled, one on the
+// pool, and two holding completions that wait in the reducer for a
+// sibling. stream_io_options::windows overrides it.
+inline constexpr unsigned default_stream_windows = 4;
+
 // Buffer memory a read plan spends on window objects, which is both the
 // reads the device has outstanding and the windows a pool has work in.
 //

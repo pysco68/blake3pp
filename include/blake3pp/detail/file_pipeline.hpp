@@ -10,11 +10,14 @@
 //       | continues_on(io.scheduler())
 //       | then(reduce_into_tree)
 //
-// and the whole pipeline runs on the thread that called update_file: the
-// library owns no thread. Only the compress stage leaves it, and
-// continues_on brings the result back through driver_scheduler.
+// and the thread that called update_file drives the whole pipeline. The
+// compress stage alone leaves it, on the caller's scheduler, and
+// continues_on brings the result back through driver_scheduler. The only
+// threads the library owns sit below the driver: on the synchronous rung the I/O
+// backend performs transfers on lanes of its own, and their callbacks
+// still run inside poll() on this thread.
 //
-// The one thread is also the contract with the I/O backends: every
+// That thread is also the contract with the I/O backends: every
 // submit_read, flush and poll happens here, and wake() is the only
 // member another thread calls. That is why a scheduler exists at all --
 // a pool thread cannot touch the driver, so it parks a node on the run
@@ -600,6 +603,8 @@ class driver_loop {
   }
 
   [[nodiscard]] D& driver() noexcept { return drv_; }
+  // For a const reporter asking the driver what its engine offered.
+  [[nodiscard]] const D& driver() const noexcept { return drv_; }
 
   // Where to record what this thread spends its time on; null records
   // nothing, which is the default and costs one branch per poll.
@@ -983,10 +988,18 @@ inline constexpr std::size_t reducer_nodes = 256;
 // windows' reservations, one node per window that may be in flight, and
 // one for the window admission is about to take. Never below
 // reducer_nodes, so a small run keeps the headroom the default had.
+// On a stream every window may be an edge window: once the producer has
+// left one short, the grid is off its boundary and the window after it
+// is a run of parts rather than one subtree -- so each window in flight
+// reserves a whole decomposition instead of a single node, and so does
+// the one admission is about to take.
 [[nodiscard]] constexpr std::size_t reducer_nodes_for(
-    unsigned windows, std::size_t parts) noexcept {
+    unsigned windows, std::size_t parts, bool streaming = false) noexcept {
+  const std::size_t per_window = streaming ? nodes_for(parts) : 1;
+  const std::size_t edges = streaming ? 0 : 2 * nodes_for(parts);
   const std::size_t needed =
-      2 * 54 + 2 * nodes_for(parts) + static_cast<std::size_t>(windows) + 1;
+      2 * 54 + edges +
+      (static_cast<std::size_t>(windows) + 1) * per_window;
   return std::max(reducer_nodes, needed);
 }
 
@@ -1010,9 +1023,9 @@ inline constexpr std::size_t reducer_nodes = 256;
 // Direct I/O wants aligned offsets as well as aligned lengths, and the
 // windows after a short first one start at head + n * window -- so an
 // unaligned head misaligns every window of the file, not just the first.
-// Degrading read by read would put every one of them on the synchronous
-// path inside poll(), on the driver thread; a buffered file keeps them
-// all asynchronous. So the choice is per file, and it is made once.
+// Degrading read by read would send every one of them to the synchronous
+// rung; a buffered file keeps them all asynchronous. So the choice is per
+// file, and it is made once.
 [[nodiscard]] constexpr bool direct_io_fits(std::size_t head) noexcept {
   return head % direct_alignment == 0;
 }
@@ -1047,6 +1060,15 @@ struct pipeline_plan {
   // message has to be a whole number of windows, which the scope
   // asserts, since a partial one could not be a subtree.
   bool ends_message = true;
+  // Whether the source is a stream: a pipe, a socket, anything whose
+  // bytes arrive rather than sit. Its length is not known in advance,
+  // and a window's own length is whatever the driver put in it rather
+  // than what the grid asked for. The scope then re-reads file.size()
+  // after every window, takes each window's length from the storage
+  // the driver handed back, and treats a window the grid did not fill
+  // as a run of whole parts rather than as one subtree. False for every
+  // seekable source, where none of that is paid for.
+  bool streaming = false;
 };
 
 // How many windows a file of file_bytes has on this grid, the short
@@ -1147,7 +1169,6 @@ struct window_plan {
   std::size_t parts = 0;
   std::size_t part_chunks = 0;
   std::size_t node_cost = 1;   // reducer slots admission reserves
-  unsigned edge_slot = 0;      // which node buffer an edge window uses
 };
 static_assert(std::is_trivially_copyable_v<window_plan>);
 
@@ -1193,6 +1214,24 @@ struct pipeline_window {
   bool cancel_asked = false;  // the sweep has already asked for this read
   window_plan plan;
   std::size_t nodes = 0;  // nodes the fold produced
+
+  // Where this window's fold leaves its nodes when the window is a run
+  // of parts rather than one subtree.
+  //
+  // Per window, not one buffer per edge. A seekable file has at most two
+  // such windows -- the short first one and the last -- but a stream has
+  // no such bound: once a producer has left one window short the grid is
+  // off its boundary, and every window after it is a run of parts until
+  // the next one brings the grid back. Any of them may be in flight at
+  // once, so the storage belongs to the window.
+  //
+  // The bound is this run's own worst case rather than the message
+  // ceiling's: fold_aligned_runs() produces one ascending and one
+  // descending chain of nodes, at most one per level of the run, and
+  // window_compress::prepare_edge() refuses a run of more parts than the
+  // budget's table holds.
+  static constexpr std::size_t node_cap = nodes_for(Budget.parts());
+  std::array<tree_reducer::node, node_cap> fold_nodes{};
 
   // Where this window's bytes are, which is settled when the window is
   // taken. Only the ADDRESS is: use this to record where a later stage
@@ -1426,9 +1465,13 @@ class window_scope
         base_count_(h.count()),
         head_window_bytes_(plan.head_bytes),
         ends_message_(plan.ends_message),
+        streaming_(plan.streaming),
+        grid_parts_(plan.window_bytes / chunk_size /
+                    part_chunks<Budget>(plan.window_bytes / chunk_size)),
         base_chunk_((h.count() + head_window_bytes_) / chunk_size),
         file_bytes_(file.size()),
-        nodes_total_(reducer_nodes_for(plan.windows, Budget.parts())),
+        nodes_total_(
+            reducer_nodes_for(plan.windows, Budget.parts(), plan.streaming)),
         reducer_capacity_(opts.reducer_capacity == 0
                               ? nodes_total_
                               : std::min(opts.reducer_capacity, nodes_total_)),
@@ -1439,9 +1482,18 @@ class window_scope
     // Where each window's bytes actually are is the driver's answer, and
     // it is asked per window, because a source already in memory has a
     // different view for every offset.
-    assert((ends_message_ || file_bytes_ % window_bytes_ == 0) &&
+    assert((ends_message_ || streaming_ || file_bytes_ % window_bytes_ == 0) &&
            "a span that does not end the message must be a whole number "
            "of windows: a partial one cannot be absorbed as a subtree");
+    // A stream has to start on the grid. The short first window is read
+    // whole or not at all -- its length is what plan_short_first splits
+    // into a head for the hasher and parts for the pool -- and a
+    // producer that left it short would leave the grid off every part
+    // boundary for the rest of the run. Every caller streams into a
+    // hasher that is on a window boundary, which is every fresh one.
+    require(!streaming_ || head_window_bytes_ == 0,
+            "update_stream(): a hasher part-way through a window cannot be "
+            "brought onto the grid from a stream");
     // Checked in every build: a read of window_bytes_ into a slot the pool
     // sized smaller runs off the end of the arena, which the driver hands
     // out by slot without a length of its own.
@@ -1585,12 +1637,21 @@ class window_scope
       d.max_windows_in_flight = max_windows_;
       d.transfers_landed = transfers_landed_;
       d.transfer_bytes = transfer_bytes_;
-      d.device_wait_ns = device_wait_ns_;
       d.starved_ns = starved_ns_;
       d.queue_depth_final = reads_in_flight_;
       d.queue_depth_peak = reads_in_flight_;
       d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
-      d.device_wait_min_ns = transfers_landed_ > 0 ? device_min_ns_ : 0;
+      // The device's own time belongs to whoever performed the transfer,
+      // so it is preferred wherever the driver can attribute it. A driver
+      // that cannot leaves the admission-to-landing span standing.
+      const device_service svc = device_service_of(loop_.driver());
+      d.device_depth = svc.depth;
+      d.lane_wait_ns = svc.lane_wait_ns;
+      const bool attributed = svc.device.transfers > 0;
+      d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns_;
+      d.device_wait_min_ns =
+          attributed ? svc.device.min_ns
+                     : (transfers_landed_ > 0 ? device_min_ns_ : 0);
     }
     if (eptr_) {
       return outcome::exception;
@@ -1754,18 +1815,31 @@ class window_scope
         bool is_edge_fanout = false;
         try {
           take_next(*w);
+          if (w->bytes == 0) {
+            // A stream whose length was a whole number of windows: the
+            // end is only visible as a window with nothing in it, and
+            // take_next() has just recorded where it is. Nothing to
+            // start, and the window goes straight back.
+            w->rec = nullptr;
+            w->op.live = false;
+            pool_.give_back(w);
+            break;
+          }
           claim_record(*w);
-          // An edge window is the short first one or the last one, each
-          // with its own cell, since a three-window file has both in
-          // flight at once; one with nothing to fan out is only a read.
-          is_full = !w->last && !w->short_first;
+          // Three shapes. A full window is one subtree and inserts one
+          // node. A window with ends the hasher owns -- the short first
+          // one, the last one -- or one a stream left off the grid is a
+          // run of parts and inserts their decomposition; it uses the
+          // cell its own window index names, because a stream can have
+          // several in flight at once. An end with nothing worth
+          // fanning out is only a read, and the hasher takes it whole.
+          is_full = !w->last && !w->short_first && w->plan.parts == 0;
           is_edge_fanout = !is_full && w->plan.parts >= 2;
           if (is_full) {
             prepare_compress(*w);
             cells.full[cell].emplace(typename Cells::connect_full{this, w});
           } else if (is_edge_fanout) {
-            (w->last ? cells.last_edge : cells.first_edge)
-                .emplace(typename Cells::connect_edge{this, w});
+            cells.edge[cell].emplace(typename Cells::connect_edge{this, w});
           } else {
             (w->last ? cells.last_read : cells.first_read)
                 .emplace(typename Cells::connect_read{this, w});
@@ -1793,7 +1867,7 @@ class window_scope
         if (is_full) {
           ex::start(*cells.full[w->cell]);
         } else if (is_edge_fanout) {
-          ex::start(*(w->last ? cells.last_edge : cells.first_edge));
+          ex::start(*cells.edge[w->cell]);
         } else {
           ex::start(*(w->last ? cells.last_read : cells.first_read));
         }
@@ -1829,10 +1903,6 @@ class window_scope
   };
 
 
-
-  // What the node buffers hold: the worst case over any run, which is
-  // what fold_aligned_runs asserts against.
-  static constexpr std::size_t edge_node_cap = 2 * 54;
 
  public:
   // The three chain builders, the receiver they complete and the
@@ -1958,7 +2028,7 @@ class window_scope
                             p.part_chunks, p.parts, p.first_chunk,
                             h_.key_words(), h_.mode_flags(), trace_, w.index,
                             file_index_);
-    const std::span<tree_reducer::node> out(edge_nodes_[w.plan.edge_slot]);
+    const std::span<tree_reducer::node> out(w.fold_nodes);
     const ex::inplace_stop_token tok = stop_source_.get_token();
     return stamped<std::size_t>(
         w, tok, compress_edge_on<Tracer::traced>(sched_, w.compress, out, tok));
@@ -1971,11 +2041,11 @@ class window_scope
   void insert_edge_nodes(window& w, std::size_t nodes) {
     // fold_aligned_runs() wrote these, bounded by the span it was given;
     // reading more than that span holds would walk off the array.
-    require(nodes <= edge_node_cap,
-            "an edge window produced more nodes than its slot holds");
+    require(nodes <= window::node_cap,
+            "an edge window produced more nodes than its own storage holds");
     w.nodes = nodes;
     for (std::size_t i = 0; i < nodes; ++i) {
-      const tree_reducer::node& n = edge_nodes_[w.plan.edge_slot][i];
+      const tree_reducer::node& n = w.fold_nodes[i];
       // Admission reserved a whole decomposition for this window, so a
       // refusal is capacity arithmetic that disagrees with itself. Checked
       // in every build: dropping the node silently is a subtree missing
@@ -2098,7 +2168,19 @@ class window_scope
     geometry g;
     g.offset = next_offset_;
     g.short_first = g.offset == 0 && head_window_bytes_ > 0;
-    const std::size_t want = g.short_first ? head_window_bytes_ : window_bytes_;
+    // A window ends at the next boundary of the grid the full windows
+    // sit on, which on a seekable source is always one whole window
+    // away. On a stream it need not be: a producer that left a window
+    // short put the cursor between two boundaries, and the window after
+    // it asks for the remainder -- the short first window's trick,
+    // applied mid-stream, which is what keeps the grid from drifting for
+    // the rest of the run.
+    const std::uint64_t past_head =
+        next_offset_ - std::min<std::uint64_t>(next_offset_, head_window_bytes_);
+    const std::size_t to_boundary =
+        static_cast<std::size_t>(past_head % window_bytes_);
+    const std::size_t want =
+        g.short_first ? head_window_bytes_ : window_bytes_ - to_boundary;
     g.bytes = static_cast<std::size_t>(
         std::min<std::uint64_t>(want, file_bytes_ - next_offset_));
     g.last = ends_message_ && next_offset_ + g.bytes >= file_bytes_;
@@ -2108,7 +2190,17 @@ class window_scope
   // What the next window would reserve in the reducer, from the same
   // plan the window will get.
   [[nodiscard]] std::size_t next_window_cost() const noexcept {
-    return plan_window(next_geometry()).node_cost;
+    const std::size_t planned = plan_window(next_geometry()).node_cost;
+    if (!streaming_) {
+      return planned;
+    }
+    // The grid asks, the driver answers, and a window it ends early
+    // reserves a whole decomposition where a full one reserves a single
+    // node. Admission has to have cleared whatever arrives, so it
+    // reserves the worst case over any length the ask could come back
+    // as -- which is also what reducer_nodes_for() sized the storage
+    // for.
+    return std::max(planned, nodes_for(grid_parts_));
   }
 
   // Decides a window's three parts. A window that is both ends of the
@@ -2133,6 +2225,42 @@ class window_scope
     if (g.short_first) {
       return plan_short_first(g.bytes, p);
     }
+    // One subtree: a whole window of the grid, starting where a node of
+    // that size may start. Every interior window of a seekable source is
+    // this, and so is every window of a stream whose producer kept up.
+    const std::uint64_t chunks = g.bytes / chunk_size;
+    if (g.bytes == window_bytes_ && chunks > 0 &&
+        p.first_chunk % chunks == 0) {
+      return p;
+    }
+    return plan_mid(g.bytes, p);
+  }
+
+  // A window the grid did not fill, in the middle of a message.
+  //
+  // None of it can go to the hasher. The hasher takes bytes in order and
+  // every window before this one is still a pending node, so a head
+  // absorbed here would land at the wrong position -- which is what
+  // separates this from the short FIRST window, whose head is at the
+  // hasher's own cursor by construction. All of it goes to the pool as
+  // whole parts instead, and comes back as the decomposition of that run.
+  //
+  // What makes that legal is the flush rule: every window a stream ends
+  // early is a multiple of one part of the grid, so the run starts on a
+  // part boundary and ends on one. take_next() checks it, because a run
+  // that is not is a wrong digest and no error.
+  [[nodiscard]] window_plan plan_mid(std::size_t bytes,
+                                     window_plan p) const noexcept {
+    const std::size_t chunks = static_cast<std::size_t>(bytes / chunk_size);
+    const std::size_t part = part_chunks<Budget>(chunks);
+    if (chunks < part) {
+      // Too short to be even one part, and nothing here may reach the
+      // hasher. Left for check_streamed_window() to refuse.
+      return p;
+    }
+    p.part_chunks = part;
+    p.parts = chunks / part;
+    p.node_cost = nodes_for(p.parts);
     return p;
   }
 
@@ -2159,7 +2287,24 @@ class window_scope
   void take_next(window& w) {
     w.cancel_asked = false;
     w.view_ready = false;
-    const geometry g = next_geometry();
+    // Before the driver is asked, not after: the device counters are
+    // differences of this timestamp and the one read_landed() takes, and
+    // for a stream the asking IS the transfer -- the driver fills the
+    // window where it names it, because the window's length is what the
+    // subtrees are planned from and a stream only knows the length once
+    // it has the bytes. One clock read per window either way.
+    w.t_read_begin = steady_now_ns();
+    geometry g = next_geometry();
+    const window_storage storage =
+        loop_.driver().window_storage_for(file_, w.slot, g.offset, g.bytes);
+    if (streaming_) {
+      // The driver had the last word on the length, and on where the
+      // message ends: a stream learns that only by reaching it, so the
+      // size is re-read here rather than taken once at the start.
+      file_bytes_ = file_.size();
+      g.bytes = storage.view.size();
+      g.last = ends_message_ && g.offset + g.bytes >= file_bytes_;
+    }
     w.plan = plan_window(g);
     w.offset = g.offset;
     w.bytes = g.bytes;
@@ -2168,11 +2313,47 @@ class window_scope
     w.chunks = w.bytes / chunk_size;
     w.index = index_++;
     w.nodes = 0;
-    const window_storage storage =
-        loop_.driver().window_storage_for(file_, w.slot, w.offset, w.bytes);
     w.read_into = storage.read_into;
     w.bytes_view = storage.view;
+    if (streaming_ && w.bytes > 0) {
+      check_streamed_window(w);
+    }
     next_offset_ += w.bytes;
+  }
+
+  // What a window a stream ended early has to be for its bytes to reach
+  // the tree at all, checked in every build.
+  //
+  // A run that is not a whole number of aligned parts yields nodes
+  // claiming ranges that are not nodes of the tree: the sizes still sum
+  // to the message, the reducer's own disjointness check still passes,
+  // and the digest is simply wrong. Nothing downstream can catch it, so
+  // it is caught here.
+  // @throws std::logic_error if the driver flushed a window the grid
+  //         cannot decompose.
+  void check_streamed_window(const window& w) const {
+    if (w.last || w.short_first) {
+      return;  // the hasher's own ends; plan_last and plan_short_first
+    }
+    require(w.bytes % chunk_size == 0,
+            "a stream flushed a window that is not a whole number of "
+            "chunks");
+    if (w.plan.parts == 0) {
+      // One subtree: a whole window of the grid, on a boundary a node of
+      // that size may start at.
+      require(w.bytes == window_bytes_,
+              "a stream flushed a window that is neither a whole window "
+              "of the grid nor a run of two or more parts");
+      return;
+    }
+    require(w.plan.parts >= 2,
+            "a stream flushed fewer than two parts: a window of one part "
+            "is not worth a round trip through the pool");
+    require(w.bytes == w.plan.parts * w.plan.part_chunks * chunk_size,
+            "a stream flushed a window its parts do not cover exactly");
+    require(w.plan.first_chunk % w.plan.part_chunks == 0,
+            "a stream flushed a window that does not start on a part "
+            "boundary");
   }
 
   // The short window that brings the hasher back to a window boundary.
@@ -2209,7 +2390,6 @@ class window_scope
     p.parts = parts;
     p.first_chunk = (count + head) / chunk_size;
     p.node_cost = nodes_for(parts);
-    p.edge_slot = 0;
     // The parts cover the window exactly: the head lands on a part
     // boundary and the window ends on a window boundary, and the part
     // size divides the window because both are powers of two and the
@@ -2245,7 +2425,6 @@ class window_scope
     p.parts = parts;
     p.tail_bytes = bytes - parts * p.part_chunks * chunk_size;
     p.node_cost = nodes_for(parts);
-    p.edge_slot = 1;
     return p;
   }
 
@@ -2386,17 +2565,18 @@ class window_scope
   }
 
   void claim_record(window& w) noexcept {
-    // Unconditional: the device counters are differences of this
-    // timestamp and the one read_landed() takes, so they cannot be a
-    // tracing caller's privilege. Two clock reads per window, which at
-    // an 8 MiB window and 46 GiB/s is about 12,000 a second.
-    w.t_read_begin = steady_now_ns();
+    // t_read_begin was stamped by take_next(), before the driver was
+    // asked for the window: see the note there.
     w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
     if (w.rec != nullptr) {
       w.rec->index = w.index;
       w.rec->bytes = w.bytes;
-      w.rec->flags = (w.last ? window_record::flag_last : 0) |
-                     (w.short_first ? window_record::flag_short_first : 0);
+      w.rec->flags =
+          (w.last ? window_record::flag_last : 0) |
+          (w.short_first ? window_record::flag_short_first : 0) |
+          (!w.last && !w.short_first && w.plan.parts > 0
+               ? window_record::flag_part_run
+               : 0);
       w.rec->slot = w.slot;
       w.rec->file = file_index_;
       w.rec->t_wait_begin = w.t_read_begin - trace_->epoch_ns();
@@ -2475,6 +2655,13 @@ class window_scope
   std::uint64_t base_count_ = 0;        // the hasher's byte count at start
   std::size_t head_window_bytes_ = 0;   // the short first window, or zero
   bool ends_message_ = true;
+  // A source whose length arrives with its bytes; see pipeline_plan.
+  bool streaming_ = false;
+  // Parts in a full window of the grid: what a window a stream ended
+  // early reserves in the reducer, since admission has to clear the
+  // length the driver turns out to hand back and not just the one it
+  // was asked for.
+  std::size_t grid_parts_ = 1;
   std::uint64_t base_chunk_ = 0;        // where the full windows' grid starts
   std::uint64_t file_bytes_ = 0;
   // The storage this run allocated, and what admission may use of it.
@@ -2483,10 +2670,6 @@ class window_scope
   ex::inplace_stop_token opts_stop_token_{};
   std::unique_ptr<tree_reducer::node[]> nodes_;
   tree_reducer reducer_;
-  // Where an edge window's fold leaves its nodes: one buffer for the
-  // first window and one for the last, since a three-window file has
-  // both in flight at once.
-  std::array<std::array<tree_reducer::node, edge_node_cap>, 2> edge_nodes_{};
 
   // What this scope currently holds, so the cancel sweep names its own
   // reads and not another pipeline's sharing the same pool.
@@ -2551,7 +2734,8 @@ struct pipeline_cells {
   using edge_op = EdgeOp;
 
   explicit pipeline_cells(unsigned count)
-      : full(std::make_unique<std::optional<full_op>[]>(count)) {}
+      : full(std::make_unique<std::optional<full_op>[]>(count)),
+        edge(std::make_unique<std::optional<edge_op>[]>(count)) {}
 
   pipeline_cells(const pipeline_cells&) = delete;
   pipeline_cells& operator=(const pipeline_cells&) = delete;
@@ -2573,12 +2757,15 @@ struct pipeline_cells {
   using connect_edge = connect_as<edge_op, &Scope::template edge_chain<>>;
 
   std::unique_ptr<std::optional<full_op>[]> full;
-  // One cell of each shape per edge window: the first and the last can
-  // be in flight together on a file of three windows, and either may
-  // turn out to have no parts worth fanning out.
-  std::optional<edge_op> first_edge;
+  // A window that is a run of parts rather than one subtree uses the
+  // same cell index as a full one would: the first and the last can be
+  // in flight together on a file of three windows, and a stream whose
+  // producer left a window short puts every window after it on this
+  // shape until the grid comes back to its boundary.
+  std::unique_ptr<std::optional<edge_op>[]> edge;
+  // The two windows that can have no parts worth fanning out, which are
+  // the file's own ends and nothing in between.
   std::optional<read_only_op> first_read;
-  std::optional<edge_op> last_edge;
   std::optional<read_only_op> last_read;
 };
 

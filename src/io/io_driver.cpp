@@ -99,11 +99,9 @@ struct io_driver::impl {
     owed_sentinel.owed_next = &op;
   }
 
-  // Drops the list without reading any operation on it, for the
-  // teardown paths whose operations may already be gone (a file destroyed
-  // with transfers owed, the driver's own destructor). Their `live` stays
-  // as it was: nothing here may touch them, which is why those paths are
-  // documented as the last resort and the pipelines drain explicitly.
+  // Drops the list without reading any operation on it, for the driver's
+  // own destructor: every file is gone by then and has drained, so the
+  // list is empty unless a caller broke that rule.
   void abandon_owed() noexcept {
     owed_sentinel.owed_next = owed_sentinel.owed_prev = &owed_sentinel;
   }
@@ -160,8 +158,8 @@ io_driver::~io_driver() {
          "an io_driver::file outlived its io_driver: every file must be "
          "destroyed before the driver it was opened on");
 #endif
-  // The context's drain, not drain(): the operations a caller left owed
-  // at destruction are not promised to exist any more.
+  // The context's drain, not drain(): every file has already drained
+  // what it owed, so there is no operation left to lower `live` on.
   impl_->ctx.drain();
   impl_->abandon_owed();
 }
@@ -174,18 +172,18 @@ io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
                                      how.preallocate_bytes,
                                      how.waive_zero_fill})) {}
 
-// A file destroyed with transfers still owed makes the context drain
-// itself, which forgets every file's transfers without a callback. The
-// operations behind them may already be gone -- that is the reason this
-// path exists -- so the list is dropped unread and their `live` is not
-// lowered. Every owed operation is one the context has in flight, so an
-// empty context with a non-empty list is exactly that case.
+// A file destroyed with transfers still owed either drains the whole
+// context, forgetting every file's transfers without a callback (Linux,
+// FreeBSD, the synchronous contexts), or forgets its own (Windows,
+// Darwin). The operations behind them are still alive (the contract
+// requires it: a lane may be writing into one until that drain returns),
+// so their `live` is lowered like an explicit drain's: every owed
+// operation when the context was left with nothing in flight, otherwise
+// this file's own, whose storage a later submit may take again.
 io_driver::file::~file() {
   io_driver::impl& d = *impl_->drv;
   impl_.reset();
-  if (d.ctx.in_flight() == 0) {
-    d.abandon_owed();
-  }
+  d.forget_owed(d.ctx.in_flight() == 0 ? nullptr : this);
 }
 
 std::uint64_t io_driver::file::size() const noexcept {
@@ -246,6 +244,18 @@ void io_driver::cancel(io_op& op) noexcept {
 
 std::size_t io_driver::in_flight() const noexcept {
   return impl_->ctx.in_flight();
+}
+
+unsigned io_driver::device_depth() const noexcept {
+  return impl_->ctx.device_depth();
+}
+
+std::uint64_t io_driver::lane_wait_ns() const noexcept {
+  return impl_->ctx.lane_wait_ns();
+}
+
+device_time io_driver::device_time_of_run() const noexcept {
+  return impl_->ctx.device();
 }
 
 void io_driver::drain() noexcept {

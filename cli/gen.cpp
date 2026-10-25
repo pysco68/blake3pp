@@ -133,10 +133,18 @@ void report_write_diagnosis(const blake3pp::diagnosis& r, unsigned threads) {
           b3tool::bytes_label(r.depth * r.window_bytes));
   println(stderr,
           "  device         {} per window over {} writes (min {}), holding "
-          "{:5.1f}% of the windows",
+          "{:5.1f}% of the windows, {} at a time",
           service_label(r.mean_service_ns), r.transfers,
           service_label(static_cast<double>(r.min_service_ns)),
-          100.0 * r.device_busy);
+          100.0 * r.device_busy, r.device_depth);
+  // Where the engine holds fewer than the pipeline queued, the windows
+  // line above is not what the device answered.
+  if (r.device_depth < r.depth) {
+    println(stderr,
+            "                 ({} of those {} windows could be at the device "
+            "at once, and each write waited {} for a slot)",
+            r.device_depth, r.depth, service_label(r.mean_lane_wait_ns));
+  }
   switch (r.label) {
     case blake3pp::bottleneck::generator:
       println(stderr,

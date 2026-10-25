@@ -1,8 +1,8 @@
 #pragma once
 
-// The portable floor: buffered, fully synchronous stdio, for platforms
-// with none of the native backends (e.g. wasm). Internal to src/io/,
-// never installed.
+// The portable floor: buffered, synchronous stdio on one lane, for a
+// platform that matches none of the native backends in
+// backend_select.hpp. Internal to src/io/, never installed.
 
 #include <cassert>
 #include <cerrno>
@@ -49,6 +49,9 @@ class stdio_source {
  public:
   // See pread_source: the engine this source is.
   static constexpr io_engine rung_engine = io_engine::stdio;
+  // Seek then read is two calls over one cursor, so transfers here may
+  // not overlap: this source gets a single lane.
+  static constexpr bool positional = false;
 
   stdio_source(const std::filesystem::path& path,
                const file_open_options& how) {

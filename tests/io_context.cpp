@@ -12,8 +12,11 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -95,9 +98,8 @@ struct temp_file {
 // One counted completion. `owner` points here, which is the only thing
 // the contract says that field is for. The thread id is recorded because
 // "callbacks run inside poll()" means on the caller's thread: a backend
-// whose completions arrive on its own workers (GCD) has to hand them over
-// rather than call from there, and nothing else in the suite would
-// notice if it did not.
+// whose transfers finish on its own workers (GCD) or on lanes hands the
+// completions over to poll() instead of calling from there.
 struct probe {
   int calls = 0;
   std::error_code ec{};
@@ -194,6 +196,9 @@ class fake_context {
       op.filled += n;
     }
     op.done_once = true;
+    // Attributed like a real performer's, so the engine over this context
+    // sees a device time rather than a hole.
+    device_.add(1);
     op.done(&op, {});
     return 1;
   }
@@ -207,6 +212,15 @@ class fake_context {
   // per context, so forgetting a file's transfers is forgetting the queue.
   void forget(file&) noexcept { queue_.clear(); }
 
+  // This context performs its transfers on the thread that polls it and
+  // queues nothing anywhere else: one at the device, no wait for a lane,
+  // and the transfer itself stamped like any other performer's.
+  [[nodiscard]] unsigned device_depth() const noexcept { return 1; }
+  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept { return 0; }
+  [[nodiscard]] blake3pp::detail::device_time device() const noexcept {
+    return device_;
+  }
+
   // The engine gives no way to reach its context, so the
   // window to fail is named before the engine is built. A static on a
   // type that exists only in this file is the smallest thing that can
@@ -216,6 +230,7 @@ class fake_context {
  private:
   std::vector<transfer*> queue_;
   io_impl::poll_waiter waiter_;
+  blake3pp::detail::device_time device_{};
 };
 
 static_assert(io_impl::io_context<fake_context>);
@@ -475,8 +490,9 @@ TEST_CASE("a cancelled read still reports exactly once, from poll") {
       expect);
 #endif
 #if defined(__APPLE__)
-  // No cancel mechanism at all: the read runs to completion and reports
-  // its data, which is the contract's other legal answer.
+  // A read a dispatch worker already has cannot be recalled: it runs to
+  // completion and reports its data, which is the contract's other legal
+  // answer. Only a transfer still queued for a lane is dropped.
   check_cancel_discipline<io_impl::gcd_context>(
       "gcd",
       [&](io_impl::gcd_context& c) {
@@ -1081,8 +1097,9 @@ TEST_CASE("io_uring: reads the ring would not take are served by poll()") {
   CHECK(pb.calls == 0);
   CHECK(ctx.in_flight() == 2);
 
-  // One deferred read per poll, on the caller's thread, same as every
-  // other read this backend cannot put on the ring.
+  // The lanes perform the deferred reads, as every read this backend
+  // cannot put on the ring; each callback still runs from poll(), on this
+  // thread.
   std::size_t polls = 0;
   while (pa.calls + pb.calls < 2) {
     ctx.poll(true);
@@ -1096,14 +1113,65 @@ TEST_CASE("io_uring: reads the ring would not take are served by poll()") {
   CHECK(std::equal(got_b.begin(), got_b.end(), content.begin() + len / 2));
 }
 
+// A refused submission moves the reads to the pump's lanes, and the
+// re-arm of the wake poll is refused the same way. The sleep then has
+// nothing in the kernel to wait for: it must watch the eventfd the lane
+// reports through, or poll(true) never returns. The wake poll is
+// consumed first, as every wake consumes it, so the re-arm is needed.
+TEST_CASE("io_uring: a refused submit with the wake poll unarmed still completes") {
+  constexpr std::size_t len = 32 * 1024 * 1024;
+  const auto content = pattern(len, 43);
+  const temp_file f(content);
+  io_impl::uring_context ctx({}, 4);
+  io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
+  if (file.name().rfind("io_uring", 0) != 0) {
+    MESSAGE("skipped: no io_uring here (" << file.name() << ")");
+    return;
+  }
+  std::vector<std::byte> got(len);
+  probe p;
+  io_impl::uring_context::transfer a{};
+  a.done = &probe::on_done;
+  a.owner = &p;
+  ctx.wake();
+  (void)ctx.poll(false);  // reaps the wake poll's completion
+  ctx.submit_read(file, 0, std::span(got), a);
+
+  struct refusal {
+    refusal() { io_impl::refuse_submit.store(true); }
+    ~refusal() { io_impl::refuse_submit.store(false); }
+  } const refused;
+  // A hang is the failure, so the poll runs on a thread the test can give
+  // up on: a stuck poll(true) cannot be interrupted, and the process ends
+  // with the reason instead.
+  std::atomic<bool> returned{false};
+  std::thread poller([&] {
+    while (p.calls == 0) {
+      (void)ctx.poll(true);
+    }
+    returned.store(true);
+  });
+  for (int i = 0; i < 1000 && !returned.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!returned.load()) {
+    std::fprintf(stderr, "io_uring: poll(true) still blocked after 10 s with "
+                         "the read on a lane\n");
+    std::abort();
+  }
+  poller.join();
+  CHECK(p.calls == 1);
+  CHECK(!p.ec);
+  CHECK(ctx.in_flight() == 0);
+  CHECK(got == content);
+}
+
 // A length that is not a multiple of the direct-I/O granule is the last
 // read of almost every real file, and the whole read of a small one. It
 // rides the ring in both directions: on the plain descriptor for a
 // buffered file, and for a direct one as the whole granules on the direct
 // descriptor followed by the rest on the plain one. None of it reaches
-// the synchronous path, which costs one device round trip per poll().
-// Before this held, a directory of 65000-byte files read at a quarter of
-// the rate of 65536-byte ones, buffered or direct.
+// the deferred path, which served_synchronously() counts.
 TEST_CASE("io_uring: an unaligned length rides the ring, buffered or direct") {
   constexpr std::size_t len = 2 * 4096 + 100;
   const auto content = pattern(len, 43);
@@ -1222,8 +1290,9 @@ TEST_CASE("aio: transfers the kernel would not take are served by poll()") {
   CHECK(pb.calls == 0);
   CHECK(ctx.in_flight() == 2);
 
-  // One deferred transfer per poll, on the caller's thread, same as
-  // every other transfer this backend cannot queue.
+  // The lanes perform the deferred transfers, as every transfer this
+  // backend cannot queue; each callback still runs from poll(), on this
+  // thread.
   std::size_t polls = 0;
   while (pa.calls + pb.calls < 2) {
     ctx.poll(true);
@@ -1243,8 +1312,7 @@ TEST_CASE("aio: transfers the kernel would not take are served by poll()") {
 // rides the AIO queue in both directions: on the plain descriptor for a
 // buffered file, and for a direct one as the whole granules on the
 // direct descriptor followed by the rest on the plain one. None of it
-// reaches the synchronous path, which costs one device round trip per
-// poll().
+// reaches the deferred path, which served_synchronously() counts.
 TEST_CASE("aio: an unaligned length rides the queue, buffered or direct") {
   constexpr std::size_t len = 2 * 4096 + 100;
   const auto content = pattern(len, 43);
@@ -1443,12 +1511,15 @@ TEST_CASE("a context destroyed with reads in flight runs no callback") {
   const temp_file f(content);
   std::vector<std::byte> buf(content.size());
   probe p;
+  // Declared before the context and the file: an operation must outlive
+  // the drain that forgets it, since a backend's own threads may write
+  // into it until that drain returns.
+  ctx_type::transfer op{};
+  op.done = &probe::on_done;
+  op.owner = &p;
   {
     ctx_type ctx({}, 4);
     ctx_type::file file(ctx, f.path, io_impl::file_open_options{});
-    ctx_type::transfer op{};
-    op.done = &probe::on_done;
-    op.owner = &p;
     ctx.submit_read(file, 0, std::span{buf}, op);
     ctx.flush();
     // Leave without polling: the read is owed and must be reaped by the
@@ -1786,6 +1857,446 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
     });
   }
 #endif
+}
+
+// --- Lanes: the transfers happen off the polling thread --------------------
+//
+// A deferred transfer is performed on a lane, so the pipeline's own
+// thread keeps admitting, reducing and retiring windows while a pread is
+// in progress. A source that counts how many transfers are inside it at
+// once shows the lanes overlap; the callback discipline above shows the
+// callbacks still run from poll().
+
+// A source whose read_at/write_at hold for `hold` and record the most
+// transfers that were inside at once. Templated on positional so the
+// serialized case is the same source with one word changed.
+template <bool Positional>
+class counting_source {
+ public:
+  static constexpr blake3pp::io_engine rung_engine =
+      blake3pp::io_engine::posix_sync;
+  static constexpr bool positional = Positional;
+
+  // Shared rather than per-source: a context opens one file here, and the
+  // counters have to outlive the source the context owns.
+  struct shared {
+    std::atomic<int> inside{0};
+    std::atomic<int> most{0};
+    std::atomic<int> transfers{0};
+    std::chrono::nanoseconds hold{std::chrono::milliseconds(4)};
+    // Set by whichever thread performed a transfer, and compared against
+    // the polling thread's. Atomic because several lanes write it.
+    std::atomic<bool> performed_off_the_poller{false};
+    std::thread::id poller{};
+    // What the source throws instead of transferring, for the result
+    // encoding below. Empty transfers normally.
+    std::error_code fail_with{};
+  };
+  static inline shared* live = nullptr;
+
+  counting_source(const fs::path&, const io_impl::file_open_options&) {}
+
+  [[nodiscard]] std::uint64_t size() const noexcept { return 1 << 20; }
+  [[nodiscard]] std::string_view name() const noexcept { return "counting"; }
+  void set_size(std::uint64_t) {}
+
+  void read_at(std::uint64_t off, std::span<std::byte> buf) { work(off, buf); }
+  void write_at(std::uint64_t off, std::span<const std::byte> buf) {
+    work(off, {});
+    (void)buf;
+  }
+
+ private:
+  static void work(std::uint64_t off, std::span<std::byte> buf) {
+    shared& s = *live;
+    if (s.fail_with) {
+      throw std::system_error(s.fail_with, "injected");
+    }
+    const int now = s.inside.fetch_add(1) + 1;
+    int seen = s.most.load();
+    while (seen < now && !s.most.compare_exchange_weak(seen, now)) {
+    }
+    if (std::this_thread::get_id() != s.poller) {
+      s.performed_off_the_poller.store(true);
+    }
+    std::this_thread::sleep_for(s.hold);
+    for (std::size_t i = 0; i < buf.size(); ++i) {
+      buf[i] = static_cast<std::byte>((off + i) & 0xff);
+    }
+    s.transfers.fetch_add(1);
+    s.inside.fetch_sub(1);
+  }
+};
+
+// Submits `n` transfers of `bytes` over a counting context and polls
+// until every callback has run. Returns the context's own account of
+// what the device and the lanes did.
+template <bool Positional>
+struct lane_run {
+  blake3pp::detail::device_time device{};
+  std::uint64_t lane_wait_ns = 0;
+  unsigned device_depth = 0;
+  int most_concurrent = 0;
+  int completed = 0;
+  std::thread::id poller{};
+  bool every_callback_on_the_polling_thread = true;
+};
+
+template <bool Positional>
+lane_run<Positional> run_counting(unsigned depth, int n,
+                                  std::size_t bytes = 4096) {
+  using source = counting_source<Positional>;
+  using context = io_impl::sync_context<source>;
+  typename source::shared shared;
+  shared.poller = std::this_thread::get_id();
+  source::live = &shared;
+
+  context ctx({}, depth);
+  typename context::file file(ctx, fs::path("ignored"), {});
+
+  std::vector<typename context::transfer> ops(static_cast<std::size_t>(n));
+  std::vector<std::vector<std::byte>> bufs(static_cast<std::size_t>(n));
+  lane_run<Positional> out;
+  const std::thread::id polling = std::this_thread::get_id();
+  out.poller = polling;
+  for (int i = 0; i < n; ++i) {
+    bufs[static_cast<std::size_t>(i)].resize(bytes);
+    auto& op = ops[static_cast<std::size_t>(i)];
+    op.owner = &out;
+    op.done = +[](io_impl::transfer_base* b, std::error_code ec) noexcept {
+      auto* const r = static_cast<lane_run<Positional>*>(b->owner);
+      r->completed++;
+      if (std::this_thread::get_id() != r->poller) {
+        r->every_callback_on_the_polling_thread = false;
+      }
+      if (ec) {
+        r->every_callback_on_the_polling_thread = false;
+      }
+    };
+    ctx.submit_read(file, static_cast<std::uint64_t>(i) * bytes,
+                    bufs[static_cast<std::size_t>(i)], op);
+  }
+  ctx.flush();
+  while (out.completed < n) {
+    ctx.poll(true);
+  }
+  // Every callback ran inside one of those poll() calls, on this thread
+  // (checked per callback above); the transfers themselves ran on the
+  // lanes.
+  out.device = ctx.device();
+  out.lane_wait_ns = ctx.lane_wait_ns();
+  out.device_depth = ctx.device_depth();
+  out.most_concurrent = shared.most.load();
+  // The transfer did not happen on the thread that called poll().
+  CHECK(shared.performed_off_the_poller.load());
+  source::live = nullptr;
+  return out;
+}
+
+TEST_CASE("a positional synchronous source serves several transfers at once") {
+  const lane_run<true> r = run_counting<true>(/*depth=*/8, /*n=*/12);
+  CHECK(r.completed == 12);
+  CHECK(r.every_callback_on_the_polling_thread);
+  // Four lanes is the ceiling, and more than one transfer was inside the
+  // source at once.
+  CHECK(r.most_concurrent > 1);
+  CHECK(r.most_concurrent <= static_cast<int>(io_impl::max_io_lanes));
+  CHECK(r.device_depth == io_impl::max_io_lanes);
+}
+
+TEST_CASE("a source that cannot take two at once gets one lane") {
+  const lane_run<false> r = run_counting<false>(/*depth=*/8, /*n=*/8);
+  CHECK(r.completed == 8);
+  CHECK(r.every_callback_on_the_polling_thread);
+  // One cursor, one lane: off the polling thread, but never overlapped.
+  CHECK(r.most_concurrent == 1);
+  CHECK(r.device_depth == 1);
+}
+
+TEST_CASE("the depth is the ceiling on lanes as much as the constant is") {
+  const lane_run<true> r = run_counting<true>(/*depth=*/2, /*n=*/6);
+  CHECK(r.completed == 6);
+  CHECK(r.device_depth == 2);
+  CHECK(r.most_concurrent <= 2);
+}
+
+TEST_CASE("the device's own time has no wait for a lane in it") {
+  // Twelve transfers of 4 ms over four lanes: the device saw 12 x 4 ms
+  // whatever the queueing, and two thirds of them waited for a lane
+  // first. The two numbers tell "the device is the wall" from "there are
+  // too few lanes", which is why the transfer is stamped on the lane and
+  // not measured as a span of the caller's timeline.
+  const lane_run<true> r = run_counting<true>(/*depth=*/8, /*n=*/12);
+  CHECK(r.device.transfers == 12);
+  // Generous bands: this is a sleep on a loaded test machine.
+  CHECK(r.device.total_ns > 12 * 2'000'000ULL);
+  CHECK(r.device.min_ns > 1'000'000ULL);
+  // Twelve transfers over four lanes queue three deep, so the wait is
+  // real and it is NOT in the device figure above.
+  CHECK(r.lane_wait_ns > 0);
+}
+
+TEST_CASE("a failed transfer's error survives the lane's encoding") {
+  // The result a lane reports is carried as a value and a category flag
+  // rather than as a whole std::error_code, which is what keeps the
+  // Windows union inside io_op's storage (detail/driver.hpp). So the
+  // round trip is worth a case of its own, and over BOTH categories the
+  // encoding distinguishes: errno, which is every POSIX source and every
+  // cancel, and the system category, which is what the Windows backends
+  // throw and what no POSIX run would otherwise exercise.
+  using source = counting_source<true>;
+  using context = io_impl::sync_context<source>;
+
+  const std::error_code cases[] = {
+      std::error_code(EIO, std::generic_category()),
+      std::error_code(5, std::system_category()),  // ERROR_ACCESS_DENIED
+  };
+  for (const std::error_code& want : cases) {
+    CAPTURE(want.value());
+    CAPTURE(want.category().name());
+    source::shared shared;
+    shared.hold = std::chrono::milliseconds(0);
+    shared.poller = std::this_thread::get_id();
+    shared.fail_with = want;
+    source::live = &shared;
+
+    struct seen {
+      std::error_code ec{};
+      int calls = 0;
+    } got;
+    context ctx({}, 4);
+    typename context::file file(ctx, fs::path("ignored"), {});
+    std::vector<std::byte> buf(4096);
+    typename context::transfer op{};
+    op.owner = &got;
+    op.done = +[](io_impl::transfer_base* b, std::error_code ec) noexcept {
+      auto* const s = static_cast<seen*>(b->owner);
+      s->ec = ec;
+      s->calls++;
+    };
+    ctx.submit_read(file, 0, buf, op);
+    ctx.flush();
+    while (got.calls == 0) {
+      ctx.poll(true);
+    }
+    CHECK(got.calls == 1);
+    CHECK(got.ec == want);
+    CHECK(got.ec.value() == want.value());
+    CHECK(got.ec.category() == want.category());
+    source::live = nullptr;
+  }
+}
+
+TEST_CASE("io_lanes starts on first use and not before") {
+  struct owner {
+    std::atomic<int> wakes{0};
+    std::atomic<int> bodies{0};
+    void wake() noexcept { wakes.fetch_add(1); }
+  } o;
+  io_impl::io_lanes lanes(io_impl::io_lanes::waker<owner>(), &o, 3);
+  // Nothing has asked it to do anything, so there is no thread yet --
+  // which is what keeps a context whose engine took everything from
+  // paying for one.
+  CHECK_FALSE(lanes.running());
+  CHECK(lanes.count() == 3);
+
+  const bool started = lanes.start(
+      +[](void* p) noexcept {
+        auto* const self = static_cast<owner*>(p);
+        self->bodies.fetch_add(1);
+        self->wake();
+      },
+      nullptr, &o);
+  CHECK(started);
+  CHECK(lanes.running());
+  CHECK(lanes.count() == 3);
+  // Idempotent: a second ask does not start a second set.
+  CHECK(lanes.start(+[](void*) noexcept {}, nullptr, &o));
+  lanes.stop();
+  CHECK(o.bodies.load() == 3);
+  CHECK(o.wakes.load() == 3);
+  // Idempotent the other way too, which is what the destructor relies on.
+  lanes.stop();
+}
+
+TEST_CASE("a file closed with a transfer in a lane waits the lane out") {
+  // The hazard is the descriptor: a lane inside pread on a file that has
+  // closed would, once the number is recycled, read another file's bytes
+  // into the engine's buffer and report success. forget() waits it out,
+  // and reports nothing of that file's.
+  using source = counting_source<true>;
+  using context = io_impl::sync_context<source>;
+  source::shared shared;
+  shared.hold = std::chrono::milliseconds(30);
+  shared.poller = std::this_thread::get_id();
+  source::live = &shared;
+
+  int completed = 0;
+  {
+    context ctx({}, 4);
+    typename context::file file(ctx, fs::path("ignored"), {});
+    std::array<context::transfer, 4> ops{};
+    std::array<std::vector<std::byte>, 4> bufs;
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+      bufs[i].resize(4096);
+      ops[i].owner = &completed;
+      ops[i].done = +[](io_impl::transfer_base* b,
+                        std::error_code) noexcept {
+        ++*static_cast<int*>(b->owner);
+      };
+      ctx.submit_read(file, i * 4096, bufs[i], ops[i]);
+    }
+    // Let the lanes get inside the source, then reclaim the file.
+    while (shared.inside.load() == 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ctx.forget(file);
+    // Nothing of this file's was reported, and no lane is still inside
+    // it: that is what forget() promises, and it is what makes the
+    // buffers and the descriptor safe to release next.
+    CHECK(completed == 0);
+    CHECK(shared.inside.load() == 0);
+    CHECK(ctx.in_flight() == 0);
+  }
+  source::live = nullptr;
+}
+
+// The operation lifetime rule from the other side: an operation must
+// outlive the drain of its file, and once that drain returns no lane may
+// touch it again. The operations here are heap objects freed right after
+// the file closes, so a lane still finishing a transfer, or taking one
+// that was queued, is a heap-use-after-free under ASan; without ASan the
+// counts say the same. One lane and three transfers, so two are queued
+// when the file closes.
+TEST_CASE("after a file's drain no lane touches its operations") {
+  using source = counting_source<true>;
+  using context = io_impl::sync_context<source>;
+  source::shared shared;
+  shared.hold = std::chrono::milliseconds(40);
+  shared.poller = std::this_thread::get_id();
+  source::live = &shared;
+  {
+    context ctx({}, 1);
+    std::array<std::vector<std::byte>, 3> bufs;
+    std::vector<std::unique_ptr<context::transfer>> ops;
+    int completed = 0;
+    {
+      typename context::file file(ctx, fs::path("ignored"), {});
+      for (std::size_t i = 0; i < bufs.size(); ++i) {
+        bufs[i].resize(4096);
+        ops.push_back(std::make_unique<context::transfer>());
+        ops[i]->owner = &completed;
+        ops[i]->done = +[](io_impl::transfer_base* b,
+                           std::error_code) noexcept {
+          ++*static_cast<int*>(b->owner);
+        };
+        ctx.submit_read(file, i * 4096, bufs[i], *ops[i]);
+      }
+      while (shared.inside.load() == 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }  // ~file: transfers owed, so the context drains
+    // The lane that was inside has finished, and nothing queued was taken.
+    CHECK(shared.inside.load() == 0);
+    CHECK(shared.transfers.load() == 1);
+    CHECK(ctx.in_flight() == 0);
+    ops.clear();
+    // Time for a lane that had not been waited out to reach a freed
+    // operation.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(shared.transfers.load() == 1);
+    CHECK(ctx.poll(false) == 0);
+    CHECK(completed == 0);
+  }
+  source::live = nullptr;
+}
+
+#if defined(__linux__)
+// The same rule on a real backend's lanes: with async off, every
+// transfer rides the pump and a pread into the caller's buffer is what a
+// lane is doing when the file closes.
+TEST_CASE("io_uring without a ring: after a file's drain no lane touches its operations") {
+  constexpr std::size_t len = 32 * 1024 * 1024;
+  const auto content = pattern(2 * len, 13);
+  const temp_file f(content);
+  std::vector<std::byte> buf(2 * len);
+  io_impl::uring_context ctx({.async = false}, 1);
+  std::array<std::unique_ptr<io_impl::uring_context::transfer>, 2> ops{
+      std::make_unique<io_impl::uring_context::transfer>(),
+      std::make_unique<io_impl::uring_context::transfer>()};
+  probe p;
+  {
+    io_impl::uring_context::file file(ctx, f.path,
+                                      io_impl::file_open_options{});
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+      ops[i]->done = &probe::on_done;
+      ops[i]->owner = &p;
+      ctx.submit_read(file, i * len,
+                      std::span{buf}.subspan(i * len, len), *ops[i]);
+    }
+    ctx.flush();
+    // Usually puts the first read on a lane before the file closes, so the
+    // drain waits for a transfer in progress. A drain that finds both
+    // still queued takes them off the queue instead, and the checks below
+    // hold either way.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  CHECK(ctx.in_flight() == 0);
+  for (auto& op : ops) {
+    op.reset();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK(ctx.poll(false) == 0);
+  CHECK(p.calls == 0);
+}
+#endif
+
+TEST_CASE("a cancel reaches a transfer no lane has taken yet") {
+  using source = counting_source<true>;
+  using context = io_impl::sync_context<source>;
+  source::shared shared;
+  shared.hold = std::chrono::milliseconds(20);
+  shared.poller = std::this_thread::get_id();
+  source::live = &shared;
+
+  struct tally {
+    int done = 0;
+    int cancelled = 0;
+  } t;
+  {
+    context ctx({}, 8);
+    typename context::file file(ctx, fs::path("ignored"), {});
+    // More transfers than lanes, so the tail of the queue is still
+    // waiting when the cancels arrive.
+    std::array<context::transfer, 10> ops{};
+    std::array<std::vector<std::byte>, 10> bufs;
+    for (std::size_t i = 0; i < ops.size(); ++i) {
+      bufs[i].resize(4096);
+      ops[i].owner = &t;
+      ops[i].done = +[](io_impl::transfer_base* b,
+                        std::error_code ec) noexcept {
+        auto* const sum = static_cast<tally*>(b->owner);
+        sum->done++;
+        if (ec == std::errc::operation_canceled) {
+          sum->cancelled++;
+        }
+      };
+      ctx.submit_read(file, i * 4096, bufs[i], ops[i]);
+    }
+    for (auto& op : ops) {
+      ctx.cancel(op);
+    }
+    while (t.done < static_cast<int>(ops.size())) {
+      ctx.poll(true);
+    }
+    // Every transfer reported exactly once, which is the contract; a
+    // cancel that arrived before a lane took the transfer took effect,
+    // and the ones a lane already had ran to completion, which the
+    // contract's advisory cancel allows.
+    CHECK(t.done == static_cast<int>(ops.size()));
+    CHECK(t.cancelled > 0);
+  }
+  source::live = nullptr;
 }
 
 }  // TEST_SUITE

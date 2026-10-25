@@ -41,12 +41,27 @@ namespace {
 // what the two terms are and why neither alone would do.
 [[nodiscard]] double queued(const diagnosis& r, std::uint64_t device_wait_ns,
                             double wall_ns) noexcept {
-  const auto depth = static_cast<double>(std::max<std::uint64_t>(1, r.depth));
+  const auto depth =
+      static_cast<double>(std::max<unsigned>(1, r.device_depth));
   const double by_wall =
       std::clamp(share(device_wait_ns, wall_ns * depth), 0.0, 1.0);
   // Nothing was ever queued behind anything: one slot's worth, whatever
   // the slots showed.
   return r.device_unqueued ? std::min(by_wall, 1.0 / depth) : by_wall;
+}
+
+// The transfers the device actually had at once: what the engine offered
+// where it could say, and the depth the pipeline asked for where it
+// could not. Never zero, because it is a denominator.
+[[nodiscard]] unsigned device_depth_of(const driver_stats& d,
+                                       std::uint64_t depth) noexcept {
+  // Both arrive 64-bit, because driver_stats and diagnosis keep every
+  // count that wide, and both are queue depths bounded by
+  // max_queue_depth -- so the one narrowing here is exact and is spelled
+  // once rather than at each caller.
+  const std::uint64_t said = d.device_depth;
+  const std::uint64_t got = said != 0 ? std::min(said, depth) : depth;
+  return static_cast<unsigned>(std::max<std::uint64_t>(1, got));
 }
 
 }  // namespace
@@ -69,10 +84,11 @@ diagnosis diagnose_read(const driver_stats& d, double wall_ns,
   diagnosis r;
   r.transfers = d.transfers_landed;
   r.depth = d.queue_depth_final;
+  r.device_depth = device_depth_of(d, r.depth);
   r.windows_used = d.max_windows_in_flight;
   r.windows_planned = planned;
   r.window_bytes = window;
-  r.bytes_in_flight = r.depth * static_cast<std::uint64_t>(window);
+  r.bytes_in_flight = r.device_depth * static_cast<std::uint64_t>(window);
   if (!r.measured() || wall_ns <= 0.0) {
     return r;
   }
@@ -83,6 +99,8 @@ diagnosis diagnose_read(const driver_stats& d, double wall_ns,
   r.device_unqueued = unqueued(r, b);
   r.device_queued = queued(r, d.device_wait_ns, wall_ns);
   r.starved = share(d.starved_ns, wall_ns);
+  r.mean_lane_wait_ns = static_cast<double>(d.lane_wait_ns) /
+                        static_cast<double>(r.transfers);
   r.arena_is_depth =
       planned > 0 && r.windows_used >= planned && planned <= r.depth;
   if (!r.long_enough()) {
@@ -126,10 +144,11 @@ diagnosis diagnose_write(const driver_stats& d, double wall_ns,
   diagnosis r;
   r.transfers = d.transfers_landed;
   r.depth = d.queue_depth_final;
+  r.device_depth = device_depth_of(d, r.depth);
   r.windows_used = r.depth;
   r.windows_planned = r.depth;
   r.window_bytes = window;
-  r.bytes_in_flight = r.depth * static_cast<std::uint64_t>(window);
+  r.bytes_in_flight = r.device_depth * static_cast<std::uint64_t>(window);
   r.arena_is_depth = true;
   if (!r.measured() || wall_ns <= 0.0) {
     return r;
@@ -149,6 +168,8 @@ diagnosis diagnose_write(const driver_stats& d, double wall_ns,
   r.device_busy = share(d.device_wait_ns, in_flight);
   r.device_queued = queued(r, d.device_wait_ns, wall_ns);
   r.starved = share(d.starved_ns, wall_ns);
+  r.mean_lane_wait_ns = static_cast<double>(d.lane_wait_ns) /
+                        static_cast<double>(r.transfers);
   if (!r.long_enough()) {
     return r;
   }

@@ -6,19 +6,20 @@
 // fills a submission entry without entering the kernel, SubmitIoRing is
 // io_uring_enter, PopIoRingCompletion drains the completion queue, and
 // FILE_FLAG_NO_BUFFERING is O_DIRECT (same sector-alignment demands, same
-// buffered-handle escape hatch for the unaligned tail). Degrades
-// per-feature at RUNTIME: no ring -> sync ReadFile/WriteFile, NO_BUFFERING
-// refused -> buffered. Internal to src/io/, never installed.
+// buffered handle for the unaligned tail). Degrades per feature at
+// runtime: no ring -> synchronous ReadFile/WriteFile on the deferred
+// pump's lanes, NO_BUFFERING refused -> buffered. Internal to src/io/,
+// never installed.
 //
-// The entry points are resolved from KernelBase.dll at first use rather
-// than linked, so the binary loads on Windows 10, where they do not
-// exist; <ioringapi.h> is included for the types only. Which rung was
+// The entry points are resolved from KernelBase.dll at first use, not
+// linked, so the binary loads on Windows 10, where they do not exist;
+// <ioringapi.h> is included for the types only. Which rung was
 // reached is in the file's name(), including why a ring was refused.
 //
 // Registered buffers and registered file handles are behind
-// reader_context_options::registered_buffers and default OFF: this is the
-// experiment the io_uring backend's header reports for Linux (28-38%
-// slower there) asked of a different kernel.
+// reader_context_options::registered_buffers and default off. On Linux
+// the same idea measured 28-38% slower (uring_backend.hpp); on Windows it
+// is unmeasured.
 
 #if defined(_WIN32)
 
@@ -264,9 +265,10 @@ class ioring {
 // transfers named by the caller's operation, completions delivered as
 // callbacks out of poll().
 //
-// A ring is single-threaded by design, which is the driver model exactly:
-// wake() is the only member another thread may call, and it is the event
-// the ring was given, so completions and wakes share one wait.
+// A ring is single-threaded, as the driver model is: wake() is the only
+// member another thread may call, and it signals the event the ring was
+// given, so completions, a lane's report and another thread's wake share
+// one wait.
 class ioring_context {
  public:
   class file;
@@ -274,7 +276,7 @@ class ioring_context {
   // No OVERLAPPED: the ring carries the offset in the submission entry
   // and the operation's address is its userData, so what is left here is
   // continuation state.
-  struct transfer : transfer_base {
+  struct transfer : performed_transfer {
     std::byte* dst = nullptr;        // reads fill this
     const std::byte* src = nullptr;  // writes read from this
     std::size_t len = 0;
@@ -449,13 +451,17 @@ class ioring_context {
   };
 
   // The event exists whether or not a ring does: it is the wake
-  // primitive, so a context whose transfers all go through the deferred
-  // list still has exactly one thing a blocked poll sleeps on.
+  // primitive, so a context whose transfers all go to the pump still has
+  // exactly one thing a blocked poll sleeps on.
   ioring_context(const reader_context_options& opts, unsigned max_inflight)
       : event_(::CreateEventW(nullptr, /*bManualReset=*/FALSE,
                               /*bInitialState=*/FALSE, nullptr)),
+        queue_depth_(std::max(1u, max_inflight)),
         async_requested_(opts.async),
-        want_registered_(opts.registered_buffers) {
+        want_registered_(opts.registered_buffers),
+        // Declared last, and initialized last: see the member list.
+        pump_(io_lanes::waker<ioring_context>(), this,
+              &perform_deferred, io_lanes_for(max_inflight)) {
     if (!event_) {
       throw_winerr("CreateEventW");
     }
@@ -506,10 +512,10 @@ class ioring_context {
   }
 
   // This context's rung and the one it degrades to, declared for the
-  // ladder walk in src/io/io_engines.cpp. Note that this is the ladder
-  // INSIDE one ioring_context -- a ring it cannot have leaves its own
-  // transfers on ReadFile. windows_context composes a second one on top,
-  // putting the completion port between the two, and declares that.
+  // ladder walk in src/io/io_engines.cpp. This is the ladder inside one
+  // ioring_context: a ring it cannot have leaves its transfers to
+  // ReadFile on the lanes. windows_context composes a second ladder on
+  // top, with the completion port between the two, and declares that.
   static constexpr io_engine rung_engine = io_engine::ioring;
   using rung_below = win_sync_rung;
 
@@ -536,12 +542,11 @@ class ioring_context {
   }
 
   // The write half of the same contract and the same ladder: a length
-  // NO_BUFFERING cannot take, or a file whose reopen never engaged,
-  // rides the deferred list and is written synchronously inside poll()
-  // through the plain handle. Nothing above the context sees the
-  // difference.
+  // NO_BUFFERING cannot take, or a file whose reopen never engaged, goes
+  // to the pump and a lane writes it through the plain handle. Nothing
+  // above the context sees the difference.
   //
-  // A zero-length write takes the deferred path too: the ring would
+  // A zero-length write goes to the pump too: the ring would
   // report zero bytes, which is the same shape as a short transfer and
   // cannot be told apart from one.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
@@ -609,18 +614,32 @@ class ioring_context {
     return arena_registered_;
   }
 
+  // The ring's depth where any transfer of this run rode it, and one
+  // otherwise. A file whose reopen never engaged sends everything to the
+  // pump, whose lanes read through the one non-overlapped handle from the
+  // first open, the case iocp_context::device_depth() reports as one.
+  [[nodiscard]] unsigned device_depth() const noexcept {
+    return used_ring_ ? queue_depth_ : 1u;
+  }
+  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
+    return pump_.lane_wait_ns();
+  }
+  [[nodiscard]] device_time device() const noexcept { return device_; }
+
   // Asks the ring to abandon one transfer. The request is a submission of
   // its own, sent with the next flush, and its completion carries a
   // userData no transfer can wear so poll() drops it; what matters is
-  // the target's own completion, which arrives either way. A transfer on
-  // the deferred list was never given to the ring, so the flag alone is
-  // the whole cancel and run_one_deferred() honours it.
+  // the target's own completion, which arrives either way. A transfer the
+  // pump has is cancelled through the pump, under its lock, because the
+  // flag is what a lane reads when it takes one; one a lane already has
+  // runs to completion.
   void cancel(transfer& op) noexcept {
 #if defined(BLAKE3PP_HAS_IORING_API)
-    if (std::exchange(op.cancelled, true)) {
+    if (!op.on_ring) {
+      pump_.cancel(op);
       return;
     }
-    if (!op.on_ring) {
+    if (std::exchange(op.cancelled, true)) {
       return;
     }
     const ioring_api& api = ioring_entry_points();
@@ -631,7 +650,7 @@ class ioring_context {
     ++queued_;
     ++ring_owed_;
 #else
-    op.cancelled = true;
+    pump_.cancel(op);
 #endif
   }
 
@@ -648,34 +667,34 @@ class ioring_context {
 #endif
   }
 
-  // The ring first, then the deferred list, in that order and never the
-  // other way round: a completion the ring hands back can park its
-  // remainder on the list, and the list is what serves it.
+  // The ring first, then the pump's finished list: a completion the ring
+  // hands back can move its remainder to the pump.
   std::size_t poll(bool block) {
     flush();
     throw_if_submit_failed();
     std::size_t ran = reap_ready();
-    ran += run_one_deferred();
+    ran += serve_deferred();
     if (ran > 0 || !block) {
       return ran;
     }
     for (;;) {
       if (take_wake()) {
-        return ran;
+        return ran + serve_deferred();
       }
       wait_once();
       ran += reap_ready();
-      ran += run_one_deferred();
+      ran += serve_deferred();
       if (ran > 0 || take_wake()) {
         return ran;
       }
     }
   }
 
-  // The one member another thread may call. The flag is the memory and
-  // the event is only the nudge: the ring signals the same event on every
-  // completion, so a wake whose signal a completion's wait consumed is
-  // still seen by the next take_wake().
+  // The one member another thread may call, and how a lane reports a
+  // finished transfer. The flag is the memory and the event is only the
+  // nudge: the ring signals the same event on every completion, so a wake
+  // whose signal a completion's wait consumed is still seen by the next
+  // take_wake().
   void wake() noexcept {
     woken_.store(true, std::memory_order_release);
     (void)::SetEvent(event_.get());
@@ -722,31 +741,35 @@ class ioring_context {
       }
     }
 #endif
-    deferred_.clear();
+    pump_.clear();
     in_flight_ = 0;
     for (file* f = files_; f != nullptr; f = f->next_) {
       f->inflight_ = 0;
     }
   }
 
-  // A file about to close gives up every transfer it owns, running no
-  // callback, so the file and the buffers its transfers name may be
-  // destroyed while the context stays usable.
+  // Gives up every transfer this file owns, running no callback, so the
+  // file and the buffers its transfers name may be destroyed while the
+  // context stays usable. The file's destructor calls this. Legal only
+  // while the operations are alive.
   //
-  // One sharp edge, since the ring is shared: a completion belonging to
-  // ANOTHER file can surface while this one is waited out, and it is
-  // reported normally rather than dropped -- losing it would strand an op
-  // that can never complete. So reclaiming one file of a multi-file
-  // context while a sibling has transfers in flight runs that sibling's
-  // callback from here, which is the one place outside poll() where one
-  // runs.
+  // The ring is shared, so a completion belonging to another file can
+  // surface while this one is waited out. It is reported, since dropping
+  // it would strand an operation that can never complete, so reclaiming
+  // one file while a sibling has transfers in flight can run that
+  // sibling's callback from here.
   void forget(file& f) noexcept {
     // The file stays on files_: it is still open and may be read again.
-    // What never reached the ring goes first, because a deferred transfer
-    // names this file's handles and this file's share of the count, and
-    // the next poll() would run it through both after they are gone.
-    const std::size_t dropped = deferred_.remove_if(
-        [&f](const transfer& op) noexcept { return op.owner_file == &f; });
+    // What never reached the ring goes first: it names this file's handles
+    // and its share of the count. A lane inside a transfer on these
+    // handles cannot be recalled, so it is waited out, and what it
+    // finished is dropped unreported.
+    const auto mine = [&f](const transfer& op) noexcept {
+      return op.owner_file == &f;
+    };
+    std::size_t dropped = pump_.remove_queued_if(mine);
+    pump_.quiesce();
+    dropped += pump_.remove_done_if(mine);
     in_flight_ -= std::min(dropped, in_flight_);
     f.inflight_ -= std::min(dropped, f.inflight_);
 #if defined(BLAKE3PP_HAS_IORING_API)
@@ -801,6 +824,7 @@ class ioring_context {
     op.owner_file = &f;
     op.on_ring = false;
     op.cancelled = false;
+    op.reset_performance();
   }
 
   // How much of a piece of a transfer the ring takes; zero means none of
@@ -811,15 +835,14 @@ class ioring_context {
   // A buffered overlapped handle takes any shape, so a buffered file's
   // pieces ride whole. NO_BUFFERING rejects an unaligned length and an
   // unaligned offset, so a direct file's piece is cut to the whole
-  // granules it holds at a granule offset, and what that leaves -- the
-  // sub-granule end of a file, or a resumption off a boundary -- goes
-  // through the synchronous path inside poll(), on the plain handle,
-  // which is not overlapped and cannot ride. The completion-port
-  // backend's port_len() and the io_uring backend's piece_for() are the
-  // same question.
+  // granules it holds at a granule offset. The rest (the sub-granule end
+  // of a file, or a resumption off a boundary) goes to a lane, on the
+  // plain handle, which is not overlapped and cannot ride. The
+  // completion-port backend's port_len() and the io_uring backend's
+  // piece_for() ask the same question.
   //
-  // A zero-length transfer takes the synchronous path too: the ring would
-  // report zero bytes, the same shape as a short transfer.
+  // A zero-length transfer goes to a lane too: the ring would report zero
+  // bytes, the same shape as a short transfer.
   [[nodiscard]] std::uint32_t ring_len(const transfer& op, std::uint64_t off,
                                        std::size_t len) const noexcept {
     if (!use_ring_ || op.owner_file == nullptr ||
@@ -837,10 +860,11 @@ class ioring_context {
     const std::uint32_t len = ring_len(op, op.off, op.len);
     const bool queued = len != 0 && build(op, len);
     op.on_ring = queued;
+    used_ring_ = used_ring_ || queued;
     in_flight_++;
     f.inflight_++;
     if (!queued) {
-      deferred_.push(op);
+      pump_.push(op);
     }
   }
 
@@ -937,6 +961,7 @@ class ioring_context {
   }
 
   void complete(transfer& op, std::error_code ec) noexcept {
+    device_.add_if_served(op.device_total_ns());
     in_flight_--;
     if (op.owner_file != nullptr) {
       op.owner_file->inflight_--;
@@ -983,38 +1008,59 @@ class ioring_context {
                             "SubmitIoRing");
   }
 
-  std::size_t run_one_deferred() noexcept {
-    transfer* const next = deferred_.take();
-    if (next == nullptr) {
-      return 0;
-    }
-    transfer& op = *next;
-    std::error_code ec;
-    if (op.cancelled) {
-      ec = std::make_error_code(std::errc::operation_canceled);
-    } else {
-      // From op.filled, not from zero: a short transfer whose remainder
-      // the ring would not take arrives here part-done, and the bytes
-      // already in the buffer must not be fetched again over themselves.
-      try {
-        const std::size_t rest = op.len - op.filled;
-        const bool fast_async =
-            op.owner_file != nullptr && op.owner_file->ring_handle_;
-        if (op.is_write) {
-          write_sync(*op.sync_file, fast_async, op.off + op.filled,
-                     {op.src + op.filled, rest});
-        } else {
-          read_sync(*op.sync_file, fast_async, op.off + op.filled,
-                    {op.dst + op.filled, rest});
-        }
-        op.filled = op.len;
-        served_synchronously_++;
-      } catch (const std::system_error& e) {
-        ec = e.code();
+  // One transfer, on a lane. Touches the operation and the file it names,
+  // and nothing else of this context, so served_synchronously_ is counted
+  // where the completion is run.
+  static std::error_code perform_deferred(transfer& op) noexcept {
+    // From op.filled, not from zero: a short transfer whose remainder
+    // the ring would not take arrives here part-done, and the bytes
+    // already in the buffer must not be fetched again over themselves.
+    try {
+      const std::size_t rest = op.len - op.filled;
+      const bool fast_async =
+          op.owner_file != nullptr && op.owner_file->ring_handle_;
+      if (op.is_write) {
+        write_sync(*op.sync_file, fast_async, op.off + op.filled,
+                   {op.src + op.filled, rest});
+      } else {
+        read_sync(*op.sync_file, fast_async, op.off + op.filled,
+                  {op.dst + op.filled, rest});
       }
+      op.filled = op.len;
+    } catch (const std::system_error& e) {
+      return e.code();
+    } catch (...) {
+      // read_sync and write_sync throw only system_error; anything else
+      // is reported as EIO so it cannot terminate a noexcept lane.
+      return std::make_error_code(std::errc::io_error);
+    }
+    return {};
+  }
+
+  // Runs the callbacks of the transfers the lanes finished, on this
+  // thread. The inline step serves a machine that would not give the
+  // pump a thread.
+  std::size_t serve_deferred() noexcept {
+    std::size_t ran = 0;
+    for (transfer* op = pump_.take_done(); op != nullptr;) {
+      transfer* const next = op->next_deferred;
+      report_deferred(*op);
+      ++ran;
+      op = next;
+    }
+    if (transfer* const op = pump_.run_one_here(); op != nullptr) {
+      report_deferred(*op);
+      ++ran;
+    }
+    return ran;
+  }
+
+  void report_deferred(transfer& op) noexcept {
+    const std::error_code ec = op.result();
+    if (!ec) {
+      served_synchronously_++;
     }
     complete(op, ec);
-    return 1;
   }
 
   // A non-OVERLAPPED handle plus an OVERLAPPED offset blocks until
@@ -1102,9 +1148,9 @@ class ioring_context {
   }
 
   // Queues one read or write of `len` bytes from where the transfer
-  // stopped. False means the ring refused the entry, and the caller puts
-  // the transfer on the deferred list instead: a counted transfer has to
-  // reach its callback whatever the ring does.
+  // stopped. False means the ring refused the entry, and the caller hands
+  // the transfer to the pump instead: a counted transfer has to reach its
+  // callback whatever the ring does.
   [[nodiscard]] bool build(transfer& op, std::uint32_t len) noexcept {
     const ioring_api& api = ioring_entry_points();
     const std::uint64_t at = op.off + op.filled;
@@ -1129,6 +1175,9 @@ class ioring_context {
     if (FAILED(hr)) {
       return false;
     }
+    // The piece is the ring's from here, and charged to the device from
+    // here.
+    op.device_begin();
     ++queued_;
     ++ring_owed_;
     return true;
@@ -1202,6 +1251,8 @@ class ioring_context {
   // whether it was requeued rather than completed, which is the caller's
   // cue to submit.
   [[nodiscard]] bool settle(transfer& op, const IORING_CQE& cqe) noexcept {
+    // This piece is back from the ring, whatever it reports.
+    op.device_end();
     if (FAILED(cqe.ResultCode)) {
       complete(op, ring_error(cqe.ResultCode));
       return false;
@@ -1219,11 +1270,10 @@ class ioring_context {
           ring_len(op, op.off + op.filled, op.len - op.filled);
       if (len == 0 || !build(op, len)) {
         // The remainder is not something this file may hand the ring. It
-        // is still owed, so it goes down the same rung an unalignable
-        // transfer takes from the start, which finishes what is left
-        // inside poll().
+        // is still owed, so it goes to the pump like an unalignable
+        // transfer does from the start, and a lane finishes what is left.
         op.on_ring = false;
-        deferred_.push(op);
+        pump_.push(op);
         return false;
       }
       return true;
@@ -1322,7 +1372,8 @@ class ioring_context {
 #else
   // Without the SDK's declarations there is no ring: use_ring_ is false
   // for the life of the context, so ring_len() takes nothing, place()
-  // defers every transfer and poll() has no completion queue to read.
+  // hands every transfer to the pump and poll() has no completion queue
+  // to read.
   [[nodiscard]] static bool build(transfer&, std::uint32_t) noexcept {
     return false;
   }
@@ -1343,7 +1394,6 @@ class ioring_context {
 #else
   ioring_refusal refusal_{};
 #endif
-  deferred_ops<transfer> deferred_;
   file* files_ = nullptr;  // every open file, for the drain
   std::span<std::byte> arena_{};
   void* reg_handle_ = nullptr;  // the handle in the ring's table, if any
@@ -1352,11 +1402,24 @@ class ioring_context {
   std::size_t queued_ = 0;     // entries built and not yet submitted
   std::size_t ring_owed_ = 0;  // requests the ring has yet to hand back
   std::uint32_t submit_failed_ = 0;  // latched for the next poll() to throw
+  // What the device itself took, stamped by the ring where it carried a
+  // piece and by a lane where one did.
+  device_time device_{};
+  // What the caller asked to have in flight at once; device_depth()
+  // reports it where the ring took the transfers.
+  unsigned queue_depth_ = 1;
   bool async_requested_ = true;
   bool want_registered_ = false;
   bool arena_registered_ = false;
   bool use_ring_ = false;
+  // Whether any transfer of this run reached the ring, which is what
+  // device_depth() reports against.
+  bool used_ring_ = false;
   std::atomic<bool> woken_{false};
+  // The lanes that serve what the ring will not take. Declared last,
+  // so the destructor's join runs while the event its wake() signals is
+  // still open. Do not move this up.
+  deferred_pump<transfer> pump_;
 };
 
 // Definition-site conformance check (see uring_backend.hpp): fails here,

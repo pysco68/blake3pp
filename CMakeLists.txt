@@ -183,6 +183,7 @@ if(BLAKE3PP_WITH_IO)
     src/io/file_writer.cpp
     src/io/io_driver.cpp
     src/io/io_engines.cpp
+    src/io/stream_reader.cpp
     src/io_hash.cpp)
   target_compile_definitions(blake3pp PUBLIC BLAKE3PP_WITH_IO=1)
 endif()

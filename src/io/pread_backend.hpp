@@ -1,10 +1,10 @@
 #pragma once
 
-// The synchronous POSIX backend: plain positional pread/pwrite, with the
-// O_DIRECT reopen where the platform offers it. This is the compile-time
-// choice for POSIX systems with neither io_uring nor GCD; the equivalent
-// RUNTIME floor on Linux lives inside uring_backend.hpp. Internal to
-// src/io/, never installed.
+// The synchronous POSIX backend: plain positional pread/pwrite on the
+// deferred pump's lanes, with the O_DIRECT reopen where the platform
+// offers it. This is the compile-time choice for POSIX systems other than
+// Linux, Darwin and FreeBSD; the runtime floor of those three lives inside
+// their own backends. Internal to src/io/, never installed.
 
 #if defined(__unix__) || defined(__APPLE__)
 
@@ -20,12 +20,15 @@
 namespace blake3pp::detail::io_impl {
 
 // The source half of the synchronous contract (sync_context in
-// backend.hpp supplies the deferred list, the poll loop and the wake).
+// backend.hpp supplies the lanes, the poll loop and the wake).
 class pread_source {
  public:
   // The engine this source is, for sync_context's rung declaration; the
   // word name() below spells, from the one table that spells it.
   static constexpr io_engine rung_engine = io_engine::posix_sync;
+  // pread and pwrite carry their own offset and leave the descriptor's
+  // alone, so two of them may run at once on one file.
+  static constexpr bool positional = true;
 
   pread_source(const std::filesystem::path& path,
                const file_open_options& how)
