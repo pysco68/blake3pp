@@ -1052,4 +1052,14 @@ TEST_CASE("a hasher off the window grid cannot be streamed into") {
   p.close_read();
 }
 
+TEST_CASE("the early hand-over default is per platform") {
+  // Pinned to the literal: the driver and the report both read this
+  // default, so a change to it must change this expectation.
+#if defined(_WIN32)
+  CHECK_FALSE(blake3pp::detail::stream_hands_over_early());
+#else
+  CHECK(blake3pp::detail::stream_hands_over_early());
+#endif
+}
+
 }  // TEST_SUITE

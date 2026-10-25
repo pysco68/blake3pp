@@ -1938,6 +1938,7 @@ struct lane_run {
   unsigned device_depth = 0;
   int most_concurrent = 0;
   int completed = 0;
+  std::thread::id poller{};
   bool every_callback_on_the_polling_thread = true;
 };
 
@@ -1957,6 +1958,7 @@ lane_run<Positional> run_counting(unsigned depth, int n,
   std::vector<std::vector<std::byte>> bufs(static_cast<std::size_t>(n));
   lane_run<Positional> out;
   const std::thread::id polling = std::this_thread::get_id();
+  out.poller = polling;
   for (int i = 0; i < n; ++i) {
     bufs[static_cast<std::size_t>(i)].resize(bytes);
     auto& op = ops[static_cast<std::size_t>(i)];
@@ -1964,6 +1966,9 @@ lane_run<Positional> run_counting(unsigned depth, int n,
     op.done = +[](io_impl::transfer_base* b, std::error_code ec) noexcept {
       auto* const r = static_cast<lane_run<Positional>*>(b->owner);
       r->completed++;
+      if (std::this_thread::get_id() != r->poller) {
+        r->every_callback_on_the_polling_thread = false;
+      }
       if (ec) {
         r->every_callback_on_the_polling_thread = false;
       }
@@ -1975,16 +1980,14 @@ lane_run<Positional> run_counting(unsigned depth, int n,
   while (out.completed < n) {
     ctx.poll(true);
   }
-  // Every callback ran inside one of those poll() calls, on this thread;
-  // the transfers themselves ran somewhere else, which is the point.
-  out.every_callback_on_the_polling_thread =
-      out.every_callback_on_the_polling_thread && polling == polling;
+  // Every callback ran inside one of those poll() calls, on this thread
+  // (checked per callback above); the transfers themselves ran on the
+  // lanes.
   out.device = ctx.device();
   out.lane_wait_ns = ctx.lane_wait_ns();
   out.device_depth = ctx.device_depth();
   out.most_concurrent = shared.most.load();
-  // The whole point: the transfer did not happen on the thread that
-  // called poll(), and the callback did.
+  // The transfer did not happen on the thread that called poll().
   CHECK(shared.performed_off_the_poller.load());
   source::live = nullptr;
   return out;
@@ -1993,6 +1996,7 @@ lane_run<Positional> run_counting(unsigned depth, int n,
 TEST_CASE("a positional synchronous source serves several transfers at once") {
   const lane_run<true> r = run_counting<true>(/*depth=*/8, /*n=*/12);
   CHECK(r.completed == 12);
+  CHECK(r.every_callback_on_the_polling_thread);
   // Four lanes is the ceiling, and more than one transfer was inside the
   // source at once.
   CHECK(r.most_concurrent > 1);
@@ -2003,6 +2007,7 @@ TEST_CASE("a positional synchronous source serves several transfers at once") {
 TEST_CASE("a source that cannot take two at once gets one lane") {
   const lane_run<false> r = run_counting<false>(/*depth=*/8, /*n=*/8);
   CHECK(r.completed == 8);
+  CHECK(r.every_callback_on_the_polling_thread);
   // One cursor, one lane: off the polling thread, but never overlapped.
   CHECK(r.most_concurrent == 1);
   CHECK(r.device_depth == 1);
