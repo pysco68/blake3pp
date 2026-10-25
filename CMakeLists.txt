@@ -164,6 +164,21 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   target_compile_options(blake3pp_warnings INTERFACE -Wshadow-all -Wdocumentation)
 endif()
 
+# Opt-in: a warning in blake3pp's own code fails the build. Set on the
+# plain Linux presets, so a new warning stops the lane that introduced it
+# instead of being printed and unread. It applies to blake3pp_warnings
+# only, never to fetched dependencies, which still carry warnings of
+# their own on some lanes.
+option(BLAKE3PP_WARNINGS_AS_ERRORS
+  "Treat warnings in blake3pp's own targets as errors" OFF)
+if(BLAKE3PP_WARNINGS_AS_ERRORS)
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(blake3pp_warnings INTERFACE /WX)
+  else()
+    target_compile_options(blake3pp_warnings INTERFACE -Werror)
+  endif()
+endif()
+
 # The file-I/O layer needs a filesystem, 64-bit seeks and (on the native
 # backends) OS-specific async I/O.  A freestanding target -- an RTOS on a
 # microcontroller, say -- has none of that and wants none of the code:
