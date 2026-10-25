@@ -48,6 +48,7 @@
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -676,6 +677,136 @@ TEST_CASE("update_stream over a real pipe matches the sequential hasher") {
     }
   }
 }
+
+// ------------------------------------------------------------------
+// The watch before a read: its shape, from what it counts.
+//
+// A scripted platform drives stream_watch with a virtual clock. Every
+// operation advances the clock by what the real one costs in round
+// figures -- a probe 100 ns, a relax 50 ns, a sleep whatever remains to
+// the arrival plus a wake-up -- and arrivals come at the scripted gap
+// after each wait begins. Nothing here is a duration the machine
+// measures: the assertions are on counters.
+
+namespace {
+
+struct scripted_watch_platform {
+  std::int64_t t = 0;
+  std::int64_t next_arrival = 0;
+  std::int64_t wake_latency = 30'000;  // the real figure is tens of us
+  [[nodiscard]] std::int64_t now() const noexcept { return t; }
+  [[nodiscard]] bool probe() noexcept {
+    t += 100;
+    return t >= next_arrival;
+  }
+  void sleep() noexcept { t = std::max(t, next_arrival) + wake_latency; }
+  void relax() noexcept { t += 50; }
+  // Begins a wait whose data arrives `gap` from now.
+  void arrive_in(std::int64_t gap) noexcept { next_arrival = t + gap; }
+};
+
+}  // namespace
+
+TEST_CASE("a producer whose gaps sit inside the ceiling is never slept on") {
+  detail::stream_watch w;
+  scripted_watch_platform p;
+  for (int i = 0; i < 64; ++i) {
+    p.arrive_in(5'000);
+    w.wait(p);
+  }
+  const auto& c = w.stats();
+  CHECK(c.slept == 0);
+  CHECK(c.caught == 64);
+  // One opening probe and then one per interval until the data at 5 us,
+  // give or take the probe's own cost.
+  const std::uint64_t paced = 5'000 / detail::stream_watch::probe_interval_ns;
+  CHECK(c.probes >= 64 * paced);
+  CHECK(c.probes <= 64 * (paced + 2));
+  CHECK(w.budget() == detail::stream_watch::ceiling_ns);
+}
+
+TEST_CASE("a producer whose gaps exceed the ceiling decays the budget to the floor") {
+  detail::stream_watch w;
+  scripted_watch_platform p;
+  // Halved on every time-out, 16 us to the floor in a handful of waits.
+  for (int i = 0; i < 8; ++i) {
+    p.arrive_in(100'000);
+    w.wait(p);
+  }
+  CHECK(w.stats().slept == 8);
+  CHECK(w.stats().caught == 0);
+  CHECK(w.budget() == detail::stream_watch::floor_ns);
+  // And a short sleep re-arms it by one step.
+  p.wake_latency = 2'000;
+  p.arrive_in(5'000);
+  w.wait(p);
+  CHECK(w.budget() == detail::stream_watch::floor_ns + detail::stream_watch::step_ns);
+}
+
+TEST_CASE("at the floor every wait still makes one paced probe") {
+  // The floor is one probe interval, and the promise is that a wait at
+  // the floor probes once before it sleeps. A loop that tested the
+  // budget before the probe made none, and a producer whose gaps sit
+  // around a microsecond was slept on every time.
+  detail::stream_watch w;
+  scripted_watch_platform p;
+  for (int i = 0; i < 8; ++i) {
+    p.arrive_in(100'000);
+    w.wait(p);
+  }
+  REQUIRE(w.budget() == detail::stream_watch::floor_ns);
+  const auto before = w.stats();
+  p.arrive_in(100'000);
+  w.wait(p);
+  // The opening probe and exactly one paced probe, then the sleep.
+  CHECK(w.stats().probes - before.probes == 2);
+  CHECK(w.stats().slept - before.slept == 1);
+  // And data that arrives inside that one interval is caught, not slept on.
+  p.arrive_in(detail::stream_watch::probe_interval_ns - 200);
+  w.wait(p);
+  CHECK(w.stats().slept - before.slept == 1);
+  CHECK(w.stats().caught - before.caught == 1);
+}
+
+#if !defined(_WIN32)
+TEST_CASE("a slow producer is waited for and the descriptor is left as found") {
+#if defined(__EMSCRIPTEN__)
+  // Emscripten's in-memory pipe answers EAGAIN to a read of an empty pipe
+  // even after the write end has closed, so a case that reads a live
+  // producer to its end cannot finish there.
+  MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
+  return;
+#endif
+  // The reader watches an empty pipe before it sleeps; a producer that
+  // pauses for longer than the watch must still be waited for, and the
+  // waiting must not reach the descriptor's flags, which standard input
+  // shares with the parent shell.
+  const auto bytes = pattern(3 * 64 * 1024 + 17, 43);
+  os_pipe p;
+  REQUIRE(p.open());
+  const int flags_before = ::fcntl(p.r, F_GETFL);
+  std::thread producer([&p, &bytes] {
+    std::size_t at = 0;
+    while (at < bytes.size()) {
+      const std::size_t want = std::min<std::size_t>(64 * 1024, bytes.size() - at);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      const auto n = ::write(p.w, bytes.data() + at, want);
+      REQUIRE(n > 0);
+      at += static_cast<std::size_t>(n);
+    }
+    p.close_write();
+  });
+  blake3pp::hasher h;
+  const blake3pp::stream_report r =
+      blake3pp::update_stream(h, p.r, blake3pp::get_parallel_scheduler());
+  producer.join();
+  CHECK(::fcntl(p.r, F_GETFL) == flags_before);
+  CHECK((flags_before & O_NONBLOCK) == 0);
+  p.close_read();
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+  CHECK(r.bytes == bytes.size());
+}
+#endif
 
 TEST_CASE("a hasher off the window grid cannot be streamed into") {
   os_pipe p;

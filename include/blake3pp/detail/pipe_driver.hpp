@@ -35,17 +35,19 @@
 //
 // Blocking there does not stall the producer: a stream with nothing in
 // it is a producer that is not waiting on this reader, while a reader
-// that stopped draining a FULL one would stall it. It is not free,
-// though. A readiness probe reports an empty queue without sleeping,
-// and a blocking read learns the same fact by sleeping. Dropping the
-// probe therefore trades calls for wake-ups: measured on Linux at
-// 512-byte producer writes, 32% fewer syscalls and 32% more voluntary
-// context switches, for 3.6% of wall clock. At 4 KiB writes it is 2.3%,
-// and at a producer that keeps up it is nothing -- not because the
-// stream stays full, since a 1 MiB pipe cannot fill an 8 MiB ask and
-// so nearly every read drains it, but because it refills at once and
-// the block returns immediately. What buys the cost back is Windows,
-// where the probe has no non-blocking form at all.
+// that stopped draining a FULL one would stall it. What it costs is the
+// sleep itself. A pipe write wakes its reader only when the reader is
+// asleep, so a reader that drains the pipe and sleeps turns every write
+// of a fast producer into a cross-CPU wake-up, paid by the producer in
+// the write and by the reader in the scheduling latency after it. The
+// reader therefore watches an empty stream for a bounded, adaptive
+// budget before it sleeps (stream_watch). Measured on
+// Linux over 2 GiB from /dev/zero through dd, 16 threads, four
+// counterbalanced rounds: 15% less wall at 512-byte producer writes,
+// 21% at 4 KiB and 33% behind cat, at equal or lower total CPU, because
+// the sleeps it removes were themselves system time; a producer that
+// keeps up never finds the stream empty and never pays for the watch,
+// and one with gaps of 50 us or 1 ms is unchanged in wall and CPU.
 //
 // A short read means the queue was emptied by it whatever the ask, since
 // a read takes everything queued up to what it asked for. The ask
@@ -106,6 +108,119 @@ using native_stream = int;
 // around it is the arithmetic a 2^64-byte file would get.
 inline constexpr std::uint64_t streaming_size = ~std::uint64_t{0};
 
+// The wait before a read of a stream that is empty: watch it for a
+// bounded, adaptive budget, then sleep.
+//
+// A template over the platform, which supplies four operations --
+//
+//   now()    the monotonic clock, in nanoseconds;
+//   probe()  whether a read would return now, without waiting;
+//   sleep()  wait until a read would return;
+//   relax()  one iteration of a busy wait;
+//
+// -- so the tests drive the loop with a scripted clock and scripted
+// arrivals and assert on what it counted, and the shipped reader
+// supplies the real ones (stream_reader.cpp). The rule can only ever
+// cost time, never a byte, so a digest test cannot see a defect in it;
+// the counters are what make its shape observable.
+//
+// The watch replaces a sleep and a wake-up with a few probes, so it pays
+// only where a probe costs less than the sleep it removes. Two platforms
+// read without it:
+//
+//   * Darwin. A zero-timeout poll() costs the caller an involuntary
+//     context switch whenever anything else is runnable, data queued or
+//     not, so the probe that opens every wait is already a loss.
+//   * Windows. PeekNamedPipe costs 1.50 us a call, and a watch built on it
+//     lost every one of 42 counterbalanced pairs.
+//
+// Such a platform skips wait() entirely rather than running it with a
+// zero budget (stream_reader.cpp carries the measurements).
+//
+// The budget moves in steps of an eighth of the ceiling and never jumps:
+// a probe that finds data grows it, a budget that times out is halved,
+// and a sleep that a full-ceiling watch would have avoided grows it.
+// Eight consecutive hits re-arm a fully decayed budget. A smaller step
+// notices a producer that speeds up more slowly. A step as large as the
+// ceiling pays a full wasted watch on every long gap of a producer whose
+// gaps straddle the ceiling; measured, that rule lost 5% to a reader that
+// only sleeps. The floor is one probe interval: the smallest budget that
+// still makes one probe before the sleep.
+//
+// The ceiling is 16 us and the watch is paced to one probe per
+// microsecond, so a full budget is sixteen probes and a write is noticed
+// at most a microsecond late. Measured on Linux against probe intervals
+// of 4 and 16 us, 1 us was the fastest at 4 KiB producer writes and level
+// at 512-byte ones.
+//
+// This is the only clock in the stream path, and it decides nothing the
+// hasher can see: it chooses how the thread waits, watching or sleeping,
+// for the same readiness. Nothing here ends a window.
+//
+// One instance per reader, touched only by the thread that owns the
+// driver; a reader shared between threads would race here.
+class stream_watch {
+ public:
+  static constexpr std::int64_t ceiling_ns = 16 * 1000;
+  static constexpr std::int64_t probe_interval_ns = 1000;
+  static constexpr std::int64_t step_ns = ceiling_ns / 8;
+  static constexpr std::int64_t floor_ns = probe_interval_ns;
+
+  // What the waits did. `probes` counts every probe, the one each wait
+  // opens with included; `caught` the waits a probe ended; `slept` the
+  // waits that reached the sleep.
+  struct counters {
+    std::uint64_t probes = 0;
+    std::uint64_t caught = 0;
+    std::uint64_t slept = 0;
+  };
+
+  // Returns once a read would return something. May throw whatever the
+  // platform's probe or sleep throws.
+  template <class Platform>
+  void wait(Platform& p) {
+    ++stats_.probes;
+    if (p.probe()) {
+      return;
+    }
+    const std::int64_t t0 = p.now();
+    const std::int64_t budget = budget_;
+    std::int64_t last_probe = t0;
+    for (;;) {
+      std::int64_t t = p.now();
+      while (t - last_probe < probe_interval_ns) {
+        p.relax();
+        t = p.now();
+      }
+      last_probe = t;
+      ++stats_.probes;
+      if (p.probe()) {
+        budget_ = std::min(ceiling_ns, budget + step_ns);
+        ++stats_.caught;
+        return;
+      }
+      // The probe before the budget: a budget of one interval makes
+      // exactly one probe, as the floor promises.
+      if (t - t0 >= budget) {
+        break;
+      }
+    }
+    budget_ = std::max(floor_ns, budget / 2);
+    p.sleep();
+    ++stats_.slept;
+    if (p.now() - t0 < ceiling_ns) {
+      budget_ = std::min(ceiling_ns, budget + step_ns);
+    }
+  }
+
+  [[nodiscard]] std::int64_t budget() const noexcept { return budget_; }
+  [[nodiscard]] const counters& stats() const noexcept { return stats_; }
+
+ private:
+  std::int64_t budget_ = ceiling_ns;
+  counters stats_{};
+};
+
 // The platform's read, behind a compiled seam.
 //
 // One call reads what is already there rather than what was asked for:
@@ -128,8 +243,21 @@ class stream_reader {
   // held less than was asked for, so there is nothing further to take
   // until the producer writes again. That is the driver's hand-over
   // signal, and it comes out of the read the driver was making anyway.
+  //
+  // An empty stream is watched for a bounded, adaptive budget before
+  // the call sleeps in the kernel (stream_watch). A pipe write wakes
+  // its reader only when the reader is asleep, so a reader that drains
+  // the pipe and sleeps turns every write of a fast producer into a
+  // cross-CPU wake-up that both sides pay for; watching the queue for a
+  // few microseconds instead keeps both out of the scheduler. The
+  // budget decides only how long the call waits before it sleeps --
+  // never what it returns, which is what the queue holds when the read
+  // is made, exactly as before.
   // @throws std::system_error on a read failure.
   [[nodiscard]] result read_some(std::span<std::byte> out);
+
+  // The watch's budget and counters, for a driver that reports them.
+  [[nodiscard]] const stream_watch& watch() const noexcept { return watch_; }
 
   // The most one read may usefully be asked for, or zero where asking
   // for the whole remainder costs nothing.
@@ -174,7 +302,12 @@ class stream_reader {
   std::size_t widen(std::size_t bytes) noexcept;
 
  private:
+  // Waits until a read would return something -- bytes, the end, or an
+  // error -- watching first and sleeping after.
+  void wait_readable();
+
   native_stream h_;
+  stream_watch watch_;
 };
 
 // This process's standard input as a stream handle.
@@ -304,6 +437,8 @@ class basic_pipe_driver {
   [[nodiscard]] std::uint64_t bytes_read() const noexcept { return total_; }
   // The stream buffer the OS granted, or zero where it was not asked.
   [[nodiscard]] std::size_t widened_to() const noexcept { return widened_; }
+  // The reader, for what it counted (stream_reader::watch()).
+  [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
  private:
   // One window's bytes, and how many of them there are.
