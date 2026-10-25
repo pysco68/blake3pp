@@ -68,7 +68,9 @@ class io_driver {
 
   // An open file bound to a driver. Destroy every file before its
   // driver: the driver's drain protects the memory these are reading
-  // into.
+  // into. Destroy the operations submitted on a file after the file, or
+  // after drain(file&): a file closing with transfers owed drains them
+  // and may write into those operations until it returns.
   class file {
    public:
     file(io_driver& drv, const std::filesystem::path& path,
@@ -93,23 +95,23 @@ class io_driver {
   };
 
   // Queues one read of exactly buf.size() bytes. No syscall, no
-  // callback. A window the file cannot take asynchronously is served
-  // synchronously inside poll(), as it is in the backends.
+  // callback. A window the file cannot take asynchronously is read
+  // synchronously by the backend's own I/O threads.
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    io_op& op);
   // The write side of the same contract: no syscall, no callback, and a
-  // length the platform cannot take asynchronously is written inside
-  // poll() like an unalignable read is.
+  // length the platform cannot take asynchronously is written off the
+  // polling thread like an unalignable read is.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
                     io_op& op);
   // Pushes everything queued to the OS in one call. A read the OS
-  // refuses is not lost: it is read synchronously inside poll(), which
-  // is why nothing here reports a submit failure.
+  // refuses is not lost: it is read synchronously off the polling
+  // thread, which is why nothing here reports a submit failure.
   void flush() noexcept;
-  // Reaps completions, reissues short reads, performs at most one
-  // deferred synchronous read, and runs the callbacks of every op that
-  // finished. Flushes first. With block, sleeps until at least one
-  // callback ran or wake() was called. Returns callbacks run.
+  // Reaps completions, reissues short reads, and runs the callbacks of
+  // every op that finished -- including the ones the backend's deferred
+  // threads performed. Flushes first. With block, sleeps until at least
+  // one callback ran or wake() was called. Returns callbacks run.
   std::size_t poll(bool block);
   // The only member another thread may call.
   void wake() noexcept;
@@ -125,6 +127,21 @@ class io_driver {
   // no cancel mechanism does nothing and the read runs to completion.
   void cancel(io_op& op) noexcept;
   [[nodiscard]] std::size_t in_flight() const noexcept;
+  // The most transfers the engine behind this driver can have at the
+  // device at once: the depth it was built with where an asynchronous
+  // engine took them, and on the synchronous rung the I/O threads serving
+  // it -- one on Windows, whose threads share one non-overlapped handle
+  // and were measured to gain nothing over one. What the diagnosis reads
+  // the device's queue against.
+  [[nodiscard]] unsigned device_depth() const noexcept;
+  // Nanoseconds transfers spent waiting for one of those threads before
+  // they started, with none of the device in it: the measure of too few
+  // of them. Zero on a run the engine carried.
+  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept;
+  // What the device itself took over this run, stamped by whoever
+  // performed each transfer rather than inferred from a span of the
+  // pipeline's timeline.
+  [[nodiscard]] device_time device_time_of_run() const noexcept;
   // Waits out every read still owed, running no callback, and forgets
   // the rest. The invariant it establishes: afterwards in_flight() is
   // zero, the driver references no io_op, and every op it owed has
@@ -132,30 +149,30 @@ class io_driver {
   // sweep them with cancel() and meet nothing. The driver stays usable.
   // The destructor drains too, a no-op after this.
   void drain() noexcept;
-  // The same for one file: afterwards no transfer of this file is owed or
+  // drain() for one file. Afterwards no transfer of this file is owed or
   // referenced and its operations have `live` lowered, so its buffers and
-  // the operations naming them may be destroyed, and the driver stays
-  // usable for this file and every other.
-  // A sibling file's completion that surfaces during the wait is reported
-  // normally -- dropping it would strand an op that can never complete --
-  // so a caller closing one file of several should idle it first.
+  // the operations naming them may be destroyed. The driver stays usable
+  // for this file and every other.
   //
-  // The file's destructor does NOT do this: it cannot, because the
-  // operations whose transfers would be forgotten may already be gone, and
-  // reading them is what this call does. A file destroyed with transfers
-  // still owed drains the WHOLE context instead, which is the backends'
-  // last resort and strands every sibling's owed transfer. Call this while
-  // the operations are alive.
+  // A sibling file's completion that surfaces during the wait is reported
+  // normally, because dropping it would strand an op that can never
+  // complete. A caller closing one file of several should idle it first.
+  //
+  // The file's destructor does NOT do this: a file destroyed with
+  // transfers still owed drains the WHOLE context, the backends' last
+  // resort, which strands every sibling's owed transfer. Either way the
+  // operations must outlive the drain, because the backend's own threads
+  // may write into one until it returns. Destroy the operations only after
+  // this call or after the file.
   void drain(file& f) noexcept;
 
   // Takes the window memory: one direct-I/O-aligned arena of
-  // windows * window_bytes, valid until the driver is destroyed -- which
-  // drains first, so no read is ever in flight into freed memory.
-  // Exactly one call per driver, made by the window pool at
-  // construction; a second call is a contract violation that debug
-  // builds assert on rather than a reallocation. There is no free().
-  // Several pipelines may run over one arena at once, each borrowing
-  // windows from that pool.
+  // windows * window_bytes, valid until the driver is destroyed. The
+  // destructor drains first, so no read is ever in flight into freed
+  // memory. Exactly one call per driver, made by the window pool at
+  // construction; a second call is a contract violation that debug builds
+  // assert on. There is no free(). Several pipelines may run over one
+  // arena at once, each borrowing windows from that pool.
   void reserve(unsigned windows, std::size_t window_bytes);
 
   // The slice of that arena window `slot` reads into, and the same bytes

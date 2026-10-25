@@ -792,6 +792,20 @@
       }
     },
     {
+      "name": "linux-gcc16-cxx26-tsan",
+      "configurePreset": "linux-gcc16-cxx26-tsan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-clang22-cxx26-tsan",
+      "configurePreset": "linux-clang22-cxx26-tsan",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
       "name": "linux-ppc64le-gcc15-cxx23",
       "configurePreset": "linux-ppc64le-gcc15-cxx23",
       "output": {

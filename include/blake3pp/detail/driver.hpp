@@ -98,8 +98,8 @@ struct io_op {
   // compiled, so no header here can sizeof/alignof all of them to take
   // their max. Measured by the "op storage" case in
   // tests/file_pipeline.cpp, which prints what the build actually has:
-  // the real transfer is 104 bytes aligned to 8 on Linux and on FreeBSD,
-  // leaving 56 bytes of headroom for the other backends' larger fields
+  // the real transfer is 120 bytes aligned to 8 on Linux and on FreeBSD,
+  // leaving 72 bytes of headroom for the other backends' larger fields
   // (Windows' OVERLAPPED among them). What keeps FreeBSD's inside it is
   // that its 160-byte struct aiocb lives in the CONTEXT's request pool
   // rather than in the operation; src/io/aio_backend.hpp says why the
@@ -110,7 +110,23 @@ struct io_op {
   // Could be derived as sizeof/alignof of a union of the transfer types
   // instead of asserted, at the cost of pulling every backend's header
   // into every TU that only needs the concept.
-  static constexpr std::size_t storage_size = 160;
+  //
+  // WINDOWS is the binding case, and the only one. It chooses the ring or
+  // the port at runtime, so windows_context::transfer is a transfer_base
+  // around a UNION of both backends' transfers, each of which carries a
+  // transfer_base of its own (src/io/backend_select.hpp). A byte added to
+  // transfer_base is therefore charged TWICE there, and the larger of the
+  // two members sets the rest: 16 for the composite's base plus 152 for
+  // iocp_context::transfer is 168, against 112 for the ring's. No Linux
+  // build can catch that: every context there is a single transfer.
+  //
+  // 192 leaves 24 bytes over that 168. The slack costs bytes per
+  // operation in flight, and an operation is one window: at the 256-window
+  // ceiling (max_queue_depth) the operations take 48 KiB, against at least
+  // 16 MiB for the windows they point into (256 of the 64 KiB minimum). A
+  // figure trimmed to fit would break on the next field a Windows backend
+  // needs.
+  static constexpr std::size_t storage_size = 192;
   static constexpr std::size_t storage_align = 16;
   alignas(storage_align) std::byte storage[storage_size];
 
@@ -202,5 +218,68 @@ concept file_driver =
       { d.window_storage_for(f, windows, off, bytes) }
           -> std::same_as<window_storage>;
     };
+
+// What the driver's engine actually offered the device, where it can say.
+//
+// Optional rather than part of file_driver, like
+// register_arena_if_supported() in src/io/backend.hpp: only the file I/O
+// driver has an engine with a queue of its own. A driver without these
+// members (memory_driver, pipe_driver) leaves the depth the pipeline asked
+// for standing and the pipeline's own admission-to-landing span as the
+// device's time.
+struct device_time {
+  // Summed nanoseconds the device had a transfer, over the pieces it was
+  // carried in.
+  std::uint64_t total_ns = 0;
+  // The shortest of those, which is the device's latency with nothing
+  // queued ahead.
+  std::uint64_t min_ns = 0;
+  // Transfers that contributed. Zero means the driver cannot say, and
+  // the pipeline's own measure stands.
+  std::uint64_t transfers = 0;
+
+  void add(std::uint64_t ns) noexcept {
+    total_ns += ns;
+    min_ns = transfers == 0 ? ns : (ns < min_ns ? ns : min_ns);
+    ++transfers;
+  }
+
+  // Records a transfer the device actually had, and ignores one it never
+  // did -- cancelled before it was issued, or refused outright. Counting
+  // a zero would pull `min_ns` to zero, which is the yardstick the mean
+  // is read against, and dilute the mean with a transfer that never
+  // happened.
+  void add_if_served(std::uint64_t ns) noexcept {
+    if (ns > 0) {
+      add(ns);
+    }
+  }
+};
+
+struct device_service {
+  // The most transfers the engine can have at the device at once; zero
+  // means the driver cannot say and the queue depth in force stands.
+  unsigned depth = 0;
+  // Nanoseconds transfers spent waiting for one of the driver's own
+  // servers before they started, with none of the device in it.
+  std::uint64_t lane_wait_ns = 0;
+  // What the device itself took, stamped where the transfer happened.
+  device_time device{};
+};
+
+template <class D>
+[[nodiscard]] device_service device_service_of(const D& drv) noexcept {
+  if constexpr (requires {
+                  { drv.device_depth() } noexcept -> std::same_as<unsigned>;
+                  { drv.lane_wait_ns() } noexcept -> std::same_as<std::uint64_t>;
+                  {
+                    drv.device_time_of_run()
+                  } noexcept -> std::same_as<device_time>;
+                }) {
+    return {drv.device_depth(), drv.lane_wait_ns(), drv.device_time_of_run()};
+  } else {
+    return {};
+  }
+}
 
 }  // namespace blake3pp::detail

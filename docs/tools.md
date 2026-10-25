@@ -283,7 +283,7 @@ $ blake3ppgen --seed s --length 2G --output out.bin --diag
 diagnosis: device-limited (write side)
   generator        2.8% of the 16 windows in flight (2.8% of 16 threads)
   windows        16 in flight, 4 MiB each (64 MiB); the arena and the depth are one number here
-  device         15.083 ms per window over 512 writes (min 1.301 ms), holding  93.9% of the windows
+  device         15.083 ms per window over 512 writes (min 1.301 ms), holding  93.9% of the windows, 16 at a time
   the device held a full queue for the run: it is the wall.
 ```
 

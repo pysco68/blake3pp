@@ -239,9 +239,10 @@ class polled_reader_engine {
 // acquire() blocking on a slot whose write is still in flight is the
 // backpressure.
 //
-// Every submit queues; the context decides how the bytes travel, and a
-// length the platform cannot take asynchronously rides the backend's
-// deferred list and lands inside poll(), exactly as such a read does.
+// Every submit queues; the context decides how the bytes travel. A
+// length the platform cannot take asynchronously is performed on one of
+// the backend's I/O lanes, and its completion is reported from poll(),
+// exactly as such a read's is.
 // Hence the timing both paths share:
 //
 //   submit() ACCEPTS bytes. finish() LANDS them.

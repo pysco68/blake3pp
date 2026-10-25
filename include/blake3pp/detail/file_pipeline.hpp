@@ -10,11 +10,14 @@
 //       | continues_on(io.scheduler())
 //       | then(reduce_into_tree)
 //
-// and the whole pipeline runs on the thread that called update_file: the
-// library owns no thread. Only the compress stage leaves it, and
-// continues_on brings the result back through driver_scheduler.
+// and the thread that called update_file drives the whole pipeline. The
+// compress stage alone leaves it, on the caller's scheduler, and
+// continues_on brings the result back through driver_scheduler. The only
+// threads the library owns sit below the driver: on the synchronous rung the I/O
+// backend performs transfers on lanes of its own, and their callbacks
+// still run inside poll() on this thread.
 //
-// The one thread is also the contract with the I/O backends: every
+// That thread is also the contract with the I/O backends: every
 // submit_read, flush and poll happens here, and wake() is the only
 // member another thread calls. That is why a scheduler exists at all --
 // a pool thread cannot touch the driver, so it parks a node on the run
@@ -600,6 +603,8 @@ class driver_loop {
   }
 
   [[nodiscard]] D& driver() noexcept { return drv_; }
+  // For a const reporter asking the driver what its engine offered.
+  [[nodiscard]] const D& driver() const noexcept { return drv_; }
 
   // Where to record what this thread spends its time on; null records
   // nothing, which is the default and costs one branch per poll.
@@ -1018,9 +1023,9 @@ inline constexpr std::size_t reducer_nodes = 256;
 // Direct I/O wants aligned offsets as well as aligned lengths, and the
 // windows after a short first one start at head + n * window -- so an
 // unaligned head misaligns every window of the file, not just the first.
-// Degrading read by read would put every one of them on the synchronous
-// path inside poll(), on the driver thread; a buffered file keeps them
-// all asynchronous. So the choice is per file, and it is made once.
+// Degrading read by read would send every one of them to the synchronous
+// rung; a buffered file keeps them all asynchronous. So the choice is per
+// file, and it is made once.
 [[nodiscard]] constexpr bool direct_io_fits(std::size_t head) noexcept {
   return head % direct_alignment == 0;
 }
@@ -1632,12 +1637,21 @@ class window_scope
       d.max_windows_in_flight = max_windows_;
       d.transfers_landed = transfers_landed_;
       d.transfer_bytes = transfer_bytes_;
-      d.device_wait_ns = device_wait_ns_;
       d.starved_ns = starved_ns_;
       d.queue_depth_final = reads_in_flight_;
       d.queue_depth_peak = reads_in_flight_;
       d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
-      d.device_wait_min_ns = transfers_landed_ > 0 ? device_min_ns_ : 0;
+      // The device's own time belongs to whoever performed the transfer,
+      // so it is preferred wherever the driver can attribute it. A driver
+      // that cannot leaves the admission-to-landing span standing.
+      const device_service svc = device_service_of(loop_.driver());
+      d.device_depth = svc.depth;
+      d.lane_wait_ns = svc.lane_wait_ns;
+      const bool attributed = svc.device.transfers > 0;
+      d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns_;
+      d.device_wait_min_ns =
+          attributed ? svc.device.min_ns
+                     : (transfers_landed_ > 0 ? device_min_ns_ : 0);
     }
     if (eptr_) {
       return outcome::exception;

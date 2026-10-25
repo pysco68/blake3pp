@@ -177,11 +177,13 @@ thread is the bottleneck.
 | `max_reads_in_flight` | the most reads submitted and not yet landed: what the device saw |
 | `max_windows_in_flight` | the most windows reading, on the pool or waiting to reduce |
 | `transfers_landed`, `transfer_bytes` | windows whose transfer landed, and the bytes they moved |
-| `device_wait_ns` | summed per-window time the device had the transfer, with nothing of the pipeline's own in it |
+| `device_wait_ns` | summed per-window time the device had the transfer, stamped by whoever performed it; where the driver cannot attribute (memory, a stream), the admission-to-landing span |
 | `starved_ns` | the pipeline unable to use a window it already held: reading, no free window; writing, nothing to write |
 | `queue_depth_final`, `queue_depth_peak` | the depth the run ended on and the deepest it reached |
 | `agent_busy_ns` | summed over every window and agent: the pool compressing on a read run, filling on a write one |
 | `device_wait_min_ns` | the shortest of those per-transfer times: the device with nothing queued ahead of it |
+| `device_depth` | the most transfers the engine could have at the device at once: the queue depth on an asynchronous engine, the I/O threads on the synchronous rung (one on Windows); 0 where the driver cannot say |
+| `lane_wait_ns` | time transfers waited for one of those I/O threads before they started; nonzero only where those threads served transfers |
 | `read_backend` | the rung the reads engaged, through `read_backend(d)` |
 
 The four transfer counters are kept on every run, traced or not, and a

@@ -32,11 +32,13 @@ every window that passes through them.
 
 `read` is a sender over the fastest mechanism the platform and the
 filesystem allow -- io_uring, IoRing or IOCP, GCD, POSIX AIO on a
-kqueue, or a synchronous `pread` -- behind
-one driver interface. Its `start()` queues the transfer and returns. It does
-not flush, because the driver loop flushes once per round and a whole
-batch of windows then reaches the OS in one call; and it does not
-complete, because the backends call back only from inside `poll()`.
+kqueue, or a synchronous `pread` -- behind one driver interface. Its
+`start()` queues the transfer and returns. It does not flush, because the
+driver loop flushes once per round and a whole batch of windows then
+reaches the OS in one call; and it does not complete, because the backends
+call back only from inside `poll()`. A synchronous transfer is performed
+on up to four I/O threads of the backend's own, so the driving thread
+does not block in a read, and it is still reported from `poll()`.
 
 The value completion carries the window's bytes: the backends read exactly
 what was asked for or report an error, so a window that completes is whole.

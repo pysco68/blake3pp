@@ -402,8 +402,9 @@ struct fake_script {
   int bad_alloc_at_window = -1;
   // What the device does about a cancel. All three are conforming, and
   // the pipeline has to report the same thing under each: the backends
-  // differ exactly here (io_uring aborts, IOCP aborts, GCD has no
-  // cancel at all, and any of them can lose the race to the data).
+  // differ exactly here (io_uring and IOCP abort the transfer, GCD cannot
+  // recall a read a dispatch worker already has, and any of them can lose
+  // the race to the data).
   enum cancel_mode {
     cancel_aborts,   // the read ends operation_canceled
     cancel_loses,    // the data had already arrived; the ask changes nothing
@@ -972,6 +973,40 @@ TEST_CASE("a drain lowers live on the operations it forgot") {
     drv.cancel(op_b);
     CHECK(drv.poll(false) == 0);
   }
+
+  SUBCASE("a file destroyed while a sibling is in flight") {
+    // Where the context forgets per file (Windows, Darwin), the sibling's
+    // read is still counted when A goes, and A's own must be lowered all
+    // the same: its storage may be submitted again.
+    io_driver drv({}, 4);
+    io_op op_a{};
+    io_op op_b{};
+    read_probe probe_a;
+    read_probe probe_b;
+    op_a.done = &read_probe::on_done;
+    op_a.owner = &probe_a;
+    op_b.done = &read_probe::on_done;
+    op_b.owner = &probe_b;
+    io_driver::file file_b(drv, fb.path, /*direct_io=*/false);
+    drv.reserve(2, len);
+    const auto pool_b = drv.window_storage_for(file_b, 1, 0, len).read_into;
+    {
+      io_driver::file file_a(drv, fa.path, /*direct_io=*/false);
+      const auto pool_a = drv.window_storage_for(file_a, 0, 0, len).read_into;
+      drv.submit_read(file_b, 0, pool_b, op_b);
+      drv.submit_read(file_a, 0, pool_a, op_a);
+      drv.flush();
+    }
+    CHECK(!op_a.live);
+    CHECK(probe_a.calls == 0);
+    drv.cancel(op_a);  // nothing owed: a no-op, not a request on a closed file
+    while (drv.in_flight() > 0) {
+      drv.poll(true);
+    }
+    CHECK(!op_b.live);
+    CHECK(drv.poll(false) == 0);
+    CHECK(probe_a.calls == 0);
+  }
 }
 
 // The teardown contract the arena exists for: a driver destroyed with a
@@ -985,12 +1020,14 @@ TEST_CASE("the io driver drains a read in flight before freeing its arena") {
   const temp_file f(content);
 
   read_probe probe;
+  // Before the driver and the file: an operation must outlive the drain
+  // that forgets it.
+  io_op op{};
   {
     io_driver drv({}, 4);
     io_driver::file file(drv, f.path, /*direct_io=*/false);
     drv.reserve(1, len);
   const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
-    io_op op{};
     op.done = &read_probe::on_done;
     op.owner = &probe;
     drv.submit_read(file, 0, pool, op);
@@ -1051,14 +1088,11 @@ TEST_CASE("one file's transfers are reclaimed without the others'") {
   CHECK(std::equal(kept_pool.begin(), kept_pool.end(), content.begin()));
 }
 
-// A file destroyed with a transfer still owed, which is the order a caller
-// gets by declaring the operation after the file. Its destructor cannot
-// read those transfers -- the operation they live in may already be gone --
-// so it takes the whole drain instead: the kernel is waited out, no
-// callback runs, and the driver is usable afterwards. The cost is that a
-// sibling's pending callback goes with it, which is why the pipeline
-// reclaims its file explicitly (above) rather than leaving it to this.
-TEST_CASE("a file closing with a transfer owed drains rather than read it") {
+// A file destroyed with a transfer still owed takes the whole drain: the
+// kernel is waited out, no callback runs, the operation is no longer
+// owed, and the driver is usable afterwards. A sibling's pending callback
+// goes with it, so the pipeline reclaims its file explicitly (above).
+TEST_CASE("a file closing with a transfer owed drains the context") {
   using blake3pp::detail::io_driver;
   using blake3pp::detail::io_op;
   constexpr std::size_t len = 256 * 1024;
@@ -1068,10 +1102,13 @@ TEST_CASE("a file closing with a transfer owed drains rather than read it") {
   io_driver drv({}, 4);
   drv.reserve(1, len);
   read_probe closing;
+  // Before the file: an operation must outlive the drain its file's
+  // destructor runs.
+  io_op closing_op{};
   {
     io_driver::file going(drv, f.path, /*direct_io=*/false);
     const auto pool = drv.window_storage_for(going, 0, 0, len).read_into;
-    io_op op{};  // after the file, so it dies first
+    io_op& op = closing_op;
     op.done = &read_probe::on_done;
     op.owner = &closing;
     drv.submit_read(going, 0, pool, op);
@@ -1080,6 +1117,7 @@ TEST_CASE("a file closing with a transfer owed drains rather than read it") {
   }
   CHECK(closing.calls == 0);
   CHECK(drv.in_flight() == 0);
+  CHECK(!closing_op.live);
 
   // And the driver still works: another file reads through it.
   io_driver::file again(drv, f.path, /*direct_io=*/false);

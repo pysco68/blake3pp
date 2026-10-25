@@ -107,10 +107,10 @@ class windows_context {
         // keeps best_io_engine() from remembering a resource failure.
         ring_refusal_settled_ = ring_->engaged_rung().settled;
         // A ring that could not be had leaves the port as the better of
-        // the two fallbacks: the ring context's own ladder would serve
-        // every transfer synchronously. The reason goes onto the port's
-        // file names, where a ring asked for and refused is otherwise
-        // invisible; a ring not asked for leaves them as they are.
+        // the two fallbacks, since the ring context's own ladder would
+        // serve every transfer synchronously on its lanes. When async was
+        // asked for, the reason goes onto the port's file names, where a
+        // refused ring would otherwise be invisible.
         if (opts.async) {
           ring_refusal_ = no_ioring_suffix(ring_->refusal());
         }
@@ -168,6 +168,16 @@ class windows_context {
     } else {
       port_->cancel(op.in.port);
     }
+  }
+
+  [[nodiscard]] unsigned device_depth() const noexcept {
+    return ring_ ? ring_->device_depth() : port_->device_depth();
+  }
+  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
+    return ring_ ? ring_->lane_wait_ns() : port_->lane_wait_ns();
+  }
+  [[nodiscard]] device_time device() const noexcept {
+    return ring_ ? ring_->device() : port_->device();
   }
 
   [[nodiscard]] std::size_t in_flight() const noexcept {

@@ -400,14 +400,23 @@ void report_read_diagnosis(const blake3pp::diagnosis& r, unsigned threads,
   // 38.8 GiB/s through the pipeline at the default 32 MiB outstanding
   // and 46.9 at 1 GiB. A device reading needs this figure beside it.
   println(stderr, "  in flight      {} x {} = {} outstanding at the device",
-          r.depth, b3tool::bytes_label(r.window_bytes),
+          r.device_depth, b3tool::bytes_label(r.window_bytes),
           b3tool::bytes_label(r.bytes_in_flight));
+  // Where the engine holds fewer reads than the pipeline queued, the
+  // device answered the engine's count, not the queue depth.
+  if (r.device_depth < r.depth) {
+    println(stderr,
+            "                 (the queue depth is {}; this engine holds {} at "
+            "a time, and each read waited {} for a slot)",
+            r.depth, r.device_depth, service_label(r.mean_lane_wait_ns));
+  }
   println(stderr,
           "  device         {} per window over {} reads (min {}, {:.1f} of {} "
           "queued)",
           service_label(r.mean_service_ns), r.transfers,
           service_label(static_cast<double>(r.min_service_ns)),
-          r.device_queued * static_cast<double>(r.depth), r.depth);
+          r.device_queued * static_cast<double>(r.device_depth),
+          r.device_depth);
   switch (r.label) {
     case blake3pp::bottleneck::hash:
       println(stderr,

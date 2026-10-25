@@ -159,12 +159,15 @@ hashing:
 | FreeBSD | POSIX AIO (`lio_listio`) on a kqueue | `O_DIRECT` |
 
 Each feature degrades independently at runtime: a file the filesystem will
-not open for direct I/O is read buffered, and an engine the OS refuses
-reads synchronously inside the same poll. Which engines a build has is
-decided at compile time and reported by `compiled_io_engines()` (below)
--- the stdio fallback included, which is for platforms with none of the
-above (wasm) rather than a rung anything degrades to. The rung that was engaged is reported after the fact, with the
-reason appended when an asynchronous engine was asked for and refused:
+not open for direct I/O is read buffered, and a transfer the asynchronous
+engine refuses is performed synchronously on a few I/O threads of the
+library's own, then reported from the same poll. Which engines a build has
+is decided at compile time and reported by `compiled_io_engines()`
+(below). That list includes the stdio fallback, which serves platforms
+with none of the engines above (wasm); nothing degrades to it.
+
+The rung that was engaged is reported after the fact, with the reason
+appended when an asynchronous engine was asked for and refused:
 `write_report::backend` for a write, and
 `blake3pp::read_backend(trace.driver())` for a read given a `trace_buffer`.
 

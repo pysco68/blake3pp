@@ -7,24 +7,25 @@
 // kernel by flush(), completions reaped and reported only inside poll().
 // Degrades per feature at RUNTIME inside this class: O_DIRECT refused by
 // the filesystem -> buffered AIO; no kqueue, or no AIO queue to put a
-// request on -> synchronous pread. Internal to src/io/, never installed.
+// request on -> pread on the deferred pump's lanes. Internal to src/io/,
+// never installed.
 //
-// O_DIRECT on FreeBSD is a hint rather than a mode. UFS honours it for
-// page-aligned buffers, offsets and lengths and quietly serves anything
-// else through the cache. ZFS honours it from OpenZFS 2.3 under the
-// dataset's `direct` property: `direct=standard` (the default there)
-// serves requests whose offset and length are 4 KiB aligned and answers
-// EINVAL for the rest, `direct=disabled` ignores the flag,
-// `direct=always` takes every request. Releases before 2.3 have no such
-// property and no direct path, and ignore the flag entirely. The context
-// keeps the same rule either way -- whole granules at a granule offset
-// ride the direct descriptor, the rest rides the plain one -- and adds
-// one page-sized pread through the direct descriptor at open, so a
-// filesystem that will NOT serve it says so in the file's name instead
-// of in the middle of a run. What that probe answers is whether the
-// descriptor is served, which is all O_DIRECT has ever promised where it
-// is a hint: a `+direct` rung on a filesystem that ignores the flag
-// still reads through that filesystem's cache.
+// O_DIRECT on FreeBSD is a hint:
+//  - UFS honours it for page-aligned buffers, offsets and lengths and
+//    serves anything else through the cache.
+//  - ZFS honours it from OpenZFS 2.3 under the dataset's `direct`
+//    property. `direct=standard` (the default) serves requests whose
+//    offset and length are 4 KiB aligned and answers EINVAL for the rest,
+//    `direct=disabled` ignores the flag, and `direct=always` takes every
+//    request.
+//  - ZFS before 2.3 has no direct path and ignores the flag.
+// The context keeps one rule for all of them: whole granules at a granule
+// offset ride the direct descriptor, the rest rides the plain one. A
+// reader also issues one page-sized pread through the direct descriptor
+// at open, so a filesystem that refuses it says so in the file's name
+// instead of in the middle of a run. The probe answers only whether the
+// descriptor is served: a `+direct` rung on a filesystem that ignores the
+// flag still reads through that filesystem's cache.
 
 #if defined(__FreeBSD__)
 
@@ -121,13 +122,13 @@ inline std::string no_kqueue_suffix(int err) {
 // transfers named by the caller's operation, completions delivered as
 // callbacks out of poll(). Degrades per feature at runtime, as the whole
 // layer does: O_DIRECT refused by the filesystem -> buffered, AIO refused
-// -> every transfer served synchronously from the deferred list.
+// -> every transfer served by the deferred pump's own threads.
 class aio_context {
  public:
   class file;  // defined below; a transfer names the file it belongs to
   struct request;  // the context-owned aiocb a transfer rides on
 
-  struct transfer : transfer_base {
+  struct transfer : performed_transfer {
     std::span<std::byte> buf{};         // reads fill this
     std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
@@ -138,10 +139,10 @@ class aio_context {
     // pool while the transfer is queued or in flight and given back when
     // it finishes; null for one on the synchronous rung.
     request* req = nullptr;
-    // One link for two queues: a transfer waits to be issued, or waits to
-    // be served synchronously, and never both. deferred_ops names the
-    // field, so the pending queue is another deferred_ops over the same
-    // one rather than a second pointer in every operation.
+    // One link for several queues: a transfer waits to be issued, or
+    // waits for a lane, or has been served by one, and is never on two
+    // at once. The pending queue is a deferred_ops over the same field,
+    // so every operation carries one pointer for all of them.
     transfer* next_deferred = nullptr;
     bool issued = false;     // the kernel has it; an event is owed
     bool cancelled = false;  // a cancel was asked for; one is enough
@@ -152,23 +153,17 @@ class aio_context {
     }
   };
 
-  // One kernel request, owned by the CONTEXT and not by the caller's
-  // transfer. This is the one place this backend departs from the shape
-  // of the others, and the contract is why. The kernel reads the aiocb
+  // One kernel request, owned by the context. The kernel reads the aiocb
   // when the request is queued, writes the status into it when the
   // request finishes, and aio_return() writes into it again when the
-  // result is taken -- and all three can still be owed after the
-  // caller's operation is gone, because a file destroyed with transfers
-  // in flight makes the context drain and the contract is explicit
-  // (backend.hpp, ~file) that the transfers may already be destroyed by
-  // then. An aiocb inside the transfer would put the kernel's writes
-  // into memory the caller has reused; here the drain reaps every
-  // request without reading a transfer at all, and `op` is what says
-  // whether there is still one to report to.
+  // result is taken. The drain reaps every request through the pool
+  // without reading a transfer, and `op` says whether a transfer is still
+  // owed a report; a drain sets it to null.
   //
-  // It also keeps the caller's operation the size the other backends'
-  // are: a struct aiocb is 160 bytes on amd64, a sigevent included, and
-  // io_op::storage would have had to grow for every platform to hold one.
+  // Keeping the aiocb out of the transfer also keeps the caller's
+  // operation the size of the other backends'. A struct aiocb is 160 bytes
+  // on amd64, a sigevent included, and io_op::storage would have to grow on
+  // every platform to hold one.
   struct request {
     struct aiocb cb {};
     transfer* op = nullptr;      // null once a drain has forgotten it
@@ -218,19 +213,13 @@ class aio_context {
       ctx.files_ = this;
     }
 
-    // A file that still owns transfers cannot simply close: the kernel is
-    // writing into the buffers they name and the context would be left
-    // counting them.
-    //
-    // What it must not do is look at those transfers. They live in the
-    // caller's operations, and an operation declared after the file --
-    // which is the natural order, since submitting needs a file -- is
-    // destroyed before it. So a file with nothing owed only unlinks, and
-    // one with transfers still owed takes the context-wide drain, which
-    // reaps without reporting and reads no transfer at all. That costs
-    // the other files their pending callbacks, which is why a caller with
-    // siblings in flight reclaims this file first, through
-    // io_driver::drain(file&), while its operations are alive.
+    // A file with nothing owed only unlinks. One with transfers still owed
+    // takes the context-wide drain, which reaps without reporting and waits
+    // out the pump's lanes: the kernel or a lane may be writing into the
+    // buffers those transfers name. Its operations must still be alive (the
+    // contract's operation lifetime rule). The drain costs the other files
+    // their pending callbacks, so a caller with siblings in flight reclaims
+    // this file first, through io_driver::drain(file&).
     ~file() {
       ctx_->unlink(*this);
       if (inflight_ != 0) {
@@ -280,7 +269,11 @@ class aio_context {
   };
 
   aio_context(const reader_context_options& opts, unsigned max_inflight)
-      : async_requested_(opts.async) {
+      : queue_depth_(std::max(1u, max_inflight)),
+        async_requested_(opts.async),
+        // Declared last, and initialized last: see the member list.
+        pump_(io_lanes::waker<aio_context>(), this,
+              &perform_deferred, io_lanes_for(max_inflight)) {
     if (!opts.async) {
       return;
     }
@@ -346,16 +339,17 @@ class aio_context {
   // Hands the kernel everything queued since it last looked, in batches
   // of AIO_LISTIO_MAX cut to what the per-process queue still holds.
   //
-  // A refused submit is not an error the caller can do anything with:
-  // the transfers are already counted in in_flight(), and an exception
-  // here would leave them counted and uncompleted. They take the ladder
-  // this backend already has for a transfer it cannot put on the queue.
+  // A refused submit is not an error the caller can act on: the
+  // transfers are already counted in in_flight(), and an exception here
+  // would leave them counted and uncompleted. A transfer the kernel will
+  // not take for a lasting reason goes to the pump's lanes; one refused
+  // for now stays pending for the next flush.
   void flush() noexcept {
     if (!use_aio_) {
       return;
     }
     // A cancel asked for before the request went out is the whole cancel:
-    // the kernel never sees it, and the deferred list reports it.
+    // the kernel never sees it, and the pump reports it.
     sweep_cancelled();
     while (!pending_.empty()) {
       const std::size_t n = fill_batch();
@@ -368,41 +362,41 @@ class aio_context {
     }
     // Something has to be able to finish, or a blocking poll() would wait
     // for an event that cannot arrive. With nothing in the kernel and
-    // nothing to serve synchronously, the oldest transfer the kernel
-    // refused takes the synchronous rung so the run makes progress.
-    if (issued_ == 0 && deferred_.empty() && !pending_.empty()) {
+    // nothing on the pump, the oldest transfer the kernel refused goes to
+    // the pump's lanes so the run makes progress.
+    if (issued_ == 0 && pump_.queue_empty() && !pending_.empty()) {
       transfer* const op = pending_.take();
       release(*op);
-      deferred_.push(*op);
+      pump_.push(*op);
     }
   }
 
-  // The queue first, then the deferred list, in that order and never the
-  // other way round: a completion the queue hands back can park its
-  // remainder on the list, and the list is what serves it.
+  // The kqueue first, then the pump's finished list: a completion the
+  // kqueue hands back can move its remainder to the pump.
   std::size_t poll(bool block) {
     flush();
     std::size_t ran = reap(false);
-    ran += run_one_deferred();
+    ran += serve_deferred();
     if (ran > 0 || !block) {
       return ran;
     }
     for (;;) {
       if (take_wake()) {
-        return ran;
+        return ran + serve_deferred();
       }
       ran += reap(true);
-      ran += run_one_deferred();
+      ran += serve_deferred();
       if (ran > 0 || take_wake()) {
         return ran;
       }
     }
   }
 
-  // The one member another thread may call. A user event on the kqueue is
-  // thread-safe by the kqueue contract, and a trigger nobody is waiting
-  // for stays pending until a kevent() takes it, which is the contract's
-  // "a wake with no blocked poll is remembered".
+  // The one member another thread may call, and how a lane reports a
+  // finished transfer. A user event on the kqueue is thread-safe, and a
+  // trigger nobody is waiting for stays pending until a kevent() takes
+  // it, which is the contract's "a wake with no blocked poll is
+  // remembered". A context without a kqueue wakes through its waiter.
   void wake() noexcept {
     if (!use_aio_) {
       waiter_.wake();
@@ -414,10 +408,16 @@ class aio_context {
   }
 
   // The kernel is asked once; a second ask would only repeat the
-  // question. A transfer that has not been issued has not been given to
-  // anything, so the flag alone is the whole cancel: flush() moves it to
-  // the deferred list and run_one_deferred() honours it.
+  // question. A transfer the pump already has is cancelled through the
+  // pump, under its lock, because the flag is what a lane reads when it
+  // takes one; one a lane already has runs to completion. A transfer
+  // still on the pending queue is flagged here and sweep_cancelled()
+  // hands it to the pump.
   void cancel(transfer& op) noexcept {
+    if (!op.issued && op.req == nullptr) {
+      pump_.cancel(op);
+      return;
+    }
     if (std::exchange(op.cancelled, true)) {
       return;
     }
@@ -460,38 +460,45 @@ class aio_context {
   }
 
   // Every transfer the kernel has not been offered is taken back and
-  // given to the synchronous rung, which is what a flush the kernel
-  // refuses outright leaves behind. The contract's promise that a
-  // counted transfer reaches its callback is what makes this the
-  // recovery rather than an error: poll() serves each one and reports
-  // whatever happens then.
+  // given to the pump, which is what a flush the kernel refuses outright
+  // leaves behind. A counted transfer must reach its callback, so this is
+  // the recovery: a lane performs each one and poll() reports the result.
   //
   // Called by the test that covers that path, since a working kernel
   // cannot be asked to refuse.
   void defer_pending() noexcept {
     while (transfer* const op = pending_.take()) {
       release(*op);
-      deferred_.push(*op);
+      pump_.push(*op);
     }
   }
 
-  // Transfers, or remainders of transfers, finished on the synchronous
-  // path inside poll() since construction: zero for a context whose
-  // queue took everything.
+  // Transfers, or remainders of transfers, performed by the lanes (or by
+  // poll() where no lane runs) since construction: zero for a context
+  // whose queue took everything.
   [[nodiscard]] std::size_t served_synchronously() const noexcept {
     return served_synchronously_;
   }
 
+  // The kernel queues as deep as the caller asked; without AIO the pump's
+  // lanes are the whole of what the device sees.
+  [[nodiscard]] unsigned device_depth() const noexcept {
+    return use_aio_ ? queue_depth_ : pump_.depth();
+  }
+  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
+    return pump_.lane_wait_ns();
+  }
+  [[nodiscard]] device_time device() const noexcept { return device_; }
+
   // Requests the kernel never took are withdrawn, the ones it did take
-  // are waited out and discarded, and the deferred list is forgotten.
-  // Cancelling first is only haste: a request that cannot be cancelled
-  // still has to be waited for, because it is writing into a buffer the
-  // caller is about to release.
+  // are waited out and discarded, and the pump is cleared and its lanes
+  // waited out. Cancelling first shortens the wait; a request that cannot
+  // be cancelled is still waited for, because it is writing into a buffer
+  // the caller is about to release.
   //
-  // Reads no transfer: this is the path ~file() takes, and by then the
-  // operations may be gone. The queues are dropped without being walked
-  // and the request pool is handed back wholesale, which is sound
-  // because nothing is left in flight by the time it happens.
+  // The queues are dropped without being walked and the request pool is
+  // handed back wholesale, since nothing is in flight by then. The
+  // operations must still be alive while the lanes are waited out.
   void drain() noexcept {
     if (use_aio_ && issued_ > 0) {
       for (file* f = files_; f != nullptr; f = f->next_open_) {
@@ -503,7 +510,7 @@ class aio_context {
       }
     }
     pending_.clear();
-    deferred_.clear();
+    pump_.clear();
     free_all_requests();
     in_flight_ = 0;
     issued_ = 0;
@@ -516,25 +523,21 @@ class aio_context {
   // file and the buffers its transfers name may be destroyed while the
   // context stays usable: afterwards in_flight() counts none of them.
   //
-  // Legal only while the operations those transfers live in are alive,
-  // which is what asking for this means: a transfer still owed is one the
-  // caller still owns. ~file() cannot assume it and does not call this.
-  // What never reached the kernel is dropped outright; what the kernel
-  // holds has to be waited out, because it is writing into those buffers
-  // and nothing can take that back.
+  // Legal only while the operations those transfers live in are alive;
+  // ~file() drains the context instead. What never reached the kernel is
+  // dropped; what the kernel or a lane holds is waited out, because it is
+  // writing into those buffers.
   //
-  // The kqueue is shared, so a completion belonging to ANOTHER file can
-  // surface while this one is waited out; it is reported normally rather
-  // than dropped, since losing it would strand an operation that can
-  // never complete. Reclaiming one file of a multi-file context while a
-  // sibling has transfers in flight therefore runs that sibling's
-  // callback from here, which is the one place outside poll() where one
-  // runs.
+  // The kqueue is shared, so a completion belonging to another file can
+  // surface while this one is waited out. It is reported, since dropping
+  // it would strand an operation that can never complete, so reclaiming
+  // one file while a sibling has transfers in flight can run that
+  // sibling's callback from here.
   void forget(file& f) noexcept {
     // The file stays on files_: it is still open and may be read again, and
     // a later context-wide drain has to be able to zero its count.
     drop_queued(f, pending_);
-    drop_queued(f, deferred_);
+    drop_pumped(f);
     if (!use_aio_ || f.inflight_ == 0) {
       return;
     }
@@ -569,7 +572,7 @@ class aio_context {
       // A continuation of this file's own transfer is dropped the same
       // way its first piece was: it never left for the kernel.
       drop_queued(f, pending_);
-      drop_queued(f, deferred_);
+      drop_pumped(f);
     }
   }
 
@@ -618,6 +621,7 @@ class aio_context {
     op.next_deferred = nullptr;
     op.issued = false;
     op.cancelled = false;
+    op.reset_performance();
     in_flight_++;
     f.inflight_++;
   }
@@ -630,14 +634,14 @@ class aio_context {
   //
   // O_DIRECT rejects an unaligned length and an unaligned offset, so the
   // direct descriptor carries whole granules at a granule offset, and a
-  // piece with a sub-granule end is cut to the granules it holds. What
-  // that leaves -- the end of a file whose size is not a multiple of the
-  // granule, a resumption off a boundary, and every piece of a buffered
-  // file -- goes to the kernel through the plain descriptor, which takes
-  // any shape. A file's last window therefore stays asynchronous however
-  // long it is; what reaches the synchronous path inside poll() is a
-  // context with no AIO, a submit the kernel refused, and a zero-length
-  // transfer, which has nothing for the kernel to do.
+  // piece with a sub-granule end is cut to the granules it holds. The rest
+  // goes to the kernel through the plain descriptor, which takes any
+  // shape: the end of a file whose size is not a multiple of the granule,
+  // a resumption off a boundary, and every piece of a buffered file. A
+  // file's last window therefore stays asynchronous however long it is.
+  // What goes to the pump's lanes is a context with no AIO, a
+  // submit the kernel refused, and a zero-length transfer, which has
+  // nothing for the kernel to do.
   struct aio_piece {
     int fd;           // -1: the kernel takes none of it
     std::size_t len;  // what rides, from the piece's start
@@ -657,9 +661,9 @@ class aio_context {
   }
 
   // A request to put the next piece on, taken from the pool or made.
-  // Null means the pool could not grow, which is a transfer for the
-  // synchronous rung rather than an error: issue() is noexcept because
-  // a short completion's continuation runs inside poll().
+  // Null means the pool could not grow, and the transfer goes to the pump
+  // instead of failing: issue() is noexcept because a short completion's
+  // continuation runs inside poll().
   [[nodiscard]] request* acquire_request() noexcept {
     if (free_ != nullptr) {
       request* const r = free_;
@@ -687,6 +691,7 @@ class aio_context {
   // Gives back whatever request a transfer is holding. Only for a
   // transfer that is alive and not in the kernel's hands.
   void release(transfer& op) noexcept {
+    op.device_end();  // whatever it was, the kernel is not serving it now
     if (op.req != nullptr) {
       release_request(op.req);
       op.req = nullptr;
@@ -706,7 +711,7 @@ class aio_context {
   }
 
   // Fills the request for the next piece and queues it, or hands the
-  // piece to the deferred list when the kernel cannot take its shape.
+  // piece to the pump when the kernel cannot take its shape.
   // `data` is where the piece starts, which for a continuation is past
   // what already moved; a continuation keeps the request its first piece
   // rode on, which is free to refill once aio_return has been called.
@@ -714,12 +719,12 @@ class aio_context {
     const aio_piece piece = piece_for(op, op.off + op.filled, len);
     if (piece.fd < 0) {
       release(op);
-      deferred_.push(op);
+      pump_.push(op);
       return;
     }
     request* const req = op.req != nullptr ? op.req : acquire_request();
     if (req == nullptr) {
-      deferred_.push(op);
+      pump_.push(op);
       return;
     }
     op.req = req;
@@ -742,15 +747,15 @@ class aio_context {
     pending_.push(op);
   }
 
-  // Moves every pending transfer a cancel reached onto the deferred list,
-  // where it reports operation_canceled without ever having been issued.
+  // Moves every pending transfer a cancel reached to the pump, where it
+  // reports operation_canceled without ever having been issued.
   void sweep_cancelled() noexcept {
     pending_.remove_if([this](transfer& op) noexcept {
       if (!op.cancelled) {
         return false;
       }
       release(op);
-      deferred_.push(op);
+      pump_.push(op);
       return true;
     });
   }
@@ -801,6 +806,9 @@ class aio_context {
       }
       const int err = all ? EINPROGRESS : ::aio_error(&op.req->cb);
       if (err == EINPROGRESS || err == 0) {
+        // The kernel has it from here, and charged to the device from
+        // here.
+        op.device_begin();
         op.issued = true;
         issued_++;
         took_any = true;
@@ -811,10 +819,10 @@ class aio_context {
       }
       // Refused for a reason retrying will not change (a filesystem whose
       // files this kernel will not serve asynchronously, with
-      // vfs.aio.enable_unsafe off). The synchronous rung takes it, and
-      // served_synchronously() is where that becomes visible.
+      // vfs.aio.enable_unsafe off). The pump's lanes take it, and
+      // served_synchronously() counts it.
       release(op);
-      deferred_.push(op);
+      pump_.push(op);
       return true;
     });
     return took_any;
@@ -880,6 +888,7 @@ class aio_context {
   }
 
   void complete(transfer& op, std::error_code ec) noexcept {
+    device_.add_if_served(op.device_total_ns());
     // Before the callback, which may submit this very operation again.
     release(op);
     retire(op);
@@ -901,6 +910,8 @@ class aio_context {
   // span it walks differs. Returns whether it was requeued rather than
   // completed, which is the caller's cue to flush.
   [[nodiscard]] bool settle(transfer& op, reaped r) noexcept {
+    // This piece is back from the kernel, whatever it reports.
+    op.device_end();
     if (r.err == ECANCELED) {
       complete(op, std::make_error_code(std::errc::operation_canceled));
       return false;
@@ -925,9 +936,8 @@ class aio_context {
       const std::byte* const from =
           op.is_write ? op.wbuf.data() + op.filled : op.buf.data() + op.filled;
       issue(op, from, op.length() - op.filled);
-      // issue() either queued the remainder or handed it to the deferred
-      // list; either way the transfer is still owed and nothing was
-      // reported.
+      // issue() either queued the remainder or handed it to the pump;
+      // either way the transfer is still owed and nothing was reported.
       return true;
     }
     complete(op, {});
@@ -984,7 +994,7 @@ class aio_context {
 
   // One wait's worth of completions, reaped and dropped: the drain's
   // step. Nothing is continued, nothing is reported, and no transfer is
-  // read -- by here the caller's operations may be gone.
+  // read: the requests carry everything the reap needs.
   void reap_quietly() noexcept {
     const int got = wait_events(true);
     if (got < 0) {
@@ -1000,41 +1010,59 @@ class aio_context {
     }
   }
 
-  // At most one per poll(): a synchronous transfer holds the calling
-  // thread for the whole window, and the caller asked to be given control
-  // back.
-  std::size_t run_one_deferred() noexcept {
-    transfer* const next = deferred_.take();
-    if (next == nullptr) {
-      return 0;
-    }
-    transfer& op = *next;
-    std::error_code ec;
-    if (op.cancelled) {
-      ec = std::make_error_code(std::errc::operation_canceled);
-    } else {
-      try {
-        // From where the transfer stopped, which for a fresh one is the
-        // start and for a continuation is what the kernel already moved.
-        // The remainder picks the descriptor: an unalignable rest is
-        // exactly what the plain fd exists for.
-        const std::size_t done = op.filled;
-        const std::size_t rest = op.length() - done;
-        if (op.is_write) {
-          op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
-                                   op.wbuf.data() + done, rest, op.off + done);
-        } else {
-          op.sync_file->pread_all(op.sync_file->sync_fd(rest),
-                                  op.buf.data() + done, rest, op.off + done);
-        }
-        op.filled = op.length();
-        served_synchronously_++;
-      } catch (const std::system_error& e) {
-        ec = e.code();
+  // One transfer, on a lane. Touches the operation and the file it names,
+  // and nothing else of this context, so served_synchronously_ is counted
+  // where the completion is run.
+  static std::error_code perform_deferred(transfer& op) noexcept {
+    try {
+      // From where the transfer stopped, which for a fresh one is the
+      // start and for a continuation is what the kernel already moved.
+      // The remainder picks the descriptor: an unalignable rest is
+      // exactly what the plain fd exists for.
+      const std::size_t done = op.filled;
+      const std::size_t rest = op.length() - done;
+      if (op.is_write) {
+        op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
+                                 op.wbuf.data() + done, rest, op.off + done);
+      } else {
+        op.sync_file->pread_all(op.sync_file->sync_fd(rest),
+                                op.buf.data() + done, rest, op.off + done);
       }
+      op.filled = op.length();
+    } catch (const std::system_error& e) {
+      return e.code();
+    } catch (...) {
+      // posix_file throws only system_error; anything else is reported as
+      // EIO so it cannot terminate a noexcept lane.
+      return std::make_error_code(std::errc::io_error);
+    }
+    return {};
+  }
+
+  // Runs the callbacks of the transfers the lanes finished, on this
+  // thread. The inline step serves a machine that would not give the
+  // pump a thread.
+  std::size_t serve_deferred() noexcept {
+    std::size_t ran = 0;
+    for (transfer* op = pump_.take_done(); op != nullptr;) {
+      transfer* const next = op->next_deferred;
+      report_deferred(*op);
+      ++ran;
+      op = next;
+    }
+    if (transfer* const op = pump_.run_one_here(); op != nullptr) {
+      report_deferred(*op);
+      ++ran;
+    }
+    return ran;
+  }
+
+  void report_deferred(transfer& op) noexcept {
+    const std::error_code ec = op.result();
+    if (!ec) {
+      served_synchronously_++;
     }
     complete(op, ec);
-    return 1;
   }
 
   // Drops one file's share of a queue, with no wait and no callback:
@@ -1048,6 +1076,27 @@ class aio_context {
       release(op);
       return true;
     });
+    in_flight_ -= std::min(dropped, in_flight_);
+    f.inflight_ -= std::min(dropped, f.inflight_);
+  }
+
+  // The pump's share of the same job. What is still queued was never
+  // performed and is dropped; what a lane holds is waited out, because it
+  // is reading or writing through this file's descriptor and into the
+  // caller's buffer. The lanes are the context's, so the wait covers
+  // sibling files too, and a sibling's finished transfer stays on the
+  // done list for a later poll() to report.
+  void drop_pumped(file& f) noexcept {
+    const auto mine = [&](transfer& op) noexcept {
+      if (op.owner_file != &f) {
+        return false;
+      }
+      release(op);
+      return true;
+    };
+    std::size_t dropped = pump_.remove_queued_if(mine);
+    pump_.quiesce();
+    dropped += pump_.remove_done_if(mine);
     in_flight_ -= std::min(dropped, in_flight_);
     f.inflight_ -= std::min(dropped, f.inflight_);
   }
@@ -1067,8 +1116,7 @@ class aio_context {
   // high-water mark of a run is what the next window costs anyway.
   std::deque<request> requests_;
   request* free_ = nullptr;
-  deferred_ops<transfer> pending_;   // queued, not yet offered to the kernel
-  deferred_ops<transfer> deferred_;  // what the kernel will not take
+  deferred_ops<transfer> pending_;  // queued, not yet offered to the kernel
   std::vector<struct aiocb*> batch_;
   std::vector<struct kevent> events_;
   // Every open file of this context, so its own drain can zero the shares
@@ -1083,9 +1131,19 @@ class aio_context {
   // The wake for a context that never got a kqueue: the user event is the
   // wake everywhere else.
   poll_waiter waiter_;
+  // What the device itself took, stamped by the kernel's queue where it
+  // carried a piece and by a lane where one did.
+  device_time device_{};
+  // What the caller asked to have in flight at once; device_depth()
+  // reports it where the kernel took the transfers.
+  unsigned queue_depth_ = 1;
   bool async_requested_ = true;
   bool use_aio_ = false;
   bool woken_ = false;
+  // The lanes that serve what the kernel will not take. Declared last, so
+  // the destructor's join runs while the kqueue and the waiter its wake()
+  // reaches are still alive. Do not move this up.
+  deferred_pump<transfer> pump_;
 };
 
 // Definition-site conformance check. Concepts only verify use-sites, so

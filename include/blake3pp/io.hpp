@@ -85,14 +85,13 @@ struct file_io_options {
   /// whenever they can, so this asks for the hand-off explicitly. Ignored
   /// where the platform has no such notion.
   bool offload_submit = true;
-  /// Queue reads asynchronously where the platform offers it; off reads
-  /// them synchronously inside the same poll, which is what a platform
-  /// with no async engine does anyway. The engines this gives up are
-  /// the ones is_async() marks; for a given build,
-  /// compiled_io_engines() filtered by is_async() names them. Which
-  /// rung was engaged is reported after the fact:
-  /// read_backend(trace.driver()) for a read, write_report::backend for
-  /// a write.
+  /// Queue reads asynchronously where the platform offers it. Off performs
+  /// them synchronously on a few I/O threads of the library's own, which
+  /// is what a platform with no async engine does anyway. The engines this
+  /// gives up are the ones is_async() marks; for a given build,
+  /// compiled_io_engines() filtered by is_async() names them. Which rung
+  /// was engaged is reported after the fact: read_backend(trace.driver())
+  /// for a read, write_report::backend for a write.
   bool async = true;
   /// Windows: prefer the I/O ring (Windows 11, `ioringapi.h`) over the
   /// completion port where the machine has one. Off selects the port,
@@ -502,9 +501,9 @@ struct file_write_options {
   unsigned queue_depth = detail::default_write_queue_depth;
   /// Bypass the page cache where the platform can.
   bool direct_io = true;
-  /// Queue writes asynchronously where the platform offers it; off
-  /// writes synchronously, as a platform with no async engine does
-  /// anyway. The engines this gives up are the ones is_async() marks;
+  /// Queue writes asynchronously where the platform offers it. Off
+  /// writes synchronously on the library's own I/O threads, as a platform
+  /// with no async engine does anyway. The engines this gives up are the ones is_async() marks;
   /// for a given build, compiled_io_engines() filtered by is_async()
   /// names them.
   bool async = true;

@@ -68,6 +68,11 @@ endif()
 # target gets it, which keeps the inline function it guards one
 # definition; the library itself never includes that header.
 target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_PIPELINE_STOP=1)
+# The io backends' fault seams (a refused io_uring submission), compiled
+# into this target only. The backend headers put their seamed copy under
+# a name of its own, so the library's copy linked into the same
+# executable stays one definition.
+target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_IO_SEAMS=1)
 target_link_libraries(blake3pp_tests PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings
