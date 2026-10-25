@@ -316,6 +316,10 @@ function(blake3pp_add_kernel ns)
   set(tgt "blake3pp_kernel_${ns}")
   add_library(${tgt} OBJECT "${_ak_src}")
   target_compile_definitions(${tgt} PRIVATE "BLAKE3PP_ARCH_NS=${ns}")
+  target_link_libraries(${tgt} PRIVATE blake3pp_warnings)
+  # cl reports the code after an `if constexpr` branch that returns as
+  # unreachable (C4702) in every instantiation that takes the branch.
+  target_compile_options(${tgt} PRIVATE "$<$<CXX_COMPILER_ID:MSVC>:/wd4702>")
   # The resolved tuning switches, passed explicitly rather than left to the
   # headers' fallback defaults.
   get_property(_ak_switches GLOBAL PROPERTY BLAKE3PP_KERNEL_SWITCHES)

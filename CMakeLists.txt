@@ -150,10 +150,18 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 else()
   target_compile_options(blake3pp_warnings INTERFACE -Wall -Wextra -Wconversion -Wshadow)
 endif()
-# clang checks the doc comments (a @param naming no parameter, a @return
-# on void) against the declarations they document.
+# The same checks on every compiler. clang's -Wconversion includes
+# -Wsign-conversion and -Wshorten-64-to-32; GCC's leaves sign changes out
+# in C++, so it is named here. GCC's -Wshadow covers a constructor
+# parameter or a local that shadows a member; clang's needs -Wshadow-all
+# for those.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(blake3pp_warnings INTERFACE -Wsign-conversion)
+endif()
+# clang also checks the doc comments (a @param naming no parameter, a
+# @return on void) against the declarations they document.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  target_compile_options(blake3pp_warnings INTERFACE -Wdocumentation)
+  target_compile_options(blake3pp_warnings INTERFACE -Wshadow-all -Wdocumentation)
 endif()
 
 # The file-I/O layer needs a filesystem, 64-bit seeks and (on the native

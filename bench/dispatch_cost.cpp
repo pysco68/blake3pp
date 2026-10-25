@@ -102,7 +102,7 @@ class perf_group {
   perf_group() {
     const std::uint64_t cfg[4] = {PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS,
                                   PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES};
-    for (int i = 0; i < 4; ++i) {
+    for (std::size_t i = 0; i < 4; ++i) {
       perf_event_attr a{};
       a.type = PERF_TYPE_HARDWARE;
       a.size = sizeof a;
@@ -121,7 +121,7 @@ class perf_group {
     for (int fd : fd_) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
   }
   void stop(counters& c) {
-    for (int i = 0; i < 4; ++i) {
+    for (std::size_t i = 0; i < 4; ++i) {
       ioctl(fd_[i], PERF_EVENT_IOC_DISABLE, 0);
       std::uint64_t v = 0;
       if (read(fd_[i], &v, sizeof v) == static_cast<ssize_t>(sizeof v)) c.hw[i] = v;
@@ -137,7 +137,7 @@ void pin_to_current_cpu() {
   if (cpu < 0) return;
   cpu_set_t set;
   CPU_ZERO(&set);
-  CPU_SET(cpu, &set);
+  CPU_SET(static_cast<std::size_t>(cpu), &set);
   sched_setaffinity(0, sizeof set, &set);
 }
 #else
@@ -198,7 +198,7 @@ void rounds(row& r, std::size_t reps, Run&& run_variant) {
     };
     r.c[v].ns = median([](const counters& c) { return c.ns; });
     r.c[v].have_hw = sm.front().have_hw;
-    for (int i = 0; i < 4; ++i) r.c[v].hw[i] = static_cast<std::uint64_t>(median([i](const counters& c) { return double(c.hw[i]); }));
+    for (std::size_t i = 0; i < 4; ++i) r.c[v].hw[i] = static_cast<std::uint64_t>(median([i](const counters& c) { return static_cast<double>(c.hw[i]); }));
   }
 }
 
@@ -256,8 +256,9 @@ void print(const row& r, std::size_t reps) {
     const counters& c = r.c[v];
     if (g_only_variant >= 0 && v != g_only_variant) continue;
     if (c.have_hw) {
-      std::printf("  %-11s %9.2f %9.1f %9.1f %9.2f %10.4f\n", names[v], c.ns / per, c.hw[0] / per, c.hw[1] / per,
-                  c.hw[2] / per, c.hw[3] / per);
+      std::printf("  %-11s %9.2f %9.1f %9.1f %9.2f %10.4f\n", names[v], c.ns / per,
+                  static_cast<double>(c.hw[0]) / per, static_cast<double>(c.hw[1]) / per,
+                  static_cast<double>(c.hw[2]) / per, static_cast<double>(c.hw[3]) / per);
     } else {
       std::printf("  %-11s %9.2f %9s\n", names[v], c.ns / per, "(no hw counters)");
     }

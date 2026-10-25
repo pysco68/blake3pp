@@ -138,7 +138,7 @@ function(_blake3pp_dispatch_cost ns)
     "$<$<CXX_COMPILER_ID:GNU>:-fno-devirtualize;-fno-ipa-cp-clone>")
   target_include_directories(${tgt} PRIVATE
     "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/include")
-  target_link_libraries(${tgt} PRIVATE blake3pp::features)
+  target_link_libraries(${tgt} PRIVATE blake3pp::features blake3pp_warnings)
   set_target_properties(${tgt} PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 endfunction()
 # Off by default: up to four extra kernel compilations that only the

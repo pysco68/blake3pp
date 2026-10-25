@@ -43,6 +43,7 @@ namespace {
 // sends and so could sleep until the next timer tick. `isb` drains the
 // pipeline, which costs a few tens of cycles and nothing else, and is
 // what Rust's std::hint::spin_loop emits on AArch64 for the same reason.
+#if !defined(_WIN32)
 inline void cpu_relax() noexcept {
 #if defined(__x86_64__) || defined(__i386__)
   _mm_pause();
@@ -52,6 +53,7 @@ inline void cpu_relax() noexcept {
   asm volatile("" ::: "memory");
 #endif
 }
+#endif
 
 }  // namespace
 

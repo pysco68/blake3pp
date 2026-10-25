@@ -22,8 +22,12 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
   # stdexec (and any other honest feature-test consumer) refuse to build;
   # the conformant preprocessor is likewise table stakes for its macro
   # machinery. Both are pure conformance switches, safe project-wide.
-  target_compile_options(blake3pp_features INTERFACE
-    /Zc:__cplusplus /Zc:preprocessor)
+  # clang-cl's preprocessor is conformant already and reports
+  # /Zc:preprocessor as an unused argument, so cl alone is given it.
+  target_compile_options(blake3pp_features INTERFACE /Zc:__cplusplus)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_options(blake3pp_features INTERFACE /Zc:preprocessor)
+  endif()
 endif()
 
 function(_blake3pp_probe var code)
