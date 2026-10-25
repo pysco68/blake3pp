@@ -335,8 +335,12 @@ struct stream_io_options {
   std::size_t window_bytes = detail::default_window_bytes;
   /// Window objects the run allocates, which is how many may be in
   /// flight -- one being filled, the rest on the pool or waiting to
-  /// reduce. Zero takes the default; a stream fills one at a time, so
-  /// there is nothing here for a device's queue to buy.
+  /// reduce. Zero takes the default.
+  ///
+  /// A stream has one position and fills one window at a time, so there
+  /// is no device queue here for a depth to buy. blake3ppsum's --qd
+  /// arrives here for that reason: the window count is the only thing a
+  /// stream has for it to set.
   unsigned windows = 0;
   /// Ask the OS for this much stream buffer (Linux: F_SETPIPE_SZ). Zero
   /// leaves it alone. A larger buffer is what keeps an 8 MiB window from

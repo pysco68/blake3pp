@@ -176,9 +176,14 @@ class engine {
       blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
       const auto t0 = std::chrono::steady_clock::now();
       if (pool_.parallel()) {
+        // --qd reaches a stream as its window count: a stream has one
+        // position and no device queue for a depth to set. Both defaults
+        // are 4, so the default run is unchanged.
         stream_ = blake3pp::update_stream(
             h, blake3pp::standard_input(), pool_.scheduler(),
-            {.window_bytes = opts_.io.window_bytes, .trace = opts_.io.trace});
+            {.window_bytes = opts_.io.window_bytes,
+             .windows = opts_.io.queue_depth,
+             .trace = opts_.io.trace});
         pipelined_ = true;
       } else {
         read_stdin_into(h);
