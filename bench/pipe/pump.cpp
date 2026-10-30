@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 

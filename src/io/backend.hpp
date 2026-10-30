@@ -32,6 +32,7 @@
 //    forget() can therefore run a sibling's callback.
 // Internal to src/io/, never installed.
 
+#include <atomic>
 #include <cerrno>
 #include <string_view>
 #if defined(__linux__)

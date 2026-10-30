@@ -65,6 +65,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
