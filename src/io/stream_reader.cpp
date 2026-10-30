@@ -7,8 +7,7 @@
 // The contract is "wait for the producer's next write, then return what
 // has arrived". The driver reads in a loop until the window is full, and
 // a read that comes back short of its ask is how it learns the stream
-// ran dry: the queue is empty, so there is no moment at which a full
-// pipe is left undrained and no call whose only answer is "nothing".
+// ran dry: the queue is empty, so a full pipe is never left undrained.
 
 #include <blake3pp/detail/pipe_driver.hpp>
 
@@ -73,50 +72,77 @@ std::size_t stream_reader::read_bound() const noexcept {
   return ask_bound_.bound();
 }
 
-// A blocking read is all this needs, and it is safe to make because an
-// anonymous pipe is a byte-mode pipe: the read returns with whatever
-// arrived rather than waiting for the count it asked for.
+// GetFileType answers FILE_TYPE_PIPE for a socket too, and a socket is
+// not a pipe for what this decides: a non-overlapped socket answers every
+// read after a graceful close with success and nothing moved, so reading
+// that as "not the end" spins for ever. GetNamedPipeInfo succeeds on
+// anonymous pipes and on byte- and message-mode named pipes, and fails on
+// sockets.
+bool stream_reader::handle_is_pipe(native_stream h) noexcept {
+  return GetNamedPipeInfo(h, nullptr, nullptr, nullptr, nullptr) != 0;
+}
+
+void stream_reader::wait_for_data() {
+  // Returns once a read would return: bytes are queued, or the writer
+  // has gone and the read will report ERROR_BROKEN_PIPE. A peek that
+  // fails for any other reason is reported as the read would report it.
+  //
+  // Between peeks the thread yields its core for up to a millisecond,
+  // then sleeps. Sleep(1) is not a millisecond: it lasts until the next
+  // timer tick, up to 15.6 ms at the default resolution, and a producer
+  // that pauses briefly between writes would otherwise cost a tick per
+  // pause. The yield phase is bounded, so a producer that has stalled
+  // costs at most a millisecond of yielding per wait, then sleeps.
+  constexpr auto yield_for = std::chrono::milliseconds(1);
+  const auto yield_until = std::chrono::steady_clock::now() + yield_for;
+  for (;;) {
+    DWORD avail = 0;
+    if (PeekNamedPipe(h_, nullptr, 0, nullptr, &avail, nullptr) == 0) {
+      const DWORD err = GetLastError();
+      if (err == ERROR_BROKEN_PIPE) {
+        return;
+      }
+      throw std::system_error(static_cast<int>(err), std::system_category(),
+                              "waiting on a stream");
+    }
+    if (avail > 0) {
+      return;
+    }
+    if (std::chrono::steady_clock::now() < yield_until) {
+      // Gives the core to any ready thread, the producer included, and
+      // returns at once when there is none.
+      (void)SwitchToThread();
+    } else {
+      Sleep(1);
+    }
+  }
+}
+
+// A blocking ReadFile returns with what the pipe holds rather than
+// waiting for the count it asked for: an anonymous or byte-mode pipe
+// returns what is queued, and a message-mode pipe returns the next
+// message, or as much of it as the ask holds (ERROR_MORE_DATA below).
 //
-// What this no longer does is ask first. PeekNamedPipe reports the queue
-// at an instant and a read capped at that count chases the producer
-// instead of taking its whole write: measured at 4.1 to 4.8 syscalls per
-// producer write, against 1.0 here, with one empty-pipe observation per
-// write. The ask is bounded by stream_reader::read_bound() instead,
-// which follows what earlier reads delivered (read_ask_bound) and is a
-// bound on the range, not a reading of the queue.
+// The read does not first ask PeekNamedPipe how much is queued: a read
+// capped at that count chases the producer instead of taking its whole
+// write. The ask is bounded by read_bound() instead, which follows what
+// earlier reads returned (read_ask_bound) and bounds the range rather
+// than reading the queue.
 //
-// Nor does it watch the stream before the read, which is what the POSIX
-// branch below does and what stream_watch exists for. On Windows the
-// probe costs more than the sleep it avoids.
+// Nor does it watch the stream before the read, as the POSIX branch
+// below does. Win32 has no cheap readiness probe for this handle: an
+// anonymous pipe is not waitable, a CreatePipe handle has no overlapped
+// form, and PeekNamedPipe costs 1.50 us a call on a Ryzen AI MAX+ 395.
+// Measured over 2 GiB through the stdin path, a watch built on it lost
+// all 42 counterbalanced pairs across five producer write sizes, two of
+// them also at two threads. In one run, 0.84 s of the 0.92 s it added was its
+// 561 000 probes.
 //
-// PeekNamedPipe is 1.50 us per call on a Ryzen AI MAX+ 395, against
-// 77-290 ns for a zero-timeout poll() on Linux, and the figure does not
-// move with anything: 1501 ns on an empty pipe, 1506 ns with bytes
-// queued, 1531 ns with eight other threads runnable, 1504 ns taken
-// between the reads of a live pipeline. Win32 offers nothing cheaper on
-// this handle. An anonymous pipe is not waitable, a CreatePipe handle
-// has no overlapped form, and GetNamedPipeInfo answers 4096 against a
-// buffer that holds a megabyte. NtQueryInformationFile with
-// FilePipeLocalInformation answers the same question for 528 ns, and
-// that is not enough either.
-//
-// The watch does avoid the sleeps, and still loses. Measured over 2 GiB
-// through the stdin path at 4 KiB producer writes, it caught 259 079 of
-// the 259 770 waits that found the stream empty and slept 691 times, for
-// 45% more wall clock: catching took 2.16 probes per wait, and 561 351
-// probes are 0.84 s of the 0.92 s it added. Six counterbalanced rounds
-// at each of five producer write sizes and two more at --threads 2 lost
-// all 42 pairs -- +45% wall at 4 KiB, +38% at 64 KiB, +22% at 256 KiB,
-// +16% at 1 MiB, +2.4% at 4 MiB -- at higher total CPU across producer
-// and consumer in six of the seven shapes.
-//
-// A zero budget does not rescue it, because the one probe that opens
-// every wait is itself a loss: taken with the 528 ns call it costs 33% at
-// 256 KiB producer writes. A Windows anonymous pipe holds about one
-// producer write, measured as a high-water ReadDataAvailable of 8 KiB
-// behind 4 KiB writes, 256 KiB behind 256 KiB writes and 1 MiB behind
-// 1 MiB writes. The producer is therefore waiting on a full pipe for this
-// read, and what the reader spends probing the producer spends stalled.
+// A Windows anonymous pipe holds about one producer write: a high-water
+// ReadDataAvailable of 8 KiB behind 4 KiB writes, 256 KiB behind 256 KiB
+// writes, 1 MiB behind 1 MiB writes. The producer is therefore waiting on
+// a full pipe for this read, and the time the reader spends probing is
+// time the producer spends stalled.
 stream_reader::result stream_reader::read_some(std::span<std::byte> out) {
   if (out.empty()) {
     return {};
@@ -124,16 +150,46 @@ stream_reader::result stream_reader::read_some(std::span<std::byte> out) {
   const DWORD want =
       static_cast<DWORD>(std::min<std::size_t>(out.size(), 0xFFFF'FFFFu));
   DWORD moved = 0;
-  if (ReadFile(h_, out.data(), want, &moved, nullptr) == 0) {
+  for (;;) {
+    if (ReadFile(h_, out.data(), want, &moved, nullptr) != 0) {
+      break;
+    }
     const DWORD err = GetLastError();
+    if (err == ERROR_MORE_DATA) {
+      // A message-mode pipe whose next message is longer than the ask:
+      // `moved` bytes of it arrived, and the next read returns the rest.
+      break;
+    }
     if (err == ERROR_BROKEN_PIPE || err == ERROR_HANDLE_EOF) {
       return {.bytes = 0, .eof = true};
+    }
+    if (err == ERROR_NO_DATA && is_pipe_) {
+      // A pipe whose read end a parent put into PIPE_NOWAIT mode: nothing
+      // is queued, which is EAGAIN's meaning on POSIX and is waited out
+      // the same way. The mode is the handle's, inherited and shared, so
+      // it is left as found. There is no readiness primitive for an
+      // anonymous pipe -- WaitForSingleObject on the handle is signalled
+      // with the pipe empty, measured -- so the wait is PeekNamedPipe
+      // until bytes are queued or the peek reports the writer gone (see
+      // wait_for_data() for how it waits between peeks).
+      wait_for_data();
+      continue;
     }
     throw std::system_error(static_cast<int>(err), std::system_category(),
                             "reading a stream");
   }
   if (moved == 0) {
-    return {.bytes = 0, .eof = true};
+    // A read that succeeds with nothing moved means two different things
+    // by handle type, measured on Windows 11: a file at its end, the NUL
+    // device and a socket whose peer closed all answer this way and never
+    // ERROR_HANDLE_EOF, so for them it is the end of the stream and
+    // reading on would never return. A pipe's end arrives as
+    // ERROR_BROKEN_PIPE above and never this way. A message-mode pipe
+    // reports a zero-length message the producer wrote here, which is not
+    // the end, and reading it as the end would hash a prefix and report
+    // success; anonymous and byte-mode pipes have not been seen to answer
+    // this way. It teaches the ask bound nothing either way.
+    return {.bytes = 0, .eof = !is_pipe_};
   }
   ask_bound_.note(static_cast<std::size_t>(want),
                   static_cast<std::size_t>(moved));
