@@ -73,6 +73,10 @@ target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_PIPELINE_STOP=1)
 # a name of its own, so the library's copy linked into the same
 # executable stays one definition.
 target_compile_definitions(blake3pp_tests PRIVATE BLAKE3PP_TEST_IO_SEAMS=1)
+if(WIN32 AND BLAKE3PP_WITH_IO)
+  # tests/pipe_source.cpp reads a stream from a socket.
+  target_link_libraries(blake3pp_tests PRIVATE ws2_32)
+endif()
 target_link_libraries(blake3pp_tests PRIVATE
   blake3pp::blake3pp
   blake3pp_warnings

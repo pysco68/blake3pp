@@ -355,23 +355,22 @@ using stream_handle = detail::native_stream;
 /// What update_stream() takes.
 struct stream_io_options {
   /// Bytes per window, 8 MiB by default; rounded down to a power-of-2
-  /// multiple of chunk_size, minimum 64 KiB. A producer that keeps up
-  /// fills every one of them.
+  /// multiple of chunk_size, minimum 64 KiB.
   std::size_t window_bytes = detail::default_window_bytes;
-  /// Window objects the run allocates, which is how many may be in
-  /// flight -- one being filled, the rest on the pool or waiting to
-  /// reduce. Zero takes the default.
+  /// Window objects the run allocates: one being filled, the rest on the
+  /// pool or waiting to reduce. Zero takes the default of four; any other
+  /// value is clamped to [2, 256].
   ///
-  /// A stream has one position and fills one window at a time, so there
-  /// is no device queue here for a depth to buy. blake3ppsum's --qd
-  /// arrives here for that reason: the window count is the only thing a
-  /// stream has for it to set.
+  /// A stream fills one window at a time, so it has no device queue for a
+  /// depth to set; blake3ppsum's --qd sets this field for a stream.
   unsigned windows = 0;
-  /// Ask the OS for this much stream buffer (Linux: F_SETPIPE_SZ). Zero
-  /// leaves it alone. A larger buffer is what keeps an 8 MiB window from
-  /// being a hundred hand-offs through a 64 KiB pipe; the request is
-  /// clamped by the system's own ceiling and the figure in force comes
-  /// back in stream_report.
+  /// The stream buffer to ask the OS for, in bytes; zero leaves it alone.
+  /// Linux only (F_SETPIPE_SZ, which only a pipe takes): the request is
+  /// clamped to INT_MAX and to the system's ceiling,
+  /// /proc/sys/fs/pipe-max-size for an unprivileged process. Other
+  /// platforms ignore it. The 1 MiB default keeps an 8 MiB window from
+  /// being 128 hand-offs through Linux's default 64 KiB pipe. The buffer in
+  /// force comes back in stream_report::stream_buffer_bytes.
   std::size_t stream_buffer_bytes = 1u << 20;
   /// Where to record per-window timing, or null for none; the same
   /// buffer file_io_options::trace takes.

@@ -778,19 +778,20 @@ class uring_context {
     }
   }
 
-  // The one member another thread may call.
+  // The one member another thread may call, and how a lane reports a
+  // finished transfer. The armed wake poll watches this eventfd.
   void wake() noexcept { waiter_.wake(); }
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
-  // Transfers, or remainders of transfers, finished on the synchronous
-  // path inside poll() since construction: zero for a context whose ring
-  // took everything.
+  // Transfers, or remainders of transfers, performed by the lanes (or by
+  // poll() where no lane runs) and reported since construction: zero for
+  // a context whose ring took everything.
   [[nodiscard]] std::size_t served_synchronously() const noexcept {
     return served_synchronously_;
   }
 
   // The ring queues as deep as the caller asked; without it the pump's
-  // threads are the whole of what the device sees.
+  // lanes are the whole of what the device sees.
   [[nodiscard]] unsigned device_depth() const noexcept {
     return use_uring_ ? ring_depth_ : pump_.depth();
   }

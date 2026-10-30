@@ -79,6 +79,14 @@ if(TARGET blake3pp_parallel_backend)
   endif()
 endif()
 
+# Pipe instruments and the scripts that run them; standalone, so they
+# build where the executables above do not. Not under Emscripten: they
+# spawn processes and use pipes, which the wasm target does not have
+# (wasm-ld reports posix_spawnp undefined in rux).
+if(NOT EMSCRIPTEN)
+  add_subdirectory(pipe)
+endif()
+
 # Smoke: the benches are shipped tools, so one tiny run each proves they
 # start, find their kernels and print. It also runs the shared tooling
 # (pinning, cooldown, timing) the CLI smoke tests never reach, which the
@@ -138,7 +146,7 @@ function(_blake3pp_dispatch_cost ns)
     "$<$<CXX_COMPILER_ID:GNU>:-fno-devirtualize;-fno-ipa-cp-clone>")
   target_include_directories(${tgt} PRIVATE
     "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/include")
-  target_link_libraries(${tgt} PRIVATE blake3pp::features)
+  target_link_libraries(${tgt} PRIVATE blake3pp::features blake3pp_warnings)
   set_target_properties(${tgt} PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 endfunction()
 # Off by default: up to four extra kernel compilations that only the

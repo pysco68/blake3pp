@@ -32,6 +32,7 @@
 //    forget() can therefore run a sibling's callback.
 // Internal to src/io/, never installed.
 
+#include <atomic>
 #include <cerrno>
 #include <string_view>
 #if defined(__linux__)
@@ -70,7 +71,10 @@
 namespace blake3pp::detail::io_impl {
 
 [[noreturn]] inline void throw_errno(const char* what) {
-  throw std::system_error(errno, std::generic_category(), what);
+  // Read before the throw: the exception object is allocated first, and
+  // errno must be the failed call's, not the allocator's.
+  const int e = errno;
+  throw std::system_error(e, std::generic_category(), what);
 }
 
 // The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule.
@@ -399,13 +403,12 @@ struct performed_transfer : transfer_base {
 // poll() throws only when the mechanism itself fails, never for a
 // transfer's own error.
 //
-// A read that in_flight() counts must reach its callback. That is what
-// makes a submit failure a degradation rather than an exception: an
-// engine that refuses to take a read it was already handed leaves it on
-// the deferred list, where poll() reads it synchronously and reports
-// whatever happens then. An exception at that point would leave the
-// read counted, uncompleted and unreachable, which no caller can
-// recover from.
+// A transfer that in_flight() counts must reach its callback, so a
+// refused submission is a degradation, not an exception: the context
+// moves the transfer to its deferred list, where a lane performs it
+// (poll() does, when no lane runs) and poll() reports the result. An
+// exception at that point would leave the transfer counted, uncompleted
+// and unreachable.
 template <class C>
 concept io_context = requires(C c, const C cc, typename C::file& f,
                               typename C::transfer& op, std::uint64_t off,
@@ -419,16 +422,15 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // The file_reader::backend() string, computed when the file was opened
   // and owned by it: the engine hands it straight to file_reader.
   { f.name() } noexcept -> std::same_as<std::string_view>;
-  // Queues one read of exactly buf.size() bytes at off. No syscall, no
-  // callback. A window the file cannot take asynchronously (an unaligned
-  // length under O_DIRECT, or no ring at all) goes on the context's
-  // deferred list and is read synchronously inside poll().
+  // Queues one read of exactly buf.size() bytes at off. Performs no
+  // transfer and runs no callback. A transfer the asynchronous engine
+  // cannot take (no engine, a length NO_BUFFERING cannot take on Windows,
+  // a zero length) goes on the context's deferred list, where a lane
+  // reads it (poll() does, when no lane runs).
   { c.submit_read(f, off, buf, op) };
-  // Queues one write of exactly cbuf.size() bytes at off. Same rules as
-  // submit_read: no syscall, no callback, and a write the file cannot
-  // take asynchronously -- an unaligned length under O_DIRECT, or no
-  // engine at all -- goes on the deferred list and is written inside
-  // poll(). The caller's bytes must stay put until the callback runs.
+  // Queues one write of exactly cbuf.size() bytes at off, under the same
+  // rules as submit_read. The caller's bytes must stay put until the
+  // callback runs.
   { c.submit_write(f, off, cbuf, op) };
   // Sets the file's size, for trimming a preallocation back to what was
   // actually written. Only meaningful on a file opened for writing.

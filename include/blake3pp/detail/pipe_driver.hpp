@@ -306,12 +306,23 @@ class read_ask_bound {
 class stream_reader {
  public:
   struct result {
+    // May be zero with eof false: a zero-length message the producer
+    // wrote to a Windows message-mode pipe, which the fill loop treats as
+    // a read that moved nothing and asks again. A POSIX read() never returns
+    // it, because zero there is the end of the stream.
     std::size_t bytes = 0;
     // The producer closed its end: nothing further will arrive.
     bool eof = false;
   };
 
-  explicit stream_reader(native_stream handle) noexcept : h_(handle) {}
+  explicit stream_reader(native_stream handle) noexcept
+      : h_(handle)
+#if defined(_WIN32)
+        ,
+        is_pipe_(handle_is_pipe(handle))
+#endif
+  {
+  }
 
   // Reads into `out`, waiting for the producer's next write if the
   // stream is empty and returning as soon as anything arrives.
@@ -367,6 +378,15 @@ class stream_reader {
   void wait_readable();
 
   native_stream h_;
+#if defined(_WIN32)
+  // Whether the handle is a pipe, which decides what a read that moved
+  // nothing means (see read_some()). Asked once, at construction.
+  static bool handle_is_pipe(native_stream h) noexcept;
+  // Waits until a PIPE_NOWAIT pipe has bytes queued or its writer has
+  // gone; see read_some().
+  void wait_for_data();
+  bool is_pipe_ = false;
+#endif
   stream_watch watch_;
 #if defined(_WIN32)
   read_ask_bound ask_bound_;
@@ -531,13 +551,11 @@ class basic_pipe_driver {
   // and that byte becomes the first of the next window. The three ways
   // out are the three ways a window ends.
   //
-  // Every read blocks, and every read asks for as much of what is left
-  // of the window as the platform prices fairly. No call returns
-  // nothing: a read brings back a buffer's worth or a producer's
-  // backlog, and one short of its ask carries the dry signal the
-  // hand-over wants without a call of its own. Measured on Linux over
-  // 2 GiB, the loop reads 2304 times behind a producer that keeps up and
-  // 1.65 million times behind 4.19 million 512-byte writes.
+  // Every read blocks, and asks for as much of what is left of the window
+  // as Reader::read_bound() allows. A read returns at least one byte,
+  // except a zero-length message on a Windows message-mode pipe, which
+  // the loop takes as a short read. A read short of its ask is the dry
+  // signal the hand-over acts on.
   [[nodiscard]] std::size_t fill(std::span<std::byte> out) {
     const std::size_t n = out.size();
     if (eof_ && carry_len_ == 0) {

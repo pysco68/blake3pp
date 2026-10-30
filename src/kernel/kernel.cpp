@@ -488,10 +488,12 @@ BLAKE3PP_FORCE_INLINE void init_state(u32v v[16], const CvWord& cv_word,
 // Fills u32v::width consecutive XOF output blocks: the root node's cv and
 // message are BROADCAST (identical in every lane); only the counter varies
 // per lane. No input transpose exists at all; the store is the only
-// lane-major step.
-void xof_wide(const std::uint32_t cv[8], const std::uint8_t block[block_len],
-              std::uint32_t len, std::uint64_t counter, std::uint32_t flags,
-              std::uint8_t* out) noexcept {
+// lane-major step. Unreferenced when u32v::width is 1.
+[[maybe_unused]] void xof_wide(const std::uint32_t cv[8],
+                               const std::uint8_t block[block_len],
+                               std::uint32_t len, std::uint64_t counter,
+                               std::uint32_t flags,
+                               std::uint8_t* out) noexcept {
   const readable_block in(block);
 
   u32v m[16];
@@ -533,12 +535,14 @@ void xof_many(const std::uint32_t cv[8], const std::uint8_t block[block_len],
 // Hashes exactly u32v::width inputs, one per SIMD lane. State and message
 // live transposed: each of the 16 words is a vector holding that word for
 // every lane. Message transposition goes through a small staging array; the
-// rounds, the dominant cost, are pure vertical vector ops.
-void hash_batch(const std::uint8_t* const* inputs, std::size_t blocks,
-                const std::uint32_t key[8], std::uint64_t counter,
-                bool increment_counter, std::uint32_t flags,
-                std::uint32_t flags_start, std::uint32_t flags_end,
-                std::uint8_t* out) noexcept {
+// rounds, the dominant cost, are pure vertical vector ops. Unreferenced
+// when u32v::width is 1.
+[[maybe_unused]] void hash_batch(const std::uint8_t* const* inputs,
+                                 std::size_t blocks, const std::uint32_t key[8],
+                                 std::uint64_t counter, bool increment_counter,
+                                 std::uint32_t flags, std::uint32_t flags_start,
+                                 std::uint32_t flags_end,
+                                 std::uint8_t* out) noexcept {
   constexpr std::size_t W = u32v::width;
 
   u32v cv[8];
