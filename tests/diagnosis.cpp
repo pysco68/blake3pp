@@ -2,11 +2,12 @@
 // sees them: one public header, counters filled in by hand, no pipeline
 // and no tooling header in sight.
 //
-// The pipeline-driven cases are in file_pipeline.cpp and
-// write_pipeline.cpp, which produce each reading from the synthetic
-// device rather than describing it. What this file asserts is that the
-// facility is reachable and correct through <blake3pp/trace.hpp> alone,
-// which is the contract a caller outside this repository has.
+// The readings are asserted here, against counters whose shares are
+// stated. The pipeline-driven cases in file_pipeline.cpp and
+// write_pipeline.cpp run the synthetic device on a real clock, which load
+// moves, so they assert the geometry and that the counters cohere. This
+// file also holds the facility to <blake3pp/trace.hpp> alone, the
+// contract a caller outside this repository has.
 
 #include <cstddef>
 #include <cstdint>
@@ -72,6 +73,36 @@ TEST_CASE("a full queue over an idle pool reads as device-limited") {
   CHECK_FALSE(r.device_unqueued);
 }
 
+TEST_CASE("a full queue under a wide arena reads as device-limited") {
+  // The shape tests/file_pipeline.cpp drives through the real pipeline
+  // with a slow device: more windows planned than the queue is deep, so
+  // the arena cannot be the constraint, and the queue held for the run.
+  // That run's queue share is a share of the wall clock, which load
+  // moves; here the share is stated.
+  const auto d = counters(64, 0.10, 0.95, 10'000'000);
+  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(r.long_enough());
+  CHECK_FALSE(r.arena_is_depth);
+  CHECK_FALSE(r.device_unqueued);
+  CHECK(r.label == blake3pp::bottleneck::device);
+}
+
+TEST_CASE("a saturated pool that starves the driver still reads as hash-limited") {
+  // A pool that is the constraint leaves the driver with no free window
+  // most of the run, so starved_ns is most of the wall clock. starved_ns
+  // does not measure pool starvation, and a reading built on it would
+  // call this arena-limited. tests/file_pipeline.cpp produces this shape
+  // with a zero-copy source; the shares are stated here because load
+  // moves the pool's share of a real clock.
+  auto d = counters(64, 0.95, 0.02, 1'000'000);
+  d.starved_ns = static_cast<std::uint64_t>(0.9 * wall_ns);
+  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(r.long_enough());
+  CHECK(r.starved > 0.5);
+  CHECK_FALSE(r.arena_is_depth);
+  CHECK(r.label == blake3pp::bottleneck::hash);
+}
+
 TEST_CASE("an arena at the queue depth reads as arena-limited") {
   const auto d = counters(64, 0.10, 0.50, 10'000'000);
   const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 4, window);
@@ -123,6 +154,68 @@ TEST_CASE("a default-constructed diagnosis has no reading to give") {
   const blake3pp::diagnosis empty;
   CHECK_FALSE(empty.measured());
   CHECK(empty.label == blake3pp::bottleneck::undecided);
+}
+
+TEST_CASE("a pool between the bands is undecided between hash and the arena or device") {
+  // The pool at 85% is past the idle band and short of saturation. The
+  // device's queue share is 50%, under the idle band, and its mean
+  // service of 31 ms is well above the 10 ms minimum, so it did queue
+  // but neither end is decided. The second candidate is the arena when
+  // the arena is the depth, and the device otherwise.
+  const auto d = counters(64, 0.85, 0.50, 10'000'000);
+  const auto narrow = blake3pp::diagnose_read(d, wall_ns, threads, depth, window);
+  REQUIRE(narrow.long_enough());
+  CHECK(narrow.label == blake3pp::bottleneck::undecided);
+  CHECK(narrow.first == blake3pp::bottleneck::hash);
+  CHECK(narrow.second == blake3pp::bottleneck::arena);
+
+  const auto wide = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(wide.long_enough());
+  CHECK(wide.label == blake3pp::bottleneck::undecided);
+  CHECK(wide.first == blake3pp::bottleneck::hash);
+  CHECK(wide.second == blake3pp::bottleneck::device);
+}
+
+TEST_CASE("a device between the bands is undecided between device and the arena or hash") {
+  // The device at 85% of its queue, the pool idle: the device is the
+  // first candidate, and the second is whichever the arena leaves.
+  const auto d = counters(64, 0.10, 0.85, 10'000'000);
+  const auto narrow = blake3pp::diagnose_read(d, wall_ns, threads, depth, window);
+  REQUIRE(narrow.long_enough());
+  CHECK(narrow.label == blake3pp::bottleneck::undecided);
+  CHECK(narrow.first == blake3pp::bottleneck::device);
+  CHECK(narrow.second == blake3pp::bottleneck::arena);
+
+  const auto wide = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(wide.long_enough());
+  CHECK(wide.label == blake3pp::bottleneck::undecided);
+  CHECK(wide.first == blake3pp::bottleneck::device);
+  CHECK(wide.second == blake3pp::bottleneck::hash);
+}
+
+TEST_CASE("a queued device between the bands with a wide arena is undecided device or hash") {
+  // Neither share reaches its band, the arena is wider than the queue,
+  // and the device did queue: the final branch of diagnose_read().
+  const auto d = counters(64, 0.10, 0.60, 10'000'000);
+  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(r.long_enough());
+  CHECK_FALSE(r.arena_is_depth);
+  CHECK_FALSE(r.device_unqueued);
+  CHECK(r.label == blake3pp::bottleneck::undecided);
+  CHECK(r.first == blake3pp::bottleneck::device);
+  CHECK(r.second == blake3pp::bottleneck::hash);
+}
+
+TEST_CASE("a write run whose fill and device shares tie is undecided between generator and device") {
+  // Fill share 2 x 0.30 = 0.60 of the windows in flight, device share
+  // 0.60: within the tie band of each other, and the device's queue
+  // share 0.60 is below saturation.
+  const auto d = counters(64, 0.30, 0.60, 10'000'000);
+  const auto r = blake3pp::diagnose_write(d, wall_ns, threads, window);
+  REQUIRE(r.long_enough());
+  CHECK(r.label == blake3pp::bottleneck::undecided);
+  CHECK(r.first == blake3pp::bottleneck::generator);
+  CHECK(r.second == blake3pp::bottleneck::device);
 }
 
 TEST_CASE("the write side names the generator and the device") {

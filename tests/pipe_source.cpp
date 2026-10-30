@@ -1,32 +1,40 @@
-// The stream source: a driver whose bytes arrive rather than sit.
+// The stream source: a driver whose bytes arrive as a producer writes them.
 //
-// Three things are being tested, and only the first is about the driver:
+// What is tested:
 //
 //  * the driver contract, as memory_source.cpp tests the in-memory one:
 //    callbacks only from poll(), a wake that releases a blocked one, and
-//    windows whose length is the driver's answer rather than the grid's
-//    question;
-//  * the DIGEST, over every shape a stream can take -- a producer that
+//    windows as long as the stream made them;
+//  * the DIGEST, over every shape a stream can take: a producer that
 //    keeps up, one that runs dry mid-window, a length that is an exact
 //    multiple of the window, an empty stream, a dribbling producer, and
 //    one that stops mid-window and closes. A window ended early reaches
-//    the tree as the decomposition of a run of parts, and a
-//    decomposition that is wrong is a wrong digest with nothing else to
-//    see, so every case here asserts the digest against the same bytes
-//    hashed sequentially;
-//  * the hand-over condition itself: that an empty stream with a part in
-//    hand ends a window, and that a producer who keeps up never trips
-//    it.
+//    the tree as the decomposition of a run of parts, and a wrong
+//    decomposition is a wrong digest with nothing else to see, so every
+//    case asserts the digest against the same bytes hashed sequentially;
+//  * the hand-over condition: an empty stream with a part in hand ends a
+//    window, a producer who keeps up never trips it, and with the early
+//    hand-over off a dry stream is waited for;
+//  * the read bound the driver asks within, and the Windows ask bound;
+//  * the platform reader end to end over a real pipe, and the faults it
+//    can see: EINTR, a non-blocking descriptor, a closed one, a writer
+//    that vanishes, and on Windows PIPE_NOWAIT, a socket and a
+//    message-mode pipe;
+//  * the watch before a read, on a virtual clock.
 //
-// The reader is scripted rather than a second process, so what arrives
-// when is the test's decision and not the scheduler's: every short flush
-// below happens at a byte offset the case chose.
+// Most cases use a scripted reader, so what arrives when is the test's
+// decision and not the scheduler's: every short flush below happens at a
+// byte offset the case chose.
 
 #include <algorithm>
+#include <csignal>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <stdexcept>
@@ -47,9 +55,12 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -88,6 +99,12 @@ class scripted_reader {
   struct step {
     std::size_t bytes = 0;  // deliver this many, in as many calls as it takes
     bool dry = false;       // the stream is momentarily empty
+    // One read that succeeds and moves nothing, without ending the
+    // stream: what a zero-length producer write looks like on Windows.
+    bool empty_read = false;
+    // The platform's read fails here: the reader throws, as
+    // stream_reader does for anything but EINTR and EAGAIN.
+    bool fail = false;
   };
 
   struct result {
@@ -107,7 +124,8 @@ class scripted_reader {
     std::size_t moved = 0;
     for (;;) {
       while (next_ < script_.size() && script_[next_].bytes == 0 &&
-             !script_[next_].dry) {
+             !script_[next_].dry && !script_[next_].empty_read &&
+             !script_[next_].fail) {
         ++next_;
       }
       if (next_ >= script_.size()) {
@@ -117,6 +135,25 @@ class scripted_reader {
                          : result{.bytes = 0, .eof = true};
       }
       step& s = script_[next_];
+      if (s.fail) {
+        // A failure is reported once the bytes before it are out: a
+        // real read either moves bytes or fails, never both.
+        if (moved > 0) {
+          return {.bytes = moved, .eof = false};
+        }
+        ++next_;
+        ++failures_;
+        throw std::system_error(std::make_error_code(std::errc::io_error),
+                                "scripted read failure");
+      }
+      if (s.empty_read) {
+        ++next_;
+        ++empty_reads_;
+        if (moved > 0) {
+          return {.bytes = moved, .eof = false};
+        }
+        return {.bytes = 0, .eof = false};
+      }
       if (s.dry) {
         ++next_;
         ++dries_;
@@ -166,6 +203,10 @@ class scripted_reader {
 
   // How many times the script left the stream empty.
   [[nodiscard]] std::uint64_t dries() const noexcept { return dries_; }
+  [[nodiscard]] std::uint64_t empty_reads() const noexcept {
+    return empty_reads_;
+  }
+  [[nodiscard]] std::uint64_t failures() const noexcept { return failures_; }
 
  private:
   std::span<const std::byte> src_;
@@ -174,6 +215,8 @@ class scripted_reader {
   std::size_t at_ = 0;
   std::size_t next_ = 0;
   std::uint64_t dries_ = 0;
+  std::uint64_t empty_reads_ = 0;
+  std::uint64_t failures_ = 0;
   std::vector<std::size_t> asks_;
 };
 
@@ -259,8 +302,8 @@ std::size_t part_run_records(const outcome& o) {
       }));
 }
 
-// A real pipe and a producer on it: the one place in this file that
-// touches the OS, and the only platform-shaped code in it.
+// A real pipe and a producer on it, for the cases that read through the
+// platform's reader.
 struct os_pipe {
 #if defined(_WIN32)
   using end = HANDLE;
@@ -879,9 +922,10 @@ TEST_CASE("the Windows ask bound follows what the reads deliver") {
 
 TEST_CASE("update_stream over a real pipe matches the sequential hasher") {
 #if defined(__EMSCRIPTEN__)
-  // Emscripten's in-memory pipe answers EAGAIN to a read of an empty pipe
-  // even after the write end has closed, so a case that reads a live
-  // producer to its end cannot finish there.
+  // Emscripten's pipe is an in-memory emulation that answers EAGAIN to a
+  // read of an empty pipe, even once the writer has closed (see the
+  // vanished-writer case), so a case that reads a live producer to its
+  // end cannot finish there.
   MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
   return;
 #endif
@@ -939,6 +983,517 @@ TEST_CASE("update_stream over a real pipe matches the sequential hasher") {
     }
   }
 }
+
+// ------------------------------------------------------------------
+// Faults the reader can see. Each must end either as the digest of
+// exactly the bytes a genuine end of stream delivered, or with no digest
+// and the error out of run_window_pipeline(). Nothing asserts on time.
+
+TEST_CASE("end of stream exactly on a window boundary, one byte past it, and inside the read-ahead") {
+  // Three lengths around the boundary the one-byte read-ahead exists
+  // for, delivered by a producer that runs dry between every write so
+  // the early hand-over and the read-ahead both engage.
+  constexpr std::size_t w = 64 * 1024;
+  for (const std::size_t len : {2 * w, 2 * w + 1, 2 * w - 1, 3 * w, 3 * w + 1}) {
+    for (const std::size_t piece : {std::size_t{4096}, w / 2, w}) {
+      CAPTURE(len);
+      CAPTURE(piece);
+      const auto bytes = pattern(len, 61);
+      std::vector<scripted_reader::step> script;
+      for (std::size_t at = 0; at < len; at += piece) {
+        script.push_back({.bytes = std::min(piece, len - at)});
+        script.push_back({.dry = true});
+      }
+      const outcome o = run_stream(bytes, script);
+      CHECK(o.digest == blake3pp::hash(bytes));
+      CHECK(o.bytes == len);
+    }
+  }
+}
+
+TEST_CASE("a read that moves nothing without ending the stream is asked again") {
+  // What a zero-length producer write looks like through the seam:
+  // the fill loop neither ends the window nor counts it as the end of
+  // the stream, and the digest is of every byte that followed.
+  constexpr std::size_t w = 64 * 1024;
+  const auto bytes = pattern(3 * w + 777, 62);
+  std::vector<scripted_reader::step> script = {
+      {.empty_read = true},
+      {.bytes = w / 2},
+      {.empty_read = true},
+      {.empty_read = true},
+      {.bytes = w},
+      {.dry = true},
+      {.empty_read = true},
+      {.bytes = bytes.size() - w - w / 2},
+      {.empty_read = true},
+  };
+  blake3pp::hasher h;
+  const detail::pipeline_plan plan = detail::plan_stream(h.count(), w, 0);
+  test_driver drv(scripted_reader{bytes, script},
+                  {.flush_quantum = detail::stream_flush_quantum<budget>(plan.window_bytes)});
+  test_driver::file f(drv);
+  detail::run_window_pipeline<budget>(h, drv, f, blake3pp::get_parallel_scheduler(),
+                                      plan, {.window_bytes = plan.window_bytes});
+  CHECK(drv.reader().empty_reads() == 5);
+  CHECK(drv.bytes_read() == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+}
+
+TEST_CASE("a read that fails mid-window propagates and leaves no digest") {
+  // The reader throws from inside window_storage_for() on the loop
+  // thread. run_window_pipeline() must rethrow that error, the hasher
+  // must still be where it was (nothing absorbed from the broken
+  // window), and the driver must owe nothing: no read outstanding, so
+  // nothing can complete into freed storage afterwards.
+  constexpr std::size_t w = 64 * 1024;
+  const auto bytes = pattern(5 * w, 63);
+  for (const std::size_t good : {std::size_t{0}, w / 2, 2 * w, 2 * w + 4096}) {
+    CAPTURE(good);
+    std::vector<scripted_reader::step> script;
+    if (good > 0) {
+      script.push_back({.bytes = good});
+      script.push_back({.dry = true});
+    }
+    script.push_back({.fail = true});
+    script.push_back({.bytes = bytes.size() - good});
+    blake3pp::hasher h;
+    const std::uint64_t count_before = h.count();
+    const detail::pipeline_plan plan = detail::plan_stream(h.count(), w, 0);
+    test_driver drv(scripted_reader{bytes, script},
+                    {.flush_quantum = detail::stream_flush_quantum<budget>(plan.window_bytes)});
+    test_driver::file f(drv);
+    bool threw = false;
+    try {
+      detail::run_window_pipeline<budget>(h, drv, f, blake3pp::get_parallel_scheduler(),
+                                          plan, {.window_bytes = plan.window_bytes});
+    } catch (const std::system_error& e) {
+      threw = true;
+      CHECK(e.code() == std::errc::io_error);
+    }
+    CHECK(threw);
+    CHECK(drv.reader().failures() == 1);
+    CHECK(drv.in_flight() == 0);
+    // Windows that were handed over before the failure were hashed;
+    // the failing window was not. Either way the result is not the
+    // digest of the stream and the caller has an exception, not a
+    // digest, to act on.
+    CHECK(h.count() >= count_before);
+    CHECK(h.count() <= good);
+    CHECK(drv.bytes_read() <= good);
+  }
+}
+
+TEST_CASE("a failure on the very first read leaves the hasher untouched") {
+  blake3pp::hasher h;
+  const auto before = h.finalize();
+  const detail::pipeline_plan plan = detail::plan_stream(h.count(), 64 * 1024, 0);
+  test_driver drv(scripted_reader{{}, {{.fail = true}}},
+                  {.flush_quantum = detail::stream_flush_quantum<budget>(plan.window_bytes)});
+  test_driver::file f(drv);
+  CHECK_THROWS_AS(detail::run_window_pipeline<budget>(
+                      h, drv, f, blake3pp::get_parallel_scheduler(), plan,
+                      {.window_bytes = plan.window_bytes}),
+                  std::system_error);
+  CHECK(h.count() == 0);
+  CHECK(h.finalize() == before);
+  CHECK(drv.in_flight() == 0);
+}
+
+#if !defined(_WIN32)
+namespace {
+
+// Deliveries seen by the handler, so a test can show its signals landed
+// rather than being sent into the void.
+std::atomic<unsigned> signals_delivered{0};
+
+void count_signal(int) { signals_delivered.fetch_add(1, std::memory_order_relaxed); }
+
+// Installs a handler for SIGUSR1 without SA_RESTART, so a blocking
+// read() or poll() in the reader returns EINTR when the signal lands,
+// and restores the previous disposition when destroyed.
+struct interrupting_signal {
+  struct sigaction previous{};
+  interrupting_signal() {
+    struct sigaction sa{};
+    sa.sa_handler = count_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGUSR1, &sa, &previous);
+  }
+  ~interrupting_signal() { sigaction(SIGUSR1, &previous, nullptr); }
+};
+
+}  // namespace
+
+TEST_CASE("EINTR during a blocking read or watch is retried without losing bytes") {
+#if defined(__EMSCRIPTEN__)
+  // Emscripten's pipe is an in-memory emulation that answers EAGAIN to a
+  // read of an empty pipe, even once the writer has closed (see the
+  // vanished-writer case), so a case that reads a live producer to its
+  // end cannot finish there.
+  MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
+  return;
+#endif
+  // The producer writes in small pieces with the reader asleep or
+  // watching between them, and a second thread sends SIGUSR1 to the
+  // reading thread throughout. Every interrupted call must be retried:
+  // a reader that returned the interruption as a short or zero read
+  // would end the stream early with the digest of a prefix.
+  //
+  // Outside Darwin the reader waits in poll() before every read(): the
+  // watch's zero-timeout probes, then a blocking one if nothing came. The
+  // interruptions land in poll(), and the read()-level EINTR branch in
+  // read_some() is reached only when a signal arrives between the two
+  // calls. The interrupted read() and EAGAIN branches are Darwin
+  // coverage, since the watch is compiled out there and nothing waits in
+  // front of read(). Counting the read()-level EINTRs needs readshim,
+  // which this binary does not load; cli_fault_eintr_storm counts them,
+  // and this test counts the deliveries.
+  const interrupting_signal guard;
+  const unsigned delivered_before = signals_delivered.load();
+  const auto bytes = pattern(6 * 64 * 1024 + 1234, 64);
+  os_pipe p;
+  REQUIRE(p.open());
+  const pthread_t reader_thread = pthread_self();
+  std::atomic<bool> done{false};
+  std::atomic<unsigned> signals{0};
+  std::thread producer([&] {
+    std::size_t at = 0;
+    while (at < bytes.size()) {
+      const std::size_t want = std::min<std::size_t>(4096, bytes.size() - at);
+      const auto n = ::write(p.w, bytes.data() + at, want);
+      REQUIRE(n > 0);
+      at += static_cast<std::size_t>(n);
+      pthread_kill(reader_thread, SIGUSR1);
+      ++signals;
+    }
+    p.close_write();
+    // Paced, so the reader still reaches the end: an unpaced storm keeps
+    // a FreeBSD reader re-entering the handler and restarting poll() for
+    // minutes, under KVM as well as under emulation.
+    while (!done.load()) {
+      pthread_kill(reader_thread, SIGUSR1);
+      ++signals;
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  });
+  blake3pp::hasher h;
+  const blake3pp::stream_report r =
+      blake3pp::update_stream(h, p.r, blake3pp::get_parallel_scheduler());
+  done.store(true);
+  producer.join();
+  p.close_read();
+  CHECK(signals.load() > 0);
+  CHECK(signals_delivered.load() - delivered_before > 0);
+  CHECK(r.bytes == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+}
+
+TEST_CASE("a descriptor handed over non-blocking is read to the end") {
+#if defined(__EMSCRIPTEN__)
+  // Emscripten's pipe is an in-memory emulation that answers EAGAIN to a
+  // read of an empty pipe, even once the writer has closed (see the
+  // vanished-writer case), so a case that reads a live producer to its
+  // end cannot finish there.
+  MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
+  return;
+#endif
+  // O_NONBLOCK on the read end: an empty pipe answers EAGAIN rather
+  // than blocking, and the reader must wait for readiness and retry,
+  // with the watch's probes in front of it, until the producer closes.
+  //
+  // Outside Darwin the watch waits for readiness before each read(), so
+  // the read()-level EAGAIN branch in read_some() is reached only when
+  // another reader empties the pipe between the two calls, which no test
+  // here makes happen deterministically. That branch is Darwin coverage.
+  const auto bytes = pattern(4 * 64 * 1024 + 99, 65);
+  os_pipe p;
+  REQUIRE(p.open());
+  REQUIRE(::fcntl(p.r, F_SETFL, ::fcntl(p.r, F_GETFL) | O_NONBLOCK) == 0);
+  std::thread producer([&] {
+    std::size_t at = 0;
+    while (at < bytes.size()) {
+      const std::size_t want = std::min<std::size_t>(3000, bytes.size() - at);
+      const auto n = ::write(p.w, bytes.data() + at, want);
+      REQUIRE(n > 0);
+      at += static_cast<std::size_t>(n);
+      std::this_thread::yield();
+    }
+    p.close_write();
+  });
+  blake3pp::hasher h;
+  const blake3pp::stream_report r =
+      blake3pp::update_stream(h, p.r, blake3pp::get_parallel_scheduler());
+  producer.join();
+  CHECK((::fcntl(p.r, F_GETFL) & O_NONBLOCK) != 0);
+  p.close_read();
+  CHECK(r.bytes == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+}
+
+TEST_CASE("a closed descriptor is an error, not an empty stream") {
+  // EBADF must throw. Reading it as the end of the stream would hand
+  // back the empty digest for a stream that was never read.
+  os_pipe p;
+  REQUIRE(p.open());
+  const int fd = p.r;
+  p.close_read();
+  blake3pp::hasher h;
+  CHECK_THROWS_AS(blake3pp::update_stream(h, fd, blake3pp::get_parallel_scheduler()),
+                  std::system_error);
+  CHECK(h.count() == 0);
+}
+
+TEST_CASE("a pipe whose writer vanished mid-stream ends with the bytes it sent, not an error") {
+#if defined(__EMSCRIPTEN__)
+  // Emscripten's in-memory pipe answers EAGAIN to a read of an empty pipe
+  // even after the write end has closed, so the end of the stream this
+  // case waits for never arrives there.
+  MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
+  return;
+#endif
+  // The one case a reader cannot distinguish from a clean end: the
+  // producer closes (or dies) after writing part of the stream. The read
+  // of the empty pipe reports EOF, and the digest is of the bytes that
+  // arrived. Where the watch runs, it sleeps at most once per window plus
+  // two.
+  const auto bytes = pattern(64 * 1024 + 4096 * 3, 66);
+  os_pipe p;
+  REQUIRE(p.open());
+  std::thread producer([&] { p.produce(bytes, 4096); });
+  blake3pp::hasher h;
+  const blake3pp::stream_report r =
+      blake3pp::update_stream(h, p.r, blake3pp::get_parallel_scheduler());
+  producer.join();
+  p.close_read();
+  CHECK(r.bytes == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+  if (r.watch.measured) {
+    CHECK(r.watch.slept <= r.windows + 2);
+  }
+}
+#endif
+
+#if defined(_WIN32)
+TEST_CASE("a pipe whose read end is in PIPE_NOWAIT mode is read to the end") {
+  // A parent may hand over stdin with PIPE_NOWAIT set, in which case an
+  // empty pipe answers ERROR_NO_DATA rather than blocking. The reader
+  // must wait and retry, never fail and never read it as the end, and
+  // must leave the mode as it found it: the handle is shared.
+  const auto bytes = pattern(3 * 64 * 1024 + 4567, 67);
+  os_pipe p;
+  REQUIRE(p.open());
+  DWORD mode = PIPE_NOWAIT;
+  REQUIRE(SetNamedPipeHandleState(p.r, &mode, nullptr, nullptr) != 0);
+  std::thread producer([&p, &bytes] {
+    std::size_t at = 0;
+    while (at < bytes.size()) {
+      const std::size_t want = std::min<std::size_t>(4096, bytes.size() - at);
+      DWORD moved = 0;
+      REQUIRE(WriteFile(p.w, bytes.data() + at, static_cast<DWORD>(want), &moved,
+                        nullptr) != 0);
+      at += moved;
+      std::this_thread::yield();
+    }
+    p.close_write();
+  });
+  blake3pp::hasher h;
+  const blake3pp::stream_report r =
+      blake3pp::update_stream(h, p.r, blake3pp::get_parallel_scheduler());
+  producer.join();
+  DWORD state = 0;
+  REQUIRE(GetNamedPipeHandleStateA(p.r, &state, nullptr, nullptr, nullptr, nullptr, 0) != 0);
+  CHECK((state & PIPE_NOWAIT) != 0);
+  p.close_read();
+  CHECK(r.bytes == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+}
+#endif
+
+#if defined(_WIN32)
+// Runs `body` on a thread and ends the process if it has not returned
+// within `limit`: the failures these cases guard are a read that never
+// ends, which no CHECK can report.
+template <class Body>
+void within(std::chrono::seconds limit, const char* what, Body body) {
+  std::atomic<bool> done{false};
+  std::thread t([&] {
+    body();
+    done.store(true);
+  });
+  const auto until = std::chrono::steady_clock::now() + limit;
+  while (!done.load() && std::chrono::steady_clock::now() < until) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!done.load()) {
+    std::fprintf(stderr, "%s: still reading after %llds\n", what,
+                 static_cast<long long>(limit.count()));
+    std::abort();
+  }
+  t.join();
+}
+
+// GetFileType calls a socket a pipe, but a non-overlapped socket whose
+// peer closed answers every read with success and nothing moved, and
+// never with an error. Read as a pipe's zero-length message, that is a
+// read retried for ever on a core; it is the end of the stream.
+TEST_CASE("a socket on the read end ends where its peer closed") {
+  WSADATA wsa{};
+  REQUIRE(WSAStartup(MAKEWORD(2, 2), &wsa) == 0);
+  // Without WSA_FLAG_OVERLAPPED, as a socket handed over as stdin is; an
+  // accepted socket takes the listener's attributes.
+  const SOCKET listener =
+      WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, 0);
+  REQUIRE(listener != INVALID_SOCKET);
+  sockaddr_in at{};
+  at.sin_family = AF_INET;
+  at.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  REQUIRE(bind(listener, reinterpret_cast<sockaddr*>(&at), sizeof at) == 0);
+  int at_len = sizeof at;
+  REQUIRE(getsockname(listener, reinterpret_cast<sockaddr*>(&at), &at_len) ==
+          0);
+  REQUIRE(listen(listener, 1) == 0);
+  const SOCKET writer =
+      WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, 0);
+  REQUIRE(writer != INVALID_SOCKET);
+  REQUIRE(connect(writer, reinterpret_cast<sockaddr*>(&at), sizeof at) == 0);
+  const SOCKET reader = accept(listener, nullptr, nullptr);
+  REQUIRE(reader != INVALID_SOCKET);
+  closesocket(listener);
+
+  const auto bytes = pattern(3 * 64 * 1024 + 321, 71);
+  std::thread producer([&] {
+    std::size_t sent = 0;
+    while (sent < bytes.size()) {
+      const int n = send(
+          writer, reinterpret_cast<const char*>(bytes.data() + sent),
+          static_cast<int>(std::min<std::size_t>(8192, bytes.size() - sent)),
+          0);
+      if (n <= 0) {
+        break;
+      }
+      sent += static_cast<std::size_t>(n);
+    }
+    shutdown(writer, SD_SEND);
+    closesocket(writer);
+  });
+  blake3pp::hasher h;
+  blake3pp::stream_report r{};
+  within(std::chrono::seconds(30), "socket stream", [&] {
+    r = blake3pp::update_stream(h, reinterpret_cast<HANDLE>(reader),
+                                blake3pp::get_parallel_scheduler());
+  });
+  producer.join();
+  closesocket(reader);
+  WSACleanup();
+  CHECK(r.bytes == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+}
+#endif
+
+#if defined(_WIN32)
+// A message-mode named pipe, the read end in message read mode, and the
+// write end connected to it. The anonymous pipes everywhere else in this
+// file are byte mode, which never shows either case below.
+struct message_pipe {
+  HANDLE r = INVALID_HANDLE_VALUE;
+  HANDLE w = INVALID_HANDLE_VALUE;
+
+  bool open() {
+    static std::atomic<unsigned> serial{0};
+    char name[96];
+    std::snprintf(name, sizeof name, "\\\\.\\pipe\\blake3pp-test-%lu-%u",
+                  GetCurrentProcessId(), serial.fetch_add(1));
+    r = CreateNamedPipeA(name, PIPE_ACCESS_INBOUND,
+                         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                         1, 0, 1 << 20, 0, nullptr);
+    if (r == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+    w = CreateFileA(name, GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                    nullptr);
+    if (w == INVALID_HANDLE_VALUE) {
+      return false;
+    }
+    return ConnectNamedPipe(r, nullptr) != 0 ||
+           GetLastError() == ERROR_PIPE_CONNECTED;
+  }
+  // One WriteFile per message; a zero length writes an empty message.
+  void send(std::span<const std::byte> m) const {
+    DWORD moved = 0;
+    REQUIRE(WriteFile(w, m.data(), static_cast<DWORD>(m.size()), &moved,
+                      nullptr) != 0);
+    REQUIRE(moved == m.size());
+  }
+  void close_write() {
+    CloseHandle(w);
+    w = INVALID_HANDLE_VALUE;
+  }
+  ~message_pipe() {
+    if (w != INVALID_HANDLE_VALUE) {
+      CloseHandle(w);
+    }
+    if (r != INVALID_HANDLE_VALUE) {
+      CloseHandle(r);
+    }
+  }
+};
+
+// A zero-length message mid-stream is a read that succeeds and moves
+// nothing, which on a pipe is not the end: reading it as the end hashes
+// the prefix and reports success.
+TEST_CASE("a zero-length message on a message-mode pipe is not the end") {
+  const auto bytes = pattern(6 * 4096 + 1000, 73);
+  message_pipe p;
+  REQUIRE(p.open());
+  std::thread producer([&] {
+    const std::span<const std::byte> all{bytes};
+    p.send(all.first(4096));
+    p.send(all.subspan(4096, 4096));
+    p.send({});
+    p.send(all.subspan(8192));
+    p.close_write();
+  });
+  blake3pp::hasher h;
+  blake3pp::stream_report r{};
+  within(std::chrono::seconds(30), "message pipe", [&] {
+    r = blake3pp::update_stream(h, p.r, blake3pp::get_parallel_scheduler());
+  });
+  producer.join();
+  CHECK(r.bytes == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+}
+
+// The ask bound learns the size of the messages so far, so a later
+// message longer than that arrives as ERROR_MORE_DATA with part of it
+// moved. That is a read that delivered bytes; the rest is the next read.
+TEST_CASE("a message longer than the ask is read across two reads") {
+  const auto bytes = pattern(32 * 4096 + 5123 + 777, 79);
+  message_pipe p;
+  REQUIRE(p.open());
+  std::thread producer([&] {
+    const std::span<const std::byte> all{bytes};
+    std::size_t at = 0;
+    for (int i = 0; i < 32; ++i, at += 4096) {
+      p.send(all.subspan(at, 4096));
+      // One message at a time, so each read comes back with one.
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    p.send(all.subspan(at, 5123));
+    p.send(all.subspan(at + 5123));
+    p.close_write();
+  });
+  blake3pp::hasher h;
+  blake3pp::stream_report r{};
+  within(std::chrono::seconds(30), "message pipe", [&] {
+    r = blake3pp::update_stream(h, p.r, blake3pp::get_parallel_scheduler());
+  });
+  producer.join();
+  CHECK(r.bytes == bytes.size());
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+}
+#endif
 
 TEST_CASE("a reader without a watch or an ask bound reports neither") {
   // The scripted reader has no watch() and its read_bound() is a
@@ -1047,9 +1602,10 @@ TEST_CASE("at the floor every wait still makes one paced probe") {
 #if !defined(_WIN32)
 TEST_CASE("a slow producer is waited for and the descriptor is left as found") {
 #if defined(__EMSCRIPTEN__)
-  // Emscripten's in-memory pipe answers EAGAIN to a read of an empty pipe
-  // even after the write end has closed, so a case that reads a live
-  // producer to its end cannot finish there.
+  // Emscripten's pipe is an in-memory emulation that answers EAGAIN to a
+  // read of an empty pipe, even once the writer has closed (see the
+  // vanished-writer case), so a case that reads a live producer to its
+  // end cannot finish there.
   MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
   return;
 #endif

@@ -150,10 +150,34 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
 else()
   target_compile_options(blake3pp_warnings INTERFACE -Wall -Wextra -Wconversion -Wshadow)
 endif()
-# clang checks the doc comments (a @param naming no parameter, a @return
-# on void) against the declarations they document.
+# The same checks on every compiler. clang's -Wconversion includes
+# -Wsign-conversion and -Wshorten-64-to-32; GCC's leaves sign changes out
+# in C++, so it is named here. GCC's -Wshadow covers a constructor
+# parameter or a local that shadows a member; clang's needs -Wshadow-all
+# for those.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(blake3pp_warnings INTERFACE -Wsign-conversion)
+endif()
+# clang also checks the doc comments (a @param naming no parameter, a
+# @return on void) against the declarations they document.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  target_compile_options(blake3pp_warnings INTERFACE -Wdocumentation)
+  target_compile_options(blake3pp_warnings INTERFACE -Wshadow-all -Wdocumentation)
+endif()
+
+# Opt-in: a warning in blake3pp's own code fails the build. Set on the
+# plain Linux presets (linux-gcc16-cxx26 and linux-clang22-cxx26, see
+# tools/gen-toolchains.py), so a new warning stops the lane that
+# introduced it. It applies to blake3pp_warnings and to the externally
+# compiled kernels only, never to fetched dependencies, which carry
+# warnings of their own on some lanes.
+option(BLAKE3PP_WARNINGS_AS_ERRORS
+  "Treat warnings in blake3pp's own targets as errors" OFF)
+if(BLAKE3PP_WARNINGS_AS_ERRORS)
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(blake3pp_warnings INTERFACE /WX)
+  else()
+    target_compile_options(blake3pp_warnings INTERFACE -Werror)
+  endif()
 endif()
 
 # The file-I/O layer needs a filesystem, 64-bit seeks and (on the native
@@ -440,6 +464,15 @@ if(BLAKE3PP_BUILD_WEB AND EMSCRIPTEN)
 endif()
 
 option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility" ${PROJECT_IS_TOP_LEVEL})
+# The fault tests in cli/ drive the pipe instruments in bench/pipe/. Those
+# are standalone, and bench/ adds them only when the benchmarks are on, so
+# with the benchmarks off they are added here for the tests instead. Not
+# under Emscripten, for the reason bench/CMakeLists.txt gives.
+if(BLAKE3PP_BUILD_TESTS AND BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT
+   AND BLAKE3PP_WITH_IO AND NOT BLAKE3PP_BUILD_BENCH AND NOT EMSCRIPTEN)
+  add_subdirectory(bench/pipe bench/pipe)
+endif()
+
 # Both tools are file tools (hash_file, the direct-I/O writer): without
 # the I/O layer there is nothing for them to be.
 if(BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT AND BLAKE3PP_WITH_IO)

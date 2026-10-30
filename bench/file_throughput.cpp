@@ -272,7 +272,9 @@ kernel_counters read_kernel_counters() {
       std::istringstream header(line);
       std::string tok;
       while (header >> tok) {
-        ncpu += tok.starts_with("CPU") ? 1 : 0;
+        if (tok.starts_with("CPU")) {
+          ++ncpu;
+        }
       }
     }
     k.irqs.assign(ncpu, 0);
@@ -713,7 +715,7 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
       to_reduced.push_back(w.t_absorbed - w.t_joined);
     }
     const auto median = [](std::vector<std::int64_t>& v) {
-      std::ranges::nth_element(v, v.begin() + v.size() / 2);
+      std::ranges::nth_element(v, v.begin() + std::ssize(v) / 2);
       return static_cast<double>(v[v.size() / 2]) / 1000.0;
     };
     println(stdout,

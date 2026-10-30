@@ -702,15 +702,17 @@ class ioring_context {
 
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
 
-  // Transfers, or remainders of transfers, finished on the synchronous
-  // path inside poll() since construction: zero for a buffered file on a
-  // ring, one per direct file whose size is not a multiple of the granule.
+  // Transfers, or remainders of transfers, performed by the lanes (or by
+  // poll() where no lane runs) and reported since construction: zero for a
+  // buffered file on a ring, one per direct file whose size is not a
+  // multiple of the granule.
   [[nodiscard]] std::size_t served_synchronously() const noexcept {
     return served_synchronously_;
   }
 
   // Reaps every transfer the ring still owes without reporting any, and
-  // forgets the deferred list. There is no handle-wide cancel here --
+  // clears the pump, waiting its lanes out. There is no handle-wide cancel
+  // here --
   // BuildIoRingCancelRequest names one request by its userData, and this
   // backend keeps no list of them -- so the requests are waited out, as
   // the io_uring backend's drain does.

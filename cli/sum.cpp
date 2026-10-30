@@ -119,7 +119,8 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
   } else {
     std::ifstream in(source, std::ios::binary);
     if (!in) {
-      throw std::system_error(errno, std::generic_category(), source);
+      const int e = errno;  // before the throw allocates the exception
+      throw std::system_error(e, std::generic_category(), source);
     }
     content.assign(std::istreambuf_iterator<char>(in), {});
   }
@@ -145,6 +146,12 @@ struct result {
   std::string error;
 };
 
+#if defined(_MSC_VER)
+// The engine's members carry an alignment, so MSVC pads the class and says
+// so at its closing brace (C4324). The padding is intended.
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
@@ -356,16 +363,25 @@ class engine {
     return r;
   }
 
+  // The sequential path's read of stdin, through the library's stream
+  // reader. It retries a read interrupted by a signal (EINTR), waits out
+  // a descriptor handed over non-blocking (EAGAIN), and on Windows bounds
+  // its ask by what the pipe delivers. stdio's fread reports EINTR and
+  // EAGAIN as errors, which would end the run with "Interrupted system
+  // call" or "Resource temporarily unavailable".
   template <class Sink>
   static void read_stdin_into(Sink& sink) {
+    blake3pp::detail::stream_reader reader{blake3pp::standard_input()};
     std::vector<std::byte> buf(b3tool::stream_buffer_bytes);
-    std::size_t n = 0;
-    while ((n = std::fread(buf.data(), 1, buf.size(), stdin)) > 0) {
-      sink.update(std::span{buf}.first(n));
-    }
-    if (std::ferror(stdin) != 0) {
-      throw std::system_error(errno, std::generic_category(),
-                              "reading standard input");
+    for (;;) {
+      const std::size_t bound = reader.read_bound();
+      const std::size_t ask = bound == 0 ? buf.size() : std::min(buf.size(), bound);
+      const blake3pp::detail::stream_reader::result r =
+          reader.read_some(std::span{buf}.first(ask));
+      if (r.eof) {
+        return;
+      }
+      sink.update(std::span{buf}.first(r.bytes));
     }
   }
 
@@ -375,6 +391,9 @@ class engine {
   double wall_ns_ = 0.0;
   bool pipelined_ = false;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 // --diag: what the run that just happened was limited by, from the
 // counters it kept. One line of reading, four of figures, and, where the
@@ -533,7 +552,7 @@ int run_check(engine& eng, std::istream& in, std::string_view list_name) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run_main(int argc, char** argv) {
   b3tool::tool_startup();
   options o;
   constexpr std::size_t mib = std::size_t{1} << 20;
@@ -749,4 +768,21 @@ int main(int argc, char** argv) {
   }
 
   return failures == 0 ? 0 : b3tool::exit_failure;
+}
+
+// The digest lines go out through a buffered stdout, so a write into a
+// pipe whose reader has gone (with SIGPIPE ignored, and on Windows, which
+// has no SIGPIPE) fails at a flush, and the flush at exit is silent.
+// Flushing here and checking the stream's error state turns that into a
+// failed run on every path.
+int main(int argc, char** argv) {
+  const int rc = run_main(argc, argv);
+  errno = 0;
+  if (std::fflush(stdout) != 0 || std::ferror(stdout) != 0) {
+    const int e = errno;
+    println(stderr, "blake3ppsum: write error on standard output{}{}",
+            e != 0 ? ": " : "", e != 0 ? std::generic_category().message(e) : "");
+    return rc == 0 ? b3tool::exit_failure : rc;
+  }
+  return rc;
 }

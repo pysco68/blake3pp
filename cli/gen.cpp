@@ -21,6 +21,7 @@
 //     without first copying it into memory.
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -175,7 +176,18 @@ void report_write_diagnosis(const blake3pp::diagnosis& r, unsigned threads) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+// A write to stdout failed: the reader closed its end, with SIGPIPE
+// ignored or on Windows, which has no SIGPIPE. The stream is incomplete,
+// so the run fails. With SIGPIPE at its default the process dies of the
+// signal first, which a shell reports as a failure too.
+int write_failed() {
+  const int e = errno;
+  println(stderr, "blake3ppgen: write error on standard output{}{}",
+          e != 0 ? ": " : "", e != 0 ? std::generic_category().message(e) : "");
+  return b3tool::exit_failure;
+}
+
+int run_main(int argc, char** argv) {
   b3tool::tool_startup();
   std::string seed;
   std::string seed_file;
@@ -455,10 +467,10 @@ int main(int argc, char** argv) {
     if (hex) {
       const std::string line = blake3pp::to_hex(std::span{buf}.first(take));
       if (std::fwrite(line.data(), 1, line.size(), stdout) != line.size()) {
-        break;  // downstream closed (e.g. head); not an error
+        return write_failed();
       }
     } else if (std::fwrite(buf.data(), 1, take, stdout) != take) {
-      break;
+      return write_failed();
     }
     remaining.consume(take);
   }
@@ -466,4 +478,16 @@ int main(int argc, char** argv) {
     std::fputc('\n', stdout);
   }
   return 0;
+}
+
+// The tail of the stream sits in stdout's buffer until a flush, and the
+// flush at exit is silent; flushing and checking here is what turns a
+// write that failed at the end into a failed run.
+int main(int argc, char** argv) {
+  const int rc = run_main(argc, argv);
+  errno = 0;
+  if (std::fflush(stdout) != 0 || std::ferror(stdout) != 0) {
+    return rc == 0 ? write_failed() : rc;
+  }
+  return rc;
 }

@@ -55,7 +55,21 @@ class stdio_source {
 
   stdio_source(const std::filesystem::path& path,
                const file_open_options& how) {
+    // The Microsoft CRT deprecates std::fopen in favour of fopen_s, which
+    // opens without sharing; std::fopen is the call this source means.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
     stream_.reset(std::fopen(path.string().c_str(), how.write ? "wb" : "rb"));
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     if (!stream_) {
       throw_errno("fopen");
     }

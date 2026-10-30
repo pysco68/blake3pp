@@ -7,8 +7,6 @@
 #include <doctest/doctest.h>
 
 #include <array>
-#include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -117,21 +115,31 @@ TEST_CASE("fold_sibling_cvs refuses a count that is not a power of two") {
 // there is no context to run.
 #if defined(BLAKE3PP_WITH_IO)
 TEST_CASE("an io_context refuses a second thread that tries to run it") {
+  // Both threads retry until the runner is inside run(), where it stays
+  // until the stop, and this thread is refused. A run_until_idle() that
+  // gets in first returns at once, since nothing is started, and a runner
+  // refused meanwhile tries again.
   blake3pp::async::io_context ctx({.window_bytes = 64 * 1024});
-  std::atomic<bool> running{false};
   std::thread runner([&] {
-    running.store(true, std::memory_order_release);
-    try {
-      ctx.run();
-    } catch (...) {  // the stop below is how this one ends
+    for (;;) {
+      try {
+        ctx.run();  // until the request_stop() below
+        return;
+      } catch (const std::logic_error&) {
+        std::this_thread::yield();  // this thread held it for a moment
+      }
     }
   });
-  while (!running.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
+  bool refused = false;
+  while (!refused) {
+    try {
+      ctx.run_until_idle();  // nothing started, so it returns at once
+      std::this_thread::yield();
+    } catch (const std::logic_error&) {
+      refused = true;
+    }
   }
-  // Long enough that the runner is inside drive() rather than before it.
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  CHECK_THROWS_AS(ctx.run_until_idle(), std::logic_error);
+  CHECK(refused);
   ctx.request_stop();
   runner.join();
 }
