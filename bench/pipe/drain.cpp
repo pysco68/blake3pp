@@ -63,6 +63,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -349,7 +350,9 @@ int main(int argc, char** argv) {
   long pipe_bytes = -1;  // the buffer in force, where it can be asked
 #if defined(F_SETPIPE_SZ) && defined(F_GETPIPE_SZ)
   if (widen_kib > 0) {
-    ::fcntl(in, F_SETPIPE_SZ, static_cast<int>(widen_kib * 1024));
+    // Clamped to INT_MAX, not narrowed (see widen() in stream_reader.cpp).
+    const std::size_t want = std::min<std::size_t>(widen_kib * 1024, INT_MAX);
+    ::fcntl(in, F_SETPIPE_SZ, static_cast<int>(want));
   }
   pipe_bytes = ::fcntl(in, F_GETPIPE_SZ);
 #else

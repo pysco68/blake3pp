@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstddef>
 #include <span>
@@ -329,8 +330,12 @@ std::size_t stream_reader::widen(std::size_t bytes) noexcept {
   // /proc/sys/fs/pipe-max-size for an unprivileged process, and F_SETPIPE_SZ
   // fails outright on anything that is not a pipe. What matters is the
   // buffer in force afterwards, which is what this reports.
+  // The request is an int, so a larger one is clamped to INT_MAX instead
+  // of narrowed: 4 GiB would arrive as 0 and 2 GiB as a negative size
+  // (EINVAL). The kernel's own pipe-max-size limit still applies after.
   if (bytes > 0) {
-    (void)::fcntl(h_, F_SETPIPE_SZ, static_cast<int>(bytes));
+    const int request = static_cast<int>(std::min<std::size_t>(bytes, INT_MAX));
+    (void)::fcntl(h_, F_SETPIPE_SZ, request);
   }
   const int have = ::fcntl(h_, F_GETPIPE_SZ);
   return have > 0 ? static_cast<std::size_t>(have) : 0;
