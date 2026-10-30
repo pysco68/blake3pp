@@ -71,7 +71,10 @@
 namespace blake3pp::detail::io_impl {
 
 [[noreturn]] inline void throw_errno(const char* what) {
-  throw std::system_error(errno, std::generic_category(), what);
+  // Read before the throw: the exception object is allocated first, and
+  // errno must be the failed call's, not the allocator's.
+  const int e = errno;
+  throw std::system_error(e, std::generic_category(), what);
 }
 
 // The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule.

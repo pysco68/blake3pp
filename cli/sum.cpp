@@ -119,7 +119,8 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
   } else {
     std::ifstream in(source, std::ios::binary);
     if (!in) {
-      throw std::system_error(errno, std::generic_category(), source);
+      const int e = errno;  // before the throw allocates the exception
+      throw std::system_error(e, std::generic_category(), source);
     }
     content.assign(std::istreambuf_iterator<char>(in), {});
   }
