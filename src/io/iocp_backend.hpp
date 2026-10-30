@@ -582,9 +582,10 @@ class iocp_context {
     return pump_.lane_wait_ns();
   }
   [[nodiscard]] device_time device() const noexcept { return device_; }
-  // Transfers, or remainders of transfers, finished on the synchronous
-  // path inside poll() since construction: zero for a buffered file on a
-  // port, one per direct file whose size is not a multiple of the granule.
+  // Transfers, or remainders of transfers, performed by the lanes (or by
+  // poll() where no lane runs) and reported since construction: zero for a
+  // buffered file on a port, one per direct file whose size is not a
+  // multiple of the granule.
   [[nodiscard]] std::size_t served_synchronously() const noexcept {
     return served_synchronously_;
   }

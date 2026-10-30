@@ -2287,10 +2287,8 @@ TEST_CASE("a cancel reaches a transfer no lane has taken yet") {
   using context = io_impl::sync_context<source>;
   source::shared shared;
   // The lanes are held inside the source until the cancels are in, so
-  // at most eight of the ten transfers can have been taken when they
-  // arrive and at least two are still waiting. A 20 ms hold made that
-  // likely; on a loaded machine a lane could finish and take the tail
-  // before the cancels ran.
+  // at most four of the ten transfers can have been taken when they
+  // arrive (one per lane) and at least six are still waiting.
   shared.hold = std::chrono::milliseconds(0);
   shared.gated = true;
   shared.poller = std::this_thread::get_id();
@@ -2332,9 +2330,10 @@ TEST_CASE("a cancel reaches a transfer no lane has taken yet") {
     // and the ones a lane already had ran to completion, which the
     // contract's advisory cancel allows.
     CHECK(t.done == static_cast<int>(ops.size()));
-    // Eight lanes, ten transfers: the two no lane could take were
-    // cancelled before any lane came back for them.
-    CHECK(t.cancelled >= 2);
+    // At most one transfer per lane was taken before the cancels arrived;
+    // the rest were cancelled before any lane came back for them.
+    CHECK(t.cancelled >=
+          static_cast<int>(ops.size() - io_impl::max_io_lanes));
   }
   source::live = nullptr;
 }
