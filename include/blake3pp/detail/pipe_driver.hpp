@@ -3,76 +3,61 @@
 // A source whose bytes arrive rather than sit: the window driver for a
 // pipe, a socket, or anything else that cannot be seeked.
 //
-// The file driver the pipeline was written for pread()s at a window's
-// offset, and the grid assumes the offset is the window's index times
-// its size. A stream has neither: its bytes come past once, in order,
-// and how many there are is known only when they stop. What it still
-// has is the one property the pipeline needs -- reads are submitted in
-// grid order -- so a driver that fills whichever window admission hands
-// it, in the order it is handed them, delivers the same bytes at the
-// same offsets.
+// The file driver reads at a window's offset, and the grid assumes the
+// offset is the window's index times its size. A stream has neither: its
+// bytes come past once, in order, and how many there are is known only
+// when they stop. The pipeline submits reads in grid order, so a driver
+// that fills windows in the order admission hands them out delivers the
+// same bytes at the same offsets.
 //
-// The shape is the bench's null_driver: the completion half is
-// memory_driver's queued_reads, because a window whose bytes are
-// already in the arena has one job left, to report from poll() and not
-// before. Filling the window is the one duty added, and it happens
-// where the pipeline asks for the window's storage -- on the driver
-// thread, while the pool hashes the windows admitted before it. That
-// overlap is the whole point: the stdin path otherwise copies and
-// hashes in sequence.
+// The completion half is memory_driver's queued_reads, as in the bench's
+// null_driver: a window whose bytes are already in the arena has one job
+// left, to report from poll() and not before. The fill happens where the
+// pipeline asks for the window's storage, on the driver thread, while the
+// pool hashes the windows admitted before it.
 //
 // Three things end a window, whichever comes first:
 //
 //   * the window's byte count -- the normal case, and the only one a
 //     producer that keeps up ever reaches;
-//   * the stream running dry with at least half a window in hand -- a
-//     producer that is behind must not stall the pool;
+//   * the stream running dry with at least half a window in hand, where
+//     early hand-over is on (pipe_driver_options::early_hand_over);
 //   * end of stream -- the last window, of whatever length.
 //
-// The hand-over condition is an observable and not a clock. Every read
-// blocks, and a read that comes back short of what it asked for is the
-// hand-over signal, which costs no call of its own.
+// The dry signal is a read that comes back short of its ask. It needs no
+// clock and no call of its own: a read takes everything queued up to its
+// ask, so a short read emptied the queue. A read that comes back whole may
+// have left bytes behind, so the loop reads on. POSIX asks for the whole
+// window remainder, which no stream buffer fills, so every POSIX read
+// reports a drained queue; Windows caps the ask at Reader::read_bound().
 //
-// Blocking there does not stall the producer: a stream with nothing in
-// it is a producer that is not waiting on this reader, while a reader
-// that stopped draining a FULL one would stall it. What it costs is the
-// sleep itself. A pipe write wakes its reader only when the reader is
-// asleep, so a reader that drains the pipe and sleeps turns every write
-// of a fast producer into a cross-CPU wake-up, paid by the producer in
-// the write and by the reader in the scheduling latency after it. The
-// reader therefore watches an empty stream for a bounded, adaptive
-// budget before it sleeps (stream_watch). Measured on
-// Linux over 2 GiB from /dev/zero through dd, 16 threads, four
-// counterbalanced rounds: 15% less wall at 512-byte producer writes,
-// 21% at 4 KiB and 33% behind cat, at equal or lower total CPU, because
-// the sleeps it removes were themselves system time; a producer that
-// keeps up never finds the stream empty and never pays for the watch,
-// and one with gaps of 50 us or 1 ms is unchanged in wall and CPU.
+// Every read blocks. A stream with nothing in it is a producer that is not
+// waiting on this reader, so the block holds nothing up; a reader that
+// stopped draining a FULL stream would stall the producer.
 //
-// A short read means the queue was emptied by it whatever the ask, since
-// a read takes everything queued up to what it asked for. The ask
-// governs the other branch: a read that comes back WHOLE may have left
-// something behind, so the loop reads on rather than handing over. POSIX
-// asks for the whole window remainder, which no stream buffer fills, so
-// that branch is never taken there and every read reports a drained
-// queue; Windows caps the ask at Reader::read_bound(), where it is
-// taken. The window lengths come out the same either way: 2 GiB through
-// a 1 MiB pipe at 8 MiB windows gives 512 windows, 256 of them flushed
-// short, with the cap and without it.
+// The cost is the sleep. A pipe write wakes its reader only when the
+// reader is asleep, so a reader that drains the pipe and sleeps turns
+// every write of a fast producer into a cross-CPU wake-up. On POSIX
+// platforms other than Darwin and Emscripten the reader therefore watches
+// an empty stream for a bounded, adaptive budget before it sleeps
+// (stream_watch). Measured on Linux over 2 GiB from a page-cache file,
+// `dd bs=512` and `dd bs=4096` into the stdin path take 25% and 27% less
+// wall with the watch, and 13% and 19% less CPU across both processes:
+// the sleeps it removes were themselves system time.
 //
 // A short flush is a multiple of the flush quantum (one part of the
-// window grid), which is what keeps every extent a run of whole,
-// aligned parts: tree_reducer admits a range only with a power-of-two
-// size on a multiple of that size, and fold_aligned_runs decomposes a
-// part-aligned run into exactly those.
+// window grid), which keeps every extent a run of whole, aligned parts:
+// tree_reducer admits a range only with a power-of-two size on a multiple
+// of that size, and fold_aligned_runs decomposes a part-aligned run into
+// exactly those.
 //
 // One byte of read-ahead is the price of the tree's own rule. A subtree
 // handed to the hasher must not contain the message's final chunk, so a
 // window may only be inserted once a byte past it is known to exist:
 // each fill reads one byte beyond the window and carries it into the
-// next. A stream whose length is a multiple of the window would
-// otherwise end with its final chunk inside a subtree, which is a wrong
-// digest and no error.
+// next. Without it, a stream whose length is a multiple of the window
+// would end with its final chunk inside a subtree, which is a wrong digest
+// and no error.
 //
 // Internal to the library. Standard library only: the platform's read
 // lives behind stream_reader, whose definition is compiled in
@@ -332,15 +317,12 @@ class stream_reader {
   // until the producer writes again. That is the driver's hand-over
   // signal, and it comes out of the read the driver was making anyway.
   //
-  // An empty stream is watched for a bounded, adaptive budget before
-  // the call sleeps in the kernel (stream_watch). A pipe write wakes
-  // its reader only when the reader is asleep, so a reader that drains
-  // the pipe and sleeps turns every write of a fast producer into a
-  // cross-CPU wake-up that both sides pay for; watching the queue for a
-  // few microseconds instead keeps both out of the scheduler. The
-  // budget decides only how long the call waits before it sleeps --
-  // never what it returns, which is what the queue holds when the read
-  // is made, exactly as before.
+  // On POSIX platforms other than Darwin and Emscripten, an empty stream
+  // is watched for a bounded, adaptive budget before the call sleeps in
+  // the kernel (stream_watch); Windows, Darwin and Emscripten block in
+  // the read. The budget decides only how long the call watches before
+  // it sleeps, never what it returns: what the queue holds when the read
+  // is made.
   // @throws std::system_error on a read failure.
   [[nodiscard]] result read_some(std::span<std::byte> out);
 
