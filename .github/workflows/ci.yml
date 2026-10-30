@@ -715,12 +715,14 @@ jobs:
           fi
           file build/${preset}/cli/blake3ppsum
 
-      # Before the upload, because 189 MB of debug info has to cross the
-      # artifact store AND then the ssh pipe into the guest; stripped,
-      # the same five binaries are under 10 MB. Same candidate loop as
-      # the release job's packaging step, with plain GNU strip as the
-      # last resort: the target is x86_64 ELF carrying a FreeBSD OSABI
-      # byte, which BFD strips without caring which kernel it is for.
+      # Before the upload, because the debug info would otherwise cross
+      # the artifact store AND then the ssh pipe into the guest: the tests,
+      # the two tools and the two benches are 189 MB with it and under
+      # 10 MB without. The pipe instruments are stripped with them. Same
+      # candidate loop as the release job's packaging step, with plain GNU
+      # strip as the last resort: the target is x86_64 ELF carrying a
+      # FreeBSD OSABI byte, which BFD strips without caring which kernel
+      # it is for.
       # zig ships no stripper of its own (`zig objcopy --strip-all`
       # answers "unimplemented" on 0.17), which is why the zig image
       # installs binutils.
@@ -735,9 +737,13 @@ jobs:
           echo "stripping with ${STRIP}"
           d=build/freebsd-zig-cxx23
           "$STRIP" "$d"/tests/blake3pp_tests "$d"/cli/blake3ppsum "$d"/cli/blake3ppgen \
-                   "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file
+                   "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file \
+                   "$d"/bench/pipe/pump "$d"/bench/pipe/drain "$d"/bench/pipe/rux \
+                   "$d"/bench/pipe/libpipe_readshim.so
           ls -l "$d"/tests/blake3pp_tests "$d"/cli/blake3ppsum "$d"/cli/blake3ppgen \
-                "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file
+                "$d"/bench/blake3pp_bench "$d"/bench/blake3pp_bench_file \
+                "$d"/bench/pipe/pump "$d"/bench/pipe/drain "$d"/bench/pipe/rux \
+                "$d"/bench/pipe/libpipe_readshim.so
 
       - name: Upload FreeBSD binaries
         uses: actions/upload-artifact@v7
@@ -750,6 +756,10 @@ jobs:
             build/freebsd-zig-cxx23/cli/blake3ppgen
             build/freebsd-zig-cxx23/bench/blake3pp_bench
             build/freebsd-zig-cxx23/bench/blake3pp_bench_file
+            build/freebsd-zig-cxx23/bench/pipe/pump
+            build/freebsd-zig-cxx23/bench/pipe/drain
+            build/freebsd-zig-cxx23/bench/pipe/rux
+            build/freebsd-zig-cxx23/bench/pipe/libpipe_readshim.so
 
   # The other half: boot a real FreeBSD and run the bytes the job above
   # produced. The guest image is NOT built here. It is prepared once by
@@ -848,6 +858,26 @@ jobs:
             | bash tools/freebsd-guest.sh run 'mkdir -p /root/b3 && tar xf - -C /root/b3 && chmod -R +x /root/b3 && ls -lR /root/b3'
       - name: Test on a real FreeBSD kernel
         run: bash tools/freebsd-guest.sh run 'cd /root/b3 && ./tests/blake3pp_tests'
+
+      # The fault cases of cli/faults.cmake, one case at a time, as ctest
+      # runs them on a host with the pipe instruments: the pipeline's exit
+      # codes and the digest are checked against the real FreeBSD pipe.
+      # The guest image is a plain release, so cmake is installed first.
+      # A case that cannot run here prints "skipped:" and exits 0.
+      - name: Fault cases on the FreeBSD kernel
+        run: |
+          set -euo pipefail
+          bash tools/freebsd-guest.sh run 'env ASSUME_ALWAYS_YES=yes pkg install -y cmake > /dev/null && cmake --version | head -1'
+          bash tools/freebsd-guest.sh run 'cat > /root/b3/faults.cmake' < cli/faults.cmake
+          bash tools/freebsd-guest.sh run 'set -eu
+            cd /root/b3
+            for c in short_stream empty_stream producer_dies pipefail stall read_error eintr_storm nonblock_stdin closed_stdin stdout_closed gen_reader_closed; do
+              echo "== $c"
+              cmake -DSUM=/root/b3/cli/blake3ppsum -DGEN=/root/b3/cli/blake3ppgen \
+                -DPUMP=/root/b3/bench/pipe/pump -DDRAIN=/root/b3/bench/pipe/drain \
+                -DRUX=/root/b3/bench/pipe/rux -DSHIM=/root/b3/bench/pipe/libpipe_readshim.so \
+                -DWORK=/root/fault-$c -DCASE=$c -P /root/b3/faults.cmake
+            done'
 
       # The digest is the invariant; the I/O rungs are the variable. If
       # the AIO-on-kqueue reader, the O_DIRECT path, the synchronous
