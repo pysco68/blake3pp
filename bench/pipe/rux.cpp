@@ -46,6 +46,8 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <stdlib.h>
+#include <time.h>
 #include <string>
 #include <vector>
 

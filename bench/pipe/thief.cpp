@@ -18,6 +18,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <ratio>
 
 #include <exec/static_thread_pool.hpp>
 #include <stdexec/execution.hpp>

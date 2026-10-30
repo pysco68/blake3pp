@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ratio>
 #include <string>
 #include <thread>
 #include <vector>
@@ -52,6 +53,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 #endif
 
 namespace {
