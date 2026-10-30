@@ -46,16 +46,6 @@ endforeach()
 # faults come from the pipe instruments in bench/pipe/, so these tests
 # exist where those were built, and not in a cross build.
 if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
-  # Under GCC's AddressSanitizer -- a shared runtime -- a signal storm
-  # reaches the process, with readshim's SIGUSR1 handler installed and the
-  # signal unblocked on every thread, and yet no blocking call returns
-  # EINTR, so the eintr_storm case cannot inject its fault there. The
-  # case reports that as a skip in this build instead of a failure; in
-  # every other build an uninterrupted storm still fails it.
-  set(_fault_shim_no_eintr OFF)
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_FLAGS MATCHES "-fsanitize=[^ ]*address")
-    set(_fault_shim_no_eintr ON)
-  endif()
   foreach(case short_stream empty_stream producer_dies pipefail stall read_error
       eintr_storm nonblock_stdin closed_stdin stdout_closed gen_reader_closed)
     add_test(NAME cli_fault_${case}
@@ -66,7 +56,6 @@ if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
         "-DDRAIN=$<TARGET_FILE:pipe_drain>"
         "-DRUX=$<TARGET_FILE:pipe_rux>"
         "-DSHIM=$<$<TARGET_EXISTS:pipe_readshim>:$<TARGET_FILE:pipe_readshim>>"
-        "-DSHIM_NO_EINTR=${_fault_shim_no_eintr}"
         "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/fault-${case}"
         "-DCASE=${case}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/faults.cmake")
