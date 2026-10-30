@@ -60,8 +60,12 @@ if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
         "-DCASE=${case}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/faults.cmake")
     # A case that cannot run on this platform says "skipped:" and exits 0;
-    # ctest reports that as Skipped, not Passed.
-    set_tests_properties(cli_fault_${case} PROPERTIES SKIP_REGULAR_EXPRESSION "skipped:")
+    # ctest reports that as Skipped, not Passed. The command is cmake, so
+    # ctest cannot see the tools it drives: they are named as required
+    # files, and a build that left them out reports Not Run.
+    set_tests_properties(cli_fault_${case} PROPERTIES
+      SKIP_REGULAR_EXPRESSION "skipped:"
+      REQUIRED_FILES "$<TARGET_FILE:blake3ppsum>;$<TARGET_FILE:blake3ppgen>;$<TARGET_FILE:pipe_pump>;$<TARGET_FILE:pipe_drain>;$<TARGET_FILE:pipe_rux>")
   endforeach()
 
   # The platform's bench script, smoke-run (runpipe.ps1 on Windows where
@@ -89,7 +93,8 @@ if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
               "sum=$<TARGET_FILE:blake3ppsum> -")
   endif()
   if(TEST pipe_runpipe_smoke)
-    set_tests_properties(pipe_runpipe_smoke PROPERTIES RUN_SERIAL TRUE)
+    set_tests_properties(pipe_runpipe_smoke PROPERTIES RUN_SERIAL TRUE
+      REQUIRED_FILES "$<TARGET_FILE:blake3ppsum>;$<TARGET_FILE:pipe_pump>;$<TARGET_FILE:pipe_drain>;$<TARGET_FILE:pipe_rux>")
   endif()
 endif()
 
