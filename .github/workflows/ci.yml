@@ -338,7 +338,7 @@ jobs:
           # Execution-provider alternative (beman.execution).
           - { preset: linux-clang22-cxx26-beman, image: clang22 }
           # Sanitizers: one address, one memory (against the baked
-          # msan-libc++), one thread on the other compiler family, and one
+          # msan-libc++), one thread on each compiler family, and one
           # address lane at the matrix's other optimisation level, since an
           # optimiser-dependent defect only exists under the optimiser that
           # made it.
@@ -346,6 +346,7 @@ jobs:
           - { preset: linux-clang22-cxx26-asan-release, image: clang22 }
           - { preset: linux-clang22-cxx26-msan, image: clang22 }
           - { preset: linux-gcc16-cxx26-tsan, image: gcc16 }
+          - { preset: linux-clang22-cxx26-tsan, image: clang22 }
           # The differential fuzz harness, whose ctest leg is a short pass
           # of it. Its lane is the libstdc++ C++23 one, which is what
           # libFuzzer's runtime links against.
