@@ -233,7 +233,7 @@ void closing_reader(pipebench::handle h, std::size_t buf_bytes, std::uint64_t li
   }
   pipebench::close_std_in();
   if (!mark.empty()) {
-    if (std::FILE* f = std::fopen(mark.c_str(), "wb")) {
+    if (std::FILE* f = pipebench::open_file(mark.c_str(), "wb")) {
       std::fclose(f);
     }
   }

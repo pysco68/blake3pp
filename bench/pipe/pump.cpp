@@ -167,7 +167,7 @@ int main(int argc, char** argv) {
   };
 
   if (!path.empty()) {
-    std::FILE* f = std::fopen(path.c_str(), "rb");
+    std::FILE* f = pipebench::open_file(path.c_str(), "rb");
     if (f == nullptr) {
       std::fprintf(stderr, "pump: cannot open %s\n", path.c_str());
       return 1;

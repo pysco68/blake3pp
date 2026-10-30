@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -41,6 +42,26 @@ using handle = int;
 inline handle std_in() noexcept { return STDIN_FILENO; }
 inline handle std_out() noexcept { return STDOUT_FILENO; }
 #endif
+
+// std::fopen, which the Microsoft CRT deprecates in favour of fopen_s;
+// fopen_s opens without sharing, and std::fopen is the call meant here.
+// The same pair as src/io/stdio_backend.hpp, so the tools build with
+// BLAKE3PP_WARNINGS_AS_ERRORS on every compiler.
+inline std::FILE* open_file(const char* path, const char* mode) noexcept {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+  return std::fopen(path, mode);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+}
 
 // What one read did.
 struct read_result {
