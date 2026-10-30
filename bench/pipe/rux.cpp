@@ -309,7 +309,21 @@ int main(int argc, char** argv) {
   if (out_path.empty()) {
     std::fputs(line.c_str(), stderr);
   } else {
+    // The Microsoft CRT deprecates std::fopen in favour of fopen_s, which
+    // opens without sharing; the same pair as src/io/stdio_backend.hpp.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
     std::FILE* f = std::fopen(out_path.c_str(), "wb");
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     if (f == nullptr) {
       std::fprintf(stderr, "rux: cannot write %s\n", out_path.c_str());
       return c.exit_code == 0 ? 126 : c.exit_code;
