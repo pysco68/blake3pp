@@ -80,8 +80,12 @@ if(TARGET blake3pp_parallel_backend)
 endif()
 
 # Pipe instruments and the scripts that run them; standalone, so they
-# build where the executables above do not.
-add_subdirectory(pipe)
+# build where the executables above do not. Not under Emscripten: they
+# spawn processes and use pipes, which the wasm target does not have
+# (wasm-ld reports posix_spawnp undefined in rux).
+if(NOT EMSCRIPTEN)
+  add_subdirectory(pipe)
+endif()
 
 # Smoke: the benches are shipped tools, so one tiny run each proves they
 # start, find their kernels and print. It also runs the shared tooling

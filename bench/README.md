@@ -263,9 +263,10 @@ difference at all.
 
 `bench/pipe/` measures what `blake3ppsum -` does with a stream: small
 programs that each do one job, and two scripts that run them. They link
-no blake3pp library, only CLI11, so they build wherever the compiler
-does. On Windows they build as the `pipe_*` targets even though the
-bench executables above do not link there.
+no blake3pp library, only CLI11 (and stdexec for `thief`), so they build
+wherever the compiler does. On Windows they build as the `pipe_*`
+targets even though the bench executables above do not link there. They
+are not built for Emscripten.
 
 | program | measures | platforms |
 |---|---|---|

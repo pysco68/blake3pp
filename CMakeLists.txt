@@ -465,9 +465,10 @@ endif()
 option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility" ${PROJECT_IS_TOP_LEVEL})
 # The fault tests in cli/ drive the pipe instruments in bench/pipe/. Those
 # are standalone, and bench/ adds them only when the benchmarks are on, so
-# with the benchmarks off they are added here for the tests instead.
+# with the benchmarks off they are added here for the tests instead. Not
+# under Emscripten, for the reason bench/CMakeLists.txt gives.
 if(BLAKE3PP_BUILD_TESTS AND BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT
-   AND BLAKE3PP_WITH_IO AND NOT BLAKE3PP_BUILD_BENCH)
+   AND BLAKE3PP_WITH_IO AND NOT BLAKE3PP_BUILD_BENCH AND NOT EMSCRIPTEN)
   add_subdirectory(bench/pipe bench/pipe)
 endif()
 
