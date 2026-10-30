@@ -6,12 +6,16 @@
 #   cmake -DSUM= -DGEN= -DPUMP= -DDRAIN= -DRUX= [-DSHIM=] -DWORK= -DCASE=
 #         -P faults.cmake
 #
-# The faults come from the bench instruments (bench/pipe/): pump writes an
-# exact number of bytes and then closes, dies or stalls; drain closes its
-# end under a writer; rux starts a command with a chosen SIGPIPE, a signal
-# storm, non-blocking or no stdin, and reports its exit code; readshim,
-# preloaded, makes stdin's reads fail with EIO after N bytes or makes a
-# signal interrupt them.
+# The faults come from the bench instruments (bench/pipe/):
+#   * pump writes an exact number of bytes and then closes, dies or
+#     stalls;
+#   * drain closes its end under a writer;
+#   * rux starts a command with a chosen SIGPIPE, a signal storm,
+#     non-blocking or no stdin, and reports its exit code;
+#   * readshim, a shared library preloaded through LD_PRELOAD or
+#     DYLD_INSERT_LIBRARIES, makes stdin's reads fail with EIO after N
+#     bytes or makes a signal interrupt them, and counts the interrupted
+#     reads and polls.
 #
 # The contract every case holds blake3ppsum to:
 #   * a digest printed is the digest of exactly the bytes that arrived,

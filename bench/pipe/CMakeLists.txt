@@ -21,10 +21,12 @@ endforeach()
 # read() and poll() counter and fault injector, loaded with LD_PRELOAD or
 # DYLD_INSERT_LIBRARIES. Not on
 # Windows, which has no preload mechanism (see readshim.cpp), and not
-# where the toolchain cannot make a shared object.
+# where the toolchain cannot make a shared object. SHARED, not MODULE:
+# on macOS a MODULE is an MH_BUNDLE, which DYLD_INSERT_LIBRARIES refuses
+# to load ("cannot link against bundle").
 get_property(_pipe_shared GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS)
 if(UNIX AND NOT EMSCRIPTEN AND _pipe_shared)
-  add_library(pipe_readshim MODULE readshim.cpp)
+  add_library(pipe_readshim SHARED readshim.cpp)
   target_link_libraries(pipe_readshim PRIVATE blake3pp_warnings ${CMAKE_DL_LIBS})
 endif()
 

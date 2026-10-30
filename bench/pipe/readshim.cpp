@@ -4,6 +4,9 @@
 //   LD_PRELOAD=/path/libpipe_readshim.so blake3ppsum -  < in      (Linux, FreeBSD)
 //   DYLD_INSERT_LIBRARIES=/path/libpipe_readshim.dylib blake3ppsum - < in   (macOS)
 //
+// It is a shared library: on macOS a CMake MODULE is a bundle, which
+// DYLD_INSERT_LIBRARIES refuses to load.
+//
 // At exit it prints, to stderr, the calls and bytes on standard input and
 // on all descriptors together, then the interrupted calls and the
 // injected errors:

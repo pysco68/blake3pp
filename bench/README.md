@@ -274,7 +274,7 @@ are not built for Emscripten.
 | `drain` | Consumer that discards the bytes. One blocking reader; `--threads N` for readers that always have a read posted (the never-sleeping drain); `--watch PROBE` to probe before each read by the stream reader's rule. `--close-after N` closes its stdin under the writer. Widens a Linux pipe as `update_stream` does (`--widen`). Reports bytes, reads, the pipe buffer and how the stream ended. | all; `--watch` probes are per platform |
 | `rux` | Runs one command and reports its exit code, wall clock, user and system CPU, and voluntary and involuntary context switches; exits with the command's code. `--sigpipe`, `--signal-storm`, `--nonblock-stdin`, `--close-stdin` set up a fault. | all; context switches read `na` on Windows, and `--sigpipe` and `--signal-storm` are POSIX |
 | `pipeprobe` | Re-checks the pipe facts the stream reader's comments cite: `depth` (what a pipe holds with nothing reading), `cost` (one readiness probe, clock read and busy-wait hint), `price` (whether a read costs by the range it asks for). | all |
-| `libpipe_readshim` | Preloaded read() and poll() counter. Can inject EIO after N bytes (`READSHIM_FAIL_AFTER`) or make a signal interrupt reads (`READSHIM_EINTR`). | Linux, FreeBSD, macOS; not Windows |
+| `libpipe_readshim` | Preloaded read() and poll() counter, a shared library (on Linux and FreeBSD it also takes the fortified `__read_chk` and `__poll_chk`, and `ppoll`). Can inject EIO after N bytes (`READSHIM_FAIL_AFTER`) or make a signal interrupt reads (`READSHIM_EINTR`). | Linux, FreeBSD, macOS; not Windows |
 | `thief` | Context switches an idle stdexec pool costs one busy task, per millisecond. | POSIX with stdexec |
 
 Where a tool cannot be portable, the source says why:
