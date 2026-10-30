@@ -79,6 +79,10 @@ if(TARGET blake3pp_parallel_backend)
   endif()
 endif()
 
+# Pipe instruments and the scripts that run them; standalone, so they
+# build where the executables above do not.
+add_subdirectory(pipe)
+
 # Smoke: the benches are shipped tools, so one tiny run each proves they
 # start, find their kernels and print. It also runs the shared tooling
 # (pinning, cooldown, timing) the CLI smoke tests never reach, which the

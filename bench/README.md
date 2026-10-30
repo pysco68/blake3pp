@@ -10,6 +10,11 @@ file pipeline against the device's raw read rate. Both build with
 one question and are off by default (`-DBLAKE3PP_BENCH_DISPATCH_COST=ON`;
 not built for MSVC-style compilers or Emscripten).
 
+`pipe/` holds the instruments for measuring a stream through a pipe and
+the scripts that run them; see [Pipe instruments](#pipe-instruments)
+below. They are standalone programs that build on every platform,
+Windows included.
+
 `compare/` holds the reference implementation's own bench, the blake3
 crate over rayon, in its own Cargo project: `-DBLAKE3PP_BENCH_COMPARE=ON`
 builds one binary per compile-time SIMD cap into `<build>/bench/compare/`
@@ -253,3 +258,102 @@ run-to-run noise. Per 64-byte block it is 0.1 % of the instructions and
 3–18 cycles of about 300 under GCC; under clang, zero extra
 instructions at the leaf batch, two per block, and no cycle
 difference at all.
+
+## Pipe instruments
+
+`bench/pipe/` measures what `blake3ppsum -` does with a stream: small
+programs that each do one job, and two scripts that run them. They link
+no blake3pp library, only CLI11, so they build wherever the compiler
+does. On Windows they build as the `pipe_*` targets even though the
+bench executables above do not link there.
+
+| program | measures | platforms |
+|---|---|---|
+| `pump` | Producer. Writes a generated pattern (`--gen GiB`) or a file (`--file`) in fixed `--chunk KiB` writes, optionally paced (`--gap-us`). Fault modes: `--close-after N`, `--die-after N` (SIGKILL / TerminateProcess), `--stall-ms T --after N`. | all |
+| `drain` | Consumer that discards the bytes. One blocking reader; `--threads N` for readers that always have a read posted (the never-sleeping drain); `--watch PROBE` to probe before each read by the stream reader's rule. `--close-after N` closes its stdin under the writer. Widens a Linux pipe as `update_stream` does (`--widen`). Reports bytes, reads, the pipe buffer and how the stream ended. | all; `--watch` probes are per platform |
+| `rux` | Runs one command and reports its exit code, wall clock, user and system CPU, and voluntary and involuntary context switches; exits with the command's code. `--sigpipe`, `--signal-storm`, `--nonblock-stdin`, `--close-stdin` set up a fault. | all; context switches read `na` on Windows, and `--sigpipe` and `--signal-storm` are POSIX |
+| `pipeprobe` | Re-checks the pipe facts the stream reader's comments cite: `depth` (what a pipe holds with nothing reading), `cost` (one readiness probe, clock read and busy-wait hint), `price` (whether a read costs by the range it asks for). | all |
+| `libpipe_readshim` | Preloaded read() and poll() counter. Can inject EIO after N bytes (`READSHIM_FAIL_AFTER`) or make a signal interrupt reads (`READSHIM_EINTR`). | Linux, FreeBSD, macOS; not Windows |
+| `thief` | Context switches an idle stdexec pool costs one busy task, per millisecond. | POSIX with stdexec |
+
+Where a tool cannot be portable, the source says why:
+
+- Windows has no per-process context-switch counter that outlives the
+  process, so `rux` reports `na` there.
+- Windows has no preload mechanism short of a code-rewriting hook, so
+  `readshim` is not built there.
+- `readshim` cannot see reads that the C library's stdio makes through
+  an internal symbol (glibc and Darwin both do this), nor a statically
+  linked program's reads.
+- Windows has no signals, so `rux --signal-storm` and `--sigpipe` are
+  POSIX only.
+- `thief` reads its context switches through `getrusage`, which Windows
+  does not have, and it measures stdexec's pool, so it is built on POSIX
+  with the stdexec provider only.
+
+### Running a measurement
+
+`runpipe.sh` (POSIX `sh`: Linux, macOS, FreeBSD) and `runpipe.ps1`
+(Windows) run one producer into several consumers:
+
+    sh bench/pipe/runpipe.sh -t <dir with the tools> -r 6 \
+       -p 'pump --gen 2 --chunk 4' base='blake3ppsum -' t2='blake3ppsum --threads 2 -'
+
+    powershell -ExecutionPolicy Bypass -File bench\pipe\runpipe.ps1 -ToolDir <dir> `
+       -Producer 'pump.exe --gen 2 --chunk 4' "base=blake3ppsum.exe -"
+
+Each side of every pipeline runs under `rux`, so both exit codes and
+both processes' CPU are recorded whatever the shell does with a
+pipeline's status. A run prints the producer's exact command, the
+reference digest, the drain ceiling and the stream's length. It then
+prints one row per round in run order, then per-arm medians. It stops
+with a non-zero exit at the first round that:
+
+- has a side that exited non-zero or produced no report;
+- printed a digest other than the reference, which is taken once before
+  the rotation;
+- was more than 1.5 times faster than the drain ceiling: the best of four
+  drain configurations over the same producer, each run twice. A round
+  faster than the ceiling but within that margin is printed with a
+  warning.
+
+The arm order reverses every round. The Windows script runs each
+pipeline through `cmd.exe`, whose anonymous pipe is the one a Windows
+user's `x | blake3ppsum -` meets. A PowerShell pipeline between native
+programs passes the bytes through PowerShell instead, and WSL's or Git
+Bash's pipes are different pipes. `runpipe.sh` passes `shellcheck`
+0.11.0 at `--severity=style` with the default checks; the
+`koalaman/shellcheck-alpine:v0.11.0` image runs it from stdin:
+
+    docker run --rm -i koalaman/shellcheck-alpine:v0.11.0 \
+       shellcheck --shell=sh --severity=style - < bench/pipe/runpipe.sh
+
+ctest runs the platform's script once (`pipe_runpipe_smoke`):
+`runpipe.ps1` on Windows where PowerShell is found, `runpipe.sh`
+elsewhere. The fault tests in
+`cli/faults.cmake` (`cli_fault_*`) use the same tools to hold
+`blake3ppsum` and `blake3ppgen` to their behaviour in a broken pipeline.
+
+### Rules for a stream measurement
+
+1. **Name the producer as its exact command.** Two producers of the same
+   bytes give the same consumer different figures. On one machine at one
+   commit, `cat FILE` from the page cache fed `blake3ppsum -` at 7026
+   MiB/s and `head -c 2G /dev/zero | cat` at 1952. At 4 KiB writes, `dd`
+   reading a file put it at 0.84x `b3sum` and `dd` reading `/dev/zero`
+   at 2.1x, so the producer can turn a loss into a win.
+2. **Report the producer's CPU and the two-process total**, never the
+   consumer's alone. A consumer change can move cost into the producer:
+   a reader that sleeps makes every write a wake-up.
+3. **Counterbalance**: run the arms on one machine, alternating, with
+   the order reversed every round, and report every round in run order
+   so drift is visible.
+4. **Check every figure against a drain ceiling.** A harness whose
+   command failed at once has reported 2 GiB in 0.013 s, 155 000 MiB/s.
+   The drain must read the same pipe as the consumer, so it widens a
+   Linux pipe to 1 MiB, as `update_stream` does; a drain on the default
+   64 KiB pipe is no ceiling for a `blake3ppsum` that widened it. On
+   Windows the drain's ask must match the producer's write, because a
+   read is priced by the range it asks for.
+
+Result files do not go in the repository.

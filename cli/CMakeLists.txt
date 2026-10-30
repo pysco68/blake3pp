@@ -39,6 +39,37 @@ foreach(case version engines empty_stdin stdin_parallel stdin_diag check_roundtr
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()
 
+# The bench scripts (bench/pipe/), smoke-run where their tools were built.
+if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
+  # The platform's bench script, smoke-run (runpipe.ps1 on Windows where
+  # PowerShell is found, runpipe.sh elsewhere): one short validated
+  # rotation through blake3ppsum, which exercises every check the script
+  # makes -- both exit codes, the digest against the reference, the drain
+  # ceiling. Serial, because a drain ceiling measured while other tests
+  # load the machine is no ceiling.
+  set(_pipe_dir "${PROJECT_SOURCE_DIR}/bench/pipe")
+  if(WIN32)
+    find_program(BLAKE3PP_POWERSHELL NAMES powershell pwsh)
+    if(BLAKE3PP_POWERSHELL)
+      add_test(NAME pipe_runpipe_smoke
+        COMMAND ${BLAKE3PP_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
+                -File "${_pipe_dir}/runpipe.ps1"
+                -ToolDir "$<TARGET_FILE_DIR:pipe_pump>" -Rounds 2 -Shape smoke
+                -Producer "$<TARGET_FILE:pipe_pump> --gen 0.0625 --chunk 64"
+                "sum=$<TARGET_FILE:blake3ppsum> -")
+    endif()
+  else()
+    add_test(NAME pipe_runpipe_smoke
+      COMMAND sh "${_pipe_dir}/runpipe.sh"
+              -t "$<TARGET_FILE_DIR:pipe_pump>" -r 2 -s smoke
+              -p "$<TARGET_FILE:pipe_pump> --gen 0.0625 --chunk 64"
+              "sum=$<TARGET_FILE:blake3ppsum> -")
+  endif()
+  if(TEST pipe_runpipe_smoke)
+    set_tests_properties(pipe_runpipe_smoke PROPERTIES RUN_SERIAL TRUE)
+  endif()
+endif()
+
 # The sized parallel scheduler is one definition per program; the tools
 # take it when the build offers one (see the root CMakeLists).
 if(TARGET blake3pp_parallel_backend)
