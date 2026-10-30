@@ -14,7 +14,10 @@
 //   readshim: fd0 reads=<n> bytes=<n> | all reads=<n> bytes=<n> | eintr=<n> poll_eintr=<n> injected_eio=<n>
 //
 // It counts calls to the C library's read() made through the dynamic
-// linker. What that does not see, by platform:
+// linker, and the EINTRs that read() and poll() return. On Linux and
+// FreeBSD it also takes the fortified __read_chk() and __poll_chk() and
+// ppoll(); on macOS it interposes read() and poll(). What that does not
+// see, by platform:
 //
 //   * Windows: nothing to load it into. There is no preload mechanism
 //     short of a Detours-style hook that rewrites the target's import
@@ -38,9 +41,9 @@
 //                         unblock SIGUSR1, so a signal that arrives during
 //                         a blocking read makes it fail with EINTR. Send
 //                         the signals with `rux --signal-storm`. The
-//                         report counts the EINTRs read() and poll()
-//                         actually returned -- a reader that waits in
-//                         poll() before it reads takes them there.
+//                         report counts the EINTRs the read and poll
+//                         calls returned; a reader that waits in poll()
+//                         before it reads takes them there.
 //   READSHIM_FAIL_AFTER=N once N bytes have been read from standard
 //                         input, every further read of it fails with EIO.
 //                         The read that crosses N is shortened to end at
@@ -53,8 +56,10 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 
 #include <poll.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -164,11 +169,11 @@ __attribute__((used)) static const struct {
 
 #else
 
-// The preloaded definition of read(); the real one is the next in the
-// lookup order.
-extern "C" ssize_t read(int fd, void* buf, size_t n) {
-  using read_fn = ssize_t (*)(int, void*, size_t);
-  static const read_fn real = reinterpret_cast<read_fn>(dlsym(RTLD_NEXT, "read"));
+// The body every read entry point runs: the injected error or the
+// shortened ask, the call through `real` (which takes the ask), and the
+// count.
+template <typename Real>
+ssize_t shim_read_body(int fd, size_t n, Real real) {
   bool fail = false;
   const size_t ask = before_read(fd, n, fail);
   if (fail && n > 0) {
@@ -176,17 +181,53 @@ extern "C" ssize_t read(int fd, void* buf, size_t n) {
     errno = EIO;
     return -1;
   }
-  const ssize_t r = real(fd, buf, ask);
+  const ssize_t r = real(ask);
   count(fd, r);
   return r;
+}
+
+// The body every poll entry point runs.
+template <typename Real>
+int shim_poll_body(Real real) {
+  const int r = real();
+  if (r < 0 && errno == EINTR) poll_eintrs.fetch_add(1, std::memory_order_relaxed);
+  return r;
+}
+
+// Each entry point below is the preloaded definition; the real one is
+// the next in the lookup order. With _FORTIFY_SOURCE a read() or poll()
+// whose buffer size the compiler knows is emitted as __read_chk() or
+// __poll_chk(), and ppoll() is its own call, so all of them are
+// interposed. Without this a fortified build's calls bypass the shim
+// and an interrupt storm reports zero interruptions.
+extern "C" ssize_t read(int fd, void* buf, size_t n) {
+  using read_fn = ssize_t (*)(int, void*, size_t);
+  static const read_fn real = reinterpret_cast<read_fn>(dlsym(RTLD_NEXT, "read"));
+  return shim_read_body(fd, n, [&](size_t ask) { return real(fd, buf, ask); });
+}
+
+extern "C" ssize_t __read_chk(int fd, void* buf, size_t n, size_t buflen) {
+  using read_fn = ssize_t (*)(int, void*, size_t, size_t);
+  static const read_fn real = reinterpret_cast<read_fn>(dlsym(RTLD_NEXT, "__read_chk"));
+  return shim_read_body(fd, n, [&](size_t ask) { return real(fd, buf, ask, buflen); });
 }
 
 extern "C" int poll(pollfd* fds, nfds_t n, int timeout) {
   using poll_fn = int (*)(pollfd*, nfds_t, int);
   static const poll_fn real = reinterpret_cast<poll_fn>(dlsym(RTLD_NEXT, "poll"));
-  const int r = real(fds, n, timeout);
-  if (r < 0 && errno == EINTR) poll_eintrs.fetch_add(1, std::memory_order_relaxed);
-  return r;
+  return shim_poll_body([&] { return real(fds, n, timeout); });
+}
+
+extern "C" int __poll_chk(pollfd* fds, nfds_t n, int timeout, size_t fdslen) {
+  using poll_fn = int (*)(pollfd*, nfds_t, int, size_t);
+  static const poll_fn real = reinterpret_cast<poll_fn>(dlsym(RTLD_NEXT, "__poll_chk"));
+  return shim_poll_body([&] { return real(fds, n, timeout, fdslen); });
+}
+
+extern "C" int ppoll(pollfd* fds, nfds_t n, const timespec* ts, const sigset_t* mask) {
+  using ppoll_fn = int (*)(pollfd*, nfds_t, const timespec*, const sigset_t*);
+  static const ppoll_fn real = reinterpret_cast<ppoll_fn>(dlsym(RTLD_NEXT, "ppoll"));
+  return shim_poll_body([&] { return real(fds, n, ts, mask); });
 }
 
 #endif

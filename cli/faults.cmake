@@ -262,7 +262,9 @@ elseif(CASE STREQUAL "eintr_storm")
     if(NOT got STREQUAL want)
       message(FATAL_ERROR "--threads ${t}: digest ${got} under a signal storm, expected ${want}")
     endif()
-    # Proof the fault happened: interrupted calls, in read() or poll().
+    # Proof the fault happened: interrupted calls, counted by readshim in
+    # read() and in poll() (with their fortified forms and ppoll() on
+    # Linux and FreeBSD).
     string(REGEX MATCH "fd0 reads=[1-9][0-9]*[^\n]*eintr=([0-9]+) poll_eintr=([0-9]+)" _ "${err}")
     if(NOT CMAKE_MATCH_COUNT EQUAL 2)
       message(FATAL_ERROR "--threads ${t}: no readshim report from blake3ppsum: ${err}")
@@ -270,13 +272,6 @@ elseif(CASE STREQUAL "eintr_storm")
     math(EXPR interrupted "${CMAKE_MATCH_1}+${CMAKE_MATCH_2}")
     message(STATUS "--threads ${t}: ${interrupted} interrupted calls, all retried")
     if(interrupted EQUAL 0)
-      if(SHIM_NO_EINTR)
-        # See cli/CMakeLists.txt: the fault cannot be injected in this
-        # build. The digest above was still checked.
-        message(STATUS "skipped: no blocking call returns EINTR under this "
-                       "build's sanitizer runtime, so the storm tested nothing")
-        return()
-      endif()
       message(FATAL_ERROR "--threads ${t}: no call was interrupted, so nothing was tested: ${err}")
     endif()
   endforeach()
