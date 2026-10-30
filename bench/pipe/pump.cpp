@@ -27,11 +27,16 @@
 //                     Windows. The bytes already written stay in the pipe.
 //   --stall-ms T --after N
 //                     after N bytes, pause T ms once, then carry on
+//   --wait-for PATH --after N
+//                     after N bytes, wait until PATH exists, then carry on.
+//                     A handshake with another process (drain --mark),
+//                     for a test whose ordering must not rest on a delay.
 // A write is split where a threshold falls inside it.
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,6 +70,7 @@ int main(int argc, char** argv) {
   std::int64_t gap_us = 0;
   std::uint64_t close_after = 0, die_after = 0, stall_after = 0;
   std::int64_t stall_ms = 0;
+  std::string wait_for;
 
   CLI::App app{"pump: write a generated or file-backed stream to stdout in fixed-size writes"};
   auto* gen = app.add_option("--gen", gib, "GiB to generate in memory");
@@ -79,7 +85,10 @@ int main(int argc, char** argv) {
   close_opt->excludes(die_opt);
   auto* stall_opt = app.add_option("--stall-ms", stall_ms, "pause this long once, after --after bytes")
                         ->check(CLI::NonNegativeNumber);
-  app.add_option("--after", stall_after, "where --stall-ms pauses, in bytes")->needs(stall_opt);
+  auto* wait_opt = app.add_option("--wait-for", wait_for, "after --after bytes, wait until this file exists");
+  auto* after_opt = app.add_option("--after", stall_after, "where --stall-ms or --wait-for pauses, in bytes");
+  stall_opt->needs(after_opt);
+  wait_opt->needs(after_opt);
   CLI11_PARSE(app, argc, argv);
   if (gen->count() == 0 && file->count() == 0) {
     std::fprintf(stderr, "pump: one of --gen or --file is required\n");
@@ -97,7 +106,20 @@ int main(int argc, char** argv) {
   std::uint64_t writes = 0;
 
   std::uint64_t written = 0;
-  bool stalled = stall_ms == 0;
+  bool stalled = stall_ms == 0 && wait_for.empty();
+  // The pause at --after: a fixed delay, a wait for a file, or both.
+  auto pause_here = [&] {
+    if (stall_ms > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
+    }
+    if (!wait_for.empty()) {
+      std::error_code ec;
+      while (!std::filesystem::exists(wait_for, ec)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    stalled = true;
+  };
   const bool closing = close_opt->count() > 0;
   const bool dying = die_opt->count() > 0;
 
@@ -129,10 +151,7 @@ int main(int argc, char** argv) {
       if (closing) cut_at(close_after);
       if (dying) cut_at(die_after);
       if (!stalled) cut_at(stall_after);
-      if (!stalled && written >= stall_after) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
-        stalled = true;
-      }
+      if (!stalled && written >= stall_after) pause_here();
       if (closing && written >= close_after) return -1;  // done, cleanly
       if (dying && written >= die_after) pipebench::die();
       const std::size_t take = static_cast<std::size_t>(limit);
@@ -141,10 +160,7 @@ int main(int argc, char** argv) {
       n -= take;
       written += take;
     }
-    if (!stalled && written >= stall_after) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(stall_ms));
-      stalled = true;
-    }
+    if (!stalled && written >= stall_after) pause_here();
     if (closing && written >= close_after) return -1;
     if (dying && written >= die_after) pipebench::die();
     return 0;

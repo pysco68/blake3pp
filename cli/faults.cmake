@@ -55,6 +55,14 @@ if(CMAKE_HOST_APPLE)
 else()
   set(PRELOAD_VAR LD_PRELOAD)
 endif()
+# A preloaded readshim comes before the sanitizer runtime in the library
+# list. GCC's AddressSanitizer is a shared runtime that refuses to start
+# unless it is first; clang's links into the binary and does not check.
+# The order is required: readshim forwards each call to the next
+# definition, which is the sanitizer's own interceptor. The check is
+# switched off for the preloaded commands, keeping whatever else the lane
+# set.
+set(SHIM_ASAN "ASAN_OPTIONS=$ENV{ASAN_OPTIONS}:verify_asan_link_order=0")
 
 # What a process that did not exit 0 looks like in RESULTS_VARIABLE: a
 # number, or a description such as "Child killed".
@@ -194,7 +202,8 @@ elseif(CASE STREQUAL "pipefail")
   expect_success("the pipefail pipeline with a clean producer" "${r}")
 
 elseif(CASE STREQUAL "stall")
-  # A producer that pauses mid-stream: waited for, nothing lost.
+  # A producer that pauses mid-stream: waited for, nothing lost. The
+  # pause is input; the assertion is the digest, which no timing moves.
   reference(want ${N})
   foreach(t IN LISTS MODES)
     execute_process(
@@ -218,7 +227,7 @@ elseif(CASE STREQUAL "read_error")
   foreach(t IN LISTS MODES)
     execute_process(
       COMMAND "${PUMP}" ${GEN_ARGS} --close-after ${N}
-      COMMAND "${CMAKE_COMMAND}" -E env READSHIM_FAIL_AFTER=1000003 "${PRELOAD_VAR}=${SHIM}"
+      COMMAND "${CMAKE_COMMAND}" -E env READSHIM_FAIL_AFTER=1000003 "${SHIM_ASAN}" "${PRELOAD_VAR}=${SHIM}"
               "${SUM}" --threads ${t} -
       OUTPUT_VARIABLE out ERROR_VARIABLE err RESULTS_VARIABLE codes)
     list(GET codes 1 sc)
@@ -244,7 +253,7 @@ elseif(CASE STREQUAL "eintr_storm")
   foreach(t IN LISTS MODES)
     execute_process(
       COMMAND "${PUMP}" ${GEN_ARGS} --close-after ${want_bytes} --gap-us 200
-      COMMAND "${CMAKE_COMMAND}" -E env READSHIM_EINTR=1 "${PRELOAD_VAR}=${SHIM}"
+      COMMAND "${CMAKE_COMMAND}" -E env READSHIM_EINTR=1 "${SHIM_ASAN}" "${PRELOAD_VAR}=${SHIM}"
               "${RUX}" --signal-storm 300 -- "${SUM}" --threads ${t} -
       OUTPUT_VARIABLE out ERROR_VARIABLE err RESULTS_VARIABLE codes)
     list(GET codes 1 sc)
@@ -261,6 +270,13 @@ elseif(CASE STREQUAL "eintr_storm")
     math(EXPR interrupted "${CMAKE_MATCH_1}+${CMAKE_MATCH_2}")
     message(STATUS "--threads ${t}: ${interrupted} interrupted calls, all retried")
     if(interrupted EQUAL 0)
+      if(SHIM_NO_EINTR)
+        # See cli/CMakeLists.txt: the fault cannot be injected in this
+        # build. The digest above was still checked.
+        message(STATUS "skipped: no blocking call returns EINTR under this "
+                       "build's sanitizer runtime, so the storm tested nothing")
+        return()
+      endif()
       message(FATAL_ERROR "--threads ${t}: no call was interrupted, so nothing was tested: ${err}")
     endif()
   endforeach()
@@ -318,10 +334,16 @@ elseif(CASE STREQUAL "stdout_closed")
     if(NOT v STREQUAL "native")
       set(sig --sigpipe ${v})
     endif()
+    # The ordering is a handshake, not a delay: drain closes its end and
+    # then marks it, and pump holds the rest of the stream until the mark
+    # exists, so blake3ppsum cannot reach its digest before its reader
+    # is gone.
+    set(mark "${WORK}/closed-${v}")
+    file(REMOVE "${mark}")
     execute_process(
-      COMMAND "${PUMP}" ${GEN_ARGS} --close-after ${N} --stall-ms 400 --after 1048576
+      COMMAND "${PUMP}" ${GEN_ARGS} --close-after ${N} --after 1048576 --wait-for "${mark}"
       COMMAND "${RUX}" ${sig} -- "${SUM}" -
-      COMMAND "${DRAIN}" --close-after 0
+      COMMAND "${DRAIN}" --close-after 0 --mark "${mark}"
       ERROR_VARIABLE err RESULTS_VARIABLE codes)
     list(GET codes 1 sc)
     expect_failure("blake3ppsum writing into a closed pipe (SIGPIPE ${v})" "${sc}")

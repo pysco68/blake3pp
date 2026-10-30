@@ -1891,6 +1891,17 @@ class counting_source {
     // What the source throws instead of transferring, for the result
     // encoding below. Empty transfers normally.
     std::error_code fail_with{};
+    // While set, a lane that takes a transfer waits inside the source
+    // before doing it. A test holds the lanes this way when what it
+    // asserts depends on which transfers a lane has taken; the hold above
+    // would only make the ordering likely.
+    std::atomic<bool> gated{false};
+    // When set, a transfer does not finish until a second lane has entered
+    // the source (most >= 2), or until ten seconds pass, which sets
+    // rendezvous_timed_out. Overlap is then a handshake; the hold above
+    // only makes it likely.
+    bool rendezvous = false;
+    std::atomic<bool> rendezvous_timed_out{false};
   };
   static inline shared* live = nullptr;
 
@@ -1919,6 +1930,19 @@ class counting_source {
     if (std::this_thread::get_id() != s.poller) {
       s.performed_off_the_poller.store(true);
     }
+    while (s.gated.load()) {
+      std::this_thread::yield();
+    }
+    if (s.rendezvous) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (s.most.load() < 2) {
+        if (std::chrono::steady_clock::now() > deadline) {
+          s.rendezvous_timed_out.store(true);
+          break;
+        }
+        std::this_thread::yield();
+      }
+    }
     std::this_thread::sleep_for(s.hold);
     for (std::size_t i = 0; i < buf.size(); ++i) {
       buf[i] = static_cast<std::byte>((off + i) & 0xff);
@@ -1940,15 +1964,18 @@ struct lane_run {
   int completed = 0;
   std::thread::id poller{};
   bool every_callback_on_the_polling_thread = true;
+  bool rendezvous_timed_out = false;
 };
 
 template <bool Positional>
 lane_run<Positional> run_counting(unsigned depth, int n,
-                                  std::size_t bytes = 4096) {
+                                  std::size_t bytes = 4096,
+                                  bool rendezvous = false) {
   using source = counting_source<Positional>;
   using context = io_impl::sync_context<source>;
   typename source::shared shared;
   shared.poller = std::this_thread::get_id();
+  shared.rendezvous = rendezvous;
   source::live = &shared;
 
   context ctx({}, depth);
@@ -1987,6 +2014,7 @@ lane_run<Positional> run_counting(unsigned depth, int n,
   out.lane_wait_ns = ctx.lane_wait_ns();
   out.device_depth = ctx.device_depth();
   out.most_concurrent = shared.most.load();
+  out.rendezvous_timed_out = shared.rendezvous_timed_out.load();
   // The transfer did not happen on the thread that called poll().
   CHECK(shared.performed_off_the_poller.load());
   source::live = nullptr;
@@ -1994,9 +2022,12 @@ lane_run<Positional> run_counting(unsigned depth, int n,
 }
 
 TEST_CASE("a positional synchronous source serves several transfers at once") {
-  const lane_run<true> r = run_counting<true>(/*depth=*/8, /*n=*/12);
+  // Every transfer waits for a second lane to be inside the source, so
+  // reaching two is a handshake: the run either overlaps or times out.
+  const lane_run<true> r = run_counting<true>(/*depth=*/8, /*n=*/12, 4096, /*rendezvous=*/true);
   CHECK(r.completed == 12);
   CHECK(r.every_callback_on_the_polling_thread);
+  CHECK_FALSE(r.rendezvous_timed_out);
   // Four lanes is the ceiling, and more than one transfer was inside the
   // source at once.
   CHECK(r.most_concurrent > 1);
@@ -2255,7 +2286,13 @@ TEST_CASE("a cancel reaches a transfer no lane has taken yet") {
   using source = counting_source<true>;
   using context = io_impl::sync_context<source>;
   source::shared shared;
-  shared.hold = std::chrono::milliseconds(20);
+  // The lanes are held inside the source until the cancels are in, so
+  // at most eight of the ten transfers can have been taken when they
+  // arrive and at least two are still waiting. A 20 ms hold made that
+  // likely; on a loaded machine a lane could finish and take the tail
+  // before the cancels ran.
+  shared.hold = std::chrono::milliseconds(0);
+  shared.gated = true;
   shared.poller = std::this_thread::get_id();
   source::live = &shared;
 
@@ -2286,6 +2323,7 @@ TEST_CASE("a cancel reaches a transfer no lane has taken yet") {
     for (auto& op : ops) {
       ctx.cancel(op);
     }
+    shared.gated = false;
     while (t.done < static_cast<int>(ops.size())) {
       ctx.poll(true);
     }
@@ -2294,7 +2332,9 @@ TEST_CASE("a cancel reaches a transfer no lane has taken yet") {
     // and the ones a lane already had ran to completion, which the
     // contract's advisory cancel allows.
     CHECK(t.done == static_cast<int>(ops.size()));
-    CHECK(t.cancelled > 0);
+    // Eight lanes, ten transfers: the two no lane could take were
+    // cancelled before any lane came back for them.
+    CHECK(t.cancelled >= 2);
   }
   source::live = nullptr;
 }

@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -77,10 +78,34 @@ class one_thread_pool {
   // driver to fail underneath it.
   explicit one_thread_pool(std::chrono::milliseconds delay = {})
       : delay_(delay), worker_([this] { run(); }) {}
+
+  // Gated: the worker takes no node until release(), however many are
+  // posted. A test releases it on an event, such as the driver parking
+  // with no free window, so an ordering it asserts holds by construction.
+  // A sleep would make the ordering likely only.
+  void hold() {
+    const std::lock_guard lock(m_);
+    held_ = true;
+  }
+  void release() {
+    {
+      const std::lock_guard lock(m_);
+      held_ = false;
+    }
+    cv_.notify_all();
+  }
+
+  // Runs once, on the worker, before the first node: a hook for an
+  // action that has to come from another thread while work is in hand.
+  void before_first_node(std::function<void()> f) {
+    const std::lock_guard lock(m_);
+    first_ = std::move(f);
+  }
   ~one_thread_pool() {
     {
       const std::lock_guard lock(m_);
       stop_ = true;
+      held_ = false;  // a gate left closed must not strand a posted node
     }
     cv_.notify_all();
     worker_.join();
@@ -139,12 +164,13 @@ class one_thread_pool {
 
  private:
   void run() {
+    std::function<void()> first;
     for (;;) {
       run_node* n = nullptr;
       {
         std::unique_lock lock(m_);
-        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
-        if (queue_.empty()) {
+        cv_.wait(lock, [this] { return stop_ || (!held_ && !queue_.empty()); });
+        if (held_ || queue_.empty()) {
           if (stop_) {
             return;
           }
@@ -152,6 +178,12 @@ class one_thread_pool {
         }
         n = queue_.front();
         queue_.erase(queue_.begin());
+        first = std::move(first_);
+        first_ = nullptr;
+      }
+      if (first) {
+        first();
+        first = nullptr;
       }
       if (delay_.count() > 0) {
         std::this_thread::sleep_for(delay_);
@@ -164,6 +196,8 @@ class one_thread_pool {
   std::condition_variable cv_;
   std::vector<run_node*> queue_;
   bool stop_ = false;
+  bool held_ = false;
+  std::function<void()> first_;
   std::chrono::milliseconds delay_;
   std::thread worker_;
 };

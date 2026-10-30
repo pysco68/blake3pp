@@ -1,8 +1,9 @@
 // drain: a consumer for a pipe that does nothing with the bytes, so what
 // it measures is the pipe and the producer.
 //
-//   drain [--buf <KiB>] [--threads <N>]
-//   drain [--buf <KiB>] --watch <probe> [--budget <us>] [--interval <ns>]
+//   drain [--buf <KiB>] [--widen <KiB>] [--threads <N>]
+//   drain [--buf <KiB>] [--widen <KiB>] --watch <probe> [--budget <us>] [--interval <ns>]
+//   drain [--buf <KiB>] [--widen <KiB>] --close-after <N> [--mark <path>]
 //
 // The summary goes to stderr, one line:
 //   drain: bytes=<n> in <s> s = <MiB/s> MiB/s | reads=<n> bytes_per_read=<n> [| probes=<n> caught=<n> slept=<n>] | pipe=<n> | end=<how>
@@ -35,10 +36,12 @@
 // from a blake3ppsum that does, and is no ceiling for it. The summary's
 // `pipe=` is the buffer in force, or `na` where it cannot be asked.
 //
-// --close-after N reads N bytes, closes standard input and exits 0,
-// leaving the writer with a pipe that has no reader: the broken pipe on
-// the writer's output side (EPIPE or SIGPIPE on POSIX, ERROR_NO_DATA on
-// Windows). N = 0 closes before reading anything.
+// --close-after N reads N bytes, closes standard input and exits 0. The
+// writer is left with a pipe that has no reader, which it meets as a
+// broken pipe: EPIPE or SIGPIPE on POSIX, ERROR_NO_DATA on Windows.
+// N = 0 closes before reading anything. --mark PATH creates PATH once the
+// end is closed, so another process can wait for that (pump --wait-for)
+// instead of for a delay.
 //
 // The summary's `end=` says how the stream ended: `eof` for a zero-byte
 // read, `code-<n>` with the platform's code for a read that failed, or
@@ -214,7 +217,8 @@ void plain_reader(pipebench::handle h, std::size_t buf_bytes, tally& t) {
 
 // Reads exactly `limit` bytes (fewer if the stream ends first), then
 // closes standard input under the writer.
-void closing_reader(pipebench::handle h, std::size_t buf_bytes, std::uint64_t limit, tally& t) {
+void closing_reader(pipebench::handle h, std::size_t buf_bytes, std::uint64_t limit,
+                    const std::string& mark, tally& t) {
   std::vector<unsigned char> buf(buf_bytes, 1);
   while (t.bytes < limit) {
     const std::uint64_t left = limit - t.bytes;
@@ -228,6 +232,11 @@ void closing_reader(pipebench::handle h, std::size_t buf_bytes, std::uint64_t li
     ++t.reads;
   }
   pipebench::close_std_in();
+  if (!mark.empty()) {
+    if (std::FILE* f = std::fopen(mark.c_str(), "wb")) {
+      std::fclose(f);
+    }
+  }
 }
 
 // One reader with the watch in front of each read.
@@ -299,6 +308,7 @@ int main(int argc, char** argv) {
   std::int64_t interval_ns = 1000;
   std::uint64_t close_after = 0;
   std::size_t widen_kib = 1024;
+  std::string mark;
 
   CLI::App app{"drain: read stdin to the end and report what the reads did"};
   app.add_option("--buf", buf_kib, "bytes asked for per read, in KiB")
@@ -322,6 +332,8 @@ int main(int argc, char** argv) {
   auto* close_opt = app.add_option("--close-after", close_after,
                                    "read this many bytes, then close stdin under the writer and exit 0");
   close_opt->excludes(thr)->excludes(wat);
+  app.add_option("--mark", mark, "with --close-after: create this file once stdin is closed")
+      ->needs(close_opt);
   CLI11_PARSE(app, argc, argv);
 
   prober probe;
@@ -345,7 +357,7 @@ int main(int argc, char** argv) {
   std::vector<tally> tallies(threads);
   const auto start = clock_type::now();
   if (close_opt->count() > 0) {
-    closing_reader(in, buf_bytes, close_after, tallies[0]);
+    closing_reader(in, buf_bytes, close_after, mark, tallies[0]);
   } else if (!watch.empty()) {
     watching_reader(in, buf_bytes, probe, budget_us * 1000, interval_ns, tallies[0]);
   } else if (threads == 1) {
