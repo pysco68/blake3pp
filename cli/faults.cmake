@@ -283,8 +283,9 @@ elseif(CASE STREQUAL "eintr_storm")
 
 elseif(CASE STREQUAL "nonblock_stdin")
   # stdin handed over non-blocking. POSIX: every EAGAIN is waited out and
-  # the digest is unchanged. Windows (PIPE_NOWAIT): either that, or no
-  # digest and a non-zero exit -- never a digest of a partial stream.
+  # the digest is unchanged. Windows (PIPE_NOWAIT): the reader waits out
+  # ERROR_NO_DATA the same way; the case also accepts no digest and a
+  # non-zero exit, and never a digest of a partial stream.
   set(GEN_ARGS --gen 1 --chunk 4)
   set(want_bytes 4194307)
   reference(want ${want_bytes})
