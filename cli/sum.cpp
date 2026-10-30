@@ -146,6 +146,12 @@ struct result {
   std::string error;
 };
 
+#if defined(_MSC_VER)
+// The engine's members carry an alignment, so MSVC pads the class and says
+// so at its closing brace (C4324). The padding is intended.
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 class engine {
  public:
   explicit engine(const options& o) : opts_(o), pool_(o.threads) {
@@ -385,6 +391,9 @@ class engine {
   double wall_ns_ = 0.0;
   bool pipelined_ = false;
 };
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 // --diag: what the run that just happened was limited by, from the
 // counters it kept. One line of reading, four of figures, and, where the
