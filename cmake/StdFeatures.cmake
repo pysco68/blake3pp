@@ -214,74 +214,14 @@ macro(_blake3pp_fetch_stdexec)
     include(FetchContent)
     FetchContent_Declare(stdexec
       GIT_REPOSITORY https://github.com/NVIDIA/stdexec.git
-      GIT_TAG 6d7ad689f4d4831c5136e4abe1c601f9a3b64e43 # nvhpc-26.05
+      GIT_TAG 792e1342f8c983e205d899f840038d6d57fc9bd1 # main, 2026-10-14
       SOURCE_SUBDIR include
       BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/stdexec-build")
     hfc_FetchContent_MakeAvailable_interlocked(stdexec)
-    # Two patches to stdexec, each of which says why:
-    #   * stdexec-xorshift-zero-seed.patch, every build: a pool worker whose
-    #     random seed comes out 0 spins for ever and the tasks queued to it
-    #     never run.
-    #   * stdexec-bwos-counter-width.patch, builds with 32-bit pointers only:
-    #     where std::size_t has 32 bits, the work-stealing queue loses tasks
-    #     and the pool hangs.
-    # They are applied to one copy in the build tree, because the source
-    # cache is shared with other build trees and other checkouts.
-    set(_blake3pp_stdexec_copy "${CMAKE_BINARY_DIR}/_deps/stdexec-patched")
-    set(_blake3pp_stdexec_include "${_blake3pp_stdexec_copy}/include")
-    set(_blake3pp_stdexec_patches
-      "${PROJECT_SOURCE_DIR}/cmake/patches/stdexec-xorshift-zero-seed.patch")
-    set(_blake3pp_stdexec_patched_headers include/exec/detail/xorshift.hpp)
-    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
-      list(APPEND _blake3pp_stdexec_patches
-        "${PROJECT_SOURCE_DIR}/cmake/patches/stdexec-bwos-counter-width.patch")
-      list(APPEND _blake3pp_stdexec_patched_headers
-        include/exec/detail/bwos_lifo_queue.hpp)
-    endif()
-    # Redone only when a patch, a header a patch changes or the source
-    # directory changes: a fresh copy on every configure would rebuild
-    # everything that includes stdexec. The header hashes cover a source
-    # directory that is edited in place, such as one set by
-    # FETCHCONTENT_SOURCE_DIR_STDEXEC.
-    set(_blake3pp_stamp "${stdexec_SOURCE_DIR}")
-    foreach(_blake3pp_patch IN LISTS _blake3pp_stdexec_patches)
-      file(SHA256 "${_blake3pp_patch}" _blake3pp_hash)
-      string(APPEND _blake3pp_stamp " ${_blake3pp_hash}")
-    endforeach()
-    foreach(_blake3pp_header IN LISTS _blake3pp_stdexec_patched_headers)
-      file(SHA256 "${stdexec_SOURCE_DIR}/${_blake3pp_header}" _blake3pp_hash)
-      string(APPEND _blake3pp_stamp " ${_blake3pp_hash}")
-    endforeach()
-    set(_blake3pp_stamp_old "")
-    if(EXISTS "${_blake3pp_stdexec_copy}/.patched")
-      file(READ "${_blake3pp_stdexec_copy}/.patched" _blake3pp_stamp_old)
-    endif()
-    if(NOT _blake3pp_stamp_old STREQUAL _blake3pp_stamp)
-      file(REMOVE_RECURSE "${_blake3pp_stdexec_copy}")
-      file(COPY "${stdexec_SOURCE_DIR}/include"
-        DESTINATION "${_blake3pp_stdexec_copy}")
-      find_package(Git REQUIRED)
-      foreach(_blake3pp_patch IN LISTS _blake3pp_stdexec_patches)
-        # The ceiling stops git from finding the repository around the
-        # build tree, which would resolve the patch's paths from its root.
-        execute_process(
-          COMMAND "${CMAKE_COMMAND}" -E env
-            "GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps"
-            "${GIT_EXECUTABLE}" apply -p1 "${_blake3pp_patch}"
-          WORKING_DIRECTORY "${_blake3pp_stdexec_copy}"
-          RESULT_VARIABLE _blake3pp_patch_rc
-          ERROR_VARIABLE _blake3pp_patch_err)
-        if(NOT _blake3pp_patch_rc EQUAL 0)
-          message(FATAL_ERROR "blake3pp: ${_blake3pp_patch} does not "
-            "apply to ${stdexec_SOURCE_DIR}: ${_blake3pp_patch_err}")
-        endif()
-      endforeach()
-      file(WRITE "${_blake3pp_stdexec_copy}/.patched" "${_blake3pp_stamp}")
-    endif()
     find_package(Threads REQUIRED)
     add_library(blake3pp_stdexec INTERFACE)
     target_include_directories(blake3pp_stdexec SYSTEM INTERFACE
-      "${_blake3pp_stdexec_include}")
+      "${stdexec_SOURCE_DIR}/include")
     target_link_libraries(blake3pp_stdexec INTERFACE Threads::Threads)
   endif()
 endmacro()
