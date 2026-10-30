@@ -165,10 +165,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # Opt-in: a warning in blake3pp's own code fails the build. Set on the
-# plain Linux presets, so a new warning stops the lane that introduced it
-# instead of being printed and unread. It applies to blake3pp_warnings
-# only, never to fetched dependencies, which still carry warnings of
-# their own on some lanes.
+# plain Linux presets (linux-gcc16-cxx26 and linux-clang22-cxx26, see
+# tools/gen-toolchains.py), so a new warning stops the lane that
+# introduced it. It applies to blake3pp_warnings and to the externally
+# compiled kernels only, never to fetched dependencies, which carry
+# warnings of their own on some lanes.
 option(BLAKE3PP_WARNINGS_AS_ERRORS
   "Treat warnings in blake3pp's own targets as errors" OFF)
 if(BLAKE3PP_WARNINGS_AS_ERRORS)
