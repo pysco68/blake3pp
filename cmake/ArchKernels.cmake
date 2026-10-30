@@ -279,12 +279,22 @@ function(blake3pp_add_kernel ns)
       if(NOT _ak_xsimd_inc OR NOT EXISTS "${_ak_xsimd_inc}")
         message(FATAL_ERROR "external kernel ${ns}: FORCE_XSIMD but no xsimd headers found (populate xsimd first)")
       endif()
+      # xsimd is third-party: its headers take -isystem so the project's
+      # warning set, which the external compile carries, does not apply to
+      # them.
       list(APPEND _ak_defs "-DBLAKE3PP_HAS_XSIMD=1" "-DBLAKE3PP_FORCE_XSIMD=1"
-           "-I${_ak_xsimd_inc}")
+           "-isystem" "${_ak_xsimd_inc}")
+    endif()
+    # The warning set the primary compiler gets, spelled for GCC, which is
+    # the compiler that builds this object. The clang-only checks of
+    # blake3pp_warnings are left out: GCC does not know them.
+    set(_ak_warn -Wall -Wextra -Wconversion -Wshadow -Wsign-conversion)
+    if(BLAKE3PP_WARNINGS_AS_ERRORS)
+      list(APPEND _ak_warn -Werror)
     endif()
     add_custom_command(OUTPUT "${_ak_obj}"
       COMMAND "${AK_EXTERNAL_COMPILER}" -std=c++23 -O3 -fPIC
-              -fno-exceptions -fno-rtti -fno-stack-protector
+              -fno-exceptions -fno-rtti -fno-stack-protector ${_ak_warn}
               ${AK_ARCH_FLAGS} ${_ak_defs} "-DBLAKE3PP_ARCH_NS=${ns}"
               "-I${PROJECT_SOURCE_DIR}/src" "-I${PROJECT_SOURCE_DIR}/include"
               -c "${_ak_src}" -o "${_ak_obj}"
