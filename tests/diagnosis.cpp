@@ -156,6 +156,68 @@ TEST_CASE("a default-constructed diagnosis has no reading to give") {
   CHECK(empty.label == blake3pp::bottleneck::undecided);
 }
 
+TEST_CASE("a pool between the bands is undecided between hash and the arena or device") {
+  // The pool at 85% is past the idle band and short of saturation. The
+  // device's queue share is 50%, under the idle band, and its mean
+  // service of 31 ms is well above the 10 ms minimum, so it did queue
+  // but neither end is decided. The second candidate is the arena when
+  // the arena is the depth, and the device otherwise.
+  const auto d = counters(64, 0.85, 0.50, 10'000'000);
+  const auto narrow = blake3pp::diagnose_read(d, wall_ns, threads, depth, window);
+  REQUIRE(narrow.long_enough());
+  CHECK(narrow.label == blake3pp::bottleneck::undecided);
+  CHECK(narrow.first == blake3pp::bottleneck::hash);
+  CHECK(narrow.second == blake3pp::bottleneck::arena);
+
+  const auto wide = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(wide.long_enough());
+  CHECK(wide.label == blake3pp::bottleneck::undecided);
+  CHECK(wide.first == blake3pp::bottleneck::hash);
+  CHECK(wide.second == blake3pp::bottleneck::device);
+}
+
+TEST_CASE("a device between the bands is undecided between device and the arena or hash") {
+  // The device at 85% of its queue, the pool idle: the device is the
+  // first candidate, and the second is whichever the arena leaves.
+  const auto d = counters(64, 0.10, 0.85, 10'000'000);
+  const auto narrow = blake3pp::diagnose_read(d, wall_ns, threads, depth, window);
+  REQUIRE(narrow.long_enough());
+  CHECK(narrow.label == blake3pp::bottleneck::undecided);
+  CHECK(narrow.first == blake3pp::bottleneck::device);
+  CHECK(narrow.second == blake3pp::bottleneck::arena);
+
+  const auto wide = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(wide.long_enough());
+  CHECK(wide.label == blake3pp::bottleneck::undecided);
+  CHECK(wide.first == blake3pp::bottleneck::device);
+  CHECK(wide.second == blake3pp::bottleneck::hash);
+}
+
+TEST_CASE("a queued device between the bands with a wide arena is undecided device or hash") {
+  // Neither share reaches its band, the arena is wider than the queue,
+  // and the device did queue: the final branch of diagnose_read().
+  const auto d = counters(64, 0.10, 0.60, 10'000'000);
+  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  REQUIRE(r.long_enough());
+  CHECK_FALSE(r.arena_is_depth);
+  CHECK_FALSE(r.device_unqueued);
+  CHECK(r.label == blake3pp::bottleneck::undecided);
+  CHECK(r.first == blake3pp::bottleneck::device);
+  CHECK(r.second == blake3pp::bottleneck::hash);
+}
+
+TEST_CASE("a write run whose fill and device shares tie is undecided between generator and device") {
+  // Fill share 2 x 0.30 = 0.60 of the windows in flight, device share
+  // 0.60: within the tie band of each other, and the device's queue
+  // share 0.60 is below saturation.
+  const auto d = counters(64, 0.30, 0.60, 10'000'000);
+  const auto r = blake3pp::diagnose_write(d, wall_ns, threads, window);
+  REQUIRE(r.long_enough());
+  CHECK(r.label == blake3pp::bottleneck::undecided);
+  CHECK(r.first == blake3pp::bottleneck::generator);
+  CHECK(r.second == blake3pp::bottleneck::device);
+}
+
 TEST_CASE("the write side names the generator and the device") {
   // Writing, the windows in flight are the generator's parallelism as
   // well as the device's queue, so the reading is which of the two held
