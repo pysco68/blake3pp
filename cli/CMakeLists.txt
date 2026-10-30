@@ -39,8 +39,31 @@ foreach(case version engines empty_stdin stdin_parallel stdin_diag check_roundtr
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()
 
-# The bench scripts (bench/pipe/), smoke-run where their tools were built.
+# Fault tests: blake3ppsum and blake3ppgen in pipelines whose producer
+# closes early, dies or stalls, whose reader goes away, whose stdin is
+# non-blocking, closed or failing, and whose reads are interrupted by
+# signals. faults.cmake states the contract they hold the tools to. The
+# faults come from the pipe instruments in bench/pipe/, so these tests
+# exist where those were built, and not in a cross build.
 if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
+  foreach(case short_stream empty_stream producer_dies pipefail stall read_error
+      eintr_storm nonblock_stdin closed_stdin stdout_closed gen_reader_closed)
+    add_test(NAME cli_fault_${case}
+      COMMAND ${CMAKE_COMMAND}
+        "-DSUM=$<TARGET_FILE:blake3ppsum>"
+        "-DGEN=$<TARGET_FILE:blake3ppgen>"
+        "-DPUMP=$<TARGET_FILE:pipe_pump>"
+        "-DDRAIN=$<TARGET_FILE:pipe_drain>"
+        "-DRUX=$<TARGET_FILE:pipe_rux>"
+        "-DSHIM=$<$<TARGET_EXISTS:pipe_readshim>:$<TARGET_FILE:pipe_readshim>>"
+        "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/fault-${case}"
+        "-DCASE=${case}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/faults.cmake")
+    # A case that cannot run on this platform says "skipped:" and exits 0;
+    # ctest reports that as Skipped, not Passed.
+    set_tests_properties(cli_fault_${case} PROPERTIES SKIP_REGULAR_EXPRESSION "skipped:")
+  endforeach()
+
   # The platform's bench script, smoke-run (runpipe.ps1 on Windows where
   # PowerShell is found, runpipe.sh elsewhere): one short validated
   # rotation through blake3ppsum, which exercises every check the script

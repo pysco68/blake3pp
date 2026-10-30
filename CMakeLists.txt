@@ -463,6 +463,14 @@ if(BLAKE3PP_BUILD_WEB AND EMSCRIPTEN)
 endif()
 
 option(BLAKE3PP_BUILD_CLI "Build the blake3ppsum utility" ${PROJECT_IS_TOP_LEVEL})
+# The fault tests in cli/ drive the pipe instruments in bench/pipe/. Those
+# are standalone, and bench/ adds them only when the benchmarks are on, so
+# with the benchmarks off they are added here for the tests instead.
+if(BLAKE3PP_BUILD_TESTS AND BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT
+   AND BLAKE3PP_WITH_IO AND NOT BLAKE3PP_BUILD_BENCH)
+  add_subdirectory(bench/pipe bench/pipe)
+endif()
+
 # Both tools are file tools (hash_file, the direct-I/O writer): without
 # the I/O layer there is nothing for them to be.
 if(BLAKE3PP_BUILD_CLI AND BLAKE3PP_HAS_FORMAT AND BLAKE3PP_WITH_IO)
