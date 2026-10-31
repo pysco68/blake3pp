@@ -246,7 +246,7 @@ elseif(_blake3pp_execution_provider STREQUAL "beman")
   # (2026-09-12), which is what makes this provider stand alone.
   FetchContent_Declare(beman_execution
     GIT_REPOSITORY https://github.com/bemanproject/execution.git
-    GIT_TAG 8e358c01f4f4435e06b0691de433f4b2a07367be) # main, 2026-09-22
+    GIT_TAG 08284799e0a09c7aeb4af5ccd37fc82aea598dbe) # main, 2026-10-11
   set(_blake3pp_beman_extension [=[
       set(BEMAN_USE_MODULES OFF CACHE BOOL "" FORCE)
       # beman gates its (large, occasionally non-compiling) test suite on
