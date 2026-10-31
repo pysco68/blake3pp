@@ -136,6 +136,13 @@ elseif(CASE STREQUAL "trace_inputs")
       message(FATAL_ERROR "the trace had no room for the run's windows: ${err}")
     endif()
   endforeach()
+  # The driver event carries the device's depth, the lanes' queueing and
+  # the backend that read.
+  file(READ "${WORK}/t1.json" json)
+  if(NOT json MATCHES "\"device_depth\":[0-9]+" OR NOT json MATCHES "\"lane_wait_ns\":[0-9]+"
+     OR NOT json MATCHES "\"read_backend\":\"[^\"]+\"")
+    message(FATAL_ERROR "the driver event lacks the device and backend fields")
+  endif()
 
 elseif(CASE STREQUAL "check_roundtrip")
   file(WRITE "${WORK}/f" "hello blake3pp")

@@ -78,12 +78,14 @@ inline bool write_chrome_trace(const std::string& path,
         "\"device_wait_ns\":{},\"starved_ns\":{},"
         "\"queue_depth_final\":{},"
         "\"queue_depth_peak\":{},\"agent_busy_ns\":{},"
-        "\"device_wait_min_ns\":{}}}}}",
+        "\"device_wait_min_ns\":{},\"device_depth\":{},"
+        "\"lane_wait_ns\":{},\"read_backend\":\"{}\"}}}}",
         us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
         d.polls, d.blocking_polls, d.wakes, d.queue_runs, d.admission_stalls,
         d.max_pending, d.transfers_landed, d.transfer_bytes,
         d.device_wait_ns, d.starved_ns, d.queue_depth_final,
-        d.queue_depth_peak, d.agent_busy_ns, d.device_wait_min_ns);
+        d.queue_depth_peak, d.agent_busy_ns, d.device_wait_min_ns,
+        d.device_depth, d.lane_wait_ns, blake3pp::read_backend(d));
   }
   std::map<std::uint32_t, bool> slots_named;
   for (const auto& w : trace.windows()) {
