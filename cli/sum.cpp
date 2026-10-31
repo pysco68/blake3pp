@@ -582,7 +582,7 @@ int run_main(int argc, char** argv) {
 
   app.add_option("--threads", o.threads, "compute threads (1 = sequential; default: all)")
       ->check(b3tool::at_least_one_thread)
-      ->capture_default_str();
+      ->default_str(b3tool::threads_default_str());
 
   app.add_option("--window", o.io.window_bytes, "I/O window size in MiB")
       ->transform(b3tool::mib_to_bytes)

@@ -22,6 +22,7 @@ not here.
 | `objscan.py` | Look inside a built object or binary: instruction classes, code-generation quality, and the kernel audit. |
 | `kernel-audit.json` | The rules `objscan.py audit` enforces. |
 | `include-audit.py` | Cross-build `clang-include-cleaner` pass: additions from the union, removals only from the intersection. |
+| `gen-help-docs.py` | Write the `--help` transcripts in `docs/tools.md` from the `help_docs` target's builds (`--bin-dir <build>/cli`); `--check` reports a stale transcript and writes nothing. |
 | `bench-charts.py` | Render the documentation's charts (`docs/img/*.svg`) from `docs/data/charts.json`; `--extract <report>` pulls the rows out of a bench report, `--check` reports a chart the data file has outgrown. |
 
 ## objscan.py

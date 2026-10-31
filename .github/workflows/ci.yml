@@ -428,6 +428,15 @@ jobs:
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
+      # The --help transcripts in docs/tools.md come from the *_help_docs
+      # targets, which print placeholders for everything machine- or
+      # build-dependent, so one lane checks them for every machine.
+      - name: Build the --help documentation targets
+        if: matrix.preset == 'linux-gcc16-cxx26'
+        run: cmake --build build/${{ matrix.preset }} --target help_docs
+      - name: Check docs/tools.md against them (fix with tools/gen-help-docs.py)
+        if: matrix.preset == 'linux-gcc16-cxx26'
+        run: python3 tools/gen-help-docs.py --bin-dir build/${{ matrix.preset }}/cli --check
       - name: Upload coverage report
         if: contains(matrix.preset, 'coverage')
         uses: actions/upload-artifact@v7

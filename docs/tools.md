@@ -8,10 +8,11 @@ only (`BLAKE3PP_BUILD_CLI`).
 reproducible test data at the speed of your disk. Both are built on the
 library documented here, so they are also worked examples of it.
 
-The help below is what the tools print, with three placeholders for the
-parts that depend on the build or the machine:
+The help below is what the tools print. `tools/gen-help-docs.py` writes
+it from documentation builds of the tools, and CI checks that it is
+current. Two parts depend on the build or the machine and are shown as
+placeholders:
 
-- the variants a build carries;
 - the core count a thread default picks up;
 - the async I/O engines a build carries. `--no-async` names them from
   `blake3pp::compiled_io_engines()`: `io_uring` on Linux, `ioring/iocp`
@@ -26,6 +27,7 @@ See [the API reference](api.md) for the introspection calls behind it.
 Plain, keyed and derive_key hashing, extended output, and `--check` to
 verify checksum lines it printed earlier.
 
+<!-- generated: blake3ppsum_help_docs --help -->
 ```
 Print or check BLAKE3 checksums.
 With no FILE, or FILE of '-', read standard input.
@@ -48,7 +50,7 @@ OPTIONS:
                               key-derivation mode with this context string
           --length UINT:UINT in [1 - 1048576] [32]
                               output length in bytes (extended output)
-          --arch ENUM:value in {auto, scalar, every variant this build carries} [auto]
+          --arch ENUM:value in {auto, avx512, avx2, sse42, sve2_512, sve512, sve2_256, sve256, sve2_128, neon, sve128, rvv512_zvbb, rvv512, rvv256_zvbb, rvv256, rvv128_zvbb, rvv128, xthead, vsx, vxe, msa, lasx, lsx, simd128, scalar} [auto]
                               pin a SIMD variant
           --threads UINT:THREADS [<cores>]
                               compute threads (1 = sequential; default: all)
@@ -59,8 +61,7 @@ OPTIONS:
           --no-async          read synchronously (no <this build's async engines> queue)
           --inline-submit     issue reads inline in the submitting thread, not on io_uring's
                               workers
-          --no-ioring         Windows: read through the completion port instead of the I/O
-                              ring
+          --no-ioring         Windows: read through the completion port instead of the I/O ring
           --trace TEXT        record per-window timing and write it as Chrome trace JSON to
                               PATH (open in ui.perfetto.dev)
           --trace-agents Needs: --trace
@@ -69,6 +70,7 @@ OPTIONS:
                               device, or the window arena between them); one FILE or '-', on
                               the pipelined path
 ```
+<!-- /generated -->
 
 ```bash
 blake3ppsum big.iso                          # multi-core, direct-I/O
@@ -83,6 +85,7 @@ output. One seed always yields the same stream, and `--seek` is O(1), so
 materializing a slice at offset 10 GB costs what a slice at offset 0
 costs.
 
+<!-- generated: blake3ppgen_help_docs --help -->
 ```
 Deterministic seekable byte stream from BLAKE3 extended output.
 The same seed always yields the same stream; --seek is O(1).
@@ -115,8 +118,8 @@ OPTIONS:
                               with --output: issue writes inline in the submitting thread, not
                               on io_uring's workers
           --no-ioring Needs: --output
-                              with --output, Windows: write through the completion port
-                              instead of the I/O ring
+                              with --output, Windows: write through the completion port instead
+                              of the I/O ring
           --waive-zero-fill Needs: --output
                               with --output, Windows: set the valid data length up front
                               instead of writing a sparse file (needs the volume-maintenance
@@ -142,6 +145,7 @@ OPTIONS:
           --threads UINT:THREADS [<cores>]
                               generator threads (1 = sequential; default: all)
 ```
+<!-- /generated -->
 
 ```bash
 blake3ppgen --seed run42 --length 1G > testdata.bin

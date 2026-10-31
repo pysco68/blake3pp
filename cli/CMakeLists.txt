@@ -18,6 +18,29 @@ target_link_libraries(blake3ppgen PRIVATE
   blake3pp::tool_allocator
   blake3pp::node_program)
 
+# The same two sources, built so that --help prints the placeholders
+# docs/tools.md uses in place of what depends on the machine or the build
+# (the core count, the async engines). tools/gen-help-docs.py runs
+# them to write and check the transcripts there. Not built by default and
+# not installed.
+foreach(_tool IN ITEMS sum gen)
+  add_executable(blake3pp${_tool}_help_docs EXCLUDE_FROM_ALL ${_tool}.cpp)
+  target_compile_definitions(blake3pp${_tool}_help_docs PRIVATE
+    BLAKE3PP_HELP_DOCS=1)
+  target_link_libraries(blake3pp${_tool}_help_docs PRIVATE
+    blake3pp::blake3pp
+    blake3pp_warnings
+    blake3pp::tooling
+    blake3pp::tool_allocator
+    blake3pp::node_program)
+  if(TARGET blake3pp_parallel_backend)
+    target_link_libraries(blake3pp${_tool}_help_docs PRIVATE
+      blake3pp::parallel_backend)
+  endif()
+endforeach()
+add_custom_target(help_docs
+  DEPENDS blake3ppsum_help_docs blake3ppgen_help_docs)
+
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell). They cover known answers, --check round
 # trips with corruption detection, the key forms, the stream and --diag
