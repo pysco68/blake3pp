@@ -135,12 +135,13 @@ OPTIONS:
                               report on stderr which side limited the run (the generator or the
                               device); needs --output and --length on the pipelined path
           --window UINT Needs: --output
-                              with --output: write buffer size in MiB (default: 4 MiB per
-                              generator thread, so every fill fans out fully)
+                              with --output: write buffer size in MiB (default: 8 MiB with
+                              --threads 1; otherwise 4 MiB with --length, or without it 4 MiB
+                              per generator thread up to 64 MiB)
           --qd UINT Needs: --output
                               with --output: write buffers in flight (default: one per
-                              generator thread, or 2 with --threads 1; the writer clamps it to
-                              its range)
+                              generator thread with --length and more than one thread,
+                              otherwise 2; the writer clamps it to its range)
   -v,     --verbose           report the engaged write backend on stderr
           --threads UINT:THREADS [<cores>]
                               generator threads (1 = sequential; default: all)
