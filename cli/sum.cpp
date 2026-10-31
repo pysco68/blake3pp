@@ -32,6 +32,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/stat.h>
+
 #include <CLI/CLI.hpp>
 #include <blake3pp/blake3pp.hpp>
 
@@ -46,6 +48,29 @@ using b3tool::println;
 using b3tool::undiagnosable;
 using b3tool::reading_label;
 using b3tool::service_label;
+
+// Trace windows allotted to an input whose size is not known up front: a
+// pipe on standard input, and each checksum list under --check, whose
+// files are named only as it is read. 64 GiB at the default window;
+// records past it are counted as dropped.
+constexpr std::size_t unsized_trace_windows = 16384;
+
+// The size of standard input if it is a regular file (a redirect), or
+// nothing for a pipe, a terminal or a device.
+std::optional<std::uint64_t> stdin_file_size() noexcept {
+#if defined(_WIN32)
+  struct _stat64 st {};
+  if (::_fstat64(0, &st) != 0 || (st.st_mode & _S_IFMT) != _S_IFREG) {
+    return std::nullopt;
+  }
+#else
+  struct stat st {};
+  if (::fstat(0, &st) != 0 || !S_ISREG(st.st_mode)) {
+    return std::nullopt;
+  }
+#endif
+  return static_cast<std::uint64_t>(st.st_size);
+}
 
 struct options {
   blake3pp::hash_file_options io;
@@ -628,11 +653,10 @@ int run_main(int argc, char** argv) {
 
   int failures = 0;
   try {
-    // Trace storage is sized from the FILE arguments up front: one record
-    // per window of each, with a spare for the short first window, and a
-    // size the filesystem will not give counts as two windows. Standard
-    // input therefore gets two records, and with --check the list files
-    // are sized rather than the files they name; records past the storage
+    // Trace storage is sized up front: one record per window of each
+    // input, with a spare for the short first window. Standard input
+    // redirected from a file is sized by fstat; a pipe, and every list
+    // under --check, gets unsized_trace_windows. Records past the storage
     // are counted as dropped. The buffer outlives the engine, whose
     // operations record into it.
     std::vector<blake3pp::window_record> window_records;
@@ -646,15 +670,32 @@ int run_main(int argc, char** argv) {
       trace.emplace(std::span<blake3pp::window_record>{});
       o.io.trace = &*trace;
     }
+    if (o.files.empty()) {
+      o.files.emplace_back("-");
+    }
     if (!o.trace_path.empty()) {
       const std::size_t window =
           blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
       std::size_t windows = 0;
       for (const auto& f : o.files) {
-        std::error_code ec;
-        const std::uintmax_t size =
-            f == "-" ? 0 : std::filesystem::file_size(f, ec);
-        windows += ec ? 2 : static_cast<std::size_t>(size / window) + 2;
+        std::optional<std::uint64_t> size;
+        if (o.check) {
+          // The list's files are named only as it is read.
+        } else if (f == "-") {
+          size = stdin_file_size();
+        } else {
+          // A FIFO or device named on the command line has no size;
+          // a path that is not there reads nothing.
+          std::error_code ec;
+          const std::uintmax_t n = std::filesystem::file_size(f, ec);
+          if (!ec) {
+            size = n;
+          } else if (!std::filesystem::exists(f, ec)) {
+            size = 0;
+          }
+        }
+        windows += size ? static_cast<std::size_t>(*size / window) + 2
+                        : unsized_trace_windows;
       }
       window_records.resize(windows);
       if (o.trace_agents) {
@@ -664,9 +705,29 @@ int run_main(int argc, char** argv) {
       o.io.trace = &*trace;
     }
     engine eng(o);
-    if (o.files.empty()) {
-      o.files.emplace_back("-");
-    }
+
+    // Written on every way out of the run, --check included.
+    const auto write_trace = [&] {
+      if (trace && !o.trace_path.empty()) {
+        if (b3tool::write_chrome_trace(o.trace_path, *trace, "blake3ppsum",
+                                       o.threads)) {
+          println(stderr,
+                  "blake3ppsum: trace: {} window records{}{}, JSON to {}",
+                  trace->windows().size(),
+                  o.trace_agents
+                      ? std::format(" and {} agent records",
+                                    trace->agents().size())
+                      : std::string{},
+                  trace->dropped_windows() > 0
+                      ? std::format(" ({} dropped)", trace->dropped_windows())
+                      : std::string{},
+                  o.trace_path);
+        } else {
+          println(stderr, "blake3ppsum: could not write {}", o.trace_path);
+          failures++;
+        }
+      }
+    };
 
     if (o.check) {
       for (const auto& f : o.files) {
@@ -685,6 +746,7 @@ int run_main(int argc, char** argv) {
       if (failures > 0) {
         println(stderr, "blake3ppsum: WARNING: {} computed checksum(s) did NOT match", failures);
       }
+      write_trace();
       return failures == 0 ? 0 : b3tool::exit_failure;
     }
 
@@ -743,25 +805,7 @@ int run_main(int argc, char** argv) {
         }
       }
     }
-    if (trace && !o.trace_path.empty()) {
-      if (b3tool::write_chrome_trace(o.trace_path, *trace, "blake3ppsum",
-                                     o.threads)) {
-        println(stderr,
-                "blake3ppsum: trace: {} window records{}{}, JSON to {}",
-                trace->windows().size(),
-                o.trace_agents
-                    ? std::format(" and {} agent records",
-                                  trace->agents().size())
-                    : std::string{},
-                trace->dropped_windows() > 0
-                    ? std::format(" ({} dropped)", trace->dropped_windows())
-                    : std::string{},
-                o.trace_path);
-      } else {
-        println(stderr, "blake3ppsum: could not write {}", o.trace_path);
-        failures++;
-      }
-    }
+    write_trace();
   } catch (const std::exception& e) {
     println(stderr, "blake3ppsum: {}", e.what());
     return b3tool::exit_usage;

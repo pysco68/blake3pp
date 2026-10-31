@@ -115,6 +115,28 @@ elseif(CASE STREQUAL "stdin_diag")
     message(FATAL_ERROR "--diag --check was accepted")
   endif()
 
+elseif(CASE STREQUAL "trace_inputs")
+  # Trace storage is sized before the run, so an input whose size is not
+  # a FILE argument must still get room for its windows: standard input
+  # with no FILE given, and the files a --check list names.
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed trace --length 20000000
+    --threads ${SMOKE_THREADS}
+    OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
+  run_sum(sums res0 ARGS stream)
+  file(WRITE "${WORK}/sums" "${sums}")
+  run_sum(out res1 ERR_VAR err1 ARGS --trace t1.json --window 1
+    STDIN "${WORK}/stream")
+  run_sum(out res2 ERR_VAR err2 ARGS --trace t2.json --window 1 --check sums)
+  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0)
+    message(FATAL_ERROR "a traced run failed (rc=${res1}, ${res2}): ${err1} ${err2}")
+  endif()
+  foreach(err IN ITEMS "${err1}" "${err2}")
+    if(NOT err MATCHES "trace: ([0-9]+) window records" OR CMAKE_MATCH_1 LESS 19
+       OR err MATCHES "dropped")
+      message(FATAL_ERROR "the trace had no room for the run's windows: ${err}")
+    endif()
+  endforeach()
+
 elseif(CASE STREQUAL "check_roundtrip")
   file(WRITE "${WORK}/f" "hello blake3pp")
   run_sum(sums res ARGS f)

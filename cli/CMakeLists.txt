@@ -46,8 +46,8 @@ add_custom_target(help_docs
 # trips with corruption detection, the key forms, the stream and --diag
 # paths, the generator's determinism, seek and --output, and the usage
 # errors (see smoketest.cmake).
-foreach(case version engines empty_stdin stdin_parallel stdin_diag check_roundtrip
-    check_batched length_prefix
+foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
+    check_roundtrip check_batched length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
     gen_output gen_seed_file sum_errors key_forms gen_errors)
   add_test(NAME cli_${case}
