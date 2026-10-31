@@ -293,10 +293,10 @@ TEST_CASE("parallel fill matches the sequential output stream") {
 
   // A segment request below one block is rounded up to a block.
   auto seq = h.finalize_xof();
-  std::vector<std::byte> expected(1000);
+  std::array<std::byte, 1000> expected{};
   seq.fill(expected);
   auto par = h.finalize_xof();
-  std::vector<std::byte> got(1000);
+  std::array<std::byte, 1000> got{};
   blake3pp::fill(par, got, sched, 7);
   CHECK(got == expected);
 }
