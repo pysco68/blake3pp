@@ -12,7 +12,6 @@
 #include <ios>
 #include <optional>
 #include <ostream>
-#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -54,6 +53,7 @@
 // the tests below ask the selected context what rung it engaged and
 // hold the public list to the answer.
 #include "io/backend_select.hpp"
+#include "temp_names.hpp"
 
 namespace {
 
@@ -70,9 +70,8 @@ std::vector<std::byte> make_input(std::size_t len) {
 struct temp_file {
   fs::path path;
   explicit temp_file(const std::vector<std::byte>& content) {
-    static const unsigned run_id = std::random_device{}();
     path = fs::temp_directory_path() /
-           ("blake3pp_io_test_" + std::to_string(run_id) + "_" +
+           ("blake3pp_io_test_" + b3test::process_salt() + "_" +
             std::to_string(counter++));
     // ostream::write wants char, so the bytes are converted rather than
     // reinterpreted: one transform and one bulk write.

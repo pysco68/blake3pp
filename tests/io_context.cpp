@@ -25,7 +25,6 @@
 #include <memory>
 #include <optional>
 #include <ostream>
-#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -38,6 +37,7 @@
 #include <blake3pp/detail/file_reader.hpp>
 #include <doctest/doctest.h>
 
+#include "temp_names.hpp"
 #include "io/backend.hpp"
 #include "io/engine.hpp"
 #include "io/stdio_backend.hpp"
@@ -78,9 +78,8 @@ std::vector<std::byte> pattern(std::size_t len, std::uint32_t seed) {
 struct temp_file {
   fs::path path;
   explicit temp_file(const std::vector<std::byte>& content) {
-    static const unsigned run_id = std::random_device{}();
     path = fs::temp_directory_path() /
-           ("blake3pp_ctx_test_" + std::to_string(run_id) + "_" +
+           ("blake3pp_ctx_test_" + b3test::process_salt() + "_" +
             std::to_string(counter++));
     std::string chars(content.size(), '\0');
     std::ranges::transform(content, chars.begin(),
