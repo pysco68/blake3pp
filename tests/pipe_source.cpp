@@ -1135,6 +1135,17 @@ TEST_CASE("EINTR during a blocking read or watch is retried without losing bytes
   MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
   return;
 #endif
+#if defined(__FreeBSD__) && defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+  // ThreadSanitizer deadlocks itself on FreeBSD under this signal storm:
+  // a SIGUSR1 taken while the runtime holds its slot lock (here inside an
+  // intercepted pthread_mutex_unlock) goes through libthr's own wrapper,
+  // whose intercepted memcpy re-enters the runtime and waits on that same
+  // lock. Nothing of blake3pp's is on either stack.
+  MESSAGE("skipped: ThreadSanitizer deadlocks on FreeBSD under a signal storm");
+  return;
+#endif
+#endif
   // The producer writes in small pieces with the reader asleep or
   // watching between them, and a second thread sends SIGUSR1 to the
   // reading thread throughout. Every interrupted call must be retried:
