@@ -64,7 +64,13 @@ class stdio_source {
 #pragma warning(push)
 #pragma warning(disable : 4996)
 #endif
-    stream_.reset(std::fopen(path.string().c_str(), how.write ? "wb" : "rb"));
+    // The path's native form: on Windows the narrow one is the ANSI code
+    // page's, which cannot name every file.
+#if defined(_WIN32)
+    stream_.reset(::_wfopen(path.c_str(), how.write ? L"wb" : L"rb"));
+#else
+    stream_.reset(std::fopen(path.c_str(), how.write ? "wb" : "rb"));
+#endif
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #elif defined(_MSC_VER)

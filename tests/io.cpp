@@ -1418,6 +1418,44 @@ void roundtrip_engines(std::string_view tag) {
   CHECK(out == content);
 }
 
+// A name no single-byte code page holds. On Windows the narrow form of
+// such a path is not the file's name, so the stdio rung has to open the
+// wide form; elsewhere the name is its UTF-8 bytes.
+TEST_CASE("the stdio rung opens a path outside the ANSI code page") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  const auto content = make_input(100 * 1024 + 3);
+  const fs::path path =
+      fs::temp_directory_path() /
+      (fs::path(u8"blake3pp_\u043f\u0443\u0442\u044c_\u65e5\u672c_") +=
+       b3test::process_salt());
+  {
+    io_impl::polled_writer_engine<io_impl::stdio_context> w(
+        path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
+    std::size_t pos = 0;
+    while (pos < content.size()) {
+      const auto b = w.acquire();
+      const std::size_t n = std::min(b.capacity, content.size() - pos);
+      std::memcpy(b.data, content.data() + pos, n);
+      w.submit(b, n);
+      pos += n;
+    }
+    w.finish();
+  }
+  REQUIRE(fs::file_size(path) == content.size());
+  std::vector<std::byte> out;
+  {
+    io_impl::polled_reader_engine<io_impl::stdio_context> r(
+        path, {.window_bytes = 64 * 1024, .queue_depth = 2});
+    while (auto win = r.next()) {
+      out.insert(out.end(), win->data, win->data + win->bytes);
+      r.release(*win);
+    }
+  }
+  std::error_code ec;
+  fs::remove(path, ec);
+  CHECK(out == content);
+}
+
 // The engines are templates over the backend concepts, so the backends
 // the selector ignores on this platform still get concept-checked (the
 // definition-site static_asserts in their headers fire on #include) and
