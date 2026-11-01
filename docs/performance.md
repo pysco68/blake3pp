@@ -714,7 +714,7 @@ asking io_uring for the hand-off restores it. The sweep run on the same
 machine reads 41.1 GiB/s best with the hand-off and 22.2 without.
 
 The 8 MiB x qd 4 defaults were tuned on low-latency NVMe and also measure
-23-25% slow on GCP pd-class volumes, where 32 MiB x qd 16 recovers it. The
+25% slow on a GCP pd-class volume, where 32 MiB x qd 16 recovers it. The
 measured sweet spot on every device so far is a queue depth of four to
 eight; the ceiling is 256 windows in flight, each of `window_bytes`, and
 `BLAKE3PP_MAX_QUEUE_DEPTH` moves it.

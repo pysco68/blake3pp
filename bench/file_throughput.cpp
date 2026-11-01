@@ -31,7 +31,7 @@
 //
 // --io-sweep exists because the right window/qd is a property of the
 // DEVICE (bandwidth x latency), not the CPU: the 8 MiB x qd4 defaults,
-// tuned on low-latency NVMe, measure 23-25% slow on GCP pd-class volumes,
+// tuned on low-latency NVMe, measure 25% slow on a GCP pd-class volume,
 // where 32x16 recovers it. The sweep settles it per machine.
 
 #include <algorithm>
