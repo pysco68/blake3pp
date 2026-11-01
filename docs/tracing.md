@@ -395,7 +395,7 @@ $ blake3pp_bench_file blake3pp_bench_file.dat --reps 1 --cooldown 0 \
       --trace file.json --trace-agents
 file: blake3pp_bench_file.dat (1024.0 MiB), backend: io_uring+direct, window 8 MiB, qd 4
 trace: 129 window records and 2064 agent records, JSON to file.json
-cache: not dropped (needs root or elevation); direct I/O bypasses it, metadata stays warm
+cache: not dropped (needs root or elevation); one untimed direct pass first, so every timed pass meets the same cache
 raw io         3.62 GiB/s   [device ceiling, no hashing]
 ...
 parallel:   16 threads, affinity mask: 16 cpus

@@ -1277,8 +1277,8 @@ int main(int argc, char** argv) {
   println(stdout, "cache: {}",
           cold ? "dropped before every rep"
           : opts.direct_io
-              ? "not dropped (needs root or elevation); direct I/O bypasses "
-                "it, metadata stays warm"
+              ? "not dropped (needs root or elevation); one untimed direct "
+                "pass first, so every timed pass meets the same cache"
               : "NOT DROPPED (needs root or elevation): with --no-direct, "
                 "every rep after the first reads RAM, not the device");
 
@@ -1289,7 +1289,7 @@ int main(int argc, char** argv) {
   // The control group: the identical pipeline delivering windows that are
   // released unread. This is the device ceiling as seen through this
   // backend, window and qd, and every hash row below is a fraction of it.
-  const double raw_s = best_cold_seconds(reps, cold, [&] {
+  const auto raw_pass = [&] {
     blake3pp::detail::file_reader r(
         path.c_str(),
         {.window_bytes = opts.window_bytes,
@@ -1304,7 +1304,16 @@ int main(int argc, char** argv) {
       r.release(w.value());
       w = r.next();
     }
-  });
+  };
+  // Direct I/O does not always bypass the cache: FreeBSD's UFS serves a
+  // direct read of cached data from the cache and does not keep it, so
+  // without a drop the first timed pass would read RAM and every later
+  // one the device. One untimed pass leaves the cache as every timed pass
+  // will find it.
+  if (!cold && opts.direct_io) {
+    raw_pass();
+  }
+  const double raw_s = best_cold_seconds(reps, cold, raw_pass);
   println(stdout, "{:<10} {}   [device ceiling, no hashing]",
           "raw io", b3tool::rate(static_cast<std::size_t>(bytes), raw_s));
 
