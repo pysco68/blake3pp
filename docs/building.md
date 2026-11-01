@@ -46,6 +46,7 @@ On a Mac:
   F_NOCACHE I/O)
 - `macos-clang22-cxx26`: Homebrew LLVM 22 against its bundled libc++
   (`brew install llvm`)
+- `macos-clang22-cxx26-tsan`: the same under ThreadSanitizer
 
 On FreeBSD, with the base system's compiler (`pkg install cmake ninja`):
 
