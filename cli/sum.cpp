@@ -171,6 +171,44 @@ struct result {
   std::string error;
 };
 
+// A name as a digest line writes it, in the GNU sha256sum and b3sum form:
+// a name holding a backslash, a newline or a carriage return has them
+// written as "\\", "\n" and "\r", and the line starts with a backslash
+// (prefix). Any other name is written unchanged with an empty prefix.
+struct line_name {
+  std::string_view prefix;
+  std::string text;
+};
+
+line_name escape_name(std::string_view name) {
+  if (name.find_first_of("\\\n\r") == std::string_view::npos) {
+    return {"", std::string{name}};
+  }
+  line_name out{"\\", {}};
+  for (const char c : name) {
+    switch (c) {
+      case '\\': out.text += "\\\\"; break;
+      case '\n': out.text += "\\n"; break;
+      case '\r': out.text += "\\r"; break;
+      default: out.text += c; break;
+    }
+  }
+  return out;
+}
+
+// What --check found, summed over every list.
+struct check_counts {
+  int malformed = 0;    // lines not in the checksum-line format
+  int unreadable = 0;   // listed files that could not be read
+  int mismatched = 0;   // files whose digest differs from the listed one
+  int bad_lists = 0;    // lists that could not be read or hold no
+                        // well-formed line, each reported on its own
+
+  [[nodiscard]] bool failed() const noexcept {
+    return malformed + unreadable + mismatched + bad_lists > 0;
+  }
+};
+
 #if defined(_MSC_VER)
 // The engine's members carry an alignment, so MSVC pads the class and says
 // so at its closing brace (C4324). The padding is intended.
@@ -336,32 +374,39 @@ class engine {
                                  r.error);
                          return false;
                        }
-                       println(stdout, "{}  {}", r.hex, files[i]);
+                       const line_name n = escape_name(files[i]);
+                       println(stdout, "{}{}  {}", n.prefix, r.hex, n.text);
                        return true;
                      });
   }
 
   // The batch behind --check: each file's digest taken to the length of
-  // the hex it is compared against.
-  int verify_many(const std::vector<std::string>& files,
-                  const std::vector<std::string>& expected) {
+  // the hex it is compared against. Failures go into counts.
+  void verify_many(const std::vector<std::string>& files,
+                   const std::vector<std::string>& expected,
+                   check_counts& counts) {
     std::vector<std::size_t> out_lens(files.size());
     for (std::size_t i = 0; i < files.size(); ++i) {
       out_lens[i] = expected[i].size() / 2;
     }
-    return run_batch(files, out_lens,
-                     [&](std::size_t i, const result& r) noexcept {
-                       if (!r.error.empty()) {
-                         println(stderr, "blake3ppsum: {}: {}", files[i],
-                                 r.error);
-                         println(stdout, "{}: FAILED open or read", files[i]);
-                         return false;
-                       }
-                       const bool ok = r.hex == expected[i];
-                       println(stdout, "{}: {}", files[i],
-                               ok ? "OK" : "FAILED");
-                       return ok;
-                     });
+    run_batch(files, out_lens,
+              [&](std::size_t i, const result& r) noexcept {
+                const line_name n = escape_name(files[i]);
+                if (!r.error.empty()) {
+                  println(stderr, "blake3ppsum: {}: {}", files[i], r.error);
+                  println(stdout, "{}{}: FAILED open or read", n.prefix,
+                          n.text);
+                  counts.unreadable++;
+                  return false;
+                }
+                const bool ok = r.hex == expected[i];
+                println(stdout, "{}{}: {}", n.prefix, n.text,
+                        ok ? "OK" : "FAILED");
+                if (!ok) {
+                  counts.mismatched++;
+                }
+                return ok;
+              });
   }
 
  private:
@@ -517,62 +562,127 @@ void report_read_diagnosis(const blake3pp::diagnosis& r, unsigned threads,
   }
 }
 
-// Verifies "<hex>  <name>" lines of any (even) digest length; also accepts
-// the '*' binary marker.
+// One checksum line in the GNU sha256sum and b3sum format: an optional
+// leading backslash, the hex digest (all hex digits, even length), one
+// space, then a space (text mode) or '*' (binary mode), then the name to
+// the end of the line. On a line with the leading backslash the name is
+// unescaped: "\\" is a backslash, "\n" a newline and "\r" a carriage
+// return; any other escape is malformed. Nothing when the line is not in
+// this format.
+struct check_line {
+  std::string hex;  // lowercase
+  std::string name;
+};
+
+std::optional<check_line> parse_check_line(std::string_view sv) {
+  const bool escaped = sv.starts_with('\\');
+  if (escaped) {
+    sv.remove_prefix(1);
+  }
+  const std::size_t hex_end = sv.find(' ');
+  if (hex_end == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const std::string_view hex = sv.substr(0, hex_end);
+  if (hex.size() < 2 || hex.size() % 2 != 0 ||
+      !std::all_of(hex.begin(), hex.end(), [](char c) {
+        return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+      })) {
+    return std::nullopt;
+  }
+  std::string_view rest = sv.substr(hex_end + 1);
+  if (rest.size() < 2 || (rest.front() != ' ' && rest.front() != '*')) {
+    return std::nullopt;
+  }
+  rest.remove_prefix(1);
+  check_line out;
+  out.hex.reserve(hex.size());
+  for (const char c : hex) {
+    out.hex += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  if (!escaped) {
+    out.name = rest;
+    return out;
+  }
+  for (std::size_t i = 0; i < rest.size(); ++i) {
+    if (rest[i] != '\\') {
+      out.name += rest[i];
+      continue;
+    }
+    if (++i == rest.size()) {
+      return std::nullopt;
+    }
+    switch (rest[i]) {
+      case '\\': out.name += '\\'; break;
+      case 'n': out.name += '\n'; break;
+      case 'r': out.name += '\r'; break;
+      default: return std::nullopt;
+    }
+  }
+  return out;
+}
+
+// Verifies the checksum lines of one list (see parse_check_line) of any
+// digest length. Empty lines and lines starting with '#' are skipped, and
+// one trailing carriage return is dropped from every line.
 //
 // The list is read first, then the files are hashed: with a compute pool
 // and more than one file they go through one context together, as on the
 // printing path. Malformed lines are reported as the list is read, so
-// they print before the results.
-int run_check(engine& eng, std::istream& in, std::string_view list_name) {
-  int failures = 0;
+// they print before the results. A read error on the list, and a list
+// without one well-formed line, are reported and counted in bad_lists.
+void run_check(engine& eng, std::istream& in, std::string_view list_name,
+               check_counts& counts) {
   std::vector<std::string> names;
   std::vector<std::string> expected;
   std::string line;
   for (int line_no = 1; std::getline(in, line); ++line_no) {
-    const std::string_view sv{line};
+    std::string_view sv{line};
+    if (sv.ends_with('\r')) {
+      sv.remove_suffix(1);
+    }
     if (sv.empty() || sv.starts_with('#')) {
       continue;
     }
-    const std::size_t hex_end = sv.find(' ');
-    const std::string_view hex = sv.substr(0, hex_end);
-    if (hex_end == std::string_view::npos || hex.size() < 2 || hex.size() % 2 != 0) {
+    std::optional<check_line> parsed = parse_check_line(sv);
+    if (!parsed) {
       println(stderr, "blake3ppsum: {}:{}: malformed line", list_name, line_no);
-      failures++;
+      counts.malformed++;
       continue;
     }
-    auto rest = sv.substr(hex_end);
-    rest.remove_prefix(std::min(rest.find_first_not_of(' '), rest.size()));
-    if (rest.starts_with('*')) {
-      rest.remove_prefix(1);
-    }
-    names.emplace_back(rest);
-    expected.emplace_back(hex);
-    for (char& c : expected.back()) {
-      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
+    names.push_back(std::move(parsed->name));
+    expected.push_back(std::move(parsed->hex));
+  }
+  if (in.bad() || !in.eof()) {
+    println(stderr, "blake3ppsum: {}: read error", list_name);
+    counts.bad_lists++;
+  } else if (names.empty()) {
+    println(stderr, "blake3ppsum: {}: no properly formatted checksum lines found",
+            list_name);
+    counts.bad_lists++;
   }
 
   if (eng.can_batch(names)) {
-    return failures + eng.verify_many(names, expected);
+    eng.verify_many(names, expected, counts);
+    return;
   }
 
   for (std::size_t i = 0; i < names.size(); ++i) {
     const std::string& name = names[i];
+    const line_name n = escape_name(name);
     try {
       if (eng.hash_hex(name, expected[i].size() / 2) == expected[i]) {
-        println(stdout, "{}: OK", name);
+        println(stdout, "{}{}: OK", n.prefix, n.text);
       } else {
-        println(stdout, "{}: FAILED", name);
-        failures++;
+        println(stdout, "{}{}: FAILED", n.prefix, n.text);
+        counts.mismatched++;
       }
     } catch (const std::exception& e) {
       println(stderr, "blake3ppsum: {}: {}", name, e.what());
-      println(stdout, "{}: FAILED open or read", name);
-      failures++;
+      println(stdout, "{}{}: FAILED open or read", n.prefix, n.text);
+      counts.unreadable++;
     }
   }
-  return failures;
 }
 
 }  // namespace
@@ -730,21 +840,38 @@ int run_main(int argc, char** argv) {
     };
 
     if (o.check) {
+      check_counts counts;
       for (const auto& f : o.files) {
         if (f == "-") {
-          failures += run_check(eng, std::cin, "-");
+          run_check(eng, std::cin, "-", counts);
           continue;
         }
-        std::ifstream in(f);
+        // Binary, as standard input is: the parser drops the carriage
+        // return of a CRLF line itself, on every platform.
+        std::ifstream in(f, std::ios::binary);
         if (!in) {
           println(stderr, "blake3ppsum: {}: cannot open", f);
-          failures++;
+          counts.bad_lists++;
           continue;
         }
-        failures += run_check(eng, in, f);
+        run_check(eng, in, f, counts);
       }
-      if (failures > 0) {
-        println(stderr, "blake3ppsum: WARNING: {} computed checksum(s) did NOT match", failures);
+      if (counts.malformed > 0) {
+        println(stderr, "blake3ppsum: WARNING: {} {} improperly formatted",
+                counts.malformed,
+                counts.malformed == 1 ? "line is" : "lines are");
+      }
+      if (counts.unreadable > 0) {
+        println(stderr, "blake3ppsum: WARNING: {} listed {} could not be read",
+                counts.unreadable, counts.unreadable == 1 ? "file" : "files");
+      }
+      if (counts.mismatched > 0) {
+        println(stderr, "blake3ppsum: WARNING: {} computed {} did NOT match",
+                counts.mismatched,
+                counts.mismatched == 1 ? "checksum" : "checksums");
+      }
+      if (counts.failed()) {
+        failures++;
       }
       write_trace();
       return failures == 0 ? 0 : b3tool::exit_failure;
@@ -757,7 +884,9 @@ int run_main(int argc, char** argv) {
     } else {
       for (const auto& f : o.files) {
         try {
-          println(stdout, "{}  {}", eng.hash_hex(f, o.out_len), f);
+          const std::string hex = eng.hash_hex(f, o.out_len);
+          const line_name n = escape_name(f);
+          println(stdout, "{}{}  {}", n.prefix, hex, n.text);
         } catch (const std::exception& e) {
           println(stderr, "blake3ppsum: {}: {}", f, e.what());
           failures++;

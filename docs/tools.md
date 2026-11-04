@@ -27,6 +27,15 @@ See [the API reference](api.md) for the introspection calls behind it.
 Plain, keyed and derive_key hashing, extended output, and `--check` to
 verify checksum lines it printed earlier.
 
+Checksum lines use the `sha256sum` and `b3sum` format, so `--check` also
+reads lists written by those tools: the hex digest, one space, a space
+or `*`, and the name to the end of the line. A name holding a backslash,
+a newline or a carriage return is written as `\\`, `\n` and `\r` on a
+line that starts with `\`, and `--check` reads it back the same way.
+Lines with CRLF endings verify. `--check` reports malformed lines,
+files that could not be read and mismatched digests in separate counts,
+and fails a list that holds no well-formed line.
+
 <!-- generated: blake3ppsum_help_docs --help -->
 ```
 Print or check BLAKE3 checksums.

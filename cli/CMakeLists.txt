@@ -43,11 +43,13 @@ add_custom_target(help_docs
 
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell). They cover known answers, --check round
-# trips with corruption detection, the key forms, the stream and --diag
+# trips with corruption detection, the checksum-list format (escaped
+# names, CRLF lists, the closing counts), the key forms, the stream and --diag
 # paths, the generator's determinism, seek and --output, and the usage
 # errors (see smoketest.cmake).
 foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
-    check_roundtrip check_batched length_prefix
+    check_roundtrip check_batched check_empty_list check_crlf check_names
+    check_escaped_line check_nonhex check_counts length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
     gen_output gen_seed_file sum_errors key_forms gen_errors)
   add_test(NAME cli_${case}

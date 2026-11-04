@@ -210,6 +210,164 @@ elseif(CASE STREQUAL "check_batched")
     message(FATAL_ERROR "batched --check mislabelled the corrupted file (rc=${res}): ${out}")
   endif()
 
+elseif(CASE STREQUAL "check_empty_list")
+  # A list without one well-formed line verifies nothing and fails, as an
+  # empty or comment-only list does in sha256sum -c; so does a list that
+  # cannot be read (a directory).
+  file(WRITE "${WORK}/empty_list" "")
+  file(WRITE "${WORK}/comment_list" "# only a comment\n\n# and another\n")
+  foreach(list IN ITEMS empty_list comment_list)
+    run_sum(out res ERR_VAR err ARGS --check ${list})
+    if(NOT res EQUAL 1 OR NOT err MATCHES "${list}: no properly formatted checksum lines found")
+      message(FATAL_ERROR "--check of ${list} did not fail (rc=${res}): ${err}")
+    endif()
+  endforeach()
+  run_sum(out res ERR_VAR err ARGS --check - STDIN "${WORK}/comment_list")
+  if(NOT res EQUAL 1 OR NOT err MATCHES "no properly formatted checksum lines found")
+    message(FATAL_ERROR "--check of a comment-only stdin did not fail (rc=${res}): ${err}")
+  endif()
+  file(MAKE_DIRECTORY "${WORK}/dir")
+  run_sum(out res ERR_VAR err ARGS --check dir)
+  if(NOT res EQUAL 1
+     OR NOT err MATCHES "read error|cannot open|no properly formatted checksum lines found")
+    message(FATAL_ERROR "--check of a directory did not fail (rc=${res}): ${err}")
+  endif()
+
+elseif(CASE STREQUAL "check_crlf")
+  # A list with CRLF line endings verifies as a file and on stdin, over
+  # the batched path (two files) and the sequential one.
+  file(WRITE "${WORK}/one" "first file")
+  file(WRITE "${WORK}/two" "second file")
+  run_sum(sums res ARGS one two)
+  if(NOT res EQUAL 0)
+    message(FATAL_ERROR "hashing failed (rc=${res})")
+  endif()
+  # file(WRITE) on Windows writes every "\n" as CRLF already, so the
+  # endings are set by NEWLINE_STYLE, which writes the same bytes on every
+  # platform.
+  file(CONFIGURE OUTPUT "${WORK}/crlf_sums" CONTENT "${sums}" @ONLY
+       NEWLINE_STYLE CRLF)
+  run_sum(out1 res1 ERR_VAR err1 ARGS --check crlf_sums)
+  run_sum(out2 res2 ERR_VAR err2 ARGS --check - STDIN "${WORK}/crlf_sums")
+  run_sum(out3 res3 ERR_VAR err3 ARGS --threads 1 --check crlf_sums)
+  foreach(i 1 2 3)
+    if(NOT res${i} EQUAL 0 OR NOT out${i} MATCHES "one: OK\ntwo: OK\n")
+      message(FATAL_ERROR "CRLF list run ${i} failed (rc=${res${i}}): ${out${i}} ${err${i}}")
+    endif()
+  endforeach()
+
+elseif(CASE STREQUAL "check_names")
+  # Names the format has to carry exactly: a leading space everywhere; a
+  # leading '*', a newline, a backslash and a carriage return where the
+  # filesystem allows them. blake3ppsum writes them (escaped where the
+  # name holds '\', newline or CR) and --check reads them back, on the
+  # batched and the sequential path.
+  set(names " lead")
+  if(NOT CMAKE_HOST_WIN32)
+    list(APPEND names "*star" "nl\nname" "back\\slash" "cr\rname")
+  endif()
+  foreach(name IN LISTS names)
+    file(WRITE "${WORK}/${name}" "content of ${name}")
+  endforeach()
+  run_sum(sums res ARGS ${names})
+  run_sum(seq res2 ARGS --threads 1 ${names})
+  if(NOT res EQUAL 0 OR NOT res2 EQUAL 0 OR NOT sums STREQUAL seq)
+    message(FATAL_ERROR "hashing the names failed (rc=${res}, ${res2}):\n${sums}\n${seq}")
+  endif()
+  # A newline in front, so that every line, the first included, follows one.
+  set(lines "\n${sums}")
+  if(NOT lines MATCHES "\n[0-9a-f]+   lead\n")
+    message(FATAL_ERROR "the leading space was not written: ${sums}")
+  endif()
+  if(NOT CMAKE_HOST_WIN32)
+    if(NOT lines MATCHES "\n[0-9a-f]+  \\*star\n"
+       OR NOT lines MATCHES "\n\\\\[0-9a-f]+  nl\\\\nname\n"
+       OR NOT lines MATCHES "\n\\\\[0-9a-f]+  back\\\\\\\\slash\n"
+       OR NOT lines MATCHES "\n\\\\[0-9a-f]+  cr\\\\rname\n")
+      message(FATAL_ERROR "the names were not written escaped: ${sums}")
+    endif()
+  endif()
+  file(WRITE "${WORK}/sums" "${sums}")
+  foreach(threads 4 1)
+    run_sum(out res ERR_VAR err ARGS --threads ${threads} --check sums)
+    if(NOT res EQUAL 0)
+      message(FATAL_ERROR "--check --threads ${threads} rejected the names (rc=${res}): ${out} ${err}")
+    endif()
+    set(expect " lead: OK\n")
+    if(NOT CMAKE_HOST_WIN32)
+      list(APPEND expect "*star: OK\n" "\\nl\\nname: OK\n" "\\back\\\\slash: OK\n"
+                         "\\cr\\rname: OK\n")
+    endif()
+    foreach(line IN LISTS expect)
+      string(FIND "${out}" "${line}" at)
+      if(at LESS 0)
+        message(FATAL_ERROR "--check --threads ${threads} lacks '${line}': ${out}")
+      endif()
+    endforeach()
+  endforeach()
+
+elseif(CASE STREQUAL "check_escaped_line")
+  # Hand-written lines in the GNU escaped form: the leading backslash is
+  # not part of the digest, and "\\" in the name is one backslash. On
+  # Windows that backslash is a path separator, so the name is a file in
+  # a directory there. The digest is that of the empty input.
+  set(empty_hex "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+  if(CMAKE_HOST_WIN32)
+    file(WRITE "${WORK}/back/slash" "")
+  else()
+    file(WRITE "${WORK}/back\\slash" "")
+  endif()
+  file(WRITE "${WORK}/plain" "")
+  file(WRITE "${WORK}/sums"
+    "\\${empty_hex}  back\\\\slash\n\\${empty_hex} *back\\\\slash\n\\${empty_hex}  plain\n")
+  run_sum(out res ERR_VAR err ARGS --threads 1 --check sums)
+  string(FIND "${out}" "\\back\\\\slash: OK\n\\back\\\\slash: OK\nplain: OK\n" at)
+  if(NOT res EQUAL 0 OR at LESS 0)
+    message(FATAL_ERROR "escaped lines did not verify (rc=${res}): ${out} ${err}")
+  endif()
+
+elseif(CASE STREQUAL "check_nonhex")
+  # A digest field of even length that is not hex is a malformed line, not
+  # a mismatch.
+  file(WRITE "${WORK}/f" "hello blake3pp")
+  run_sum(sums res ARGS f)
+  string(REPEAT "g0" 32 nonhex)
+  file(WRITE "${WORK}/list" "${sums}${nonhex}  f\n")
+  run_sum(out res ERR_VAR err ARGS --check list)
+  if(NOT res EQUAL 1 OR NOT out STREQUAL "f: OK\n"
+     OR NOT err MATCHES "list:2: malformed line"
+     OR NOT err MATCHES "WARNING: 1 line is improperly formatted"
+     OR err MATCHES "did NOT match")
+    message(FATAL_ERROR "a non-hex digest was not reported malformed (rc=${res}): ${out} ${err}")
+  endif()
+
+elseif(CASE STREQUAL "check_counts")
+  # The closing summary counts malformed lines, files that could not be
+  # read and mismatches apart: here 2, 1 and 3, on the batched and the
+  # sequential path. A list that cannot be opened is reported on its own
+  # and is not a listed file.
+  set(empty_hex "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
+  string(REPEAT "0" 64 zeros)
+  file(WRITE "${WORK}/f" "hello blake3pp")
+  run_sum(sums res ARGS f)
+  file(WRITE "${WORK}/list"
+    "${sums}abc f\n\\${empty_hex}  bad\\qescape\n${zeros}  nofile\n"
+    "${zeros}  f\n${zeros} *f\n${empty_hex}  f\n")
+  foreach(threads 4 1)
+    run_sum(out res ERR_VAR err ARGS --threads ${threads} --check list)
+    if(NOT res EQUAL 1 OR NOT out MATCHES "^f: OK\n"
+       OR NOT err MATCHES "WARNING: 2 lines are improperly formatted"
+       OR NOT err MATCHES "WARNING: 1 listed file could not be read"
+       OR NOT err MATCHES "WARNING: 3 computed checksums did NOT match")
+      message(FATAL_ERROR "--check --threads ${threads} miscounted (rc=${res}): ${out} ${err}")
+    endif()
+  endforeach()
+  run_sum(out res ERR_VAR err ARGS --check list nolist)
+  if(NOT res EQUAL 1 OR NOT err MATCHES "nolist: cannot open"
+     OR NOT err MATCHES "WARNING: 1 listed file could not be read")
+    message(FATAL_ERROR "a missing list was not counted (rc=${res}): ${err}")
+  endif()
+
 elseif(CASE STREQUAL "length_prefix")
   # Extended output: the 32-byte digest is the prefix of any longer output.
   file(WRITE "${WORK}/f" "extended output prefix property")
