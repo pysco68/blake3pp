@@ -9,12 +9,16 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
 #include <blake3pp/blake3pp.hpp>
+#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/memory_driver.hpp>
 #include <blake3pp/detail/tree_reducer.hpp>
+#include <blake3pp/parallel_backend.hpp>
 
 namespace {
 
@@ -108,6 +112,37 @@ TEST_CASE("fold_sibling_cvs refuses a count that is not a power of two") {
           blake3pp::detail::resolve(h.selected_arch()), three, h.key_words(),
           h.mode_flags(), out),
       std::logic_error);
+}
+
+// A span that does not end the message goes to the pool as whole
+// subtrees, so one that is not a whole number of windows is refused
+// before any byte is hashed, in every build.
+TEST_CASE("a pipeline span that does not end the message must be whole windows") {
+  constexpr std::size_t w = 64 * 1024;
+  const std::vector<std::byte> bytes(2 * w + 1, std::byte{0x5a});
+  for (const std::size_t len : {2 * w, 2 * w + 1}) {
+    CAPTURE(len);
+    const std::span<const std::byte> span = std::span{bytes}.first(len);
+    blake3pp::hasher h;
+    blake3pp::detail::memory_driver drv;
+    blake3pp::detail::memory_driver::file f(drv, span);
+    blake3pp::detail::pipeline_plan plan =
+        blake3pp::detail::plan_memory_pipeline(h.count(), w, len);
+    REQUIRE(plan.window_bytes == w);
+    plan.ends_message = false;
+    const auto run = [&] {
+      blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
+          h, drv, f, blake3pp::get_parallel_scheduler(), plan,
+          {.window_bytes = w});
+    };
+    if (len % w == 0) {
+      CHECK_NOTHROW(run());
+      CHECK(h.count() == len);
+    } else {
+      CHECK_THROWS_AS(run(), std::logic_error);
+      CHECK(h.count() == 0);
+    }
+  }
 }
 
 // Two threads inside one context: the second would walk the operation list
