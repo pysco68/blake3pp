@@ -68,6 +68,16 @@
 
 namespace blake3pp {
 
+namespace detail {
+// The thread count of a process pool sized from a hardware thread count.
+// std::thread::hardware_concurrency() answers 0 when the count is unknown,
+// and a pool needs at least one thread, so 0 becomes 1. Both
+// providers' process pools take their default size from this.
+[[nodiscard]] constexpr unsigned pool_threads(unsigned hardware) noexcept {
+  return hardware != 0 ? hardware : 1u;
+}
+}  // namespace detail
+
 #if defined(BLAKE3PP_EXECUTION_STD)
 
 /// The type of the process-wide scheduler: a per-build concrete type, not
@@ -136,7 +146,7 @@ inline exec::static_thread_pool& process_pool() {
       process_pool_started().store(true, std::memory_order_relaxed);
       return process_pool_threads().load(std::memory_order_relaxed);
     }();
-    return n != 0 ? n : std::thread::hardware_concurrency();
+    return n != 0 ? n : pool_threads(std::thread::hardware_concurrency());
   }()};
   return pool;
 }

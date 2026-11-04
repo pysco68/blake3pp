@@ -308,7 +308,9 @@ auto query_parallel_scheduler_backend()
       const std::lock_guard lock{blake3pp::sizing_mutex()};
       const unsigned sized = blake3pp::g_threads.load(std::memory_order_relaxed);
       blake3pp::g_started.store(true, std::memory_order_relaxed);
-      return sized != 0 ? sized : std::max(1u, std::thread::hardware_concurrency());
+      return sized != 0 ? sized
+                        : blake3pp::detail::pool_threads(
+                              std::thread::hardware_concurrency());
     }();
     return std::make_shared<blake3pp::sized_backend>(threads);
   }();

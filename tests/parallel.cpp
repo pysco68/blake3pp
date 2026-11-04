@@ -310,6 +310,15 @@ TEST_CASE("parallel hash is deterministic across runs") {
   }
 }
 
+// hardware_concurrency() may answer 0; the process pool is never sized 0.
+TEST_CASE("the process pool size from a hardware count is at least one") {
+  static_assert(blake3pp::detail::pool_threads(0) == 1);
+  static_assert(blake3pp::detail::pool_threads(1) == 1);
+  static_assert(blake3pp::detail::pool_threads(16) == 16);
+  CHECK(blake3pp::detail::pool_threads(0) == 1);
+  CHECK(blake3pp::detail::pool_threads(16) == 16);
+}
+
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)
 // The scheduler-parameterized design meeting the platform's native
 // runtime: stdexec's libdispatch scheduler submits the same bulk work to
