@@ -36,6 +36,11 @@ Lines with CRLF endings verify. `--check` reports malformed lines,
 files that could not be read and mismatched digests in separate counts,
 and fails a list that holds no well-formed line.
 
+Names are UTF-8 on every platform. On Windows both tools run with UTF-8
+as the process code page (Windows 10 version 1903 and later), so a name
+on the command line or in a list may hold any character, and a list
+written on one platform verifies on another.
+
 <!-- generated: blake3ppsum_help_docs --help -->
 ```
 Print or check BLAKE3 checksums.

@@ -196,6 +196,25 @@ line_name escape_name(std::string_view name) {
   return out;
 }
 
+// Whether a name converts to a std::filesystem::path. On Windows the
+// conversion decodes the name in the process code page, UTF-8 under the
+// tools' manifest, and throws on bytes that are not valid in it, as a
+// checksum list written in another encoding may hold. Elsewhere a path is
+// the name's bytes.
+bool is_path(const std::string& name) noexcept {
+#if defined(_WIN32)
+  try {
+    static_cast<void>(std::filesystem::path(name));
+    return true;
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)name;
+  return true;
+#endif
+}
+
 // What --check found, summed over every list.
 struct check_counts {
   int malformed = 0;    // lines not in the checksum-line format
@@ -305,11 +324,14 @@ class engine {
 
   // Whether hash_many() would do anything the per-file loop does not.
   // Standard input has no file to hand to a context, and one file needs
-  // no arena shared with anything.
+  // no arena shared with anything. A batch takes every name as a path up
+  // front, so a name that is not one leaves the files to the per-file
+  // loop, which reports that name alone as unreadable.
   [[nodiscard]] bool can_batch(const std::vector<std::string>& files) const {
     return pool_.parallel() && files.size() > 1 &&
            std::none_of(files.begin(), files.end(),
-                        [](const std::string& f) { return f == "-"; });
+                        [](const std::string& f) { return f == "-"; }) &&
+           std::all_of(files.begin(), files.end(), is_path);
   }
 
   // Several files over one context, a bounded number in flight at a

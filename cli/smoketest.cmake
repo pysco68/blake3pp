@@ -29,7 +29,9 @@ file(MAKE_DIRECTORY "${WORK}")
 set(SMOKE_THREADS 4)
 
 # ERR_VAR names a variable to receive stderr, which is where --diag and
-# the usage errors report.
+# the usage errors report. Output is decoded as UTF-8, which is what the
+# tools write; on Windows, under this file's policy version, execute_process
+# would otherwise decode it in the console's code page (CMP0176).
 function(run_sum out_var result_var)
   cmake_parse_arguments(RS "" "STDIN;ERR_VAR" "ARGS" ${ARGN})
   if(NOT "--threads" IN_LIST RS_ARGS)
@@ -45,7 +47,8 @@ function(run_sum out_var result_var)
     ${input_args}
     OUTPUT_VARIABLE out
     ERROR_VARIABLE err
-    RESULT_VARIABLE res)
+    RESULT_VARIABLE res
+    ENCODING UTF-8)
   set(${out_var} "${out}" PARENT_SCOPE)
   set(${result_var} "${res}" PARENT_SCOPE)
   if(RS_ERR_VAR)
@@ -367,6 +370,100 @@ elseif(CASE STREQUAL "check_counts")
      OR NOT err MATCHES "WARNING: 1 listed file could not be read")
     message(FATAL_ERROR "a missing list was not counted (rc=${res}): ${err}")
   endif()
+
+elseif(CASE STREQUAL "utf8_names")
+  # A name no single-byte code page holds (Greek, Latin-1, CJK), given on
+  # the command line, opens and comes back in the digest line as its
+  # UTF-8 bytes, on the sequential and the batched path; the list so
+  # written verifies. On Windows this takes the tools' UTF-8 process code
+  # page: under an ANSI one the name reaches the tool lossy, and what it
+  # prints is not UTF-8. The output goes to a file and is compared as
+  # bytes, so no decoding stands between the tool and the check.
+  set(name "Ω-é-文.bin")
+  file(WRITE "${WORK}/${name}" "content of a UTF-8 name")
+  file(WRITE "${WORK}/plain.bin" "content of a UTF-8 name")
+  run_sum(ref res ARGS plain.bin)
+  string(SUBSTRING "${ref}" 0 64 hex)
+  if(NOT res EQUAL 0 OR NOT hex MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "hashing the ASCII name failed (rc=${res}): ${ref}")
+  endif()
+  string(HEX "${hex}  ${name}\n${hex}  plain.bin\n" expect)
+  foreach(threads 1 4)
+    execute_process(
+      COMMAND ${EMULATOR} "${SUM}" --threads ${threads} "${name}" plain.bin
+      WORKING_DIRECTORY "${WORK}"
+      OUTPUT_FILE "${WORK}/sums${threads}"
+      ERROR_VARIABLE err
+      RESULT_VARIABLE res
+      ENCODING UTF-8)
+    file(READ "${WORK}/sums${threads}" got HEX)
+    if(NOT res EQUAL 0 OR NOT got STREQUAL expect)
+      file(READ "${WORK}/sums${threads}" text)
+      message(FATAL_ERROR "--threads ${threads}: the UTF-8 name did not "
+                          "hash or print as written (rc=${res}): ${text} ${err}\n"
+                          "bytes ${got}\nwanted ${expect}")
+    endif()
+    run_sum(out res ERR_VAR err ARGS --threads ${threads} --check sums${threads})
+    if(NOT res EQUAL 0 OR NOT out STREQUAL "${name}: OK\nplain.bin: OK\n")
+      message(FATAL_ERROR "--threads ${threads}: the list written with the "
+                          "UTF-8 name did not verify (rc=${res}): ${out} ${err}")
+    endif()
+  endforeach()
+
+elseif(CASE STREQUAL "check_utf8_list")
+  # A UTF-8 list, as written on Linux, names a file outside the ANSI code
+  # page: it verifies from a file and from standard input, alone (the
+  # sequential path) and beside a second file (the batched path), and the
+  # OK lines carry the name as written.
+  set(name "Ω-é-文.bin")
+  file(WRITE "${WORK}/${name}" "content of a UTF-8 name")
+  file(WRITE "${WORK}/plain.bin" "content of a UTF-8 name")
+  run_sum(ref res ARGS plain.bin)
+  string(SUBSTRING "${ref}" 0 64 hex)
+  if(NOT res EQUAL 0 OR NOT hex MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "hashing the ASCII name failed (rc=${res}): ${ref}")
+  endif()
+  file(WRITE "${WORK}/one" "${hex}  ${name}\n")
+  file(WRITE "${WORK}/two" "${hex}  ${name}\n${hex}  plain.bin\n")
+  run_sum(out1 res1 ERR_VAR err1 ARGS --check one)
+  run_sum(out2 res2 ERR_VAR err2 ARGS --check - STDIN "${WORK}/one")
+  run_sum(out3 res3 ERR_VAR err3 ARGS --check two)
+  run_sum(out4 res4 ERR_VAR err4 ARGS --check - STDIN "${WORK}/two")
+  run_sum(out5 res5 ERR_VAR err5 ARGS --threads 1 --check two)
+  foreach(i 1 2 3 4 5)
+    if(i LESS 3)
+      set(expect "${name}: OK\n")
+    else()
+      set(expect "${name}: OK\nplain.bin: OK\n")
+    endif()
+    if(NOT res${i} EQUAL 0 OR NOT out${i} STREQUAL expect)
+      message(FATAL_ERROR "UTF-8 list run ${i} failed (rc=${res${i}}): ${out${i}} ${err${i}}")
+    endif()
+  endforeach()
+
+elseif(CASE STREQUAL "gen_utf8_names")
+  # blake3ppgen opens a name outside the ANSI code page given to
+  # --seed-file and to --output, on the pipelined and the sequential
+  # file sink, and writes what it writes for an ASCII name.
+  set(name "Ω-é-文")
+  file(WRITE "${WORK}/${name}.seed" "seed of a UTF-8 name")
+  file(WRITE "${WORK}/plain.seed" "seed of a UTF-8 name")
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file plain.seed
+    --length 100003 --threads 1
+    WORKING_DIRECTORY "${WORK}"
+    OUTPUT_FILE "${WORK}/plain.out" RESULT_VARIABLE r0)
+  foreach(threads 1 4)
+    execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${name}.seed"
+      --length 100003 --threads ${threads} --output "${name}.${threads}"
+      WORKING_DIRECTORY "${WORK}"
+      ERROR_VARIABLE err RESULT_VARIABLE res ENCODING UTF-8)
+    execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
+      "${WORK}/plain.out" "${WORK}/${name}.${threads}" RESULT_VARIABLE same)
+    if(NOT r0 EQUAL 0 OR NOT res EQUAL 0 OR NOT same EQUAL 0)
+      message(FATAL_ERROR "--threads ${threads}: gen over UTF-8 names "
+                          "failed or diverged (rc=${r0}, ${res}): ${err}")
+    endif()
+  endforeach()
 
 elseif(CASE STREQUAL "length_prefix")
   # Extended output: the 32-byte digest is the prefix of any longer output.

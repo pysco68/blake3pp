@@ -41,15 +41,36 @@ endforeach()
 add_custom_target(help_docs
   DEPENDS blake3ppsum_help_docs blake3ppgen_help_docs)
 
+# Names on Windows. The tools take names as narrow strings: from argv, from
+# checksum lists, and into std::filesystem::path and the narrow CRT, all
+# of which use the process's ANSI code page. utf8.manifest sets that code
+# page to UTF-8, so a name is its UTF-8 bytes there as on every other
+# platform, and the lines the tools print are UTF-8. CMake merges a
+# .manifest source with the manifest the linker generates and embeds the
+# result, for link.exe and lld-link alike. /utf-8 makes the literal
+# encoding UTF-8 under cl as it already is under clang-cl, which is what
+# makes std::print write to a console through the wide console API: names
+# then display whatever the console's own code page is, and the console's
+# setting is left alone.
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  foreach(_tool IN ITEMS blake3ppsum blake3ppgen
+      blake3ppsum_help_docs blake3ppgen_help_docs)
+    target_sources(${_tool} PRIVATE utf8.manifest)
+    target_compile_options(${_tool} PRIVATE /utf-8)
+  endforeach()
+endif()
+
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell). They cover known answers, --check round
 # trips with corruption detection, the checksum-list format (escaped
-# names, CRLF lists, the closing counts), the key forms, the stream and --diag
-# paths, the generator's determinism, seek and --output, and the usage
-# errors (see smoketest.cmake).
+# names, CRLF lists, the closing counts), names outside the ANSI code
+# page, the key forms, the stream and --diag paths, the generator's
+# determinism, seek and --output, and the usage errors (see
+# smoketest.cmake).
 foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
     check_roundtrip check_batched check_empty_list check_crlf check_names
-    check_escaped_line check_nonhex check_counts length_prefix
+    check_escaped_line check_nonhex check_counts utf8_names check_utf8_list
+    gen_utf8_names length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
     gen_output gen_seed_file sum_errors key_forms gen_errors)
   add_test(NAME cli_${case}
