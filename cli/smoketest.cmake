@@ -1,8 +1,9 @@
-# Cross-platform smoke tests for blake3ppsum, run in CMake script mode so
-# the same driver works on Linux, macOS and Windows (no shell involved).
+# Cross-platform smoke tests for blake3ppsum and blake3ppgen, run in CMake
+# script mode so the same driver works on Linux, macOS and Windows (no
+# shell involved).
 #
-#   cmake -DSUM=<path-to-blake3ppsum> -DWORK=<scratch-dir> -DCASE=<name>
-#         -P smoketest.cmake
+#   cmake -DSUM=<blake3ppsum> -DGEN=<blake3ppgen> -DWORK=<scratch-dir>
+#         -DCASE=<name> [-DEMULATOR=<prefix>] -P smoketest.cmake
 
 # Script mode starts from no policy at all, so a CMake that still has the
 # OLD behaviour of a policy this file depends on takes it: without this,

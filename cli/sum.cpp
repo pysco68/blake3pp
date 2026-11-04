@@ -92,9 +92,9 @@ std::string version_text() {
                    blake3pp::to_string(a),
                    blake3pp::is_available(a) ? "" : "[no cpu support]");
   }
-  // The confession line: variants the CPU could run but this binary does
-  // not carry (e.g. xthead on T-Head silicon in a build whose compiler
-  // could not express it). Silence when there is nothing to confess.
+  // Variants the CPU supports that this binary does not carry (e.g.
+  // xthead on T-Head silicon in a build whose compiler could not express
+  // it). The line is printed only when there are any.
   std::string uncompiled;
   for (const auto a : blake3pp::all_arches()) {
     if (a != blake3pp::arch::auto_detect && blake3pp::cpu_supports(a) &&

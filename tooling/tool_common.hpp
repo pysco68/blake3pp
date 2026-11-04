@@ -242,11 +242,10 @@ enum class one_thread { sequential, pooled };
 // stdexec honors the count exactly (a pool of that size); the other
 // providers use the process-wide parallel scheduler, where any count > 1
 // means "parallel" and the exact number is the provider's business. That
-// difference is the whole reason this type exists, and it collapses to one
-// non-template signature because of a type coincidence worth knowing:
-// under stdexec blake3pp::parallel_scheduler_t IS the scheduler type of an
-// exec::static_thread_pool (see include/blake3pp/parallel.hpp), so the
-// owned pool and the process-wide one return the same type here.
+// difference is why this type exists. It has one non-template signature
+// because under stdexec blake3pp::parallel_scheduler_t IS the scheduler
+// type of an exec::static_thread_pool (see include/blake3pp/parallel.hpp),
+// so the owned pool and the process-wide one return the same type here.
 class compute_pool {
  public:
   // A count of 0 means "as many as the machine has", which is what a
@@ -316,14 +315,12 @@ class compute_pool {
 // Linux goes through raw syscalls rather than sched_setaffinity()/
 // sched_getcpu(): the libc wrappers hide behind _GNU_SOURCE, which musl
 // does not define for us under every frontend we ship, and a header is the
-// wrong place to define it. Same visible-moving-parts spirit as the
-// io_uring and hwprobe call sites.
+// wrong place to define it.
 
 // Which CPU the calling thread is on right now, -1 where the OS offers no
-// answer (macOS has no API for it). Printed per bench row: the Exynos
-// failure was not "could not pin" but "did not know the rows ran on
-// different cores"; a reader of someone else's bench output has no other
-// way to see it.
+// answer (macOS has no API for it). Printed per bench row: on the Exynos
+// the rows ran on different cores and nothing said so, and a reader of
+// someone else's bench output has no other way to see it.
 inline int current_cpu() noexcept {
 #if defined(__linux__)
   unsigned cpu = 0;
@@ -442,10 +439,10 @@ inline int affinity_cpu_count() noexcept {
 }
 
 // --- Measurement ------------------------------------------------------------
-// The benchmarks are deliberately framework-free (pair them with hyperfine
-// when process-level statistics are wanted), but "best of N, warm up once,
-// idle between measurements" is a house convention rather than something
-// each program should reinvent.
+// The benchmarks are framework-free (pair them with hyperfine when
+// process-level statistics are wanted). "Best of N, warm up once, idle
+// between measurements" is shared here so each program does not reinvent
+// it.
 
 // Best-of-`reps` wall-clock seconds for fn: the interesting number for a
 // throughput ceiling, since interference only ever slows a run down. With
