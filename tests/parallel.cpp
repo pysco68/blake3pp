@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -317,6 +318,21 @@ TEST_CASE("the process pool size from a hardware count is at least one") {
   static_assert(blake3pp::detail::pool_threads(16) == 16);
   CHECK(blake3pp::detail::pool_threads(0) == 1);
   CHECK(blake3pp::detail::pool_threads(16) == 16);
+}
+
+// The last bulk chunk ends at shape even where begin + chunk_length
+// would wrap.
+TEST_CASE("a bulk chunk ends at the shape near the top of size_t") {
+  using blake3pp::detail::bulk_chunk_end;
+  constexpr std::size_t max = std::numeric_limits<std::size_t>::max();
+  constexpr std::size_t half = max / 2 + 1;  // per-chunk length on two agents
+  static_assert(bulk_chunk_end(0, half, max) == half);
+  static_assert(bulk_chunk_end(half, half, max) == max);
+  static_assert(bulk_chunk_end(max - 1, 8, max) == max);
+  static_assert(bulk_chunk_end(0, 8, 20) == 8);
+  static_assert(bulk_chunk_end(16, 8, 20) == 20);
+  CHECK(bulk_chunk_end(half, half, max) == max);
+  CHECK(bulk_chunk_end(16, 8, 20) == 20);
 }
 
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)

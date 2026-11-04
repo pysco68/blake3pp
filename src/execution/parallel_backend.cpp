@@ -192,7 +192,7 @@ struct bulk_job final : job {
     for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
          i < chunks; i = next.fetch_add(1, std::memory_order_relaxed)) {
       const std::size_t begin = i * chunk_length;
-      proxy.execute(begin, std::min(begin + chunk_length, shape));
+      proxy.execute(begin, detail::bulk_chunk_end(begin, chunk_length, shape));
     }
   }
   void complete() noexcept override { proxy.set_value(); }
