@@ -772,6 +772,9 @@ class aio_context {
     std::size_t n = 0;
     for (transfer* op = pending_.front(); op != nullptr && n < cap;
          op = op->next_deferred) {
+      // A value the kernel never writes there, so an entry it did not
+      // reach reads as not taken (see offer()).
+      op->req->cb._aiocb_private.error = not_looked_at;
       batch_[n++] = &op->req->cb;
     }
     return n;
@@ -783,19 +786,24 @@ class aio_context {
   //
   // lio_listio answers for the list as a whole:
   //  - 0 when every request was queued;
-  //  - EINVAL or EAGAIN when the list was rejected before any of it was (a
-  //    list longer than vfs.aio.max_aio_queue_per_proc, or no room at all);
-  //  - EIO when some request was refused.
-  // Only EIO needs picking apart, and aio_error() does it. A request the
-  // kernel holds answers EINPROGRESS, or its result if it has already
-  // finished. One it never took answers the reason it was refused, or
-  // -1/EINVAL for a request the kernel knows nothing of.
+  //  - EINVAL or EFAULT when the list was rejected before any entry was
+  //    looked at (a list longer than vfs.aio.max_aio_queue_per_proc);
+  //  - EIO when some entry was refused for a reason other than room,
+  //    else EAGAIN when some entry was refused for room, whatever
+  //    happened to the others.
+  // So after EIO or EAGAIN each entry has to be asked, and aio_error()
+  // cannot tell: it answers from the kernel's job list, where a job the
+  // kernel took and that already failed reads like a refusal. FreeBSD's
+  // aio_aqueue writes the user copy's _aiocb_private.error instead:
+  // EINPROGRESS once the job is committed, the errno when it refuses one,
+  // and nothing a finished job writes until aio_return. That field is
+  // the answer here.
   [[nodiscard]] bool offer(std::size_t n) noexcept {
     const bool all =
         ::lio_listio(LIO_NOWAIT, batch_.data(), static_cast<int>(n),
                      nullptr) == 0;
     const int why = all ? 0 : errno;
-    if (!all && (why == EAGAIN || why == EINVAL || why == EINTR)) {
+    if (!all && why != EIO && why != EAGAIN) {
       return false;  // nothing was queued; the whole batch stays pending
     }
     bool took_any = false;
@@ -804,8 +812,8 @@ class aio_context {
       if (seen++ >= n) {
         return false;  // past the batch that was offered
       }
-      const int err = all ? EINPROGRESS : ::aio_error(&op.req->cb);
-      if (err == EINPROGRESS || err == 0) {
+      const long err = all ? EINPROGRESS : op.req->cb._aiocb_private.error;
+      if (err == EINPROGRESS) {
         // The kernel has it from here, and charged to the device from
         // here.
         op.device_begin();
@@ -814,8 +822,8 @@ class aio_context {
         took_any = true;
         return true;
       }
-      if (err == EAGAIN || err < 0) {
-        return false;  // refused for now, or never seen: still pending
+      if (err == EAGAIN || err == not_looked_at || err == 0) {
+        return false;  // refused for room, or not reached: still pending
       }
       // Refused for a reason retrying will not change (a filesystem whose
       // files this kernel will not serve asynchronously, with
@@ -1128,6 +1136,10 @@ class aio_context {
   std::size_t issued_ = 0;
   std::size_t served_synchronously_ = 0;
   int queue_limit_ = 0;
+  // What fill_batch() leaves in _aiocb_private.error: no errno, and not
+  // EINPROGRESS or 0, so offer() reads an entry the kernel never reached
+  // as not taken.
+  static constexpr long not_looked_at = -1;
   // The wake for a context that never got a kqueue: the user event is the
   // wake everywhere else.
   poll_waiter waiter_;
