@@ -575,6 +575,19 @@ elseif(CASE STREQUAL "gen_errors")
       message(FATAL_ERROR "gen accepted '${bad}'")
     endif()
   endforeach()
+  # A negative size, a size whose suffix multiplication overflows 64 bits
+  # and a --window whose byte count overflows size_t fail before any
+  # output. The timeout bounds a run that takes -1 as 2^64-1 bytes; a
+  # timed-out run leaves a message in r, not an exit code.
+  foreach(bad "--length;-1" "--length;16777216T" "--seek;-5"
+              "--length;16;--output;${WORK}/window.bin;--window;17592186044416")
+    execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s ${bad}
+      --threads ${SMOKE_THREADS}
+      OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE r TIMEOUT 60)
+    if(NOT r MATCHES "^[1-9][0-9]*$")
+      message(FATAL_ERROR "gen did not reject '${bad}': ${r}")
+    endif()
+  endforeach()
 
 elseif(CASE STREQUAL "engines")
   # The engine introspection, end to end. --version prints the list the

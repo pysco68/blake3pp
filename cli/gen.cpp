@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <exception>
 #include <format>
+#include <limits>
 #include <optional>
 #include <ratio>
 #include <span>
@@ -54,6 +55,11 @@ std::optional<std::uint64_t> parse_size(const std::string& text) {
   if (text == "inf") {
     return std::nullopt;
   }
+  // std::stoull skips leading whitespace and negates a leading '-', so a
+  // size has to start with a digit.
+  if (text.empty() || text[0] < '0' || text[0] > '9') {
+    throw CLI::ValidationError("size", "malformed size");
+  }
   std::size_t consumed = 0;
   const std::uint64_t base = std::stoull(text, &consumed);
   std::uint64_t multiplier = 1;
@@ -67,6 +73,9 @@ std::optional<std::uint64_t> parse_size(const std::string& text) {
     }
   } else if (consumed != text.size()) {
     throw CLI::ValidationError("size", "malformed size");
+  }
+  if (base > std::numeric_limits<std::uint64_t>::max() / multiplier) {
+    throw CLI::ValidationError("size", "too large");
   }
   return base * multiplier;
 }
@@ -251,6 +260,10 @@ int run_main(int argc, char** argv) {
       throw CLI::ValidationError("--seek", "must be finite");
     }
     seek = *seek_to;
+    // --window is MiB in a size_t; above this the byte count wraps.
+    if (window_mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+      throw CLI::ValidationError("--window", "too large");
+    }
   } catch (const std::exception& e) {
     println(stderr, "blake3ppgen: {}", e.what());
     return b3tool::exit_usage;
