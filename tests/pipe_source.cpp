@@ -18,8 +18,9 @@
 //  * the read bound the driver asks within, and the Windows ask bound;
 //  * the platform reader end to end over a real pipe, and the faults it
 //    can see: EINTR, a non-blocking descriptor, a closed one, a handle
-//    that names no stream, a writer that vanishes, and on Windows
-//    PIPE_NOWAIT, a socket and a message-mode pipe;
+//    that names no stream, a writer that vanishes, on Linux a FIFO no
+//    writer ever opens, and on Windows PIPE_NOWAIT, a socket and a
+//    message-mode pipe;
 //  * the watch before a read, on a virtual clock.
 //
 // Most cases use a scripted reader, so what arrives when is the test's
@@ -37,9 +38,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -63,6 +68,7 @@
 #else
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -1213,13 +1219,15 @@ TEST_CASE("a descriptor handed over non-blocking is read to the end") {
   return;
 #endif
   // O_NONBLOCK on the read end: an empty pipe answers EAGAIN rather
-  // than blocking, and the reader must wait for readiness and retry,
-  // with the watch's probes in front of it, until the producer closes.
+  // than blocking, and the reader must wait for readiness and retry
+  // until the producer closes.
   //
-  // Outside Darwin the watch waits for readiness before each read(), so
-  // the read()-level EAGAIN branch in read_some() is reached only when
-  // another reader empties the pipe between the two calls, which no test
-  // here makes happen deterministically. That branch is Darwin coverage.
+  // On a non-blocking descriptor the reader reads first and waits on
+  // EAGAIN, with the watch's probes in front of the sleep outside
+  // Darwin and Emscripten. The second EAGAIN branch, after a wait, is
+  // reached outside Darwin only when another reader empties the pipe
+  // between the probe and the read, which no test here makes happen
+  // deterministically.
   const auto bytes = pattern(4 * 64 * 1024 + 99, 65);
   os_pipe p;
   REQUIRE(p.open());
@@ -1385,6 +1393,44 @@ TEST_CASE("a handle that names no stream is EBADF, not a wait") {
     CHECK(from_reader == std::errc::bad_file_descriptor);
   }
 }
+
+#if defined(__linux__)
+// Linux reports no POLLHUP on a FIFO until a writer has connected, while
+// read() on one opened O_NONBLOCK reports the end at once. A reader that
+// waited for readiness first would never return.
+TEST_CASE("a FIFO opened non-blocking that no writer ever opens is an empty stream") {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("blake3pp_pipe_source_fifo_" + std::to_string(::getpid()));
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  REQUIRE(::mkfifo(path.c_str(), 0600) == 0);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+  // Unlinked at once: the descriptor keeps the FIFO, and no writer can
+  // open it by name.
+  std::filesystem::remove(path, ignored);
+  REQUIRE(fd >= 0);
+  std::optional<blake3pp::digest> got;
+  std::uint64_t bytes = 0;
+  std::string error;
+  within(std::chrono::seconds(5), "a FIFO with no writer", [&] {
+    try {
+      blake3pp::hasher h;
+      const blake3pp::stream_report r =
+          blake3pp::update_stream(h, fd, blake3pp::get_parallel_scheduler());
+      bytes = r.bytes;
+      got = h.finalize();
+    } catch (const std::exception& e) {
+      error = e.what();
+    }
+  });
+  ::close(fd);
+  CHECK(error.empty());
+  REQUIRE(got.has_value());
+  CHECK(*got == blake3pp::hash(std::span<const std::byte>{}));
+  CHECK(bytes == 0);
+}
+#endif
 
 #if defined(_WIN32)
 // GetFileType calls a socket a pipe, but a non-overlapped socket whose

@@ -250,17 +250,17 @@ namespace {
 // writes, 19% at 4 KiB): the sleeps it removes were themselves system
 // time.
 //
-// One probe precedes every read, and what it costs is a property of the
-// platform, not of the watch. On Linux a zero-timeout poll() of a pipe
-// keeps the calling thread on its core, so for a producer that keeps up
-// it is one call per read of a megabyte or more, and for one that does
-// not, the read was going to wait anyway. On XNU the same call costs the
-// caller an involuntary context switch whenever anything else is
-// runnable, data present or not: measured on an M2 at 512-byte producer
-// writes, 1.06 million probes of which 3 593 entered the watch, 645 000
-// involuntary switches against 10 500 without the probe, and 31% more
-// wall clock. The Darwin branch below therefore skips wait_readable()
-// entirely rather than setting the budget to zero.
+// One probe precedes every read of a blocking descriptor, and what it
+// costs is a property of the platform, not of the watch. On Linux a
+// zero-timeout poll() of a pipe keeps the calling thread on its core, so
+// for a producer that keeps up it is one call per read of a megabyte or
+// more, and for one that does not, the read was going to wait anyway. On
+// XNU the same call costs the caller an involuntary context switch
+// whenever anything else is runnable, data present or not: measured on an
+// M2 at 512-byte producer writes, 1.06 million probes of which 3 593
+// entered the watch, 645 000 involuntary switches against 10 500 without
+// the probe, and 31% more wall clock. The Darwin branch below therefore
+// skips wait_readable() entirely rather than setting the budget to zero.
 //
 // ioctl(FIONREAD) does not take that switch on XNU: a watch built on it
 // made 4.8 million probes for 11 500 switches. It was 10% faster at `cat`
@@ -283,6 +283,23 @@ struct posix_watch_platform {
 // rest of the range untouched, so an ask costs only what it returns.
 std::size_t stream_reader::read_bound() const noexcept { return 0; }
 
+// Where a wait precedes the read, a descriptor in O_NONBLOCK mode reads
+// first instead, and waits only on EAGAIN: poll() is not a complete
+// answer for one. A Linux FIFO opened O_NONBLOCK before any writer
+// reports neither POLLIN nor POLLHUP until a writer has connected, while
+// read() reports the end of the stream at once. A blocking descriptor
+// keeps the wait first, since there the read itself would sleep.
+bool stream_reader::handle_reads_first(native_stream h) noexcept {
+#if defined(__APPLE__) || defined(__EMSCRIPTEN__)
+  // No wait before the read here (wait_readable()), so nothing to skip.
+  (void)h;
+  return false;
+#else
+  const int flags = ::fcntl(h, F_GETFL);
+  return flags != -1 && (flags & O_NONBLOCK) != 0;
+#endif
+}
+
 void stream_reader::wait_readable() {
 #if defined(__APPLE__) || defined(__EMSCRIPTEN__)
   // No probe and no watch on Darwin, where the read blocks (measured at
@@ -300,7 +317,10 @@ stream_reader::result stream_reader::read_some(std::span<std::byte> out) {
   if (out.empty()) {
     return {};
   }
-  wait_readable();
+  bool waited = !reads_first_;
+  if (waited) {
+    wait_readable();
+  }
   for (;;) {
     const auto n = ::read(h_, out.data(), out.size());
     if (n > 0) {
@@ -313,8 +333,14 @@ stream_reader::result stream_reader::read_some(std::span<std::byte> out) {
       continue;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      // A descriptor the caller's shell handed over non-blocking, and a
-      // queue another reader emptied between the probe and the read.
+      // A descriptor the caller's shell handed over non-blocking, read
+      // before any wait (handle_reads_first()), and a queue another
+      // reader emptied between the probe and the read.
+      if (!waited) {
+        waited = true;
+        wait_readable();
+        continue;
+      }
       (void)readable(h_, -1);
       continue;
     }

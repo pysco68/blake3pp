@@ -310,6 +310,9 @@ class stream_reader {
 #if defined(_WIN32)
         ,
         is_pipe_(handle_is_pipe(handle))
+#else
+        ,
+        reads_first_(handle_reads_first(handle))
 #endif
   {
   }
@@ -389,6 +392,13 @@ class stream_reader {
   // gone; see read_some().
   void wait_for_data();
   bool is_pipe_ = false;
+#else
+  // Whether read_some() reads before it waits: a descriptor in
+  // O_NONBLOCK mode, where a FIFO no writer has opened yet is never
+  // reported ready by poll() on Linux but reads as its end at once.
+  // Asked once, at construction.
+  static bool handle_reads_first(native_stream h) noexcept;
+  bool reads_first_ = false;
 #endif
   stream_watch watch_;
 #if defined(_WIN32)
