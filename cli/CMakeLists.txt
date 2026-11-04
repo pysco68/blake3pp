@@ -85,6 +85,21 @@ foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()
 
+# A standard input in O_NONBLOCK mode, driven from Python because CMake
+# script mode cannot set the flag on a pipe. It runs in cross builds too,
+# under the emulator, which is where the wasm build's node meets it. The
+# interpreter is named by path: ctest runs a command that names a target
+# under the emulator, which would hand Python to node.
+if(NOT WIN32)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME cli_stdin_nonblock
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/stdin_nonblock.py"
+        "${CMAKE_CURRENT_BINARY_DIR}/smoke-stdin_nonblock"
+        "$<TARGET_FILE:blake3ppsum>" ${CMAKE_CROSSCOMPILING_EMULATOR})
+  endif()
+endif()
+
 # Fault tests: blake3ppsum and blake3ppgen in pipelines whose producer
 # closes early, dies or stalls, whose reader goes away, whose stdin is
 # non-blocking, closed or failing, and whose reads are interrupted by

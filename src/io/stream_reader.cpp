@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <span>
 #include <system_error>
+#include <thread>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -321,6 +322,11 @@ stream_reader::result stream_reader::read_some(std::span<std::byte> out) {
   if (waited) {
     wait_readable();
   }
+#if defined(__EMSCRIPTEN__)
+  // The pause between reads that find standard input empty; see the
+  // EAGAIN branch below.
+  std::chrono::milliseconds pause{1};
+#endif
   for (;;) {
     const auto n = ::read(h_, out.data(), out.size());
     if (n > 0) {
@@ -341,7 +347,17 @@ stream_reader::result stream_reader::read_some(std::span<std::byte> out) {
         wait_readable();
         continue;
       }
+#if defined(__EMSCRIPTEN__)
+      // poll() is not available here (see wait_readable()): on a
+      // non-blocking standard input under node it throws from the
+      // runtime, and node has no synchronous wait for a descriptor. A
+      // pause stands in for the wait, doubling from 1 ms to 10 ms while
+      // the input stays empty; each call starts again at 1 ms.
+      std::this_thread::sleep_for(pause);
+      pause = std::min(2 * pause, std::chrono::milliseconds{10});
+#else
       (void)readable(h_, -1);
+#endif
       continue;
     }
     const int e = errno;  // before the throw allocates the exception
