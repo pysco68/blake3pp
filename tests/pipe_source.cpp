@@ -17,9 +17,9 @@
 //    hand-over off a dry stream is waited for;
 //  * the read bound the driver asks within, and the Windows ask bound;
 //  * the platform reader end to end over a real pipe, and the faults it
-//    can see: EINTR, a non-blocking descriptor, a closed one, a writer
-//    that vanishes, and on Windows PIPE_NOWAIT, a socket and a
-//    message-mode pipe;
+//    can see: EINTR, a non-blocking descriptor, a closed one, a handle
+//    that names no stream, a writer that vanishes, and on Windows
+//    PIPE_NOWAIT, a socket and a message-mode pipe;
 //  * the watch before a read, on a virtual clock.
 //
 // Most cases use a scripted reader, so what arrives when is the test's
@@ -27,6 +27,7 @@
 // byte offset the case chose.
 
 #include <algorithm>
+#include <array>
 #include <csignal>
 #include <atomic>
 #include <bit>
@@ -36,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <system_error>
@@ -1322,7 +1324,6 @@ TEST_CASE("a pipe whose read end is in PIPE_NOWAIT mode is read to the end") {
 }
 #endif
 
-#if defined(_WIN32)
 // Runs `body` on a thread and ends the process if it has not returned
 // within `limit`: the failures these cases guard are a read that never
 // ends, which no CHECK can report.
@@ -1345,6 +1346,47 @@ void within(std::chrono::seconds limit, const char* what, Body body) {
   t.join();
 }
 
+// poll() skips an entry whose descriptor is negative and reports nothing
+// ready, so a reader that waited on one would sleep for ever. A handle
+// that names no stream is EBADF from every entry, before any wait.
+TEST_CASE("a handle that names no stream is EBADF, not a wait") {
+#if defined(_WIN32)
+  const std::array<detail::native_stream, 2> handles{nullptr,
+                                                     INVALID_HANDLE_VALUE};
+#else
+  const std::array<detail::native_stream, 2> handles{
+      -1, std::numeric_limits<int>::min()};
+#endif
+  for (const detail::native_stream bad : handles) {
+    blake3pp::hasher h;
+    std::error_code thrown;
+    std::error_code reported;
+    within(std::chrono::seconds(5), "a handle that names no stream", [&] {
+      try {
+        (void)blake3pp::update_stream(h, bad,
+                                      blake3pp::get_parallel_scheduler());
+      } catch (const std::system_error& e) {
+        thrown = e.code();
+      } catch (...) {
+      }
+      (void)blake3pp::update_stream(h, bad, blake3pp::get_parallel_scheduler(),
+                                    reported);
+    });
+    CHECK(thrown == std::errc::bad_file_descriptor);
+    CHECK(reported == std::errc::bad_file_descriptor);
+    CHECK(h.count() == 0);
+    std::error_code from_reader;
+    try {
+      const detail::stream_reader reader{bad};
+      (void)reader;
+    } catch (const std::system_error& e) {
+      from_reader = e.code();
+    }
+    CHECK(from_reader == std::errc::bad_file_descriptor);
+  }
+}
+
+#if defined(_WIN32)
 // GetFileType calls a socket a pipe, but a non-overlapped socket whose
 // peer closed answers every read with success and nothing moved, and
 // never with an error. Read as a pipe's zero-length message, that is a

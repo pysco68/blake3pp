@@ -496,7 +496,10 @@ template <class Reader>
 /// @param sched   Where the subtree reductions run.
 /// @param opts    The geometry.
 /// @return What the run did; see stream_report.
-/// @throws std::system_error on a read failure, std::logic_error for a
+/// @throws std::system_error on a read failure and, with
+///         std::errc::bad_file_descriptor, for a handle that names no
+///         stream (a negative descriptor; on Windows a null handle or
+///         INVALID_HANDLE_VALUE), std::logic_error for a
 ///         hasher off the window grid, and whatever the execution provider
 ///         raises. A producer that dies cannot be told from one that
 ///         closed its end: both read as the end of the stream.

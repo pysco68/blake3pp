@@ -73,6 +73,7 @@
 #include <ranges>
 #include <span>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include <blake3pp/core.hpp>
@@ -300,8 +301,12 @@ class stream_reader {
     bool eof = false;
   };
 
-  explicit stream_reader(native_stream handle) noexcept
-      : h_(handle)
+  // @throws std::system_error (EBADF) for a handle that names no stream:
+  // a negative descriptor, or a null or INVALID_HANDLE_VALUE handle.
+  // poll() skips a negative descriptor and reports nothing ready, so a
+  // wait on one would never return.
+  explicit stream_reader(native_stream handle)
+      : h_(checked(handle))
 #if defined(_WIN32)
         ,
         is_pipe_(handle_is_pipe(handle))
@@ -358,6 +363,22 @@ class stream_reader {
   // Waits until a read would return something -- bytes, the end, or an
   // error -- watching first and sleeping after.
   void wait_readable();
+
+  [[nodiscard]] static native_stream checked(native_stream h) {
+#if defined(_WIN32)
+    const bool names_none =
+        h == nullptr ||
+        h == reinterpret_cast<native_stream>(static_cast<std::intptr_t>(-1));
+#else
+    const bool names_none = h < 0;
+#endif
+    if (names_none) {
+      throw std::system_error(
+          std::make_error_code(std::errc::bad_file_descriptor),
+          "reading a stream");
+    }
+    return h;
+  }
 
   native_stream h_;
 #if defined(_WIN32)
