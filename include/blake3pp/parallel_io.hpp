@@ -381,31 +381,38 @@ struct stream_io_options {
 struct stream_report {
   /// Bytes the stream delivered.
   std::uint64_t bytes = 0;
-  /// Windows the run hashed.
+  /// Windows the stream filled, the last one included.
   std::uint64_t windows = 0;
   /// Of those, the ones that ended early because the producer ran dry
   /// before filling them. Zero is a producer that kept up with the grid;
-  /// anything else says the run was waiting on the producer.
+  /// anything else says the run was waiting on the producer. Always zero
+  /// where early_hand_over is false.
   std::uint64_t short_flushes = 0;
-  /// The window the run settled on, and how many it allocated: the
-  /// figures diagnose_read() is read against.
+  /// The window the run used, after rounding: the figure diagnose_read()
+  /// takes as its window.
   std::size_t window_bytes = 0;
+  /// Window objects the run allocated: the figure diagnose_read() takes
+  /// as its planned count.
   unsigned windows_planned = 0;
-  /// The stream buffer in force, or zero where the platform has no such
-  /// knob; stream_buffer_reported says which.
+  /// The stream buffer in force after the request, in bytes. Zero where
+  /// nothing was asked (stream_io_options::stream_buffer_bytes of zero),
+  /// where the platform has no such knob, and where the handle is not a
+  /// pipe.
   std::size_t stream_buffer_bytes = 0;
-  /// Whether stream_buffer_bytes is a figure the platform reported
-  /// (Linux: the pipe buffer F_GETPIPE_SZ returned) or a zero that
-  /// means it cannot be asked.
+  /// Whether stream_buffer_bytes is a figure the OS reported (Linux: what
+  /// F_GETPIPE_SZ returned after the request). False whenever it is zero.
   bool stream_buffer_reported = false;
   /// Whether a window could end when the stream ran dry with at least
-  /// half a window in hand. False means every window filled or reached
-  /// the end of the stream.
+  /// half a window in hand: true on POSIX, false on Windows. False means
+  /// every window ended full or at the end of the stream.
   bool early_hand_over = false;
-  /// What the readiness watch before each read did, where the platform
-  /// has one. All zero and `measured` false where it does not.
+  /// What the readiness watch before each read did. POSIX platforms other
+  /// than Darwin and Emscripten watch an empty stream before blocking on
+  /// it; Windows, Darwin and Emscripten block in the read, and report all
+  /// zero with `measured` false.
   struct watch_report {
-    /// The platform watches an empty stream before sleeping on it.
+    /// Whether the run made any readiness probe: true for every run that
+    /// read on a platform that watches.
     bool measured = false;
     /// Readiness probes made, the one that opens every wait included.
     std::uint64_t probes = 0;
@@ -462,19 +469,19 @@ template <class Reader>
 /// Same contract as update_file() in every respect the hasher can see: h
 /// keeps its mode, stays open for more input and for every finalize
 /// form, and the digest is the one the same bytes produce through any
-/// other path. What differs is the geometry, because a stream has none
-/// to plan from: its length is known only when it ends, and a window is
-/// however much of it arrived.
+/// other path. The geometry differs: a stream's length is known only
+/// when it ends, so a window is however much of it arrived.
 ///
-/// The reader fills one window on this thread while the pool hashes the
-/// ones before it, which is the overlap a push API cannot have. A
-/// producer that keeps up fills every window and the run is bounded by
-/// the hash or by the stream itself; a producer that does not has its
-/// windows ended when the stream runs dry with half of one in hand, so
-/// the pool is fed rather
-/// than stalled and the producer is never left blocked on a full pipe.
-/// Either way `--diag`'s device side is the stream: there is no other
-/// device in the picture.
+/// The calling thread reads one window while the pool hashes the ones
+/// before it. Every read blocks until the producer has written something.
+/// A window ends when it is full or when the stream ends, and on POSIX
+/// also when the producer runs dry with at least half a window in hand,
+/// so the pool is fed while the producer is slow
+/// (stream_report::early_hand_over). On Linux the pipe buffer is widened
+/// first (stream_io_options::stream_buffer_bytes), and on POSIX platforms
+/// other than Darwin and Emscripten an empty stream is watched for a few
+/// microseconds before the read blocks (stream_report::watch). The handle
+/// is not closed, and its blocking mode is left as found.
 ///
 /// @pre The hasher sits on a window boundary: count() is a multiple of
 ///      the rounded window size, which every fresh hasher is. A hasher
@@ -489,7 +496,10 @@ template <class Reader>
 /// @param sched   Where the subtree reductions run.
 /// @param opts    The geometry.
 /// @return What the run did; see stream_report.
-/// @throws std::system_error on a read failure, std::logic_error for a
+/// @throws std::system_error on a read failure and, with
+///         std::errc::bad_file_descriptor, for a handle that names no
+///         stream (a negative descriptor; on Windows a null handle or
+///         INVALID_HANDLE_VALUE), std::logic_error for a
 ///         hasher off the window grid, and whatever the execution provider
 ///         raises. A producer that dies cannot be told from one that
 ///         closed its end: both read as the end of the stream.

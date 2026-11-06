@@ -17,8 +17,9 @@
 //    hand-over off a dry stream is waited for;
 //  * the read bound the driver asks within, and the Windows ask bound;
 //  * the platform reader end to end over a real pipe, and the faults it
-//    can see: EINTR, a non-blocking descriptor, a closed one, a writer
-//    that vanishes, and on Windows PIPE_NOWAIT, a socket and a
+//    can see: EINTR, a non-blocking descriptor, a closed one, a handle
+//    that names no stream, a writer that vanishes, on Linux a FIFO no
+//    writer ever opens, and on Windows PIPE_NOWAIT, a socket and a
 //    message-mode pipe;
 //  * the watch before a read, on a virtual clock.
 //
@@ -27,6 +28,7 @@
 // byte offset the case chose.
 
 #include <algorithm>
+#include <array>
 #include <csignal>
 #include <atomic>
 #include <bit>
@@ -36,8 +38,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <filesystem>
+#include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -61,6 +68,7 @@
 #else
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -1135,6 +1143,17 @@ TEST_CASE("EINTR during a blocking read or watch is retried without losing bytes
   MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
   return;
 #endif
+#if defined(__FreeBSD__) && defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+  // ThreadSanitizer deadlocks itself on FreeBSD under this signal storm:
+  // a SIGUSR1 taken while the runtime holds its slot lock (here inside an
+  // intercepted pthread_mutex_unlock) goes through libthr's own wrapper,
+  // whose intercepted memcpy re-enters the runtime and waits on that same
+  // lock. Nothing of blake3pp's is on either stack.
+  MESSAGE("skipped: ThreadSanitizer deadlocks on FreeBSD under a signal storm");
+  return;
+#endif
+#endif
   // The producer writes in small pieces with the reader asleep or
   // watching between them, and a second thread sends SIGUSR1 to the
   // reading thread throughout. Every interrupted call must be retried:
@@ -1200,13 +1219,15 @@ TEST_CASE("a descriptor handed over non-blocking is read to the end") {
   return;
 #endif
   // O_NONBLOCK on the read end: an empty pipe answers EAGAIN rather
-  // than blocking, and the reader must wait for readiness and retry,
-  // with the watch's probes in front of it, until the producer closes.
+  // than blocking, and the reader must wait for readiness and retry
+  // until the producer closes.
   //
-  // Outside Darwin the watch waits for readiness before each read(), so
-  // the read()-level EAGAIN branch in read_some() is reached only when
-  // another reader empties the pipe between the two calls, which no test
-  // here makes happen deterministically. That branch is Darwin coverage.
+  // On a non-blocking descriptor the reader reads first and waits on
+  // EAGAIN, with the watch's probes in front of the sleep outside
+  // Darwin and Emscripten. The second EAGAIN branch, after a wait, is
+  // reached outside Darwin only when another reader empties the pipe
+  // between the probe and the read, which no test here makes happen
+  // deterministically.
   const auto bytes = pattern(4 * 64 * 1024 + 99, 65);
   os_pipe p;
   REQUIRE(p.open());
@@ -1311,7 +1332,6 @@ TEST_CASE("a pipe whose read end is in PIPE_NOWAIT mode is read to the end") {
 }
 #endif
 
-#if defined(_WIN32)
 // Runs `body` on a thread and ends the process if it has not returned
 // within `limit`: the failures these cases guard are a read that never
 // ends, which no CHECK can report.
@@ -1334,6 +1354,85 @@ void within(std::chrono::seconds limit, const char* what, Body body) {
   t.join();
 }
 
+// poll() skips an entry whose descriptor is negative and reports nothing
+// ready, so a reader that waited on one would sleep for ever. A handle
+// that names no stream is EBADF from every entry, before any wait.
+TEST_CASE("a handle that names no stream is EBADF, not a wait") {
+#if defined(_WIN32)
+  const std::array<detail::native_stream, 2> handles{nullptr,
+                                                     INVALID_HANDLE_VALUE};
+#else
+  const std::array<detail::native_stream, 2> handles{
+      -1, std::numeric_limits<int>::min()};
+#endif
+  for (const detail::native_stream bad : handles) {
+    blake3pp::hasher h;
+    std::error_code thrown;
+    std::error_code reported;
+    within(std::chrono::seconds(5), "a handle that names no stream", [&] {
+      try {
+        (void)blake3pp::update_stream(h, bad,
+                                      blake3pp::get_parallel_scheduler());
+      } catch (const std::system_error& e) {
+        thrown = e.code();
+      } catch (...) {
+      }
+      (void)blake3pp::update_stream(h, bad, blake3pp::get_parallel_scheduler(),
+                                    reported);
+    });
+    CHECK(thrown == std::errc::bad_file_descriptor);
+    CHECK(reported == std::errc::bad_file_descriptor);
+    CHECK(h.count() == 0);
+    std::error_code from_reader;
+    try {
+      const detail::stream_reader reader{bad};
+      (void)reader;
+    } catch (const std::system_error& e) {
+      from_reader = e.code();
+    }
+    CHECK(from_reader == std::errc::bad_file_descriptor);
+  }
+}
+
+#if defined(__linux__)
+// Linux reports no POLLHUP on a FIFO until a writer has connected, while
+// read() on one opened O_NONBLOCK reports the end at once. A reader that
+// waited for readiness first would never return.
+TEST_CASE("a FIFO opened non-blocking that no writer ever opens is an empty stream") {
+  const std::filesystem::path path =
+      std::filesystem::temp_directory_path() /
+      ("blake3pp_pipe_source_fifo_" + std::to_string(::getpid()));
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  REQUIRE(::mkfifo(path.c_str(), 0600) == 0);
+  const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+  // Unlinked at once: the descriptor keeps the FIFO, and no writer can
+  // open it by name.
+  std::filesystem::remove(path, ignored);
+  REQUIRE(fd >= 0);
+  std::optional<blake3pp::digest> got;
+  std::uint64_t bytes = 0;
+  std::string error;
+  within(std::chrono::seconds(5), "a FIFO with no writer", [&] {
+    try {
+      blake3pp::hasher h;
+      const blake3pp::stream_report r =
+          blake3pp::update_stream(h, fd, blake3pp::get_parallel_scheduler());
+      bytes = r.bytes;
+      got = h.finalize();
+    } catch (const std::exception& e) {
+      error = e.what();
+    }
+  });
+  ::close(fd);
+  CHECK(error.empty());
+  REQUIRE(got.has_value());
+  CHECK(*got == blake3pp::hash(std::span<const std::byte>{}));
+  CHECK(bytes == 0);
+}
+#endif
+
+#if defined(_WIN32)
 // GetFileType calls a socket a pipe, but a non-overlapped socket whose
 // peer closed answers every read with success and nothing moved, and
 // never with an error. Read as a pipe's zero-length message, that is a

@@ -148,6 +148,21 @@
       }
     },
     {
+      "name": "macos-clang22-cxx26-tsan",
+      "displayName": "macOS Homebrew LLVM 22, C++26, ThreadSanitizer",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/macos-clang22-cxx26-tsan",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/macos-clang22-cxx26-tsan/macos-clang22-cxx26-tsan.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
       "name": "freebsd-clang-cxx23",
       "displayName": "FreeBSD base Clang, C++23 (POSIX AIO on a kqueue)",
       "generator": "Ninja",
@@ -467,6 +482,15 @@
       }
     },
     {
+      "name": "macos-clang22-cxx26-tsan",
+      "configurePreset": "macos-clang22-cxx26-tsan",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
       "name": "freebsd-clang-cxx23",
       "configurePreset": "freebsd-clang-cxx23",
       "condition": {
@@ -661,6 +685,18 @@
     {
       "name": "macos-clang22-cxx26",
       "configurePreset": "macos-clang22-cxx26",
+      "output": {
+        "outputOnFailure": true
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
+      "name": "macos-clang22-cxx26-tsan",
+      "configurePreset": "macos-clang22-cxx26-tsan",
       "output": {
         "outputOnFailure": true
       },

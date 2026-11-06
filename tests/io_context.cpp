@@ -25,7 +25,6 @@
 #include <memory>
 #include <optional>
 #include <ostream>
-#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -38,6 +37,7 @@
 #include <blake3pp/detail/file_reader.hpp>
 #include <doctest/doctest.h>
 
+#include "temp_names.hpp"
 #include "io/backend.hpp"
 #include "io/engine.hpp"
 #include "io/stdio_backend.hpp"
@@ -50,6 +50,10 @@
 #include "io/uring_backend.hpp"
 #endif
 #if defined(__FreeBSD__)
+#include <aio.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include "io/aio_backend.hpp"
 #endif
 #if defined(_WIN32)
@@ -78,9 +82,8 @@ std::vector<std::byte> pattern(std::size_t len, std::uint32_t seed) {
 struct temp_file {
   fs::path path;
   explicit temp_file(const std::vector<std::byte>& content) {
-    static const unsigned run_id = std::random_device{}();
     path = fs::temp_directory_path() /
-           ("blake3pp_ctx_test_" + std::to_string(run_id) + "_" +
+           ("blake3pp_ctx_test_" + b3test::process_salt() + "_" +
             std::to_string(counter++));
     std::string chars(content.size(), '\0');
     std::ranges::transform(content, chars.begin(),
@@ -1305,6 +1308,106 @@ TEST_CASE("aio: transfers the kernel would not take are served by poll()") {
   CHECK(ctx.served_synchronously() == 2);
   CHECK(std::equal(got_a.begin(), got_a.end(), content.begin()));
   CHECK(std::equal(got_b.begin(), got_b.end(), content.begin() + len / 2));
+}
+
+// lio_listio queues each entry on its own and answers EAGAIN when any
+// entry was refused for room, whatever happened to the others. Here the
+// per-process queue is filled with reads of an empty socket, which stay
+// queued, and three slots are freed, so the context's batch of eight is
+// taken in part. Every transfer must complete exactly once, with its
+// bytes: an accepted entry kept pending is queued a second time.
+TEST_CASE("aio: a batch the kernel takes in part completes each transfer once") {
+  int sv[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  // Reads of the socket, held queued until bytes arrive. The limit is
+  // whatever the kernel says it is; a queue that never fills is too
+  // large to test this way.
+  constexpr std::size_t cap = 8192;
+  std::vector<struct aiocb> held(cap);
+  std::vector<char> sink(cap);
+  std::size_t queued = 0;
+  for (; queued < cap; ++queued) {
+    struct aiocb& cb = held[queued];
+    std::memset(&cb, 0, sizeof cb);
+    cb.aio_fildes = sv[0];
+    cb.aio_buf = &sink[queued];
+    cb.aio_nbytes = 1;
+    cb.aio_sigevent.sigev_notify = SIGEV_NONE;
+    if (::aio_read(&cb) != 0) {
+      REQUIRE(errno == EAGAIN);
+      break;
+    }
+  }
+  // Reaps the oldest held reads after sending them a byte each, which
+  // gives their slots back.
+  std::size_t reaped = 0;
+  const auto release_held = [&](std::size_t count) {
+    const std::vector<char> bytes(count, 'x');
+    REQUIRE(::write(sv[1], bytes.data(), count) ==
+            static_cast<ssize_t>(count));
+    for (std::size_t i = 0; i < count; ++i, ++reaped) {
+      struct aiocb& cb = held[reaped];
+      const struct aiocb* list[1] = {&cb};
+      while (::aio_error(&cb) == EINPROGRESS) {
+        (void)::aio_suspend(list, 1, nullptr);
+      }
+      CHECK(::aio_return(&cb) == 1);
+    }
+  };
+  if (queued == cap || queued < 8) {
+    release_held(queued);
+    ::close(sv[0]);
+    ::close(sv[1]);
+    MESSAGE("skipped: the per-process AIO queue holds " << queued);
+    return;
+  }
+  release_held(3);
+
+  constexpr std::size_t n = 8;
+  constexpr std::size_t piece = 4096;
+  const auto content = pattern(n * piece, 43);
+  const temp_file f(content);
+  {
+    io_impl::aio_context ctx({}, n);
+    io_impl::aio_context::file file(ctx, f.path, io_impl::file_open_options{});
+    std::vector<std::vector<std::byte>> got(n, std::vector<std::byte>(piece));
+    std::array<probe, n> probes{};
+    std::array<io_impl::aio_context::transfer, n> ops{};
+    for (std::size_t i = 0; i < n; ++i) {
+      ops[i].done = &probe::on_done;
+      ops[i].owner = &probes[i];
+      ctx.submit_read(file, i * piece, std::span(got[i]), ops[i]);
+    }
+    const auto calls = [&] {
+      int sum = 0;
+      for (const probe& p : probes) {
+        sum += p.calls;
+      }
+      return sum;
+    };
+    std::size_t polls = 0;
+    while (calls() < static_cast<int>(n)) {
+      ctx.poll(true);
+      ++polls;
+      REQUIRE(polls < 1000);
+    }
+    // A transfer queued twice completes twice; give a second completion
+    // the chance to arrive.
+    for (int i = 0; i < 4; ++i) {
+      ctx.poll(false);
+    }
+    CHECK(ctx.in_flight() == 0);
+    for (std::size_t i = 0; i < n; ++i) {
+      CAPTURE(i);
+      CHECK(probes[i].calls == 1);
+      CHECK(!probes[i].ec);
+      CHECK(std::equal(got[i].begin(), got[i].end(),
+                       content.begin() + static_cast<std::ptrdiff_t>(i * piece)));
+    }
+  }
+  release_held(queued - reaped);
+  ::close(sv[0]);
+  ::close(sv[1]);
 }
 
 // A length that is not a multiple of the direct-I/O granule is the last

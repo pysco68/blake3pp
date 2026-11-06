@@ -291,28 +291,39 @@ auto r = blake3pp::update_stream(h, blake3pp::standard_input(),
 auto d = h.finalize();
 ```
 
-The reader fills one window on the calling thread while the pool hashes
-the ones before it. A producer that keeps up fills every window, and the
-run is bounded by the hash or by the stream itself. A producer that does
-not has its windows ended when the stream runs dry with at least half a
-window in hand, and what arrived is hashed as a run of subtrees rather
-than waited for. The `stream_report` the call returns says how many
-windows ended that way.
+The calling thread reads one window while the pool hashes the ones
+before it. A producer that keeps up fills every window, and the run is
+bounded by the hash or by the stream itself. How a window ends behind a
+slower producer depends on the platform:
 
-The hand-over condition is an observable rather than a clock: the fill
-blocks for the first bytes, drains what is queued without blocking, and
-gives the window up on an empty stream. An empty stream is proof that the
-producer is not waiting on the reader, so blocking for its next write is
-free, and the producer is never left blocked on a pipe nobody is
-draining. Half a window is the floor because a hand-over costs a round
-trip through the pool and what it buys is overlap, so a short prefix is
-not worth one. The behaviour is the same on every platform.
+- **POSIX** ends a window early when the stream runs dry with at least
+  half a window in hand, and hashes what arrived as a run of subtrees,
+  so the pool starts before the window is full.
+- **Windows** ends a window only when it is full or the stream ends. Its
+  pipe holds about one producer write, so the producer paces every
+  window either way, and an early hand-over would only split the work.
+
+The dry signal is a read that comes back short of its ask; no clock is
+involved. Every read blocks until the producer writes. An empty stream
+means the producer is not waiting on the reader, so the reader's block
+holds nothing up, and the producer is never left blocked on a pipe
+nobody is draining. On POSIX platforms other than Darwin and Emscripten,
+the reader watches an empty stream for a few microseconds before it
+blocks, which saves a wake-up per producer write. On Linux the reader
+first asks the OS for a 1 MiB pipe buffer.
+
+The `stream_report` the call returns says what happened: the windows
+and how many ended early, the pipe buffer the OS granted, what the
+watch caught, and on Windows the bound on a read's ask. The
+`stream_io_options` set the window size, the number of windows
+(`blake3ppsum --qd` sets it for a stream) and the pipe buffer to ask
+for.
 
 The hasher must sit on a window boundary, which every fresh one does; a
 hasher part-way through a window cannot be brought onto the grid from a
 stream, because the window that would do it is the one window a stream
 cannot promise to fill. `--diag` reads a stream run like any other, with
-the stream as the device.
+the stream as the device, and adds lines for the stream itself.
 
 ### Writing a file
 

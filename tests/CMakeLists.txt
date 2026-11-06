@@ -1,6 +1,6 @@
-# doctest: a single-header framework with no dependency tree. Still built
-# from source with the project's own toolchain flags rather than a system
-# package: the matrix includes libc++ builds. AtConfigureTime because the
+# doctest: a single-header framework with no dependency tree, built from
+# source with the project's own toolchain flags because the matrix
+# includes libc++ builds. AtConfigureTime because the
 # doctest_discover_tests() cmake module (installed into the config dir) is
 # include()d below, at configure.
 FetchContent_Declare(doctest
@@ -92,7 +92,13 @@ if(EMSCRIPTEN)
   # emscripten's isatty says "terminal" and the ANSI-colored listing
   # defeats the parser. One aggregate entry (emulator-wrapped by ctest)
   # keeps the whole suite running instead.
-  add_test(NAME blake3pp_tests COMMAND blake3pp_tests --no-colors)
+  # Every case runs in this one process, so a stalled case would hold the
+  # run until the CI job's own limit. The timeout fails it instead, and
+  # --duration prints each case as it ends, so the output of a timed-out
+  # run names the last case that finished.
+  add_test(NAME blake3pp_tests
+    COMMAND blake3pp_tests --no-colors --duration=true)
+  set_tests_properties(blake3pp_tests PROPERTIES TIMEOUT 600)
 elseif(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
   # Discovery must RUN the binary, which a cross build without an
   # emulator cannot (e.g. arm64-windows built on x64). Register the

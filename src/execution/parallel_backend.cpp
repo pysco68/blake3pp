@@ -192,7 +192,7 @@ struct bulk_job final : job {
     for (std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
          i < chunks; i = next.fetch_add(1, std::memory_order_relaxed)) {
       const std::size_t begin = i * chunk_length;
-      proxy.execute(begin, std::min(begin + chunk_length, shape));
+      proxy.execute(begin, detail::bulk_chunk_end(begin, chunk_length, shape));
     }
   }
   void complete() noexcept override { proxy.set_value(); }
@@ -308,7 +308,9 @@ auto query_parallel_scheduler_backend()
       const std::lock_guard lock{blake3pp::sizing_mutex()};
       const unsigned sized = blake3pp::g_threads.load(std::memory_order_relaxed);
       blake3pp::g_started.store(true, std::memory_order_relaxed);
-      return sized != 0 ? sized : std::max(1u, std::thread::hardware_concurrency());
+      return sized != 0 ? sized
+                        : blake3pp::detail::pool_threads(
+                              std::thread::hardware_concurrency());
     }();
     return std::make_shared<blake3pp::sized_backend>(threads);
   }();

@@ -1,13 +1,16 @@
 // The browser module: the library's types behind embind, under their own
 // names. hasher, parallel_hasher and output_reader keep the member
-// functions they have in C++; the one-shot hash() has both its shapes;
-// the dispatch queries are the ones blake3ppsum --version prints. What
-// the boundary changes: bytes are passed as (address, length) into the
-// module's memory, which the embedder gets from Module._malloc and
-// writes through Module.HEAPU8 (JavaScript cannot hand over a span);
-// digests come back as hex; and a scheduler is an object, thread_pool,
-// which the embedder owns and passes exactly as C++ code passes a
-// scheduler (it must outlive every parallel_hasher made from it).
+// functions they have in C++, the one-shot hash() has both its shapes,
+// and the dispatch queries are the ones blake3ppsum --version prints.
+//
+// What the boundary changes:
+//   * Bytes are passed as (address, length) into the module's memory,
+//     which the embedder gets from Module._malloc and writes through
+//     Module.HEAPU8. JavaScript cannot hand over a span.
+//   * Digests come back as hex.
+//   * A scheduler is an object, thread_pool, which the embedder owns and
+//     passes exactly as C++ code passes a scheduler. It must outlive
+//     every parallel_hasher made from it.
 //
 // Every call runs on the thread that instantiated the module and a
 // pooled call blocks it until the pool is done, so a page puts the
@@ -40,9 +43,9 @@ arch arch_named(const std::string& name) {
   return arch_from_string(name).value_or(arch::auto_detect);
 }
 
-/// A pool of exactly this many threads (exec::static_thread_pool under
-/// stdexec; the process-wide parallel scheduler under the other
-/// providers, as the CLI tools do), owned by the embedder.
+// The embedder's pool: an exec::static_thread_pool of exactly this many
+// threads under stdexec. Under the other providers it hands out the
+// process-wide parallel scheduler and the count is not used.
 class thread_pool {
  public:
   explicit thread_pool(unsigned threads)

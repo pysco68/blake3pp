@@ -41,11 +41,11 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
-#include <random>
 #include <ratio>
 #include <vector>
 
 #include "suite_pool.hpp"
+#include "temp_names.hpp"
 #include "test_schedulers.hpp"
 
 #include <blake3pp/detail/ex_compat.hpp>
@@ -364,9 +364,8 @@ std::vector<std::byte> pattern(std::size_t len, std::uint32_t seed) {
 struct temp_file {
   fs::path path;
   explicit temp_file(const std::vector<std::byte>& content) {
-    static const unsigned run_id = std::random_device{}();
     path = fs::temp_directory_path() /
-           ("blake3pp_pipe_test_" + std::to_string(run_id) + "_" +
+           ("blake3pp_pipe_test_" + b3test::process_salt() + "_" +
             std::to_string(counter++));
     std::string chars(content.size(), '\0');
     std::ranges::transform(content, chars.begin(),

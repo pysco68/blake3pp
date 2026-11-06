@@ -101,7 +101,7 @@ jobs:
           # newer. The notes below say so where a user will read it.
           #
           # ci already stripped these in the build job (they cross the
-          # artifact store and then an ssh pipe into a guest, and 189 MB
+          # artifact store and then an ssh pipe into a guest, and 200 MB
           # of debug info does neither cheaply); the strip here is the
           # same belt-and-braces the Linux loop applies, and llvm-strip
           # takes a FreeBSD-OSABI ELF of either architecture without

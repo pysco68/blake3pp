@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <chrono>
 #include <filesystem>
-#include <random>
 #include <ratio>
 #include <span>
 #include <stdexcept>
@@ -36,6 +35,7 @@
 #include <blake3pp/parallel_io.hpp>
 #include <blake3pp/trace.hpp>
 
+#include "temp_names.hpp"
 #include "test_schedulers.hpp"
 #include <doctest/doctest.h>
 
@@ -67,9 +67,8 @@ void fill_from_offset(std::span<std::byte> out, std::uint64_t off) noexcept {
 struct temp_path {
   fs::path path;
   temp_path() {
-    static const unsigned run = std::random_device{}();
     path = fs::temp_directory_path() /
-           ("blake3pp_wp_" + std::to_string(run) + "_" +
+           ("blake3pp_wp_" + b3test::process_salt() + "_" +
             std::to_string(counter++));
   }
   ~temp_path() {

@@ -18,13 +18,59 @@ target_link_libraries(blake3ppgen PRIVATE
   blake3pp::tool_allocator
   blake3pp::node_program)
 
+# The same two sources, built so that --help prints the placeholders
+# docs/tools.md uses in place of what depends on the machine or the build
+# (the core count, the async engines). tools/gen-help-docs.py runs
+# them to write and check the transcripts there. Not built by default and
+# not installed.
+foreach(_tool IN ITEMS sum gen)
+  add_executable(blake3pp${_tool}_help_docs EXCLUDE_FROM_ALL ${_tool}.cpp)
+  target_compile_definitions(blake3pp${_tool}_help_docs PRIVATE
+    BLAKE3PP_HELP_DOCS=1)
+  target_link_libraries(blake3pp${_tool}_help_docs PRIVATE
+    blake3pp::blake3pp
+    blake3pp_warnings
+    blake3pp::tooling
+    blake3pp::tool_allocator
+    blake3pp::node_program)
+  if(TARGET blake3pp_parallel_backend)
+    target_link_libraries(blake3pp${_tool}_help_docs PRIVATE
+      blake3pp::parallel_backend)
+  endif()
+endforeach()
+add_custom_target(help_docs
+  DEPENDS blake3ppsum_help_docs blake3ppgen_help_docs)
+
+# Names on Windows. The tools take names as narrow strings: from argv, from
+# checksum lists, and into std::filesystem::path and the narrow CRT, all
+# of which use the process's ANSI code page. utf8.manifest sets that code
+# page to UTF-8, so a name is its UTF-8 bytes there as on every other
+# platform, and the lines the tools print are UTF-8. CMake merges a
+# .manifest source with the manifest the linker generates and embeds the
+# result, for link.exe and lld-link alike. /utf-8 makes the literal
+# encoding UTF-8 under cl as it already is under clang-cl, which is what
+# makes std::print write to a console through the wide console API: names
+# then display whatever the console's own code page is, and the console's
+# setting is left alone.
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  foreach(_tool IN ITEMS blake3ppsum blake3ppgen
+      blake3ppsum_help_docs blake3ppgen_help_docs)
+    target_sources(${_tool} PRIVATE utf8.manifest)
+    target_compile_options(${_tool} PRIVATE /utf-8)
+  endforeach()
+endif()
+
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell). They cover known answers, --check round
-# trips with corruption detection, the key forms, the stream and --diag
-# paths, the generator's determinism, seek and --output, and the usage
-# errors (see smoketest.cmake).
-foreach(case version engines empty_stdin stdin_parallel stdin_diag check_roundtrip
-    check_batched length_prefix
+# trips with corruption detection, the checksum-list format (escaped
+# names, CRLF lists, the closing counts), names outside the ANSI code
+# page, the key forms, the stream and --diag paths, the generator's
+# determinism, seek and --output, and the usage errors (see
+# smoketest.cmake).
+foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
+    check_roundtrip check_batched check_empty_list check_crlf check_names
+    check_escaped_line check_nonhex check_counts utf8_names check_utf8_list
+    gen_utf8_names length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
     gen_output gen_seed_file sum_errors key_forms gen_errors)
   add_test(NAME cli_${case}
@@ -38,6 +84,21 @@ foreach(case version engines empty_stdin stdin_parallel stdin_diag check_roundtr
       "-DEMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()
+
+# A standard input in O_NONBLOCK mode, driven from Python because CMake
+# script mode cannot set the flag on a pipe. It runs in cross builds too,
+# under the emulator, which is where the wasm build's node meets it. The
+# interpreter is named by path: ctest runs a command that names a target
+# under the emulator, which would hand Python to node.
+if(NOT WIN32)
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME cli_stdin_nonblock
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/stdin_nonblock.py"
+        "${CMAKE_CURRENT_BINARY_DIR}/smoke-stdin_nonblock"
+        "$<TARGET_FILE:blake3ppsum>" ${CMAKE_CROSSCOMPILING_EMULATOR})
+  endif()
+endif()
 
 # Fault tests: blake3ppsum and blake3ppgen in pipelines whose producer
 # closes early, dies or stalls, whose reader goes away, whose stdin is

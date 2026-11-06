@@ -1058,7 +1058,7 @@ struct pipeline_plan {
   // interior one like any other, and goes to the pool as a subtree
   // instead of to the hasher as a tail. A span that does not end the
   // message has to be a whole number of windows, which the scope
-  // asserts, since a partial one could not be a subtree.
+  // checks in every build, since a partial one could not be a subtree.
   bool ends_message = true;
   // Whether the source is a stream: a pipe, a socket, anything whose
   // bytes arrive rather than sit. Its length is not known in advance,
@@ -1482,9 +1482,10 @@ class window_scope
     // Where each window's bytes actually are is the driver's answer, and
     // it is asked per window, because a source already in memory has a
     // different view for every offset.
-    assert((ends_message_ || streaming_ || file_bytes_ % window_bytes_ == 0) &&
-           "a span that does not end the message must be a whole number "
-           "of windows: a partial one cannot be absorbed as a subtree");
+    require(ends_message_ || streaming_ || file_bytes_ % window_bytes_ == 0,
+            "run_window_pipeline(): a span that does not end the message "
+            "must be a whole number of windows: a partial one cannot be "
+            "absorbed as a subtree");
     // A stream has to start on the grid. The short first window is read
     // whole or not at all -- its length is what plan_short_first splits
     // into a head for the hasher and parts for the pool -- and a

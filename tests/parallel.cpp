@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -293,10 +294,10 @@ TEST_CASE("parallel fill matches the sequential output stream") {
 
   // A segment request below one block is rounded up to a block.
   auto seq = h.finalize_xof();
-  std::vector<std::byte> expected(1000);
+  std::array<std::byte, 1000> expected{};
   seq.fill(expected);
   auto par = h.finalize_xof();
-  std::vector<std::byte> got(1000);
+  std::array<std::byte, 1000> got{};
   blake3pp::fill(par, got, sched, 7);
   CHECK(got == expected);
 }
@@ -308,6 +309,30 @@ TEST_CASE("parallel hash is deterministic across runs") {
   for (int r = 0; r < 5; ++r) {
     CHECK(blake3pp::hash(input, sched) == first);
   }
+}
+
+// hardware_concurrency() may answer 0; the process pool is never sized 0.
+TEST_CASE("the process pool size from a hardware count is at least one") {
+  static_assert(blake3pp::detail::pool_threads(0) == 1);
+  static_assert(blake3pp::detail::pool_threads(1) == 1);
+  static_assert(blake3pp::detail::pool_threads(16) == 16);
+  CHECK(blake3pp::detail::pool_threads(0) == 1);
+  CHECK(blake3pp::detail::pool_threads(16) == 16);
+}
+
+// The last bulk chunk ends at shape even where begin + chunk_length
+// would wrap.
+TEST_CASE("a bulk chunk ends at the shape near the top of size_t") {
+  using blake3pp::detail::bulk_chunk_end;
+  constexpr std::size_t max = std::numeric_limits<std::size_t>::max();
+  constexpr std::size_t half = max / 2 + 1;  // per-chunk length on two agents
+  static_assert(bulk_chunk_end(0, half, max) == half);
+  static_assert(bulk_chunk_end(half, half, max) == max);
+  static_assert(bulk_chunk_end(max - 1, 8, max) == max);
+  static_assert(bulk_chunk_end(0, 8, 20) == 8);
+  static_assert(bulk_chunk_end(16, 8, 20) == 20);
+  CHECK(bulk_chunk_end(half, half, max) == max);
+  CHECK(bulk_chunk_end(16, 8, 20) == 20);
 }
 
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) && defined(__APPLE__)

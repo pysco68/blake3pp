@@ -428,6 +428,15 @@ jobs:
 
       - name: Configure, build, test (full emulator matrix)
         run: bash tools/ci-test.sh ${{ matrix.preset }}
+      # The --help transcripts in docs/tools.md come from the *_help_docs
+      # targets, which print placeholders for everything machine- or
+      # build-dependent, so one lane checks them for every machine.
+      - name: Build the --help documentation targets
+        if: matrix.preset == 'linux-gcc16-cxx26'
+        run: cmake --build build/${{ matrix.preset }} --target help_docs
+      - name: Check docs/tools.md against them (fix with tools/gen-help-docs.py)
+        if: matrix.preset == 'linux-gcc16-cxx26'
+        run: python3 tools/gen-help-docs.py --bin-dir build/${{ matrix.preset }}/cli --check
       - name: Upload coverage report
         if: contains(matrix.preset, 'coverage')
         uses: actions/upload-artifact@v7
@@ -717,8 +726,8 @@ jobs:
 
       # Before the upload, because the debug info would otherwise cross
       # the artifact store AND then the ssh pipe into the guest: the tests,
-      # the two tools and the two benches are 189 MB with it and under
-      # 10 MB without. The pipe instruments are stripped with them. Same
+      # the two tools and the two benches are about 200 MB with it and
+      # about 10 MB without. The pipe instruments are stripped with them. Same
       # candidate loop as the release job's packaging step, with plain GNU
       # strip as the last resort: the target is x86_64 ELF carrying a
       # FreeBSD OSABI byte, which BFD strips without caring which kernel
@@ -1031,7 +1040,7 @@ jobs:
           done
           [ "$missing" = 0 ]
 
-      # Before the upload, for the same reason as the amd64 lane: 189 MB
+      # Before the upload, for the same reason as the amd64 lane: 200 MB
       # of debug info has to cross the artifact store AND then the ssh
       # pipe into the guest. The stripper candidates lead with the
       # aarch64 cross binutils, because the host `strip` in this image

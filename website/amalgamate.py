@@ -148,7 +148,7 @@ def inline(rel, seen, variant):
 def strip_comments(text: str) -> str:
     """Drop C and C++ comments, leaving string literals alone.
 
-    The pasted library is nine thousand lines of a reader's screen, and
+    The pasted library is many thousand lines of a reader's screen, and
     its comments document a build this file is not: the shipped library
     has a translation unit per kernel, and this has one. The banner at
     the top says so, and says it once.
@@ -223,7 +223,7 @@ def main():
     args = ap.parse_args()
 
     # Whatever ends up at the bottom, the reader has to be told it is
-    # there: everything above it is nine thousand lines of library.
+    # there: everything above it is many thousand lines of library.
     demo = args.demo_name or ("" if args.no_demo else "the demo")
     notice = ""
     if demo:

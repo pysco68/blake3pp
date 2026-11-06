@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <exception>
 #include <format>
+#include <limits>
 #include <optional>
 #include <ratio>
 #include <span>
@@ -54,6 +55,11 @@ std::optional<std::uint64_t> parse_size(const std::string& text) {
   if (text == "inf") {
     return std::nullopt;
   }
+  // std::stoull skips leading whitespace and negates a leading '-', so a
+  // size has to start with a digit.
+  if (text.empty() || text[0] < '0' || text[0] > '9') {
+    throw CLI::ValidationError("size", "malformed size");
+  }
   std::size_t consumed = 0;
   const std::uint64_t base = std::stoull(text, &consumed);
   std::uint64_t multiplier = 1;
@@ -67,6 +73,9 @@ std::optional<std::uint64_t> parse_size(const std::string& text) {
     }
   } else if (consumed != text.size()) {
     throw CLI::ValidationError("size", "malformed size");
+  }
+  if (base > std::numeric_limits<std::uint64_t>::max() / multiplier) {
+    throw CLI::ValidationError("size", "too large");
   }
   return base * multiplier;
 }
@@ -236,10 +245,10 @@ int run_main(int argc, char** argv) {
   auto* trace_opt = app.add_option("--trace", trace_path, "with --output and --length, on the pipelined path: record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)")->needs(output_opt);
   app.add_flag("--trace-agents", trace_agents, "with --trace: also record which CPU filled each window, and for how long")->needs(trace_opt);
   app.add_flag("--diag", diag, "report on stderr which side limited the run (the generator or the device); needs --output and --length on the pipelined path")->needs(output_opt);
-  app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 4 MiB per generator thread, so every fill fans out fully)")->needs(output_opt);
-  app.add_option("--qd", qd, "with --output: write buffers in flight (default: one per generator thread, or 2 with --threads 1; the writer clamps it to its range)")->needs(output_opt);
+  app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 8 MiB with --threads 1; otherwise 4 MiB with --length, or without it 4 MiB per generator thread up to 64 MiB)")->needs(output_opt);
+  app.add_option("--qd", qd, "with --output: write buffers in flight (default: one per generator thread with --length and more than one thread, otherwise 2; the writer clamps it to its range)")->needs(output_opt);
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
-  app.add_option("--threads", threads, "generator threads (1 = sequential; default: all)")->check(b3tool::at_least_one_thread)->capture_default_str();
+  app.add_option("--threads", threads, "generator threads (1 = sequential; default: all)")->check(b3tool::at_least_one_thread)->default_str(b3tool::threads_default_str());
   CLI11_PARSE(app, argc, argv);
 
   std::optional<std::uint64_t> length;
@@ -251,6 +260,10 @@ int run_main(int argc, char** argv) {
       throw CLI::ValidationError("--seek", "must be finite");
     }
     seek = *seek_to;
+    // --window is MiB in a size_t; above this the byte count wraps.
+    if (window_mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+      throw CLI::ValidationError("--window", "too large");
+    }
   } catch (const std::exception& e) {
     println(stderr, "blake3ppgen: {}", e.what());
     return b3tool::exit_usage;

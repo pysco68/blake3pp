@@ -30,6 +30,7 @@
 #include <blake3pp/parallel_backend.hpp>
 #include <doctest/doctest.h>
 
+#include "temp_names.hpp"
 
 namespace {
 namespace fs = std::filesystem;
@@ -53,9 +54,8 @@ class temp_file {
     // A name of its own, with nothing POSIX-only in it: this suite runs
     // on every platform the library builds for.
     static std::atomic<unsigned> counter{0};
-    static const unsigned salt = std::random_device{}();
     path_ = fs::temp_directory_path() /
-            ("blake3pp_async_" + std::to_string(salt) + "_" +
+            ("blake3pp_async_" + b3test::process_salt() + "_" +
              std::to_string(counter.fetch_add(1)));
     std::ofstream out(path_, std::ios::binary);
     out.write(reinterpret_cast<const char*>(content.data()),

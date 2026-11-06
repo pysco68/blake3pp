@@ -245,19 +245,23 @@ it also measures natively. qemu-user is no help here: the toolchain
 images' qemu has no TCG plugins (no guest instruction count), and TCG
 timings say nothing about a CPU's indirect branches.
 
-### Result on a Zen 3
+### Results
 
-Zen 3 (Ryzen 7 PRO 6860Z), gcc 16: the dispatch is one instruction,
-the load of the function pointer; the indirect call replaces a direct
-call one for one and is predicted (the branch-miss rate through the
-table equals the rate by name). At the leaf batch that is 0.002–0.003 %
-of the instructions on every variant, flat across widths, because a
-wider kernel is dispatched half as often per byte and does half the
-instructions per chunk; in cycles the difference sits inside the 2 %
-run-to-run noise. Per 64-byte block it is 0.1 % of the instructions and
-3–18 cycles of about 300 under GCC; under clang, zero extra
-instructions at the leaf batch, two per block, and no cycle
-difference at all.
+Instructions, Zen 3 (Ryzen 7 PRO 6860Z), gcc 16: the dispatch is one
+instruction, the load of the function pointer; the indirect call
+replaces a direct call one for one and is predicted (the branch-miss
+rate through the table equals the rate by name). At the leaf batch that
+is 0.002–0.003 % of the instructions on every variant, flat across
+widths, because a wider kernel is dispatched half as often per byte and
+does half the instructions per chunk. Per 64-byte block it is 0.1 % of
+the instructions; under clang, zero extra instructions at the leaf batch
+and two per block.
+
+Time, on idle cloud servers (Neoverse V2, Neoverse N1 and Zen 5, medians
+of 9 interleaved reps): at one call per 64-byte block, dispatched and
+by-name calls are within 0.1 ns of each other on every core and
+variant. At the leaf batch they differ by 0.1–2 %, with the sign changing
+between shapes and machines, which is the run-to-run spread.
 
 ## Pipe instruments
 
