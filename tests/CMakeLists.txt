@@ -1,6 +1,6 @@
-# doctest: a single-header framework with no dependency tree. Still built
-# from source with the project's own toolchain flags rather than a system
-# package: the matrix includes libc++ builds. AtConfigureTime because the
+# doctest: a single-header framework with no dependency tree, built from
+# source with the project's own toolchain flags because the matrix
+# includes libc++ builds. AtConfigureTime because the
 # doctest_discover_tests() cmake module (installed into the config dir) is
 # include()d below, at configure.
 FetchContent_Declare(doctest

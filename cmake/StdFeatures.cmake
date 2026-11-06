@@ -151,6 +151,7 @@ endif()
 #   stdexec - NVIDIA stdexec: the performance workhorse (C++20+)
 # Exactly one of BLAKE3PP_EXECUTION_{STD,BEMAN,STDEXEC} lands on
 # blake3pp::features; <blake3pp/parallel.hpp> switches on it.
+#
 # The opt-in sized parallel scheduler (<blake3pp/parallel_backend.hpp>).
 # P2079's scheduler is process-wide and takes no size; a program chooses
 # otherwise by replacing the backend, one definition per program. ON
@@ -200,8 +201,8 @@ int main() {
 ]])
 
 # stdexec is needed by the stdexec provider alone: beman ships its own
-# parallel_scheduler backend as of 2026-09-12, so choosing beman no longer
-# pulls stdexec into the build.
+# parallel_scheduler backend, so choosing beman does not pull stdexec into
+# the build.
 #
 # It is also the one INTERLOCKED (populate-only) hfc content, by policy: its
 # upstream CMake pulls rapids-cmake from the network at configure time, so

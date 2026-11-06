@@ -140,7 +140,7 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
   # MSVC-style drivers. /W4 is the sane maximum (/Wall drowns in STL noise),
   # and clang-cl needs it for the same reason cl.exe does: its driver aliases
   # the GNU spelling -Wall to /Wall, i.e. -Weverything, which buries the build
-  # in -Wc++98-compat noise about the C++23 the library is written in. /W4
+  # in -Wc++98-compat noise about the C++20 the library is written in. /W4
   # maps to -Wall -Wextra under clang-cl, so the two extra GNU-spelled flags
   # below still add up to the set the GNU branch asks for.
   target_compile_options(blake3pp_warnings INTERFACE /W4)
