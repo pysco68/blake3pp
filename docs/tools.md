@@ -329,7 +329,7 @@ virtual disk, through the page cache where `--no-direct` appears.
 
 For the **tools** (blake3ppsum, blake3ppgen, benchmarks),
 [mimalloc](https://github.com/microsoft/mimalloc/) is the default
-allocator on every supported target (`BLAKE3PP_TOOL_MIMALLOC`, off only
-for wasm and macOS).
+allocator on every supported target (`BLAKE3PP_TOOL_MIMALLOC`, off by
+default for wasm and macOS, and forced off in sanitizer builds).
 
 The library itself stays allocator-neutral.
