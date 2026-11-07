@@ -68,6 +68,30 @@ audit_kernels() {  # <build-dir>
 }
 audit_kernels "${build_dir}"
 
+# A kernel built by a second compiler (vxe, xthead) is a custom command,
+# whose header dependencies only exist if its depfile reached ninja. Each
+# such object must list the headers it reads (dispatch.hpp, which every
+# kernel reaches through kernel.hpp, stands for them), or an edit to one
+# leaves a stale object in an incremental build.
+check_external_kernel_deps() {  # <build-dir>
+  [ -f "$1/build.ninja" ] || return 0
+  local obj ok=1
+  # Only the externally compiled kernels are written there.
+  for obj in "$1"/blake3pp_generated/kernel_*.o; do
+    [ -f "${obj}" ] || continue
+    # Captured whole: grep -q would close the pipe at the first match,
+    # and under pipefail ninja's SIGPIPE would read as a missing header.
+    local deps
+    deps=$(ninja -C "$1" -t deps "${obj#"$1"/}")
+    if [[ "${deps}" != *include/blake3pp/dispatch.hpp* ]]; then
+      echo "::error::${preset}: ${obj} does not depend on its kernel headers"
+      ok=0
+    fi
+  done
+  [ "${ok}" = 1 ] || failed_passes+=("external kernel dependencies")
+}
+check_external_kernel_deps "${build_dir}"
+
 # Coverage presets (TC_COVERAGE in the toolchain): every test run below,
 # the SDE pass included, contributes to one report written at the end
 # to build/<preset>/coverage (summary.txt, coverage.lcov, html/). The
