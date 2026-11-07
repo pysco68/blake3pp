@@ -448,6 +448,26 @@ TEST_CASE("a stream window is as long as the stream made it") {
   CHECK(f.size() == 100 * 1024);
 }
 
+// A full window ends by carrying the one byte that proved it was not the
+// last, and that byte opens the next window. A window asked for less than
+// that is refused rather than given a carry it cannot hold.
+TEST_CASE("a stream window shorter than the carry is refused") {
+  const auto bytes = pattern(100 * 1024, 13);
+  test_driver drv(scripted_reader{bytes, all_at_once(bytes.size())},
+                  {.flush_quantum = 16 * 1024});
+  test_driver::file f(drv);
+  drv.reserve(2, 64 * 1024);
+  const detail::window_storage w0 = drv.window_storage_for(f, 0, 0, 64 * 1024);
+  REQUIRE(w0.view.size() == 64 * 1024);
+  CHECK_THROWS_AS((void)drv.window_storage_for(f, 1, 64 * 1024, 0),
+                  std::logic_error);
+  // The carried byte is still there for a window that can hold it.
+  const detail::window_storage w1 =
+      drv.window_storage_for(f, 1, 64 * 1024, 64 * 1024);
+  REQUIRE_FALSE(w1.view.empty());
+  CHECK(w1.view.front() == bytes[64 * 1024]);
+}
+
 TEST_CASE("a stream reports its reads only from poll") {
   const auto bytes = pattern(64 * 1024, 12);
   test_driver drv(scripted_reader{bytes, all_at_once(bytes.size())},
