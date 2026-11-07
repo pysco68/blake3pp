@@ -136,11 +136,24 @@ std::string version_text() {
 std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
   std::string content;
   if (source == "-") {
-    // Room for the hex form plus a line ending; anything longer is not a
-    // key and fails the checks below.
-    std::array<char, 2 * blake3pp::key_size + 4> buf;
-    const std::size_t n = std::fread(buf.data(), 1, buf.size(), stdin);
-    content.assign(buf.data(), n);
+    // Read to the end the way the data path reads standard input, so a
+    // non-blocking or interrupted read does not end the key early. Room
+    // for the hex form plus four bytes of line ending and padding; input
+    // that fills the buffer is longer than any key.
+    blake3pp::detail::stream_reader reader{blake3pp::standard_input()};
+    std::array<std::byte, 2 * blake3pp::key_size + 5> buf;
+    std::size_t n = 0;
+    for (;;) {
+      if (n == buf.size()) {
+        throw std::runtime_error("the key on standard input is too long");
+      }
+      const auto r = reader.read_some(std::span{buf}.subspan(n));
+      if (r.eof) {
+        break;
+      }
+      n += r.bytes;
+    }
+    content.assign(reinterpret_cast<const char*>(buf.data()), n);
   } else {
     std::ifstream in(source, std::ios::binary);
     if (!in) {
@@ -156,9 +169,7 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
     }
     return key;
   }
-  while (!content.empty() && (content.back() == '\n' || content.back() == '\r' || content.back() == ' ')) {
-    content.pop_back();
-  }
+  content.erase(content.find_last_not_of(" \t\r\n") + 1);
   if (const auto parsed = blake3pp::digest::from_hex(content)) {
     return parsed.value().bytes;
   }

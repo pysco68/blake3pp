@@ -716,6 +716,20 @@ elseif(CASE STREQUAL "key_forms")
      OR NOT a STREQUAL b OR NOT a STREQUAL c)
     message(FATAL_ERROR "key forms disagree: raw=${a} hex=${b} stdin=${c}")
   endif()
+  # On stdin the key is read to the end: trailing whitespace, a tab
+  # included, is dropped, and anything after it makes the input no key,
+  # however far past the hex it starts.
+  file(READ "${WORK}/hexkey" hex)
+  file(WRITE "${WORK}/key-tab" "${hex}\t\n")
+  file(WRITE "${WORK}/key-trailer" "${hex}    x")
+  run_sum(t rt ARGS --keyed - f STDIN "${WORK}/key-tab")
+  run_sum(x rx ARGS --keyed - f STDIN "${WORK}/key-trailer")
+  if(NOT rt EQUAL 0 OR NOT t STREQUAL a)
+    message(FATAL_ERROR "a stdin key ending in a tab was not taken: rc=${rt} ${t}")
+  endif()
+  if(rx EQUAL 0)
+    message(FATAL_ERROR "a stdin key followed by four spaces and a byte was accepted: ${x}")
+  endif()
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed k --length 20000000
     --threads ${SMOKE_THREADS}
     OUTPUT_FILE "${WORK}/big" RESULT_VARIABLE rg)
