@@ -41,13 +41,20 @@ namespace blake3pp::detail::io_impl {
                           std::system_category(), what);
 }
 
-// A read the port reports as aborted is one CancelIoEx reached. The
-// contract names that outcome operation_canceled on every platform, so a
-// caller can recognise it without asking which OS it is on.
+// A transfer's Win32 error as the contract names it on every platform, so
+// a caller can recognise it without asking which OS it is on: a read the
+// port reports as aborted is one CancelIoEx reached (operation_canceled),
+// and a read past the end of the file is the unexpected EOF every backend
+// reports as io_error.
 [[nodiscard]] inline std::error_code read_error(DWORD err) noexcept {
-  return err == ERROR_OPERATION_ABORTED
-             ? std::make_error_code(std::errc::operation_canceled)
-             : std::error_code(static_cast<int>(err), std::system_category());
+  switch (err) {
+    case ERROR_OPERATION_ABORTED:
+      return std::make_error_code(std::errc::operation_canceled);
+    case ERROR_HANDLE_EOF:
+      return std::make_error_code(std::errc::io_error);
+    default:
+      return std::error_code(static_cast<int>(err), std::system_category());
+  }
 }
 
 // Owns one Win32 HANDLE and closes it exactly once. Win32 spells "no
@@ -800,8 +807,13 @@ class iocp_context {
         op.is_write
             ? ::WriteFile(op.h, op.src + op.filled, len, nullptr, &op.ov)
             : ::ReadFile(op.h, op.dst + op.filled, len, nullptr, &op.ov);
-    if (ok == 0 && ::GetLastError() != ERROR_IO_PENDING) {
-      throw_winerr(op.is_write ? "WriteFile(async)" : "ReadFile(async)");
+    if (ok == 0) {
+      const DWORD err = ::GetLastError();
+      if (err != ERROR_IO_PENDING) {
+        throw std::system_error(read_error(err), op.is_write
+                                                     ? "WriteFile(async)"
+                                                     : "ReadFile(async)");
+      }
     }
     ++port_owed_;
   }
@@ -948,7 +960,7 @@ class iocp_context {
       DWORD n = 0;
       if (::ReadFile(use_h, buf.data() + got,
                      static_cast<DWORD>(buf.size() - got), &n, &ov) == 0) {
-        throw_winerr("ReadFile");
+        throw std::system_error(read_error(::GetLastError()), "ReadFile");
       }
       if (n == 0) {
         throw std::system_error(EIO, std::generic_category(),

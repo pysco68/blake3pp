@@ -1249,7 +1249,8 @@ TEST_CASE("a read that fails reports through the error channel") {
   const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
 
   // Past the end of the file: the backend reports the unexpected EOF as
-  // an error, and the chain sees it as std::error_code, not a value.
+  // io_error, the same on every platform, and the chain sees it as
+  // std::error_code, not a value.
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
   blake3pp::detail::io_op rop{};
@@ -1258,7 +1259,7 @@ TEST_CASE("a read that fails reports through the error channel") {
   ex::start(op);
   io.run_until(st);
   CHECK(r.completed);
-  CHECK(r.ec);
+  CHECK(r.ec == std::errc::io_error);
   CHECK(r.bytes == 0);
 }
 

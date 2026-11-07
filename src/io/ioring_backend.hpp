@@ -1083,7 +1083,7 @@ class ioring_context {
       DWORD n = 0;
       if (::ReadFile(use_h, buf.data() + got,
                      static_cast<DWORD>(buf.size() - got), &n, &ov) == 0) {
-        throw_winerr("ReadFile");
+        throw std::system_error(read_error(::GetLastError()), "ReadFile");
       }
       if (n == 0) {
         throw std::system_error(EIO, std::generic_category(),
