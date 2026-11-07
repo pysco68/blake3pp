@@ -234,6 +234,14 @@ class basic_io_context {
   }
 
   /// @cond INTERNAL
+  // sync_wait()'s spelling of run_until(): `start` runs once this thread
+  // holds the context, so a claim that fails -- another thread is running
+  // it -- throws before anything has been started on it.
+  template <class Start>
+  void run_until(const std::atomic<bool>& done, Start&& start) {
+    drive(/*until_idle=*/false, &done, start);
+  }
+
   // What a sender's operation state needs; not public API.
   [[nodiscard]] blake3pp::detail::pipeline_host<Budget,
                                                 blake3pp::detail::io_driver>&
@@ -282,7 +290,13 @@ class basic_io_context {
     return opts.windows != 0 ? std::min(opts.windows, ceiling) : plan.windows;
   }
 
-  void drive(bool until_idle, const std::atomic<bool>* until = nullptr) {
+  struct no_start {
+    void operator()() const noexcept {}
+  };
+
+  template <class Start = no_start>
+  void drive(bool until_idle, const std::atomic<bool>* until = nullptr,
+             Start&& start = {}) {
     // Reported in every build, like the pipeline's own stall report and for
     // the same reason: two threads inside one context is a shape a caller
     // configured, not a bug a sanitizer lane would find, and under NDEBUG
@@ -301,6 +315,7 @@ class basic_io_context {
       std::atomic<bool>& flag;
       ~running_guard() { flag.store(false, std::memory_order_release); }
     } const guard{running_};
+    start();
     blake3pp::detail::loop_status status{};
     host_.loop().run_until(
         status,
@@ -1225,10 +1240,19 @@ auto sync_wait(basic_io_context<Budget>& ctx, Sender&& sndr) {
   auto op = blake3pp::ex::connect(
       std::forward<Sender>(sndr),
       detail::sync_receiver<tuple_t>{&st, &ctx.host().loop()});
-  blake3pp::ex::start(op);
+  bool started = false;
   try {
-    ctx.run_until(st.done);
+    ctx.run_until(st.done, [&]() noexcept {
+      started = true;
+      blake3pp::ex::start(op);
+    });
   } catch (...) {
+    // The context was not this thread's to drive -- another thread is in
+    // run(), or this is a completion on the context's own thread -- and
+    // nothing was started: the misuse is reported, nothing wound down.
+    if (!started) {
+      throw;
+    }
     // `op` is started and unfinished, and the context still has it
     // linked: destroying it on the way out of this frame would leave the
     // loop walking a dead node. So the run is stopped and wound down

@@ -267,6 +267,77 @@ TEST_CASE("the senders record into a buffer handed in as a tracer") {
   }
 }
 
+// sync_wait() on a context another thread is running is a misuse that
+// drive() reports with logic_error. It must reach the caller as that,
+// with nothing started and nothing stopped: the running thread's own
+// operations go on, and so does its run().
+TEST_CASE("sync_wait on a context another thread runs throws and stops nothing") {
+  const auto a = pattern(3 * 64 * 1024 + 9, 70);
+  const temp_file f(a);
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+  std::thread runner([&] { ctx.run(); });
+  // Once this completes, the runner holds the context.
+  auto first = ex::sync_wait(async::async_hash_file(ctx, f.path(), sched));
+  REQUIRE(first.has_value());
+
+  CHECK_THROWS_AS(
+      async::sync_wait(ctx, async::async_hash_file(ctx, f.path(), sched)),
+      std::logic_error);
+  CHECK_FALSE(ctx.stop_requested());
+
+  auto second = ex::sync_wait(async::async_hash_file(ctx, f.path(), sched));
+  REQUIRE(second.has_value());
+  CHECK(std::get<0>(*second) == blake3pp::hash(a));
+  ctx.request_stop();
+  runner.join();
+}
+
+// A receiver that calls sync_wait() on the context whose thread is
+// completing it, which is the same misuse from the inside.
+struct nested_wait_receiver {
+  using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
+  async::io_context* ctx;
+  const fs::path* path;
+  bool* threw_logic_error;
+  record* rec;
+
+  void set_value(blake3pp::digest d) && noexcept {
+    try {
+      (void)async::sync_wait(*ctx, async::async_hash_file(
+                                       *ctx, *path, blake3pp::get_parallel_scheduler()));
+    } catch (const std::logic_error&) {
+      *threw_logic_error = true;
+    } catch (...) {
+    }
+    rec->value = d;
+    ++rec->values;
+  }
+  void set_error(std::error_code ec) && noexcept {
+    rec->ec = ec;
+    ++rec->errors;
+  }
+  void set_error(std::exception_ptr) && noexcept { ++rec->errors; }
+  void set_stopped() && noexcept { ++rec->stops; }
+};
+
+TEST_CASE("sync_wait from a completion on the context's thread throws") {
+  const auto a = pattern(2 * 64 * 1024 + 1, 71);
+  const temp_file f(a);
+  async::io_context ctx(tight());
+  bool threw = false;
+  record rec;
+  const fs::path path = f.path();
+  auto op = ex::connect(
+      async::async_hash_file(ctx, path, blake3pp::get_parallel_scheduler()),
+      nested_wait_receiver{&ctx, &path, &threw, &rec});
+  ex::start(op);
+  ctx.run_until_idle();
+  CHECK(rec.values == 1);
+  CHECK(rec.value == blake3pp::hash(a));
+  CHECK(threw);
+}
+
 // A trace buffer only has to outlive its operation. The context's loop
 // outlives both, and with a thread in run() it keeps going round after
 // the operation has reported: nothing it does then may reach the buffer.
