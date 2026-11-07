@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 
