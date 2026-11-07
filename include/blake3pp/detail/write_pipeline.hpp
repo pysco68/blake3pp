@@ -112,7 +112,6 @@ class write_scope
         opts_stop_token_(opts.stop_token),
         windows_(std::make_unique<window[]>(count_)) {
     drv.reserve(count_, window_bytes_);
-    loop_.record_into(trace_);
     for (unsigned i = count_; i > 0; --i) {
       window& w = windows_[i - 1];
       w.slot = i - 1;
@@ -385,7 +384,7 @@ class write_scope
       }
       note_generator_wait();
       settle();
-    }, [this] { this->report_stall(); });
+    }, [this] { this->report_stall(); }, trace_);
   }
 
   // Not noexcept: the geometry check below is one the chain's own error

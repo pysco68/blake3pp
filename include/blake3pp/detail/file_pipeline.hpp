@@ -606,13 +606,6 @@ class driver_loop {
   // For a const reporter asking the driver what its engine offered.
   [[nodiscard]] const D& driver() const noexcept { return drv_; }
 
-  // Where to record what this thread spends its time on; null records
-  // nothing, which is the default and costs one branch per poll.
-  void record_into(trace_buffer* trace) noexcept {
-    trace_ = trace;
-    stats_ = trace != nullptr ? &trace->driver() : nullptr;
-  }
-
   // Hands one node to the driver, from any thread.
   //
   // Everything after the push touches this loop and nothing else: the
@@ -664,27 +657,33 @@ class driver_loop {
         "empty run queue and nothing outstanding: nothing could wake it");
   }
 
+  // `trace` receives what the thread spends its time on during this call;
+  // null records nothing and costs one branch per poll. It is given per
+  // call because an async context's loop outlives the operations it runs,
+  // and their buffers with them.
   template <class BeforeFlush, class OnStall>
   void run_until(const loop_status& status, BeforeFlush&& before_flush,
-                 OnStall&& on_stall) {
+                 OnStall&& on_stall, trace_buffer* trace = nullptr) {
     // Also on the way out of a throwing poll(): the caller's next act is
     // to destroy the operation cells, and a thread inside publish() is
     // still reading this loop.
     const publisher_guard guard{this};
+    driver_stats* const stats = trace != nullptr ? &trace->driver() : nullptr;
     // The driver's own split of busy against parked, which is what says
     // whether this thread is the bottleneck once the stage shares of a
     // window no longer sum to the wall clock. One clock read per poll,
     // and none at all without a trace buffer.
-    std::int64_t t = stats_ != nullptr ? trace_->now() : 0;
+    std::int64_t t = stats != nullptr ? trace->now() : 0;
     for (;;) {
-      drain();
+      const std::size_t ran_queue = drain();
       before_flush();
-      if (stats_ != nullptr) {
-        ++stats_->iterations;
+      if (stats != nullptr) {
+        stats->queue_runs += ran_queue;
+        ++stats->iterations;
       }
       if (status.done) {
-        if (stats_ != nullptr) {
-          stats_->busy_ns += static_cast<std::uint64_t>(trace_->now() - t);
+        if (stats != nullptr) {
+          stats->busy_ns += static_cast<std::uint64_t>(trace->now() - t);
         }
         return;
       }
@@ -700,25 +699,25 @@ class driver_loop {
       if (block && drv_.in_flight() == 0 && status.outstanding == 0) {
         on_stall();
       }
-      if (stats_ == nullptr) {
+      if (stats == nullptr) {
         drv_.poll(block);
         continue;
       }
-      const std::int64_t t_poll = trace_->now();
-      stats_->busy_ns += static_cast<std::uint64_t>(t_poll - t);
+      const std::int64_t t_poll = trace->now();
+      stats->busy_ns += static_cast<std::uint64_t>(t_poll - t);
       const std::size_t ran = drv_.poll(block);
-      t = trace_->now();
-      ++stats_->polls;
+      t = trace->now();
+      ++stats->polls;
       if (block) {
-        ++stats_->blocking_polls;
-        stats_->parked_ns += static_cast<std::uint64_t>(t - t_poll);
+        ++stats->blocking_polls;
+        stats->parked_ns += static_cast<std::uint64_t>(t - t_poll);
         if (ran == 0) {
           // Nothing of the driver's own finished, so what released this
           // poll was a wake from a thread handing a window back.
-          ++stats_->wakes;
+          ++stats->wakes;
         }
       } else {
-        stats_->busy_ns += static_cast<std::uint64_t>(t - t_poll);
+        stats->busy_ns += static_cast<std::uint64_t>(t - t_poll);
       }
     }
   }
@@ -755,9 +754,6 @@ class driver_loop {
       ++ran;
       n = next;
     }
-    if (stats_ != nullptr) {
-      stats_->queue_runs += ran;
-    }
     return ran;
   }
 
@@ -773,8 +769,6 @@ class driver_loop {
   D& drv_;
   run_queue queue_;
   std::atomic<unsigned> publishers_{0};
-  trace_buffer* trace_ = nullptr;
-  driver_stats* stats_ = nullptr;
 };
 
 // --------------------------------------------------------------------
@@ -1518,7 +1512,6 @@ class window_scope
     require(host.pool().window_bytes() >= window_bytes_,
             "update_file(): a host whose windows are smaller than this run "
             "plans to read");
-    loop_.record_into(trace_);
     // One operation cell per window this run may hold at once. The cells
     // are the scope's; the windows are not, so a borrowed window carries
     // the index of the cell it was lent with. Handed out lowest first,
@@ -1754,7 +1747,8 @@ class window_scope
     pipeline_cells_for<window_scope> cells(count_);
     try {
       loop_.run_until(
-          status_, [&] { admit_round(cells); }, [this] { on_stall(); });
+          status_, [&] { admit_round(cells); }, [this] { on_stall(); },
+          trace_);
     } catch (...) {
       quiesce();
       throw;

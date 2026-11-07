@@ -267,6 +267,37 @@ TEST_CASE("the senders record into a buffer handed in as a tracer") {
   }
 }
 
+// A trace buffer only has to outlive its operation. The context's loop
+// outlives both, and with a thread in run() it keeps going round after
+// the operation has reported: nothing it does then may reach the buffer.
+// The buffer is on the heap so a sanitizer sees the use after free.
+TEST_CASE("a traced operation's buffer may go once the operation completes") {
+  constexpr std::size_t win = 64 * 1024;
+  const auto content = pattern(5 * win + 4097, 15);
+  const temp_file f(content);
+  const std::size_t windows_per_file = (content.size() + win - 1) / win;
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+  std::thread runner([&] { ctx.run(); });
+
+  blake3pp::hasher h;
+  for (int round = 0; round < 3; ++round) {
+    std::vector<blake3pp::window_record> windows(windows_per_file);
+    std::vector<blake3pp::agent_record> agents(windows_per_file * 64);
+    auto trace = std::make_unique<blake3pp::trace_buffer>(windows, agents);
+    h.reset();
+    auto r = ex::sync_wait(async::async_update_file(
+        ctx, h, f.path(), sched, {}, blake3pp::buffer_tracer{trace.get()}));
+    REQUIRE(r.has_value());
+    CHECK(trace->windows().size() == windows_per_file);
+    CHECK(h.finalize() == blake3pp::hash(content));
+  }
+  // The buffers are gone; the stop makes the runner go round again.
+  ctx.request_stop();
+  runner.join();
+}
+
 TEST_CASE("async_update_file streams into the caller's hasher") {
   const auto head = pattern(1000, 12);
   const auto content = pattern(2 * 64 * 1024, 13);
