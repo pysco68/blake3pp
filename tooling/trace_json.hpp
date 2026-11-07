@@ -62,10 +62,13 @@ inline bool write_chrome_trace(const std::string& path,
   // The driver's own track: one event over the whole run, carrying what
   // that thread spent its time on. Windows go on the track of the window
   // object that carried them, so several in flight read as parallel
-  // lanes rather than as one track nesting into itself.
+  // lanes rather than as one track nesting into itself. A batch over a
+  // shared context records no loop counters, which then read zero, but its
+  // files still name the backend that read them.
   const auto& d = trace.driver();
   const auto windows = trace.windows();
-  if (d.iterations > 0 && !windows.empty()) {
+  if ((d.iterations > 0 || !blake3pp::read_backend(d).empty()) &&
+      !windows.empty()) {
     const std::int64_t begin = windows.front().t_wait_begin;
     const std::int64_t end = windows.back().t_released;
     out << std::format(

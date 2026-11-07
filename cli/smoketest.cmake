@@ -131,10 +131,14 @@ elseif(CASE STREQUAL "trace_inputs")
   run_sum(out res1 ERR_VAR err1 ARGS --trace t1.json --window 1
     STDIN "${WORK}/stream")
   run_sum(out res2 ERR_VAR err2 ARGS --trace t2.json --window 1 --check sums)
-  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0)
-    message(FATAL_ERROR "a traced run failed (rc=${res1}, ${res2}): ${err1} ${err2}")
+  file(COPY_FILE "${WORK}/stream" "${WORK}/stream2")
+  run_sum(out res3 ERR_VAR err3 ARGS --trace t3.json --window 1 stream stream2)
+  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0
+     OR NOT res3 EQUAL 0)
+    message(FATAL_ERROR "a traced run failed (rc=${res1}, ${res2}, ${res3}): "
+      "${err1} ${err2} ${err3}")
   endif()
-  foreach(err IN ITEMS "${err1}" "${err2}")
+  foreach(err IN ITEMS "${err1}" "${err2}" "${err3}")
     if(NOT err MATCHES "trace: ([0-9]+) window records" OR CMAKE_MATCH_1 LESS 19
        OR err MATCHES "dropped")
       message(FATAL_ERROR "the trace had no room for the run's windows: ${err}")
@@ -146,6 +150,12 @@ elseif(CASE STREQUAL "trace_inputs")
   if(NOT json MATCHES "\"device_depth\":[0-9]+" OR NOT json MATCHES "\"lane_wait_ns\":[0-9]+"
      OR NOT json MATCHES "\"read_backend\":\"[^\"]+\"")
     message(FATAL_ERROR "the driver event lacks the device and backend fields")
+  endif()
+  # Several files hash over one shared context, whose trace still names
+  # the backend that read them.
+  file(READ "${WORK}/t3.json" json)
+  if(NOT json MATCHES "\"read_backend\":\"[^\"]+\"")
+    message(FATAL_ERROR "a several-file trace names no read backend")
   endif()
 
 elseif(CASE STREQUAL "check_roundtrip")
