@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -216,8 +217,9 @@ class sized_backend final : public repl::parallel_scheduler_backend {
     }
     if (pool_.submit(j, 1) == 0) {
       delete j;
-      proxy.set_error(std::make_exception_ptr(
-          std::runtime_error("blake3pp: parallel scheduler queue full")));
+      // The queue refuses an entry only when it cannot allocate one, and
+      // building a message string then would need memory too.
+      proxy.set_error(std::make_exception_ptr(std::bad_alloc{}));
       return;
     }
     settle(j, 1, 1);
@@ -280,8 +282,9 @@ class sized_backend final : public repl::parallel_scheduler_backend {
     const std::size_t queued = pool_.submit(j, wanted);
     if (queued == 0) {
       delete j;
-      proxy.set_error(std::make_exception_ptr(
-          std::runtime_error("blake3pp: parallel scheduler queue full")));
+      // The queue refuses an entry only when it cannot allocate one, and
+      // building a message string then would need memory too.
+      proxy.set_error(std::make_exception_ptr(std::bad_alloc{}));
       return;
     }
     settle(j, wanted, queued);
