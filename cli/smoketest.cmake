@@ -644,6 +644,34 @@ elseif(CASE STREQUAL "sum_alloc_failure")
       "trace written: ${traced}, stderr: ${err}")
   endif()
 
+elseif(CASE STREQUAL "sum_batch_release")
+  # A batch releases each file's digest once it is reported. 1024 files at
+  # --length 1 MiB are 2 GiB of hex, which does not fit the 2 GiB address
+  # space this run gets if every reported line is kept to the end. Linux
+  # only, for the same reasons as sum_alloc_failure.
+  if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR SANITIZED OR EMULATOR)
+    message(STATUS "skipped: needs prlimit on a native, unsanitized Linux build")
+    return()
+  endif()
+  find_program(PRLIMIT prlimit)
+  if(NOT PRLIMIT)
+    message(STATUS "skipped: no prlimit")
+    return()
+  endif()
+  set(names "")
+  foreach(i RANGE 1 1024)
+    file(WRITE "${WORK}/f${i}" "${i}\n")
+    list(APPEND names "f${i}")
+  endforeach()
+  execute_process(
+    COMMAND "${PRLIMIT}" --as=2147483648 -- "${SUM}" --threads 4
+      --length 1048576 ${names}
+    WORKING_DIRECTORY "${WORK}"
+    OUTPUT_FILE /dev/null ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(NOT r EQUAL 0)
+    message(FATAL_ERROR "1024 files at --length 1 MiB in 2 GiB: exit ${r}: ${err}")
+  endif()
+
 elseif(CASE STREQUAL "trace_write_failure")
   # A trace that cannot be written is reported and fails the run, also
   # when it is small enough that nothing reaches the file before the

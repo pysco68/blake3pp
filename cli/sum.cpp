@@ -394,6 +394,9 @@ class engine {
                 if (!report(next, *out[next])) {
                   failures++;
                 }
+                // Reported is done with: a long --length is megabytes of
+                // hex per file.
+                out[next].reset();
               }
             } catch (const std::system_error&) {
               write_failed = true;
