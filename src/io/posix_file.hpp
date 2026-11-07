@@ -109,6 +109,11 @@ struct posix_file {
         }
         throw_errno("pwrite");
       }
+      if (n == 0) {
+        // No progress and no error: retrying would spin for ever.
+        throw std::system_error(EIO, std::generic_category(),
+                                "pwrite wrote nothing");
+      }
       put += static_cast<std::size_t>(n);
     }
   }
