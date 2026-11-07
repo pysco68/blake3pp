@@ -63,8 +63,11 @@ std::mutex& sizing_mutex() noexcept {
 std::atomic<unsigned> g_threads{0};
 
 // Whether the scheduler exists yet. Under stdexec the pool itself records
-// it (parallel.hpp); under beman the backend below is the moment.
+// it (parallel.hpp); under beman the backend below is the moment, and this
+// is where it records it.
+#if !defined(BLAKE3PP_EXECUTION_STDEXEC)
 std::atomic<bool> g_started{false};
+#endif
 
 bool scheduler_started() noexcept {
 #if defined(BLAKE3PP_EXECUTION_STDEXEC)
