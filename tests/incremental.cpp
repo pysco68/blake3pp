@@ -215,6 +215,80 @@ TEST_CASE("update after update_last is the whole message") {
   }
 }
 
+// Zero bytes are a valid input to both entry points and must leave the
+// state alone. The two shapes that broke were a full chunk still open (an
+// empty update_last() closed it, so finalization lost its root chunk) and
+// a held subtree (an empty update() put it back on the stack with no chunk
+// after it). The prefixes reach every other state too: fresh, partial
+// block, full block, partial chunk, and a chunk ended by update_last().
+TEST_CASE("empty updates leave the digest alone") {
+  const auto input = make_input(8 * 1024);
+  const std::array<std::byte, blake3pp::key_size> key{std::byte{7}};
+  enum class mode { plain, keyed, derive };
+  enum class empty_call { update, update_last, both };
+
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    const auto* ops = blake3pp::detail::resolve(a);
+    REQUIRE(ops != nullptr);
+    const auto make = [&](mode m) {
+      switch (m) {
+        case mode::keyed: return blake3pp::hasher::keyed(key, ops);
+        case mode::derive:
+          return blake3pp::hasher::derive_key("blake3pp empty updates", ops);
+        case mode::plain: break;
+      }
+      return blake3pp::hasher{ops};
+    };
+    for (const mode m : {mode::plain, mode::keyed, mode::derive}) {
+      for (const std::size_t first : {0u, 5u, 64u, 100u, 1024u, 2048u, 3072u}) {
+        for (const bool first_last : {false, true}) {
+          for (const empty_call e : {empty_call::update,
+                                     empty_call::update_last,
+                                     empty_call::both}) {
+            for (const std::size_t rest : {0u, 1u, 1024u, 2048u}) {
+              CAPTURE(static_cast<int>(m));
+              CAPTURE(first);
+              CAPTURE(first_last);
+              CAPTURE(static_cast<int>(e));
+              CAPTURE(rest);
+              const auto bytes = std::span{input}.first(first + rest);
+              blake3pp::hasher h = make(m);
+              if (first_last) {
+                h.update_last(bytes.first(first));
+              } else {
+                h.update(bytes.first(first));
+              }
+              for (int i = 0; i < 3; ++i) {
+                if (e != empty_call::update_last) {
+                  h.update(std::span<const std::byte>{});
+                }
+                if (e != empty_call::update) {
+                  h.update_last(std::string_view{});
+                }
+              }
+              h.update(bytes.subspan(first));
+
+              blake3pp::hasher expected = make(m);
+              expected.update(bytes);
+              CHECK(h.count() == bytes.size());
+              CHECK(h.finalize() == expected.finalize());
+              std::array<std::byte, 200> xof{};
+              std::array<std::byte, 200> expected_xof{};
+              h.finalize_xof().fill(xof);
+              expected.finalize_xof().fill(expected_xof);
+              CHECK(xof == expected_xof);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 // The extended output stream comes off the same root node, so a reader
 // taken after update_last() must match one taken after update().
 TEST_CASE("update_last leaves the same XOF stream") {

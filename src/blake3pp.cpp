@@ -151,7 +151,13 @@ void hasher::resume_held() noexcept {
   }
 }
 
+// Empty input returns at once, here and in update_last(): resume_held()
+// and close_full_chunk() assume bytes follow, and either one run without
+// them changes the tree finalize() sees.
 void hasher::update(std::span<const std::byte> input) noexcept {
+  if (input.empty()) {
+    return;
+  }
   resume_held();
   const auto* p = kern::kernel_bytes(input.data());
   std::size_t len = input.size();
@@ -191,6 +197,9 @@ void hasher::update(std::string_view input) noexcept {
 }
 
 void hasher::update_last(std::span<const std::byte> input) noexcept {
+  if (input.empty()) {
+    return;
+  }
   resume_held();
   close_full_chunk();
   const std::size_t len = input.size();
