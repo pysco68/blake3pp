@@ -83,9 +83,8 @@ behave against a device whose shape is known.
 `blake3pp_bench_file`, over a real file: `--reps`, `--cooldown`,
 `--window` (MiB), `--qd`, `--no-direct`, `--no-async` (the synchronous
 rung, against the platform's async engine), `--inline-submit`,
-`--threads`, `--no-ioring` and `--registered-buffers` (Windows: the
-completion port instead of the I/O ring, and the ring's buffer
-registration), `--seq-only`, `--trace PATH` with `--trace-agents`,
+`--threads`, `--no-ioring` (Windows: the completion port instead of the
+I/O ring), `--seq-only`, `--trace PATH` with `--trace-agents`,
 `--io-sweep` (the window x qd pacing matrix), and `--make <MiB>` to
 create a file and use it. Without a device: `--null-source <GiB>` and
 `--null-sink <GiB>`, with `--null-rate` and `--null-knee` for a modelled

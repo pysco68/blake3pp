@@ -24,6 +24,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -63,8 +64,11 @@ std::mutex& sizing_mutex() noexcept {
 std::atomic<unsigned> g_threads{0};
 
 // Whether the scheduler exists yet. Under stdexec the pool itself records
-// it (parallel.hpp); under beman the backend below is the moment.
+// it (parallel.hpp); under beman the backend below is the moment, and this
+// is where it records it.
+#if !defined(BLAKE3PP_EXECUTION_STDEXEC)
 std::atomic<bool> g_started{false};
+#endif
 
 bool scheduler_started() noexcept {
 #if defined(BLAKE3PP_EXECUTION_STDEXEC)
@@ -213,8 +217,9 @@ class sized_backend final : public repl::parallel_scheduler_backend {
     }
     if (pool_.submit(j, 1) == 0) {
       delete j;
-      proxy.set_error(std::make_exception_ptr(
-          std::runtime_error("blake3pp: parallel scheduler queue full")));
+      // The queue refuses an entry only when it cannot allocate one, and
+      // building a message string then would need memory too.
+      proxy.set_error(std::make_exception_ptr(std::bad_alloc{}));
       return;
     }
     settle(j, 1, 1);
@@ -277,8 +282,9 @@ class sized_backend final : public repl::parallel_scheduler_backend {
     const std::size_t queued = pool_.submit(j, wanted);
     if (queued == 0) {
       delete j;
-      proxy.set_error(std::make_exception_ptr(
-          std::runtime_error("blake3pp: parallel scheduler queue full")));
+      // The queue refuses an entry only when it cannot allocate one, and
+      // building a message string then would need memory too.
+      proxy.set_error(std::make_exception_ptr(std::bad_alloc{}));
       return;
     }
     settle(j, wanted, queued);

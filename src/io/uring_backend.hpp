@@ -123,6 +123,17 @@ inline namespace test_seams {
 // While set, every submission is refused as io_uring_enter would refuse
 // one, which no working kernel can be asked to do.
 inline std::atomic<bool> refuse_submit{false};
+// While positive, each submission takes nothing, as an enter answering 0
+// does, and the count drops; then refuse_submits, the same way, refuses.
+inline std::atomic<unsigned> stall_submits{0};
+inline std::atomic<unsigned> refuse_submits{0};
+
+[[nodiscard]] inline bool take_seam(std::atomic<unsigned>& count) noexcept {
+  unsigned n = count.load();
+  while (n != 0 && !count.compare_exchange_weak(n, n - 1)) {
+  }
+  return n != 0;
+}
 #endif
 
 // One mmap, unmapped when it goes, with MAP_FAILED folded into the empty
@@ -403,7 +414,10 @@ struct uring {
         return;
       }
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
-      if (refuse_submit.load()) {
+      if (take_seam(stall_submits)) {
+        return;  // n == 0: the entries stay published
+      }
+      if (refuse_submit.load() || take_seam(refuse_submits)) {
         errno = EAGAIN;
         throw_errno("io_uring_enter(submit)");
       }
@@ -540,18 +554,17 @@ class uring_context {
       ctx.files_ = this;
     }
 
-    // A file with nothing owed only unlinks. One with transfers still owed
-    // takes the context-wide drain, which reaps without reporting and waits
-    // out the pump's lanes: the kernel or a lane may be writing into the
-    // buffers those transfers name. Its operations must still be alive (the
-    // contract's operation lifetime rule). The drain costs the other files
-    // their pending callbacks, so a caller with siblings in flight reclaims
-    // this file first, through io_driver::drain(file&).
+    // Takes this file's transfers with it, and only those: forget() waits
+    // out what the kernel or a lane holds of them, because it may be
+    // writing into the buffers they name, and a sibling's completion that
+    // surfaces meanwhile is reported, not dropped. Its operations must
+    // still be alive (the contract's operation lifetime rule). The file
+    // leaves the context's list only afterwards: forget() waits until this
+    // file's count is zero, and the list is what lets a context-wide drain
+    // zero it.
     ~file() {
+      ctx_->forget(*this);
       ctx_->unlink(*this);
-      if (inflight_ != 0) {
-        ctx_->drain();
-      }
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
@@ -593,8 +606,10 @@ class uring_context {
     if (opts.async && ring_.init(2 * max_inflight + 2)) {
       use_uring_ = true;
       offload_ = opts.offload_submit;
+      // The member flush(): a refused enter moves what it held to the
+      // pump, as it does at any other time, rather than failing the open.
       arm_wake();
-      ring_.flush();
+      flush();
     }
   }
 
@@ -832,7 +847,7 @@ class uring_context {
   // context stays usable: afterwards in_flight() counts none of them.
   //
   // Legal only while the operations those transfers live in are alive;
-  // ~file() drains the context instead. What never reached the kernel is
+  // ~file() calls it. What never reached the kernel is
   // dropped; what the kernel or a lane holds is waited out, because it is
   // writing into those buffers.
   //
@@ -1156,20 +1171,12 @@ class uring_context {
     const bool woken = waiter_.take();
     if (use_uring_ && !wake_armed_) {
       arm_wake();
-      try {
-        ring_.flush();
-      } catch (const std::system_error&) {
-        // The arm did not reach the kernel. It is withdrawn rather than
-        // left queued, so wake_armed_ says what is true: nothing watches
-        // the eventfd, and sleep_once() must not block on the completion
-        // queue for a wake that cannot arrive. The next blocking poll
-        // arms again.
-        ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
-          if (ud == wake_ud()) {
-            wake_armed_ = false;
-          }
-        });
-      }
+      // A refused arm comes back through the member flush like any other
+      // refusal: withdrawn, so wake_armed_ says what is true and
+      // sleep_once() does not block on a wake that cannot arrive, and any
+      // transfer still published with it moves to the pump instead of
+      // being dropped. The next blocking poll arms again.
+      flush();
     }
     return woken;
   }

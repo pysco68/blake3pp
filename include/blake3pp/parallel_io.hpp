@@ -113,8 +113,7 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
       opts.queue_depth, opts.window_bytes, threads);
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
-                         .ioring = opts.ioring,
-                         .registered_buffers = opts.registered_buffers},
+                         .ioring = opts.ioring},
                         depth);
   detail::io_driver::file file(
       drv, path,
@@ -203,8 +202,7 @@ void update_file(hasher& h, const std::filesystem::path& path,
                                      opts.window_bytes));
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
-                         .ioring = opts.ioring,
-                         .registered_buffers = opts.registered_buffers},
+                         .ioring = opts.ioring},
                         plan.reads_in_flight);
   detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(

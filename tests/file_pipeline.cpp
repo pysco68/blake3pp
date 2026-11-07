@@ -1097,11 +1097,10 @@ TEST_CASE("one file's transfers are reclaimed without the others'") {
   CHECK(std::equal(kept_pool.begin(), kept_pool.end(), content.begin()));
 }
 
-// A file destroyed with a transfer still owed takes the whole drain: the
-// kernel is waited out, no callback runs, the operation is no longer
-// owed, and the driver is usable afterwards. A sibling's pending callback
-// goes with it, so the pipeline reclaims its file explicitly (above).
-TEST_CASE("a file closing with a transfer owed drains the context") {
+// A file destroyed with a transfer still owed takes it along: the kernel
+// is waited out, no callback runs, the operation is no longer owed, and
+// the driver is usable afterwards.
+TEST_CASE("a file closing with a transfer owed takes it along") {
   using blake3pp::detail::io_driver;
   using blake3pp::detail::io_op;
   constexpr std::size_t len = 256 * 1024;
@@ -1141,6 +1140,54 @@ TEST_CASE("a file closing with a transfer owed drains the context") {
   }
   CHECK(!after.ec);
   CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
+}
+
+// What a closing file takes along is its own: a sibling's read owed at
+// the same time is still reported, with its bytes, on every context.
+TEST_CASE("a file closing with a transfer owed leaves its sibling's owed") {
+  using blake3pp::detail::io_driver;
+  using blake3pp::detail::io_op;
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 30);
+  const temp_file f(content);
+
+  // The async context and the synchronous one, which own their transfers
+  // differently.
+  for (const bool async : {true, false}) {
+    CAPTURE(async);
+    io_driver drv({.async = async}, 4);
+    drv.reserve(2, len);
+    io_driver::file sibling(drv, f.path, /*direct_io=*/false);
+    const auto sibling_pool = drv.window_storage_for(sibling, 1, 0, len).read_into;
+    read_probe kept;
+    io_op kept_op{};
+    kept_op.done = &read_probe::on_done;
+    kept_op.owner = &kept;
+    read_probe closing;
+    io_op closing_op{};  // before the file it is owed by
+    drv.submit_read(sibling, 0, sibling_pool, kept_op);
+    {
+      io_driver::file going(drv, f.path, /*direct_io=*/false);
+      const auto pool = drv.window_storage_for(going, 0, 0, len).read_into;
+      closing_op.done = &read_probe::on_done;
+      closing_op.owner = &closing;
+      drv.submit_read(going, 0, pool, closing_op);
+      drv.flush();
+      // Both reads may have landed by now; the sibling's is reported by a
+      // poll either way, and has not been.
+    }
+    CHECK(closing.calls == 0);
+    CHECK(!closing_op.live);
+    // A dropped sibling would never be reported, so the wait is bounded.
+    for (int i = 0; i < 2000 && kept.calls == 0; ++i) {
+      drv.poll(false);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(kept.calls == 1);
+    CHECK(!kept.ec);
+    CHECK(std::equal(sibling_pool.begin(), sibling_pool.end(), content.begin()));
+    CHECK(drv.in_flight() == 0);
+  }
 }
 
 // The same drain on a live driver: the owed read is reaped and never
@@ -1249,7 +1296,8 @@ TEST_CASE("a read that fails reports through the error channel") {
   const auto pool = drv.window_storage_for(file, 0, 0, len).read_into;
 
   // Past the end of the file: the backend reports the unexpected EOF as
-  // an error, and the chain sees it as std::error_code, not a value.
+  // io_error, the same on every platform, and the chain sees it as
+  // std::error_code, not a value.
   chain_result r;
   blake3pp::detail::loop_status st{false, 1};
   blake3pp::detail::io_op rop{};
@@ -1258,7 +1306,7 @@ TEST_CASE("a read that fails reports through the error channel") {
   ex::start(op);
   io.run_until(st);
   CHECK(r.completed);
-  CHECK(r.ec);
+  CHECK(r.ec == std::errc::io_error);
   CHECK(r.bytes == 0);
 }
 

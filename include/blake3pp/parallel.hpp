@@ -233,8 +233,7 @@ namespace detail {
 // be a power of two. Plain, keyed and derive_key hashers all work.
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
-                               Scheduler&& sched,
-                               const kern::kernel_ops* ops) {
+                               Scheduler&& sched) {
   if (input.size() < min_pipeline_bytes) {
     // The call finalizes, so these bytes end the message.
     h.update_last(input);
@@ -247,7 +246,7 @@ template <stack_budget Budget, class Scheduler>
   const pipeline_plan plan = plan_memory_pipeline(
       h.count(), window, static_cast<std::uint64_t>(input.size()));
   run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
-                              {.window_bytes = window, .ops = ops});
+                              {.window_bytes = window});
   return h.finalize();
 }
 
@@ -271,8 +270,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           const kern::kernel_ops* ops) {
   hasher h{ops};
-  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched),
-                                   ops);
+  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched));
 }
 
 /// Multi-core one-shot hash: the subtree reductions of input run on sched,
@@ -330,10 +328,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
                                 arch a = arch::auto_detect) {
   // Reuse the ops overload's partitioning by seeding it with a keyed
   // hasher: the engine takes key material from the hasher itself.
-  const kern::kernel_ops* const ops = detail::resolve(a);
-  hasher h = hasher::keyed(key, ops);
-  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched),
-                                   ops);
+  hasher h = hasher::keyed(key, a);
+  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched));
 }
 
 /// Multi-core keyed one-shot of a string's bytes.
@@ -368,10 +364,9 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
                                 std::span<const std::byte> key_material,
                                 Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  const kern::kernel_ops* const ops = detail::resolve(a);
-  hasher h = hasher::derive_key(context, ops);
-  return detail::hash_into<Budget>(
-      h, key_material, std::forward<Scheduler>(sched), ops);
+  hasher h = hasher::derive_key(context, a);
+  return detail::hash_into<Budget>(h, key_material,
+                                   std::forward<Scheduler>(sched));
 }
 
 /// Multi-core key derivation from a string's bytes.
@@ -415,6 +410,8 @@ struct parallel_hasher_options {
 ///   - The window buffer is the type's one allocation, made at
 ///     construction.
 ///   - finalize() is non-destructive, like hasher's.
+///   - A moved-from hasher is in the state reset() leaves; its next
+///     update() allocates the buffer again.
 ///   - Not thread-safe. The scheduler's workers are used only inside
 ///     update().
 ///
@@ -443,9 +440,9 @@ class parallel_hasher {
   explicit parallel_hasher(Scheduler sched,
                            const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
-        ops_(detail::resolve(opts.a)),
-        h_(ops_),
-        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
+        h_(opts.a),
+        window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
+        remainder_(window_bytes_) {}
 
   /// Keyed (MAC/PRF) mode.
   /// @param sched  Where the subtree reductions run.
@@ -454,9 +451,9 @@ class parallel_hasher {
   parallel_hasher(Scheduler sched, std::span<const std::byte, key_size> key,
                   const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
-        ops_(detail::resolve(opts.a)),
-        h_(hasher::keyed(key, ops_)),
-        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
+        h_(hasher::keyed(key, opts.a)),
+        window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
+        remainder_(window_bytes_) {}
 
   /// Key-derivation mode: the input is the key material, domain-separated
   /// by context (see hasher::derive_key).
@@ -466,9 +463,39 @@ class parallel_hasher {
   parallel_hasher(Scheduler sched, std::string_view context,
                   const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
-        ops_(detail::resolve(opts.a)),
-        h_(hasher::derive_key(context, ops_)),
-        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
+        h_(hasher::derive_key(context, opts.a)),
+        window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
+        remainder_(window_bytes_) {}
+
+  /// Copies the message so far, with its mode, key, variant and window.
+  parallel_hasher(const parallel_hasher&) = default;
+  /// Copies the message so far, with its mode, key, variant and window.
+  parallel_hasher& operator=(const parallel_hasher&) = default;
+
+  /// Takes the message, mode, key, variant and window; `other` is left
+  /// as reset() leaves it.
+  parallel_hasher(parallel_hasher&& other) noexcept
+      : sched_(other.sched_),
+        h_(other.h_),
+        window_bytes_(other.window_bytes_),
+        remainder_(std::move(other.remainder_)),
+        filled_(std::exchange(other.filled_, 0)) {
+    other.h_.reset();
+  }
+
+  /// Takes the message, mode, key, variant and window; `other` is left
+  /// as reset() leaves it.
+  parallel_hasher& operator=(parallel_hasher&& other) noexcept {
+    if (this != &other) {
+      sched_ = other.sched_;
+      h_ = other.h_;
+      window_bytes_ = other.window_bytes_;
+      remainder_ = std::move(other.remainder_);
+      filled_ = std::exchange(other.filled_, 0);
+      other.h_.reset();
+    }
+    return *this;
+  }
 
   /// Absorbs the next bytes of the message; complete windows are fanned
   /// out over the scheduler from here.
@@ -482,12 +509,16 @@ class parallel_hasher {
     if (input.empty()) {
       return;
     }
+    // A moved-from hasher gave its buffer away.
+    if (remainder_.size() < window_bytes_) {
+      remainder_.resize(window_bytes_);
+    }
     // Whole windows of the caller's own bytes are hashed where they lie.
     // The only copying is what it takes to finish a window the last call
     // left part-built, which is under one window and never more.
     if (filled_ > 0) {
       const std::size_t take =
-          std::min(remainder_.size() - filled_, input.size());
+          std::min(window_bytes_ - filled_, input.size());
       std::copy_n(input.data(), take, remainder_.data() + filled_);
       filled_ += take;
       input = input.subspan(take);
@@ -501,7 +532,7 @@ class parallel_hasher {
       // the hasher has not taken must not be absorbed twice by a later
       // call. A throw loses them, which the exception says.
       filled_ = 0;
-      absorb(std::span<const std::byte>{remainder_});
+      absorb(std::span<const std::byte>{remainder_.data(), window_bytes_});
     }
 
     // What is left starts on a window boundary, because the hasher does:
@@ -513,8 +544,8 @@ class parallel_hasher {
     // root -- and from here there is no way to know whether more is
     // coming. So the remainder is never empty once anything has arrived,
     // and finalize absorbs it through the hasher itself.
-    const std::size_t rest = input.size() % remainder_.size();
-    const std::size_t keep = rest == 0 ? remainder_.size() : rest;
+    const std::size_t rest = input.size() % window_bytes_;
+    const std::size_t keep = rest == 0 ? window_bytes_ : rest;
     if (const std::size_t whole = input.size() - keep; whole > 0) {
       absorb(input.first(whole));
       input = input.subspan(whole);
@@ -582,10 +613,10 @@ class parallel_hasher {
     detail::memory_driver drv;
     detail::memory_driver::file f(drv, tail);
     const detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h.count(), remainder_.size(), static_cast<std::uint64_t>(filled_));
+        h.count(), window_bytes_, static_cast<std::uint64_t>(filled_));
     detail::run_window_pipeline<Budget>(
         h, drv, f, sched_, plan,
-        {.window_bytes = remainder_.size(), .ops = ops_});
+        {.window_bytes = window_bytes_});
     return h;
   }
 
@@ -601,19 +632,19 @@ class parallel_hasher {
     detail::memory_driver drv;
     detail::memory_driver::file f(drv, bytes);
     detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h_.count(), remainder_.size(),
+        h_.count(), window_bytes_,
         static_cast<std::uint64_t>(bytes.size()));
     // Never: update() holds the final window back, so nothing absorbed
     // here can contain the message's end.
     plan.ends_message = false;
     detail::run_window_pipeline<Budget>(
         h_, drv, f, sched_, plan,
-        {.window_bytes = remainder_.size(), .ops = ops_});
+        {.window_bytes = window_bytes_});
   }
 
   Scheduler sched_;
-  const kern::kernel_ops* ops_;
   hasher h_;
+  std::size_t window_bytes_;
   // One window's worth, holding whatever has not yet reached a window
   // boundary. Never more: the rest of the message is hashed where the
   // caller put it.
@@ -651,20 +682,22 @@ void fill(output_reader& r, std::span<std::byte> out, Scheduler&& sched,
     r.fill(out);
     return;
   }
-  const std::uint64_t base = r.position();
+  // Each segment's reader is placed from r by block counter, as fill()
+  // advances one, so segments past byte 2^64 - 1 continue the stream as
+  // a sequential fill does.
   const std::size_t n_segs = (out.size() + segment - 1) / segment;
   auto work = ex::schedule(sched) |
               ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
                 output_reader part = r;
                 const std::size_t off = i * segment;
-                part.seek(base + off);
+                detail::reader_access::advance(part, off);
                 part.fill(out.subspan(off, std::min(segment, out.size() - off)));
               });
   if (!ex::sync_wait(std::move(work))) {
     throw std::system_error(std::make_error_code(std::errc::operation_canceled),
                             "the scheduler stopped the parallel fill");
   }
-  r.seek(base + out.size());
+  detail::reader_access::advance(r, out.size());
 }
 
 }  // namespace blake3pp

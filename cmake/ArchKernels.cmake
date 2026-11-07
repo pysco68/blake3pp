@@ -292,7 +292,12 @@ function(blake3pp_add_kernel ns)
               -fno-exceptions -fno-rtti -fno-stack-protector ${_ak_warn}
               ${AK_ARCH_FLAGS} ${_ak_defs} "-DBLAKE3PP_ARCH_NS=${ns}"
               "-I${PROJECT_SOURCE_DIR}/src" "-I${PROJECT_SOURCE_DIR}/include"
+              -MD -MF "${_ak_obj}.d"
               -c "${_ak_src}" -o "${_ak_obj}"
+      # The compiler's own list of what the object read, so an edit to any
+      # header under src/kernel (or dispatch.hpp, arch.def, xsimd) rebuilds
+      # it; DEPENDS alone would name only what is spelled here.
+      DEPFILE "${_ak_obj}.d"
       DEPENDS "${_ak_src}" "${PROJECT_SOURCE_DIR}/src/kernel/kernel.hpp"
       COMMENT "kernel ${ns} via external compiler: ${AK_EXTERNAL_COMPILER}"
       VERBATIM)

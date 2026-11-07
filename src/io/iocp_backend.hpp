@@ -21,6 +21,7 @@
 #include <string_view>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -36,18 +37,47 @@
 
 namespace blake3pp::detail::io_impl {
 
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+// The test executable compiles this backend, and the IoRing one that
+// shares its helpers, with seams and under a name of their own: the
+// library's copies, which the same executable links, stay one definition
+// each, and nothing shipped carries the seams.
+inline namespace test_seams {
+// While positive, each read the port is handed is issued at half its
+// length, and the count drops: the completion comes back short, as one
+// may, and the rest goes through the port again.
+inline std::atomic<unsigned> short_port_reads{0};
+// While positive, each read the port is handed is refused, as ReadFile
+// refuses one for want of resources, and the count drops.
+inline std::atomic<unsigned> refuse_port_reads{0};
+
+[[nodiscard]] inline bool take_seam(std::atomic<unsigned>& count) noexcept {
+  unsigned n = count.load();
+  while (n != 0 && !count.compare_exchange_weak(n, n - 1)) {
+  }
+  return n != 0;
+}
+#endif
+
 [[noreturn]] inline void throw_winerr(const char* what) {
   throw std::system_error(static_cast<int>(::GetLastError()),
                           std::system_category(), what);
 }
 
-// A read the port reports as aborted is one CancelIoEx reached. The
-// contract names that outcome operation_canceled on every platform, so a
-// caller can recognise it without asking which OS it is on.
+// A transfer's Win32 error as the contract names it on every platform, so
+// a caller can recognise it without asking which OS it is on: a read the
+// port reports as aborted is one CancelIoEx reached (operation_canceled),
+// and a read past the end of the file is the unexpected EOF every backend
+// reports as io_error.
 [[nodiscard]] inline std::error_code read_error(DWORD err) noexcept {
-  return err == ERROR_OPERATION_ABORTED
-             ? std::make_error_code(std::errc::operation_canceled)
-             : std::error_code(static_cast<int>(err), std::system_category());
+  switch (err) {
+    case ERROR_OPERATION_ABORTED:
+      return std::make_error_code(std::errc::operation_canceled);
+    case ERROR_HANDLE_EOF:
+      return std::make_error_code(std::errc::io_error);
+    default:
+      return std::error_code(static_cast<int>(err), std::system_category());
+  }
 }
 
 // Owns one Win32 HANDLE and closes it exactly once. Win32 spells "no
@@ -498,22 +528,9 @@ class iocp_context {
   }
 
   void place(transfer& op, file& f) {
-    const DWORD len = port_len(op, op.off, op.len);
-    bool queued = len != 0;
-    if (queued) {
-      try {
-        issue(op, len);
-      } catch (const std::system_error&) {
-        queued = false;
-      }
-    }
-    op.on_port = queued;
-    used_port_ = used_port_ || queued;
     in_flight_++;
     f.inflight_++;
-    if (!queued) {
-      pump_.push(op);
-    }
+    route(op);
   }
 
  public:
@@ -543,19 +560,21 @@ class iocp_context {
   // The port first, then the pump's finished list: a completion the port
   // hands back can move its remainder to the pump.
   std::size_t poll(bool block) {
-    std::size_t ran = reap_ready(false);
-    ran += serve_deferred();
-    if (ran > 0 || !block) {
-      return ran;
+    const std::size_t before = reported_;
+    reap_ready(false);
+    serve_deferred();
+    if (reported_ != before || !block) {
+      return reported_ - before;
     }
     for (;;) {
       if (std::exchange(woken_, false)) {
-        return ran + serve_deferred();
+        serve_deferred();
+        return reported_ - before;
       }
-      ran += reap_ready(true);
-      ran += serve_deferred();
-      if (ran > 0 || std::exchange(woken_, false)) {
-        return ran;
+      reap_ready(true);
+      serve_deferred();
+      if (reported_ != before || std::exchange(woken_, false)) {
+        return reported_ - before;
       }
     }
   }
@@ -719,7 +738,7 @@ class iocp_context {
       } else {
         op.filled += bytes;
         if (op.filled < op.len) {
-          (void)reissue(op);
+          route(op);
         } else {
           complete(op, {});
         }
@@ -763,55 +782,60 @@ class iocp_context {
   }
 
 
-  // Queues the rest of a short read. False means ReadFile refused it and
-  // the op was completed with that error instead. Both callers are
-  // inside poll(), which is where a read's error is allowed to reach its
-  // callback; what cannot happen is leaving it counted and unissued.
-  [[nodiscard]] bool reissue(transfer& op) noexcept {
+  // What the transfer still owes, from op.filled: on the port where it
+  // will take it, otherwise to a lane. A first piece and the rest of a
+  // short one take the same road, as on the ring.
+  void route(transfer& op) noexcept {
     const DWORD len = port_len(op, op.off + op.filled, op.len - op.filled);
-    if (len == 0) {
-      // The remainder is not something this file may hand the port. It is
-      // still owed, so it goes to the pump like an unalignable transfer
-      // does from the start, and a lane finishes what is left.
-      op.on_port = false;
+    op.on_port = len != 0 && issue(op, len);
+    used_port_ = used_port_ || op.on_port;
+    if (!op.on_port) {
       pump_.push(op);
-      return true;
-    }
-    try {
-      issue(op, len);
-      return true;
-    } catch (const std::system_error& e) {
-      complete(op, e.code());
-      return false;
     }
   }
 
   // Hands the port `len` bytes of what the transfer still owes, from
   // op.filled: all of it, or the granules of it that port_len() allowed.
-  void issue(transfer& op, DWORD len) {
+  // False when ReadFile or WriteFile refused it outright, which owes no
+  // completion; the charge ends there, so a lane's own charge does not
+  // take in the wait for the lane.
+  [[nodiscard]] bool issue(transfer& op, DWORD len) noexcept {
     std::memset(&op.ov, 0, sizeof(op.ov));
     const std::uint64_t off = op.off + op.filled;
     op.ov.Offset = static_cast<DWORD>(off);
     op.ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+    if (!op.is_write && take_seam(refuse_port_reads)) {
+      return false;
+    }
+    if (!op.is_write && len > 2 * direct_align && take_seam(short_port_reads)) {
+      len = static_cast<DWORD>(len / 2 - len / 2 % direct_align);
+    }
+#endif
     // The piece is the kernel's from here, and charged to the device
-    // from here.
+    // from here: a cached read completes inside the call.
     op.device_begin();
     const BOOL ok =
         op.is_write
             ? ::WriteFile(op.h, op.src + op.filled, len, nullptr, &op.ov)
             : ::ReadFile(op.h, op.dst + op.filled, len, nullptr, &op.ov);
     if (ok == 0 && ::GetLastError() != ERROR_IO_PENDING) {
-      throw_winerr(op.is_write ? "WriteFile(async)" : "ReadFile(async)");
+      op.device_end();
+      return false;
     }
     ++port_owed_;
+    return true;
   }
 
+  // Every callback runs from here, which is what poll() counts: a
+  // remainder moved to the pump is still owed, and is not one.
   void complete(transfer& op, std::error_code ec) noexcept {
     device_.add_if_served(op.device_total_ns());
     in_flight_--;
     if (op.owner_file != nullptr) {
       op.owner_file->inflight_--;
     }
+    ++reported_;
     op.done(&op, ec);
   }
 
@@ -830,8 +854,8 @@ class iocp_context {
   // the port would not take has moved to the pump: where no lane runs,
   // only poll()'s next step performs it, so a wait on the port with
   // nothing else owed to it would never return.
-  std::size_t reap_ready(bool block) {
-    std::size_t ran = 0;
+  void reap_ready(bool block) {
+    const std::size_t before = reported_;
     bool parked = false;
     for (;;) {
       DWORD bytes = 0;
@@ -839,14 +863,14 @@ class iocp_context {
       OVERLAPPED* pov = nullptr;
       const BOOL ok = ::GetQueuedCompletionStatus(
           port_.get(), &bytes, &key, &pov,
-          block && ran == 0 && !parked ? INFINITE : 0);
+          block && reported_ == before && !parked ? INFINITE : 0);
       if (pov == nullptr) {
         if (ok == 0 && ::GetLastError() == WAIT_TIMEOUT) {
-          return ran;  // nothing more queued
+          return;  // nothing more queued
         }
         if (key == wake_key) {
           woken_ = true;
-          return ran;
+          return;
         }
         throw_winerr("GetQueuedCompletionStatus");
       }
@@ -855,25 +879,19 @@ class iocp_context {
       op.device_end();
       if (ok == 0) {
         complete(op, read_error(::GetLastError()));
-        ran++;
         continue;
       }
       if (bytes == 0) {
         complete(op, std::error_code(EIO, std::generic_category()));
-        ran++;
         continue;
       }
       op.filled += bytes;
       if (op.filled < op.len) {
-        if (!reissue(op)) {
-          ran++;  // it ended here, with the error ReadFile gave
-        } else if (!op.on_port) {
-          parked = true;  // the rest is on the pump
-        }
+        route(op);
+        parked = parked || !op.on_port;  // the rest is on the pump
         continue;
       }
       complete(op, {});
-      ran++;
     }
   }
 
@@ -907,19 +925,15 @@ class iocp_context {
   // Runs the callbacks of the transfers the lanes finished, on this
   // thread. The inline step serves a machine that would not give the
   // pump a thread.
-  std::size_t serve_deferred() noexcept {
-    std::size_t ran = 0;
+  void serve_deferred() noexcept {
     for (transfer* op = pump_.take_done(); op != nullptr;) {
       transfer* const next = op->next_deferred;
       report_deferred(*op);
-      ++ran;
       op = next;
     }
     if (transfer* const op = pump_.run_one_here(); op != nullptr) {
       report_deferred(*op);
-      ++ran;
     }
-    return ran;
   }
 
   void report_deferred(transfer& op) noexcept {
@@ -948,7 +962,7 @@ class iocp_context {
       DWORD n = 0;
       if (::ReadFile(use_h, buf.data() + got,
                      static_cast<DWORD>(buf.size() - got), &n, &ov) == 0) {
-        throw_winerr("ReadFile");
+        throw std::system_error(read_error(::GetLastError()), "ReadFile");
       }
       if (n == 0) {
         throw std::system_error(EIO, std::generic_category(),
@@ -997,6 +1011,8 @@ class iocp_context {
   file* files_ = nullptr;      // every open file, for the drain
   std::size_t in_flight_ = 0;
   std::size_t served_synchronously_ = 0;
+  // Callbacks run since construction; poll() returns its growth.
+  std::size_t reported_ = 0;
   std::size_t port_owed_ = 0;  // requests the port has yet to hand back
   // What the device itself took, stamped by the port where it carried a
   // piece and by a lane where one did.
@@ -1018,6 +1034,10 @@ class iocp_context {
 // with the missed requirement named, the first time MSVC compiles this
 // header, before any engine instantiation exists.
 static_assert(io_context<iocp_context>);
+
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+}  // inline namespace test_seams
+#endif
 
 }  // namespace blake3pp::detail::io_impl
 

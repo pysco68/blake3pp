@@ -86,6 +86,42 @@ TEST_CASE("arch introspection invariants") {
          exec == "stdexec"));
 }
 
+// The order all_arches() and the dispatch preference come from, checked
+// against arch.def itself rather than a copy of today's ranks.
+TEST_CASE("all_arches() holds every arch.def row once, by ascending rank") {
+  struct row {
+    blake3pp::arch a;
+    unsigned rank;
+  };
+  constexpr row rows[] = {
+#define BLAKE3PP_ARCH(enumerator, name, rank) {blake3pp::arch::enumerator, rank},
+#include <blake3pp/detail/arch.def>
+#undef BLAKE3PP_ARCH
+  };
+  const auto rank_of = [&](blake3pp::arch a) {
+    const auto* r = std::find_if(std::begin(rows), std::end(rows),
+                                 [a](const row& x) { return x.a == a; });
+    REQUIRE(r != std::end(rows));
+    return r->rank;
+  };
+
+  const auto all = blake3pp::all_arches();
+  REQUIRE(all.size() == std::size(rows));
+  CHECK(all.front() == blake3pp::arch::auto_detect);
+  CHECK(all.back() == blake3pp::arch::scalar);
+  for (std::size_t i = 1; i < all.size(); ++i) {
+    CAPTURE(arch_name(all[i]));
+    CHECK(rank_of(all[i - 1]) < rank_of(all[i]));
+  }
+
+  // The compiled list keeps the same order.
+  const auto compiled = blake3pp::compiled_arches();
+  for (std::size_t i = 1; i < compiled.size(); ++i) {
+    CAPTURE(arch_name(compiled[i]));
+    CHECK(rank_of(compiled[i - 1]) < rank_of(compiled[i]));
+  }
+}
+
 TEST_CASE("scalar table is populated") {
   CHECK(scalar::ops.variant == blake3pp::arch::scalar);
   CHECK(scalar::ops.simd_degree == 1u);

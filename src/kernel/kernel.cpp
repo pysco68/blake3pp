@@ -370,8 +370,10 @@ class readable_block {
 
  private:
 #if BLAKE3PP_ALIGN_MESSAGE_BLOCK
-  alignas(std::uint32_t) std::uint8_t staged_ BLAKE3PP_CXXATTR_UNINITIALIZED
-      [block_len];
+  // The opt-out from the C++26 fill goes on the automatic objects of this
+  // type (see compress()): the attribute appertains to a variable, and a
+  // data member is not one.
+  alignas(std::uint32_t) std::uint8_t staged_[block_len];
 #endif
   const std::uint8_t* at_;
 };
@@ -382,7 +384,7 @@ BLAKE3PP_FORCE_INLINE void compress(const std::uint32_t cv[8],
                      std::array<std::uint32_t, 16>& out) noexcept {
   // See readable_block: where the merged load would fault, an unaligned
   // block is copied once so that the address really is aligned.
-  const readable_block in(block);
+  const readable_block in BLAKE3PP_CXXATTR_UNINITIALIZED(block);
   const std::uint8_t* const src = in.get();
 
   std::uint32_t m BLAKE3PP_CXXATTR_UNINITIALIZED [16];
@@ -494,7 +496,7 @@ BLAKE3PP_FORCE_INLINE void init_state(u32v v[16], const CvWord& cv_word,
                                std::uint32_t len, std::uint64_t counter,
                                std::uint32_t flags,
                                std::uint8_t* out) noexcept {
-  const readable_block in(block);
+  const readable_block in BLAKE3PP_CXXATTR_UNINITIALIZED(block);
 
   u32v m[16];
   for (std::size_t i = 0; i < 16; ++i) {

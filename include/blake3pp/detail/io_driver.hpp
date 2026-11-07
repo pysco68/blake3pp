@@ -36,10 +36,6 @@ struct io_driver_options {
   // where the machine has one; off selects the port. The engaged rung is
   // in file::name().
   bool ioring = true;
-  // Windows I/O ring: register the arena reserve() takes and the file
-  // handle with the ring rather than naming a pointer and a HANDLE per
-  // transfer.
-  bool registered_buffers = false;
 };
 
 

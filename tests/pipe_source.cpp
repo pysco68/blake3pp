@@ -59,6 +59,8 @@
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
+#include "counting_kernels.hpp"
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -444,6 +446,26 @@ TEST_CASE("a stream window is as long as the stream made it") {
   }
   CHECK(at == 100 * 1024);
   CHECK(f.size() == 100 * 1024);
+}
+
+// A full window ends by carrying the one byte that proved it was not the
+// last, and that byte opens the next window. A window asked for less than
+// that is refused rather than given a carry it cannot hold.
+TEST_CASE("a stream window shorter than the carry is refused") {
+  const auto bytes = pattern(100 * 1024, 13);
+  test_driver drv(scripted_reader{bytes, all_at_once(bytes.size())},
+                  {.flush_quantum = 16 * 1024});
+  test_driver::file f(drv);
+  drv.reserve(2, 64 * 1024);
+  const detail::window_storage w0 = drv.window_storage_for(f, 0, 0, 64 * 1024);
+  REQUIRE(w0.view.size() == 64 * 1024);
+  CHECK_THROWS_AS((void)drv.window_storage_for(f, 1, 64 * 1024, 0),
+                  std::logic_error);
+  // The carried byte is still there for a window that can hold it.
+  const detail::window_storage w1 =
+      drv.window_storage_for(f, 1, 64 * 1024, 64 * 1024);
+  REQUIRE_FALSE(w1.view.empty());
+  CHECK(w1.view.front() == bytes[64 * 1024]);
 }
 
 TEST_CASE("a stream reports its reads only from poll") {
@@ -927,6 +949,29 @@ TEST_CASE("the Windows ask bound follows what the reads deliver") {
 
 // ------------------------------------------------------------------
 // The real reader, end to end.
+
+// A stream compresses with the hasher's own kernel table too (see
+// tests/io.cpp for the file form).
+TEST_CASE("update_stream compresses with the hasher's table") {
+#if defined(__EMSCRIPTEN__)
+  MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
+  return;
+#endif
+  constexpr std::size_t len = 4 * 1024 * 1024 + 5;
+  const auto bytes = pattern(len, 42);
+  os_pipe p;
+  REQUIRE(p.open());
+  std::thread producer([&p, &bytes] { p.produce(bytes, ~std::size_t{0}); });
+  b3test::counting_kernels::chunks.store(0);
+  blake3pp::hasher h{b3test::counting_kernels::table()};
+  const blake3pp::stream_report r = blake3pp::update_stream(
+      h, p.r, blake3pp::get_parallel_scheduler(), {.window_bytes = 1024 * 1024});
+  producer.join();
+  p.close_read();
+  CHECK(r.bytes == len);
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+  CHECK(b3test::counting_kernels::chunks.load() >= len / 1024 * 9 / 10);
+}
 
 TEST_CASE("update_stream over a real pipe matches the sequential hasher") {
 #if defined(__EMSCRIPTEN__)

@@ -136,11 +136,24 @@ std::string version_text() {
 std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
   std::string content;
   if (source == "-") {
-    // Room for the hex form plus a line ending; anything longer is not a
-    // key and fails the checks below.
-    std::array<char, 2 * blake3pp::key_size + 4> buf;
-    const std::size_t n = std::fread(buf.data(), 1, buf.size(), stdin);
-    content.assign(buf.data(), n);
+    // Read to the end the way the data path reads standard input, so a
+    // non-blocking or interrupted read does not end the key early. Room
+    // for the hex form plus four bytes of line ending and padding; input
+    // that fills the buffer is longer than any key.
+    blake3pp::detail::stream_reader reader{blake3pp::standard_input()};
+    std::array<std::byte, 2 * blake3pp::key_size + 5> buf;
+    std::size_t n = 0;
+    for (;;) {
+      if (n == buf.size()) {
+        throw std::runtime_error("the key on standard input is too long");
+      }
+      const auto r = reader.read_some(std::span{buf}.subspan(n));
+      if (r.eof) {
+        break;
+      }
+      n += r.bytes;
+    }
+    content.assign(reinterpret_cast<const char*>(buf.data()), n);
   } else {
     std::ifstream in(source, std::ios::binary);
     if (!in) {
@@ -156,9 +169,7 @@ std::array<std::byte, blake3pp::key_size> load_key(const std::string& source) {
     }
     return key;
   }
-  while (!content.empty() && (content.back() == '\n' || content.back() == '\r' || content.back() == ' ')) {
-    content.pop_back();
-  }
+  content.erase(content.find_last_not_of(" \t\r\n") + 1);
   if (const auto parsed = blake3pp::digest::from_hex(content)) {
     return parsed.value().bytes;
   }
@@ -326,9 +337,11 @@ class engine {
   // Standard input has no file to hand to a context, and one file needs
   // no arena shared with anything. A batch takes every name as a path up
   // front, so a name that is not one leaves the files to the per-file
-  // loop, which reports that name alone as unreadable.
+  // loop, which reports that name alone as unreadable. The context always
+  // asks for the OS's async engine, so --no-async leaves the files to the
+  // per-file loop too.
   [[nodiscard]] bool can_batch(const std::vector<std::string>& files) const {
-    return pool_.parallel() && files.size() > 1 &&
+    return pool_.parallel() && opts_.io.async && files.size() > 1 &&
            std::none_of(files.begin(), files.end(),
                         [](const std::string& f) { return f == "-"; }) &&
            std::all_of(files.begin(), files.end(), is_path);
@@ -345,7 +358,9 @@ class engine {
   //
   // A file that fails carries its message instead of a digest, so one bad
   // file does not end the run. report(index, result) says whether that
-  // file passed; the count of the ones that did not is returned.
+  // file passed; the count of the ones that did not is returned. A write
+  // to stdout that throws ends the run instead: it is stopped, counted as
+  // one failure, and left to main()'s check of stdout to report.
   template <class Report>
   int run_batch(const std::vector<std::string>& files,
                 const std::vector<std::size_t>& out_lens, Report report) {
@@ -354,13 +369,12 @@ class engine {
                                      .arena_bytes = 128u << 20,
                                      .direct_io = opts_.io.direct_io,
                                      .offload_submit = opts_.io.offload_submit,
-                                     .ioring = opts_.io.ioring,
-                                     .registered_buffers =
-                                         opts_.io.registered_buffers});
+                                     .ioring = opts_.io.ioring});
     const std::vector<std::filesystem::path> paths(files.begin(), files.end());
     std::vector<std::optional<result>> out(files.size());
     std::size_t next = 0;  // the next outcome to report
     int failures = 0;
+    bool write_failed = false;
     // The tracer is a type the sender carries, so the two spellings are
     // two instantiations of the same call.
     const auto run = [&](auto tracer) {
@@ -370,13 +384,26 @@ class engine {
           [&](std::size_t i, blake3pp::hasher& h,
               const blake3pp::async::file_outcome& o) noexcept {
             out[i] = describe(o, h, out_lens[i]);
-            for (; next < out.size() && out[next].has_value(); ++next) {
-              if (!report(next, *out[next])) {
-                failures++;
+            if (write_failed) {
+              return;
+            }
+            try {
+              for (; next < out.size() && out[next].has_value(); ++next) {
+                if (!report(next, *out[next])) {
+                  failures++;
+                }
+                // Reported is done with: a long --length is megabytes of
+                // hex per file.
+                out[next].reset();
               }
+            } catch (const std::system_error&) {
+              write_failed = true;
+              ctx.request_stop();
             }
           },
           tracer);
+      // A stopped run returns an empty optional; only the write failure
+      // stops one.
       blake3pp::async::sync_wait(ctx, std::move(work));
     };
     if (opts_.io.trace != nullptr) {
@@ -384,13 +411,13 @@ class engine {
     } else {
       run(blake3pp::null_tracer{});
     }
-    return failures;
+    return failures + (write_failed ? 1 : 0);
   }
 
   // The batch behind the printing path: one line per file.
   int hash_many(const std::vector<std::string>& files, std::size_t out_len) {
     return run_batch(files, std::vector<std::size_t>(files.size(), out_len),
-                     [&](std::size_t i, const result& r) noexcept {
+                     [&](std::size_t i, const result& r) {
                        if (!r.error.empty()) {
                          println(stderr, "blake3ppsum: {}: {}", files[i],
                                  r.error);
@@ -412,7 +439,7 @@ class engine {
       out_lens[i] = expected[i].size() / 2;
     }
     run_batch(files, out_lens,
-              [&](std::size_t i, const result& r) noexcept {
+              [&](std::size_t i, const result& r) {
                 const line_name n = escape_name(files[i]);
                 if (!r.error.empty()) {
                   println(stderr, "blake3ppsum: {}: {}", files[i], r.error);
@@ -689,20 +716,29 @@ void run_check(engine& eng, std::istream& in, std::string_view list_name,
     return;
   }
 
+  // A failed read is the file's and the run goes on; a failed write is
+  // stdout's, which ends the list and is left to main() to report.
   for (std::size_t i = 0; i < names.size(); ++i) {
     const std::string& name = names[i];
     const line_name n = escape_name(name);
     try {
-      if (eng.hash_hex(name, expected[i].size() / 2) == expected[i]) {
+      std::optional<std::string> got;
+      try {
+        got = eng.hash_hex(name, expected[i].size() / 2);
+      } catch (const std::exception& e) {
+        println(stderr, "blake3ppsum: {}: {}", name, e.what());
+      }
+      if (!got) {
+        println(stdout, "{}{}: FAILED open or read", n.prefix, n.text);
+        counts.unreadable++;
+      } else if (*got == expected[i]) {
         println(stdout, "{}{}: OK", n.prefix, n.text);
       } else {
         println(stdout, "{}{}: FAILED", n.prefix, n.text);
         counts.mismatched++;
       }
-    } catch (const std::exception& e) {
-      println(stderr, "blake3ppsum: {}: {}", name, e.what());
-      println(stdout, "{}{}: FAILED open or read", n.prefix, n.text);
-      counts.unreadable++;
+    } catch (const std::system_error&) {
+      return;
     }
   }
 }
@@ -861,100 +897,118 @@ int run_main(int argc, char** argv) {
       }
     };
 
-    if (o.check) {
-      check_counts counts;
-      for (const auto& f : o.files) {
-        if (f == "-") {
-          run_check(eng, std::cin, "-", counts);
-          continue;
+    // The run itself. Past this point a failure is the work's, not the
+    // invocation's: it exits 1, and the trace is written either way.
+    try {
+      if (o.check) {
+        check_counts counts;
+        for (const auto& f : o.files) {
+          // A list whose output could not be written ended early; the
+          // next one would only fail the same way.
+          if (std::ferror(stdout) != 0) {
+            break;
+          }
+          if (f == "-") {
+            run_check(eng, std::cin, "-", counts);
+            continue;
+          }
+          // Binary, as standard input is: the parser drops the carriage
+          // return of a CRLF line itself, on every platform.
+          std::ifstream in(f, std::ios::binary);
+          if (!in) {
+            println(stderr, "blake3ppsum: {}: cannot open", f);
+            counts.bad_lists++;
+            continue;
+          }
+          run_check(eng, in, f, counts);
         }
-        // Binary, as standard input is: the parser drops the carriage
-        // return of a CRLF line itself, on every platform.
-        std::ifstream in(f, std::ios::binary);
-        if (!in) {
-          println(stderr, "blake3ppsum: {}: cannot open", f);
-          counts.bad_lists++;
-          continue;
+        if (counts.malformed > 0) {
+          println(stderr, "blake3ppsum: WARNING: {} {} improperly formatted",
+                  counts.malformed,
+                  counts.malformed == 1 ? "line is" : "lines are");
         }
-        run_check(eng, in, f, counts);
-      }
-      if (counts.malformed > 0) {
-        println(stderr, "blake3ppsum: WARNING: {} {} improperly formatted",
-                counts.malformed,
-                counts.malformed == 1 ? "line is" : "lines are");
-      }
-      if (counts.unreadable > 0) {
-        println(stderr, "blake3ppsum: WARNING: {} listed {} could not be read",
-                counts.unreadable, counts.unreadable == 1 ? "file" : "files");
-      }
-      if (counts.mismatched > 0) {
-        println(stderr, "blake3ppsum: WARNING: {} computed {} did NOT match",
-                counts.mismatched,
-                counts.mismatched == 1 ? "checksum" : "checksums");
-      }
-      if (counts.failed()) {
-        failures++;
-      }
-      write_trace();
-      return failures == 0 ? 0 : b3tool::exit_failure;
-    }
-
-    if (eng.can_batch(o.files)) {
-      // Several files over one context: one arena, several in flight,
-      // lines printed as files complete, in input order.
-      failures += eng.hash_many(o.files, o.out_len);
-    } else {
-      for (const auto& f : o.files) {
-        try {
-          const std::string hex = eng.hash_hex(f, o.out_len);
-          const line_name n = escape_name(f);
-          println(stdout, "{}{}  {}", n.prefix, hex, n.text);
-        } catch (const std::exception& e) {
-          println(stderr, "blake3ppsum: {}: {}", f, e.what());
+        if (counts.unreadable > 0) {
+          println(stderr, "blake3ppsum: WARNING: {} listed {} could not be read",
+                  counts.unreadable, counts.unreadable == 1 ? "file" : "files");
+        }
+        if (counts.mismatched > 0) {
+          println(stderr, "blake3ppsum: WARNING: {} computed {} did NOT match",
+                  counts.mismatched,
+                  counts.mismatched == 1 ? "checksum" : "checksums");
+        }
+        if (counts.failed()) {
           failures++;
         }
-      }
-    }
-    if (o.diag) {
-      const unsigned hw_threads = b3tool::default_threads();
-      std::size_t window = 0;
-      unsigned windows = 0;
-      if (o.files.front() == "-") {
-        // The stream's geometry as the run settled it. A stream fills one
-        // window at a time, so the device side of the diagnosis is the
-        // stream itself.
-        window = eng.stream().window_bytes;
-        windows = eng.stream().windows_planned;
       } else {
-        // The plan update_file() made, from the same budget rule: the
-        // arena figure is read against its window count.
-        window = blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
-        std::error_code size_ec;
-        const std::uintmax_t size =
-            std::filesystem::file_size(o.files.front(), size_ec);
-        windows = blake3pp::detail::plan_pipeline(
-                      0, o.io.window_bytes, o.io.queue_depth, o.io.direct_io,
-                      size_ec ? 0 : static_cast<std::uint64_t>(size),
-                      blake3pp::detail::read_plan_budget_bytes(
-                          hw_threads, o.io.window_bytes))
-                      .windows;
-      }
-      report_read_diagnosis(
-          eng.pipelined()
-              ? blake3pp::diagnose_read(trace->driver(), eng.wall_ns(), o.threads,
-                                      windows, window)
-              : blake3pp::diagnosis{},
-          o.threads, hw_threads);
-      if (o.files.front() == "-" && eng.pipelined()) {
-        // What the diagnosis cannot show about a stream run: how the
-        // windows ended, the pipe buffer the OS granted, and what the
-        // reader did before each read.
-        for (const auto& line : b3tool::stream_lines(
-                 eng.stream(),
-                 [](std::uint64_t n) { return b3tool::bytes_label(n); })) {
-          println(stderr, "{}", line);
+        if (eng.can_batch(o.files)) {
+          // Several files over one context: one arena, several in flight,
+          // lines printed as files complete, in input order.
+          failures += eng.hash_many(o.files, o.out_len);
+        } else {
+          for (const auto& f : o.files) {
+            std::string hex;
+            try {
+              hex = eng.hash_hex(f, o.out_len);
+            } catch (const std::exception& e) {
+              println(stderr, "blake3ppsum: {}: {}", f, e.what());
+              failures++;
+              continue;
+            }
+            // A failed write is stdout's, not the file's: main() reports it.
+            try {
+              const line_name n = escape_name(f);
+              println(stdout, "{}{}  {}", n.prefix, hex, n.text);
+            } catch (const std::system_error&) {
+              failures++;
+              break;
+            }
+          }
+        }
+        if (o.diag) {
+          const unsigned hw_threads = b3tool::default_threads();
+          std::size_t window = 0;
+          unsigned windows = 0;
+          if (o.files.front() == "-") {
+            // The stream's geometry as the run settled it. A stream fills one
+            // window at a time, so the device side of the diagnosis is the
+            // stream itself.
+            window = eng.stream().window_bytes;
+            windows = eng.stream().windows_planned;
+          } else {
+            // The plan update_file() made, from the same budget rule: the
+            // arena figure is read against its window count.
+            window = blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
+            std::error_code size_ec;
+            const std::uintmax_t size =
+                std::filesystem::file_size(o.files.front(), size_ec);
+            windows = blake3pp::detail::plan_pipeline(
+                          0, o.io.window_bytes, o.io.queue_depth, o.io.direct_io,
+                          size_ec ? 0 : static_cast<std::uint64_t>(size),
+                          blake3pp::detail::read_plan_budget_bytes(
+                              hw_threads, o.io.window_bytes))
+                          .windows;
+          }
+          report_read_diagnosis(
+              eng.pipelined()
+                  ? blake3pp::diagnose_read(trace->driver(), eng.wall_ns(),
+                                            o.threads, windows, window)
+                  : blake3pp::diagnosis{},
+              o.threads, hw_threads);
+          if (o.files.front() == "-" && eng.pipelined()) {
+            // What the diagnosis cannot show about a stream run: how the
+            // windows ended, the pipe buffer the OS granted, and what the
+            // reader did before each read.
+            for (const auto& line : b3tool::stream_lines(
+                     eng.stream(),
+                     [](std::uint64_t n) { return b3tool::bytes_label(n); })) {
+              println(stderr, "{}", line);
+            }
+          }
         }
       }
+    } catch (const std::exception& e) {
+      println(stderr, "blake3ppsum: {}", e.what());
+      failures++;
     }
     write_trace();
   } catch (const std::exception& e) {

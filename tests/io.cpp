@@ -53,6 +53,7 @@
 // the tests below ask the selected context what rung it engaged and
 // hold the public list to the answer.
 #include "io/backend_select.hpp"
+#include "counting_kernels.hpp"
 #include "temp_names.hpp"
 
 namespace {
@@ -102,9 +103,9 @@ constexpr blake3pp::io_engine every_io_engine[] = {
 };
 
 // The leading engine name of a `backend` string, with every decoration
-// the backends append cut off: "+direct", "+nocache", "+regbuf",
-// " (inline submit)", " [io_uring: ENOSYS, kernel too old]". What is
-// left is one io_engine's own spelling, which is what to_string() gives.
+// the backends append cut off: "+direct", "+nocache", " (inline submit)",
+// " [io_uring: ENOSYS, kernel too old]". What is left is one io_engine's
+// own spelling, which is what to_string() gives.
 std::string engine_token(std::string_view backend) {
   return std::string(backend.substr(0, backend.find_first_of("+ ")));
 }
@@ -716,6 +717,37 @@ TEST_CASE("missing file throws system_error") {
   CHECK_THROWS_AS(
       (void)blake3pp::hash_file("/nonexistent/blake3pp/no/such/file"),
       std::system_error);
+}
+
+// io.hpp promises the engaged rung through read_backend(trace.driver())
+// on every read path, and the sequential window loop is one of them.
+TEST_CASE("a traced sequential update_file names its read backend") {
+  const auto content = make_input(1024 * 1024 + 3);
+  const temp_file f(content);
+  for (const bool async : {true, false}) {
+    CAPTURE(async);
+    std::vector<blake3pp::window_record> windows(64);
+    blake3pp::trace_buffer trace(windows, std::span<blake3pp::agent_record>{});
+    blake3pp::hasher h;
+    blake3pp::update_file(h, f.path, {.async = async, .trace = &trace});
+    CHECK(h.finalize() == blake3pp::hash(content));
+    CHECK_FALSE(blake3pp::read_backend(trace.driver()).empty());
+  }
+}
+
+// A hasher on a kernel table of the caller's: the windows the pipeline
+// compresses on the pool go through that table, as the hasher's own bytes
+// do, and not through the library table its variant would resolve to.
+TEST_CASE("update_file over a scheduler compresses with the hasher's table") {
+  constexpr std::size_t len = 8 * 1024 * 1024 + 5;
+  const auto content = make_input(len);
+  const temp_file f(content);
+  b3test::counting_kernels::chunks.store(0);
+  blake3pp::hasher h{b3test::counting_kernels::table()};
+  blake3pp::update_file(h, f.path, blake3pp::get_parallel_scheduler(),
+                        {.window_bytes = 1024 * 1024});
+  CHECK(h.finalize() == blake3pp::hash(content));
+  CHECK(b3test::counting_kernels::chunks.load() >= len / 1024 * 9 / 10);
 }
 
 TEST_CASE("reader reports a backend") {

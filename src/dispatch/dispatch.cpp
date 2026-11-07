@@ -69,36 +69,22 @@ constexpr arch_row arch_table[] = {
 
 constexpr std::size_t num_arches = std::size(arch_table);
 
-consteval bool ranks_unique() {
-  for (std::size_t i = 0; i < num_arches; ++i) {
-    for (std::size_t j = i + 1; j < num_arches; ++j) {
-      if (arch_table[i].rank == arch_table[j].rank) {
-        return false;
-      }
-    }
-  }
-  return true;
-}
-static_assert(ranks_unique(), "arch.def ranks must be unique");
+// The rows by ascending rank.
+constexpr std::array<arch_row, num_arches> rows_by_rank = [] {
+  auto rows = std::to_array(arch_table);
+  std::ranges::sort(rows, {}, &arch_row::rank);
+  return rows;
+}();
+static_assert(std::ranges::adjacent_find(rows_by_rank, {}, &arch_row::rank) ==
+                  rows_by_rank.end(),
+              "arch.def ranks must be unique");
 
 // Every enumerator sorted by rank: auto_detect first (rank 0), then
 // best-first. This is all_arches() verbatim, and the dispatch preference
 // order is its tail. One list, two roles.
 constexpr std::array<arch, num_arches> all_enumerators = [] {
   std::array<arch, num_arches> out{};
-  std::size_t n = 0;
-  // Selection by ascending rank; ranks are unique (asserted above).
-  for (unsigned last = 0; n < num_arches;) {
-    const arch_row* next = nullptr;
-    for (const arch_row& r : arch_table) {
-      if ((n == 0 || r.rank > last) &&
-          (next == nullptr || r.rank < next->rank)) {
-        next = &r;
-      }
-    }
-    out[n++] = next->a;
-    last = next->rank;
-  }
+  std::ranges::transform(rows_by_rank, out.begin(), &arch_row::a);
   return out;
 }();
 static_assert(all_enumerators.front() == arch::auto_detect,
@@ -126,12 +112,8 @@ static_assert(compiled_sorted.back() == arch::scalar,
               "the scalar fallback must always be registered");
 
 const registry_entry* find_registry(arch a) noexcept {
-  for (const registry_entry& e : registry) {
-    if (e.a == a) {
-      return &e;
-    }
-  }
-  return nullptr;
+  const auto* const it = std::ranges::find(registry, a, &registry_entry::a);
+  return it != std::ranges::end(registry) ? it : nullptr;
 }
 
 bool compiled_in(arch a) noexcept { return find_registry(a) != nullptr; }

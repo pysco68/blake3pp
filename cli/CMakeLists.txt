@@ -67,12 +67,23 @@ endif()
 # page, the key forms, the stream and --diag paths, the generator's
 # determinism, seek and --output, and the usage errors (see
 # smoketest.cmake).
+# A sanitizer's shadow memory does not fit the address-space limit that
+# gen_short_buffer runs under.
+if(CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+  set(b3_sanitized ON)
+else()
+  set(b3_sanitized OFF)
+endif()
 foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
+    batch_no_async
     check_roundtrip check_batched check_empty_list check_crlf check_names
     check_escaped_line check_nonhex check_counts utf8_names check_utf8_list
     gen_utf8_names length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
-    gen_output gen_seed_file sum_errors key_forms gen_errors)
+    gen_output gen_seed_file gen_short_buffer sum_alloc_failure
+    sum_batch_release
+    trace_write_failure sum_errors
+    key_forms gen_errors)
   add_test(NAME cli_${case}
     COMMAND ${CMAKE_COMMAND}
       "-DSUM=$<TARGET_FILE:blake3ppsum>"
@@ -82,6 +93,7 @@ foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
       # ctest only wraps add_test(target) commands in the emulator; a
       # script-mode driver must carry it explicitly for cross builds.
       "-DEMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}"
+      "-DSANITIZED=${b3_sanitized}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/smoketest.cmake")
 endforeach()
 
@@ -108,7 +120,8 @@ endif()
 # exist where those were built, and not in a cross build.
 if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
   foreach(case short_stream empty_stream producer_dies pipefail stall read_error
-      eintr_storm nonblock_stdin closed_stdin stdout_closed gen_reader_closed)
+      eintr_storm nonblock_stdin closed_stdin stdout_closed stdout_closed_batch
+      stdout_closed_check gen_reader_closed)
     add_test(NAME cli_fault_${case}
       COMMAND ${CMAKE_COMMAND}
         "-DSUM=$<TARGET_FILE:blake3ppsum>"

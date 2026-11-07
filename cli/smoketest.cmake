@@ -131,10 +131,14 @@ elseif(CASE STREQUAL "trace_inputs")
   run_sum(out res1 ERR_VAR err1 ARGS --trace t1.json --window 1
     STDIN "${WORK}/stream")
   run_sum(out res2 ERR_VAR err2 ARGS --trace t2.json --window 1 --check sums)
-  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0)
-    message(FATAL_ERROR "a traced run failed (rc=${res1}, ${res2}): ${err1} ${err2}")
+  file(COPY_FILE "${WORK}/stream" "${WORK}/stream2")
+  run_sum(out res3 ERR_VAR err3 ARGS --trace t3.json --window 1 stream stream2)
+  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0
+     OR NOT res3 EQUAL 0)
+    message(FATAL_ERROR "a traced run failed (rc=${res1}, ${res2}, ${res3}): "
+      "${err1} ${err2} ${err3}")
   endif()
-  foreach(err IN ITEMS "${err1}" "${err2}")
+  foreach(err IN ITEMS "${err1}" "${err2}" "${err3}")
     if(NOT err MATCHES "trace: ([0-9]+) window records" OR CMAKE_MATCH_1 LESS 19
        OR err MATCHES "dropped")
       message(FATAL_ERROR "the trace had no room for the run's windows: ${err}")
@@ -146,6 +150,43 @@ elseif(CASE STREQUAL "trace_inputs")
   if(NOT json MATCHES "\"device_depth\":[0-9]+" OR NOT json MATCHES "\"lane_wait_ns\":[0-9]+"
      OR NOT json MATCHES "\"read_backend\":\"[^\"]+\"")
     message(FATAL_ERROR "the driver event lacks the device and backend fields")
+  endif()
+  # Several files hash over one shared context, whose trace still names
+  # the backend that read them.
+  file(READ "${WORK}/t3.json" json)
+  if(NOT json MATCHES "\"read_backend\":\"[^\"]+\"")
+    message(FATAL_ERROR "a several-file trace names no read backend")
+  endif()
+
+elseif(CASE STREQUAL "batch_no_async")
+  # --no-async reaches every path: several files and a --check list, which
+  # hash over one shared context, read through the backend one file gets.
+  # The trace names the backend that read; without an async engine in the
+  # build all three are synchronous and agree anyway.
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed batch --length 1048576
+    --threads ${SMOKE_THREADS}
+    OUTPUT_FILE "${WORK}/a" RESULT_VARIABLE r0)
+  file(COPY_FILE "${WORK}/a" "${WORK}/b")
+  run_sum(sums res0 ERR_VAR err0 ARGS --no-async --trace one.json a)
+  run_sum(sums res1 ERR_VAR err1 ARGS --no-async --trace many.json a b)
+  file(WRITE "${WORK}/sums" "${sums}")
+  run_sum(out res2 ERR_VAR err2 ARGS --no-async --trace check.json --check sums)
+  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0)
+    message(FATAL_ERROR "a --no-async run failed (rc=${res0}, ${res1}, ${res2}): "
+      "${err0} ${err1} ${err2}")
+  endif()
+  set(backends "")
+  foreach(t IN ITEMS one many check)
+    file(READ "${WORK}/${t}.json" json)
+    if(NOT json MATCHES "\"read_backend\":\"([^\"]+)\"")
+      message(FATAL_ERROR "the ${t} trace names no read backend")
+    endif()
+    list(APPEND backends "${t}: ${CMAKE_MATCH_1}")
+    set(backend_${t} "${CMAKE_MATCH_1}")
+  endforeach()
+  if(NOT backend_many STREQUAL backend_one OR NOT backend_check STREQUAL backend_one)
+    list(JOIN backends ", " backends)
+    message(FATAL_ERROR "--no-async read through different backends: ${backends}")
   endif()
 
 elseif(CASE STREQUAL "check_roundtrip")
@@ -547,6 +588,111 @@ elseif(CASE STREQUAL "gen_threads")
     message(FATAL_ERROR "threaded generation diverges from sequential")
   endif()
 
+elseif(CASE STREQUAL "gen_short_buffer")
+  # The stdout buffer holds what --length asks for, not one segment per
+  # thread: 64 bytes on 1024 threads must not take 4 GiB, and on a 32-bit
+  # target the uncapped product wrapped to an empty buffer that wrote
+  # nothing for ever. On Linux the run gets an address space too small
+  # for the old buffer, so that regression fails instead of allocating.
+  # A sanitizer's shadow memory and an emulator (node reserves the wasm
+  # heap and its guard regions up front) need more than that, so those
+  # lanes run it without the limit.
+  set(limit "")
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND NOT SANITIZED AND NOT EMULATOR)
+    find_program(PRLIMIT prlimit)
+    if(PRLIMIT)
+      set(limit "${PRLIMIT}" --as=3221225472 --)
+    endif()
+  endif()
+  execute_process(
+    COMMAND ${limit} ${EMULATOR} "${GEN}" --seed t --length 64 --threads 1024
+    OUTPUT_FILE "${WORK}/short" ERROR_VARIABLE err RESULT_VARIABLE r)
+  file(SIZE "${WORK}/short" n)
+  if(NOT r EQUAL 0 OR NOT n EQUAL 64)
+    message(FATAL_ERROR "--length 64 --threads 1024: exit ${r}, ${n} bytes: ${err}")
+  endif()
+
+elseif(CASE STREQUAL "sum_alloc_failure")
+  # A batch whose arena cannot be allocated: four 1 GiB windows in an
+  # address space of 2 GiB. The failure comes after the engine is built,
+  # so it is the run's (exit 1, not the usage status), it is reported
+  # rather than aborting the process, and the trace is still written.
+  # Linux only, where prlimit sets the limit; a sanitizer or an emulator
+  # needs more address space than that to start at all.
+  if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR SANITIZED OR EMULATOR)
+    message(STATUS "skipped: needs prlimit on a native, unsanitized Linux build")
+    return()
+  endif()
+  find_program(PRLIMIT prlimit)
+  if(NOT PRLIMIT)
+    message(STATUS "skipped: no prlimit")
+    return()
+  endif()
+  file(WRITE "${WORK}/a" "a\n")
+  file(WRITE "${WORK}/b" "b\n")
+  execute_process(
+    COMMAND "${PRLIMIT}" --as=2147483648 -- "${SUM}" --threads 4 --window 1024
+      --trace "${WORK}/trace.json" a b
+    WORKING_DIRECTORY "${WORK}"
+    OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE r)
+  set(traced NO)
+  if(EXISTS "${WORK}/trace.json")
+    set(traced YES)
+  endif()
+  if(NOT r STREQUAL "1" OR NOT err MATCHES "bad_alloc" OR NOT traced)
+    message(FATAL_ERROR "an arena that cannot be allocated: exit ${r}, "
+      "trace written: ${traced}, stderr: ${err}")
+  endif()
+
+elseif(CASE STREQUAL "sum_batch_release")
+  # A batch releases each file's digest once it is reported. 1024 files at
+  # --length 1 MiB are 2 GiB of hex, which does not fit the 2 GiB address
+  # space this run gets if every reported line is kept to the end. Linux
+  # only, for the same reasons as sum_alloc_failure.
+  if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR SANITIZED OR EMULATOR)
+    message(STATUS "skipped: needs prlimit on a native, unsanitized Linux build")
+    return()
+  endif()
+  find_program(PRLIMIT prlimit)
+  if(NOT PRLIMIT)
+    message(STATUS "skipped: no prlimit")
+    return()
+  endif()
+  set(names "")
+  foreach(i RANGE 1 1024)
+    file(WRITE "${WORK}/f${i}" "${i}\n")
+    list(APPEND names "f${i}")
+  endforeach()
+  execute_process(
+    COMMAND "${PRLIMIT}" --as=2147483648 -- "${SUM}" --threads 4
+      --length 1048576 ${names}
+    WORKING_DIRECTORY "${WORK}"
+    OUTPUT_FILE /dev/null ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(NOT r EQUAL 0)
+    message(FATAL_ERROR "1024 files at --length 1 MiB in 2 GiB: exit ${r}: ${err}")
+  endif()
+
+elseif(CASE STREQUAL "trace_write_failure")
+  # A trace that cannot be written is reported and fails the run, also
+  # when it is small enough that nothing reaches the file before the
+  # stream is closed. /dev/full accepts the open and refuses every write.
+  if(NOT EXISTS /dev/full)
+    message(STATUS "skipped: no /dev/full")
+    return()
+  endif()
+  file(WRITE "${WORK}/a" "a\n")
+  execute_process(COMMAND ${EMULATOR} "${SUM}" --trace /dev/full a
+    WORKING_DIRECTORY "${WORK}" OUTPUT_QUIET ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(r EQUAL 0 OR NOT err MATCHES "could not write /dev/full")
+    message(FATAL_ERROR "blake3ppsum --trace /dev/full: exit ${r}: ${err}")
+  endif()
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed t --length 64 --threads 4 --output a2
+      --trace /dev/full
+    WORKING_DIRECTORY "${WORK}" OUTPUT_QUIET ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(r EQUAL 0 OR NOT err MATCHES "/dev/full")
+    message(FATAL_ERROR "blake3ppgen --trace /dev/full: exit ${r}: ${err}")
+  endif()
+
 elseif(CASE STREQUAL "gen_seed_file")
   # --seed-file streams through the library's file pipeline: a seed
   # spanning several windows must hash identically sequentially and
@@ -638,6 +784,20 @@ elseif(CASE STREQUAL "key_forms")
   if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT r3 EQUAL 0
      OR NOT a STREQUAL b OR NOT a STREQUAL c)
     message(FATAL_ERROR "key forms disagree: raw=${a} hex=${b} stdin=${c}")
+  endif()
+  # On stdin the key is read to the end: trailing whitespace, a tab
+  # included, is dropped, and anything after it makes the input no key,
+  # however far past the hex it starts.
+  file(READ "${WORK}/hexkey" hex)
+  file(WRITE "${WORK}/key-tab" "${hex}\t\n")
+  file(WRITE "${WORK}/key-trailer" "${hex}    x")
+  run_sum(t rt ARGS --keyed - f STDIN "${WORK}/key-tab")
+  run_sum(x rx ARGS --keyed - f STDIN "${WORK}/key-trailer")
+  if(NOT rt EQUAL 0 OR NOT t STREQUAL a)
+    message(FATAL_ERROR "a stdin key ending in a tab was not taken: rc=${rt} ${t}")
+  endif()
+  if(rx EQUAL 0)
+    message(FATAL_ERROR "a stdin key followed by four spaces and a byte was accepted: ${x}")
   endif()
   execute_process(COMMAND ${EMULATOR} "${GEN}" --seed k --length 20000000
     --threads ${SMOKE_THREADS}

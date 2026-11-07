@@ -21,8 +21,7 @@
 // API: `file_io_probe::backend` and `write_report::backend` have always
 // been spelled this way, and to_string() says the same words from this
 // table. A backend may decorate the name -- "+direct", "+nocache",
-// "+regbuf", " [io_uring: ENOSYS, kernel too old]" -- after the engine
-// token; the token itself is what is here.
+// " [io_uring: ENOSYS, kernel too old]" -- after the engine token; the token itself is what is here.
 //
 // `async` marks the engines a caller gives up with --no-async: the ones
 // that hand a transfer to the OS and collect a completion later. It is

@@ -606,13 +606,6 @@ class driver_loop {
   // For a const reporter asking the driver what its engine offered.
   [[nodiscard]] const D& driver() const noexcept { return drv_; }
 
-  // Where to record what this thread spends its time on; null records
-  // nothing, which is the default and costs one branch per poll.
-  void record_into(trace_buffer* trace) noexcept {
-    trace_ = trace;
-    stats_ = trace != nullptr ? &trace->driver() : nullptr;
-  }
-
   // Hands one node to the driver, from any thread.
   //
   // Everything after the push touches this loop and nothing else: the
@@ -623,11 +616,28 @@ class driver_loop {
   // what keeps the loop and the driver alive long enough to reach it --
   // run_until does not return while a thread is between the two.
   void publish(run_node* n) noexcept {
-    publishers_.fetch_add(1, std::memory_order_relaxed);
+    const publishing pin{this};
     queue_.push(n);
     drv_.wake();
-    publishers_.fetch_sub(1, std::memory_order_release);
   }
+
+  // A thread that hands run_until's caller something and then still has
+  // to reach this loop, the way publish() does, holds one of these across
+  // both: run_until does not return until it is gone. The hand-over must
+  // come after the constructor, which is what makes the count visible to
+  // a caller that saw the hand-over.
+  class publishing {
+   public:
+    explicit publishing(driver_loop* loop) noexcept : loop_(loop) {
+      loop_->publishers_.fetch_add(1, std::memory_order_relaxed);
+    }
+    publishing(const publishing&) = delete;
+    publishing& operator=(const publishing&) = delete;
+    ~publishing() { loop_->publishers_.fetch_sub(1, std::memory_order_release); }
+
+   private:
+    driver_loop* loop_;
+  };
 
   // Drives everything until the pipeline says it is done, which happens
   // inside a completion this loop itself ran. Blocks only when there is
@@ -647,27 +657,33 @@ class driver_loop {
         "empty run queue and nothing outstanding: nothing could wake it");
   }
 
+  // `trace` receives what the thread spends its time on during this call;
+  // null records nothing and costs one branch per poll. It is given per
+  // call because an async context's loop outlives the operations it runs,
+  // and their buffers with them.
   template <class BeforeFlush, class OnStall>
   void run_until(const loop_status& status, BeforeFlush&& before_flush,
-                 OnStall&& on_stall) {
+                 OnStall&& on_stall, trace_buffer* trace = nullptr) {
     // Also on the way out of a throwing poll(): the caller's next act is
     // to destroy the operation cells, and a thread inside publish() is
     // still reading this loop.
     const publisher_guard guard{this};
+    driver_stats* const stats = trace != nullptr ? &trace->driver() : nullptr;
     // The driver's own split of busy against parked, which is what says
     // whether this thread is the bottleneck once the stage shares of a
     // window no longer sum to the wall clock. One clock read per poll,
     // and none at all without a trace buffer.
-    std::int64_t t = stats_ != nullptr ? trace_->now() : 0;
+    std::int64_t t = stats != nullptr ? trace->now() : 0;
     for (;;) {
-      drain();
+      const std::size_t ran_queue = drain();
       before_flush();
-      if (stats_ != nullptr) {
-        ++stats_->iterations;
+      if (stats != nullptr) {
+        stats->queue_runs += ran_queue;
+        ++stats->iterations;
       }
       if (status.done) {
-        if (stats_ != nullptr) {
-          stats_->busy_ns += static_cast<std::uint64_t>(trace_->now() - t);
+        if (stats != nullptr) {
+          stats->busy_ns += static_cast<std::uint64_t>(trace->now() - t);
         }
         return;
       }
@@ -683,25 +699,25 @@ class driver_loop {
       if (block && drv_.in_flight() == 0 && status.outstanding == 0) {
         on_stall();
       }
-      if (stats_ == nullptr) {
+      if (stats == nullptr) {
         drv_.poll(block);
         continue;
       }
-      const std::int64_t t_poll = trace_->now();
-      stats_->busy_ns += static_cast<std::uint64_t>(t_poll - t);
+      const std::int64_t t_poll = trace->now();
+      stats->busy_ns += static_cast<std::uint64_t>(t_poll - t);
       const std::size_t ran = drv_.poll(block);
-      t = trace_->now();
-      ++stats_->polls;
+      t = trace->now();
+      ++stats->polls;
       if (block) {
-        ++stats_->blocking_polls;
-        stats_->parked_ns += static_cast<std::uint64_t>(t - t_poll);
+        ++stats->blocking_polls;
+        stats->parked_ns += static_cast<std::uint64_t>(t - t_poll);
         if (ran == 0) {
           // Nothing of the driver's own finished, so what released this
           // poll was a wake from a thread handing a window back.
-          ++stats_->wakes;
+          ++stats->wakes;
         }
       } else {
-        stats_->busy_ns += static_cast<std::uint64_t>(t - t_poll);
+        stats->busy_ns += static_cast<std::uint64_t>(t - t_poll);
       }
     }
   }
@@ -738,9 +754,6 @@ class driver_loop {
       ++ran;
       n = next;
     }
-    if (stats_ != nullptr) {
-      stats_->queue_runs += ran;
-    }
     return ran;
   }
 
@@ -756,8 +769,6 @@ class driver_loop {
   D& drv_;
   run_queue queue_;
   std::atomic<unsigned> publishers_{0};
-  trace_buffer* trace_ = nullptr;
-  driver_stats* stats_ = nullptr;
 };
 
 // --------------------------------------------------------------------
@@ -943,11 +954,6 @@ struct pipeline_options {
   // argument at admit_more()), which only a caller that knows the file
   // can judge.
   std::size_t reducer_capacity = 0;
-  // The kernel table the windows compress with, or null to take the
-  // hasher's. The expert entry points hand a caller-supplied table
-  // straight through; resolving the hasher's variant back to a
-  // registered table would quietly replace it with the library's own.
-  const kern::kernel_ops* ops = nullptr;
   // A stop the caller owns. The scope watches it for the whole run and
   // requests its own stop from it, so a token requested from any thread
   // reaches the driver through the one member another thread may call.
@@ -1455,7 +1461,10 @@ class window_scope
         sched_(std::move(sched)),
         trace_(tracer.buffer()),
         file_index_(opts.file_index),
-        ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
+        // The hasher's own table, never one resolved from its variant:
+        // that would quietly replace a caller-supplied table with the
+        // library's.
+        ops_(kernels(h)),
         window_bytes_(plan.window_bytes),
         count_(std::min(plan.windows, host.pool().count())),
         reads_in_flight_(plan.reads_in_flight),
@@ -1501,7 +1510,6 @@ class window_scope
     require(host.pool().window_bytes() >= window_bytes_,
             "update_file(): a host whose windows are smaller than this run "
             "plans to read");
-    loop_.record_into(trace_);
     // One operation cell per window this run may hold at once. The cells
     // are the scope's; the windows are not, so a borrowed window carries
     // the index of the cell it was lent with. Handed out lowest first,
@@ -1737,7 +1745,8 @@ class window_scope
     pipeline_cells_for<window_scope> cells(count_);
     try {
       loop_.run_until(
-          status_, [&] { admit_round(cells); }, [this] { on_stall(); });
+          status_, [&] { admit_round(cells); }, [this] { on_stall(); },
+          trace_);
     } catch (...) {
       quiesce();
       throw;
@@ -2021,6 +2030,13 @@ class window_scope
     }
   }
 
+  // The two compress stages return provider senders too and are not
+  // tagged, so two units share their names and the linker keeps one body
+  // for both units' calls. That is harmless because the body builds the
+  // same non-polymorphic layout in every unit: RULE 6's failure
+  // (ex_compat.hpp) needs a layout that differs between units, met
+  // through a vptr. A stage whose sender could differ by unit takes the
+  // tag too.
   [[nodiscard]] auto edge_compress_stage(window& w) {
     read_landed(w);
     absorb_head(w);

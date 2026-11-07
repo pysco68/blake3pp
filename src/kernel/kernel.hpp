@@ -69,19 +69,19 @@ inline constexpr std::uint32_t flag_derive_key_material = 1u << 6;
 // per >=1 KiB of work; everything behind it inlines under the variant's own
 // flags.
 // The kernel ABI is flat, std::uint8_t* as a C interface would be, while
-// the library's own surface is std::byte. Both are byte types, so these
-// hand back a view of the same object rather than punning its type; the
-// hop through void* is what keeps them out of reinterpret_cast. That
-// holds only while std::uint8_t is unsigned char, which the aliasing
-// rules exempt. An implementation could make it a distinct type.
+// the library's own surface is std::byte. These return the same address
+// as the other type. Reading and writing through it is valid because
+// std::uint8_t is unsigned char, which may access any object's bytes; an
+// implementation could make it a distinct type, which the assertion
+// rules out.
 static_assert(std::is_same_v<std::uint8_t, unsigned char>,
               "the kernel ABI reads std::byte storage through std::uint8_t");
 [[nodiscard]] inline const std::uint8_t* kernel_bytes(
     const std::byte* p) noexcept {
-  return static_cast<const std::uint8_t*>(static_cast<const void*>(p));
+  return reinterpret_cast<const std::uint8_t*>(p);
 }
 [[nodiscard]] inline std::uint8_t* kernel_bytes(std::byte* p) noexcept {
-  return static_cast<std::uint8_t*>(static_cast<void*>(p));
+  return reinterpret_cast<std::uint8_t*>(p);
 }
 
 struct kernel_ops {

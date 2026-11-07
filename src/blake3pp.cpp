@@ -151,7 +151,13 @@ void hasher::resume_held() noexcept {
   }
 }
 
+// Empty input returns at once, here and in update_last(): resume_held()
+// and close_full_chunk() assume bytes follow, and either one run without
+// them changes the tree finalize() sees.
 void hasher::update(std::span<const std::byte> input) noexcept {
+  if (input.empty()) {
+    return;
+  }
   resume_held();
   const auto* p = kern::kernel_bytes(input.data());
   std::size_t len = input.size();
@@ -191,6 +197,9 @@ void hasher::update(std::string_view input) noexcept {
 }
 
 void hasher::update_last(std::span<const std::byte> input) noexcept {
+  if (input.empty()) {
+    return;
+  }
   resume_held();
   close_full_chunk();
   const std::size_t len = input.size();
@@ -289,37 +298,34 @@ void hasher::finalize(std::span<std::byte> out) const noexcept {
 void output_reader::fill(std::span<std::byte> out) noexcept {
   std::size_t done = 0;
   while (done < out.size()) {
-    const std::uint64_t block_index = position_ / kern::block_len;
-    const std::size_t in_block =
-        static_cast<std::size_t>(position_ % kern::block_len);
     // Block-aligned bulk of the request goes lanes-wide: output counters
     // map to SIMD lanes, so long fills run at hash_many-class speed.
-    if (in_block == 0 && out.size() - done >= kern::block_len) {
+    if (block_offset_ == 0 && out.size() - done >= kern::block_len) {
       const std::size_t nblocks = (out.size() - done) / kern::block_len;
       ops_->xof_many(input_cv_.data(), block_.data(), block_len_,
-                     block_index, flags_,
+                     block_counter_, flags_,
                      kern::kernel_bytes(out.data() + done),
                      nblocks);
       done += nblocks * kern::block_len;
-      position_ += nblocks * kern::block_len;
+      block_counter_ += nblocks;
       continue;
     }
-    if (!cache_valid_ || cached_block_ != block_index) {
+    if (!cache_valid_ || cached_block_ != block_counter_) {
       // uint8_t view of the byte cache at the flat kernel ABI boundary.
       ops_->compress_xof(input_cv_.data(), block_.data(), block_len_,
-                         block_index, flags_,
+                         block_counter_, flags_,
                          kern::kernel_bytes(cache_.data()));
-      cached_block_ = block_index;
+      cached_block_ = block_counter_;
       cache_valid_ = true;
     }
     // Explicit std::size_t: kern::block_len is uint32_t, so on a 32-bit
     // target the two arguments deduce to different types and the call is
     // ambiguous.  Both values are bounded by out.size() and 64.
-    const std::size_t take =
-        std::min<std::size_t>(out.size() - done, kern::block_len - in_block);
-    std::copy_n(cache_.data() + in_block, take, out.data() + done);
+    const std::size_t take = std::min<std::size_t>(
+        out.size() - done, kern::block_len - block_offset_);
+    std::copy_n(cache_.data() + block_offset_, take, out.data() + done);
     done += take;
-    position_ += take;
+    advance(take);
   }
 }
 

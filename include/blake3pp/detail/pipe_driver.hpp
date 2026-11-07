@@ -510,6 +510,13 @@ class basic_pipe_driver {
     require(slot < windows_ && bytes <= window_bytes_,
             "pipe_driver::window_storage_for(): a window outside the "
             "reserved geometry");
+    // The bytes carried from the previous window open this one, so it
+    // must have room for them. The grid never asks for less: a flush
+    // leaves at least two quanta of the ask, and the carry is at most
+    // that.
+    require(bytes >= carry_len_,
+            "pipe_driver::window_storage_for(): a window shorter than the "
+            "bytes the previous one carried");
     const std::span<std::byte> slice{
         arena_.data() + static_cast<std::size_t>(slot) * window_bytes_, bytes};
     const std::size_t got = fill(slice);
@@ -638,20 +645,13 @@ class basic_pipe_driver {
   }
 
   // The carry from the previous window, which belongs at the front of
-  // this one.
+  // this one; window_storage_for() has checked that out holds it.
   std::size_t take_carry(std::span<std::byte> out) noexcept {
-    if (carry_len_ == 0) {
-      return 0;
+    const std::size_t n = carry_len_;
+    if (n != 0) {
+      std::memcpy(out.data(), carry_.data(), n);
+      carry_len_ = 0;
     }
-    const std::size_t n = std::min(carry_len_, out.size());
-    std::memcpy(out.data(), carry_.data(), n);
-    // out is never shorter than the carry in practice -- the smallest
-    // window the grid asks for is one quantum -- but a caller that asks
-    // for less must not lose bytes.
-    if (n < carry_len_) {
-      std::memmove(carry_.data(), carry_.data() + n, carry_len_ - n);
-    }
-    carry_len_ -= n;
     return n;
   }
 

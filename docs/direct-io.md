@@ -88,12 +88,6 @@ rung still reads `"aio+direct"`. On FreeBSD 14.5 (OpenZFS 2.2.9) that is
 exactly what happens, and `zfs get direct` there answers "invalid
 property": the release has no direct path to ask for.
 
-`file_io_options::registered_buffers` (default `false`) additionally
-registers the window arena and the file handle with the ring, so a
-transfer names a region index and a table slot instead of a pointer and a
-`HANDLE`. A ring that refuses either keeps serving pointer refs, and a
-transfer into a buffer outside the arena uses one anyway.
-
 Bypassing the cache means every transfer does real device work: a page
 the kernel already held will not save a second trip, and a drive earning
 its number has to actually move the bytes.
@@ -184,8 +178,7 @@ and whether one open kept its engine need a path: that is
   was given a `trace_buffer` ([Performance tracing](tracing.md)). The
   spellings are `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
   `"gcd+nocache"`, `"aio+direct"`, `"pread"`, `"readfile"` and
-  `"stdio"`, with `"+regbuf"` appended where the ring took the arena
-  registration.
+  `"stdio"`.
 - `write_report::backend` names the write side the same way:
   `"io_uring+direct"`, `"ioring+direct"`, `"iocp+direct"`,
   `"gcd-write+nocache"`, `"aio+direct"`, `"pwrite"`, `"writefile"`, or

@@ -95,6 +95,73 @@ function(digest_of out_var text)
   set(${out_var} "${d}" PARENT_SCOPE)
 endfunction()
 
+# The files the stdout_closed_* cases hash: all with the same content, so
+# a --check list can name every one with the same digest. The names are
+# long so that --check's short lines still add up to more than a pipe
+# holds.
+function(write_many_files out_var count)
+  set(names "")
+  foreach(i RANGE 1 ${count})
+    set(f "${WORK}/file-${i}-padding-padding-padding-padding-padding-padding")
+    file(WRITE "${f}" "the same few bytes in every file\n")
+    list(APPEND names "${f}")
+  endforeach()
+  set(${out_var} "${names}" PARENT_SCOPE)
+endfunction()
+
+# blake3ppsum hashing (`hash`) or checking (`check`) many files into a
+# stdout with no reader, in batch and per-file mode.
+function(stdout_closed_many mode)
+  if(CMAKE_HOST_WIN32)
+    set(variants native)
+  else()
+    set(variants default ignore)
+  endif()
+  if(mode STREQUAL "hash")
+    # 4 KiB of hex per line: 128 lines are 512 KiB.
+    write_many_files(names 128)
+    set(args --length 2048 ${names})
+  else()
+    # About 150 bytes per "name: OK" line: 3000 lines are 450 KiB.
+    write_many_files(names 3000)
+    list(GET names 0 first)
+    execute_process(COMMAND "${SUM}" "${first}" OUTPUT_VARIABLE out RESULT_VARIABLE r)
+    expect_success("hashing the --check reference" "${r}")
+    digest_of(d "${out}")
+    set(list_text "")
+    foreach(f IN LISTS names)
+      string(APPEND list_text "${d}  ${f}\n")
+    endforeach()
+    file(WRITE "${WORK}/list.b3" "${list_text}")
+    set(args --check "${WORK}/list.b3")
+  endif()
+  foreach(t IN LISTS MODES)
+    foreach(v IN LISTS variants)
+      set(sig "")
+      if(NOT v STREQUAL "native")
+        set(sig --sigpipe ${v})
+      endif()
+      execute_process(
+        COMMAND "${RUX}" ${sig} -- "${SUM}" --threads ${t} ${args}
+        COMMAND "${DRAIN}" --widen 0 --close-after 0
+        ERROR_VARIABLE err RESULTS_VARIABLE codes)
+      list(GET codes 0 sc)
+      set(what "blake3ppsum ${mode} --threads ${t} into a closed pipe (SIGPIPE ${v})")
+      expect_failure("${what}" "${sc}")
+      if(NOT v STREQUAL "default")
+        # rux reports the child's status on stderr too; only the tool's
+        # own lines count.
+        string(REGEX MATCHALL "blake3ppsum: [^\n]*" said "${err}")
+        list(LENGTH said n)
+        if(NOT sc STREQUAL "1" OR NOT n EQUAL 1 OR NOT err MATCHES "blake3ppsum: write error")
+          message(FATAL_ERROR "${what}: expected exit 1 and one write error, got exit ${sc} and ${n} messages: ${err}")
+        endif()
+      endif()
+      message(STATUS "${what}: exited ${sc}")
+    endforeach()
+  endforeach()
+endfunction()
+
 # Whether readshim can be used: it is built on Unix where the toolchain
 # makes shared libraries (bench/pipe/CMakeLists.txt), never on Windows.
 set(HAVE_SHIM FALSE)
@@ -348,6 +415,20 @@ elseif(CASE STREQUAL "stdout_closed")
     endif()
     message(STATUS "SIGPIPE ${v}: blake3ppsum exited ${sc}")
   endforeach()
+
+elseif(CASE STREQUAL "stdout_closed_batch")
+  # Many digests into a stdout whose reader has gone, more than stdio and
+  # an unwidened pipe hold between them, so writes fail while files are
+  # still being hashed: through the batch (--threads 4) and file by file
+  # (--threads 1). The run must end with exit 1 and the one message main
+  # prints, with no abort and no per-file errors.
+  stdout_closed_many(hash)
+
+elseif(CASE STREQUAL "stdout_closed_check")
+  # The same through --check: every line OK, and more of them than an
+  # unwidened pipe holds. A failed write must end the run with exit 1 and
+  # main's one message, never with a second write from the handler.
+  stdout_closed_many(check)
 
 elseif(CASE STREQUAL "gen_reader_closed")
   # blake3ppgen's reader goes away after 1 MiB of a 1 GiB stream: it must

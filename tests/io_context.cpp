@@ -614,6 +614,98 @@ TEST_CASE("IoRing: an unaligned length rides the ring but for a direct tail") {
   }
 }
 
+// poll() returns the callbacks it ran. A direct file whose length is not
+// a whole number of granules sends its tail to the pump after the first
+// piece comes back, and moving that remainder runs no callback: over the
+// whole read, the returns add up to the one callback, on the ring and on
+// the port.
+TEST_CASE("Windows: poll() counts callbacks, not a remainder moved to the pump") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  constexpr std::size_t len = 64 * 4096 + 100;
+  const auto content = pattern(len, 46);
+  const temp_file f(content);
+  const auto check = [&](auto& ctx) {
+    using ctx_t = std::remove_cvref_t<decltype(ctx)>;
+    typename ctx_t::file file(ctx, f.path,
+                              io_impl::file_open_options{.direct_io = true});
+    MESSAGE("read through " << file.name());
+    std::vector<std::byte> got(len);
+    probe p;
+    typename ctx_t::transfer op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, std::span(got), op);
+    ctx.flush();
+    std::size_t reported = 0;
+    for (std::size_t polls = 0; p.calls == 0; ++polls) {
+      REQUIRE(polls < 1000);
+      reported += ctx.poll(true);
+    }
+    CHECK(!p.ec);
+    CHECK(got == content);
+    CHECK(reported == p.calls);
+  };
+  {
+    io_impl::ioring_context ctx({}, 4);
+    check(ctx);
+  }
+  {
+    io_impl::iocp_context ctx({}, 4);
+    check(ctx);
+  }
+}
+
+// A read the port refuses goes to a lane, whether it is a transfer's first
+// piece or the rest of one that came back short, and its device time is
+// what the port and the lane each had: a refusal ends the port's charge,
+// so the wait for a lane is in neither, and the transfer is still
+// counted. The seams make the port's first read short and refuse the one
+// after it.
+TEST_CASE("IOCP: a refused read goes to a lane and keeps its device time") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  constexpr std::size_t len = 1024 * 1024;
+  const auto content = pattern(len, 47);
+  const temp_file f(content);
+  struct seams_off {
+    ~seams_off() {
+      io_impl::short_port_reads.store(0);
+      io_impl::refuse_port_reads.store(0);
+    }
+  } const reset;
+  for (const bool first_piece : {false, true}) {
+    CAPTURE(first_piece);
+    io_impl::iocp_context ctx({}, 4);
+    io_impl::iocp_context::file file(ctx, f.path, io_impl::file_open_options{});
+    if (file.name() != "iocp") {
+      MESSAGE("skipped: no overlapped handle here (" << file.name() << ")");
+      return;
+    }
+    std::vector<std::byte> got(len);
+    probe p;
+    io_impl::iocp_context::transfer op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    if (first_piece) {
+      io_impl::refuse_port_reads.store(1);
+    } else {
+      io_impl::short_port_reads.store(1);
+    }
+    ctx.submit_read(file, 0, std::span(got), op);
+    ctx.flush();
+    // The rest of the short piece is routed from poll(), and refused there.
+    io_impl::refuse_port_reads.store(1);
+    for (std::size_t polls = 0; p.calls == 0; ++polls) {
+      REQUIRE(polls < 1000);
+      (void)ctx.poll(true);
+    }
+    io_impl::refuse_port_reads.store(0);
+    CHECK(!p.ec);
+    CHECK(got == content);
+    CHECK(ctx.served_synchronously() == 1);
+    CHECK(ctx.device().transfers == 1);
+  }
+}
+
 // A cancel on the ring is a submission of its own, and its completion
 // carries a userData that belongs to no transfer. Reaped as one it would
 // walk to an operation that does not exist, so it has to be dropped: the
@@ -661,54 +753,6 @@ TEST_CASE("IoRing: the cancel request's completion reports no operation") {
   CHECK(pa.calls == 1);
   CHECK(pb.calls == 1);
   CHECK(canary.calls == 0);
-}
-
-// Registered buffers are an option, not a rung the caller can be given
-// without asking, and a ring that refuses the registration has to keep
-// reading. All three answers deliver the same bytes: registration asked
-// for and taken, not asked for at all, and asked for with a region no
-// ring can accept.
-TEST_CASE("IoRing: registration on, off and refused deliver the same bytes") {
-  namespace io_impl = blake3pp::detail::io_impl;
-  const auto content = pattern(300 * 1024 + 77, 46);
-  const temp_file f(content);
-  const auto expected = blake3pp::hash(content);
-  for (const bool registered : {false, true}) {
-    CAPTURE(registered);
-    io_impl::polled_reader_engine<io_impl::ioring_context> r(
-        f.path, {.window_bytes = 64 * 1024,
-                 .queue_depth = 2,
-                 .registered_buffers = registered});
-    MESSAGE("reader backend: " << r.backend_name());
-    blake3pp::hasher h;
-    while (auto w = r.next()) {
-      h.update(std::span<const std::byte>{w->data, w->bytes});
-      r.release(*w);
-    }
-    CHECK(h.finalize() == expected);
-  }
-  // A registration the ring cannot take: an empty region describes
-  // nothing. The transfers then name pointers, as every transfer outside
-  // a registered arena does, and the bytes are the same.
-  {
-    io_impl::ioring_context ctx({.registered_buffers = true}, 4);
-    ctx.register_arena({});
-    CHECK(!ctx.arena_registered());
-    io_impl::ioring_context::file file(ctx, f.path,
-                                       io_impl::file_open_options{});
-    std::vector<std::byte> got(content.size());
-    probe p;
-    io_impl::ioring_context::transfer op{};
-    op.done = &probe::on_done;
-    op.owner = &p;
-    ctx.submit_read(file, 0, std::span{got}, op);
-    ctx.flush();
-    while (p.calls == 0) {
-      ctx.poll(true);
-    }
-    CHECK(!p.ec);
-    CHECK(got == content);
-  }
 }
 
 // The reasons a ring could not be had are part of the ladder a tool
@@ -789,6 +833,34 @@ TEST_CASE("a GCD file waits out its workers before its descriptor closes") {
   CHECK(ctx.in_flight() == 0);
   CHECK(ctx.poll(false) == 0);
   CHECK(p.calls == 0);
+}
+
+// What a closing file waits for is its own: one that owes nothing closes
+// at once, however long a sibling's transfer is held in a worker. The
+// seam holds the dispatch group as such a worker does.
+TEST_CASE("a GCD file that owes nothing closes without waiting on a sibling") {
+  const auto content = pattern(64 * 1024, 72);
+  const temp_file f(content);
+  io_impl::gcd_context ctx({}, 4);
+  if (!ctx.test_uses_gcd()) {
+    MESSAGE("skipped: no dispatch group here");
+    return;
+  }
+  ctx.test_hold_group();
+  std::atomic<bool> closed{false};
+  std::thread closer([&] {
+    {
+      io_impl::gcd_context::file idle(ctx, f.path, io_impl::file_open_options{});
+    }
+    closed.store(true);
+  });
+  for (int i = 0; i < 1000 && !closed.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool closed_while_held = closed.load();
+  ctx.test_release_group();
+  closer.join();
+  CHECK(closed_while_held);
 }
 #endif
 
@@ -1166,6 +1238,90 @@ TEST_CASE("io_uring: a refused submit with the wake poll unarmed still completes
   CHECK(p.calls == 1);
   CHECK(!p.ec);
   CHECK(ctx.in_flight() == 0);
+  CHECK(got == content);
+}
+
+// A transfer can still be published when the wake poll is re-armed: an
+// earlier enter that accepted nothing leaves it there. If that re-arm is
+// refused, the transfer has to move to the pump with the arm, not be
+// taken back and dropped, or the blocking poll waits for it for ever.
+TEST_CASE("io_uring: a read still published when a re-arm is refused completes") {
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 48);
+  const temp_file f(content);
+  io_impl::uring_context ctx({}, 4);
+  io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
+  if (file.name().rfind("io_uring", 0) != 0) {
+    MESSAGE("skipped: no io_uring here (" << file.name() << ")");
+    return;
+  }
+  std::vector<std::byte> got(len);
+  probe p;
+  io_impl::uring_context::transfer a{};
+  a.done = &probe::on_done;
+  a.owner = &p;
+  ctx.wake();
+  (void)ctx.poll(false);  // reaps the wake poll's completion: the next block re-arms
+  struct seams_off {
+    ~seams_off() {
+      io_impl::stall_submits.store(0);
+      io_impl::refuse_submits.store(0);
+    }
+  } const reset;
+  // The poll's own flush accepts nothing; the re-arm's flush is refused.
+  io_impl::stall_submits.store(1);
+  io_impl::refuse_submits.store(1);
+  ctx.submit_read(file, 0, std::span(got), a);
+  std::atomic<bool> returned{false};
+  std::thread poller([&] {
+    while (p.calls == 0) {
+      (void)ctx.poll(true);
+    }
+    returned.store(true);
+  });
+  for (int i = 0; i < 1000 && !returned.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!returned.load()) {
+    std::fprintf(stderr, "io_uring: poll(true) still blocked after 10 s with "
+                         "the read dropped by a refused re-arm\n");
+    std::abort();
+  }
+  poller.join();
+  CHECK(p.calls == 1);
+  CHECK(!p.ec);
+  CHECK(got == content);
+}
+
+// A refusal can come before any transfer: the constructor arms the wake
+// poll and submits it. The context must still build, and reads through it
+// must complete.
+TEST_CASE("io_uring: a context built while submits are refused still reads") {
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 44);
+  const temp_file f(content);
+  std::optional<io_impl::uring_context> ctx;
+  {
+    struct refusal {
+      refusal() { io_impl::refuse_submit.store(true); }
+      ~refusal() { io_impl::refuse_submit.store(false); }
+    } const refused;
+    CHECK_NOTHROW(ctx.emplace(io_impl::reader_context_options{}, 4u));
+  }
+  REQUIRE(ctx.has_value());
+  io_impl::uring_context::file file(*ctx, f.path, io_impl::file_open_options{});
+  std::vector<std::byte> got(len);
+  probe p;
+  io_impl::uring_context::transfer op{};
+  op.done = &probe::on_done;
+  op.owner = &p;
+  ctx->submit_read(file, 0, std::span(got), op);
+  ctx->flush();
+  for (std::size_t polls = 0; p.calls == 0; ++polls) {
+    REQUIRE(polls < 1000);
+    ctx->poll(true);
+  }
+  CHECK(!p.ec);
   CHECK(got == content);
 }
 
@@ -2329,7 +2485,7 @@ TEST_CASE("after a file's drain no lane touches its operations") {
       while (shared.inside.load() == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-    }  // ~file: transfers owed, so the context drains
+    }  // ~file: transfers owed, so the file forgets them
     // The lane that was inside has finished, and nothing queued was taken.
     CHECK(shared.inside.load() == 0);
     CHECK(shared.transfers.load() == 1);

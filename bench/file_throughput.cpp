@@ -937,7 +937,6 @@ int main(int argc, char** argv) {
   bool no_async = false;
   bool no_direct = false;
   bool no_ioring = false;
-  bool registered_buffers = false;
   double null_rate = 0;
   unsigned null_knee = 1;
   blake3pp::hash_file_options opts;
@@ -981,10 +980,6 @@ int main(int argc, char** argv) {
   app.add_flag("--no-ioring", no_ioring,
                "Windows: read through the completion port instead of the "
                "I/O ring (the comparison arm)");
-  app.add_flag("--registered-buffers", registered_buffers,
-               "Windows I/O ring: register the window arena and the file "
-               "handle with the ring instead of naming a pointer and a "
-               "HANDLE per transfer");
   app.add_option("--threads", pool_threads,
                  "parallel-engine threads (1 = a one-thread pool; default: "
                  "all); diagnostic: sweep N-1/N/N+1 to test whether the "
@@ -1023,7 +1018,6 @@ int main(int argc, char** argv) {
   opts.async = !no_async;
   opts.offload_submit = !inline_submit;
   opts.ioring = !no_ioring;
-  opts.registered_buffers = registered_buffers;
   if (null_gib > 0) {
         const auto total =
         static_cast<std::uint64_t>(null_gib * 1024.0 * 1024.0 * 1024.0);
@@ -1039,8 +1033,7 @@ int main(int argc, char** argv) {
         .queue_depth = opts.queue_depth,
         .direct_io = opts.direct_io,
         .offload_submit = opts.offload_submit,
-        .ioring = opts.ioring,
-        .registered_buffers = opts.registered_buffers};
+        .ioring = opts.ioring};
     null_device dev{.rate_gib_s = null_rate, .knee = null_knee};
     dev.settle(win);
     if (!trace_path.empty()) {
@@ -1096,8 +1089,7 @@ int main(int argc, char** argv) {
       const kernel_counters kernel_before = read_kernel_counters();
       null_driver drv({.async = true,
                        .offload_submit = opts.offload_submit,
-                       .ioring = opts.ioring,
-                       .registered_buffers = opts.registered_buffers},
+                       .ioring = opts.ioring},
                       plan.reads_in_flight, total, null_filler,
                       plan.window_bytes * plan.windows, dev);
       null_driver::file nf(drv);
@@ -1180,8 +1172,7 @@ int main(int argc, char** argv) {
           (total + win - 1) / win, start_depth));
       null_driver drv({.async = true,
                        .offload_submit = opts.offload_submit,
-                       .ioring = opts.ioring,
-                       .registered_buffers = opts.registered_buffers},
+                       .ioring = opts.ioring},
                       windows, total, null_filler, win * windows, dev);
       null_driver::file nf(drv);
       const auto t0 = std::chrono::steady_clock::now();
@@ -1234,8 +1225,7 @@ int main(int argc, char** argv) {
          .direct_io = opts.direct_io,
          .async = opts.async,
          .offload_submit = opts.offload_submit,
-         .ioring = opts.ioring,
-         .registered_buffers = opts.registered_buffers});
+         .ioring = opts.ioring});
     bytes = probe.file_size();
     println(stdout, "file: {} ({:.1f} MiB), backend: {}, window {} MiB, qd {}",
             path, static_cast<double>(bytes) / (1024.0 * 1024.0),
@@ -1297,8 +1287,7 @@ int main(int argc, char** argv) {
          .direct_io = opts.direct_io,
          .async = opts.async,
          .offload_submit = opts.offload_submit,
-         .ioring = opts.ioring,
-         .registered_buffers = opts.registered_buffers});
+         .ioring = opts.ioring});
     auto w = r.next();
     while (w.has_value()) {
       r.release(w.value());

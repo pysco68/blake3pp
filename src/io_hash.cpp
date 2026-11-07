@@ -29,10 +29,11 @@ void update_file(hasher& h, const std::filesystem::path& path,
                                     .direct_io = direct_io,
                                     .async = opts.async,
                                     .offload_submit = opts.offload_submit,
-                                    .ioring = opts.ioring,
-                                    .registered_buffers =
-                                        opts.registered_buffers});
+                                    .ioring = opts.ioring});
   trace_buffer* const trace = opts.trace;
+  if (trace != nullptr) {
+    set_read_backend(trace->driver(), reader.backend());
+  }
   std::uint64_t index = 0;
   for (;;) {
     // The wait is timed before the record is claimed: the last next()
@@ -81,8 +82,7 @@ file_io_probe probe_file_io(const std::filesystem::path& path,
                                      opts.window_bytes));
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
-                         .ioring = opts.ioring,
-                         .registered_buffers = opts.registered_buffers},
+                         .ioring = opts.ioring},
                         plan.reads_in_flight);
   detail::io_driver::file file(drv, path, plan.direct_io);
   return {.file_bytes = file.size(),

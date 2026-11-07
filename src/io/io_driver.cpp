@@ -85,8 +85,7 @@ struct io_driver::impl {
       : ctx(io_impl::reader_context_options{
                 .async = opts.async,
                 .offload_submit = opts.offload_submit,
-                .ioring = opts.ioring,
-                .registered_buffers = opts.registered_buffers},
+                .ioring = opts.ioring},
             max_inflight) {
     owed_sentinel.owed_next = owed_sentinel.owed_prev = &owed_sentinel;
   }
@@ -172,18 +171,16 @@ io_driver::file::file(io_driver& drv, const std::filesystem::path& path,
                                      how.preallocate_bytes,
                                      how.waive_zero_fill})) {}
 
-// A file destroyed with transfers still owed either drains the whole
-// context, forgetting every file's transfers without a callback (Linux,
-// FreeBSD, the synchronous contexts), or forgets its own (Windows,
-// Darwin). The operations behind them are still alive (the contract
-// requires it: a lane may be writing into one until that drain returns),
-// so their `live` is lowered like an explicit drain's: every owed
-// operation when the context was left with nothing in flight, otherwise
-// this file's own, whose storage a later submit may take again.
+// A file destroyed with transfers still owed forgets its own, on every
+// context, and its siblings' stay owed. The operations behind them are
+// still alive (the contract requires it: a lane may be writing into one
+// until the forget returns), so their `live` is lowered like an explicit
+// drain's, for this file's operations, whose storage a later submit may
+// take again.
 io_driver::file::~file() {
   io_driver::impl& d = *impl_->drv;
   impl_.reset();
-  d.forget_owed(d.ctx.in_flight() == 0 ? nullptr : this);
+  d.forget_owed(this);
 }
 
 std::uint64_t io_driver::file::size() const noexcept {
@@ -281,11 +278,6 @@ void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
   impl_->window_bytes = window_bytes;
   impl_->arena_bytes = window_bytes * windows;
   impl_->buffers = io_impl::make_aligned_buffer(impl_->arena_bytes);
-  // One region, offered to the context before any read names a buffer in
-  // it; a context with nothing to do with it ignores the offer.
-  io_impl::register_arena_if_supported(
-      impl_->ctx, std::span<std::byte>{impl_->buffers.get(),
-                                       impl_->arena_bytes});
 }
 
 window_storage io_driver::window_storage_for(file&, unsigned slot,

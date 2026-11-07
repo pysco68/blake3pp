@@ -149,12 +149,12 @@ struct io_op {
   // The operation emplace_native() left in the storage. Only the driver
   // that submitted this read may ask, and only while the read is owed:
   // the bytes hold that op until the next submit builds another over
-  // them, and `live` is that window. The hop through void* is what keeps
-  // this out of reinterpret_cast, as it does in the kernel tables.
+  // them, and `live` is that window. The storage's address is the op's,
+  // and std::launder gives a pointer to the op constructed there.
   template <class Op>
   [[nodiscard]] Op& native() noexcept {
     assert(live && "io_op::native() on an operation no driver owes");
-    return *std::launder(static_cast<Op*>(static_cast<void*>(storage)));
+    return *std::launder(reinterpret_cast<Op*>(storage));
   }
 };
 
@@ -221,9 +221,8 @@ concept file_driver =
 
 // What the driver's engine actually offered the device, where it can say.
 //
-// Optional rather than part of file_driver, like
-// register_arena_if_supported() in src/io/backend.hpp: only the file I/O
-// driver has an engine with a queue of its own. A driver without these
+// Optional rather than part of file_driver: only the file I/O driver has
+// an engine with a queue of its own. A driver without these
 // members (memory_driver, pipe_driver) leaves the depth the pipeline asked
 // for standing and the pipeline's own admission-to-landing span as the
 // device's time.

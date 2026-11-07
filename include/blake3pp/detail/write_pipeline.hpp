@@ -112,7 +112,6 @@ class write_scope
         opts_stop_token_(opts.stop_token),
         windows_(std::make_unique<window[]>(count_)) {
     drv.reserve(count_, window_bytes_);
-    loop_.record_into(trace_);
     for (unsigned i = count_; i > 0; --i) {
       window& w = windows_[i - 1];
       w.slot = i - 1;
@@ -272,7 +271,10 @@ class write_scope
     return have < want ? static_cast<unsigned>(have) : want;
   }
 
-  // The chain, read backwards from the read side's.
+  // The chain, read backwards from the read side's. Untagged, unlike the
+  // read side's builders, for the reason file_pipeline.hpp gives at its
+  // compress stages: the body builds the same non-polymorphic layout in
+  // every unit, so the one copy the linker keeps serves them all.
   [[nodiscard]] auto window_chain(window& w) {
     return ex::then(
         ex::let_value(
@@ -385,7 +387,7 @@ class write_scope
       }
       note_generator_wait();
       settle();
-    }, [this] { this->report_stall(); });
+    }, [this] { this->report_stall(); }, trace_);
   }
 
   // Not noexcept: the geometry check below is one the chain's own error

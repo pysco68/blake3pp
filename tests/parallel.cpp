@@ -6,6 +6,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <blake3pp/core.hpp>
@@ -117,6 +119,84 @@ TEST_CASE("parallel_hasher checkpoints and resets like hasher") {
   ph.reset();
   ph.update("fresh start");
   CHECK(ph.finalize() == blake3pp::hash(std::string_view{"fresh start"}));
+}
+
+// A move takes the message, the mode and the window to the destination
+// and leaves the source as reset() would: its finalize is the empty
+// message's digest in its mode, and it hashes a new message correctly.
+// Empty and part-filled sources, construction and assignment, assignment
+// over a destination with a message of its own, and self-assignment.
+TEST_CASE("parallel_hasher moves leave the source reset") {
+  using ph_t = blake3pp::parallel_hasher<
+      decltype(blake3pp::get_parallel_scheduler())>;
+  static_assert(std::is_nothrow_move_constructible_v<ph_t>);
+  static_assert(std::is_nothrow_move_assignable_v<ph_t>);
+  static_assert(std::is_copy_constructible_v<ph_t>);
+  static_assert(noexcept(std::declval<ph_t&>().reset()));
+
+  auto sched = blake3pp::get_parallel_scheduler();
+  const blake3pp::parallel_hasher_options opts{.window_bytes = 128 * 1024};
+  std::array<std::byte, blake3pp::key_size> key{};
+  key[0] = std::byte{9};
+  const std::span<const std::byte, blake3pp::key_size> key_span{key};
+  const auto input = make_input(3 * 128 * 1024 + 4097);
+  const auto next = make_input(2 * 128 * 1024 + 5);
+
+  enum class mode { plain, keyed, derive };
+  const auto make = [&](mode m) {
+    switch (m) {
+      case mode::keyed: return ph_t{sched, key_span, opts};
+      case mode::derive: return ph_t{sched, std::string_view{"moves"}, opts};
+      case mode::plain: break;
+    }
+    return ph_t{sched, opts};
+  };
+  const auto sequential = [&](mode m, std::span<const std::byte> bytes) {
+    blake3pp::hasher h = m == mode::keyed   ? blake3pp::hasher::keyed(key_span)
+                         : m == mode::derive ? blake3pp::hasher::derive_key("moves")
+                                             : blake3pp::hasher{};
+    h.update(bytes);
+    return h.finalize();
+  };
+  const auto check_reset = [&](mode m, ph_t& h) {
+    CHECK(h.count() == 0);
+    CHECK(h.finalize() == sequential(m, {}));
+    h.reset();
+    h.update(std::span{next});
+    CHECK(h.finalize() == sequential(m, next));
+  };
+
+  for (const mode m : {mode::plain, mode::keyed, mode::derive}) {
+    // Empty, part of a window, and past several windows with a part-filled
+    // tail.
+    for (const std::size_t len :
+         {std::size_t{0}, std::size_t{4097}, input.size()}) {
+      CAPTURE(static_cast<int>(m));
+      CAPTURE(len);
+      const auto bytes = std::span{input}.first(len);
+      const auto want = sequential(m, bytes);
+
+      ph_t a = make(m);
+      a.update(bytes);
+      ph_t b{std::move(a)};
+      CHECK(b.count() == len);
+      CHECK(b.finalize() == want);
+      check_reset(m, a);
+
+      ph_t c = make(m);
+      c.update(std::span{next}.first(1000));
+      ph_t d = make(m);
+      d.update(bytes);
+      c = std::move(d);
+      CHECK(c.count() == len);
+      CHECK(c.finalize() == want);
+      check_reset(m, d);
+
+      ph_t& self = c;
+      c = std::move(self);
+      CHECK(c.finalize() == want);
+    }
+  }
 }
 
 TEST_CASE("keyed mode propagates through every parallel quadrant") {
@@ -250,6 +330,35 @@ TEST_CASE("parallel_hasher XOF forms match the sequential stream") {
 // output_reader::fill(): same bytes, same position afterwards, from
 // aligned and unaligned starting offsets, across segment boundaries and
 // through the sequential fallback for requests of one segment or less.
+// The same across the end of BLAKE3's output, byte 2^64 - 1: segments
+// past it continue the stream as a sequential fill does, and the reader
+// is left where the sequential one is.
+TEST_CASE("parallel fill matches the sequential one across byte 2^64 - 1") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  h.update(std::string_view{"parallel xof end"});
+  constexpr std::size_t segment = 4096;
+  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+  for (const std::uint64_t start :
+       {max - 3 * segment + 1, max - 2 * segment - 100, max - 70}) {
+    for (const std::size_t len : {6 * segment, 6 * segment + 777}) {
+      CAPTURE(start);
+      CAPTURE(len);
+      auto seq = h.finalize_xof();
+      seq.seek(start);
+      std::vector<std::byte> expected(len);
+      seq.fill(expected);
+
+      auto par = h.finalize_xof();
+      par.seek(start);
+      std::vector<std::byte> got(len);
+      blake3pp::fill(par, got, sched, segment);
+      CHECK(got == expected);
+      CHECK(par.take<100>() == seq.take<100>());
+    }
+  }
+}
+
 TEST_CASE("parallel fill matches the sequential output stream") {
   auto sched = blake3pp::get_parallel_scheduler();
   blake3pp::hasher h;

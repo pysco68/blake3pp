@@ -237,14 +237,6 @@ class windows_context {
     return {port.engine, port.settled && ring_refusal_settled_};
   }
 
-  // Only the ring has anything to do with the arena; the port's absence
-  // of this member is why register_arena_if_supported() exists.
-  void register_arena(std::span<std::byte> arena) noexcept {
-    if (ring_) {
-      ring_->register_arena(arena);
-    }
-  }
-
  private:
   // The chosen backend's operation, made the union's active member and
   // given the caller's callback. Every callback in the library reaches its

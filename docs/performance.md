@@ -668,8 +668,9 @@ Digests agree in both. The two rows say different things: on the stripe the
 default window is what costs, and with the geometry the sweep found,
 `blake3ppsum` is 32% ahead of `b3sum`; on the M2 the default is already
 right and direct I/O is worth 2.9x over `mmap`. Through the page cache
-instead, `blake3ppsum --no-direct` takes 5.765 s on the stripe (5.55 GiB/s),
-which is the Linux buffered-read path below.
+instead, `blake3ppsum --no-direct` took 5.765 s on the stripe (5.55 GiB/s)
+before the window-depth change described in the Linux buffered-read section
+below.
 
 ### Window and queue depth are a device property
 
@@ -796,12 +797,25 @@ library's, and it is gone. What remains of buffered I/O's cost is the copy
 itself, two cores' worth at 6 GiB/s, which direct I/O does not pay at all
 (0.07-0.14 cores of io-wq).
 
-That is settled up to about 6 GiB/s and not above it. On the four-drive
-PCIe 5 stripe with kernel 7.0, `blake3ppsum --no-direct` reads 5.55 GiB/s
-where `b3sum`'s `mmap + rayon` through the same page cache reads 30.22, and
-on a 9 GiB/s z3 the buffered path caps near 3.2-3.5 where `mmap` reaches 8.7.
-Whether that ceiling is the kernel's or this library's buffered reader has
-not been established; it is an open item.
+Above about 6 GiB/s the limit was this pipeline's own. It held one window
+at a time, so one buffered read was outstanding and one io-wq worker was
+copying. Two runs on one z3-highmem-22 with kernel `7.0.0-1011-gcp`
+(8 GiB, cache dropped per repetition, 8 MiB windows at queue depth 4)
+differ only in the commit:
+
+| commit | buffered, raw | buffered, hashed | direct, hashed | `mmap + rayon` |
+|---|---|---|---|---|
+| `91b789a`, 2026-09-11, one window in flight | 3.48 GiB/s | 3.17 | 8.96 | |
+| `1ef58b3`, 2026-10-04, several windows in flight | 8.21 | 8.24 | 9.06 | 8.72 |
+
+With several windows in flight the buffered path hashes at 91% of direct
+and level with `mmap + rayon`. The remaining cost is the copy: 3.64 cores
+of io-wq against 0.12-0.14 on the direct rows. A slow kernel still caps
+the path, and the reader tracks that cap without adding to it: on the
+four-drive PCIe 5 stripe under a 5.15 rescue kernel, buffered raw reads
+5.14 GiB/s, this pipeline hashes 4.42 and `mmap + rayon` reads 4.39.
+The earlier figures of 5.55 GiB/s on the stripe and 3.2-3.5 on a z3 were
+taken before the change.
 [Direct I/O](direct-io.md) covers when turning it off is the right call.
 
 A virtual disk inverts the trade. On ext4 on a WSL2 virtual disk, the same
@@ -979,12 +993,6 @@ Each of these is a measured gap with an open item behind it.
   where clang runs at 82%, and its pool row at 7.89 GiB/s on four threads
   against 12.6 for upstream's kernels in the same pipeline. Parked on
   Microsoft's optimizer, not on this library.
-- **The buffered Linux read path.** Below kernel 7.0 it reads at about half
-  the device (3.84 against 6.79 GiB/s), and the trace attributes that to the
-  kernel's own copy rather than to this library; 7.0 closes it at that speed.
-  Above it the gap reopens and is not attributed: on a four-drive PCIe 5
-  stripe with kernel 7.0, `--no-direct` caps at 5.55 GiB/s where `mmap`
-  reaches 30, and on a 9 GiB/s z3 at 3.2-3.5 where `mmap` reaches 8.7.
 - **The parallel rows of `blake3pp_bench` do not interleave.** Until they
   do, a throttling device biases them towards whichever row runs later, and
   in-run parallel numbers from phones and laptops are not quotable.
