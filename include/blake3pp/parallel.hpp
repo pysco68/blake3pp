@@ -415,6 +415,8 @@ struct parallel_hasher_options {
 ///   - The window buffer is the type's one allocation, made at
 ///     construction.
 ///   - finalize() is non-destructive, like hasher's.
+///   - A moved-from hasher is in the state reset() leaves; its next
+///     update() allocates the buffer again.
 ///   - Not thread-safe. The scheduler's workers are used only inside
 ///     update().
 ///
@@ -445,7 +447,8 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(ops_),
-        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
+        window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
+        remainder_(window_bytes_) {}
 
   /// Keyed (MAC/PRF) mode.
   /// @param sched  Where the subtree reductions run.
@@ -456,7 +459,8 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::keyed(key, ops_)),
-        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
+        window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
+        remainder_(window_bytes_) {}
 
   /// Key-derivation mode: the input is the key material, domain-separated
   /// by context (see hasher::derive_key).
@@ -468,7 +472,40 @@ class parallel_hasher {
       : sched_(std::move(sched)),
         ops_(detail::resolve(opts.a)),
         h_(hasher::derive_key(context, ops_)),
-        remainder_(detail::rounded_window_bytes(opts.window_bytes)) {}
+        window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
+        remainder_(window_bytes_) {}
+
+  /// Copies the message so far, with its mode, key, variant and window.
+  parallel_hasher(const parallel_hasher&) = default;
+  /// Copies the message so far, with its mode, key, variant and window.
+  parallel_hasher& operator=(const parallel_hasher&) = default;
+
+  /// Takes the message, mode, key, variant and window; `other` is left
+  /// as reset() leaves it.
+  parallel_hasher(parallel_hasher&& other) noexcept
+      : sched_(other.sched_),
+        ops_(other.ops_),
+        h_(other.h_),
+        window_bytes_(other.window_bytes_),
+        remainder_(std::move(other.remainder_)),
+        filled_(std::exchange(other.filled_, 0)) {
+    other.h_.reset();
+  }
+
+  /// Takes the message, mode, key, variant and window; `other` is left
+  /// as reset() leaves it.
+  parallel_hasher& operator=(parallel_hasher&& other) noexcept {
+    if (this != &other) {
+      sched_ = other.sched_;
+      ops_ = other.ops_;
+      h_ = other.h_;
+      window_bytes_ = other.window_bytes_;
+      remainder_ = std::move(other.remainder_);
+      filled_ = std::exchange(other.filled_, 0);
+      other.h_.reset();
+    }
+    return *this;
+  }
 
   /// Absorbs the next bytes of the message; complete windows are fanned
   /// out over the scheduler from here.
@@ -482,12 +519,16 @@ class parallel_hasher {
     if (input.empty()) {
       return;
     }
+    // A moved-from hasher gave its buffer away.
+    if (remainder_.size() < window_bytes_) {
+      remainder_.resize(window_bytes_);
+    }
     // Whole windows of the caller's own bytes are hashed where they lie.
     // The only copying is what it takes to finish a window the last call
     // left part-built, which is under one window and never more.
     if (filled_ > 0) {
       const std::size_t take =
-          std::min(remainder_.size() - filled_, input.size());
+          std::min(window_bytes_ - filled_, input.size());
       std::copy_n(input.data(), take, remainder_.data() + filled_);
       filled_ += take;
       input = input.subspan(take);
@@ -501,7 +542,7 @@ class parallel_hasher {
       // the hasher has not taken must not be absorbed twice by a later
       // call. A throw loses them, which the exception says.
       filled_ = 0;
-      absorb(std::span<const std::byte>{remainder_});
+      absorb(std::span<const std::byte>{remainder_.data(), window_bytes_});
     }
 
     // What is left starts on a window boundary, because the hasher does:
@@ -513,8 +554,8 @@ class parallel_hasher {
     // root -- and from here there is no way to know whether more is
     // coming. So the remainder is never empty once anything has arrived,
     // and finalize absorbs it through the hasher itself.
-    const std::size_t rest = input.size() % remainder_.size();
-    const std::size_t keep = rest == 0 ? remainder_.size() : rest;
+    const std::size_t rest = input.size() % window_bytes_;
+    const std::size_t keep = rest == 0 ? window_bytes_ : rest;
     if (const std::size_t whole = input.size() - keep; whole > 0) {
       absorb(input.first(whole));
       input = input.subspan(whole);
@@ -582,10 +623,10 @@ class parallel_hasher {
     detail::memory_driver drv;
     detail::memory_driver::file f(drv, tail);
     const detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h.count(), remainder_.size(), static_cast<std::uint64_t>(filled_));
+        h.count(), window_bytes_, static_cast<std::uint64_t>(filled_));
     detail::run_window_pipeline<Budget>(
         h, drv, f, sched_, plan,
-        {.window_bytes = remainder_.size(), .ops = ops_});
+        {.window_bytes = window_bytes_, .ops = ops_});
     return h;
   }
 
@@ -601,19 +642,20 @@ class parallel_hasher {
     detail::memory_driver drv;
     detail::memory_driver::file f(drv, bytes);
     detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h_.count(), remainder_.size(),
+        h_.count(), window_bytes_,
         static_cast<std::uint64_t>(bytes.size()));
     // Never: update() holds the final window back, so nothing absorbed
     // here can contain the message's end.
     plan.ends_message = false;
     detail::run_window_pipeline<Budget>(
         h_, drv, f, sched_, plan,
-        {.window_bytes = remainder_.size(), .ops = ops_});
+        {.window_bytes = window_bytes_, .ops = ops_});
   }
 
   Scheduler sched_;
   const kern::kernel_ops* ops_;
   hasher h_;
+  std::size_t window_bytes_;
   // One window's worth, holding whatever has not yet reached a window
   // boundary. Never more: the rest of the message is hashed where the
   // caller put it.
