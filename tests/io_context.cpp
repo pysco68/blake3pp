@@ -882,6 +882,34 @@ TEST_CASE("a GCD file waits out its workers before its descriptor closes") {
   CHECK(ctx.poll(false) == 0);
   CHECK(p.calls == 0);
 }
+
+// What a closing file waits for is its own: one that owes nothing closes
+// at once, however long a sibling's transfer is held in a worker. The
+// seam holds the dispatch group as such a worker does.
+TEST_CASE("a GCD file that owes nothing closes without waiting on a sibling") {
+  const auto content = pattern(64 * 1024, 72);
+  const temp_file f(content);
+  io_impl::gcd_context ctx({}, 4);
+  if (!ctx.test_uses_gcd()) {
+    MESSAGE("skipped: no dispatch group here");
+    return;
+  }
+  ctx.test_hold_group();
+  std::atomic<bool> closed{false};
+  std::thread closer([&] {
+    {
+      io_impl::gcd_context::file idle(ctx, f.path, io_impl::file_open_options{});
+    }
+    closed.store(true);
+  });
+  for (int i = 0; i < 1000 && !closed.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool closed_while_held = closed.load();
+  ctx.test_release_group();
+  closer.join();
+  CHECK(closed_while_held);
+}
 #endif
 
 TEST_CASE("a write reports only from poll, and lands what it was given") {

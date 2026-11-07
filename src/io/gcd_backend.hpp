@@ -37,6 +37,12 @@
 
 namespace blake3pp::detail::io_impl {
 
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+// The test executable compiles this backend with a seam, under a name of
+// its own (see uring_backend.hpp).
+inline namespace test_seams {
+#endif
+
 // Turns the page cache off for this fd: Darwin's O_DIRECT analogue.
 inline bool set_nocache(int fd) noexcept {
   return ::fcntl(fd, F_NOCACHE, 1) != -1;
@@ -112,6 +118,8 @@ struct gcd_pump {
 // wake() uses, so a blocked poll has one thing to wait on.
 class gcd_context {
  public:
+  class file;
+
   struct transfer : performed_transfer {
     std::byte* dst = nullptr;
     std::size_t len = 0;
@@ -121,7 +129,9 @@ class gcd_context {
     const std::byte* src = nullptr;   // writes read from this
     bool is_write = false;
     int error = 0;              // errno captured by the worker
-    posix_file* sync_file = nullptr;  // the deferred path needs the pair
+    // Whose transfer this is: forget() matches on it, the file counts it,
+    // and the deferred path reads through its descriptors.
+    file* owner_file = nullptr;
     gcd_context* ctx = nullptr;
     transfer* next_deferred = nullptr;  // queued, not yet read
     transfer* next_done = nullptr;      // finished, not yet reported
@@ -185,6 +195,9 @@ class gcd_context {
     friend class gcd_context;
     posix_file f_;
     gcd_context* ctx_ = nullptr;
+    // This file's share of the context's count, so a file that owes
+    // nothing closes without waiting on its siblings' transfers.
+    std::size_t inflight_ = 0;
     std::uint64_t size_ = 0;
     std::uint64_t prealloc_ = 0;
     bool write_ = false;
@@ -292,6 +305,14 @@ class gcd_context {
   }
   [[nodiscard]] device_time device() const noexcept { return device_; }
 
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+  // Holds the dispatch group the way a worker still inside a transfer
+  // does, until released: a sibling in flight, as long as the test likes.
+  void test_hold_group() noexcept { dispatch_group_enter(pump_.group); }
+  void test_release_group() noexcept { dispatch_group_leave(pump_.group); }
+  [[nodiscard]] bool test_uses_gcd() const noexcept { return use_gcd_; }
+#endif
+
   // Waits every dispatch worker and lane out, then forgets what they
   // finished and what was never started: none of it is reported.
   void drain() noexcept {
@@ -315,21 +336,28 @@ class gcd_context {
   // files too, and a sibling's finished transfer stays on its list for a
   // later poll() to report.
   void forget(file& f) noexcept {
-    // std::min keeps a counting slip from underflowing in_flight_.
+    // A file that owes nothing has nothing in a worker or on a lane. A
+    // count a context-wide drain left stale only brings back the wait.
+    if (f.inflight_ == 0) {
+      return;
+    }
+    // std::min keeps a counting slip from underflowing the counts.
     const auto mine = [&f](const transfer& op) noexcept {
-      return op.sync_file == &f.f_;
+      return op.owner_file == &f;
+    };
+    const auto dropped = [&](std::size_t n) noexcept {
+      in_flight_ -= std::min(n, in_flight_);
+      f.inflight_ -= std::min(n, f.inflight_);
     };
     std::size_t never_started = sync_pump_.remove_queued_if(mine);
     sync_pump_.quiesce();
     never_started += sync_pump_.remove_done_if(mine);
-    in_flight_ -= std::min(never_started, in_flight_);
+    dropped(never_started);
     if (!use_gcd_) {
       return;  // nothing is in a dispatch worker
     }
     dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
-    const std::size_t finished = done_.remove_if(
-        [&f](const transfer& op) noexcept { return op.sync_file == &f.f_; });
-    in_flight_ -= std::min(finished, in_flight_);
+    dropped(done_.remove_if(mine));
   }
 
  private:
@@ -341,11 +369,12 @@ class gcd_context {
     op.error = 0;
     op.cancelled = false;
     op.fd = f.f_.fd_plain();
-    op.sync_file = &f.f_;
+    op.owner_file = &f;
     op.ctx = this;
     op.next_done = nullptr;
     op.reset_performance();
     in_flight_++;
+    f.inflight_++;
   }
 
   // A dispatch worker if there is a group, otherwise a lane of the
@@ -407,6 +436,7 @@ class gcd_context {
       transfer* const next = head->next_done;
       device_.add_if_served(head->device_total_ns());
       in_flight_--;
+      head->owner_file->inflight_--;
       head->done(head, head->error != 0
                            ? std::error_code(head->error,
                                              std::generic_category())
@@ -422,9 +452,9 @@ class gcd_context {
   static std::error_code perform_deferred(transfer& op) noexcept {
     try {
       if (op.is_write) {
-        op.sync_file->pwrite_all(op.fd, op.src, op.len, op.off);
+        op.owner_file->f_.pwrite_all(op.fd, op.src, op.len, op.off);
       } else {
-        op.sync_file->pread_all(op.fd, op.dst, op.len, op.off);
+        op.owner_file->f_.pread_all(op.fd, op.dst, op.len, op.off);
       }
       op.filled = op.len;
     } catch (const std::system_error& e) {
@@ -446,6 +476,7 @@ class gcd_context {
       transfer* const next = op->next_deferred;
       device_.add_if_served(op->device_total_ns());
       in_flight_--;
+      op->owner_file->inflight_--;
       op->done(op, op->result());
       ++ran;
       op = next;
@@ -453,6 +484,7 @@ class gcd_context {
     if (transfer* const op = sync_pump_.run_one_here(); op != nullptr) {
       device_.add_if_served(op->device_total_ns());
       in_flight_--;
+      op->owner_file->inflight_--;
       op->done(op, op->result());
       ++ran;
     }
@@ -539,6 +571,10 @@ class gcd_context {
 
 // Definition-site conformance check (see uring_backend.hpp).
 static_assert(io_context<gcd_context>);
+
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+}  // inline namespace test_seams
+#endif
 
 }  // namespace blake3pp::detail::io_impl
 
