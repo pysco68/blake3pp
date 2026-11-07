@@ -341,7 +341,6 @@ class window_scope
   // The base holds the stop source, the failure latch and the in-flight
   // count; these bring them in unqualified.
   using base = pipeline_scope_base<window_scope, D>;
-  using base::dropped_failures_;
   using base::ec_;
   using base::eptr_;
   using base::in_flight_;
@@ -353,7 +352,6 @@ class window_scope
   using base::stop_requested;
   using base::transfers_owed_;
   using base::stop_source_;
-  using base::stopped_;
 
   // The cell store is built outside this class, because the cell types
   // are the return types of the chain builders below and those are only
@@ -517,7 +515,7 @@ class window_scope
   // owns it, because it has to outlive every window in flight.
   //
   // False means there is nothing to drive: an empty file, or a token
-  // that was already stopped -- which stopped_ tells apart.
+  // that was already stopped -- which stopped() tells apart.
   [[nodiscard]] bool begin(stop_watch& watch) {
     if (file_bytes_ == 0) {
       return false;
@@ -526,7 +524,6 @@ class window_scope
       if (opts_stop_token_.stop_requested()) {
         // Stopped before anything was submitted. Nothing to cancel,
         // nothing to absorb, and the hasher is untouched.
-        stopped_ = true;
         request_stop();
         return false;
       }
@@ -598,7 +595,7 @@ class window_scope
     if (ec_) {
       return outcome::error;
     }
-    if (stopped_ || stop_requested()) {
+    if (stop_requested()) {
       return outcome::stopped;
     }
     // Every complete window is a subtree of the final tree and goes in
@@ -646,9 +643,7 @@ class window_scope
 
   // Whether a stop has taken this run, for a caller reporting a run that
   // never started.
-  [[nodiscard]] bool stopped() const noexcept {
-    return stopped_ || stop_requested();
-  }
+  [[nodiscard]] bool stopped() const noexcept { return stop_requested(); }
 
   // How many windows this run may hold at once, which is how many
   // operation cells its caller has to provide.
@@ -675,7 +670,7 @@ class window_scope
     pipeline_cells_for<window_scope> cells(count_);
     try {
       loop_.run_until(
-          status_, [&] { admit_round(cells); }, [this] { on_stall(); },
+          status_, [&] { admit_round(cells); }, [this] { this->report_stall(); },
           trace_);
     } catch (...) {
       quiesce();
@@ -822,7 +817,6 @@ class window_scope
 
   // What the loop does when it would sleep with nothing owed: for one
   // pipeline that is a configuration it cannot run.
-  void on_stall() const { this->report_stall(); }
 
  private:
 
@@ -901,7 +895,7 @@ class window_scope
         ex::continues_on(
             ex::let_value(loop_.read(file_, w.offset,
                                      w.read_into, w.op, transfers_owed_),
-                          [this, &w](std::span<const std::byte>) {
+                          [this, &w]() {
                             return compress_stage(w);
                           }),
             loop_.scheduler()),
@@ -914,7 +908,7 @@ class window_scope
   template <class Tag = tu_tag>
   [[nodiscard]] auto read_only_chain(window& w) {
     return ex::then(loop_.read(file_, w.offset, w.read_into, w.op, transfers_owed_),
-                    [this, &w](std::span<const std::byte>) noexcept {
+                    [this, &w]() noexcept {
                       read_landed(w);
                       // A short first window with nothing worth fanning
                       // out is all head, and the hasher takes it now; a
@@ -939,7 +933,7 @@ class window_scope
     return ex::then(
         ex::continues_on(
             ex::let_value(loop_.read(file_, w.offset, w.read_into, w.op, transfers_owed_),
-                          [this, &w](std::span<const std::byte>) {
+                          [this, &w]() {
                             return edge_compress_stage(w);
                           }),
             loop_.scheduler()),
@@ -1423,7 +1417,6 @@ class window_scope
   // requested, except from a provider that stops a bulk on its own,
   // which this handles the same way rather than relying on it not to.
   void on_stopped(window& w) noexcept {
-    stopped_ = true;
     request_stop();
     finish_window(w);
   }

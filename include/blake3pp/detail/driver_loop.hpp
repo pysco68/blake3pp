@@ -358,13 +358,9 @@ class io_op_state : public run_node {
       ex::set_error(std::move(rcvr_), ec);
       return;
     }
-    if constexpr (Dir == io_dir::read) {
-      // The backend reads exactly what was asked for or reports an
-      // error, so the whole window is there.
-      ex::set_value(std::move(rcvr_), std::span<const std::byte>(buf_));
-    } else {
-      ex::set_value(std::move(rcvr_));
-    }
+    // A read reports success only once the whole window is there: the
+    // backend reads exactly what was asked for or reports an error.
+    ex::set_value(std::move(rcvr_));
   }
 
   Receiver rcvr_;
@@ -387,15 +383,11 @@ class io_op_state : public run_node {
 
 template <file_driver D, io_dir Dir>
 class io_sender {
-  // A read hands its window on, a write has nothing left to say.
-  using value_signature =
-      std::conditional_t<Dir == io_dir::read,
-                         ex::set_value_t(std::span<const std::byte>),
-                         ex::set_value_t()>;
-
+  // Both directions complete with no value: the bytes are in the buffer
+  // the caller named when it built the sender.
  public:
   using sender_concept = ex_compat::sender_tag;
-  BLAKE3PP_EX_COMPLETION_SIGNATURES(value_signature,
+  BLAKE3PP_EX_COMPLETION_SIGNATURES(ex::set_value_t(),
                                     ex::set_error_t(std::error_code),
                                     ex::set_error_t(std::exception_ptr),
                                     ex::set_stopped_t());
@@ -761,8 +753,7 @@ class driver_loop {
 
 // The read and the write pipeline agree on everything about stopping: one
 // stop source for the run, a latch that decides which failure the caller
-// hears about, a count of the ones it drops, and a teardown that cannot
-// trust the loop. They disagree about what a cancel sweep names and about
+// hears about, and a teardown that cannot trust the loop. They disagree about what a cancel sweep names and about
 // when a run is done, so those two stay in the scope. The members below
 // are protected, which is how the scope keeps naming them directly.
 //
@@ -782,19 +773,17 @@ class pipeline_scope_base {
   // race by construction -- requesting stop is what makes the other
   // windows finish, and one of them may fail on the way out -- so the
   // latch decides: whatever was latched first wins, and a failure latched
-  // at any point outranks the stop it caused.
+  // at any point outranks the stop it caused. Failures after the first
+  // are dropped: the first is the cause, and the rest are usually what
+  // stopping did.
   void latch_error(std::error_code ec) noexcept {
     if (!ec_ && !eptr_) {
       ec_ = ec;
-    } else {
-      ++dropped_failures_;
     }
   }
   void latch_exception(std::exception_ptr e) noexcept {
     if (!ec_ && !eptr_) {
       eptr_ = std::move(e);
-    } else {
-      ++dropped_failures_;
     }
   }
 
@@ -802,7 +791,7 @@ class pipeline_scope_base {
   // no receiver to report set_stopped to, and an error_code is the only
   // channel they have.
   void throw_if_stopped(const char* what) const {
-    if (stopped_ || stop_requested()) {
+    if (stop_requested()) {
       throw std::system_error(
           std::make_error_code(std::errc::operation_canceled), what);
     }
@@ -892,11 +881,6 @@ class pipeline_scope_base {
   // with its token, and the scope's own admission, sweep and settle read
   // it: there is no second flag that could disagree with it.
   ex::inplace_stop_source stop_source_;
-  bool stopped_ = false;
-  // Failures after the first. They are dropped rather than reported --
-  // the first one is the cause and the rest are usually what stopping did
-  // -- and counted so a run can say how many there were.
-  std::uint64_t dropped_failures_ = 0;
   std::error_code ec_{};
   std::exception_ptr eptr_{};
 };

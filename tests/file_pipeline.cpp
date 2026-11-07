@@ -302,7 +302,6 @@ struct token_probe_sender {
 // off the loop's outstanding count, which is what ends the run.
 struct chain_result {
   bool completed = false;
-  std::size_t bytes = 0;
   std::uint64_t sum = 0;
   std::error_code ec{};
 };
@@ -322,10 +321,6 @@ struct chain_receiver {
     status->done = status->outstanding == 0;
   }
   void set_value() && noexcept { finish(); }
-  void set_value(std::span<const std::byte> w) && noexcept {
-    out->bytes = w.size();
-    finish();
-  }
   void set_value(std::uint64_t v) && noexcept {
     out->sum = v;
     finish();
@@ -1277,7 +1272,6 @@ TEST_CASE("a window read is a sender the driver loop completes") {
   io.run_until(st);
   CHECK(r.completed);
   CHECK(!r.ec);
-  CHECK(r.bytes == len);
   CHECK(owed == 0);  // and does not, once it has run
   CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
 }
@@ -1307,7 +1301,6 @@ TEST_CASE("a read that fails reports through the error channel") {
   io.run_until(st);
   CHECK(r.completed);
   CHECK(r.ec == std::errc::io_error);
-  CHECK(r.bytes == 0);
 }
 
 TEST_CASE("the driver scheduler runs work on the loop's own thread") {
@@ -1407,7 +1400,7 @@ TEST_CASE("the four-line window chain composes on this provider") {
       ex::then(
           ex::continues_on(
               ex::let_value(io.read(file, 0, pool, rop, owed),
-                            [&, sched](std::span<const std::byte> w) {
+                            [&, sched, w = std::span<const std::byte>(pool)] {
                               return ex::then(ex::schedule(sched), [&, w] {
                                 summed_elsewhere.store(
                                     std::this_thread::get_id() != here,

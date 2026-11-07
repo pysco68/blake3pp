@@ -87,7 +87,6 @@ class write_scope
   friend class pipeline_scope_base<write_scope, D>;
 
   using base = pipeline_scope_base<write_scope, D>;
-  using base::dropped_failures_;
   using base::ec_;
   using base::eptr_;
   using base::in_flight_;
@@ -99,7 +98,6 @@ class write_scope
   using base::status_;
   using base::stop_requested;
   using base::stop_source_;
-  using base::stopped_;
 
  public:
   write_scope(D& drv, typename D::file& file, Scheduler sched, Fill fill,
@@ -158,7 +156,6 @@ class write_scope
     std::optional<outer_stop_callback> watch;
     if (opts_stop_token_.stop_possible()) {
       if (opts_stop_token_.stop_requested()) {
-        stopped_ = true;
         request_stop();
         throw_if_stopped();
         return;
@@ -407,7 +404,6 @@ class write_scope
         std::min<std::uint64_t>(window_bytes_, total_ - next_offset_));
     w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
     if (w.rec != nullptr) {
-      *w.rec = window_record{};
       w.rec->index = w.offset / window_bytes_;
       w.rec->bytes = w.bytes;
       w.rec->slot = w.slot;
@@ -500,7 +496,6 @@ class write_scope
   }
 
   void on_stopped(window& w) noexcept {
-    stopped_ = true;
     request_stop();
     finish_window(w);
   }
