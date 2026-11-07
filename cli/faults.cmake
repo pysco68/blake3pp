@@ -95,7 +95,10 @@ function(digest_of out_var text)
   set(${out_var} "${d}" PARENT_SCOPE)
 endfunction()
 
-# The files the stdout_closed_* cases hash, all with the same content.
+# The files the stdout_closed_* cases hash: all with the same content, so
+# a --check list can name every one with the same digest. The names are
+# long so that --check's short lines still add up to more than a pipe
+# holds.
 function(write_many_files out_var count)
   set(names "")
   foreach(i RANGE 1 ${count})
@@ -106,17 +109,32 @@ function(write_many_files out_var count)
   set(${out_var} "${names}" PARENT_SCOPE)
 endfunction()
 
-# blake3ppsum hashing many files into a stdout with no reader, in batch
-# and per-file mode.
+# blake3ppsum hashing (`hash`) or checking (`check`) many files into a
+# stdout with no reader, in batch and per-file mode.
 function(stdout_closed_many mode)
   if(CMAKE_HOST_WIN32)
     set(variants native)
   else()
     set(variants default ignore)
   endif()
-  # 4 KiB of hex per line: 128 lines are 512 KiB.
-  write_many_files(names 128)
-  set(args --length 2048 ${names})
+  if(mode STREQUAL "hash")
+    # 4 KiB of hex per line: 128 lines are 512 KiB.
+    write_many_files(names 128)
+    set(args --length 2048 ${names})
+  else()
+    # About 150 bytes per "name: OK" line: 3000 lines are 450 KiB.
+    write_many_files(names 3000)
+    list(GET names 0 first)
+    execute_process(COMMAND "${SUM}" "${first}" OUTPUT_VARIABLE out RESULT_VARIABLE r)
+    expect_success("hashing the --check reference" "${r}")
+    digest_of(d "${out}")
+    set(list_text "")
+    foreach(f IN LISTS names)
+      string(APPEND list_text "${d}  ${f}\n")
+    endforeach()
+    file(WRITE "${WORK}/list.b3" "${list_text}")
+    set(args --check "${WORK}/list.b3")
+  endif()
   foreach(t IN LISTS MODES)
     foreach(v IN LISTS variants)
       set(sig "")
@@ -405,6 +423,12 @@ elseif(CASE STREQUAL "stdout_closed_batch")
   # (--threads 1). The run must end with exit 1 and the one message main
   # prints, with no abort and no per-file errors.
   stdout_closed_many(hash)
+
+elseif(CASE STREQUAL "stdout_closed_check")
+  # The same through --check: every line OK, and more of them than an
+  # unwidened pipe holds. A failed write must end the run with exit 1 and
+  # main's one message, never with a second write from the handler.
+  stdout_closed_many(check)
 
 elseif(CASE STREQUAL "gen_reader_closed")
   # blake3ppgen's reader goes away after 1 MiB of a 1 GiB stream: it must

@@ -702,20 +702,29 @@ void run_check(engine& eng, std::istream& in, std::string_view list_name,
     return;
   }
 
+  // A failed read is the file's and the run goes on; a failed write is
+  // stdout's, which ends the list and is left to main() to report.
   for (std::size_t i = 0; i < names.size(); ++i) {
     const std::string& name = names[i];
     const line_name n = escape_name(name);
     try {
-      if (eng.hash_hex(name, expected[i].size() / 2) == expected[i]) {
+      std::optional<std::string> got;
+      try {
+        got = eng.hash_hex(name, expected[i].size() / 2);
+      } catch (const std::exception& e) {
+        println(stderr, "blake3ppsum: {}: {}", name, e.what());
+      }
+      if (!got) {
+        println(stdout, "{}{}: FAILED open or read", n.prefix, n.text);
+        counts.unreadable++;
+      } else if (*got == expected[i]) {
         println(stdout, "{}{}: OK", n.prefix, n.text);
       } else {
         println(stdout, "{}{}: FAILED", n.prefix, n.text);
         counts.mismatched++;
       }
-    } catch (const std::exception& e) {
-      println(stderr, "blake3ppsum: {}: {}", name, e.what());
-      println(stdout, "{}{}: FAILED open or read", n.prefix, n.text);
-      counts.unreadable++;
+    } catch (const std::system_error&) {
+      return;
     }
   }
 }
@@ -877,6 +886,11 @@ int run_main(int argc, char** argv) {
     if (o.check) {
       check_counts counts;
       for (const auto& f : o.files) {
+        // A list whose output could not be written ended early; the
+        // next one would only fail the same way.
+        if (std::ferror(stdout) != 0) {
+          break;
+        }
         if (f == "-") {
           run_check(eng, std::cin, "-", counts);
           continue;

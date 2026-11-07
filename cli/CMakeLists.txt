@@ -109,7 +109,7 @@ endif()
 if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
   foreach(case short_stream empty_stream producer_dies pipefail stall read_error
       eintr_storm nonblock_stdin closed_stdin stdout_closed stdout_closed_batch
-      gen_reader_closed)
+      stdout_closed_check gen_reader_closed)
     add_test(NAME cli_fault_${case}
       COMMAND ${CMAKE_COMMAND}
         "-DSUM=$<TARGET_FILE:blake3ppsum>"
