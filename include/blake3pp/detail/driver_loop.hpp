@@ -72,7 +72,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -627,14 +626,6 @@ class driver_loop {
     driver_loop* loop_;
   };
 
-  // Drives everything until the pipeline says it is done, which happens
-  // inside a completion this loop itself ran. Blocks only when there is
-  // nothing to run, so the thread sleeps in the kernel rather than
-  // spinning, and only ever here.
-  //
-  // before_flush runs once per round, after the completions and before
-  // the submit: whatever it starts joins the same flush, so a batch of
-  // windows reaches the OS in one call rather than one each.
   // The state that cannot resolve itself: about to sleep with no read
   // owed, nothing to run and nothing outstanding. Callers that know why
   // it happened pass their own report; this one names the state and is
@@ -645,6 +636,15 @@ class driver_loop {
         "empty run queue and nothing outstanding: nothing could wake it");
   }
 
+  // Drives everything until the pipeline says it is done, which happens
+  // inside a completion this loop itself ran. Blocks only when there is
+  // nothing to run, so the thread sleeps in the kernel rather than
+  // spinning, and only ever here.
+  //
+  // before_flush runs once per round, after the completions and before
+  // the submit: whatever it starts joins the same flush, so a batch of
+  // windows reaches the OS in one call rather than one each.
+  //
   // `trace` receives what the thread spends its time on during this call;
   // null records nothing and costs one branch per poll. It is given per
   // call because an async context's loop outlives the operations it runs,
@@ -728,9 +728,6 @@ class driver_loop {
     }
   }
 
-  // The two halves of one round, for a caller winding the pipeline down
-  // outside run_until: what is parked runs, and nothing else; then one
-  // flush and one blocking poll, which throws what poll() throws.
   // Runs everything parked on the queue, once. A node may be pushed
   // again by its own completion, so the successor is read before the
   // node runs.
@@ -903,15 +900,5 @@ class pipeline_scope_base {
   std::error_code ec_{};
   std::exception_ptr eptr_{};
 };
-
-// steady_clock in nanoseconds, absolute. The trace's own scale is this
-// minus its epoch, so a traced run reads the clock once per event and
-// not twice. Both pipelines keep their transfer counters on this scale,
-// because they are kept whether or not a trace buffer was passed.
-[[nodiscard]] inline std::int64_t steady_now_ns() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
 
 }  // namespace blake3pp::detail

@@ -75,23 +75,6 @@ struct pipeline_options {
   ex::inplace_stop_token stop_token{};
 };
 
-// Several window chains in flight over one file, all on the caller's
-// thread.
-//
-// The shape of one window:
-//
-//     io.read(window)            // completes on the driver
-//       | let_value(compress)    // provider bulk, then fold, on the pool
-//       | continues_on(driver)   // back to the driver
-//       | then(reduce_into_tree) // order-free
-//
-// and the scope is what decides how many of those exist at once: a
-// window is a buffer, a part table and an operation cell, all allocated
-// at construction, and a chain may only start when one is free and
-// fewer than the plan's reads are still reading. The two bounds are
-// separate on purpose: the device wants a few reads in flight, the pool
-// wants windows to work on, and one number cannot serve both. The
-// reducer is what lets them finish in any order.
 // How a window is split three ways. `head` is absorbed by the hasher
 // on the driver the moment the read lands, `parts` full parts go to
 // the pool and come back as nodes, and `tail` waits for the reducer to
@@ -330,6 +313,23 @@ using pipeline_cells_for = pipeline_cells<
                              std::declval<typename Scope::window&>())),
                          typename Scope::scope_receiver>>;
 
+// Several window chains in flight over one file, all on the caller's
+// thread.
+//
+// The shape of one window:
+//
+//     io.read(window)            // completes on the driver
+//       | let_value(compress)    // provider bulk, then fold, on the pool
+//       | continues_on(driver)   // back to the driver
+//       | then(reduce_into_tree) // order-free
+//
+// and the scope is what decides how many of those exist at once: a
+// window is a buffer, a part table and an operation cell, all allocated
+// at construction, and a chain may only start when one is free and
+// fewer than the plan's reads are still reading. The two bounds are
+// separate on purpose: the device wants a few reads in flight, the pool
+// wants windows to work on, and one number cannot serve both. The
+// reducer is what lets them finish in any order.
 template <tracer Tracer, stack_budget Budget, file_driver D, class Scheduler>
 class window_scope
     : public pipeline_scope_base<window_scope<Tracer, Budget, D, Scheduler>,

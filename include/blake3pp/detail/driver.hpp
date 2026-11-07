@@ -14,6 +14,7 @@
 // provider: the concept is about reads, not about senders.
 
 #include <cassert>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,16 @@ namespace blake3pp::detail {
 // than degrading read by read. The backends check their own constant
 // against this one.
 inline constexpr std::size_t direct_alignment = 4096;
+
+// steady_clock in nanoseconds, absolute: the scale of every transfer
+// stamp the backends take and every counter the pipelines keep, traced
+// or not. A trace's own scale is this minus its epoch, so a traced run
+// reads the clock once per event and not twice.
+[[nodiscard]] inline std::int64_t steady_now_ns() noexcept {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 // Binds an operation's completion to a member of the object that owns it:
 //

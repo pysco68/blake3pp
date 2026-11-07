@@ -49,7 +49,6 @@
 #include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for the arena
 #endif
 #include <algorithm>
-#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -281,13 +280,6 @@ struct transfer_base {
 // around its own pread, which excludes its wait for a lane, and an
 // asynchronous engine stamps from submission to completion.
 
-// Reads the steady clock in nanoseconds, for the stamps above.
-[[nodiscard]] inline std::int64_t io_now_ns() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
 
 // What a transfer needs while a mechanism is performing it. Every context
 // that performs transfers derives its transfer from this.
@@ -308,7 +300,7 @@ struct performed_transfer : transfer_base {
   void device_begin() noexcept {
     if (!charging) {
       charging = true;
-      device_ns -= io_now_ns();
+      device_ns -= steady_now_ns();
     }
   }
   // Ends the charge, whether the piece landed or was taken back unsent.
@@ -317,7 +309,7 @@ struct performed_transfer : transfer_base {
   void device_end() noexcept {
     if (charging) {
       charging = false;
-      device_ns += io_now_ns();
+      device_ns += steady_now_ns();
     }
   }
   // What the device had this transfer for, for device_time::add(). Valid
@@ -928,7 +920,7 @@ class deferred_pump {
     if (queued_ == 0) {
       return 0;
     }
-    const std::int64_t d = io_now_ns() - since_;
+    const std::int64_t d = steady_now_ns() - since_;
     return d > 0 ? static_cast<std::uint64_t>(d) * queued_ : 0;
   }
 
@@ -939,7 +931,7 @@ class deferred_pump {
   // changes.
   void accrue() noexcept {
     lane_wait_ns_ += waiting_since_change();
-    since_ = io_now_ns();
+    since_ = steady_now_ns();
   }
 
   mutable std::mutex m_;
