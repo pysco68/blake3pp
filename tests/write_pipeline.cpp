@@ -552,6 +552,35 @@ TEST_CASE("sequential write_file writes the same file as the pipeline") {
   }
 }
 
+// One call per window, each filling a window's worth or the tail: a size
+// that is a whole number of windows, or zero, must not end with a call for
+// nothing, which a generator indexing its source by offset could not serve.
+TEST_CASE("sequential write_file calls the generator once per window") {
+  constexpr std::size_t win = 64 * 1024;
+  for (const std::uint64_t size :
+       {std::uint64_t{0}, std::uint64_t{win}, std::uint64_t{3 * win},
+        std::uint64_t{win + 1}}) {
+    CAPTURE(size);
+    const temp_path out;
+    std::uint64_t calls = 0;
+    std::uint64_t empty_calls = 0;
+    const blake3pp::write_report wrote = blake3pp::write_file(
+        out.path, size,
+        [&](std::span<std::byte> bytes, std::uint64_t off) {
+          ++calls;
+          if (bytes.empty()) {
+            ++empty_calls;
+          }
+          fill_from_offset(bytes, off);
+        },
+        {.window_bytes = win});
+    CHECK(wrote.bytes == size);
+    CHECK(empty_calls == 0);
+    CHECK(calls == (size + win - 1) / win);
+    CHECK(size_of(out.path) == size);
+  }
+}
+
 TEST_CASE("an unbounded write_file ends where the generator does") {
   constexpr std::size_t win = 64 * 1024;
   for (const std::uint64_t size : {std::uint64_t{0}, std::uint64_t{win - 7},

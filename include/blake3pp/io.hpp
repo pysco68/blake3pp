@@ -653,7 +653,11 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
       [&](const detail::file_writer::buffer& b, std::uint64_t off) {
         const std::size_t n = static_cast<std::size_t>(
             std::min<std::uint64_t>(b.capacity, size - off));
-        fill(std::span{b.data, n}, off);
+        // At off == size the writer asks once more, which is how it learns
+        // the file ended; the generator owes nothing for that window.
+        if (n != 0) {
+          fill(std::span{b.data, n}, off);
+        }
         return n;
       },
       opts);
