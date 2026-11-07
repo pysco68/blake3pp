@@ -623,11 +623,28 @@ class driver_loop {
   // what keeps the loop and the driver alive long enough to reach it --
   // run_until does not return while a thread is between the two.
   void publish(run_node* n) noexcept {
-    publishers_.fetch_add(1, std::memory_order_relaxed);
+    const publishing pin{this};
     queue_.push(n);
     drv_.wake();
-    publishers_.fetch_sub(1, std::memory_order_release);
   }
+
+  // A thread that hands run_until's caller something and then still has
+  // to reach this loop, the way publish() does, holds one of these across
+  // both: run_until does not return until it is gone. The hand-over must
+  // come after the constructor, which is what makes the count visible to
+  // a caller that saw the hand-over.
+  class publishing {
+   public:
+    explicit publishing(driver_loop* loop) noexcept : loop_(loop) {
+      loop_->publishers_.fetch_add(1, std::memory_order_relaxed);
+    }
+    publishing(const publishing&) = delete;
+    publishing& operator=(const publishing&) = delete;
+    ~publishing() { loop_->publishers_.fetch_sub(1, std::memory_order_release); }
+
+   private:
+    driver_loop* loop_;
+  };
 
   // Drives everything until the pipeline says it is done, which happens
   // inside a completion this loop itself ran. Blocks only when there is

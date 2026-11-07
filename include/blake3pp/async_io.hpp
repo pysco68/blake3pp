@@ -1095,11 +1095,23 @@ struct sync_state {
   std::atomic<bool> done{false};
 };
 
-template <class Tuple, class Wake>
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+// Runs between sync_wait()'s receiver setting its flag and waking the
+// context, which is where a waiter that did not wait for the wake would
+// return and destroy what the wake still reaches. Test builds only; the
+// library never instantiates sync_wait().
+inline namespace test_seams {
+inline void (*before_sync_wake)() noexcept = nullptr;
+}
+#endif
+
+using sync_loop = blake3pp::detail::driver_loop<blake3pp::detail::io_driver>;
+
+template <class Tuple>
 struct sync_receiver {
   using receiver_concept = blake3pp::detail::ex_compat::receiver_tag;
-  sync_receiver(sync_state<Tuple>* s, Wake wake) noexcept
-      : st_(s), wake_(wake) {}
+  sync_receiver(sync_state<Tuple>* s, sync_loop* loop) noexcept
+      : st_(s), loop_(loop) {}
   template <class... Ts>
   void set_value(Ts&&... ts) const noexcept {
     try {
@@ -1124,14 +1136,26 @@ struct sync_receiver {
 
  private:
   // The flag last, after everything the waiting thread will read, and the
-  // wake after the flag.
+  // wake after the flag. The waiter may return as soon as it sees the
+  // flag, destroying this receiver with its operation and then possibly
+  // the context, so the loop is held as a publisher across both: its
+  // run_until does not return until the wake is over. The loop pointer is
+  // copied out first, because the receiver may be gone by the time the
+  // pin is released.
   void finish() const noexcept {
+    sync_loop* const loop = loop_;
+    const sync_loop::publishing pin{loop};
     st_->done.store(true, std::memory_order_release);
-    wake_();
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+    if (before_sync_wake != nullptr) {
+      before_sync_wake();
+    }
+#endif
+    loop->driver().wake();
   }
 
   sync_state<Tuple>* st_;
-  Wake wake_;
+  sync_loop* loop_;
 };
 
 }  // namespace detail
@@ -1180,27 +1204,27 @@ template <stack_budget Budget, class Sched, class MakeHasher, class OnDone,
 /// set_stopped(), and rethrows an error (an error_code arrives as
 /// std::system_error). The sender must have exactly one value
 /// completion, as for ex::sync_wait; any sender over this context's
-/// operations qualifies, composed or not. Other operations started on
-/// the context keep running meanwhile and may still be in flight when
-/// this returns.
+/// operations qualifies, composed or not, and it may complete on any
+/// thread. Other operations started on the context keep running meanwhile
+/// and may still be in flight when this returns. The completion is over
+/// when this returns, wake included: with nothing else in flight, the
+/// context may be destroyed straight away.
 template <stack_budget Budget, class Sender>
 auto sync_wait(basic_io_context<Budget>& ctx, Sender&& sndr) {
   // Asking the sender what it completes with needs a receiver environment
   // to ask against, and the answer is what names the tuple this returns.
-  // Any sync_receiver's environment will do -- what it wakes is not part of
+  // Any sync_receiver's environment will do -- the tuple is not part of
   // it -- so the query uses a throwaway instantiation rather than the one
   // built below, which cannot be named until the tuple is known.
   using env_t = decltype(blake3pp::ex::get_env(
-      std::declval<const detail::sync_receiver<std::tuple<>,
-                                               void (*)() noexcept>&>()));
+      std::declval<const detail::sync_receiver<std::tuple<>>&>()));
   using tuple_t = blake3pp::ex::value_types_of_t<std::remove_cvref_t<Sender>,
                                                  env_t, std::tuple,
                                                  std::type_identity_t>;
   detail::sync_state<tuple_t> st;
-  const auto wake = [&ctx]() noexcept { ctx.driver().wake(); };
   auto op = blake3pp::ex::connect(
       std::forward<Sender>(sndr),
-      detail::sync_receiver<tuple_t, decltype(wake)>{&st, wake});
+      detail::sync_receiver<tuple_t>{&st, &ctx.host().loop()});
   blake3pp::ex::start(op);
   try {
     ctx.run_until(st.done);
@@ -1228,6 +1252,9 @@ auto sync_wait(basic_io_context<Budget>& ctx, Sender&& sndr) {
                    "destroyed without leaving the context a dead node\n");
       std::abort();
     }
+    // A drive() that threw before reaching the loop never waited for the
+    // receiver's wake; nothing may be destroyed until it is over.
+    ctx.host().loop().settle_publishers();
     throw;
   }
   if (st.error != nullptr) {

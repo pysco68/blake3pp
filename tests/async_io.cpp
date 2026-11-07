@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -18,6 +19,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -444,6 +446,145 @@ TEST_CASE("sync_wait drives the context until its sender completes") {
   auto none = async::sync_wait(ctx, async::async_update_file(ctx, h, fb.path(), sched));
   REQUIRE(none.has_value());
   CHECK(h.finalize() == blake3pp::hash(b));
+}
+
+// Holds the completing thread between its flag and its wake.
+struct wake_gate {
+  static inline std::atomic<bool> reached{false};
+  static inline std::atomic<bool> open{false};
+  static void hold() noexcept {
+    reached.store(true, std::memory_order_release);
+    while (!open.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
+};
+
+// A sender that completes on a thread of its own, the shape of a composed
+// sender whose last stage runs on a pool, in one of its three ways.
+enum class off_thread { value, error, stopped };
+
+struct off_thread_sender {
+  using sender_concept = blake3pp::detail::ex_compat::sender_tag;
+  using completion_signatures =
+      ex::completion_signatures<ex::set_value_t(int),
+                                ex::set_error_t(std::exception_ptr),
+                                ex::set_stopped_t()>;
+  template <class Self, class... Env>
+  static consteval auto get_completion_signatures() noexcept {
+    return completion_signatures{};
+  }
+
+  template <class Receiver>
+  struct opstate {
+    using operation_state_concept =
+        blake3pp::detail::ex_compat::operation_state_tag;
+    void start() noexcept {
+      *worker = std::thread([this] {
+        switch (how) {
+          case off_thread::value:
+            ex::set_value(std::move(rcvr), 42);
+            break;
+          case off_thread::error:
+            ex::set_error(std::move(rcvr), std::make_exception_ptr(
+                                               std::runtime_error("off thread")));
+            break;
+          case off_thread::stopped:
+            ex::set_stopped(std::move(rcvr));
+            break;
+        }
+      });
+      // So the flag is already set when the waiter first looks, and it
+      // has no reason to sleep until the wake.
+      while (gated && !wake_gate::reached.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+    }
+    Receiver rcvr;
+    std::thread* worker;
+    off_thread how;
+    bool gated;
+  };
+  template <class Receiver>
+  auto connect(Receiver rcvr) const noexcept -> opstate<Receiver> {
+    return {std::move(rcvr), worker, how, gated};
+  }
+
+  std::thread* worker;
+  off_thread how;
+  bool gated = false;
+};
+
+// What each sync_wait() returned, as a number: the value, -1 for the
+// error, -2 for a stop.
+int outcome_of(async::io_context& ctx, std::thread& worker, off_thread how,
+               bool gated) {
+  try {
+    const auto r =
+        async::sync_wait(ctx, off_thread_sender{&worker, how, gated});
+    return r.has_value() ? std::get<0>(*r) : -2;
+  } catch (const std::runtime_error&) {
+    return -1;
+  }
+}
+
+// sync_wait() may not return while its completion is still on the way to
+// the context: the receiver lives in the waiter's frame and the wake
+// reaches the context, and the caller is entitled to destroy both once the
+// wait is over. The completing thread is held after its flag and before
+// its wake; the wait must still be in progress then, and its context is
+// destroyed as soon as it returns.
+TEST_CASE("sync_wait returns only once its completion has woken the context") {
+  for (const off_thread how :
+       {off_thread::value, off_thread::error, off_thread::stopped}) {
+    CAPTURE(static_cast<int>(how));
+    wake_gate::reached.store(false);
+    wake_gate::open.store(false);
+    async::detail::before_sync_wake = &wake_gate::hold;
+    std::thread worker;
+    std::atomic<bool> returned{false};
+    int got = 0;
+    std::thread waiter([&] {
+      auto ctx = std::make_unique<async::io_context>(tight());
+      got = outcome_of(*ctx, worker, how, /*gated=*/true);
+      returned.store(true, std::memory_order_release);
+      ctx.reset();
+    });
+    while (!wake_gate::reached.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(returned.load(std::memory_order_acquire));
+    wake_gate::open.store(true, std::memory_order_release);
+    waiter.join();
+    worker.join();
+    async::detail::before_sync_wake = nullptr;
+    CHECK(returned.load());
+    const int expected = how == off_thread::value   ? 42
+                         : how == off_thread::error ? -1
+                                                    : -2;
+    CHECK(got == expected);
+  }
+
+  // Ungated, many times over, with the context gone the moment each wait
+  // returns: no wake is lost and nothing outlives what it touches.
+  for (int i = 0; i < 200; ++i) {
+    std::thread worker;
+    int got = 0;
+    {
+      async::io_context ctx(tight());
+      got = outcome_of(ctx, worker, off_thread::value, /*gated=*/false);
+    }
+    worker.join();
+    CHECK(got == 42);
+  }
+  // The same, completed on the context's own thread inside start().
+  for (int i = 0; i < 200; ++i) {
+    async::io_context ctx(tight());
+    const auto r = async::sync_wait(ctx, ex::just(7));
+    REQUIRE(r.has_value());
+    CHECK(std::get<0>(*r) == 7);
+  }
 }
 
 // Many files, a bounded number at a time, over a context with fewer
