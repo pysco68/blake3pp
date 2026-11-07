@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <ostream>
 #include <span>
 #include <string>
@@ -416,6 +417,68 @@ TEST_CASE("output_reader take<N> reads and advances like fill") {
   r2.fill(whole);
   CHECK(std::equal(a.begin(), a.end(), whole.begin()));
   CHECK(std::equal(b.begin(), b.end(), whole.begin() + 40));
+}
+
+// BLAKE3's output ends at 2^64 - 1 bytes; past that it is unspecified,
+// but a reader near the end must still give the same bytes however a
+// request is split, as upstream's block-counter readers do. Each start is
+// read one byte at a time, then in one fill and in split fills across the
+// boundary, on every kernel; none of it may be the stream's start again.
+TEST_CASE("XOF fills agree however they are split across byte 2^64 - 1") {
+  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+  constexpr std::size_t len = 300;
+  for (const auto a : blake3pp::all_arches()) {
+    if (a == blake3pp::arch::auto_detect || !blake3pp::is_available(a)) {
+      continue;
+    }
+    CAPTURE(arch_name(a));
+    blake3pp::hasher h{blake3pp::detail::resolve(a)};
+    h.update(std::string_view{"xof end"});
+    std::array<std::byte, len> head{};
+    h.finalize_xof().fill(head);
+
+    // The reference: one byte per fill, which never takes the bulk path.
+    const auto bytewise = [&](std::uint64_t start,
+                              std::array<std::byte, len>& out) {
+      auto r = h.finalize_xof();
+      r.seek(start);
+      for (std::byte& b : out) {
+        r.fill(std::span{&b, 1});
+      }
+      return r;
+    };
+
+    for (const std::uint64_t start :
+         {max - 299, max - 200, max - 69, max - 63, max - 5, max - 1, max}) {
+      CAPTURE(start);
+      std::array<std::byte, len> want{};
+      bytewise(start, want);
+      CHECK(want != head);
+
+      for (const std::size_t first :
+           {std::size_t{0}, std::size_t{1}, std::size_t{7}, std::size_t{64},
+            std::size_t{100}, std::size_t{236}}) {
+        CAPTURE(first);
+        auto r = h.finalize_xof();
+        r.seek(start);
+        CHECK(r.position() == start);
+        std::array<std::byte, len> got{};
+        r.fill(std::span{got}.first(first));
+        r.fill(std::span{got}.subspan(first));
+        CHECK(got == want);
+        // And both readers are at the same place in the stream.
+        std::array<std::byte, len> ignored{};
+        auto ref = bytewise(start, ignored);
+        CHECK(r.take<70>() == ref.take<70>());
+      }
+    }
+    // position() is exact up to the last byte.
+    auto r = h.finalize_xof();
+    r.seek(max - 63);
+    std::array<std::byte, 63> tail{};
+    r.fill(tail);
+    CHECK(r.position() == max);
+  }
 }
 
 TEST_CASE("count reports bytes absorbed across every ingestion path") {

@@ -330,6 +330,35 @@ TEST_CASE("parallel_hasher XOF forms match the sequential stream") {
 // output_reader::fill(): same bytes, same position afterwards, from
 // aligned and unaligned starting offsets, across segment boundaries and
 // through the sequential fallback for requests of one segment or less.
+// The same across the end of BLAKE3's output, byte 2^64 - 1: segments
+// past it continue the stream as a sequential fill does, and the reader
+// is left where the sequential one is.
+TEST_CASE("parallel fill matches the sequential one across byte 2^64 - 1") {
+  auto sched = blake3pp::get_parallel_scheduler();
+  blake3pp::hasher h;
+  h.update(std::string_view{"parallel xof end"});
+  constexpr std::size_t segment = 4096;
+  constexpr std::uint64_t max = std::numeric_limits<std::uint64_t>::max();
+  for (const std::uint64_t start :
+       {max - 3 * segment + 1, max - 2 * segment - 100, max - 70}) {
+    for (const std::size_t len : {6 * segment, 6 * segment + 777}) {
+      CAPTURE(start);
+      CAPTURE(len);
+      auto seq = h.finalize_xof();
+      seq.seek(start);
+      std::vector<std::byte> expected(len);
+      seq.fill(expected);
+
+      auto par = h.finalize_xof();
+      par.seek(start);
+      std::vector<std::byte> got(len);
+      blake3pp::fill(par, got, sched, segment);
+      CHECK(got == expected);
+      CHECK(par.take<100>() == seq.take<100>());
+    }
+  }
+}
+
 TEST_CASE("parallel fill matches the sequential output stream") {
   auto sched = blake3pp::get_parallel_scheduler();
   blake3pp::hasher h;

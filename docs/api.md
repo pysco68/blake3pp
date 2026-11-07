@@ -58,7 +58,9 @@ auto tag = blake3pp::hash_file(path, sched,
 
 ### Output: 32 bytes, or a stream
 
-The 32-byte digest is the first 32 bytes of an unbounded stream. Ask for
+The 32-byte digest is the first 32 bytes of a stream of up to 2^64 - 1
+bytes. Past that the output is unspecified, as in the reference
+implementations, but consecutive fills still continue one stream. Ask for
 any length, or take the reader:
 
 ```cpp

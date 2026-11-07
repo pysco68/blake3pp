@@ -365,10 +365,11 @@ int run_main(int argc, char** argv) {
       const auto t0 = std::chrono::steady_clock::now();
       const blake3pp::write_report report = blake3pp::write_file(
           output, total,
-          [&stream, seek](std::span<std::byte> out,
-                          std::uint64_t off) noexcept {
+          [&stream](std::span<std::byte> out, std::uint64_t off) noexcept {
+            // From the seeked stream by block counter: past byte
+            // 2^64 - 1, `seek + off` would wrap to the stream's start.
             blake3pp::output_reader r = stream;
-            r.seek(seek + off);
+            blake3pp::detail::reader_access::advance(r, off);
             blake3pp::fill(r, out);
           },
           pool.scheduler(), wopts);

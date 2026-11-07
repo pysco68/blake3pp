@@ -693,20 +693,22 @@ void fill(output_reader& r, std::span<std::byte> out, Scheduler&& sched,
     r.fill(out);
     return;
   }
-  const std::uint64_t base = r.position();
+  // Each segment's reader is placed from r by block counter, as fill()
+  // advances one, so segments past byte 2^64 - 1 continue the stream as
+  // a sequential fill does.
   const std::size_t n_segs = (out.size() + segment - 1) / segment;
   auto work = ex::schedule(sched) |
               ex::bulk(ex::par, n_segs, [&](std::size_t i) noexcept {
                 output_reader part = r;
                 const std::size_t off = i * segment;
-                part.seek(base + off);
+                detail::reader_access::advance(part, off);
                 part.fill(out.subspan(off, std::min(segment, out.size() - off)));
               });
   if (!ex::sync_wait(std::move(work))) {
     throw std::system_error(std::make_error_code(std::errc::operation_canceled),
                             "the scheduler stopped the parallel fill");
   }
-  r.seek(base + out.size());
+  detail::reader_access::advance(r, out.size());
 }
 
 }  // namespace blake3pp

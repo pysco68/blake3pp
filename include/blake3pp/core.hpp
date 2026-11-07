@@ -8,8 +8,10 @@
 /// precondition on its way to being thrown.
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -63,6 +65,8 @@ struct chunk_state {
   std::uint8_t blocks_compressed;
 };
 
+struct reader_access;
+
 }  // namespace detail
 
 /// A 32-byte BLAKE3 digest: a regular value type with constant-time
@@ -102,18 +106,22 @@ struct digest {
   [[nodiscard]] bool matches(std::string_view hex) const noexcept;
 };
 
-/// Streams BLAKE3's unbounded extended output (XOF).
+/// Streams BLAKE3's extended output (XOF).
 ///
 /// Obtained from hasher::finalize_xof(). A small value type capturing the
 /// root node; copyable, and independent of the hasher afterwards. The
 /// stream is seekable in O(1): output block t is one compression with
 /// counter t, so positioning to byte 10 GiB costs the same as byte 0. The
 /// 32-byte digest is exactly the stream's first 32 bytes.
+///
+/// BLAKE3's output is at most 2^64 - 1 bytes. Bytes past that are
+/// unspecified, as in the reference implementations; consecutive fills
+/// still continue one stream, however a request is split.
 class output_reader {
  public:
   /// Writes the next `out.size()` bytes of the output stream and advances
   /// past them.
-  /// @param out  Any length; the stream is unbounded.
+  /// @param out  Any length (see the class for the end of the stream).
   void fill(std::span<std::byte> out) noexcept;
 
   /// Returns the next N bytes of the stream by value and advances past
@@ -130,25 +138,49 @@ class output_reader {
   }
 
   /// Positions the stream at an absolute byte offset, in constant time.
-  /// @param byte_offset  The offset of the next byte fill() will produce.
+  /// @param byte_offset  The offset of the next byte fill() will produce;
+  ///                     any value.
   void seek(std::uint64_t byte_offset) noexcept {
-    position_ = byte_offset;
-    cache_valid_ = false;
+    block_counter_ = byte_offset / block_bytes;
+    block_offset_ = static_cast<std::uint8_t>(byte_offset % block_bytes);
   }
 
-  /// The byte offset of the next byte fill() will produce.
-  [[nodiscard]] std::uint64_t position() const noexcept { return position_; }
+  /// The byte offset of the next byte fill() will produce. Past byte
+  /// 2^64 - 1 it wraps; a debug build asserts instead.
+  [[nodiscard]] std::uint64_t position() const noexcept {
+    assert(block_counter_ <=
+               (std::numeric_limits<std::uint64_t>::max() - block_offset_) /
+                   block_bytes &&
+           "output_reader::position(): past the end of BLAKE3's output");
+    return block_counter_ * block_bytes + block_offset_;
+  }
 
  private:
   friend class hasher;
+  friend struct detail::reader_access;
   output_reader() = default;
+
+  static constexpr std::uint64_t block_bytes = 64;
+
+  // Moves the stream on by `bytes` without producing them. The block
+  // counter carries, so the position stays one stream past 2^64 - 1, as
+  // fill() keeps it.
+  void advance(std::uint64_t bytes) noexcept {
+    const std::uint64_t offset = block_offset_ + bytes % block_bytes;
+    block_counter_ += bytes / block_bytes + offset / block_bytes;
+    block_offset_ = static_cast<std::uint8_t>(offset % block_bytes);
+  }
 
   const kern::kernel_ops* ops_ = nullptr;
   std::array<std::uint32_t, 8> input_cv_ = {};
   std::array<std::uint8_t, 64> block_ = {};
   std::uint32_t block_len_ = 0;
   std::uint32_t flags_ = 0;
-  std::uint64_t position_ = 0;
+  // The position, as upstream keeps it: the counter of the output block
+  // holding the next byte, and that byte's offset in it. Neither wraps at
+  // byte 2^64.
+  std::uint64_t block_counter_ = 0;
+  std::uint8_t block_offset_ = 0;
   std::uint64_t cached_block_ = 0;
   bool cache_valid_ = false;
   std::array<std::byte, 64> cache_ = {};
@@ -440,6 +472,15 @@ void parent_cv(const kern::kernel_ops* ops,
                std::span<const std::uint32_t, 8> key,
                std::uint32_t base_flags,
                std::span<std::uint32_t, 8> out_cv) noexcept;
+
+// The parallel fill's way of placing a segment's reader: from where the
+// reader is, by block counter, never by byte arithmetic that would wrap
+// at 2^64.
+struct reader_access {
+  static void advance(output_reader& r, std::uint64_t bytes) noexcept {
+    r.advance(bytes);
+  }
+};
 }  // namespace detail
 
 }  // namespace blake3pp
