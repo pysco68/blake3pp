@@ -573,8 +573,9 @@ elseif(CASE STREQUAL "gen_short_buffer")
 
 elseif(CASE STREQUAL "sum_alloc_failure")
   # A batch whose arena cannot be allocated: four 1 GiB windows in an
-  # address space of 2 GiB. The tool must report the failure and exit
-  # non-zero, never abort.
+  # address space of 2 GiB. The failure comes after the engine is built,
+  # so it is the run's (exit 1, not the usage status), it is reported
+  # rather than aborting the process, and the trace is still written.
   # Linux only, where prlimit sets the limit; a sanitizer or an emulator
   # needs more address space than that to start at all.
   if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR SANITIZED OR EMULATOR)
@@ -593,9 +594,13 @@ elseif(CASE STREQUAL "sum_alloc_failure")
       --trace "${WORK}/trace.json" a b
     WORKING_DIRECTORY "${WORK}"
     OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE r)
-  if(NOT r MATCHES "^[0-9]+$" OR r EQUAL 0 OR NOT err MATCHES "bad_alloc")
+  set(traced NO)
+  if(EXISTS "${WORK}/trace.json")
+    set(traced YES)
+  endif()
+  if(NOT r STREQUAL "1" OR NOT err MATCHES "bad_alloc" OR NOT traced)
     message(FATAL_ERROR "an arena that cannot be allocated: exit ${r}, "
-      "stderr: ${err}")
+      "trace written: ${traced}, stderr: ${err}")
   endif()
 
 elseif(CASE STREQUAL "gen_seed_file")
