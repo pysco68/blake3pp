@@ -1261,6 +1261,58 @@ TEST_CASE("io_uring: a refused submit with the wake poll unarmed still completes
   CHECK(got == content);
 }
 
+// A transfer can still be published when the wake poll is re-armed: an
+// earlier enter that accepted nothing leaves it there. If that re-arm is
+// refused, the transfer has to move to the pump with the arm, not be
+// taken back and dropped, or the blocking poll waits for it for ever.
+TEST_CASE("io_uring: a read still published when a re-arm is refused completes") {
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 48);
+  const temp_file f(content);
+  io_impl::uring_context ctx({}, 4);
+  io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
+  if (file.name().rfind("io_uring", 0) != 0) {
+    MESSAGE("skipped: no io_uring here (" << file.name() << ")");
+    return;
+  }
+  std::vector<std::byte> got(len);
+  probe p;
+  io_impl::uring_context::transfer a{};
+  a.done = &probe::on_done;
+  a.owner = &p;
+  ctx.wake();
+  (void)ctx.poll(false);  // reaps the wake poll's completion: the next block re-arms
+  struct seams_off {
+    ~seams_off() {
+      io_impl::stall_submits.store(0);
+      io_impl::refuse_submits.store(0);
+    }
+  } const reset;
+  // The poll's own flush accepts nothing; the re-arm's flush is refused.
+  io_impl::stall_submits.store(1);
+  io_impl::refuse_submits.store(1);
+  ctx.submit_read(file, 0, std::span(got), a);
+  std::atomic<bool> returned{false};
+  std::thread poller([&] {
+    while (p.calls == 0) {
+      (void)ctx.poll(true);
+    }
+    returned.store(true);
+  });
+  for (int i = 0; i < 1000 && !returned.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!returned.load()) {
+    std::fprintf(stderr, "io_uring: poll(true) still blocked after 10 s with "
+                         "the read dropped by a refused re-arm\n");
+    std::abort();
+  }
+  poller.join();
+  CHECK(p.calls == 1);
+  CHECK(!p.ec);
+  CHECK(got == content);
+}
+
 // A refusal can come before any transfer: the constructor arms the wake
 // poll and submits it. The context must still build, and reads through it
 // must complete.

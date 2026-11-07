@@ -123,6 +123,17 @@ inline namespace test_seams {
 // While set, every submission is refused as io_uring_enter would refuse
 // one, which no working kernel can be asked to do.
 inline std::atomic<bool> refuse_submit{false};
+// While positive, each submission takes nothing, as an enter answering 0
+// does, and the count drops; then refuse_submits, the same way, refuses.
+inline std::atomic<unsigned> stall_submits{0};
+inline std::atomic<unsigned> refuse_submits{0};
+
+[[nodiscard]] inline bool take_seam(std::atomic<unsigned>& count) noexcept {
+  unsigned n = count.load();
+  while (n != 0 && !count.compare_exchange_weak(n, n - 1)) {
+  }
+  return n != 0;
+}
 #endif
 
 // One mmap, unmapped when it goes, with MAP_FAILED folded into the empty
@@ -403,7 +414,10 @@ struct uring {
         return;
       }
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
-      if (refuse_submit.load()) {
+      if (take_seam(stall_submits)) {
+        return;  // n == 0: the entries stay published
+      }
+      if (refuse_submit.load() || take_seam(refuse_submits)) {
         errno = EAGAIN;
         throw_errno("io_uring_enter(submit)");
       }
@@ -1157,20 +1171,12 @@ class uring_context {
     const bool woken = waiter_.take();
     if (use_uring_ && !wake_armed_) {
       arm_wake();
-      try {
-        ring_.flush();
-      } catch (const std::system_error&) {
-        // The arm did not reach the kernel. It is withdrawn rather than
-        // left queued, so wake_armed_ says what is true: nothing watches
-        // the eventfd, and sleep_once() must not block on the completion
-        // queue for a wake that cannot arrive. The next blocking poll
-        // arms again.
-        ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
-          if (ud == wake_ud()) {
-            wake_armed_ = false;
-          }
-        });
-      }
+      // A refused arm comes back through the member flush like any other
+      // refusal: withdrawn, so wake_armed_ says what is true and
+      // sleep_once() does not block on a wake that cannot arrive, and any
+      // transfer still published with it moves to the pump instead of
+      // being dropped. The next blocking poll arms again.
+      flush();
     }
     return woken;
   }
