@@ -547,6 +547,30 @@ elseif(CASE STREQUAL "gen_threads")
     message(FATAL_ERROR "threaded generation diverges from sequential")
   endif()
 
+elseif(CASE STREQUAL "gen_short_buffer")
+  # The stdout buffer holds what --length asks for, not one segment per
+  # thread: 64 bytes on 1024 threads must not take 4 GiB, and on a 32-bit
+  # target the uncapped product wrapped to an empty buffer that wrote
+  # nothing for ever. On Linux the run gets an address space too small
+  # for the old buffer, so that regression fails instead of allocating.
+  # A sanitizer's shadow memory and an emulator (node reserves the wasm
+  # heap and its guard regions up front) need more than that, so those
+  # lanes run it without the limit.
+  set(limit "")
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND NOT SANITIZED AND NOT EMULATOR)
+    find_program(PRLIMIT prlimit)
+    if(PRLIMIT)
+      set(limit "${PRLIMIT}" --as=3221225472 --)
+    endif()
+  endif()
+  execute_process(
+    COMMAND ${limit} ${EMULATOR} "${GEN}" --seed t --length 64 --threads 1024
+    OUTPUT_FILE "${WORK}/short" ERROR_VARIABLE err RESULT_VARIABLE r)
+  file(SIZE "${WORK}/short" n)
+  if(NOT r EQUAL 0 OR NOT n EQUAL 64)
+    message(FATAL_ERROR "--length 64 --threads 1024: exit ${r}, ${n} bytes: ${err}")
+  endif()
+
 elseif(CASE STREQUAL "gen_seed_file")
   # --seed-file streams through the library's file pipeline: a seed
   # spanning several windows must hash identically sequentially and

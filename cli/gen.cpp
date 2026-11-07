@@ -274,10 +274,14 @@ int run_main(int argc, char** argv) {
 
   // Each parallel fill task takes one segment of this size. The pipelined
   // file sink makes each window one segment; the sequential file sink and
-  // stdout buffer one segment per thread so every fill fans out fully, the
-  // file sink capped at max_buffer. --window overrides the file sinks.
+  // stdout buffer one segment per thread so every fill fans out fully,
+  // both capped at max_buffer. --window overrides the file sinks.
   constexpr std::size_t segment = blake3pp::default_fill_segment_bytes;
   constexpr std::size_t max_buffer = 64 * 1024 * 1024;
+  // Compared before it is multiplied: threads * segment wraps on a 32-bit
+  // target.
+  const std::size_t parallel_buffer =
+      threads > max_buffer / segment ? max_buffer : threads * segment;
 
   // Seed ingestion: the hasher carries the mode, and a seed file streams
   // into it on the same pool that will generate the output.
@@ -438,7 +442,7 @@ int run_main(int argc, char** argv) {
         // max_buffer: on a 32-thread machine writing to a striped NVMe
         // volume, the uncapped default put half a gigabyte in flight and
         // cost 17%.
-        wopts.window_bytes = std::min<std::size_t>(threads * segment, max_buffer);
+        wopts.window_bytes = parallel_buffer;
       }
       if (qd > 0) {
         wopts.queue_depth = qd;
@@ -473,8 +477,9 @@ int run_main(int argc, char** argv) {
     return 0;
   }
 
-  std::vector<std::byte> buf(pool.parallel() ? threads * segment
-                                             : b3tool::stream_buffer_bytes);
+  // No larger than what --length leaves to write.
+  std::vector<std::byte> buf(remaining.take(
+      pool.parallel() ? parallel_buffer : b3tool::stream_buffer_bytes));
   while (!remaining.exhausted()) {
     const std::size_t take = remaining.take(buf.size());
     fill(std::span{buf}.first(take));
