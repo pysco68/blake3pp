@@ -107,12 +107,15 @@ class tree_reducer {
     // failure is reported before anything has been touched.
     bool any = false;
     for (;;) {
-      const std::size_t sib =
-          find(merged.first_chunk ^ merged.chunks, merged.chunks);
-      if (sib == npos) {
+      const std::uint64_t sibling = merged.first_chunk ^ merged.chunks;
+      const std::span<node> pending = storage_.first(count_);
+      const auto it = std::ranges::find_if(pending, [&](const node& n) {
+        return n.first_chunk == sibling && n.chunks == merged.chunks;
+      });
+      if (it == pending.end()) {
         break;
       }
-      const node& other = storage_[sib];
+      const node& other = *it;
       const bool merged_is_left = merged.first_chunk < other.first_chunk;
       // parent_cv tolerates out_cv aliasing either child, which is what
       // lets the parent take the incoming node's place.
@@ -122,7 +125,7 @@ class tree_reducer {
       merged.first_chunk = merged_is_left ? merged.first_chunk
                                           : other.first_chunk;
       merged.chunks *= 2;
-      storage_[sib] = storage_[count_ - 1];
+      *it = storage_[count_ - 1];
       count_--;
       any = true;
     }
@@ -141,17 +144,7 @@ class tree_reducer {
   // The pending nodes, ordered by first_chunk. Invalidated by insert().
   [[nodiscard]] std::span<const node> sorted() noexcept {
     if (!sorted_) {
-      // Insertion sort: pending counts are tens of nodes, and the array is
-      // nearly ordered whenever the ranges arrive nearly in order.
-      for (std::size_t i = 1; i < count_; ++i) {
-        const node held = storage_[i];
-        std::size_t j = i;
-        while (j > 0 && storage_[j - 1].first_chunk > held.first_chunk) {
-          storage_[j] = storage_[j - 1];
-          j--;
-        }
-        storage_[j] = held;
-      }
+      std::ranges::sort(storage_.first(count_), {}, &node::first_chunk);
       sorted_ = true;
     }
     return std::span<const node>(storage_.data(), count_);
@@ -190,21 +183,6 @@ class tree_reducer {
   }
 
  private:
-  static constexpr std::size_t npos = static_cast<std::size_t>(-1);
-
-  // Linear scan: a map over tens of entries costs more than it saves, and
-  // the nodes are contiguous.
-  [[nodiscard]] std::size_t find(std::uint64_t first_chunk,
-                                 std::uint64_t chunks) const noexcept {
-    for (std::size_t i = 0; i < count_; ++i) {
-      if (storage_[i].first_chunk == first_chunk &&
-          storage_[i].chunks == chunks) {
-        return i;
-      }
-    }
-    return npos;
-  }
-
   const kern::kernel_ops* ops_;
   cv_type key_;
   std::uint32_t base_flags_;
