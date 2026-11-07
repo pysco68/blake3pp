@@ -21,6 +21,7 @@
 #include <string_view>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +36,28 @@
 #include "io/backend.hpp"
 
 namespace blake3pp::detail::io_impl {
+
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+// The test executable compiles this backend, and the IoRing one that
+// shares its helpers, with seams and under a name of their own: the
+// library's copies, which the same executable links, stay one definition
+// each, and nothing shipped carries the seams.
+inline namespace test_seams {
+// While positive, each read the port is handed is issued at half its
+// length, and the count drops: the completion comes back short, as one
+// may, and the rest goes through the port again.
+inline std::atomic<unsigned> short_port_reads{0};
+// While positive, each read the port is handed is refused, as ReadFile
+// refuses one for want of resources, and the count drops.
+inline std::atomic<unsigned> refuse_port_reads{0};
+
+[[nodiscard]] inline bool take_seam(std::atomic<unsigned>& count) noexcept {
+  unsigned n = count.load();
+  while (n != 0 && !count.compare_exchange_weak(n, n - 1)) {
+  }
+  return n != 0;
+}
+#endif
 
 [[noreturn]] inline void throw_winerr(const char* what) {
   throw std::system_error(static_cast<int>(::GetLastError()),
@@ -505,22 +528,9 @@ class iocp_context {
   }
 
   void place(transfer& op, file& f) {
-    const DWORD len = port_len(op, op.off, op.len);
-    bool queued = len != 0;
-    if (queued) {
-      try {
-        issue(op, len);
-      } catch (const std::system_error&) {
-        queued = false;
-      }
-    }
-    op.on_port = queued;
-    used_port_ = used_port_ || queued;
     in_flight_++;
     f.inflight_++;
-    if (!queued) {
-      pump_.push(op);
-    }
+    route(op);
   }
 
  public:
@@ -728,7 +738,7 @@ class iocp_context {
       } else {
         op.filled += bytes;
         if (op.filled < op.len) {
-          (void)reissue(op);
+          route(op);
         } else {
           complete(op, {});
         }
@@ -772,52 +782,49 @@ class iocp_context {
   }
 
 
-  // Queues the rest of a short read. False means ReadFile refused it and
-  // the op was completed with that error instead. Both callers are
-  // inside poll(), which is where a read's error is allowed to reach its
-  // callback; what cannot happen is leaving it counted and unissued.
-  [[nodiscard]] bool reissue(transfer& op) noexcept {
+  // What the transfer still owes, from op.filled: on the port where it
+  // will take it, otherwise to a lane. A first piece and the rest of a
+  // short one take the same road, as on the ring.
+  void route(transfer& op) noexcept {
     const DWORD len = port_len(op, op.off + op.filled, op.len - op.filled);
-    if (len == 0) {
-      // The remainder is not something this file may hand the port. It is
-      // still owed, so it goes to the pump like an unalignable transfer
-      // does from the start, and a lane finishes what is left.
-      op.on_port = false;
+    op.on_port = len != 0 && issue(op, len);
+    used_port_ = used_port_ || op.on_port;
+    if (!op.on_port) {
       pump_.push(op);
-      return true;
-    }
-    try {
-      issue(op, len);
-      return true;
-    } catch (const std::system_error& e) {
-      complete(op, e.code());
-      return false;
     }
   }
 
   // Hands the port `len` bytes of what the transfer still owes, from
   // op.filled: all of it, or the granules of it that port_len() allowed.
-  void issue(transfer& op, DWORD len) {
+  // False when ReadFile or WriteFile refused it outright, which owes no
+  // completion; the charge ends there, so a lane's own charge does not
+  // take in the wait for the lane.
+  [[nodiscard]] bool issue(transfer& op, DWORD len) noexcept {
     std::memset(&op.ov, 0, sizeof(op.ov));
     const std::uint64_t off = op.off + op.filled;
     op.ov.Offset = static_cast<DWORD>(off);
     op.ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+    if (!op.is_write && take_seam(refuse_port_reads)) {
+      return false;
+    }
+    if (!op.is_write && len > 2 * direct_align && take_seam(short_port_reads)) {
+      len = static_cast<DWORD>(len / 2 - len / 2 % direct_align);
+    }
+#endif
     // The piece is the kernel's from here, and charged to the device
-    // from here.
+    // from here: a cached read completes inside the call.
     op.device_begin();
     const BOOL ok =
         op.is_write
             ? ::WriteFile(op.h, op.src + op.filled, len, nullptr, &op.ov)
             : ::ReadFile(op.h, op.dst + op.filled, len, nullptr, &op.ov);
-    if (ok == 0) {
-      const DWORD err = ::GetLastError();
-      if (err != ERROR_IO_PENDING) {
-        throw std::system_error(read_error(err), op.is_write
-                                                     ? "WriteFile(async)"
-                                                     : "ReadFile(async)");
-      }
+    if (ok == 0 && ::GetLastError() != ERROR_IO_PENDING) {
+      op.device_end();
+      return false;
     }
     ++port_owed_;
+    return true;
   }
 
   // Every callback runs from here, which is what poll() counts: a
@@ -880,9 +887,8 @@ class iocp_context {
       }
       op.filled += bytes;
       if (op.filled < op.len) {
-        if (reissue(op) && !op.on_port) {
-          parked = true;  // the rest is on the pump
-        }
+        route(op);
+        parked = parked || !op.on_port;  // the rest is on the pump
         continue;
       }
       complete(op, {});
@@ -1028,6 +1034,10 @@ class iocp_context {
 // with the missed requirement named, the first time MSVC compiles this
 // header, before any engine instantiation exists.
 static_assert(io_context<iocp_context>);
+
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+}  // inline namespace test_seams
+#endif
 
 }  // namespace blake3pp::detail::io_impl
 

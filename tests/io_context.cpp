@@ -655,6 +655,57 @@ TEST_CASE("Windows: poll() counts callbacks, not a remainder moved to the pump")
   }
 }
 
+// A read the port refuses goes to a lane, whether it is a transfer's first
+// piece or the rest of one that came back short, and its device time is
+// what the port and the lane each had: a refusal ends the port's charge,
+// so the wait for a lane is in neither, and the transfer is still
+// counted. The seams make the port's first read short and refuse the one
+// after it.
+TEST_CASE("IOCP: a refused read goes to a lane and keeps its device time") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  constexpr std::size_t len = 1024 * 1024;
+  const auto content = pattern(len, 47);
+  const temp_file f(content);
+  struct seams_off {
+    ~seams_off() {
+      io_impl::short_port_reads.store(0);
+      io_impl::refuse_port_reads.store(0);
+    }
+  } const reset;
+  for (const bool first_piece : {false, true}) {
+    CAPTURE(first_piece);
+    io_impl::iocp_context ctx({}, 4);
+    io_impl::iocp_context::file file(ctx, f.path, io_impl::file_open_options{});
+    if (file.name() != "iocp") {
+      MESSAGE("skipped: no overlapped handle here (" << file.name() << ")");
+      return;
+    }
+    std::vector<std::byte> got(len);
+    probe p;
+    io_impl::iocp_context::transfer op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    if (first_piece) {
+      io_impl::refuse_port_reads.store(1);
+    } else {
+      io_impl::short_port_reads.store(1);
+    }
+    ctx.submit_read(file, 0, std::span(got), op);
+    ctx.flush();
+    // The rest of the short piece is routed from poll(), and refused there.
+    io_impl::refuse_port_reads.store(1);
+    for (std::size_t polls = 0; p.calls == 0; ++polls) {
+      REQUIRE(polls < 1000);
+      (void)ctx.poll(true);
+    }
+    io_impl::refuse_port_reads.store(0);
+    CHECK(!p.ec);
+    CHECK(got == content);
+    CHECK(ctx.served_synchronously() == 1);
+    CHECK(ctx.device().transfers == 1);
+  }
+}
+
 // A cancel on the ring is a submission of its own, and its completion
 // carries a userData that belongs to no transfer. Reaped as one it would
 // walk to an operation that does not exist, so it has to be dropped: the

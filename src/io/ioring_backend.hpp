@@ -57,6 +57,11 @@
 
 namespace blake3pp::detail::io_impl {
 
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+// With the port's helpers, under their seamed name (see iocp_backend.hpp).
+inline namespace test_seams {
+#endif
+
 // Why a ring could not be had, for the fallback name the tools print.
 // "no api" (Windows 10, or a KernelBase without the exports) and a
 // version below 3 are otherwise indistinguishable in bench output, and a
@@ -1425,6 +1430,10 @@ class ioring_context {
 // with the missed requirement named, the first time this header is
 // compiled, before any engine instantiation exists.
 static_assert(io_context<ioring_context>);
+
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+}  // inline namespace test_seams
+#endif
 
 }  // namespace blake3pp::detail::io_impl
 
