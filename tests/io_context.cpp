@@ -1169,6 +1169,38 @@ TEST_CASE("io_uring: a refused submit with the wake poll unarmed still completes
   CHECK(got == content);
 }
 
+// A refusal can come before any transfer: the constructor arms the wake
+// poll and submits it. The context must still build, and reads through it
+// must complete.
+TEST_CASE("io_uring: a context built while submits are refused still reads") {
+  constexpr std::size_t len = 256 * 1024;
+  const auto content = pattern(len, 44);
+  const temp_file f(content);
+  std::optional<io_impl::uring_context> ctx;
+  {
+    struct refusal {
+      refusal() { io_impl::refuse_submit.store(true); }
+      ~refusal() { io_impl::refuse_submit.store(false); }
+    } const refused;
+    CHECK_NOTHROW(ctx.emplace(io_impl::reader_context_options{}, 4u));
+  }
+  REQUIRE(ctx.has_value());
+  io_impl::uring_context::file file(*ctx, f.path, io_impl::file_open_options{});
+  std::vector<std::byte> got(len);
+  probe p;
+  io_impl::uring_context::transfer op{};
+  op.done = &probe::on_done;
+  op.owner = &p;
+  ctx->submit_read(file, 0, std::span(got), op);
+  ctx->flush();
+  for (std::size_t polls = 0; p.calls == 0; ++polls) {
+    REQUIRE(polls < 1000);
+    ctx->poll(true);
+  }
+  CHECK(!p.ec);
+  CHECK(got == content);
+}
+
 // A length that is not a multiple of the direct-I/O granule is the last
 // read of almost every real file, and the whole read of a small one. It
 // rides the ring in both directions: on the plain descriptor for a

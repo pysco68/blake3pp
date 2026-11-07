@@ -593,8 +593,10 @@ class uring_context {
     if (opts.async && ring_.init(2 * max_inflight + 2)) {
       use_uring_ = true;
       offload_ = opts.offload_submit;
+      // The member flush(): a refused enter moves what it held to the
+      // pump, as it does at any other time, rather than failing the open.
       arm_wake();
-      ring_.flush();
+      flush();
     }
   }
 
