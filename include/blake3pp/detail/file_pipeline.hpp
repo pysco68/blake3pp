@@ -2030,6 +2030,13 @@ class window_scope
     }
   }
 
+  // The two compress stages return provider senders too and are not
+  // tagged, so two units share their names and the linker keeps one body
+  // for both units' calls. That is harmless because the body builds the
+  // same non-polymorphic layout in every unit: RULE 6's failure
+  // (ex_compat.hpp) needs a layout that differs between units, met
+  // through a vptr. A stage whose sender could differ by unit takes the
+  // tag too.
   [[nodiscard]] auto edge_compress_stage(window& w) {
     read_landed(w);
     absorb_head(w);

@@ -271,7 +271,10 @@ class write_scope
     return have < want ? static_cast<unsigned>(have) : want;
   }
 
-  // The chain, read backwards from the read side's.
+  // The chain, read backwards from the read side's. Untagged, unlike the
+  // read side's builders, for the reason file_pipeline.hpp gives at its
+  // compress stages: the body builds the same non-polymorphic layout in
+  // every unit, so the one copy the linker keeps serves them all.
   [[nodiscard]] auto window_chain(window& w) {
     return ex::then(
         ex::let_value(
