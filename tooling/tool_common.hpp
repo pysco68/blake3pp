@@ -9,6 +9,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -227,6 +228,10 @@ inline void set_binary_std_streams() noexcept {
 inline void tool_startup() noexcept {
   set_binary_std_streams();
   blake3pp::run_trap_probes();
+  // Where mimalloc is built as C (the zig toolchains; see CMakeLists.txt),
+  // its operator new calls this when an allocation fails, and aborts if
+  // there is none; this throws what operator new is specified to.
+  std::set_new_handler([] { throw std::bad_alloc(); });
 }
 
 // Whether a count of one still gets a scheduler. A tool takes the

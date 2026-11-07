@@ -571,6 +571,33 @@ elseif(CASE STREQUAL "gen_short_buffer")
     message(FATAL_ERROR "--length 64 --threads 1024: exit ${r}, ${n} bytes: ${err}")
   endif()
 
+elseif(CASE STREQUAL "sum_alloc_failure")
+  # A batch whose arena cannot be allocated: four 1 GiB windows in an
+  # address space of 2 GiB. The tool must report the failure and exit
+  # non-zero, never abort.
+  # Linux only, where prlimit sets the limit; a sanitizer or an emulator
+  # needs more address space than that to start at all.
+  if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR SANITIZED OR EMULATOR)
+    message(STATUS "skipped: needs prlimit on a native, unsanitized Linux build")
+    return()
+  endif()
+  find_program(PRLIMIT prlimit)
+  if(NOT PRLIMIT)
+    message(STATUS "skipped: no prlimit")
+    return()
+  endif()
+  file(WRITE "${WORK}/a" "a\n")
+  file(WRITE "${WORK}/b" "b\n")
+  execute_process(
+    COMMAND "${PRLIMIT}" --as=2147483648 -- "${SUM}" --threads 4 --window 1024
+      --trace "${WORK}/trace.json" a b
+    WORKING_DIRECTORY "${WORK}"
+    OUTPUT_VARIABLE out ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(NOT r MATCHES "^[0-9]+$" OR r EQUAL 0 OR NOT err MATCHES "bad_alloc")
+    message(FATAL_ERROR "an arena that cannot be allocated: exit ${r}, "
+      "stderr: ${err}")
+  endif()
+
 elseif(CASE STREQUAL "gen_seed_file")
   # --seed-file streams through the library's file pipeline: a seed
   # spanning several windows must hash identically sequentially and

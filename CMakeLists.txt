@@ -322,11 +322,34 @@ if(BLAKE3PP_TOOL_MIMALLOC)
     set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
     set(MI_INSTALL_TOPLEVEL ON CACHE BOOL "" FORCE)
   ]=])
-  # zig cc enforces reproducible builds (-Werror,-Wdate-time) and mimalloc
-  # stamps __DATE__ into its version banner. Pure cl rejects the GNU flag
+  # A failed operator new must throw std::bad_alloc, which the tools report
+  # like any other failure. Compiled as C, mimalloc's operator new cannot
+  # throw: it calls the program's new_handler if it finds one and aborts
+  # otherwise. Two routes, by toolchain:
+  #   * MI_USE_CXX compiles it as C++, where it throws. MSVC and clang-cl
+  #     get that from mimalloc itself.
+  #   * zig c++ compiles the .c sources as C whatever their LANGUAGE says
+  #     (CMake adds -x c++ only under CMP0119, newer than mimalloc's minimum
+  #     version), so there mimalloc stays C, built with -fexceptions so an
+  #     exception can unwind through it, and tool_startup() installs a
+  #     handler that throws. That route needs the standard library's
+  #     get_new_handler to replace mimalloc's weak stand-in, which a static
+  #     link does and a dynamic one does not; the zig presets link
+  #     statically.
+  # Every zig toolchain file names its compiler in BLAKE3PP_ZIG_CXX, which
+  # holds wherever the wrappers were found: docker/wrappers/zig/ in a
+  # checkout, /usr/local/bin in the toolchain image.
+  if(DEFINED BLAKE3PP_ZIG_CXX)
+    string(APPEND _mi_toolchain_extension "    set(CMAKE_C_FLAGS_INIT \"\${CMAKE_C_FLAGS_INIT} -fexceptions\")\n")
+  else()
+    string(APPEND _mi_toolchain_extension "    set(MI_USE_CXX ON CACHE BOOL \"\" FORCE)\n")
+  endif()
+  # zig cc and zig c++ enforce reproducible builds (-Werror,-Wdate-time),
+  # and mimalloc stamps __DATE__ into its version banner. Pure cl rejects the GNU flag
   # spelling and has no such warning to silence, so it is skipped there.
   if(NOT (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"))
     string(APPEND _mi_toolchain_extension "    set(CMAKE_C_FLAGS_INIT \"\${CMAKE_C_FLAGS_INIT} -Wno-date-time\")\n")
+    string(APPEND _mi_toolchain_extension "    set(CMAKE_CXX_FLAGS_INIT \"\${CMAKE_CXX_FLAGS_INIT} -Wno-date-time\")\n")
   endif()
   # macOS cannot do wholesale malloc override from a static link: dyld
   # honors __interpose sections only in dylibs, so the active mechanism
