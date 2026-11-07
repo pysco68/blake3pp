@@ -345,7 +345,9 @@ class engine {
   //
   // A file that fails carries its message instead of a digest, so one bad
   // file does not end the run. report(index, result) says whether that
-  // file passed; the count of the ones that did not is returned.
+  // file passed; the count of the ones that did not is returned. A write
+  // to stdout that throws ends the run instead: it is stopped, counted as
+  // one failure, and left to main()'s check of stdout to report.
   template <class Report>
   int run_batch(const std::vector<std::string>& files,
                 const std::vector<std::size_t>& out_lens, Report report) {
@@ -361,6 +363,7 @@ class engine {
     std::vector<std::optional<result>> out(files.size());
     std::size_t next = 0;  // the next outcome to report
     int failures = 0;
+    bool write_failed = false;
     // The tracer is a type the sender carries, so the two spellings are
     // two instantiations of the same call.
     const auto run = [&](auto tracer) {
@@ -370,13 +373,23 @@ class engine {
           [&](std::size_t i, blake3pp::hasher& h,
               const blake3pp::async::file_outcome& o) noexcept {
             out[i] = describe(o, h, out_lens[i]);
-            for (; next < out.size() && out[next].has_value(); ++next) {
-              if (!report(next, *out[next])) {
-                failures++;
+            if (write_failed) {
+              return;
+            }
+            try {
+              for (; next < out.size() && out[next].has_value(); ++next) {
+                if (!report(next, *out[next])) {
+                  failures++;
+                }
               }
+            } catch (const std::system_error&) {
+              write_failed = true;
+              ctx.request_stop();
             }
           },
           tracer);
+      // A stopped run returns an empty optional; only the write failure
+      // stops one.
       blake3pp::async::sync_wait(ctx, std::move(work));
     };
     if (opts_.io.trace != nullptr) {
@@ -384,13 +397,13 @@ class engine {
     } else {
       run(blake3pp::null_tracer{});
     }
-    return failures;
+    return failures + (write_failed ? 1 : 0);
   }
 
   // The batch behind the printing path: one line per file.
   int hash_many(const std::vector<std::string>& files, std::size_t out_len) {
     return run_batch(files, std::vector<std::size_t>(files.size(), out_len),
-                     [&](std::size_t i, const result& r) noexcept {
+                     [&](std::size_t i, const result& r) {
                        if (!r.error.empty()) {
                          println(stderr, "blake3ppsum: {}: {}", files[i],
                                  r.error);
@@ -412,7 +425,7 @@ class engine {
       out_lens[i] = expected[i].size() / 2;
     }
     run_batch(files, out_lens,
-              [&](std::size_t i, const result& r) noexcept {
+              [&](std::size_t i, const result& r) {
                 const line_name n = escape_name(files[i]);
                 if (!r.error.empty()) {
                   println(stderr, "blake3ppsum: {}: {}", files[i], r.error);
@@ -905,13 +918,21 @@ int run_main(int argc, char** argv) {
       failures += eng.hash_many(o.files, o.out_len);
     } else {
       for (const auto& f : o.files) {
+        std::string hex;
         try {
-          const std::string hex = eng.hash_hex(f, o.out_len);
-          const line_name n = escape_name(f);
-          println(stdout, "{}{}  {}", n.prefix, hex, n.text);
+          hex = eng.hash_hex(f, o.out_len);
         } catch (const std::exception& e) {
           println(stderr, "blake3ppsum: {}: {}", f, e.what());
           failures++;
+          continue;
+        }
+        // A failed write is stdout's, not the file's: main() reports it.
+        try {
+          const line_name n = escape_name(f);
+          println(stdout, "{}{}  {}", n.prefix, hex, n.text);
+        } catch (const std::system_error&) {
+          failures++;
+          break;
         }
       }
     }
