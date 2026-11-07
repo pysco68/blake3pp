@@ -1,4 +1,4 @@
-#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/pipeline_plan.hpp>
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/io.hpp>

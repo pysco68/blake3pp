@@ -27,20 +27,28 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <system_error>
 #include <type_traits>
 #include <utility>
 
-#include <blake3pp/detail/compress.hpp>
+#if defined(__linux__)
+#include <sched.h>  // sched_getcpu() for agent_record::cpu
+#endif
+
+#include <blake3pp/detail/contract.hpp>
+#include <blake3pp/detail/driver.hpp>
+#include <blake3pp/detail/driver_loop.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
-#include <blake3pp/detail/file_pipeline.hpp>
-#include <blake3pp/detail/file_writer.hpp>
+#include <blake3pp/detail/io_geometry.hpp>
+#include <blake3pp/trace.hpp>
 
 namespace blake3pp::detail {
 
@@ -272,7 +280,7 @@ class write_scope
   }
 
   // The chain, read backwards from the read side's. Untagged, unlike the
-  // read side's builders, for the reason file_pipeline.hpp gives at its
+  // read side's builders, for the reason window_scope.hpp gives at its
   // compress stages: the body builds the same non-polymorphic layout in
   // every unit, so the one copy the linker keeps serves them all.
   [[nodiscard]] auto window_chain(window& w) {

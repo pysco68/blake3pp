@@ -50,9 +50,11 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/ex.hpp>
-#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/io_geometry.hpp>
 #include <blake3pp/detail/memory_driver.hpp>
+#include <blake3pp/detail/pipeline_plan.hpp>
 #include <blake3pp/detail/tree_reducer.hpp>
+#include <blake3pp/detail/window_scope.hpp>
 #include <blake3pp/trace.hpp>
 
 #if defined(__linux__)
