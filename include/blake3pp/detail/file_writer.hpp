@@ -63,9 +63,6 @@ struct file_writer_options {
   // where the machine has one; off selects the port. The engaged rung is
   // in backend().
   bool ioring = true;
-  // Windows I/O ring: register the arena and the file handle with the
-  // ring rather than naming a pointer and a HANDLE per transfer.
-  bool registered_buffers = false;
   // Preallocate this many bytes at construction when the total is known.
   // This matters enormously for async direct I/O: writes that EXTEND the
   // file serialize on the inode lock (each waits out journal + allocation),

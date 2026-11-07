@@ -221,9 +221,8 @@ concept file_driver =
 
 // What the driver's engine actually offered the device, where it can say.
 //
-// Optional rather than part of file_driver, like
-// register_arena_if_supported() in src/io/backend.hpp: only the file I/O
-// driver has an engine with a queue of its own. A driver without these
+// Optional rather than part of file_driver: only the file I/O driver has
+// an engine with a queue of its own. A driver without these
 // members (memory_driver, pipe_driver) leaves the depth the pipeline asked
 // for standing and the pipeline's own admission-to-landing span as the
 // device's time.

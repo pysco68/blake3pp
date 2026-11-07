@@ -103,9 +103,9 @@ constexpr blake3pp::io_engine every_io_engine[] = {
 };
 
 // The leading engine name of a `backend` string, with every decoration
-// the backends append cut off: "+direct", "+nocache", "+regbuf",
-// " (inline submit)", " [io_uring: ENOSYS, kernel too old]". What is
-// left is one io_engine's own spelling, which is what to_string() gives.
+// the backends append cut off: "+direct", "+nocache", " (inline submit)",
+// " [io_uring: ENOSYS, kernel too old]". What is left is one io_engine's
+// own spelling, which is what to_string() gives.
 std::string engine_token(std::string_view backend) {
   return std::string(backend.substr(0, backend.find_first_of("+ ")));
 }

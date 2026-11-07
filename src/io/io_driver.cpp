@@ -85,8 +85,7 @@ struct io_driver::impl {
       : ctx(io_impl::reader_context_options{
                 .async = opts.async,
                 .offload_submit = opts.offload_submit,
-                .ioring = opts.ioring,
-                .registered_buffers = opts.registered_buffers},
+                .ioring = opts.ioring},
             max_inflight) {
     owed_sentinel.owed_next = owed_sentinel.owed_prev = &owed_sentinel;
   }
@@ -279,11 +278,6 @@ void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
   impl_->window_bytes = window_bytes;
   impl_->arena_bytes = window_bytes * windows;
   impl_->buffers = io_impl::make_aligned_buffer(impl_->arena_bytes);
-  // One region, offered to the context before any read names a buffer in
-  // it; a context with nothing to do with it ignores the offer.
-  io_impl::register_arena_if_supported(
-      impl_->ctx, std::span<std::byte>{impl_->buffers.get(),
-                                       impl_->arena_bytes});
 }
 
 window_storage io_driver::window_storage_for(file&, unsigned slot,

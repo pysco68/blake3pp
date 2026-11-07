@@ -755,54 +755,6 @@ TEST_CASE("IoRing: the cancel request's completion reports no operation") {
   CHECK(canary.calls == 0);
 }
 
-// Registered buffers are an option, not a rung the caller can be given
-// without asking, and a ring that refuses the registration has to keep
-// reading. All three answers deliver the same bytes: registration asked
-// for and taken, not asked for at all, and asked for with a region no
-// ring can accept.
-TEST_CASE("IoRing: registration on, off and refused deliver the same bytes") {
-  namespace io_impl = blake3pp::detail::io_impl;
-  const auto content = pattern(300 * 1024 + 77, 46);
-  const temp_file f(content);
-  const auto expected = blake3pp::hash(content);
-  for (const bool registered : {false, true}) {
-    CAPTURE(registered);
-    io_impl::polled_reader_engine<io_impl::ioring_context> r(
-        f.path, {.window_bytes = 64 * 1024,
-                 .queue_depth = 2,
-                 .registered_buffers = registered});
-    MESSAGE("reader backend: " << r.backend_name());
-    blake3pp::hasher h;
-    while (auto w = r.next()) {
-      h.update(std::span<const std::byte>{w->data, w->bytes});
-      r.release(*w);
-    }
-    CHECK(h.finalize() == expected);
-  }
-  // A registration the ring cannot take: an empty region describes
-  // nothing. The transfers then name pointers, as every transfer outside
-  // a registered arena does, and the bytes are the same.
-  {
-    io_impl::ioring_context ctx({.registered_buffers = true}, 4);
-    ctx.register_arena({});
-    CHECK(!ctx.arena_registered());
-    io_impl::ioring_context::file file(ctx, f.path,
-                                       io_impl::file_open_options{});
-    std::vector<std::byte> got(content.size());
-    probe p;
-    io_impl::ioring_context::transfer op{};
-    op.done = &probe::on_done;
-    op.owner = &p;
-    ctx.submit_read(file, 0, std::span{got}, op);
-    ctx.flush();
-    while (p.calls == 0) {
-      ctx.poll(true);
-    }
-    CHECK(!p.ec);
-    CHECK(got == content);
-  }
-}
-
 // The reasons a ring could not be had are part of the ladder a tool
 // prints, and the machine that runs this suite is usually one that HAS a
 // ring, so the spellings are asserted on the composer rather than waited

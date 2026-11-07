@@ -369,9 +369,7 @@ class engine {
                                      .arena_bytes = 128u << 20,
                                      .direct_io = opts_.io.direct_io,
                                      .offload_submit = opts_.io.offload_submit,
-                                     .ioring = opts_.io.ioring,
-                                     .registered_buffers =
-                                         opts_.io.registered_buffers});
+                                     .ioring = opts_.io.ioring});
     const std::vector<std::filesystem::path> paths(files.begin(), files.end());
     std::vector<std::optional<result>> out(files.size());
     std::size_t next = 0;  // the next outcome to report

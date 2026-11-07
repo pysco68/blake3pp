@@ -15,11 +15,6 @@
 // linked, so the binary loads on Windows 10, where they do not exist;
 // <ioringapi.h> is included for the types only. Which rung was
 // reached is in the file's name(), including why a ring was refused.
-//
-// Registered buffers and registered file handles are behind
-// reader_context_options::registered_buffers and default off. On Linux
-// the same idea measured 28-38% slower (uring_backend.hpp); on Windows it
-// is unmeasured.
 
 #if defined(_WIN32)
 
@@ -115,11 +110,7 @@ struct ioring_api {
   decltype(&::BuildIoRingCancelRequest) build_cancel = nullptr;
   decltype(&::GetIoRingInfo) get_info = nullptr;
   decltype(&::IsIoRingOpSupported) is_op_supported = nullptr;
-  // Registration and the explicit flush are optional: a ring without
-  // them still reads and writes, and registration is off by default.
-  decltype(&::BuildIoRingRegisterBuffers) build_register_buffers = nullptr;
-  decltype(&::BuildIoRingRegisterFileHandles) build_register_files = nullptr;
-  // Resolved for completeness; nothing calls it, because the writer's
+  // Optional, and resolved for completeness; nothing calls it, because the writer's
   // finish() lands its bytes through SetEndOfFile on the plain handle,
   // exactly as the completion-port backend's does.
   decltype(&::BuildIoRingFlushFile) build_flush = nullptr;
@@ -149,8 +140,6 @@ struct ioring_api {
     resolve(build_cancel, "BuildIoRingCancelRequest");
     resolve(get_info, "GetIoRingInfo");
     resolve(is_op_supported, "IsIoRingOpSupported");
-    resolve(build_register_buffers, "BuildIoRingRegisterBuffers");
-    resolve(build_register_files, "BuildIoRingRegisterFileHandles");
     resolve(build_flush, "BuildIoRingFlushFile");
     ok = query_capabilities != nullptr && create != nullptr &&
          close != nullptr && submit != nullptr && pop != nullptr &&
@@ -174,7 +163,7 @@ class ioring {
   ~ioring() { close(); }
 
   // IORING_VERSION_3 is the floor: version 1 (21H2) has reads only, and
-  // reads without writes, cancel and registration is not a rung worth
+  // reads without writes and cancel is not a rung worth
   // keeping a second backend for. The op probe is the second half of the
   // same question -- a version number is what the ring CAN do, and
   // IsIoRingOpSupported is what this ring DOES.
@@ -353,11 +342,6 @@ class ioring_context {
         name_ += "+sparse";
       }
       ctx.adopt(*this);
-      // The handle table is the ring's, not the file's, and registering
-      // it replaces the whole table, so only a context with this one file
-      // open may have one. That covers the engines, which run one file
-      // per context, and leaves the multi-file driver on raw handle refs.
-      ctx.try_register_handle(*this);
     }
 
     ~file() {
@@ -367,7 +351,6 @@ class ioring_context {
         // may be read again. This one is not -- and a destroyed file
         // still on the list is what a later drain() would walk.
         ctx_->forget(*this);
-        ctx_->release_handle(*this);
         ctx_->unlink(*this);
       }
     }
@@ -449,7 +432,6 @@ class ioring_context {
     // win_file::use_iocp stays false throughout: there is no port here,
     // and the synchronous ladder reads this instead.
     bool ring_handle_ = false;
-    int reg_index_ = -1;  // the ring's handle table slot, or -1 for none
     ioring_context* ctx_ = nullptr;
     file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
@@ -463,7 +445,6 @@ class ioring_context {
                               /*bInitialState=*/FALSE, nullptr)),
         queue_depth_(std::max(1u, max_inflight)),
         async_requested_(opts.async),
-        want_registered_(opts.registered_buffers),
         // Declared last, and initialized last: see the member list.
         pump_(io_lanes::waker<ioring_context>(), this,
               &perform_deferred, io_lanes_for(max_inflight)) {
@@ -475,8 +456,8 @@ class ioring_context {
       return;
     }
     // What one batch between two flushes can hold: a transfer and its
-    // continuation for every slot, plus four entries for the
-    // registration, a cancel and spares. The completion queue is twice
+    // continuation for every slot, plus four entries for a cancel and
+    // spares. The completion queue is twice
     // that, so a completion can never be dropped for want of room.
     const std::uint32_t sq = 2u * max_inflight + 4u;
     if (!ring_.init(sq, 2u * sq)) {
@@ -561,62 +542,6 @@ class ioring_context {
     op.src = buf.data();
     op.is_write = true;
     place(op, f);
-  }
-
-  // Hands the ring the arena the engine or the driver reads into, so
-  // transfers inside it can name a registered buffer instead of a
-  // pointer. Optional, off by default, and silent about failure: a ring
-  // that refuses the registration keeps serving pointer refs, which is
-  // what every transfer outside the arena uses anyway.
-  //
-  // Called once, before any transfer: the registration is itself a
-  // submission, and its completion is waited out here rather than
-  // reported from poll().
-  void register_arena(std::span<std::byte> arena) noexcept {
-#if defined(BLAKE3PP_HAS_IORING_API)
-    if (!use_ring_ || !want_registered_ || arena_registered_ ||
-        arena.empty() || in_flight_ != 0) {
-      return;
-    }
-    const ioring_api& api = ioring_entry_points();
-    if (api.build_register_buffers == nullptr ||
-        !ring_.op_supported(IORING_OP_REGISTER_BUFFERS)) {
-      return;
-    }
-    // One region, one index: the arena is a single allocation, so a
-    // buffer inside it is index 0 plus its offset. A region longer than
-    // a UINT32 cannot be described at all, and declines quietly.
-    if (arena.size() > 0xFFFFFFFFull) {
-      return;
-    }
-    IORING_BUFFER_INFO info{};
-    info.Address = arena.data();
-    info.Length = static_cast<UINT32>(arena.size());
-    if (FAILED(api.build_register_buffers(ring_.get(), 1, &info, reg_ud()))) {
-      return;
-    }
-    ++queued_;
-    ++ring_owed_;
-    if (!submit_quiet() || !await_registration()) {
-      return;
-    }
-    arena_ = arena;
-    arena_registered_ = true;
-    // The rung is part of a file's name, and the files are usually open
-    // by the time the arena exists, so they learn it here; one opened
-    // afterwards gets it from name_for().
-    for (file* f = files_; f != nullptr; f = f->next_) {
-      f->name_ += "+regbuf";
-    }
-#else
-    (void)arena;
-#endif
-  }
-
-  // Whether the arena registration engaged, which name() also reports as
-  // "+regbuf": a run has to be readable as the rung it actually took.
-  [[nodiscard]] bool arena_registered() const noexcept {
-    return arena_registered_;
   }
 
   // The ring's depth where any transfer of this run rode it, and one
@@ -805,7 +730,7 @@ class ioring_context {
         }
         continue;
       }
-      if (cqe.UserData == reg_ud() || cqe.UserData == cancel_ud()) {
+      if (cqe.UserData == cancel_ud()) {
         continue;
       }
       transfer& op = *op_from(cqe.UserData);
@@ -883,11 +808,7 @@ class ioring_context {
   [[nodiscard]] std::string name_for(bool direct, bool on_ring,
                                      bool write) const {
     if (on_ring) {
-      std::string n = direct ? "ioring+direct" : "ioring";
-      if (arena_registered_) {
-        n += "+regbuf";
-      }
-      return n;
+      return direct ? "ioring+direct" : "ioring";
     }
     const char* const sync_name = write ? "writefile" : "readfile";
     std::string n =
@@ -988,14 +909,10 @@ class ioring_context {
     return std::bit_cast<transfer*>(ud);
   }
   // The cancel request's completion needs a userData no transfer can
-  // wear, and so does the registration's: reaping either as a transfer
-  // would walk to an operation that does not exist. Their own addresses
-  // are such values and cost nothing.
+  // wear: reaping it as a transfer would walk to an operation that does
+  // not exist. The cancel's own address is such a value and costs nothing.
   [[nodiscard]] std::uintptr_t cancel_ud() const noexcept {
     return std::bit_cast<std::uintptr_t>(&cancel_op_);
-  }
-  [[nodiscard]] std::uintptr_t reg_ud() const noexcept {
-    return std::bit_cast<std::uintptr_t>(&reg_op_);
   }
 
   // Drains the wake flag. True means a wake() had been issued.
@@ -1131,28 +1048,8 @@ class ioring_context {
   }
 
 #if defined(BLAKE3PP_HAS_IORING_API)
-  // The handle the ring should name: the registered table slot where one
-  // was taken, else the handle itself.
   [[nodiscard]] static IORING_HANDLE_REF handle_ref(const file& f) noexcept {
-    if (f.reg_index_ >= 0) {
-      return IoRingHandleRefFromIndex(static_cast<UINT32>(f.reg_index_));
-    }
     return IoRingHandleRefFromHandle(f.f_.h());
-  }
-
-  // The buffer the ring should name: the registered region plus an offset
-  // where the bytes lie inside the arena, else the pointer. A transfer
-  // into a caller's own buffer therefore keeps working while the arena is
-  // registered, which is the whole reason the choice is per transfer.
-  [[nodiscard]] IORING_BUFFER_REF buffer_ref(void* at) const noexcept {
-    if (arena_registered_) {
-      auto* const bytes = static_cast<std::byte*>(at);
-      if (bytes >= arena_.data() && bytes < arena_.data() + arena_.size()) {
-        return IoRingBufferRefFromIndexAndOffset(
-            0, static_cast<UINT32>(bytes - arena_.data()));
-      }
-    }
-    return IoRingBufferRefFromPointer(at);
   }
 
   // Queues one read or write of `len` bytes from where the transfer
@@ -1166,11 +1063,11 @@ class ioring_context {
     if (op.is_write) {
       void* const from = const_cast<std::byte*>(op.src) + op.filled;
       hr = api.build_write(ring_.get(), handle_ref(*op.owner_file),
-                           buffer_ref(from), len, at, FILE_WRITE_FLAGS_NONE,
+                           IoRingBufferRefFromPointer(from), len, at, FILE_WRITE_FLAGS_NONE,
                            op_ud(&op), IOSQE_FLAGS_NONE);
     } else {
       hr = api.build_read(ring_.get(), handle_ref(*op.owner_file),
-                          buffer_ref(op.dst + op.filled), len, at,
+                          IoRingBufferRefFromPointer(op.dst + op.filled), len, at,
                           op_ud(&op), IOSQE_FLAGS_NONE);
     }
     // The submission queue holds a transfer and its continuation for
@@ -1236,24 +1133,6 @@ class ioring_context {
     return true;
   }
 
-  // Waits out the registration's own completion, which is the only thing
-  // the ring owes at that point.
-  [[nodiscard]] bool await_registration() noexcept {
-    for (;;) {
-      IORING_CQE cqe{};
-      const HRESULT hr = pop(cqe);
-      if (hr == S_OK) {
-        if (cqe.UserData != reg_ud()) {
-          continue;
-        }
-        return SUCCEEDED(cqe.ResultCode);
-      }
-      if (FAILED(hr) || !wait_ring()) {
-        return false;
-      }
-    }
-  }
-
   // What one completion of `op` means. A transfer short of its length
   // continues from where it stopped, reads and writes alike. Returns
   // whether it was requeued rather than completed, which is the caller's
@@ -1307,7 +1186,7 @@ class ioring_context {
         throw std::system_error(static_cast<int>(hr), std::system_category(),
                                 "PopIoRingCompletion");
       }
-      if (cqe.UserData == cancel_ud() || cqe.UserData == reg_ud()) {
+      if (cqe.UserData == cancel_ud()) {
         // The cancel request reports whether it found anything, which
         // changes nothing a caller has to do; the target's own completion
         // is the one that matters and arrives either way.
@@ -1322,55 +1201,6 @@ class ioring_context {
       (void)submit_quiet();
     }
   }
-
-  // Registers this file's handle in the ring's table, so its transfers
-  // can name an index instead of a HANDLE. The table is the ring's and
-  // registering replaces all of it, so only a context with this one file
-  // open takes a slot: a second file would have to re-register while the
-  // first one's transfers are in flight.
-  void try_register_handle(file& f) noexcept {
-    const ioring_api& api = ioring_entry_points();
-    if (!use_ring_ || !want_registered_ || !f.ring_handle_ ||
-        api.build_register_files == nullptr || in_flight_ != 0 ||
-        f.next_ != nullptr || reg_handle_ != nullptr ||
-        !ring_.op_supported(IORING_OP_REGISTER_FILES)) {
-      return;
-    }
-    HANDLE h = f.f_.h();
-    if (FAILED(api.build_register_files(ring_.get(), 1, &h, reg_ud()))) {
-      return;
-    }
-    ++queued_;
-    ++ring_owed_;
-    if (!submit_quiet() || !await_registration()) {
-      return;
-    }
-    f.reg_index_ = 0;
-    reg_handle_ = h;
-  }
-
-  // Gives the slot back before the handle in it closes. Only reachable
-  // with nothing in flight, which forget() has just established for this
-  // file and which one open file makes true for the context.
-  void release_handle(file& f) noexcept {
-    if (f.reg_index_ < 0) {
-      return;
-    }
-    f.reg_index_ = -1;
-    reg_handle_ = nullptr;
-    const ioring_api& api = ioring_entry_points();
-    if (in_flight_ != 0 || api.build_register_files == nullptr) {
-      return;
-    }
-    if (FAILED(api.build_register_files(ring_.get(), 0, nullptr, reg_ud()))) {
-      return;
-    }
-    ++queued_;
-    ++ring_owed_;
-    if (submit_quiet()) {
-      (void)await_registration();
-    }
-  }
 #else
   // Without the SDK's declarations there is no ring: use_ring_ is false
   // for the life of the context, so ring_len() takes nothing, place()
@@ -1380,25 +1210,19 @@ class ioring_context {
     return false;
   }
   static void reap_ready() noexcept {}
-  void try_register_handle(file&) noexcept {}
-  void release_handle(file&) noexcept {}
 #endif  // BLAKE3PP_HAS_IORING_API
 
   // Declaration order is the teardown contract: the ring is closed before
-  // the event it was given, and both after the operations whose addresses
-  // the cancel and registration completions wear. Do not move ring_ above
-  // these.
+  // the event it was given, and both after the operation whose address
+  // every cancel completion wears. Do not move ring_ above these.
   unique_handle event_;
   transfer cancel_op_{};  // address only: every cancel completion's userData
-  transfer reg_op_{};     // address only: every registration's userData
 #if defined(BLAKE3PP_HAS_IORING_API)
   ioring ring_;
 #else
   ioring_refusal refusal_{};
 #endif
   file* files_ = nullptr;  // every open file, for the drain
-  std::span<std::byte> arena_{};
-  void* reg_handle_ = nullptr;  // the handle in the ring's table, if any
   std::size_t in_flight_ = 0;
   std::size_t served_synchronously_ = 0;
   // Callbacks run since construction; poll() returns its growth.
@@ -1413,8 +1237,6 @@ class ioring_context {
   // reports it where the ring took the transfers.
   unsigned queue_depth_ = 1;
   bool async_requested_ = true;
-  bool want_registered_ = false;
-  bool arena_registered_ = false;
   bool use_ring_ = false;
   // Whether any transfer of this run reached the ring, which is what
   // device_depth() reports against.
