@@ -603,6 +603,27 @@ elseif(CASE STREQUAL "sum_alloc_failure")
       "trace written: ${traced}, stderr: ${err}")
   endif()
 
+elseif(CASE STREQUAL "trace_write_failure")
+  # A trace that cannot be written is reported and fails the run, also
+  # when it is small enough that nothing reaches the file before the
+  # stream is closed. /dev/full accepts the open and refuses every write.
+  if(NOT EXISTS /dev/full)
+    message(STATUS "skipped: no /dev/full")
+    return()
+  endif()
+  file(WRITE "${WORK}/a" "a\n")
+  execute_process(COMMAND ${EMULATOR} "${SUM}" --trace /dev/full a
+    WORKING_DIRECTORY "${WORK}" OUTPUT_QUIET ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(r EQUAL 0 OR NOT err MATCHES "could not write /dev/full")
+    message(FATAL_ERROR "blake3ppsum --trace /dev/full: exit ${r}: ${err}")
+  endif()
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed t --length 64 --threads 4 --output a2
+      --trace /dev/full
+    WORKING_DIRECTORY "${WORK}" OUTPUT_QUIET ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(r EQUAL 0 OR NOT err MATCHES "/dev/full")
+    message(FATAL_ERROR "blake3ppgen --trace /dev/full: exit ${r}: ${err}")
+  endif()
+
 elseif(CASE STREQUAL "gen_seed_file")
   # --seed-file streams through the library's file pipeline: a seed
   # spanning several windows must hash identically sequentially and

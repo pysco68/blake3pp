@@ -199,7 +199,10 @@ inline bool write_chrome_trace(const std::string& path,
     }
   }
   out << "\n]}\n";
-  return out.good();
+  // A trace smaller than the stream's buffer reaches the file only here,
+  // so the close is part of the answer.
+  out.close();
+  return !out.fail();
 }
 
 }  // namespace b3tool

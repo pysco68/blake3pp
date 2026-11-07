@@ -79,7 +79,8 @@ foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
     check_escaped_line check_nonhex check_counts utf8_names check_utf8_list
     gen_utf8_names length_prefix
     keyed_roundtrip derive_key gen_deterministic gen_seek gen_threads
-    gen_output gen_seed_file gen_short_buffer sum_alloc_failure sum_errors
+    gen_output gen_seed_file gen_short_buffer sum_alloc_failure
+    trace_write_failure sum_errors
     key_forms gen_errors)
   add_test(NAME cli_${case}
     COMMAND ${CMAKE_COMMAND}
