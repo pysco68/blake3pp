@@ -379,8 +379,9 @@ class trace_buffer {
   }
 
   /// Where the driver thread's own time went. Only the pipeline path
-  /// fills this in; the sequential window loop, which has no driver
-  /// thread, leaves it zeroed.
+  /// fills in the counters; the sequential window loop, which has no
+  /// driver thread, records only the read backend and leaves the rest
+  /// zeroed.
   [[nodiscard]] const driver_stats& driver() const noexcept {
     return driver_;
   }

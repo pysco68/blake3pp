@@ -718,6 +718,22 @@ TEST_CASE("missing file throws system_error") {
       std::system_error);
 }
 
+// io.hpp promises the engaged rung through read_backend(trace.driver())
+// on every read path, and the sequential window loop is one of them.
+TEST_CASE("a traced sequential update_file names its read backend") {
+  const auto content = make_input(1024 * 1024 + 3);
+  const temp_file f(content);
+  for (const bool async : {true, false}) {
+    CAPTURE(async);
+    std::vector<blake3pp::window_record> windows(64);
+    blake3pp::trace_buffer trace(windows, std::span<blake3pp::agent_record>{});
+    blake3pp::hasher h;
+    blake3pp::update_file(h, f.path, {.async = async, .trace = &trace});
+    CHECK(h.finalize() == blake3pp::hash(content));
+    CHECK_FALSE(blake3pp::read_backend(trace.driver()).empty());
+  }
+}
+
 TEST_CASE("reader reports a backend") {
   const auto content = make_input(256 * 1024);
   const temp_file f(content);

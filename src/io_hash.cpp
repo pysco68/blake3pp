@@ -33,6 +33,9 @@ void update_file(hasher& h, const std::filesystem::path& path,
                                     .registered_buffers =
                                         opts.registered_buffers});
   trace_buffer* const trace = opts.trace;
+  if (trace != nullptr) {
+    set_read_backend(trace->driver(), reader.backend());
+  }
   std::uint64_t index = 0;
   for (;;) {
     // The wait is timed before the record is claimed: the last next()
