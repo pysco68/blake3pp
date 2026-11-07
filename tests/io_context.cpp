@@ -614,6 +614,47 @@ TEST_CASE("IoRing: an unaligned length rides the ring but for a direct tail") {
   }
 }
 
+// poll() returns the callbacks it ran. A direct file whose length is not
+// a whole number of granules sends its tail to the pump after the first
+// piece comes back, and moving that remainder runs no callback: over the
+// whole read, the returns add up to the one callback, on the ring and on
+// the port.
+TEST_CASE("Windows: poll() counts callbacks, not a remainder moved to the pump") {
+  namespace io_impl = blake3pp::detail::io_impl;
+  constexpr std::size_t len = 64 * 4096 + 100;
+  const auto content = pattern(len, 46);
+  const temp_file f(content);
+  const auto check = [&](auto& ctx) {
+    using ctx_t = std::remove_cvref_t<decltype(ctx)>;
+    typename ctx_t::file file(ctx, f.path,
+                              io_impl::file_open_options{.direct_io = true});
+    MESSAGE("read through " << file.name());
+    std::vector<std::byte> got(len);
+    probe p;
+    typename ctx_t::transfer op{};
+    op.done = &probe::on_done;
+    op.owner = &p;
+    ctx.submit_read(file, 0, std::span(got), op);
+    ctx.flush();
+    std::size_t reported = 0;
+    for (std::size_t polls = 0; p.calls == 0; ++polls) {
+      REQUIRE(polls < 1000);
+      reported += ctx.poll(true);
+    }
+    CHECK(!p.ec);
+    CHECK(got == content);
+    CHECK(reported == p.calls);
+  };
+  {
+    io_impl::ioring_context ctx({}, 4);
+    check(ctx);
+  }
+  {
+    io_impl::iocp_context ctx({}, 4);
+    check(ctx);
+  }
+}
+
 // A cancel on the ring is a submission of its own, and its completion
 // carries a userData that belongs to no transfer. Reaped as one it would
 // walk to an operation that does not exist, so it has to be dropped: the

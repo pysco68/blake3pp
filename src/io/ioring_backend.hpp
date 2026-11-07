@@ -672,20 +672,22 @@ class ioring_context {
   std::size_t poll(bool block) {
     flush();
     throw_if_submit_failed();
-    std::size_t ran = reap_ready();
-    ran += serve_deferred();
-    if (ran > 0 || !block) {
-      return ran;
+    const std::size_t before = reported_;
+    reap_ready();
+    serve_deferred();
+    if (reported_ != before || !block) {
+      return reported_ - before;
     }
     for (;;) {
       if (take_wake()) {
-        return ran + serve_deferred();
+        serve_deferred();
+        return reported_ - before;
       }
       wait_once();
-      ran += reap_ready();
-      ran += serve_deferred();
-      if (ran > 0 || take_wake()) {
-        return ran;
+      reap_ready();
+      serve_deferred();
+      if (reported_ != before || take_wake()) {
+        return reported_ - before;
       }
     }
   }
@@ -962,12 +964,15 @@ class ioring_context {
     }
   }
 
+  // Every callback runs from here, which is what poll() counts: a
+  // remainder moved to the pump is still owed, and is not one.
   void complete(transfer& op, std::error_code ec) noexcept {
     device_.add_if_served(op.device_total_ns());
     in_flight_--;
     if (op.owner_file != nullptr) {
       op.owner_file->inflight_--;
     }
+    ++reported_;
     op.done(&op, ec);
   }
 
@@ -1042,19 +1047,15 @@ class ioring_context {
   // Runs the callbacks of the transfers the lanes finished, on this
   // thread. The inline step serves a machine that would not give the
   // pump a thread.
-  std::size_t serve_deferred() noexcept {
-    std::size_t ran = 0;
+  void serve_deferred() noexcept {
     for (transfer* op = pump_.take_done(); op != nullptr;) {
       transfer* const next = op->next_deferred;
       report_deferred(*op);
-      ++ran;
       op = next;
     }
     if (transfer* const op = pump_.run_one_here(); op != nullptr) {
       report_deferred(*op);
-      ++ran;
     }
-    return ran;
   }
 
   void report_deferred(transfer& op) noexcept {
@@ -1285,12 +1286,11 @@ class ioring_context {
   }
 
   // Consumes every completion the ring has without blocking, continuing
-  // short transfers. Returns the number of callbacks run.
-  std::size_t reap_ready() {
+  // short transfers.
+  void reap_ready() {
     if (!use_ring_) {
-      return 0;
+      return;
     }
-    std::size_t ran = 0;
     bool requeued = false;
     for (;;) {
       IORING_CQE cqe{};
@@ -1309,18 +1309,13 @@ class ioring_context {
         continue;
       }
       transfer& op = *op_from(cqe.UserData);
-      if (settle(op, cqe)) {
-        requeued = true;
-      } else {
-        ran++;
-      }
+      requeued |= settle(op, cqe);
     }
     if (requeued) {
       // The continuation of a short transfer is the same kind of entry as
       // the transfer itself.
       (void)submit_quiet();
     }
-    return ran;
   }
 
   // Registers this file's handle in the ring's table, so its transfers
@@ -1379,7 +1374,7 @@ class ioring_context {
   [[nodiscard]] static bool build(transfer&, std::uint32_t) noexcept {
     return false;
   }
-  [[nodiscard]] static std::size_t reap_ready() noexcept { return 0; }
+  static void reap_ready() noexcept {}
   void try_register_handle(file&) noexcept {}
   void release_handle(file&) noexcept {}
 #endif  // BLAKE3PP_HAS_IORING_API
@@ -1401,6 +1396,8 @@ class ioring_context {
   void* reg_handle_ = nullptr;  // the handle in the ring's table, if any
   std::size_t in_flight_ = 0;
   std::size_t served_synchronously_ = 0;
+  // Callbacks run since construction; poll() returns its growth.
+  std::size_t reported_ = 0;
   std::size_t queued_ = 0;     // entries built and not yet submitted
   std::size_t ring_owed_ = 0;  // requests the ring has yet to hand back
   std::uint32_t submit_failed_ = 0;  // latched for the next poll() to throw

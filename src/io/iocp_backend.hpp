@@ -550,19 +550,21 @@ class iocp_context {
   // The port first, then the pump's finished list: a completion the port
   // hands back can move its remainder to the pump.
   std::size_t poll(bool block) {
-    std::size_t ran = reap_ready(false);
-    ran += serve_deferred();
-    if (ran > 0 || !block) {
-      return ran;
+    const std::size_t before = reported_;
+    reap_ready(false);
+    serve_deferred();
+    if (reported_ != before || !block) {
+      return reported_ - before;
     }
     for (;;) {
       if (std::exchange(woken_, false)) {
-        return ran + serve_deferred();
+        serve_deferred();
+        return reported_ - before;
       }
-      ran += reap_ready(true);
-      ran += serve_deferred();
-      if (ran > 0 || std::exchange(woken_, false)) {
-        return ran;
+      reap_ready(true);
+      serve_deferred();
+      if (reported_ != before || std::exchange(woken_, false)) {
+        return reported_ - before;
       }
     }
   }
@@ -818,12 +820,15 @@ class iocp_context {
     ++port_owed_;
   }
 
+  // Every callback runs from here, which is what poll() counts: a
+  // remainder moved to the pump is still owed, and is not one.
   void complete(transfer& op, std::error_code ec) noexcept {
     device_.add_if_served(op.device_total_ns());
     in_flight_--;
     if (op.owner_file != nullptr) {
       op.owner_file->inflight_--;
     }
+    ++reported_;
     op.done(&op, ec);
   }
 
@@ -842,8 +847,8 @@ class iocp_context {
   // the port would not take has moved to the pump: where no lane runs,
   // only poll()'s next step performs it, so a wait on the port with
   // nothing else owed to it would never return.
-  std::size_t reap_ready(bool block) {
-    std::size_t ran = 0;
+  void reap_ready(bool block) {
+    const std::size_t before = reported_;
     bool parked = false;
     for (;;) {
       DWORD bytes = 0;
@@ -851,14 +856,14 @@ class iocp_context {
       OVERLAPPED* pov = nullptr;
       const BOOL ok = ::GetQueuedCompletionStatus(
           port_.get(), &bytes, &key, &pov,
-          block && ran == 0 && !parked ? INFINITE : 0);
+          block && reported_ == before && !parked ? INFINITE : 0);
       if (pov == nullptr) {
         if (ok == 0 && ::GetLastError() == WAIT_TIMEOUT) {
-          return ran;  // nothing more queued
+          return;  // nothing more queued
         }
         if (key == wake_key) {
           woken_ = true;
-          return ran;
+          return;
         }
         throw_winerr("GetQueuedCompletionStatus");
       }
@@ -867,25 +872,20 @@ class iocp_context {
       op.device_end();
       if (ok == 0) {
         complete(op, read_error(::GetLastError()));
-        ran++;
         continue;
       }
       if (bytes == 0) {
         complete(op, std::error_code(EIO, std::generic_category()));
-        ran++;
         continue;
       }
       op.filled += bytes;
       if (op.filled < op.len) {
-        if (!reissue(op)) {
-          ran++;  // it ended here, with the error ReadFile gave
-        } else if (!op.on_port) {
+        if (reissue(op) && !op.on_port) {
           parked = true;  // the rest is on the pump
         }
         continue;
       }
       complete(op, {});
-      ran++;
     }
   }
 
@@ -919,19 +919,15 @@ class iocp_context {
   // Runs the callbacks of the transfers the lanes finished, on this
   // thread. The inline step serves a machine that would not give the
   // pump a thread.
-  std::size_t serve_deferred() noexcept {
-    std::size_t ran = 0;
+  void serve_deferred() noexcept {
     for (transfer* op = pump_.take_done(); op != nullptr;) {
       transfer* const next = op->next_deferred;
       report_deferred(*op);
-      ++ran;
       op = next;
     }
     if (transfer* const op = pump_.run_one_here(); op != nullptr) {
       report_deferred(*op);
-      ++ran;
     }
-    return ran;
   }
 
   void report_deferred(transfer& op) noexcept {
@@ -1009,6 +1005,8 @@ class iocp_context {
   file* files_ = nullptr;      // every open file, for the drain
   std::size_t in_flight_ = 0;
   std::size_t served_synchronously_ = 0;
+  // Callbacks run since construction; poll() returns its growth.
+  std::size_t reported_ = 0;
   std::size_t port_owed_ = 0;  // requests the port has yet to hand back
   // What the device itself took, stamped by the port where it carried a
   // piece and by a lane where one did.
