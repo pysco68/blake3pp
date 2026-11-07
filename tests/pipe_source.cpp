@@ -59,6 +59,8 @@
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
+#include "counting_kernels.hpp"
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -927,6 +929,29 @@ TEST_CASE("the Windows ask bound follows what the reads deliver") {
 
 // ------------------------------------------------------------------
 // The real reader, end to end.
+
+// A stream compresses with the hasher's own kernel table too (see
+// tests/io.cpp for the file form).
+TEST_CASE("update_stream compresses with the hasher's table") {
+#if defined(__EMSCRIPTEN__)
+  MESSAGE("skipped: an Emscripten pipe never reports the end of the stream");
+  return;
+#endif
+  constexpr std::size_t len = 4 * 1024 * 1024 + 5;
+  const auto bytes = pattern(len, 42);
+  os_pipe p;
+  REQUIRE(p.open());
+  std::thread producer([&p, &bytes] { p.produce(bytes, ~std::size_t{0}); });
+  b3test::counting_kernels::chunks.store(0);
+  blake3pp::hasher h{b3test::counting_kernels::table()};
+  const blake3pp::stream_report r = blake3pp::update_stream(
+      h, p.r, blake3pp::get_parallel_scheduler(), {.window_bytes = 1024 * 1024});
+  producer.join();
+  p.close_read();
+  CHECK(r.bytes == len);
+  CHECK(h.finalize() == blake3pp::hash(bytes));
+  CHECK(b3test::counting_kernels::chunks.load() >= len / 1024 * 9 / 10);
+}
 
 TEST_CASE("update_stream over a real pipe matches the sequential hasher") {
 #if defined(__EMSCRIPTEN__)

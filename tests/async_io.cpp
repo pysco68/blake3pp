@@ -33,6 +33,7 @@
 #include <doctest/doctest.h>
 
 #include "temp_names.hpp"
+#include "counting_kernels.hpp"
 
 namespace {
 namespace fs = std::filesystem;
@@ -367,6 +368,23 @@ TEST_CASE("a traced operation's buffer may go once the operation completes") {
   // The buffers are gone; the stop makes the runner go round again.
   ctx.request_stop();
   runner.join();
+}
+
+// The async operation compresses with the hasher's own kernel table too
+// (see tests/io.cpp for the blocking form).
+TEST_CASE("async_update_file compresses with the hasher's table") {
+  constexpr std::size_t len = 4 * 1024 * 1024 + 5;
+  const auto content = pattern(len, 16);
+  const temp_file f(content);
+  async::io_context ctx(tight());
+  b3test::counting_kernels::chunks.store(0);
+  blake3pp::hasher h{b3test::counting_kernels::table()};
+  auto r = async::sync_wait(
+      ctx, async::async_update_file(ctx, h, f.path(),
+                                    blake3pp::get_parallel_scheduler()));
+  REQUIRE(r.has_value());
+  CHECK(h.finalize() == blake3pp::hash(content));
+  CHECK(b3test::counting_kernels::chunks.load() >= len / 1024 * 9 / 10);
 }
 
 TEST_CASE("async_update_file streams into the caller's hasher") {

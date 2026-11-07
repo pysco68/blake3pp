@@ -233,8 +233,7 @@ namespace detail {
 // be a power of two. Plain, keyed and derive_key hashers all work.
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
-                               Scheduler&& sched,
-                               const kern::kernel_ops* ops) {
+                               Scheduler&& sched) {
   if (input.size() < min_pipeline_bytes) {
     // The call finalizes, so these bytes end the message.
     h.update_last(input);
@@ -247,7 +246,7 @@ template <stack_budget Budget, class Scheduler>
   const pipeline_plan plan = plan_memory_pipeline(
       h.count(), window, static_cast<std::uint64_t>(input.size()));
   run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
-                              {.window_bytes = window, .ops = ops});
+                              {.window_bytes = window});
   return h.finalize();
 }
 
@@ -271,8 +270,7 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 [[nodiscard]] digest hash(std::span<const std::byte> input, Scheduler&& sched,
                           const kern::kernel_ops* ops) {
   hasher h{ops};
-  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched),
-                                   ops);
+  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched));
 }
 
 /// Multi-core one-shot hash: the subtree reductions of input run on sched,
@@ -330,10 +328,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
                                 arch a = arch::auto_detect) {
   // Reuse the ops overload's partitioning by seeding it with a keyed
   // hasher: the engine takes key material from the hasher itself.
-  const kern::kernel_ops* const ops = detail::resolve(a);
-  hasher h = hasher::keyed(key, ops);
-  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched),
-                                   ops);
+  hasher h = hasher::keyed(key, a);
+  return detail::hash_into<Budget>(h, input, std::forward<Scheduler>(sched));
 }
 
 /// Multi-core keyed one-shot of a string's bytes.
@@ -368,10 +364,9 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
                                 std::span<const std::byte> key_material,
                                 Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  const kern::kernel_ops* const ops = detail::resolve(a);
-  hasher h = hasher::derive_key(context, ops);
-  return detail::hash_into<Budget>(
-      h, key_material, std::forward<Scheduler>(sched), ops);
+  hasher h = hasher::derive_key(context, a);
+  return detail::hash_into<Budget>(h, key_material,
+                                   std::forward<Scheduler>(sched));
 }
 
 /// Multi-core key derivation from a string's bytes.
@@ -445,8 +440,7 @@ class parallel_hasher {
   explicit parallel_hasher(Scheduler sched,
                            const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
-        ops_(detail::resolve(opts.a)),
-        h_(ops_),
+        h_(opts.a),
         window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
         remainder_(window_bytes_) {}
 
@@ -457,8 +451,7 @@ class parallel_hasher {
   parallel_hasher(Scheduler sched, std::span<const std::byte, key_size> key,
                   const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
-        ops_(detail::resolve(opts.a)),
-        h_(hasher::keyed(key, ops_)),
+        h_(hasher::keyed(key, opts.a)),
         window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
         remainder_(window_bytes_) {}
 
@@ -470,8 +463,7 @@ class parallel_hasher {
   parallel_hasher(Scheduler sched, std::string_view context,
                   const parallel_hasher_options& opts = {})
       : sched_(std::move(sched)),
-        ops_(detail::resolve(opts.a)),
-        h_(hasher::derive_key(context, ops_)),
+        h_(hasher::derive_key(context, opts.a)),
         window_bytes_(detail::rounded_window_bytes(opts.window_bytes)),
         remainder_(window_bytes_) {}
 
@@ -484,7 +476,6 @@ class parallel_hasher {
   /// as reset() leaves it.
   parallel_hasher(parallel_hasher&& other) noexcept
       : sched_(other.sched_),
-        ops_(other.ops_),
         h_(other.h_),
         window_bytes_(other.window_bytes_),
         remainder_(std::move(other.remainder_)),
@@ -497,7 +488,6 @@ class parallel_hasher {
   parallel_hasher& operator=(parallel_hasher&& other) noexcept {
     if (this != &other) {
       sched_ = other.sched_;
-      ops_ = other.ops_;
       h_ = other.h_;
       window_bytes_ = other.window_bytes_;
       remainder_ = std::move(other.remainder_);
@@ -626,7 +616,7 @@ class parallel_hasher {
         h.count(), window_bytes_, static_cast<std::uint64_t>(filled_));
     detail::run_window_pipeline<Budget>(
         h, drv, f, sched_, plan,
-        {.window_bytes = window_bytes_, .ops = ops_});
+        {.window_bytes = window_bytes_});
     return h;
   }
 
@@ -649,11 +639,10 @@ class parallel_hasher {
     plan.ends_message = false;
     detail::run_window_pipeline<Budget>(
         h_, drv, f, sched_, plan,
-        {.window_bytes = window_bytes_, .ops = ops_});
+        {.window_bytes = window_bytes_});
   }
 
   Scheduler sched_;
-  const kern::kernel_ops* ops_;
   hasher h_;
   std::size_t window_bytes_;
   // One window's worth, holding whatever has not yet reached a window

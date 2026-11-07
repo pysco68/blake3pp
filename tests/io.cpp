@@ -53,6 +53,7 @@
 // the tests below ask the selected context what rung it engaged and
 // hold the public list to the answer.
 #include "io/backend_select.hpp"
+#include "counting_kernels.hpp"
 #include "temp_names.hpp"
 
 namespace {
@@ -732,6 +733,21 @@ TEST_CASE("a traced sequential update_file names its read backend") {
     CHECK(h.finalize() == blake3pp::hash(content));
     CHECK_FALSE(blake3pp::read_backend(trace.driver()).empty());
   }
+}
+
+// A hasher on a kernel table of the caller's: the windows the pipeline
+// compresses on the pool go through that table, as the hasher's own bytes
+// do, and not through the library table its variant would resolve to.
+TEST_CASE("update_file over a scheduler compresses with the hasher's table") {
+  constexpr std::size_t len = 8 * 1024 * 1024 + 5;
+  const auto content = make_input(len);
+  const temp_file f(content);
+  b3test::counting_kernels::chunks.store(0);
+  blake3pp::hasher h{b3test::counting_kernels::table()};
+  blake3pp::update_file(h, f.path, blake3pp::get_parallel_scheduler(),
+                        {.window_bytes = 1024 * 1024});
+  CHECK(h.finalize() == blake3pp::hash(content));
+  CHECK(b3test::counting_kernels::chunks.load() >= len / 1024 * 9 / 10);
 }
 
 TEST_CASE("reader reports a backend") {

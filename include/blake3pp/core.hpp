@@ -195,6 +195,14 @@ inline void fill(output_reader& r, std::span<std::byte> out) noexcept {
   r.fill(out);
 }
 
+class hasher;
+
+namespace detail {
+// The kernel table a hasher runs on, for the engines that compress on its
+// behalf; not public API.
+[[nodiscard]] const kern::kernel_ops* kernels(const hasher& h) noexcept;
+}  // namespace detail
+
 /// The incremental BLAKE3 hasher: plain, keyed (MAC/PRF) or key-derivation
 /// mode, with a non-destructive finalize family.
 ///
@@ -360,6 +368,7 @@ class hasher {
   }
 
  private:
+  friend const kern::kernel_ops* detail::kernels(const hasher& h) noexcept;
   hasher(const kern::kernel_ops* ops, std::span<const std::uint32_t, 8> key,
          std::uint32_t base_flags) noexcept;
 
@@ -385,6 +394,10 @@ class hasher {
   std::uint64_t right_chunks_;
   std::array<std::uint32_t, 8> right_cv_;
 };
+
+inline const kern::kernel_ops* detail::kernels(const hasher& h) noexcept {
+  return h.ops_;
+}
 
 /// One-shot hash of a byte sequence on the best available variant.
 /// @param input  Any length.

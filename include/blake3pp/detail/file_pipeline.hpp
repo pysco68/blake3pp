@@ -954,11 +954,6 @@ struct pipeline_options {
   // argument at admit_more()), which only a caller that knows the file
   // can judge.
   std::size_t reducer_capacity = 0;
-  // The kernel table the windows compress with, or null to take the
-  // hasher's. The expert entry points hand a caller-supplied table
-  // straight through; resolving the hasher's variant back to a
-  // registered table would quietly replace it with the library's own.
-  const kern::kernel_ops* ops = nullptr;
   // A stop the caller owns. The scope watches it for the whole run and
   // requests its own stop from it, so a token requested from any thread
   // reaches the driver through the one member another thread may call.
@@ -1466,7 +1461,10 @@ class window_scope
         sched_(std::move(sched)),
         trace_(tracer.buffer()),
         file_index_(opts.file_index),
-        ops_(opts.ops != nullptr ? opts.ops : resolve(h.selected_arch())),
+        // The hasher's own table, never one resolved from its variant:
+        // that would quietly replace a caller-supplied table with the
+        // library's.
+        ops_(kernels(h)),
         window_bytes_(plan.window_bytes),
         count_(std::min(plan.windows, host.pool().count())),
         reads_in_flight_(plan.reads_in_flight),
