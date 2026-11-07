@@ -337,9 +337,11 @@ class engine {
   // Standard input has no file to hand to a context, and one file needs
   // no arena shared with anything. A batch takes every name as a path up
   // front, so a name that is not one leaves the files to the per-file
-  // loop, which reports that name alone as unreadable.
+  // loop, which reports that name alone as unreadable. The context always
+  // asks for the OS's async engine, so --no-async leaves the files to the
+  // per-file loop too.
   [[nodiscard]] bool can_batch(const std::vector<std::string>& files) const {
-    return pool_.parallel() && files.size() > 1 &&
+    return pool_.parallel() && opts_.io.async && files.size() > 1 &&
            std::none_of(files.begin(), files.end(),
                         [](const std::string& f) { return f == "-"; }) &&
            std::all_of(files.begin(), files.end(), is_path);

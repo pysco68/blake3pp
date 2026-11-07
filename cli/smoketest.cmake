@@ -158,6 +158,37 @@ elseif(CASE STREQUAL "trace_inputs")
     message(FATAL_ERROR "a several-file trace names no read backend")
   endif()
 
+elseif(CASE STREQUAL "batch_no_async")
+  # --no-async reaches every path: several files and a --check list, which
+  # hash over one shared context, read through the backend one file gets.
+  # The trace names the backend that read; without an async engine in the
+  # build all three are synchronous and agree anyway.
+  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed batch --length 1048576
+    --threads ${SMOKE_THREADS}
+    OUTPUT_FILE "${WORK}/a" RESULT_VARIABLE r0)
+  file(COPY_FILE "${WORK}/a" "${WORK}/b")
+  run_sum(sums res0 ERR_VAR err0 ARGS --no-async --trace one.json a)
+  run_sum(sums res1 ERR_VAR err1 ARGS --no-async --trace many.json a b)
+  file(WRITE "${WORK}/sums" "${sums}")
+  run_sum(out res2 ERR_VAR err2 ARGS --no-async --trace check.json --check sums)
+  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res1 EQUAL 0 OR NOT res2 EQUAL 0)
+    message(FATAL_ERROR "a --no-async run failed (rc=${res0}, ${res1}, ${res2}): "
+      "${err0} ${err1} ${err2}")
+  endif()
+  set(backends "")
+  foreach(t IN ITEMS one many check)
+    file(READ "${WORK}/${t}.json" json)
+    if(NOT json MATCHES "\"read_backend\":\"([^\"]+)\"")
+      message(FATAL_ERROR "the ${t} trace names no read backend")
+    endif()
+    list(APPEND backends "${t}: ${CMAKE_MATCH_1}")
+    set(backend_${t} "${CMAKE_MATCH_1}")
+  endforeach()
+  if(NOT backend_many STREQUAL backend_one OR NOT backend_check STREQUAL backend_one)
+    list(JOIN backends ", " backends)
+    message(FATAL_ERROR "--no-async read through different backends: ${backends}")
+  endif()
+
 elseif(CASE STREQUAL "check_roundtrip")
   file(WRITE "${WORK}/f" "hello blake3pp")
   run_sum(sums res ARGS f)

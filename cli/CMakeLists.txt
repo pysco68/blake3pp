@@ -75,6 +75,7 @@ else()
   set(b3_sanitized OFF)
 endif()
 foreach(case version engines empty_stdin stdin_parallel stdin_diag trace_inputs
+    batch_no_async
     check_roundtrip check_batched check_empty_list check_crlf check_names
     check_escaped_line check_nonhex check_counts utf8_names check_utf8_list
     gen_utf8_names length_prefix
