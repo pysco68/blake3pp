@@ -350,6 +350,7 @@ class window_scope
   using base::request_stop;
   using base::status_;
   using base::stop_requested;
+  using base::transfers_;
   using base::transfers_owed_;
   using base::stop_source_;
 
@@ -561,7 +562,7 @@ class window_scope
 
     // A run that ends while the pool is empty has an open starved
     // interval, and the counter is reported from here.
-    note_pool_wait_end();
+    transfers_.end_starved();
     if (trace_ != nullptr) {
       driver_stats& d = trace_->driver();
       // The rung is the file's, which closes with the run: copied here so a
@@ -571,23 +572,10 @@ class window_scope
       d.max_pending = max_pending_;
       d.max_reads_in_flight = max_reading_;
       d.max_windows_in_flight = max_windows_;
-      d.transfers_landed = transfers_landed_;
-      d.transfer_bytes = transfer_bytes_;
-      d.starved_ns = starved_ns_;
       d.queue_depth_final = reads_in_flight_;
       d.queue_depth_peak = reads_in_flight_;
       d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
-      // The device's own time belongs to whoever performed the transfer,
-      // so it is preferred wherever the driver can attribute it. A driver
-      // that cannot leaves the admission-to-landing span standing.
-      const device_service svc = device_service_of(loop_.driver());
-      d.device_depth = svc.depth;
-      d.lane_wait_ns = svc.lane_wait_ns;
-      const bool attributed = svc.device.transfers > 0;
-      d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns_;
-      d.device_wait_min_ns =
-          attributed ? svc.device.min_ns
-                     : (transfers_landed_ > 0 ? device_min_ns_ : 0);
+      transfers_.report(d, loop_.driver());
     }
     if (eptr_) {
       return outcome::exception;
@@ -1028,34 +1016,16 @@ class window_scope
   // The one stall more depth cannot help: bytes left to read, a free
   // read slot, and no window on the pool. That is the hash behind the
   // device, and the windows already in flight are buffering rather than
-  // reading. Timed on the transitions, so a starved stretch costs two
-  // clock reads however many rounds it spans.
+  // reading.
   //
   // The windows in flight are not part of this. An empty pool means
   // every window this run may hold is already out, so a term comparing
   // the count against its cap would be false wherever the rest is true,
   // and the counter would stay at zero on every run.
   void note_pool_wait() noexcept {
-    const bool starved = pool_.empty() && !stop_requested() &&
-                         next_offset_ < file_bytes_ &&
-                         reading_ < reads_in_flight_;
-    if (starved) {
-      if (pool_starved_at_ == 0) {
-        pool_starved_at_ = steady_now_ns();
-      }
-      return;
-    }
-    note_pool_wait_end();
-  }
-
-  // Closes an open starved interval, from the round that ends it or
-  // from the end of the run.
-  void note_pool_wait_end() noexcept {
-    if (pool_starved_at_ != 0) {
-      starved_ns_ += static_cast<std::uint64_t>(
-          std::max<std::int64_t>(0, steady_now_ns() - pool_starved_at_));
-      pool_starved_at_ = 0;
-    }
+    transfers_.starved(pool_.empty() && !stop_requested() &&
+                       next_offset_ < file_bytes_ &&
+                       reading_ < reads_in_flight_);
   }
 
   // Why no window could start. Reached only from the driver loop, with
@@ -1528,13 +1498,7 @@ class window_scope
   void read_landed(window& w) noexcept {
     w.view_ready = true;
     release_read_slot(w);
-    const std::int64_t t = steady_now_ns();
-    ++transfers_landed_;
-    transfer_bytes_ += w.bytes;
-    const auto service =
-        static_cast<std::uint64_t>(std::max<std::int64_t>(0, t - w.t_read_begin));
-    device_wait_ns_ += service;
-    device_min_ns_ = std::min(device_min_ns_, service);
+    const std::int64_t t = transfers_.land(w.t_read_begin, w.bytes);
     if (w.rec != nullptr) {
       w.rec->t_ready = t - trace_->epoch_ns();
     }
@@ -1625,23 +1589,10 @@ class window_scope
   std::size_t in_flight_nodes_ = 0;
   std::uint64_t admission_stalls_ = 0;
   std::size_t max_pending_ = 0;
-  // What the device did, kept on every run. They are the reason the two
-  // window timestamps are unconditional.
-  std::uint64_t transfers_landed_ = 0;
-  std::uint64_t transfer_bytes_ = 0;
-  std::uint64_t device_wait_ns_ = 0;
-  std::uint64_t starved_ns_ = 0;
   // The pool's summed compress time over the run. Written by the agent
   // that finished a window, read by the driver after everything has
   // joined, so it is atomic where the other counters above are not.
   std::atomic<std::uint64_t> agent_busy_ns_{0};
-  // The shortest transfer the device served, which is its latency with
-  // nothing queued ahead. One comparison per landed read.
-  std::uint64_t device_min_ns_ = ~std::uint64_t{0};
-  // When the pipeline last found the pool empty with work to start;
-  // zero when it is not starved. One clock read per transition, not per
-  // round.
-  std::int64_t pool_starved_at_ = 0;
 };
 
 // The connected chains of one run: one cell per window the scope may

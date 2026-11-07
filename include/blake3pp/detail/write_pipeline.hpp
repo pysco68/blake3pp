@@ -90,6 +90,7 @@ class write_scope
   using base::ec_;
   using base::eptr_;
   using base::in_flight_;
+  using base::transfers_;
   using base::transfers_owed_;
   using base::latch_error;
   using base::latch_exception;
@@ -199,23 +200,10 @@ class write_scope
 
   // What the run did, in the same fields a read run fills.
   void report(driver_stats& d) const noexcept {
-    d.transfers_landed = transfers_landed_;
-    d.transfer_bytes = transfer_bytes_;
-    d.starved_ns = starved_ns_;
     d.queue_depth_final = in_flight_cap_;
     d.queue_depth_peak = in_flight_cap_;
     d.agent_busy_ns = fill_busy_ns_.load(std::memory_order_relaxed);
-    // As on the read side: the device's own time is the performer's to
-    // report, and this thread's own span stands only where no performer
-    // can say.
-    const device_service svc = device_service_of(loop_.driver());
-    d.device_depth = svc.depth;
-    d.lane_wait_ns = svc.lane_wait_ns;
-    const bool attributed = svc.device.transfers > 0;
-    d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns_;
-    d.device_wait_min_ns = attributed
-                               ? svc.device.min_ns
-                               : (transfers_landed_ > 0 ? device_min_ns_ : 0);
+    transfers_.report(d, loop_.driver());
   }
 
  private:
@@ -350,13 +338,7 @@ class write_scope
 
   void landed(window& w) noexcept {
     w.writing = false;
-    const std::int64_t t = steady_now_ns();
-    ++transfers_landed_;
-    transfer_bytes_ += w.bytes;
-    const auto service = static_cast<std::uint64_t>(
-        std::max<std::int64_t>(0, t - w.t_write_begin));
-    device_wait_ns_ += service;
-    device_min_ns_ = std::min(device_min_ns_, service);
+    const std::int64_t t = transfers_.land(w.t_write_begin, w.bytes);
     if (w.rec != nullptr) {
       w.rec->t_absorbed = t - trace_->epoch_ns();
     }
@@ -441,24 +423,9 @@ class write_scope
   // and above the width the generator is already as parallel as the
   // pool can make it and the signal means what it says.
   void note_generator_wait() noexcept {
-    const bool starved = in_flight_cap_ >= generator_threads_ &&
-                         loop_.driver().in_flight() == 0 &&
-                         !stop_requested() && next_offset_ < total_;
-    if (starved) {
-      if (starved_at_ == 0) {
-        starved_at_ = steady_now_ns();
-      }
-      return;
-    }
-    note_generator_wait_end();
-  }
-
-  void note_generator_wait_end() noexcept {
-    if (starved_at_ != 0) {
-      starved_ns_ += static_cast<std::uint64_t>(
-          std::max<std::int64_t>(0, steady_now_ns() - starved_at_));
-      starved_at_ = 0;
-    }
+    transfers_.starved(in_flight_cap_ >= generator_threads_ &&
+                       loop_.driver().in_flight() == 0 &&
+                       !stop_requested() && next_offset_ < total_);
   }
 
   [[noreturn]] void report_stall() const {
@@ -554,21 +521,10 @@ class write_scope
 
   window* free_ = nullptr;
   std::uint64_t next_offset_ = 0;
-  // What the device did, kept on every run.
-  std::uint64_t transfers_landed_ = 0;
-  std::uint64_t transfer_bytes_ = 0;
-  std::uint64_t device_wait_ns_ = 0;
-  std::uint64_t starved_ns_ = 0;
   // The generator's summed fill time over the run. Written by the
   // agent that filled a window, read by the driver after everything
   // has joined, so it is atomic where the other counters are not.
   std::atomic<std::uint64_t> fill_busy_ns_{0};
-  // The shortest transfer the device served, which is its latency with
-  // nothing queued ahead. One comparison per landed write.
-  std::uint64_t device_min_ns_ = ~std::uint64_t{0};
-  // When the driver last went idle with bytes still owed; zero when it
-  // is not. One clock read per transition, not per round.
-  std::int64_t starved_at_ = 0;
 };
 
 // Generates one file on this thread, fanning the fills out over sched.

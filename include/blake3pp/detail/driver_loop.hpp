@@ -749,6 +749,82 @@ class driver_loop {
 };
 
 // --------------------------------------------------------------------
+// What both scopes count about the device.
+
+// The transfers a run saw land, kept on every run, traced or not, and
+// reported into the same driver_stats fields by the read and the write
+// scope. They are the reason the per-window timestamps are
+// unconditional. Each scope decides for itself when it is starved; this
+// only times the intervals, on the transitions, so a starved stretch
+// costs two clock reads however many rounds it spans.
+struct transfer_stats {
+  std::uint64_t landed = 0;
+  std::uint64_t bytes = 0;
+  // Admission to landing, summed, for a driver that cannot attribute the
+  // device's own time (device_service).
+  std::uint64_t device_wait_ns = 0;
+  // The shortest admission-to-landing span: the device's latency with
+  // nothing queued ahead.
+  std::uint64_t device_min_ns = ~std::uint64_t{0};
+  std::uint64_t starved_ns = 0;
+  // When the open starved interval began; zero when there is none.
+  std::int64_t starved_at = 0;
+
+  // One transfer of n bytes, admitted at t_begin, has landed. Returns the
+  // landing time, which the caller stamps into its trace record from the
+  // same clock read.
+  std::int64_t land(std::int64_t t_begin, std::size_t n) noexcept {
+    const std::int64_t t = steady_now_ns();
+    ++landed;
+    bytes += n;
+    const auto service =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(0, t - t_begin));
+    device_wait_ns += service;
+    device_min_ns = std::min(device_min_ns, service);
+    return t;
+  }
+
+  // Opens a starved interval if none is open, or closes the open one.
+  void starved(bool now) noexcept {
+    if (now) {
+      if (starved_at == 0) {
+        starved_at = steady_now_ns();
+      }
+      return;
+    }
+    end_starved();
+  }
+
+  // Closes an open starved interval, from the round that ends it or from
+  // the end of the run.
+  void end_starved() noexcept {
+    if (starved_at != 0) {
+      starved_ns += static_cast<std::uint64_t>(
+          std::max<std::int64_t>(0, steady_now_ns() - starved_at));
+      starved_at = 0;
+    }
+  }
+
+  // The counters, and the device's own time where the driver can
+  // attribute it: that belongs to whoever performed the transfer, so it is
+  // preferred, and the admission-to-landing span stands only where no
+  // performer can say.
+  template <file_driver D>
+  void report(driver_stats& d, const D& drv) const noexcept {
+    d.transfers_landed = landed;
+    d.transfer_bytes = bytes;
+    d.starved_ns = starved_ns;
+    const device_service svc = device_service_of(drv);
+    d.device_depth = svc.depth;
+    d.lane_wait_ns = svc.lane_wait_ns;
+    const bool attributed = svc.device.transfers > 0;
+    d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns;
+    d.device_wait_min_ns =
+        attributed ? svc.device.min_ns : (landed > 0 ? device_min_ns : 0);
+  }
+};
+
+// --------------------------------------------------------------------
 // What both scopes do with a stop and a failure.
 
 // The read and the write pipeline agree on everything about stopping: one
@@ -877,6 +953,7 @@ class pipeline_scope_base {
   // operation states (io_op_state), which are the only code that knows
   // whether a submit happened.
   unsigned transfers_owed_ = 0;
+  transfer_stats transfers_;
   // The one stop of the run. Every window receiver's environment answers
   // with its token, and the scope's own admission, sweep and settle read
   // it: there is no second flag that could disagree with it.
