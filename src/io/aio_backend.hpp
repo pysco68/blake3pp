@@ -213,18 +213,17 @@ class aio_context {
       ctx.files_ = this;
     }
 
-    // A file with nothing owed only unlinks. One with transfers still owed
-    // takes the context-wide drain, which reaps without reporting and waits
-    // out the pump's lanes: the kernel or a lane may be writing into the
-    // buffers those transfers name. Its operations must still be alive (the
-    // contract's operation lifetime rule). The drain costs the other files
-    // their pending callbacks, so a caller with siblings in flight reclaims
-    // this file first, through io_driver::drain(file&).
+    // Takes this file's transfers with it, and only those: forget() waits
+    // out what the kernel or a lane holds of them, because it may be
+    // writing into the buffers they name, and a sibling's completion that
+    // surfaces meanwhile is reported, not dropped. Its operations must
+    // still be alive (the contract's operation lifetime rule). The file
+    // leaves the context's list only afterwards: forget() waits until this
+    // file's count is zero, and the list is what lets a context-wide drain
+    // zero it.
     ~file() {
+      ctx_->forget(*this);
       ctx_->unlink(*this);
-      if (inflight_ != 0) {
-        ctx_->drain();
-      }
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
@@ -524,7 +523,7 @@ class aio_context {
   // context stays usable: afterwards in_flight() counts none of them.
   //
   // Legal only while the operations those transfers live in are alive;
-  // ~file() drains the context instead. What never reached the kernel is
+  // ~file() calls it. What never reached the kernel is
   // dropped; what the kernel or a lane holds is waited out, because it is
   // writing into those buffers.
   //

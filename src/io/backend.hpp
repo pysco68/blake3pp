@@ -462,8 +462,8 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // buffers its transfers named may be destroyed. Legal only while those
   // operations are alive. Runs no callback of this file's. A sibling
   // file's completion that surfaces during the wait is reported, or left
-  // for a later poll(), and never dropped. The iocp, ioring and gcd file
-  // destructors call this; the others drain the whole context.
+  // for a later poll(), and never dropped. Every file destructor calls
+  // this.
   { c.forget(f) } noexcept;
   // Asks the OS to abandon one transfer. Advisory, and never a
   // completion in itself: the op is still owed its callback and still
@@ -1009,23 +1009,18 @@ class sync_context {
    public:
     file(sync_context& ctx, const std::filesystem::path& path,
          const file_open_options& how)
-        : ctx_(&ctx), src_(path, how) {
-      next_open_ = ctx.files_;
-      ctx.files_ = this;
-    }
+        : ctx_(&ctx), src_(path, how) {}
 
-    // Queued transfers name this file, so they go with it: with nothing
-    // queued for this file there is nothing to do, and otherwise the
-    // context drains, which drops the whole queue and waits out every
-    // lane. The operations must still be alive here (see the contract's
-    // operation lifetime rule): a lane may be writing into one until the
-    // drain returns. The drain strands other files' transfers, so a
-    // caller with other files queued reclaims this one first, through
-    // io_driver::drain(file&).
+    // Queued transfers name this file, so they go with it, and only
+    // they: forget() drops this file's queued and finished transfers and
+    // waits out the lanes, and a sibling's stay to be reported. The
+    // operations must still be alive here (see the contract's operation
+    // lifetime rule): a lane may be writing into one until forget()
+    // returns. A count a context-wide drain left stale costs one such
+    // wait and nothing else.
     ~file() {
-      ctx_->unlink(*this);
       if (queued_ != 0) {
-        ctx_->drain();
+        ctx_->forget(*this);
       }
     }
 
@@ -1042,7 +1037,6 @@ class sync_context {
     // This file's share of the context's count, so the destructor can tell
     // whether anything of its own is queued without walking the queue.
     std::size_t queued_ = 0;
-    file* next_open_ = nullptr;  // the context's list, for its own drain
   };
 
   // The rung this is, declared for the ladder walk in
@@ -1112,15 +1106,12 @@ class sync_context {
   // queued was never performed and is dropped; what a lane holds is
   // waited out, because it is reading or writing through this file's
   // descriptor and into the caller's buffer. Legal only while the
-  // operations are alive; the file's destructor drains the context
-  // instead.
+  // operations are alive; the file's destructor calls it.
   //
   // The lanes are the context's, so the wait covers sibling files too,
   // and a sibling's finished transfer stays on the done list for a later
   // poll() to report.
   void forget(file& f) noexcept {
-    // The file stays on files_: it is still open and may be read again (see
-    // the uring backend's forget).
     const auto mine = [&f](const transfer& op) noexcept {
       return op.owner_file == &f;
     };
@@ -1129,16 +1120,6 @@ class sync_context {
     dropped += pump_.remove_done_if(mine);
     queued_ -= std::min(dropped, queued_);
     f.queued_ -= std::min(dropped, f.queued_);
-  }
-
-  void unlink(file& f) noexcept {
-    for (file** at = &files_; *at != nullptr; at = &(*at)->next_open_) {
-      if (*at == &f) {
-        *at = f.next_open_;
-        f.next_open_ = nullptr;
-        return;
-      }
-    }
   }
 
   std::size_t poll(bool block) {
@@ -1169,13 +1150,11 @@ class sync_context {
   [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
 
   // Waits the lanes out, then forgets everything queued and everything
-  // finished: none of it is reported.
+  // finished: none of it is reported. The files' own counts are left as
+  // they were; see ~file().
   void drain() noexcept {
     pump_.clear();
     queued_ = 0;
-    for (file* f = files_; f != nullptr; f = f->next_open_) {
-      f->queued_ = 0;
-    }
   }
 
   // Every transfer rides the pump here, so its lanes ARE the device's
@@ -1234,9 +1213,6 @@ class sync_context {
     op.done(&op, op.result());
   }
 
-  // Every open file of this context, so its own drain can zero the shares
-  // they count.
-  file* files_ = nullptr;
   std::size_t queued_ = 0;
   // What the lanes measured around their own transfers.
   device_time device_{};

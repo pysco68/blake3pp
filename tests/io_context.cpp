@@ -2453,7 +2453,7 @@ TEST_CASE("after a file's drain no lane touches its operations") {
       while (shared.inside.load() == 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-    }  // ~file: transfers owed, so the context drains
+    }  // ~file: transfers owed, so the file forgets them
     // The lane that was inside has finished, and nothing queued was taken.
     CHECK(shared.inside.load() == 0);
     CHECK(shared.transfers.load() == 1);
