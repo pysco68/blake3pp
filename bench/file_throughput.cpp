@@ -894,9 +894,9 @@ void io_sweep(const std::string& path, std::uint64_t bytes,
         }
       });
       const double gibs =
-          b3tool::gib_per_s(static_cast<std::size_t>(bytes), secs);
+          b3tool::gib_per_s(bytes, secs);
       std::printf("  %s",
-                  b3tool::rate(static_cast<std::size_t>(bytes), secs).c_str());
+                  b3tool::rate(bytes, secs).c_str());
       std::fflush(stdout);
       if (gibs > best_gibs) {
         best_gibs = gibs;
@@ -1106,15 +1106,13 @@ int main(int argc, char** argv) {
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
     println(stdout, "{:<10} {}   ({}...)  [{}]", "null",
-            b3tool::rate(static_cast<std::size_t>(total), best),
+            b3tool::rate(total, best),
             got.to_hex().substr(0, 16),
             got == want ? "digest matches the in-memory hash"
                         : "DIGEST MISMATCH");
     if (trace) {
       print_trace_summary(*trace, threads, 0.0,
-                          b3tool::gib_per_s(static_cast<std::size_t>(total),
-                                            best),
-                          &kernel);
+                          b3tool::gib_per_s(total, best), &kernel);
       const std::string file = trace_file_name(trace_path, "null", false);
       if (b3tool::write_chrome_trace(file, *trace, "blake3pp_bench_file null",
                              threads)) {
@@ -1192,7 +1190,7 @@ int main(int argc, char** argv) {
       best = std::min(best, std::chrono::duration<double>(t1 - t0).count());
     }
     println(stdout, "{:<10} {}", "null sink",
-            b3tool::rate(static_cast<std::size_t>(total), best));
+            b3tool::rate(total, best));
     {
       const auto& d = sink_trace.driver();
       println(stdout,
@@ -1304,7 +1302,7 @@ int main(int argc, char** argv) {
   }
   const double raw_s = best_cold_seconds(reps, cold, raw_pass);
   println(stdout, "{:<10} {}   [device ceiling, no hashing]",
-          "raw io", b3tool::rate(static_cast<std::size_t>(bytes), raw_s));
+          "raw io", b3tool::rate(bytes, raw_s));
 
   // Each row: best of reps. When tracing, every rep starts from an empty
   // buffer and the io-wq workers are read before and after it, so what is
@@ -1339,7 +1337,7 @@ int main(int argc, char** argv) {
           }
         });
     println(stdout, "{:<10} {}   ({}...)  [{:3.0f}% of raw]", label,
-            b3tool::rate(static_cast<std::size_t>(bytes), best),
+            b3tool::rate(bytes, best),
             d.to_hex().substr(0, 16), 100.0 * raw_s / best);
     if (!have_expect) {
       expect = d;
@@ -1354,7 +1352,7 @@ int main(int argc, char** argv) {
     if (trace) {
       print_trace_summary(
           *trace, threads_for_trace, iowq_cpu_s,
-          b3tool::gib_per_s(static_cast<std::size_t>(bytes), best), &kernel);
+          b3tool::gib_per_s(bytes, best), &kernel);
       const std::string file = trace_file_name(trace_path, label, !seq_only);
       if (b3tool::write_chrome_trace(file, *trace,
                              std::format("blake3pp_bench_file {}", label),
