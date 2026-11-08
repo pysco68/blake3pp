@@ -211,7 +211,10 @@ namespace detail {
 // one. A span has nothing to overlap: the bytes are all there already, so
 // a second window buys no concurrency and costs a join, a reducer insert
 // and a part table. The answer is the FEWEST windows that still bound a
-// part table, which is one window up to max_window_bytes.
+// part table: the span's own size, which plan_memory_pipeline() rounds
+// down to a power of two. Into a hasher on a window boundary, a span up
+// to max_window_bytes therefore runs as one window if its size is a power
+// of two and as two otherwise.
 //
 // One window per span against fixed 8 MiB windows, 16 threads, ABBA,
 // eight samples a side, medians: +8% at 8 MiB, +15% at 64 MiB, +53% at
@@ -221,9 +224,8 @@ namespace detail {
 // default_window_bytes is only the floor: a span at or below it is one
 // window either way.
 [[nodiscard]] constexpr std::size_t memory_window_bytes(
-    std::uint64_t span_bytes) noexcept {
-  return std::clamp(static_cast<std::size_t>(span_bytes), default_window_bytes,
-                    max_window_bytes);
+    std::size_t span_bytes) noexcept {
+  return std::clamp(span_bytes, default_window_bytes, max_window_bytes);
 }
 
 // Absorbs a span already in memory: through the pipeline, over a source
@@ -262,8 +264,7 @@ void absorb_span(hasher& h, std::span<const std::byte> bytes,
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched) {
-  const std::size_t window =
-      memory_window_bytes(static_cast<std::uint64_t>(input.size()));
+  const std::size_t window = memory_window_bytes(input.size());
   // The call finalizes, so these bytes end the message.
   absorb_span<Budget>(h, input, std::forward<Scheduler>(sched), window,
                       /*ends_message=*/true);
