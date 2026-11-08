@@ -199,19 +199,12 @@ class window_pool {
       : count_(windows),
         window_bytes_(window_bytes),
         windows_(std::make_unique<window[]>(windows)) {
-    // The window objects above are value-initialised, and the fold of a
-    // stopped compress stage depends on it: the agents stop claiming
-    // parts where the stop found them, and the fold still reads every
-    // slot of the part table, including the ones nobody wrote. Those
-    // slots are zero because make_unique<window[]> zero-fills the whole
-    // window before any constructor runs, and the table has no
-    // initialiser of its own to replace that fill with.
-    //
-    // What the guarantee rests on is a default constructor that is
-    // neither user-provided nor deleted, and no standard trait spells
-    // that -- is_trivially_default_constructible is already false here,
-    // for the members that do carry initialisers -- so the check is the
-    // outcome itself.
+    // The fold of a stopped compress stage depends on a fresh window's
+    // part table being zero: the agents stop claiming parts where the
+    // stop found them, and the fold still reads every slot, including the
+    // ones nobody wrote. The table zero-initialises itself
+    // (window_compress::cvs in compress.hpp). No standard trait states
+    // that, so the check is the outcome itself.
     static_assert(
         [] {
           const window probe{};
@@ -741,10 +734,12 @@ class window_scope
         try {
           take_next(*w);
           if (w->bytes == 0) {
-            // A stream whose length was a whole number of windows: the
-            // end is only visible as a window with nothing in it, and
-            // take_next() has just recorded where it is. Nothing to
-            // start, and the window goes straight back.
+            // An empty stream: its end is only visible as a window with
+            // nothing in it, and take_next() has just recorded where it
+            // is. Any other stream ends on a window that holds bytes,
+            // because the driver reads one byte past each window
+            // (pipe_driver.hpp). Nothing to start, and the window goes
+            // straight back.
             w->rec = nullptr;
             w->op.live = false;
             pool_.give_back(w);
