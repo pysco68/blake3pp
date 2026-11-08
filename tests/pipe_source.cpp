@@ -282,9 +282,7 @@ outcome run_stream(std::span<const std::byte> bytes,
   outcome out;
   out.records.resize(bytes.size() / 1024 + 64);
   blake3pp::trace_buffer trace(std::span{out.records});
-  detail::run_window_pipeline<budget>(h, drv, f, sched, plan,
-                                      {.window_bytes = plan.window_bytes,
-                                       .trace = &trace});
+  detail::run_window_pipeline<budget>(h, drv, f, sched, plan, {}, &trace);
   out.digest = h.finalize();
   out.windows = drv.windows_filled();
   out.short_flushes = drv.short_flushes();
@@ -1087,7 +1085,7 @@ TEST_CASE("a read that moves nothing without ending the stream is asked again") 
                   {.flush_quantum = detail::stream_flush_quantum<budget>(plan.window_bytes)});
   test_driver::file f(drv);
   detail::run_window_pipeline<budget>(h, drv, f, blake3pp::get_parallel_scheduler(),
-                                      plan, {.window_bytes = plan.window_bytes});
+                                      plan, {});
   CHECK(drv.reader().empty_reads() == 5);
   CHECK(drv.bytes_read() == bytes.size());
   CHECK(h.finalize() == blake3pp::hash(bytes));
@@ -1119,7 +1117,7 @@ TEST_CASE("a read that fails mid-window propagates and leaves no digest") {
     bool threw = false;
     try {
       detail::run_window_pipeline<budget>(h, drv, f, blake3pp::get_parallel_scheduler(),
-                                          plan, {.window_bytes = plan.window_bytes});
+                                          plan, {});
     } catch (const std::system_error& e) {
       threw = true;
       CHECK(e.code() == std::errc::io_error);
@@ -1146,7 +1144,7 @@ TEST_CASE("a failure on the very first read leaves the hasher untouched") {
   test_driver::file f(drv);
   CHECK_THROWS_AS(detail::run_window_pipeline<budget>(
                       h, drv, f, blake3pp::get_parallel_scheduler(), plan,
-                      {.window_bytes = plan.window_bytes}),
+                      {}),
                   std::system_error);
   CHECK(h.count() == 0);
   CHECK(h.finalize() == before);

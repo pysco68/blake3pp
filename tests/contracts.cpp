@@ -132,8 +132,7 @@ TEST_CASE("a pipeline span that does not end the message must be whole windows")
     plan.ends_message = false;
     const auto run = [&] {
       blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
-          h, drv, f, blake3pp::get_parallel_scheduler(), plan,
-          {.window_bytes = w});
+          h, drv, f, blake3pp::get_parallel_scheduler(), plan, {});
     };
     if (len % w == 0) {
       CHECK_NOTHROW(run());

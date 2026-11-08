@@ -44,17 +44,9 @@ namespace blake3pp::detail {
 // --------------------------------------------------------------------
 // The bounded scope.
 
-// What the scope needs that the public options do not already say.
+// What a scope runs with besides its plan and its tracer. Every field is
+// read; the requests a plan is made from are pipeline_request's.
 struct pipeline_options {
-  // The requests plan_pipeline() rounds and clamps; the scope itself
-  // reads only the plan.
-  std::size_t window_bytes = default_window_bytes;
-  unsigned queue_depth = default_queue_depth;
-  // The blocking entry points' request: run_window_pipeline() turns it
-  // into the tracer the scope is instantiated with. The scope itself
-  // reads only its tracer, so a caller that constructs a scope passes
-  // the policy and this field is not consulted.
-  trace_buffer* trace = nullptr;
   // What a window record names as its file: the file's index in a
   // many-files operation, zero otherwise.
   std::uint32_t file_index = 0;
@@ -75,6 +67,18 @@ struct pipeline_options {
   // The default token has no state and costs one stop_possible() test at
   // the start of the run, which is what the blocking entry points pass.
   ex::inplace_stop_token stop_token{};
+};
+
+// A run asked for before it is planned, which is how the tests call
+// run_window_pipeline(); the library's entry points and the bench plan
+// first and pass the plan.
+struct pipeline_request {
+  // What plan_pipeline() rounds and clamps.
+  std::size_t window_bytes = default_window_bytes;
+  unsigned queue_depth = default_queue_depth;
+  // Turned into the scope's tracer: tracing when not null.
+  trace_buffer* trace = nullptr;
+  pipeline_options options{};
 };
 
 // One window of a run: where its bytes are, the part table its compress
@@ -407,16 +411,6 @@ class window_scope
       free_cells_.push_back(count_ - 1 - i);
     }
   }
-
-  // Over a file the caller opened itself, planned from the requests in
-  // opts; what the tests construct directly.
-  window_scope(hasher& h, pipeline_host<Budget, D>& host,
-               typename D::file& file, Scheduler sched,
-               const pipeline_options& opts)
-      : window_scope(h, host, file, std::move(sched),
-                     plan_pipeline(h.count(), opts.window_bytes,
-                                   opts.queue_depth, false, file.size()),
-                     opts) {}
 
   window_scope(const window_scope&) = delete;
   window_scope& operator=(const window_scope&) = delete;
@@ -1365,12 +1359,13 @@ template <stack_budget Budget, file_driver D, class Scheduler>
 void run_window_pipeline(hasher& h, pipeline_host<Budget, D>& host,
                          typename D::file& file, Scheduler&& sched,
                          const pipeline_plan& plan,
-                         const pipeline_options& opts) {
+                         const pipeline_options& opts,
+                         trace_buffer* trace = nullptr) {
   using sched_type = std::remove_cvref_t<Scheduler>;
-  if (opts.trace != nullptr) {
+  if (trace != nullptr) {
     window_scope<buffer_tracer, Budget, D, sched_type> scope(
         h, host, file, std::forward<Scheduler>(sched), plan, opts,
-        buffer_tracer{opts.trace});
+        buffer_tracer{trace});
     scope.run();
   } else {
     window_scope<null_tracer, Budget, D, sched_type> scope(
@@ -1385,23 +1380,23 @@ void run_window_pipeline(hasher& h, pipeline_host<Budget, D>& host,
 template <stack_budget Budget, file_driver D, class Scheduler>
 void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
                          Scheduler&& sched, const pipeline_plan& plan,
-                         const pipeline_options& opts) {
+                         const pipeline_options& opts,
+                         trace_buffer* trace = nullptr) {
   pipeline_host<Budget, D> host(drv, plan.windows, plan.window_bytes);
   run_window_pipeline<Budget>(h, host, file, std::forward<Scheduler>(sched),
-                              plan, opts);
+                              plan, opts, trace);
 }
 
 // The same over a driver whose file is already open, planned from the
-// options alone: what the tests and the bench call, where the open mode
-// was the caller's.
+// request: what the tests call, where the open mode was the caller's.
 template <stack_budget Budget, file_driver D, class Scheduler>
 void run_window_pipeline(hasher& h, D& drv, typename D::file& file,
-                         Scheduler&& sched, const pipeline_options& opts) {
+                         Scheduler&& sched, const pipeline_request& req) {
   run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched),
-      plan_pipeline(h.count(), opts.window_bytes, opts.queue_depth, false,
+      plan_pipeline(h.count(), req.window_bytes, req.queue_depth, false,
                     file.size()),
-      opts);
+      req.options, req.trace);
 }
 
 }  // namespace blake3pp::detail

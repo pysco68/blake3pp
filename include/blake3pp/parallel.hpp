@@ -248,7 +248,7 @@ template <stack_budget Budget, class Scheduler>
   const pipeline_plan plan = plan_memory_pipeline(
       h.count(), window, static_cast<std::uint64_t>(input.size()));
   run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
-                              {.window_bytes = window});
+                              {});
   return h.finalize();
 }
 
@@ -616,9 +616,7 @@ class parallel_hasher {
     detail::memory_driver::file f(drv, tail);
     const detail::pipeline_plan plan = detail::plan_memory_pipeline(
         h.count(), window_bytes_, static_cast<std::uint64_t>(filled_));
-    detail::run_window_pipeline<Budget>(
-        h, drv, f, sched_, plan,
-        {.window_bytes = window_bytes_});
+    detail::run_window_pipeline<Budget>(h, drv, f, sched_, plan, {});
     return h;
   }
 
@@ -639,9 +637,7 @@ class parallel_hasher {
     // Never: update() holds the final window back, so nothing absorbed
     // here can contain the message's end.
     plan.ends_message = false;
-    detail::run_window_pipeline<Budget>(
-        h_, drv, f, sched_, plan,
-        {.window_bytes = window_bytes_});
+    detail::run_window_pipeline<Budget>(h_, drv, f, sched_, plan, {});
   }
 
   Scheduler sched_;

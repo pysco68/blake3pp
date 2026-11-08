@@ -1096,10 +1096,7 @@ int main(int argc, char** argv) {
       blake3pp::hasher h;
       const auto t0 = std::chrono::steady_clock::now();
       blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
-          h, drv, nf, sched, plan,
-          {.window_bytes = opts.window_bytes,
-           .queue_depth = opts.queue_depth,
-           .trace = io_opts.trace});
+          h, drv, nf, sched, plan, {}, io_opts.trace);
       got = h.finalize();
       const auto t1 = std::chrono::steady_clock::now();
       kernel = kernel_delta(kernel_before, read_kernel_counters());

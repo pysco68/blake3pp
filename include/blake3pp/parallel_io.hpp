@@ -207,10 +207,7 @@ void update_file(hasher& h, const std::filesystem::path& path,
   detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched), plan,
-      {.window_bytes = opts.window_bytes,
-       .queue_depth = opts.queue_depth,
-       .trace = opts.trace,
-       .stop_token = detail::blocking_stop_token()});
+      {.stop_token = detail::blocking_stop_token()}, opts.trace);
 }
 
 /// Streams a file into a hasher over a scheduler, reporting failure
@@ -516,9 +513,7 @@ stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
   detail::pipe_driver::file file(drv);
   detail::run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched), plan,
-      {.window_bytes = window,
-       .trace = opts.trace,
-       .stop_token = detail::blocking_stop_token()});
+      {.stop_token = detail::blocking_stop_token()}, opts.trace);
   return {.bytes = drv.bytes_read(),
           .windows = drv.windows_filled(),
           .short_flushes = drv.short_flushes(),

@@ -513,8 +513,6 @@ class update_file_op final : public pipeline_node {
       file_.emplace(ctx_->driver(), path_, plan_.direct_io);
       scope_.emplace(*h_, ctx_->host(), *file_, sched_, plan_,
                      blake3pp::detail::pipeline_options{
-                         .window_bytes = cfg.window_bytes,
-                         .queue_depth = cfg.queue_depth,
                          .file_index = file_index_,
                          .stop_token = stop_.get_token()},
                      tracer_);
