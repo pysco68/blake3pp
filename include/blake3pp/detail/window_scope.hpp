@@ -692,8 +692,6 @@ class window_scope
         // is last, because from then on the chain may complete and will
         // count itself down.
         const unsigned cell = free_cells_.back();
-        bool is_full = false;
-        bool is_edge_fanout = false;
         try {
           take_next(*w);
           if (w->bytes == 0) {
@@ -709,23 +707,31 @@ class window_scope
             break;
           }
           claim_record(*w);
-          // Three shapes. A full window is one subtree and inserts one
-          // node. A window with ends the hasher owns -- the short first
-          // one, the last one -- or one a stream left off the grid is a
-          // run of parts and inserts their decomposition; it uses the
+          // Three shapes, which the planner chose. A subtree inserts one
+          // node. A run of parts -- a window with ends the hasher owns,
+          // the short first one or the last one, or one a stream left
+          // off the grid -- inserts their decomposition; it uses the
           // cell its own window index names, because a stream can have
           // several in flight at once. An end with nothing worth
           // fanning out is only a read, and the hasher takes it whole.
-          is_full = !w->last && !w->short_first && w->plan.parts == 0;
-          is_edge_fanout = !is_full && w->plan.parts >= 2;
-          if (is_full) {
-            prepare_compress(*w);
-            cells.full[cell].emplace(typename Cells::connect_full{this, w});
-          } else if (is_edge_fanout) {
-            cells.edge[cell].emplace(typename Cells::connect_edge{this, w});
-          } else {
-            (w->last ? cells.last_read : cells.first_read)
-                .emplace(typename Cells::connect_read{this, w});
+          switch (w->plan.kind) {
+            case window_kind::subtree:
+              assert(w->plan.parts == 0 && !w->last && !w->short_first &&
+                     "a subtree window has no parts and no ends");
+              prepare_compress(*w);
+              cells.full[cell].emplace(typename Cells::connect_full{this, w});
+              break;
+            case window_kind::part_run:
+              assert(w->plan.parts >= 2 &&
+                     "a run of parts has at least two of them");
+              cells.edge[cell].emplace(typename Cells::connect_edge{this, w});
+              break;
+            case window_kind::read_only:
+              assert(w->plan.parts == 0 && (w->last || w->short_first) &&
+                     "a read-only window is one of the message's ends");
+              (w->last ? cells.last_read : cells.first_read)
+                  .emplace(typename Cells::connect_read{this, w});
+              break;
           }
         } catch (...) {
           w->rec = nullptr;
@@ -747,12 +753,16 @@ class window_scope
         if (w->last) {
           last_window_ = w;
         }
-        if (is_full) {
-          ex::start(*cells.full[w->cell]);
-        } else if (is_edge_fanout) {
-          ex::start(*cells.edge[w->cell]);
-        } else {
-          ex::start(*(w->last ? cells.last_read : cells.first_read));
+        switch (w->plan.kind) {
+          case window_kind::subtree:
+            ex::start(*cells.full[w->cell]);
+            break;
+          case window_kind::part_run:
+            ex::start(*cells.edge[w->cell]);
+            break;
+          case window_kind::read_only:
+            ex::start(*(w->last ? cells.last_read : cells.first_read));
+            break;
         }
       }
       note_pool_wait();

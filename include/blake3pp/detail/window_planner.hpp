@@ -18,6 +18,15 @@
 
 namespace blake3pp::detail {
 
+// Which of the scope's three chains a window runs. Decided with the
+// rest of its plan, so that connecting and starting it read one field
+// rather than rebuilding the shape from the window's ends and parts.
+enum class window_kind : std::uint8_t {
+  subtree,    // a whole window of the grid: one node, compressed by the pool
+  part_run,   // a run of whole parts, with whatever the hasher owns around it
+  read_only,  // nothing worth fanning out: the hasher takes it whole
+};
+
 // How a window is split three ways. `head` is absorbed by the hasher
 // on the driver the moment the read lands, `parts` full parts go to
 // the pool and come back as nodes, and `tail` waits for the reducer to
@@ -31,6 +40,7 @@ struct window_plan {
   std::size_t parts = 0;
   std::size_t part_chunks = 0;
   std::size_t node_cost = 1;   // reducer slots admission reserves
+  window_kind kind = window_kind::subtree;
 };
 static_assert(std::is_trivially_copyable_v<window_plan>);
 
@@ -157,6 +167,7 @@ class window_planner {
             chunk_size;
     if (g.last && g.short_first) {
       p.tail_bytes = g.bytes;
+      p.kind = window_kind::read_only;
       return p;
     }
     if (g.last) {
@@ -228,6 +239,7 @@ class window_planner {
   // because a run that is not is a wrong digest and no error.
   [[nodiscard]] window_plan plan_mid(std::size_t bytes,
                                      window_plan p) const noexcept {
+    p.kind = window_kind::part_run;
     const std::size_t chunks = bytes / chunk_size;
     const std::size_t part = part_chunks<Budget>(chunks);
     if (chunks < part) {
@@ -257,6 +269,7 @@ class window_planner {
         bytes > to_chunk ? (bytes - to_chunk) / chunk_size : 0;
     if (chunks_left < 2) {
       p.head_bytes = bytes;
+      p.kind = window_kind::read_only;
       return p;
     }
     const std::size_t part = part_chunks<Budget>(chunks_left);
@@ -268,6 +281,7 @@ class window_planner {
         bytes > head ? (bytes - head) / (part * chunk_size) : 0;
     if (parts < 2) {
       p.head_bytes = bytes;
+      p.kind = window_kind::read_only;
       return p;
     }
     p.head_bytes = head;
@@ -275,6 +289,7 @@ class window_planner {
     p.parts = parts;
     p.first_chunk = (count + head) / chunk_size;
     p.node_cost = nodes_for(parts);
+    p.kind = window_kind::part_run;
     // The parts cover the window exactly: the head lands on a part
     // boundary and the window ends on a window boundary, and the part
     // size divides the window because both are powers of two and the
@@ -301,18 +316,21 @@ class window_planner {
     const std::size_t chunks_with_tail = (bytes + chunk_size - 1) / chunk_size;
     if (chunks_with_tail < 2) {
       p.tail_bytes = bytes;
+      p.kind = window_kind::read_only;
       return p;
     }
     const std::size_t part = part_chunks<Budget>(chunks_with_tail);
     const std::size_t k = (chunks_with_tail - 1) / part;
     if (k < 2) {
       p.tail_bytes = bytes;
+      p.kind = window_kind::read_only;
       return p;
     }
     p.part_chunks = part;
     p.parts = k;
     p.tail_bytes = bytes - p.parts * part * chunk_size;
     p.node_cost = nodes_for(p.parts);
+    p.kind = window_kind::part_run;
     return p;
   }
 
