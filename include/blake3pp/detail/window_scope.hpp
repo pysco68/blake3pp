@@ -97,7 +97,7 @@ struct pipeline_window {
   window_compress<Budget> compress;
   std::uint64_t index = 0;
   std::uint64_t offset = 0;
-  std::uint64_t chunks = 0;
+  std::size_t chunks = 0;
   std::size_t bytes = 0;
   window_record* rec = nullptr;
   // When the pipeline asked the driver for this window's bytes, on

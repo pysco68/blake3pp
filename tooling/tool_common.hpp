@@ -474,7 +474,7 @@ template <class F>
 // with three significant digits. One rule for a 25 GiB/s AVX-512 row and
 // a 40 MiB/s C906 row alike; a fixed GiB/s with two decimals showed the
 // LicheeRV Nano as "0.03 vs 0.04" and hid the ratio.
-[[nodiscard]] inline std::string rate(std::size_t bytes, double seconds) {
+[[nodiscard]] inline std::string rate(std::uint64_t bytes, double seconds) {
   static constexpr const char* units[] = {"B/s", "KiB/s", "MiB/s", "GiB/s",
                                           "TiB/s"};
   double v = seconds > 0.0 ? static_cast<double>(bytes) / seconds : 0.0;
@@ -500,7 +500,7 @@ template <class F>
   return std::format("{} {}", bytes, units[u]);
 }
 
-[[nodiscard]] inline double gib_per_s(std::size_t bytes,
+[[nodiscard]] inline double gib_per_s(std::uint64_t bytes,
                                       double seconds) noexcept {
   return static_cast<double>(bytes) / seconds / (1024.0 * 1024.0 * 1024.0);
 }

@@ -228,7 +228,7 @@ class window_planner {
   // because a run that is not is a wrong digest and no error.
   [[nodiscard]] window_plan plan_mid(std::size_t bytes,
                                      window_plan p) const noexcept {
-    const std::size_t chunks = static_cast<std::size_t>(bytes / chunk_size);
+    const std::size_t chunks = bytes / chunk_size;
     const std::size_t part = part_chunks<Budget>(chunks);
     if (chunks < part) {
       // Too short to be even one part, and nothing here may reach the
@@ -298,21 +298,19 @@ class window_planner {
   // alone.
   [[nodiscard]] window_plan plan_last(std::size_t bytes,
                                       window_plan p) const noexcept {
-    const std::uint64_t chunks_with_tail =
-        (static_cast<std::uint64_t>(bytes) + chunk_size - 1) / chunk_size;
+    const std::size_t chunks_with_tail = (bytes + chunk_size - 1) / chunk_size;
     if (chunks_with_tail < 2) {
       p.tail_bytes = bytes;
       return p;
     }
-    const std::size_t part =
-        part_chunks<Budget>(static_cast<std::size_t>(chunks_with_tail));
-    const std::uint64_t k = (chunks_with_tail - 1) / part;
+    const std::size_t part = part_chunks<Budget>(chunks_with_tail);
+    const std::size_t k = (chunks_with_tail - 1) / part;
     if (k < 2) {
       p.tail_bytes = bytes;
       return p;
     }
     p.part_chunks = part;
-    p.parts = static_cast<std::size_t>(k);
+    p.parts = k;
     p.tail_bytes = bytes - p.parts * part * chunk_size;
     p.node_cost = nodes_for(p.parts);
     return p;
