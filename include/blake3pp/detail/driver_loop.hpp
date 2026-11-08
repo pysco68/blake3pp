@@ -829,13 +829,51 @@ struct transfer_stats {
 
 // The read and the write pipeline agree on everything about stopping: one
 // stop source for the run, a latch that decides which failure the caller
-// hears about, and a teardown that cannot trust the loop. They disagree about what a cancel sweep names and about
-// when a run is done, so those two stay in the scope. The members below
-// are protected, which is how the scope keeps naming them directly.
+// hears about, the receiver every window chain completes into, and a
+// teardown that cannot trust the loop. They disagree about what a cancel
+// sweep names, about what finishing a window releases and about when a run
+// is done, so those stay in the scope. The members below are protected,
+// which is how the scope keeps naming them directly.
 //
-// Derived must provide loop() and sweep_cancels().
+// Derived must provide loop(), sweep_cancels() and finish_window(W&).
 template <class Derived, class D>
 class pipeline_scope_base {
+ public:
+  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
+  using outer_stop_callback =
+      ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
+
+  struct scope_env {
+    ex::inplace_stop_token token;
+    [[nodiscard]] ex::inplace_stop_token query(
+        ex::get_stop_token_t) const noexcept {
+      return token;
+    }
+  };
+
+  // A window chain's receiver is a handle: the scope and the window it
+  // speaks for, nothing else. It must stay copy-constructible, because
+  // beman's continues_on stores the receiver by copy from an lvalue
+  // (continues_on.hpp, state_type), and the read chain runs through
+  // exactly that adaptor.
+  template <class W>
+  struct receiver {
+    using receiver_concept = ex_compat::receiver_tag;
+    receiver(Derived* s, W* win) noexcept : scope(s), w(win) {}
+    Derived* scope;
+    W* w;
+
+    [[nodiscard]] scope_env get_env() const noexcept {
+      return {scope->stop_source_.get_token()};
+    }
+    void set_value() && noexcept { scope->on_done(*w); }
+    void set_error(std::error_code ec) && noexcept { scope->on_error(*w, ec); }
+    void set_error(std::exception_ptr e) && noexcept {
+      scope->on_exception(*w, std::move(e));
+    }
+    void set_stopped() && noexcept { scope->on_stopped(*w); }
+  };
+
  protected:
   [[nodiscard]] bool stop_requested() const noexcept {
     return stop_source_.stop_requested();
@@ -861,6 +899,38 @@ class pipeline_scope_base {
     if (!ec_ && !eptr_) {
       eptr_ = std::move(e);
     }
+  }
+
+  [[nodiscard]] Derived& derived() noexcept {
+    return static_cast<Derived&>(*this);
+  }
+
+  // How a window chain ends. Every outcome but success latches what went
+  // wrong and stops the run; all four then let the scope release what the
+  // window held.
+  template <class W>
+  void on_done(W& w) noexcept {
+    derived().finish_window(w);
+  }
+  template <class W>
+  void on_error(W& w, std::error_code ec) noexcept {
+    latch_error(ec);
+    request_stop();
+    derived().finish_window(w);
+  }
+  template <class W>
+  void on_exception(W& w, std::exception_ptr e) noexcept {
+    latch_exception(std::move(e));
+    request_stop();
+    derived().finish_window(w);
+  }
+  // A stage that stopped rather than failed. Reached only after stop was
+  // requested, except from a provider that stops a bulk on its own, which
+  // this handles the same way rather than relying on it not to.
+  template <class W>
+  void on_stopped(W& w) noexcept {
+    request_stop();
+    derived().finish_window(w);
   }
 
   // The stop's own completion, for the blocking entry points: they have

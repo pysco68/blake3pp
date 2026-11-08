@@ -365,9 +365,10 @@ class window_scope
   // The window objects are the pool's; the scope only borrows them.
   using window = pipeline_window<Budget>;
 
-  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
-  using outer_stop_callback =
-      ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
+  using typename base::outer_stop_callback;
+  using typename base::request_scope_stop;
+  using scope_receiver = typename base::template receiver<window>;
+  static_assert(std::copy_constructible<scope_receiver>);
 
   // What a caller holds for the length of a run so the stop stays
   // watched: begin() fills it, end() empties it, and it must outlive
@@ -835,39 +836,6 @@ class window_scope
 
   // What every stage below the scope reads the scope's stop from; the
   // adaptors forward it down the chain.
-  struct scope_env {
-    ex::inplace_stop_token token;
-    [[nodiscard]] ex::inplace_stop_token query(
-        ex::get_stop_token_t) const noexcept {
-      return token;
-    }
-  };
-
-  // The scope's receiver is a handle: the scope and the window it speaks
-  // for, nothing else. It must stay copy-constructible, because beman's
-  // continues_on stores the receiver by copy from an lvalue
-  // (continues_on.hpp, state_type), and the chain below runs through
-  // exactly that adaptor.
-  struct scope_receiver {
-    using receiver_concept = ex_compat::receiver_tag;
-    scope_receiver(window_scope* s, window* win) noexcept
-        : scope(s), w(win) {}
-    window_scope* scope;
-    window* w;
-
-    [[nodiscard]] scope_env get_env() const noexcept {
-      return {scope->stop_source_.get_token()};
-    }
-    void set_value() && noexcept { scope->on_done(*w); }
-    void set_error(std::error_code ec) && noexcept { scope->on_error(*w, ec); }
-    void set_error(std::exception_ptr e) && noexcept {
-      scope->on_exception(*w, std::move(e));
-    }
-    void set_stopped() && noexcept { scope->on_stopped(*w); }
-  };
-
-  static_assert(std::copy_constructible<scope_receiver>);
-
   // One window, start to finish. The middle line is the compress stage;
   // everything around it is the same for every window.
   // The three chain builders are templates on a tag that is a different
@@ -1367,28 +1335,6 @@ class window_scope
     if (w.rec != nullptr) {
       w.rec->t_absorbed = trace_->now();
     }
-  }
-
-  void on_done(window& w) noexcept { finish_window(w); }
-
-  void on_error(window& w, std::error_code ec) noexcept {
-    latch_error(ec);
-    request_stop();
-    finish_window(w);
-  }
-
-  void on_exception(window& w, std::exception_ptr e) noexcept {
-    latch_exception(std::move(e));
-    request_stop();
-    finish_window(w);
-  }
-
-  // A stage that stopped rather than failed. Reached only after stop was
-  // requested, except from a provider that stops a bulk on its own,
-  // which this handles the same way rather than relying on it not to.
-  void on_stopped(window& w) noexcept {
-    request_stop();
-    finish_window(w);
   }
 
   // What every completion but a successful one owes: the read slot back

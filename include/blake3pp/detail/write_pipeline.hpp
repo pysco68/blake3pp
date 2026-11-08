@@ -223,36 +223,11 @@ class write_scope
     window_record* rec = nullptr;
   };
 
-  struct scope_env {
-    ex::inplace_stop_token token;
-    [[nodiscard]] ex::inplace_stop_token query(
-        ex::get_stop_token_t) const noexcept {
-      return token;
-    }
-  };
-
-  struct scope_receiver {
-    using receiver_concept = ex_compat::receiver_tag;
-    scope_receiver(write_scope* s, window* win) noexcept : scope(s), w(win) {}
-    write_scope* scope;
-    window* w;
-
-    [[nodiscard]] scope_env get_env() const noexcept {
-      return {scope->stop_source_.get_token()};
-    }
-    void set_value() && noexcept { scope->on_done(*w); }
-    void set_error(std::error_code ec) && noexcept { scope->on_error(*w, ec); }
-    void set_error(std::exception_ptr e) && noexcept {
-      scope->on_exception(*w, std::move(e));
-    }
-    void set_stopped() && noexcept { scope->on_stopped(*w); }
-  };
-
+  using scope_receiver = typename base::template receiver<window>;
   static_assert(std::copy_constructible<scope_receiver>);
 
-  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
-  using outer_stop_callback =
-      ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
+  using typename base::outer_stop_callback;
+  using typename base::request_scope_stop;
 
   // How many window buffers the run uses: what the queue depth asks for,
   // never more than the file has windows.
@@ -446,25 +421,6 @@ class write_scope
         loop_.driver().cancel(w.op);
       }
     }
-  }
-
-  void on_done(window& w) noexcept { finish_window(w); }
-
-  void on_error(window& w, std::error_code ec) noexcept {
-    latch_error(ec);
-    request_stop();
-    finish_window(w);
-  }
-
-  void on_exception(window& w, std::exception_ptr e) noexcept {
-    latch_exception(std::move(e));
-    request_stop();
-    finish_window(w);
-  }
-
-  void on_stopped(window& w) noexcept {
-    request_stop();
-    finish_window(w);
   }
 
   void finish_window(window& w) noexcept {
