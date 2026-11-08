@@ -30,9 +30,6 @@ std::array<std::uint32_t, 8> key_bytes_to_words(
   return words;
 }
 
-std::span<const std::byte> bytes_of(std::string_view s) noexcept {
-  return std::as_bytes(std::span{s.data(), s.size()});
-}
 
 }  // namespace
 
@@ -193,7 +190,7 @@ void hasher::update(std::span<const std::byte> input) noexcept {
 }
 
 void hasher::update(std::string_view input) noexcept {
-  update(std::as_bytes(std::span{input.data(), input.size()}));
+  update(detail::bytes_of(input));
 }
 
 void hasher::update_last(std::span<const std::byte> input) noexcept {
@@ -244,7 +241,7 @@ void hasher::update_last(std::span<const std::byte> input) noexcept {
 }
 
 void hasher::update_last(std::string_view input) noexcept {
-  update_last(std::as_bytes(std::span{input.data(), input.size()}));
+  update_last(detail::bytes_of(input));
 }
 
 output_reader hasher::finalize_xof() const noexcept {
@@ -410,7 +407,9 @@ digest hash(std::span<const std::byte> input) noexcept {
   return h.finalize();
 }
 
-digest hash(std::string_view input) noexcept { return hash(bytes_of(input)); }
+digest hash(std::string_view input) noexcept {
+  return hash(detail::bytes_of(input));
+}
 
 digest keyed_hash(std::span<const std::byte, 32> key,
                   std::span<const std::byte> input) noexcept {
@@ -421,7 +420,7 @@ digest keyed_hash(std::span<const std::byte, 32> key,
 
 digest keyed_hash(std::span<const std::byte, 32> key,
                   std::string_view input) noexcept {
-  return keyed_hash(key, bytes_of(input));
+  return keyed_hash(key, detail::bytes_of(input));
 }
 
 digest derive_key(std::string_view context,
@@ -433,7 +432,7 @@ digest derive_key(std::string_view context,
 
 digest derive_key(std::string_view context,
                   std::string_view key_material) noexcept {
-  return derive_key(context, bytes_of(key_material));
+  return derive_key(context, detail::bytes_of(key_material));
 }
 
 std::optional<digest> digest::from_hex(std::string_view hex) noexcept {

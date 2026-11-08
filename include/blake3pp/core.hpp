@@ -67,6 +67,12 @@ struct chunk_state {
 
 struct reader_access;
 
+// A string's characters as the bytes the hasher takes.
+[[nodiscard]] inline std::span<const std::byte> bytes_of(
+    std::string_view s) noexcept {
+  return std::as_bytes(std::span{s});
+}
+
 }  // namespace detail
 
 /// A 32-byte BLAKE3 digest: a regular value type with constant-time

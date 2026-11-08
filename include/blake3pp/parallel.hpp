@@ -329,8 +329,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash(std::string_view input, Scheduler&& sched,
                           arch a = arch::auto_detect) {
-  return hash<Budget>(std::as_bytes(std::span{input.data(), input.size()}),
-                      std::forward<Scheduler>(sched), a);
+  return hash<Budget>(detail::bytes_of(input), std::forward<Scheduler>(sched),
+                      a);
 }
 
 /// Multi-core keyed one-shot: the MAC/PRF of input under a 32-byte key,
@@ -365,9 +365,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 [[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::string_view input, Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  return keyed_hash<Budget>(
-      key, std::as_bytes(std::span{input.data(), input.size()}),
-      std::forward<Scheduler>(sched), a);
+  return keyed_hash<Budget>(key, detail::bytes_of(input),
+                            std::forward<Scheduler>(sched), a);
 }
 
 /// Multi-core key derivation, for key material large enough to matter (a
@@ -403,10 +402,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
                                 std::string_view key_material,
                                 Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  return derive_key<Budget>(
-      context,
-      std::as_bytes(std::span{key_material.data(), key_material.size()}),
-      std::forward<Scheduler>(sched), a);
+  return derive_key<Budget>(context, detail::bytes_of(key_material),
+                            std::forward<Scheduler>(sched), a);
 }
 
 /// parallel_hasher's knobs.
@@ -578,7 +575,7 @@ class parallel_hasher {
   /// Absorbs the next bytes of the message, given as text.
   /// @param input  The bytes of the string, not including any terminator.
   void update(std::string_view input) {
-    update(std::as_bytes(std::span{input.data(), input.size()}));
+    update(detail::bytes_of(input));
   }
 
   /// The digest of everything absorbed so far; the hasher stays usable.
