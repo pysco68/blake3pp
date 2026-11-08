@@ -682,88 +682,33 @@ class window_scope
         if (!admit_more(cost)) {
           break;
         }
-        window* const w = pool_.take();
-        // Built, then counted. Everything up to the connect is this
-        // window's own state, and anything that throws there -- an
-        // operation state a provider allocates, the lane table a window
-        // shape needs, a plan the geometry contradicts -- gives the window
-        // straight back, rather than leaving a count this run can never
-        // work off or a window a shared pool never offers again. Starting
-        // is last, because from then on the chain may complete and will
-        // count itself down.
+        // Borrow, acquire, connect, commit, start. Until the commit the
+        // window is the lease's, and anything that throws -- the
+        // driver's storage, the plan the geometry contradicts, the lane
+        // table a shape needs, an operation state a provider allocates
+        // -- gives it straight back: no cell taken, no count this run
+        // can never work off, no window a shared pool never offers
+        // again. From the commit on, the chain owns it and counts
+        // itself down when it completes.
+        window_lease lease(*this);
+        window& w = lease.get();
+        take_next(w);
+        if (w.bytes == 0) {
+          // An empty stream: its end is only visible as a window with
+          // nothing in it, and take_next() has just recorded where it
+          // is. Any other stream ends on a window that holds bytes,
+          // because the driver reads one byte past each window
+          // (pipe_driver.hpp). Nothing to start; the lease gives the
+          // window back.
+          break;
+        }
+        claim_record(w);
         const unsigned cell = free_cells_.back();
-        try {
-          take_next(*w);
-          if (w->bytes == 0) {
-            // An empty stream: its end is only visible as a window with
-            // nothing in it, and take_next() has just recorded where it
-            // is. Any other stream ends on a window that holds bytes,
-            // because the driver reads one byte past each window
-            // (pipe_driver.hpp). Nothing to start, and the window goes
-            // straight back.
-            w->rec = nullptr;
-            w->op.live = false;
-            pool_.give_back(w);
-            break;
-          }
-          claim_record(*w);
-          // Three shapes, which the planner chose. A subtree inserts one
-          // node. A run of parts -- a window with ends the hasher owns,
-          // the short first one or the last one, or one a stream left
-          // off the grid -- inserts their decomposition; it uses the
-          // cell its own window index names, because a stream can have
-          // several in flight at once. An end with nothing worth
-          // fanning out is only a read, and the hasher takes it whole.
-          switch (w->plan.kind) {
-            case window_kind::subtree:
-              assert(w->plan.parts == 0 && !w->last && !w->short_first &&
-                     "a subtree window has no parts and no ends");
-              prepare_compress(*w);
-              cells.full[cell].emplace(typename Cells::connect_full{this, w});
-              break;
-            case window_kind::part_run:
-              assert(w->plan.parts >= 2 &&
-                     "a run of parts has at least two of them");
-              cells.edge[cell].emplace(typename Cells::connect_edge{this, w});
-              break;
-            case window_kind::read_only:
-              assert(w->plan.parts == 0 && (w->last || w->short_first) &&
-                     "a read-only window is one of the message's ends");
-              (w->last ? cells.last_read : cells.first_read)
-                  .emplace(typename Cells::connect_read{this, w});
-              break;
-          }
-        } catch (...) {
-          w->rec = nullptr;
-          w->op.live = false;
-          pool_.give_back(w);
-          throw;
-        }
-        w->cell = cell;
-        free_cells_.pop_back();
-        w->next_taken = taken_;
-        taken_ = w;
-        ++in_flight_;
-        w->reading = true;
-        ++reading_;
-        max_reading_ = std::max(max_reading_, reading_);
-        max_windows_ = std::max(max_windows_, in_flight_);
-        in_flight_nodes_ += w->plan.node_cost;
-        status_.outstanding = in_flight_;
-        if (w->last) {
-          last_window_ = w;
-        }
-        switch (w->plan.kind) {
-          case window_kind::subtree:
-            ex::start(*cells.full[w->cell]);
-            break;
-          case window_kind::part_run:
-            ex::start(*cells.edge[w->cell]);
-            break;
-          case window_kind::read_only:
-            ex::start(*(w->last ? cells.last_read : cells.first_read));
-            break;
-        }
+        connect_window(cells, w, cell);
+        lease.release();
+        commit_window(w, cell);
+        // Last, because from here the chain may complete.
+        start_window(cells, w);
       }
       note_pool_wait();
       // A stop that arrives with nothing in flight ends the run here.
@@ -773,10 +718,99 @@ class window_scope
     }
   }
 
-  // What the loop does when it would sleep with nothing owed: for one
-  // pipeline that is a configuration it cannot run.
-
  private:
+  // A window taken from the pool and not yet admitted. Until release()
+  // it is the lease's, and the destructor gives it back unstarted.
+  class window_lease {
+   public:
+    explicit window_lease(window_scope& scope) noexcept
+        : scope_(scope), w_(scope.pool_.take()) {
+      assert(w_ != nullptr && "admission borrows only from a pool with a "
+                              "window free");
+    }
+    window_lease(const window_lease&) = delete;
+    window_lease& operator=(const window_lease&) = delete;
+    ~window_lease() {
+      if (w_ != nullptr) {
+        w_->rec = nullptr;
+        w_->op.live = false;
+        scope_.pool_.give_back(w_);
+      }
+    }
+
+    [[nodiscard]] window& get() const noexcept { return *w_; }
+    // The scope's counts own the window from here.
+    void release() noexcept { w_ = nullptr; }
+
+   private:
+    window_scope& scope_;
+    window* w_;
+  };
+
+  // Builds the window's chain in its cell. Three shapes, which the
+  // planner chose. A subtree inserts one node. A run of parts -- a window
+  // with ends the hasher owns, the short first one or the last one, or
+  // one a stream left off the grid -- inserts their decomposition; it
+  // uses the cell its own window index names, because a stream can have
+  // several in flight at once. An end with nothing worth fanning out is
+  // only a read, and the hasher takes it whole.
+  //
+  // Not noexcept: the lane table and the operation state may allocate.
+  template <class Cells>
+  void connect_window(Cells& cells, window& w, unsigned cell) {
+    switch (w.plan.kind) {
+      case window_kind::subtree:
+        assert(w.plan.parts == 0 && !w.last && !w.short_first &&
+               "a subtree window has no parts and no ends");
+        prepare_compress(w);
+        cells.full[cell].emplace(typename Cells::connect_full{this, &w});
+        break;
+      case window_kind::part_run:
+        assert(w.plan.parts >= 2 && "a run of parts has at least two of them");
+        cells.edge[cell].emplace(typename Cells::connect_edge{this, &w});
+        break;
+      case window_kind::read_only:
+        assert(w.plan.parts == 0 && (w.last || w.short_first) &&
+               "a read-only window is one of the message's ends");
+        (w.last ? cells.last_read : cells.first_read)
+            .emplace(typename Cells::connect_read{this, &w});
+        break;
+    }
+  }
+
+  // The window is in flight from here: it holds a cell, a read slot and
+  // its reducer reservation, and is on the list the cancel sweep walks.
+  void commit_window(window& w, unsigned cell) noexcept {
+    w.cell = cell;
+    free_cells_.pop_back();
+    w.next_taken = taken_;
+    taken_ = &w;
+    ++in_flight_;
+    w.reading = true;
+    ++reading_;
+    max_reading_ = std::max(max_reading_, reading_);
+    max_windows_ = std::max(max_windows_, in_flight_);
+    in_flight_nodes_ += w.plan.node_cost;
+    status_.outstanding = in_flight_;
+    if (w.last) {
+      last_window_ = &w;
+    }
+  }
+
+  template <class Cells>
+  void start_window(Cells& cells, window& w) noexcept {
+    switch (w.plan.kind) {
+      case window_kind::subtree:
+        ex::start(*cells.full[w.cell]);
+        break;
+      case window_kind::part_run:
+        ex::start(*cells.edge[w.cell]);
+        break;
+      case window_kind::read_only:
+        ex::start(*(w.last ? cells.last_read : cells.first_read));
+        break;
+    }
+  }
 
   // The loop the base's quiesce drives, which is the host's.
   [[nodiscard]] driver_loop<D>& loop() noexcept { return loop_; }

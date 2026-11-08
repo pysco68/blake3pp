@@ -396,6 +396,10 @@ struct fake_script {
   bool keep_throwing = false;
   // The window index whose submit_read() throws std::bad_alloc, or -1.
   int bad_alloc_at_window = -1;
+  // The window index whose window_storage_for() throws std::bad_alloc,
+  // once, or -1: a failure while the scope is still building the window,
+  // before anything is counted for it.
+  int storage_throw_at_window = -1;
   // What the device does about a cancel. All three are conforming, and
   // the pipeline has to report the same thing under each: the backends
   // differ exactly here (io_uring and IOCP abort the transfer, GCD cannot
@@ -602,7 +606,13 @@ class fake_driver {
   }
 
   [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
-      file&, unsigned slot, std::uint64_t off, std::size_t bytes) noexcept {
+      file&, unsigned slot, std::uint64_t off, std::size_t bytes) {
+    if (script_.storage_throw_at_window >= 0 &&
+        off / window_bytes_ ==
+            static_cast<std::uint64_t>(script_.storage_throw_at_window)) {
+      script_.storage_throw_at_window = -1;
+      throw std::bad_alloc();
+    }
     const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
                                      bytes};
     if (script_.zero_copy) {
@@ -2148,6 +2158,56 @@ TEST_CASE("a read the driver could not queue reports what it threw") {
       ++thrown;
     }
     CHECK(thrown == 1);
+  }
+}
+
+// A window that fails while admission is still building it is given
+// back to the pool, and the windows already in flight come back when the
+// run unwinds: a pool shared by several runs loses nothing to one that
+// failed, and the next run on it uses every window and hashes correctly.
+TEST_CASE("a window that fails before it starts goes back to a shared pool") {
+  using scope_type =
+      blake3pp::detail::window_scope<blake3pp::null_tracer,
+                                     blake3pp::default_stack_budget,
+                                     fake_driver,
+                                     blake3pp::parallel_scheduler_t>;
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 95);
+  for (const int k : {0, 3}) {
+    CAPTURE(k);
+    fake_driver drv(content, win, {.storage_throw_at_window = k});
+    fake_driver::file f(drv);
+    const blake3pp::detail::pipeline_options opts{.window_bytes = win,
+                                                  .queue_depth = 4};
+    const auto plan = blake3pp::detail::plan_pipeline(
+        0, opts.window_bytes, opts.queue_depth, false, f.size());
+    blake3pp::detail::pipeline_host<blake3pp::default_stack_budget,
+                                    fake_driver>
+        host(drv, plan.windows, plan.window_bytes);
+    const auto free_windows = [&] {
+      std::vector<scope_type::window*> taken;
+      while (auto* w = host.pool().take()) {
+        taken.push_back(w);
+      }
+      for (auto* w : taken) {
+        host.pool().give_back(w);
+      }
+      return taken.size();
+    };
+    REQUIRE(free_windows() == host.pool().count());
+    {
+      blake3pp::hasher h;
+      scope_type scope(h, host, f, sched, plan, opts);
+      CHECK_THROWS_AS(scope.run(), std::bad_alloc);
+    }
+    CHECK(free_windows() == host.pool().count());
+    CHECK(drv.in_flight() == 0);
+    blake3pp::hasher h;
+    scope_type scope(h, host, f, sched, plan, opts);
+    scope.run();
+    CHECK(h.finalize() == blake3pp::hash(content));
   }
 }
 
