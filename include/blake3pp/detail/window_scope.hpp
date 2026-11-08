@@ -24,6 +24,7 @@
 #include <system_error>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/compress.hpp>
@@ -444,11 +445,11 @@ class window_scope
     // are the scope's; the windows are not, so a borrowed window carries
     // the index of the cell it was lent with. Handed out lowest first,
     // which keeps a run that never fills the pool on the same few cells.
-    free_cells_ = std::make_unique<unsigned[]>(count_);
+    // Reserved to the cell count once, so release() never reallocates.
+    free_cells_.reserve(count_);
     for (unsigned i = 0; i < count_; ++i) {
-      free_cells_[i] = count_ - 1 - i;
+      free_cells_.push_back(count_ - 1 - i);
     }
-    free_cell_count_ = count_;
   }
 
   // Over a file the caller opened itself, planned from the requests in
@@ -734,7 +735,7 @@ class window_scope
         // work off or a window a shared pool never offers again. Starting
         // is last, because from then on the chain may complete and will
         // count itself down.
-        const unsigned cell = free_cells_[free_cell_count_ - 1];
+        const unsigned cell = free_cells_.back();
         bool is_full = false;
         bool is_edge_fanout = false;
         try {
@@ -775,7 +776,7 @@ class window_scope
           throw;
         }
         w->cell = cell;
-        --free_cell_count_;
+        free_cells_.pop_back();
         w->next_taken = taken_;
         taken_ = w;
         ++in_flight_;
@@ -1416,7 +1417,7 @@ class window_scope
     assert(*link == &w && "a window released twice, or never taken");
     *link = w.next_taken;
     w.next_taken = nullptr;
-    free_cells_[free_cell_count_++] = w.cell;
+    free_cells_.push_back(w.cell);
     pool_.give_back(&w);
   }
 
@@ -1524,8 +1525,7 @@ class window_scope
   // What this scope currently holds, so the cancel sweep names its own
   // reads and not another pipeline's sharing the same pool.
   window* taken_ = nullptr;
-  std::unique_ptr<unsigned[]> free_cells_;
-  unsigned free_cell_count_ = 0;
+  std::vector<unsigned> free_cells_;
   window* last_window_ = nullptr;
   std::uint64_t next_offset_ = 0;
   std::uint64_t index_ = 0;
