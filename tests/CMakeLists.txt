@@ -36,6 +36,7 @@ add_executable(blake3pp_tests
   memory_source.cpp
   subtree_fold.cpp
   tree_reducer.cpp
+  window_planner.cpp
   contracts.cpp
   diagnosis.cpp
   unwinder.cpp
