@@ -226,6 +226,32 @@ namespace detail {
                     max_window_bytes);
 }
 
+// Absorbs a span already in memory: through the pipeline, over a source
+// whose windows are views of the span, or straight into the hasher below
+// the size where the pipeline pays for itself. `ends_message` says
+// whether these bytes end the message, in which case the last window's
+// final part stays with the hasher.
+template <stack_budget Budget, class Scheduler>
+void absorb_span(hasher& h, std::span<const std::byte> bytes,
+                 Scheduler&& sched, std::size_t window_bytes,
+                 bool ends_message) {
+  if (bytes.size() < min_pipeline_bytes) {
+    if (ends_message) {
+      h.update_last(bytes);
+    } else {
+      h.update(bytes);
+    }
+    return;
+  }
+  memory_driver drv;
+  memory_driver::file f(drv, bytes);
+  pipeline_plan plan = plan_memory_pipeline(
+      h.count(), window_bytes, static_cast<std::uint64_t>(bytes.size()));
+  plan.ends_message = ends_message;
+  run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
+                              {});
+}
+
 // The one-shot engine: the same pipeline update_file drives, over a
 // source whose windows are views of the caller's span.
 //
@@ -236,19 +262,11 @@ namespace detail {
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched) {
-  if (input.size() < min_pipeline_bytes) {
-    // The call finalizes, so these bytes end the message.
-    h.update_last(input);
-    return h.finalize();
-  }
   const std::size_t window =
       memory_window_bytes(static_cast<std::uint64_t>(input.size()));
-  memory_driver drv;
-  memory_driver::file f(drv, input);
-  const pipeline_plan plan = plan_memory_pipeline(
-      h.count(), window, static_cast<std::uint64_t>(input.size()));
-  run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
-                              {});
+  // The call finalizes, so these bytes end the message.
+  absorb_span<Budget>(h, input, std::forward<Scheduler>(sched), window,
+                      /*ends_message=*/true);
   return h.finalize();
 }
 
@@ -607,16 +625,9 @@ class parallel_hasher {
   // with the hasher.
   [[nodiscard]] hasher drained() const {
     hasher h = h_;
-    const std::span<const std::byte> tail{remainder_.data(), filled_};
-    if (filled_ < detail::min_pipeline_bytes) {
-      h.update_last(tail);
-      return h;
-    }
-    detail::memory_driver drv;
-    detail::memory_driver::file f(drv, tail);
-    const detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h.count(), window_bytes_, static_cast<std::uint64_t>(filled_));
-    detail::run_window_pipeline<Budget>(h, drv, f, sched_, plan, {});
+    detail::absorb_span<Budget>(
+        h, std::span<const std::byte>{remainder_.data(), filled_}, sched_,
+        window_bytes_, /*ends_message=*/true);
     return h;
   }
 
@@ -625,19 +636,10 @@ class parallel_hasher {
   // which is what leaves the hasher on a window boundary for the next
   // call. Below the threshold the scope costs more than it saves.
   void absorb(std::span<const std::byte> bytes) {
-    if (bytes.size() < detail::min_pipeline_bytes) {
-      h_.update(bytes);
-      return;
-    }
-    detail::memory_driver drv;
-    detail::memory_driver::file f(drv, bytes);
-    detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h_.count(), window_bytes_,
-        static_cast<std::uint64_t>(bytes.size()));
-    // Never: update() holds the final window back, so nothing absorbed
-    // here can contain the message's end.
-    plan.ends_message = false;
-    detail::run_window_pipeline<Budget>(h_, drv, f, sched_, plan, {});
+    // Never the message's end: update() holds the final window back, so
+    // nothing absorbed here can contain it.
+    detail::absorb_span<Budget>(h_, bytes, sched_, window_bytes_,
+                                /*ends_message=*/false);
   }
 
   Scheduler sched_;
