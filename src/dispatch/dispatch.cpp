@@ -158,7 +158,6 @@ avail_table build_available() noexcept {
 // upgraded rebuild through the atomic pointer. Both live in static
 // storage, so the returned span never dangles, and readers see either
 // snapshot as one consistent unit.
-avail_table g_avail_upgraded;
 std::atomic<const avail_table*> g_avail_active{nullptr};
 
 std::span<const arch> available_impl() noexcept {
@@ -184,8 +183,8 @@ bool run_trap_probes() noexcept {
     if (!detail::platform_run_trap_probes()) {
       return false;
     }
-    g_avail_upgraded = build_available();
-    g_avail_active.store(&g_avail_upgraded, std::memory_order_release);
+    static const avail_table upgraded = build_available();
+    g_avail_active.store(&upgraded, std::memory_order_release);
     return true;
   }();
   return changed;

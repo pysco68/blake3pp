@@ -2116,6 +2116,22 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
     });
   }
 #endif
+#if defined(__unix__) || defined(__APPLE__)
+  {
+    io_impl::pread_context ctx({}, 4);
+    check(ctx, [&](io_impl::pread_context& c) {
+      return io_impl::pread_context::file(c, f.path,
+                                          io_impl::file_open_options{});
+    });
+  }
+#endif
+  {
+    io_impl::stdio_context ctx({}, 4);
+    check(ctx, [&](io_impl::stdio_context& c) {
+      return io_impl::stdio_context::file(c, f.path,
+                                          io_impl::file_open_options{});
+    });
+  }
 }
 
 // --- Lanes: the transfers happen off the polling thread --------------------
