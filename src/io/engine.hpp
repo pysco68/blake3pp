@@ -72,12 +72,6 @@ class polled_reader_engine {
     return file_.name();
   }
 
-  // The buffer arena, for callers that must fill it before the first read
-  // (the null source hands back whatever is already there).
-  [[nodiscard]] std::span<std::byte> pool() noexcept {
-    return {pool_.get(), std::size_t{qd_} * window_};
-  }
-
   std::optional<window> next() {
     // release() is noexcept, so a failed submission is latched there and
     // thrown here.

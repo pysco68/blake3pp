@@ -356,10 +356,11 @@ struct performed_transfer : transfer_base {
 //
 // A context owns the completion mechanism (a ring, a port, a queue) and
 // nothing about any particular file. C::file is an open file bound to a
-// context: constructed from (C&, const std::filesystem::path&, bool
-// direct_io) and exposing size() and name(). A source that has no path
-// constructs its file differently -- null_context::file takes a size --
-// which is why construction is described here rather than required below.
+// context: constructed from (C&, const std::filesystem::path&,
+// const file_open_options&) and exposing size() and name(). A source that
+// has no path constructs its file differently -- the tests' fake_context
+// takes a size -- which is why construction is described here rather than
+// required below.
 //
 // name() is where the degradation ladder becomes visible: it is settled
 // when the file is opened, against the context that opened it, and

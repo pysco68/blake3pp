@@ -6,7 +6,7 @@
 // should see, so everything platform-shaped lives behind a pimpl here
 // and the native context's contract is mirrored member for member.
 //
-// The one addition over that contract is allocate(): the driver owns the
+// The one addition over that contract is reserve(): the driver owns the
 // buffer memory, because the teardown rule -- drain every read BEFORE
 // freeing what it reads into -- is easy to get wrong at a distance and
 // belongs in compiled code next to the drain itself.
