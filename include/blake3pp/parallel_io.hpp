@@ -428,10 +428,11 @@ struct stream_report {
 
 namespace detail {
 
-// The parts of a stream_report that come from the reader. Each is taken
-// only from a reader that has the member, so the scripted readers in the
-// tests compile without them. The shipped reader has both members on every
-// platform, and reports zero where it does not use them.
+// The parts of a stream_report that come from the reader. The watch is
+// taken only from a reader that has one, so the scripted readers in the
+// tests compile without it; the shipped reader has it on every platform,
+// and reports zero where it does not use it. read_bound() every reader
+// has, because basic_pipe_driver asks for it on every read.
 template <class Reader>
 [[nodiscard]] stream_report::watch_report watch_report_of(
     const Reader& r) noexcept {
@@ -449,11 +450,7 @@ template <class Reader>
 
 template <class Reader>
 [[nodiscard]] std::size_t read_ask_bound_of(const Reader& r) noexcept {
-  if constexpr (requires { { r.read_bound() } -> std::convertible_to<std::size_t>; }) {
-    return r.read_bound();
-  } else {
-    return 0;
-  }
+  return r.read_bound();
 }
 
 }  // namespace detail
