@@ -62,7 +62,17 @@ audit_kernels() {  # <build-dir>
   case "${preset}" in
     wasm32-*) return 0 ;;
   esac
-  python3 tools/objscan.py audit "$1" --binary "$1/cli/blake3ppsum" && return 0
+  # Only a configuration that builds the CLI has a linked tool for the
+  # outside-the-kernels checks; the no-io one builds none, and its objects
+  # are still audited. CMake makes cli/ only where it adds the CLI, so a
+  # configured CLI whose binary is missing still fails here.
+  local binary=()
+  if [ -d "$1/cli" ]; then
+    binary=(--binary "$1/cli/blake3ppsum")
+  else
+    echo "kernel audit: ${preset} builds no CLI; the linked-tool checks are skipped"
+  fi
+  python3 tools/objscan.py audit "$1" ${binary[@]+"${binary[@]}"} && return 0
   echo "::warning::${preset}: kernel audit findings in $1, see the log"
   audit_findings+=("$1")
 }
