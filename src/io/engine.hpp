@@ -298,21 +298,19 @@ class polled_writer_engine {
   }
 
   void submit(const buffer& b, std::size_t bytes) {
-    if (bytes == 0) {
-      // Nothing to write, so the slot goes back to the front of the ring
-      // rather than being skipped: a generator that produces nothing on its
-      // last call must not cost a buffer.
-      if (b.slot < qd_ && slots_[b.slot].acquired) {
-        slots_[b.slot].acquired = false;
-        next_slot_ = b.slot;
-      }
-      return;
-    }
     if (b.slot >= qd_ || bytes > buffer_ || !slots_[b.slot].acquired) {
       throw std::system_error(EINVAL, std::generic_category(),
                               "submit() of a buffer this writer did not "
                               "hand out, or has already taken back, or of "
                               "more bytes than it holds");
+    }
+    if (bytes == 0) {
+      // Nothing to write, so the slot goes back to the front of the ring
+      // rather than being skipped: a generator that produces nothing on its
+      // last call must not cost a buffer.
+      slots_[b.slot].acquired = false;
+      next_slot_ = b.slot;
+      return;
     }
     if (tail_submitted_) {
       throw std::system_error(EINVAL, std::generic_category(),

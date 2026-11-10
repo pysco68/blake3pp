@@ -1349,6 +1349,22 @@ TEST_CASE("writer refuses a submit larger than its buffer") {
   w.finish();
 }
 
+// An empty submit hands a buffer back without writing, and it is held to
+// the same rule as any other: a buffer this writer did not hand out, or
+// has already taken back, is refused rather than silently accepted.
+TEST_CASE("writer refuses an empty submit of a buffer it does not hold") {
+  const temp_file f({});
+  blake3pp::detail::file_writer w(
+      f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
+  auto b = w.acquire();
+  auto foreign = b;
+  foreign.slot = 9;
+  CHECK_THROWS_AS(w.submit(foreign, 0), std::system_error);
+  w.submit(b, 0);  // handed back, nothing written
+  CHECK_THROWS_AS(w.submit(b, 0), std::system_error);  // already taken back
+  w.finish();
+}
+
 // Two buffers in hand are two slots, and a buffer may be submitted once.
 // A slot claimed only at submit would let a second acquire() hand out the
 // same buffer again: both writes would ride one busy flag, the first
