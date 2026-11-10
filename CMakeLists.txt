@@ -292,6 +292,8 @@ if(BLAKE3PP_SIZED_PARALLEL_SCHEDULER)
   target_link_libraries(blake3pp_parallel_backend
     PUBLIC blake3pp::blake3pp
     PRIVATE blake3pp_warnings)
+  # execution/bulk_chunk.hpp, which it shares with the library.
+  target_include_directories(blake3pp_parallel_backend PRIVATE src)
   # Linking it is what tells a consumer's code that --threads can be
   # honoured whatever the provider.
   target_compile_definitions(blake3pp_parallel_backend

@@ -35,8 +35,6 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
-#include <bit>
-#include <cassert>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -57,10 +55,6 @@
 #include <blake3pp/detail/window_scope.hpp>
 #include <blake3pp/trace.hpp>
 
-#if defined(__linux__)
-#include <sched.h>  // sched_getcpu() for agent_record::cpu
-#endif
-
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) || \
     (!defined(BLAKE3PP_EXECUTION_STD) && !defined(BLAKE3PP_EXECUTION_BEMAN))
 #if BLAKE3PP_HAS_STD_THREAD
@@ -77,15 +71,6 @@ namespace detail {
 // providers' process pools take their default size from this.
 [[nodiscard]] constexpr unsigned pool_threads(unsigned hardware) noexcept {
   return hardware != 0 ? hardware : 1u;
-}
-
-// The end of the bulk chunk that starts at begin: chunk_length items, or
-// the rest of shape when fewer remain. Requires begin < shape. Spelled so
-// that begin + chunk_length is never formed, since it wraps for a shape
-// near the top of size_t.
-[[nodiscard]] constexpr std::size_t bulk_chunk_end(
-    std::size_t begin, std::size_t chunk_length, std::size_t shape) noexcept {
-  return begin + std::min(chunk_length, shape - begin);
 }
 }  // namespace detail
 
