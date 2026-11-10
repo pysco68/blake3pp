@@ -633,7 +633,11 @@ class io_lanes {
     started_ = true;
     unblock_ = unblock;
     cookie_ = cookie;
-    lanes_.reserve(want_);
+    try {
+      lanes_.reserve(want_);
+    } catch (...) {  // not one lane, which the result reports
+      return false;
+    }
     for (unsigned i = 0; i < want_; ++i) {
       try {
         lanes_.emplace_back([body, cookie] { body(cookie); });
