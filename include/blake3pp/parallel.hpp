@@ -96,10 +96,12 @@ using parallel_scheduler_t = decltype(std::execution::get_parallel_scheduler());
 using parallel_scheduler_t = beman::execution::parallel_scheduler;
 /// The process-wide parallel scheduler, in P2079's shape.
 ///
-/// Backed by beman.execution's own parallel_scheduler backend. A program
-/// may replace it by defining query_parallel_scheduler_backend() itself:
-/// P2079 replaceability, one definition per program, like a global
-/// allocator.
+/// Backed by beman.execution's own parallel_scheduler backend, or, in a
+/// program that links blake3pp::parallel_backend, by one that runs on the
+/// thread count size_parallel_scheduler() fixed
+/// (<blake3pp/parallel_backend.hpp>). A program may also replace it by
+/// defining query_parallel_scheduler_backend() itself: P2079
+/// replaceability, one definition per program, like a global allocator.
 [[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
   return beman::execution::get_parallel_scheduler();
 }
@@ -155,8 +157,9 @@ using parallel_scheduler_t =
 /// The process-wide parallel scheduler, in P2079's shape.
 ///
 /// The same call C++26 application code makes. The first call creates the
-/// process pool (one thread per hardware thread), joined during static
-/// destruction. The scheduler-taking overloads stay the primary,
+/// process pool, joined during static destruction: one thread per
+/// hardware thread, or the count size_parallel_scheduler() fixed before
+/// it (<blake3pp/parallel_backend.hpp>). The scheduler-taking overloads stay the primary,
 /// caller-controlled API; a sized or bounded pool is the provider's own
 /// (exec::static_thread_pool pool(8); pool.get_scheduler()).
 [[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
@@ -396,9 +399,10 @@ struct parallel_hasher_options {
   /// The SIMD variant of the internal hasher.
   arch a = arch::auto_detect;
   /// Bytes accumulated before a window is fanned out; rounded by
-  /// detail::rounded_window_bytes to a power of two in
-  /// [64 KiB, 1 GiB]. Buffered input below one window hashes
-  /// sequentially at `finalize()`.
+  /// detail::rounded_window_bytes to a power of two in [64 KiB, 1 GiB] on
+  /// a 64-bit target, and below a lower cap on a 32-bit one, where
+  /// max_queue_depth windows have to fit in size_t. Buffered input below
+  /// one window hashes sequentially at `finalize()`.
   std::size_t window_bytes = detail::default_window_bytes;
 };
 
@@ -410,13 +414,14 @@ struct parallel_hasher_options {
 ///   - The digest equals the sequential one.
 ///   - All alignment and final-chunk discipline lives here, not with the
 ///     caller.
-///   - The window buffer is the type's one allocation, made at
-///     construction.
+///   - The window buffer is allocated at construction. Each fan-out also
+///     allocates the pipeline's window objects and reducer storage for
+///     that call.
 ///   - finalize() is non-destructive, like hasher's.
 ///   - A moved-from hasher is in the state reset() leaves; its next
 ///     update() allocates the buffer again.
 ///   - Not thread-safe. The scheduler's workers are used only inside
-///     update().
+///     update() and the finalize forms.
 ///
 /// Input accumulates into an aligned window, and a full window is fanned
 /// out as soon as one more byte arrives. That is the "one byte in reserve"
@@ -504,9 +509,10 @@ class parallel_hasher {
   /// out over the scheduler from here.
   ///
   /// Whole windows of `input` are hashed where they lie, so the cost in
-  /// copying is bounded: at most ONE window is copied per call, and only
-  /// to finish a window a previous call left part-built. The buffer that
-  /// holds it is one window, never more.
+  /// copying is bounded: what finishes a window a previous call left
+  /// part-built, which is under one window, and the tail held back for
+  /// the next call, which is at most one. The buffer that holds them is
+  /// one window, never more.
   /// @param input  Any length, including zero.
   void update(std::span<const std::byte> input) {
     if (input.empty()) {
@@ -517,8 +523,8 @@ class parallel_hasher {
       remainder_.resize(window_bytes_);
     }
     // Whole windows of the caller's own bytes are hashed where they lie.
-    // The only copying is what it takes to finish a window the last call
-    // left part-built, which is under one window and never more.
+    // Copying is what finishes a window the last call left part-built,
+    // here, and the tail held back at the end.
     if (filled_ > 0) {
       const std::size_t take =
           std::min(window_bytes_ - filled_, input.size());
@@ -651,7 +657,8 @@ inline constexpr std::size_t default_fill_segment_bytes = 4 * 1024 * 1024;
 /// @param out            Receives the next `out.size()` bytes of r's stream.
 /// @param sched          Where the segments are filled.
 /// @param segment_bytes  Bytes per task; rounded down to a multiple of
-///                       block_size so every task starts on the wide path.
+///                       block_size, so every task starts on the wide path
+///                       when r.position() is a multiple of block_size.
 ///                       Defaults to default_fill_segment_bytes.
 /// @throws std::system_error with errc::operation_canceled if sched
 ///         completes the work stopped; r is then left where it was.
