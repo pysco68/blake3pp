@@ -589,7 +589,7 @@ write_report write_sequential(const std::filesystem::path& path,
       writer.submit(b, n);
       done += n;
     }
-    if (n < b.capacity) {
+    if (n < b.bytes.size()) {
       break;
     }
   }
@@ -637,11 +637,11 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
       path, size,
       [&](const detail::file_writer::buffer& b, std::uint64_t off) {
         const std::size_t n = static_cast<std::size_t>(
-            std::min<std::uint64_t>(b.capacity, size - off));
+            std::min<std::uint64_t>(b.bytes.size(), size - off));
         // At off == size the writer asks once more, which is how it learns
         // the file ended; the generator owes nothing for that window.
         if (n != 0) {
-          fill(std::span{b.data, n}, off);
+          fill(b.bytes.first(n), off);
         }
         return n;
       },
@@ -672,7 +672,7 @@ write_report write_file(const std::filesystem::path& path, Fill&& fill,
       path, 0,
       [&](const detail::file_writer::buffer& b, std::uint64_t off) {
         return static_cast<std::size_t>(
-            fill(std::span{b.data, b.capacity}, off));
+            fill(b.bytes, off));
       },
       opts);
 }

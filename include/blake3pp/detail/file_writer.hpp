@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <span>
 
 #include <blake3pp/detail/io_geometry.hpp>
 
@@ -84,8 +85,7 @@ class file_writer {
   file_writer& operator=(const file_writer&) = delete;
 
   struct buffer {
-    std::byte* data;
-    std::size_t capacity;  // == buffer_bytes (rounded)
+    std::span<std::byte> bytes;  // buffer_bytes, rounded
     unsigned slot;
   };
 

@@ -1189,7 +1189,7 @@ TEST_CASE("an engaged backend is the engine this kernel grants, or says why not"
     CAPTURE(name);
     CHECK(engaged_or_explained(name, engine_write));
     auto b = w.acquire();
-    std::memcpy(b.data, content.data(), 4096);
+    std::memcpy(b.bytes.data(), content.data(), 4096);
     w.submit(b, 4096);
     w.finish();
   }
@@ -1242,7 +1242,7 @@ TEST_CASE("reader fallback backends deliver identical data") {
     MESSAGE("sync backend: " << r.backend());
     blake3pp::hasher h;
     while (auto w = r.next()) {
-      h.update(std::span<const std::byte>{w->data, w->bytes});
+      h.update(w->bytes);
       r.release(*w);
     }
     CHECK(h.finalize() == expected);
@@ -1258,7 +1258,7 @@ TEST_CASE("reader fallback backends deliver identical data") {
     MESSAGE("async backend: " << r.backend());
     blake3pp::hasher h;
     while (auto w = r.next()) {
-      h.update(std::span<const std::byte>{w->data, w->bytes});
+      h.update(w->bytes);
       r.release(*w);
     }
     CHECK(h.finalize() == expected);
@@ -1280,12 +1280,12 @@ TEST_CASE("reader refuses a window beyond queue_depth and recovers") {
   REQUIRE(w1);
   CHECK_THROWS_AS(r.next(), std::system_error);
   blake3pp::hasher h;
-  h.update(std::span<const std::byte>{w0->data, w0->bytes});
+  h.update(w0->bytes);
   r.release(*w0);
-  h.update(std::span<const std::byte>{w1->data, w1->bytes});
+  h.update(w1->bytes);
   r.release(*w1);
   while (auto w = r.next()) {
-    h.update(std::span<const std::byte>{w->data, w->bytes});
+    h.update(w->bytes);
     r.release(*w);
   }
   CHECK(h.finalize() == expected);
@@ -1342,7 +1342,7 @@ TEST_CASE("writer refuses a submit larger than its buffer") {
   blake3pp::detail::file_writer w(
       f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
   auto b = w.acquire();
-  CHECK_THROWS_AS(w.submit(b, b.capacity + 1), std::system_error);
+  CHECK_THROWS_AS(w.submit(b, b.bytes.size() + 1), std::system_error);
   auto foreign = b;
   foreign.slot = 9;
   CHECK_THROWS_AS(w.submit(foreign, 4096), std::system_error);
@@ -1381,12 +1381,12 @@ TEST_CASE("writer hands out one buffer per slot and takes each back once") {
     const auto a = w.acquire();
     const auto b = w.acquire();
     CHECK(a.slot != b.slot);
-    CHECK(a.data != b.data);
+    CHECK(a.bytes.data() != b.bytes.data());
     // Every slot is held; the third ask says so rather than reusing one.
     CHECK_THROWS_AS(w.acquire(), std::system_error);
 
-    std::copy_n(content.data(), 64 * 1024, a.data);
-    std::copy_n(content.data() + 64 * 1024, 64 * 1024, b.data);
+    std::copy_n(content.data(), 64 * 1024, a.bytes.data());
+    std::copy_n(content.data() + 64 * 1024, 64 * 1024, b.bytes.data());
     w.submit(a, 64 * 1024);
     CHECK_THROWS_AS(w.submit(a, 64 * 1024), std::system_error);  // taken back
     w.submit(b, 64 * 1024);
@@ -1413,8 +1413,8 @@ TEST_CASE("writer submit modes deliver identical data") {
       std::size_t done = 0;
       while (done < content.size()) {
         auto b = w.acquire();
-        const std::size_t n = std::min(b.capacity, content.size() - done);
-        std::memcpy(b.data, content.data() + done, n);
+        const std::size_t n = std::min(b.bytes.size(), content.size() - done);
+        std::memcpy(b.bytes.data(), content.data() + done, n);
         w.submit(b, n);
         done += n;
       }
@@ -1445,8 +1445,8 @@ void roundtrip_engines(std::string_view tag) {
     std::size_t pos = 0;
     while (pos < content.size()) {
       const auto b = w.acquire();
-      const std::size_t n = std::min(b.capacity, content.size() - pos);
-      std::memcpy(b.data, content.data() + pos, n);
+      const std::size_t n = std::min(b.bytes.size(), content.size() - pos);
+      std::memcpy(b.bytes.data(), content.data() + pos, n);
       w.submit(b, n);
       pos += n;
     }
@@ -1460,7 +1460,7 @@ void roundtrip_engines(std::string_view tag) {
   CHECK(r.file_size() == content.size());
   std::vector<std::byte> out;
   while (auto win = r.next()) {
-    out.insert(out.end(), win->data, win->data + win->bytes);
+    out.insert(out.end(), win->bytes.begin(), win->bytes.end());
     r.release(*win);
   }
   CHECK(out == content);
@@ -1482,8 +1482,8 @@ TEST_CASE("the stdio rung opens a path outside the ANSI code page") {
     std::size_t pos = 0;
     while (pos < content.size()) {
       const auto b = w.acquire();
-      const std::size_t n = std::min(b.capacity, content.size() - pos);
-      std::memcpy(b.data, content.data() + pos, n);
+      const std::size_t n = std::min(b.bytes.size(), content.size() - pos);
+      std::memcpy(b.bytes.data(), content.data() + pos, n);
       w.submit(b, n);
       pos += n;
     }
@@ -1495,7 +1495,7 @@ TEST_CASE("the stdio rung opens a path outside the ANSI code page") {
     io_impl::polled_reader_engine<io_impl::stdio_context> r(
         path, {.window_bytes = 64 * 1024, .queue_depth = 2});
     while (auto win = r.next()) {
-      out.insert(out.end(), win->data, win->data + win->bytes);
+      out.insert(out.end(), win->bytes.begin(), win->bytes.end());
       r.release(*win);
     }
   }
@@ -1539,8 +1539,8 @@ TEST_CASE("finish() lands every byte on the stdio backend") {
   std::size_t pos = 0;
   while (pos < content.size()) {
     const auto b = w.acquire();
-    const std::size_t n = std::min(b.capacity, content.size() - pos);
-    std::memcpy(b.data, content.data() + pos, n);
+    const std::size_t n = std::min(b.bytes.size(), content.size() - pos);
+    std::memcpy(b.bytes.data(), content.data() + pos, n);
     w.submit(b, n);
     pos += n;
   }

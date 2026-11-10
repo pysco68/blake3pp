@@ -101,7 +101,7 @@ class polled_reader_engine {
     }
     st.held = true;
     next_deliver_++;
-    return window{buf(s).data(), st.target, want * window_,
+    return window{{buf(s).data(), st.target}, want * window_,
                   want + 1 == num_windows_, s};
   }
 
@@ -288,7 +288,7 @@ class polled_writer_engine {
     throw_if_failed();
     slots_[s].acquired = true;
     next_slot_ = (s + 1) % qd_;
-    return buffer{buf(s).data(), buffer_, s};
+    return buffer{{buf(s).data(), buffer_}, s};
   }
 
   void submit(const buffer& b, std::size_t bytes) {
@@ -322,7 +322,7 @@ class polled_writer_engine {
     // that of flush() only); the slot must not stay marked busy for a
     // write that never existed, or wait_slot() polls for it for ever.
     try {
-      ctx_.submit_write(file_, offset_, {b.data, bytes}, st.op);
+      ctx_.submit_write(file_, offset_, b.bytes.first(bytes), st.op);
     } catch (...) {
       st.busy = false;
       throw;

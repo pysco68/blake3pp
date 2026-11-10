@@ -46,12 +46,12 @@ void update_file(hasher& h, const std::filesystem::path& path,
     window_record* const rec = trace ? trace->claim_window() : nullptr;
     if (rec) {
       rec->index = index;
-      rec->bytes = w->bytes;
+      rec->bytes = w->bytes.size();
       rec->flags = w->last ? window_record::flag_last : 0;
       rec->t_wait_begin = t_wait_begin;
       rec->t_ready = trace->now();
     }
-    h.update(std::span<const std::byte>{w->data, w->bytes});
+    h.update(w->bytes);
     if (rec) {
       rec->t_joined = rec->t_absorbed = trace->now();
     }

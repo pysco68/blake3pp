@@ -31,6 +31,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 
 #include <blake3pp/detail/io_geometry.hpp>
@@ -69,8 +70,7 @@ class file_reader {
   file_reader& operator=(const file_reader&) = delete;
 
   struct window {
-    const std::byte* data;
-    std::size_t bytes;     // == window_bytes for all but possibly the last
+    std::span<const std::byte> bytes;  // window_bytes, but for the last
     std::uint64_t offset;  // byte offset within the file
     bool last;             // reaches end of file
     unsigned slot;         // buffer slot; hand back via release()
