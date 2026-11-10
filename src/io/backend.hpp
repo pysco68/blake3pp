@@ -397,6 +397,9 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // The file_reader::backend() string, computed when the file was opened
   // and owned by it: the engine hands it straight to file_reader.
   { f.name() } noexcept -> std::same_as<std::string_view>;
+  // The file's length as the open found it, which the engines and the
+  // driver read to plan and to bound every transfer.
+  { f.size() } noexcept -> std::same_as<std::uint64_t>;
   // Queues one read of exactly buf.size() bytes at off. Performs no
   // transfer and runs no callback. A transfer the asynchronous engine
   // cannot take (no engine, a length NO_BUFFERING cannot take on Windows,
