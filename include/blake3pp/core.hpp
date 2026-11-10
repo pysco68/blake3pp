@@ -82,8 +82,8 @@ struct reader_access;
 /// It formats with std::format ("{}" prints the lowercase hex) where the
 /// standard library provides `<format>`.
 struct digest {
-  /// The digest bytes.
-  std::array<std::byte, digest_size> bytes;
+  /// The digest bytes; zero for a default-constructed digest.
+  std::array<std::byte, digest_size> bytes{};
 
   /// Constant-time equality (matching the Rust reference): the safe
   /// default for a value compared in security-sensitive contexts, at
@@ -510,7 +510,9 @@ template <>
 struct std::formatter<blake3pp::digest> : std::formatter<std::string_view> {
   template <class FormatContext>
   auto format(const blake3pp::digest& d, FormatContext& ctx) const {
-    return std::formatter<std::string_view>::format(d.to_hex(), ctx);
+    const std::array<char, 65> hex = d.to_hex_chars();
+    return std::formatter<std::string_view>::format(
+        std::string_view(hex.data(), 2 * blake3pp::digest_size), ctx);
   }
 };
 #endif
