@@ -276,6 +276,137 @@ class pipeline_host {
   window_pool<Budget> pool_;
 };
 
+// What a read run measures, apart from the transfer counters the base
+// keeps for both directions.
+//
+// Two kinds of data. The counters are collected on every run, since
+// driver_stats reports them whether or not a trace was asked for; the
+// window records exist only when a trace buffer was given, and every
+// stamp is a no-op on a window without one. Everything here runs on the
+// driver except agents_done(), which the agent that finished a window
+// calls, and so adds its share atomically.
+template <class Window>
+class read_instruments {
+ public:
+  read_instruments(trace_buffer* trace, std::uint32_t file_index) noexcept
+      : trace_(trace), file_index_(file_index) {}
+
+  [[nodiscard]] trace_buffer* trace() const noexcept { return trace_; }
+  [[nodiscard]] std::uint64_t admission_stalls() const noexcept {
+    return admission_stalls_;
+  }
+
+  // A window was taken and is about to be connected. Its record, if
+  // there is a trace, starts from the read's own timestamp, which
+  // take_next() stamped before the driver was asked for the window.
+  void claim(Window& w) noexcept {
+    w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
+    if (w.rec != nullptr) {
+      w.rec->index = w.index;
+      w.rec->bytes = w.bytes;
+      w.rec->flags =
+          (w.last ? window_record::flag_last : 0) |
+          (w.short_first ? window_record::flag_short_first : 0) |
+          (!w.last && !w.short_first && w.plan.parts > 0
+               ? window_record::flag_part_run
+               : 0);
+      w.rec->slot = w.slot;
+      w.rec->file = file_index_;
+      w.rec->t_wait_begin = w.t_read_begin - trace_->epoch_ns();
+    }
+  }
+
+  // The window is counted in flight, with `reading` reads and `windows`
+  // windows out after it.
+  void admitted(unsigned reading, unsigned windows) noexcept {
+    max_reading_ = std::max(max_reading_, reading);
+    max_windows_ = std::max(max_windows_, windows);
+  }
+
+  // A window that had a buffer and work to do was held back for want of
+  // a reducer node.
+  void stalled() noexcept { ++admission_stalls_; }
+
+  // The read landed at `t`, on steady_clock.
+  void landed(Window& w, std::int64_t t) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_ready = t - trace_->epoch_ns();
+    }
+  }
+
+  // A window that never reaches the pool has no separate join: its
+  // compute is the hasher's, at the end.
+  void joined(Window& w) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_joined = trace_->now();
+    }
+  }
+
+  // On the agent that finished the window's compress stage.
+  void agents_done(Window& w) noexcept {
+    const std::uint64_t busy =
+        w.compress.pt.busy_ns.load(std::memory_order_relaxed);
+    // Outside the record check: the pool's busy share is what says
+    // whether the hash is the constraint, and a caller may want it
+    // without paying for one record per window. The window's agents
+    // have already summed their own time into this counter, so this is
+    // one relaxed add per fanned window on the agent that finished it;
+    // the driver reads it back once, in report().
+    agent_busy_ns_.fetch_add(busy, std::memory_order_relaxed);
+    if (w.rec != nullptr) {
+      w.rec->t_joined = trace_->now();
+      w.rec->agent_busy_ns = busy;
+      w.rec->agents_active =
+          w.compress.pt.active.load(std::memory_order_relaxed);
+      w.rec->flags |= window_record::flag_parallel;
+    }
+  }
+
+  // The window's nodes are in the reducer, which now holds `pending`.
+  void absorbed(Window& w, std::size_t pending) noexcept {
+    max_pending_ = std::max(max_pending_, pending);
+    if (w.rec != nullptr) {
+      w.rec->t_absorbed = trace_->now();
+    }
+  }
+
+  // The last window, which the hasher takes whole at the end: it is
+  // never folded, so its join and its absorb are the same instant.
+  void absorbed_whole(Window& w) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_joined = w.rec->t_absorbed = trace_->now();
+    }
+  }
+
+  void released(Window& w) noexcept {
+    if (w.rec != nullptr) {
+      w.rec->t_released = trace_->now();
+    }
+  }
+
+  // The counters this owns, into the trace's driver_stats. After the
+  // run, with every agent joined.
+  void report(driver_stats& d) const noexcept {
+    d.admission_stalls = admission_stalls_;
+    d.max_pending = max_pending_;
+    d.max_reads_in_flight = max_reading_;
+    d.max_windows_in_flight = max_windows_;
+    d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
+  }
+
+ private:
+  trace_buffer* trace_ = nullptr;
+  std::uint32_t file_index_ = 0;
+  unsigned max_reading_ = 0;
+  unsigned max_windows_ = 0;
+  std::uint64_t admission_stalls_ = 0;
+  std::size_t max_pending_ = 0;
+  // The pool's summed compress time over the run. Written by the agent
+  // that finished a window, read by the driver after everything has
+  // joined, so it is atomic where the other counters are not.
+  std::atomic<std::uint64_t> agent_busy_ns_{0};
+};
+
 template <class Scope, class FullOp, class ReadOnlyOp, class EdgeOp>
 struct pipeline_cells;
 
@@ -371,7 +502,7 @@ class window_scope
         pool_(host.pool()),
         file_(file),
         sched_(std::move(sched)),
-        trace_(tracer.buffer()),
+        inst_(tracer.buffer(), opts.file_index),
         file_index_(opts.file_index),
         // The hasher's own table, never one resolved from its variant:
         // that would quietly replace a caller-supplied table with the
@@ -515,18 +646,14 @@ class window_scope
     // A run that ends while the pool is empty has an open starved
     // interval, and the counter is reported from here.
     transfers_.end_starved();
-    if (trace_ != nullptr) {
-      driver_stats& d = trace_->driver();
+    if (trace_buffer* const trace = inst_.trace(); trace != nullptr) {
+      driver_stats& d = trace->driver();
       // The rung is the file's, which closes with the run: copied here so a
       // trace read afterwards still names it.
       set_read_backend(d, file_.name());
-      d.admission_stalls = admission_stalls_;
-      d.max_pending = max_pending_;
-      d.max_reads_in_flight = max_reading_;
-      d.max_windows_in_flight = max_windows_;
+      inst_.report(d);
       d.queue_depth_final = reads_in_flight_;
       d.queue_depth_peak = reads_in_flight_;
-      d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
       transfers_.report(d, loop_.driver());
     }
     if (eptr_) {
@@ -548,12 +675,8 @@ class window_scope
       h_.update(std::span<const std::byte>(
           w.view().data() + (w.bytes - w.plan.tail_bytes),
           w.plan.tail_bytes));
-      if (w.rec != nullptr) {
-        // The last window is never folded, so its join and its absorb
-        // are the same instant: the hasher took it whole.
-        w.rec->t_joined = w.rec->t_absorbed = trace_->now();
-      }
-      stamp_released(w);
+      inst_.absorbed_whole(w);
+      inst_.released(w);
     }
     return outcome::value;
   }
@@ -611,7 +734,7 @@ class window_scope
     try {
       loop_.run_until(
           status_, [&] { admit_round(cells); }, [this] { this->report_stall(); },
-          trace_);
+          inst_.trace());
     } catch (...) {
       quiesce();
       throw;
@@ -634,7 +757,7 @@ class window_scope
   // held back because the reducer had no node for it. Zero on any run
   // whose capacity is the default; the admission test is what reads it.
   [[nodiscard]] std::uint64_t admission_stalls() const noexcept {
-    return admission_stalls_;
+    return inst_.admission_stalls();
   }
 
  private:
@@ -696,7 +819,7 @@ class window_scope
           // window back.
           break;
         }
-        claim_record(w);
+        inst_.claim(w);
         const unsigned cell = free_cells_.back();
         connect_window(cells, w, cell);
         lease.release();
@@ -782,8 +905,7 @@ class window_scope
     ++in_flight_;
     w.reading = true;
     ++reading_;
-    max_reading_ = std::max(max_reading_, reading_);
-    max_windows_ = std::max(max_windows_, in_flight_);
+    inst_.admitted(reading_, in_flight_);
     in_flight_nodes_ += w.plan.node_cost;
     status_.outstanding = in_flight_;
     if (w.last) {
@@ -856,7 +978,7 @@ class window_scope
                       // last window is all tail, and the hasher takes it
                       // once the reducer has drained.
                       absorb_head(w);
-                      stamp_joined(w);
+                      inst_.joined(w);
                     });
   }
 
@@ -908,7 +1030,7 @@ class window_scope
     const window_plan& p = w.plan;
     w.compress.prepare_edge(ops_, w.view().data() + p.head_bytes,
                             p.part_chunks, p.parts, p.first_chunk,
-                            h_.key_words(), h_.mode_flags(), trace_, w.index,
+                            h_.key_words(), h_.mode_flags(), inst_.trace(), w.index,
                             file_index_);
     const std::span<tree_reducer::node> out(w.fold_nodes);
     const ex::inplace_stop_token tok = stop_source_.get_token();
@@ -936,10 +1058,7 @@ class window_scope
               "the reducer refused an edge window's node, which admission "
               "had reserved room for");
     }
-    max_pending_ = std::max(max_pending_, reducer_.pending());
-    if (w.rec != nullptr) {
-      w.rec->t_absorbed = trace_->now();
-    }
+    inst_.absorbed(w, reducer_.pending());
   }
 
   [[nodiscard]] auto compress_stage(window& w) {
@@ -958,7 +1077,7 @@ class window_scope
       return stopped_if<Value>(
           tok, ex::then(std::forward<Stage>(stage),
                         [this, &w](Value v) noexcept {
-                          stamp_agents(w);
+                          inst_.agents_done(w);
                           return v;
                         }));
     } else {
@@ -1024,7 +1143,7 @@ class window_scope
     if (reducer_.pending() + in_flight_nodes_ + cost <= reducer_capacity_) {
       return true;
     }
-    ++admission_stalls_;
+    inst_.stalled();
     return false;
   }
 
@@ -1073,7 +1192,7 @@ class window_scope
     const bool fanned =
         w.compress.prepare(ops_, w.at(), w.chunks,
                            w.plan.first_chunk, h_.key_words(), h_.mode_flags(),
-                           trace_, w.index, file_index_);
+                           inst_.trace(), w.index, file_index_);
     // update_file only reaches the pipeline for windows big enough to fan
     // out; a window that is not is exactly what the fallback path exists
     // for.
@@ -1089,10 +1208,7 @@ class window_scope
     require(reducer_.insert(w.plan.first_chunk, w.chunks, cv),
             "the reducer refused a window's node, which admission had "
             "reserved room for");
-    max_pending_ = std::max(max_pending_, reducer_.pending());
-    if (w.rec != nullptr) {
-      w.rec->t_absorbed = trace_->now();
-    }
+    inst_.absorbed(w, reducer_.pending());
   }
 
   // What every completion but a successful one owes: the read slot back
@@ -1164,7 +1280,7 @@ class window_scope
   }
 
   void release(window& w) noexcept {
-    stamp_released(w);
+    inst_.released(w);
     // Off this scope's list before it goes back on the pool's: a window
     // is on exactly one of the two.
     window** link = &taken_;
@@ -1178,34 +1294,12 @@ class window_scope
     pool_.give_back(&w);
   }
 
-  void claim_record(window& w) noexcept {
-    // t_read_begin was stamped by take_next(), before the driver was
-    // asked for the window: see the note there.
-    w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
-    if (w.rec != nullptr) {
-      w.rec->index = w.index;
-      w.rec->bytes = w.bytes;
-      w.rec->flags =
-          (w.last ? window_record::flag_last : 0) |
-          (w.short_first ? window_record::flag_short_first : 0) |
-          (!w.last && !w.short_first && w.plan.parts > 0
-               ? window_record::flag_part_run
-               : 0);
-      w.rec->slot = w.slot;
-      w.rec->file = file_index_;
-      w.rec->t_wait_begin = w.t_read_begin - trace_->epoch_ns();
-    }
-  }
-
   // The read is in memory: the window gives its read slot back and
   // keeps its buffer. On the driver, inside the read's completion.
   void read_landed(window& w) noexcept {
     w.view_ready = true;
     release_read_slot(w);
-    const std::int64_t t = transfers_.land(w.t_read_begin, w.bytes);
-    if (w.rec != nullptr) {
-      w.rec->t_ready = t - trace_->epoch_ns();
-    }
+    inst_.landed(w, transfers_.land(w.t_read_begin, w.bytes));
   }
 
   void release_read_slot(window& w) noexcept {
@@ -1215,45 +1309,12 @@ class window_scope
     }
   }
 
-  // A window that never reaches the pool has no separate join: its
-  // compute is the hasher's, at the end.
-  void stamp_joined(window& w) noexcept {
-    if (w.rec != nullptr) {
-      w.rec->t_joined = trace_->now();
-    }
-  }
-
-  void stamp_agents(window& w) noexcept {
-    const std::uint64_t busy =
-        w.compress.pt.busy_ns.load(std::memory_order_relaxed);
-    // Outside the record check: the pool's busy share is what says
-    // whether the hash is the constraint, and a caller may want it
-    // without paying for one record per window. The window's agents
-    // have already summed their own time into this counter, so this is
-    // one relaxed add per fanned window on the agent that finished it;
-    // the driver reads it back once, in end().
-    agent_busy_ns_.fetch_add(busy, std::memory_order_relaxed);
-    if (w.rec != nullptr) {
-      w.rec->t_joined = trace_->now();
-      w.rec->agent_busy_ns = busy;
-      w.rec->agents_active =
-          w.compress.pt.active.load(std::memory_order_relaxed);
-      w.rec->flags |= window_record::flag_parallel;
-    }
-  }
-
-  void stamp_released(window& w) noexcept {
-    if (w.rec != nullptr) {
-      w.rec->t_released = trace_->now();
-    }
-  }
-
   hasher& h_;
   driver_loop<D>& loop_;
   window_pool<Budget>& pool_;
   typename D::file& file_;
   Scheduler sched_;
-  trace_buffer* trace_ = nullptr;
+  read_instruments<window> inst_;
   std::uint32_t file_index_ = 0;
   const kern::kernel_ops* ops_ = nullptr;
   unsigned count_ = 0;            // window objects, and windows in flight at most
@@ -1274,15 +1335,7 @@ class window_scope
   window* last_window_ = nullptr;
   std::uint64_t index_ = 0;
   unsigned reading_ = 0;  // windows whose read has not landed
-  unsigned max_reading_ = 0;
-  unsigned max_windows_ = 0;
   std::size_t in_flight_nodes_ = 0;
-  std::uint64_t admission_stalls_ = 0;
-  std::size_t max_pending_ = 0;
-  // The pool's summed compress time over the run. Written by the agent
-  // that finished a window, read by the driver after everything has
-  // joined, so it is atomic where the other counters above are not.
-  std::atomic<std::uint64_t> agent_busy_ns_{0};
 };
 
 // The connected chains of one run: one cell per window the scope may
