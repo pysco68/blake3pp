@@ -3,7 +3,8 @@
 // Where each window of a run sits and how it splits between the hasher
 // and the pool, worked out from the plan and a cursor alone: no driver,
 // scheduler or tracer, so a window can be costed before it is taken and
-// the arithmetic can be tested without running a pipeline.
+// the arithmetic can be tested without running a pipeline. Names no
+// execution provider.
 
 #include <algorithm>
 #include <cassert>
@@ -12,9 +13,9 @@
 #include <type_traits>
 
 #include <blake3pp/core.hpp>
-#include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/contract.hpp>
 #include <blake3pp/detail/pipeline_plan.hpp>
+#include <blake3pp/detail/stack_budget.hpp>
 
 namespace blake3pp::detail {
 

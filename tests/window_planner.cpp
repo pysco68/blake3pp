@@ -13,8 +13,8 @@
 #include <vector>
 
 #include <blake3pp/core.hpp>
-#include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/pipeline_plan.hpp>
+#include <blake3pp/detail/stack_budget.hpp>
 #include <blake3pp/detail/window_planner.hpp>
 #include <doctest/doctest.h>
 
