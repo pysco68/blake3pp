@@ -239,6 +239,14 @@ struct check_counts {
   }
 };
 
+// The first out_len bytes of h's output, as hex.
+[[nodiscard]] std::string hex_of(const blake3pp::hasher& h,
+                                 std::size_t out_len) {
+  std::vector<std::byte> out(out_len);
+  h.finalize(out);
+  return blake3pp::to_hex(out);
+}
+
 #if defined(_MSC_VER)
 // The engine's members carry an alignment, so MSVC pads the class and says
 // so at its closing brace (C4324). The padding is intended.
@@ -265,59 +273,13 @@ class engine {
   // before it. Without a pool each is read into the plain hasher. Either
   // way the mode comes from the options.
   std::string hash_hex(const std::string& path, std::size_t out_len) {
-    std::vector<std::byte> out(out_len);
-    const auto finish = [&](const auto& h) {
-      h.finalize(out);
-      return blake3pp::to_hex(out);
-    };
-    if (path == "-") {
-      blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
-      const auto t0 = std::chrono::steady_clock::now();
-      if (pool_.parallel()) {
-        // --qd reaches a stream as its window count: a stream has one
-        // position and no device queue for a depth to set. Both defaults
-        // are 4, so the default run is unchanged.
-        stream_ = blake3pp::update_stream(
-            h, blake3pp::standard_input(), pool_.scheduler(),
-            {.window_bytes = opts_.io.window_bytes,
-             .windows = opts_.io.queue_depth,
-             .trace = opts_.io.trace});
-        pipelined_ = true;
-      } else {
-        read_stdin_into(h);
-        pipelined_ = false;
-      }
-      wall_ns_ = std::chrono::duration<double, std::nano>(
-                     std::chrono::steady_clock::now() - t0)
-                     .count();
-      return finish(h);
-    }
     blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
-    // Asking for the scheduler is what builds the pool, so a file too small
-    // to fan out does not ask. Below min_pipeline_bytes the library skips
-    // the pipeline and hashes sequentially anyway, and the threads would
-    // be started, parked and joined for nothing. Measured on 16 threads, best
-    // of eleven, a whole run took 7.6 ms with the pool and 4.8 ms without
-    // on a 64 KiB file, and 6.7 and 3.3 ms on an empty one. A size the
-    // filesystem will not give is treated as large: the pipeline is the
-    // better guess for a file of unknown size (a block device, a procfs
-    // entry).
-    std::error_code size_ec;
-    const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
-    const bool worth_a_pool =
-        size_ec || size >= blake3pp::detail::min_pipeline_bytes;
     const auto t0 = std::chrono::steady_clock::now();
-    if (pool_.parallel() && worth_a_pool) {
-      blake3pp::update_file(h, path, pool_.scheduler(), opts_.io);
-      pipelined_ = true;
-    } else {
-      blake3pp::update_file(h, path, opts_.io);
-      pipelined_ = false;
-    }
+    pipelined_ = path == "-" ? hash_stdin(h) : hash_path(h, path);
     wall_ns_ = std::chrono::duration<double, std::nano>(
                    std::chrono::steady_clock::now() - t0)
                    .count();
-    return finish(h);
+    return hex_of(h, out_len);
   }
 
   // The last file's wall clock, and whether it took the pipeline. --diag
@@ -462,9 +424,7 @@ class engine {
     result r;
     try {
       if (o.ok()) {
-        std::vector<std::byte> digest(out_len);
-        h.finalize(digest);
-        r.hex = blake3pp::to_hex(digest);
+        r.hex = hex_of(h, out_len);
       } else if (o.error) {
         r.error = o.error.message();
       } else if (o.stopped) {
@@ -480,14 +440,54 @@ class engine {
     return r;
   }
 
+  // stdin into h: through the stream driver when there is a pool, read
+  // on this thread when not. True when it took the pipeline.
+  bool hash_stdin(blake3pp::hasher& h) {
+    if (!pool_.parallel()) {
+      read_stdin_into(h);
+      return false;
+    }
+    // --qd reaches a stream as its window count: a stream has one
+    // position and no device queue for a depth to set. Both defaults
+    // are 4, so the default run is unchanged.
+    stream_ = blake3pp::update_stream(
+        h, blake3pp::standard_input(), pool_.scheduler(),
+        {.window_bytes = opts_.io.window_bytes,
+         .windows = opts_.io.queue_depth,
+         .trace = opts_.io.trace});
+    return true;
+  }
+
+  // A file into h, the same way. True when it took the pipeline.
+  bool hash_path(blake3pp::hasher& h, const std::string& path) {
+    // Asking for the scheduler is what builds the pool, so a file too small
+    // to fan out does not ask. Below min_pipeline_bytes the library skips
+    // the pipeline and hashes sequentially anyway, and the threads would
+    // be started, parked and joined for nothing. Measured on 16 threads, best
+    // of eleven, a whole run took 7.6 ms with the pool and 4.8 ms without
+    // on a 64 KiB file, and 6.7 and 3.3 ms on an empty one. A size the
+    // filesystem will not give is treated as large: the pipeline is the
+    // better guess for a file of unknown size (a block device, a procfs
+    // entry).
+    std::error_code size_ec;
+    const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
+    const bool worth_a_pool =
+        size_ec || size >= blake3pp::detail::min_pipeline_bytes;
+    if (pool_.parallel() && worth_a_pool) {
+      blake3pp::update_file(h, path, pool_.scheduler(), opts_.io);
+      return true;
+    }
+    blake3pp::update_file(h, path, opts_.io);
+    return false;
+  }
+
   // The sequential path's read of stdin, through the library's stream
   // reader. It retries a read interrupted by a signal (EINTR), waits out
   // a descriptor handed over non-blocking (EAGAIN), and on Windows bounds
   // its ask by what the pipe delivers. stdio's fread reports EINTR and
   // EAGAIN as errors, which would end the run with "Interrupted system
   // call" or "Resource temporarily unavailable".
-  template <class Sink>
-  static void read_stdin_into(Sink& sink) {
+  static void read_stdin_into(blake3pp::hasher& h) {
     blake3pp::detail::stream_reader reader{blake3pp::standard_input()};
     std::vector<std::byte> buf(b3tool::stream_buffer_bytes);
     for (;;) {
@@ -498,7 +498,7 @@ class engine {
       if (r.eof) {
         return;
       }
-      sink.update(std::span{buf}.first(r.bytes));
+      h.update(std::span{buf}.first(r.bytes));
     }
   }
 
