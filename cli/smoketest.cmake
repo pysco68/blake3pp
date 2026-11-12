@@ -57,6 +57,33 @@ function(run_sum out_var result_var)
   endif()
 endfunction()
 
+# blake3ppgen under the emulator, at SMOKE_THREADS workers unless ARGS names
+# its own --threads (or asks for --help). The other arguments are the
+# execute_process() options the cases use, passed through; a macro, so the
+# variables they name are set in the case's own scope.
+macro(run_gen)
+  cmake_parse_arguments(RG "OUTPUT_QUIET;ERROR_QUIET"
+    "OUTPUT_FILE;OUTPUT_VARIABLE;RESULT_VARIABLE;ERROR_VARIABLE;WORKING_DIRECTORY;ENCODING;TIMEOUT"
+    "ARGS" ${ARGN})
+  set(_rg_args ${RG_ARGS})
+  if(NOT "--threads" IN_LIST _rg_args AND NOT "--help" IN_LIST _rg_args)
+    list(APPEND _rg_args --threads ${SMOKE_THREADS})
+  endif()
+  set(_rg_opts "")
+  foreach(_rg_k OUTPUT_FILE OUTPUT_VARIABLE RESULT_VARIABLE ERROR_VARIABLE
+      WORKING_DIRECTORY ENCODING TIMEOUT)
+    if(DEFINED RG_${_rg_k})
+      list(APPEND _rg_opts ${_rg_k} "${RG_${_rg_k}}")
+    endif()
+  endforeach()
+  foreach(_rg_k OUTPUT_QUIET ERROR_QUIET)
+    if(RG_${_rg_k})
+      list(APPEND _rg_opts ${_rg_k})
+    endif()
+  endforeach()
+  execute_process(COMMAND ${EMULATOR} "${GEN}" ${_rg_args} ${_rg_opts})
+endmacro()
+
 if(CASE STREQUAL "version")
   run_sum(out res ARGS --version)
   if(NOT res EQUAL 0 OR NOT out MATCHES "blake3ppsum")
@@ -76,8 +103,7 @@ elseif(CASE STREQUAL "stdin_parallel")
   # A multi-window stream on stdin runs the window pipeline over the
   # stream driver when a pool exists; it must agree with the sequential
   # read and with the file pipeline over the same bytes.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed stdin --length 20000000
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed stdin --length 20000000
     OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
   run_sum(par res1 ARGS --threads 4 - STDIN "${WORK}/stream")
   run_sum(seq res2 ARGS --threads 1 - STDIN "${WORK}/stream")
@@ -94,8 +120,7 @@ elseif(CASE STREQUAL "stdin_diag")
   # --diag over a stream: the stream driver supplies the counters, so a
   # diagnosis is printed. The reading depends on the machine and is not
   # asserted.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed diag --length 20000000
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed diag --length 20000000
     OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
   run_sum(out res ERR_VAR err
     ARGS --diag --window 1 --threads 4 - STDIN "${WORK}/stream")
@@ -119,12 +144,72 @@ elseif(CASE STREQUAL "stdin_diag")
     message(FATAL_ERROR "--diag --check was accepted")
   endif()
 
+elseif(CASE STREQUAL "sum_diag_file")
+  # --diag over one FILE on the pipelined path, and --trace-agents on a
+  # file run, which records the pool's agents as well as the windows. The
+  # reading depends on the machine and is not asserted; the digests are.
+  run_gen(ARGS --seed f --length 20000000
+    OUTPUT_FILE "${WORK}/f" RESULT_VARIABLE r0)
+  run_sum(ref res0 ARGS f)
+  run_sum(out res ERR_VAR err ARGS --diag --window 1 --threads 4 f)
+  if(NOT r0 EQUAL 0 OR NOT res0 EQUAL 0 OR NOT res EQUAL 0)
+    message(FATAL_ERROR "--diag over a file failed (rc=${res}): ${err}")
+  endif()
+  if(NOT err MATCHES "diagnosis:" OR NOT err MATCHES "pool busy"
+     OR err MATCHES "sequential path")
+    message(FATAL_ERROR "--diag over a file reported no reading: ${err}")
+  endif()
+  run_sum(out2 res2 ERR_VAR err2
+    ARGS --trace t.json --trace-agents --window 1 --threads 4 f)
+  if(NOT res2 EQUAL 0)
+    message(FATAL_ERROR "--trace-agents over a file failed (rc=${res2}): ${err2}")
+  endif()
+  if(NOT err2 MATCHES "trace: ([0-9]+) window records and ([0-9]+) agent records"
+     OR CMAKE_MATCH_1 LESS 1 OR CMAKE_MATCH_2 LESS 1)
+    message(FATAL_ERROR "--trace-agents recorded no agents: ${err2}")
+  endif()
+  if(NOT out STREQUAL ref OR NOT out2 STREQUAL ref)
+    message(FATAL_ERROR "a --diag or --trace run changed the digest")
+  endif()
+
+elseif(CASE STREQUAL "gen_diag_trace")
+  # blake3ppgen's own diagnostics on the pipelined path: --verbose names the
+  # write backend, --diag prints a write-side reading, and --trace with
+  # --trace-agents writes the windows and the agents that filled them. The
+  # reading depends on the machine and is not asserted; the bytes are.
+  run_gen(ARGS --seed d --length 20000000 --window 1 --output out
+    --verbose --diag --trace gen.json --trace-agents
+    WORKING_DIRECTORY "${WORK}" ERROR_VARIABLE err RESULT_VARIABLE res
+    ENCODING UTF-8)
+  if(NOT res EQUAL 0)
+    message(FATAL_ERROR "blake3ppgen --diag --trace failed (rc=${res}): ${err}")
+  endif()
+  if(NOT err MATCHES "write backend: [^\n]+ \\(pipeline\\)")
+    message(FATAL_ERROR "--verbose named no pipelined write backend: ${err}")
+  endif()
+  if(NOT err MATCHES "diagnosis: [^\n]+ \\(write side\\)")
+    message(FATAL_ERROR "--diag reported no write-side reading: ${err}")
+  endif()
+  if(NOT err MATCHES "trace: ([0-9]+) window records and ([0-9]+) agent records"
+     OR CMAKE_MATCH_1 LESS 1 OR CMAKE_MATCH_2 LESS 1)
+    message(FATAL_ERROR "--trace-agents recorded no agents: ${err}")
+  endif()
+  if(NOT EXISTS "${WORK}/gen.json")
+    message(FATAL_ERROR "--trace wrote no file")
+  endif()
+  run_gen(ARGS --seed d --length 20000000
+    OUTPUT_FILE "${WORK}/ref" RESULT_VARIABLE r2)
+  file(SHA256 "${WORK}/out" got)
+  file(SHA256 "${WORK}/ref" want)
+  if(NOT r2 EQUAL 0 OR NOT got STREQUAL want)
+    message(FATAL_ERROR "a --diag --trace run wrote different bytes")
+  endif()
+
 elseif(CASE STREQUAL "trace_inputs")
   # Trace storage is sized before the run, so an input whose size is not
   # a FILE argument must still get room for its windows: standard input
   # with no FILE given, and the files a --check list names.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed trace --length 20000000
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed trace --length 20000000
     OUTPUT_FILE "${WORK}/stream" RESULT_VARIABLE r0)
   run_sum(sums res0 ARGS stream)
   file(WRITE "${WORK}/sums" "${sums}")
@@ -163,8 +248,7 @@ elseif(CASE STREQUAL "batch_no_async")
   # hash over one shared context, read through the backend one file gets.
   # The trace names the backend that read; without an async engine in the
   # build all three are synchronous and agree anyway.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed batch --length 1048576
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed batch --length 1048576
     OUTPUT_FILE "${WORK}/a" RESULT_VARIABLE r0)
   file(COPY_FILE "${WORK}/a" "${WORK}/b")
   run_sum(sums res0 ERR_VAR err0 ARGS --no-async --trace one.json a)
@@ -490,12 +574,12 @@ elseif(CASE STREQUAL "gen_utf8_names")
   set(name "Ω-é-文")
   file(WRITE "${WORK}/${name}.seed" "seed of a UTF-8 name")
   file(WRITE "${WORK}/plain.seed" "seed of a UTF-8 name")
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file plain.seed
+  run_gen(ARGS --seed-file plain.seed
     --length 100003 --threads 1
     WORKING_DIRECTORY "${WORK}"
     OUTPUT_FILE "${WORK}/plain.out" RESULT_VARIABLE r0)
   foreach(threads 1 4)
-    execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${name}.seed"
+    run_gen(ARGS --seed-file "${name}.seed"
       --length 100003 --threads ${threads} --output "${name}.${threads}"
       WORKING_DIRECTORY "${WORK}"
       ERROR_VARIABLE err RESULT_VARIABLE res ENCODING UTF-8)
@@ -544,19 +628,16 @@ elseif(CASE STREQUAL "derive_key")
   endif()
 
 elseif(CASE STREQUAL "gen_deterministic")
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 64 --hex
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed smoke --length 64 --hex
     OUTPUT_VARIABLE a RESULT_VARIABLE r1)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 64 --hex
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed smoke --length 64 --hex
     OUTPUT_VARIABLE b RESULT_VARIABLE r2)
   if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT a STREQUAL b)
     message(FATAL_ERROR "gen is not deterministic")
   endif()
   # Cross-check the tools: gen of the empty seed at length 32 IS the
   # blake3 digest of empty input.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --length 32 --hex
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --length 32 --hex
     OUTPUT_VARIABLE g RESULT_VARIABLE r3)
   if(NOT r3 EQUAL 0 OR NOT g MATCHES
      "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262")
@@ -565,11 +646,9 @@ elseif(CASE STREQUAL "gen_deterministic")
 
 elseif(CASE STREQUAL "gen_seek")
   # O(1) seek: a slice at an offset equals that region of the full stream.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --length 148 --hex
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed smoke --length 148 --hex
     OUTPUT_VARIABLE full RESULT_VARIABLE r1)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed smoke --seek 100 --length 48 --hex
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed smoke --seek 100 --length 48 --hex
     OUTPUT_VARIABLE slice RESULT_VARIABLE r2)
   string(SUBSTRING "${full}" 200 96 expected)  # bytes 100..148 as hex
   string(SUBSTRING "${slice}" 0 96 got)
@@ -578,9 +657,9 @@ elseif(CASE STREQUAL "gen_seek")
   endif()
 
 elseif(CASE STREQUAL "gen_threads")
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed t --length 20000000 --threads 1
+  run_gen(ARGS --seed t --length 20000000 --threads 1
     OUTPUT_FILE "${WORK}/one" RESULT_VARIABLE r1)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed t --length 20000000 --threads 4
+  run_gen(ARGS --seed t --length 20000000 --threads 4
     OUTPUT_FILE "${WORK}/four" RESULT_VARIABLE r2)
   execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
     "${WORK}/one" "${WORK}/four" RESULT_VARIABLE same)
@@ -686,7 +765,7 @@ elseif(CASE STREQUAL "trace_write_failure")
   if(r EQUAL 0 OR NOT err MATCHES "could not write /dev/full")
     message(FATAL_ERROR "blake3ppsum --trace /dev/full: exit ${r}: ${err}")
   endif()
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed t --length 64 --threads 4 --output a2
+  run_gen(ARGS --seed t --length 64 --threads 4 --output a2
       --trace /dev/full
     WORKING_DIRECTORY "${WORK}" OUTPUT_QUIET ERROR_VARIABLE err RESULT_VARIABLE r)
   if(r EQUAL 0 OR NOT err MATCHES "/dev/full")
@@ -698,19 +777,18 @@ elseif(CASE STREQUAL "gen_seed_file")
   # spanning several windows must hash identically sequentially and
   # multi-core, and cross-checks against blake3ppsum's extended output of
   # the same file (gen's stream IS that XOF).
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed material --length 20000000
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed material --length 20000000
     OUTPUT_FILE "${WORK}/seed" RESULT_VARIABLE r0)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${WORK}/seed" --length 4000000 --threads 1
+  run_gen(ARGS --seed-file "${WORK}/seed" --length 4000000 --threads 1
     OUTPUT_FILE "${WORK}/one" RESULT_VARIABLE r1)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${WORK}/seed" --length 4000000 --threads 4
+  run_gen(ARGS --seed-file "${WORK}/seed" --length 4000000 --threads 4
     OUTPUT_FILE "${WORK}/four" RESULT_VARIABLE r2)
   execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
     "${WORK}/one" "${WORK}/four" RESULT_VARIABLE same)
   if(NOT r0 EQUAL 0 OR NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT same EQUAL 0)
     message(FATAL_ERROR "seed-file ingestion diverges between 1 and 4 threads")
   endif()
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed-file "${WORK}/seed" --length 64 --hex --threads 4
+  run_gen(ARGS --seed-file "${WORK}/seed" --length 64 --hex --threads 4
     OUTPUT_VARIABLE g RESULT_VARIABLE r3)
   execute_process(COMMAND ${EMULATOR} "${SUM}" --length 64 "${WORK}/seed"
     OUTPUT_VARIABLE s RESULT_VARIABLE r4)
@@ -724,14 +802,12 @@ elseif(CASE STREQUAL "gen_output")
   # --output (direct async I/O when available) must be byte-identical to
   # the stdout stream. Odd length: exercises the unaligned-tail path and
   # the preallocate-then-trim size logic.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed o --length 20000003
     OUTPUT_FILE "${WORK}/stdout_stream" RESULT_VARIABLE r1)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
+  run_gen(ARGS --seed o --length 20000003
     --output "${WORK}/direct"
-    --threads ${SMOKE_THREADS}
     RESULT_VARIABLE r2)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed o --length 20000003
+  run_gen(ARGS --seed o --length 20000003
     --output "${WORK}/threaded" --threads 4 RESULT_VARIABLE r3)
   execute_process(COMMAND ${CMAKE_COMMAND} -E compare_files
     "${WORK}/stdout_stream" "${WORK}/direct" RESULT_VARIABLE same1)
@@ -799,8 +875,7 @@ elseif(CASE STREQUAL "key_forms")
   if(rx EQUAL 0)
     message(FATAL_ERROR "a stdin key followed by four spaces and a byte was accepted: ${x}")
   endif()
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed k --length 20000000
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed k --length 20000000
     OUTPUT_FILE "${WORK}/big" RESULT_VARIABLE rg)
   run_sum(p1 s1 ARGS --keyed hexkey big)
   run_sum(p2 s2 ARGS --keyed hexkey --threads 1 big)
@@ -815,19 +890,16 @@ elseif(CASE STREQUAL "gen_errors")
   # Size parsing (suffixes, a bad suffix, garbage), an infinite --seek, a
   # missing seed file and an unwritable --output all fail cleanly; 1K
   # means 1024.
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 1K --hex
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed s --length 1K --hex
     OUTPUT_VARIABLE a RESULT_VARIABLE r1)
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 1024 --hex
-    --threads ${SMOKE_THREADS}
+  run_gen(ARGS --seed s --length 1024 --hex
     OUTPUT_VARIABLE b RESULT_VARIABLE r2)
   if(NOT r1 EQUAL 0 OR NOT r2 EQUAL 0 OR NOT a STREQUAL b)
     message(FATAL_ERROR "--length 1K is not 1024 bytes")
   endif()
   foreach(bad "--length;12X" "--length;abc" "--seek;inf"
               "--seed-file;${WORK}/nope" "--output;${WORK}/no/such/dir/out")
-    execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s --length 16 ${bad}
-    --threads ${SMOKE_THREADS}
+    run_gen(ARGS --seed s --length 16 ${bad}
     OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE r)
     if(r EQUAL 0)
       message(FATAL_ERROR "gen accepted '${bad}'")
@@ -839,8 +911,7 @@ elseif(CASE STREQUAL "gen_errors")
   # timed-out run leaves a message in r, not an exit code.
   foreach(bad "--length;-1" "--length;16777216T" "--seek;-5"
               "--length;16;--output;${WORK}/window.bin;--window;17592186044416")
-    execute_process(COMMAND ${EMULATOR} "${GEN}" --seed s ${bad}
-      --threads ${SMOKE_THREADS}
+    run_gen(ARGS --seed s ${bad}
       OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE r TIMEOUT 60)
     if(NOT r MATCHES "^[1-9][0-9]*$")
       message(FATAL_ERROR "gen did not reject '${bad}': ${r}")
@@ -915,7 +986,7 @@ elseif(CASE STREQUAL "engines")
 
   # The generator says the same thing in the write spellings, which
   # differ for exactly one engine ("gcd-write").
-  execute_process(COMMAND ${EMULATOR} "${GEN}" --help
+  run_gen(ARGS --help
     OUTPUT_VARIABLE gen_help ERROR_VARIABLE gen_err RESULT_VARIABLE res)
   if(NOT gen_help MATCHES "\\(no ([a-z0-9_/-]+) queue\\)")
     message(FATAL_ERROR "gen --no-async names no engines:\n${gen_help}")
