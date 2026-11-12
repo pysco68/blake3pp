@@ -2,45 +2,6 @@
 # benchmarks (CLI11, tooling/tool_common.hpp, the <format> floor) comes
 # from blake3pp::tooling, set up in the top-level CMakeLists.
 
-add_executable(blake3ppsum sum.cpp)
-target_link_libraries(blake3ppsum PRIVATE
-  blake3pp::blake3pp
-  blake3pp_warnings
-  blake3pp::tooling
-  blake3pp::tool_allocator
-  blake3pp::node_program)
-
-add_executable(blake3ppgen gen.cpp)
-target_link_libraries(blake3ppgen PRIVATE
-  blake3pp::blake3pp
-  blake3pp_warnings
-  blake3pp::tooling
-  blake3pp::tool_allocator
-  blake3pp::node_program)
-
-# The same two sources, built so that --help prints the placeholders
-# docs/tools.md uses in place of what depends on the machine or the build
-# (the core count, the async engines). tools/gen-help-docs.py runs
-# them to write and check the transcripts there. Not built by default and
-# not installed.
-foreach(_tool IN ITEMS sum gen)
-  add_executable(blake3pp${_tool}_help_docs EXCLUDE_FROM_ALL ${_tool}.cpp)
-  target_compile_definitions(blake3pp${_tool}_help_docs PRIVATE
-    BLAKE3PP_HELP_DOCS=1)
-  target_link_libraries(blake3pp${_tool}_help_docs PRIVATE
-    blake3pp::blake3pp
-    blake3pp_warnings
-    blake3pp::tooling
-    blake3pp::tool_allocator
-    blake3pp::node_program)
-  if(TARGET blake3pp_parallel_backend)
-    target_link_libraries(blake3pp${_tool}_help_docs PRIVATE
-      blake3pp::parallel_backend)
-  endif()
-endforeach()
-add_custom_target(help_docs
-  DEPENDS blake3ppsum_help_docs blake3ppgen_help_docs)
-
 # Names on Windows. The tools take names as narrow strings: from argv, from
 # checksum lists, and into std::filesystem::path and the narrow CRT, all
 # of which use the process's ANSI code page. utf8.manifest sets that code
@@ -52,13 +13,41 @@ add_custom_target(help_docs
 # makes std::print write to a console through the wide console API: names
 # then display whatever the console's own code page is, and the console's
 # setting is left alone.
-if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-  foreach(_tool IN ITEMS blake3ppsum blake3ppgen
-      blake3ppsum_help_docs blake3ppgen_help_docs)
-    target_sources(${_tool} PRIVATE utf8.manifest)
-    target_compile_options(${_tool} PRIVATE /utf-8)
-  endforeach()
-endif()
+#
+# One tool over one source, with what every tool links: the sized parallel
+# scheduler too when the build offers one (one definition per program; see
+# the root CMakeLists), and the manifest and /utf-8 above on an MSVC-style
+# compiler. Extra arguments (EXCLUDE_FROM_ALL) go to add_executable().
+function(_blake3pp_cli_tool target source)
+  add_executable(${target} ${ARGN} ${source})
+  target_link_libraries(${target} PRIVATE
+    blake3pp::blake3pp
+    blake3pp_warnings
+    blake3pp::tooling
+    blake3pp::tool_allocator
+    blake3pp::node_program)
+  if(TARGET blake3pp_parallel_backend)
+    target_link_libraries(${target} PRIVATE blake3pp::parallel_backend)
+  endif()
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_sources(${target} PRIVATE utf8.manifest)
+    target_compile_options(${target} PRIVATE /utf-8)
+  endif()
+endfunction()
+
+# Each tool, and the same source built so that --help prints the
+# placeholders docs/tools.md uses in place of what depends on the machine
+# or the build (the core count, the async engines). tools/gen-help-docs.py
+# runs the _help_docs builds to write and check the transcripts there; they
+# are not built by default and not installed.
+foreach(_tool IN ITEMS sum gen)
+  _blake3pp_cli_tool(blake3pp${_tool} ${_tool}.cpp)
+  _blake3pp_cli_tool(blake3pp${_tool}_help_docs ${_tool}.cpp EXCLUDE_FROM_ALL)
+  target_compile_definitions(blake3pp${_tool}_help_docs PRIVATE
+    BLAKE3PP_HELP_DOCS=1)
+endforeach()
+add_custom_target(help_docs
+  DEPENDS blake3ppsum_help_docs blake3ppgen_help_docs)
 
 # Smoke tests, driven by CMake script mode so they run identically on
 # every platform (no shell). They cover known answers, --check round
@@ -170,11 +159,4 @@ if(TARGET pipe_pump AND NOT CMAKE_CROSSCOMPILING)
     set_tests_properties(pipe_runpipe_smoke PROPERTIES RUN_SERIAL TRUE
       REQUIRED_FILES "$<TARGET_FILE:blake3ppsum>;$<TARGET_FILE:pipe_pump>;$<TARGET_FILE:pipe_drain>;$<TARGET_FILE:pipe_rux>")
   endif()
-endif()
-
-# The sized parallel scheduler is one definition per program; the tools
-# take it when the build offers one (see the root CMakeLists).
-if(TARGET blake3pp_parallel_backend)
-  target_link_libraries(blake3ppsum PRIVATE blake3pp::parallel_backend)
-  target_link_libraries(blake3ppgen PRIVATE blake3pp::parallel_backend)
 endif()
