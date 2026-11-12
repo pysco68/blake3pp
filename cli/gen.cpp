@@ -183,8 +183,6 @@ void report_write_diagnosis(const blake3pp::diagnosis& r, unsigned threads) {
   }
 }
 
-}  // namespace
-
 // A write to stdout failed: the reader closed its end, with SIGPIPE
 // ignored or on Windows, which has no SIGPIPE. The stream is incomplete,
 // so the run fails. With SIGPIPE at its default the process dies of the
@@ -498,6 +496,8 @@ int run_main(int argc, char** argv) {
   }
   return 0;
 }
+
+}  // namespace
 
 // The tail of the stream sits in stdout's buffer until a flush, and the
 // flush at exit is silent; flushing and checking here is what turns a
