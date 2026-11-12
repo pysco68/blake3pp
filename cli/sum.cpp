@@ -989,9 +989,7 @@ int run_main(int argc, char** argv) {
             // What the diagnosis cannot show about a stream run: how the
             // windows ended, the pipe buffer the OS granted, and what the
             // reader did before each read.
-            for (const auto& line : b3tool::stream_lines(
-                     eng.stream(),
-                     [](std::uint64_t n) { return b3tool::bytes_label(n); })) {
+            for (const auto& line : b3tool::stream_lines(eng.stream())) {
               println(stderr, "{}", line);
             }
           }

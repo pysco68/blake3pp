@@ -14,6 +14,8 @@
 #include <blake3pp/parallel_io.hpp>
 #include <blake3pp/trace.hpp>
 
+#include "tool_common.hpp"
+
 namespace b3tool {
 
 // A service time at the scale it reads at. Device figures span a drive's
@@ -55,11 +57,9 @@ namespace b3tool {
 // The lines about a stream run that the diagnosis cannot carry, in the
 // order they print under it. Each states what the run did; a figure a
 // platform cannot give is said to be unavailable rather than printed as
-// zero. `bytes_label` is the caller's, so this header stays free of the
-// tool's own helpers.
-template <class BytesLabel>
-[[nodiscard]] std::vector<std::string> stream_lines(
-    const blake3pp::stream_report& s, BytesLabel&& bytes_label) {
+// zero.
+[[nodiscard]] inline std::vector<std::string> stream_lines(
+    const blake3pp::stream_report& s) {
   std::vector<std::string> out;
   if (s.early_hand_over) {
     out.push_back(std::format(
