@@ -678,14 +678,16 @@ struct diagnosis {
 /// often neither.
 ///
 /// @code
+/// // The plan the run will make, for the arena's width and the window.
+/// const blake3pp::file_io_probe plan = blake3pp::probe_file_io(path);
 /// std::vector<blake3pp::window_record> windows(count);
 /// blake3pp::trace_buffer trace(windows);
 /// const auto t0 = std::chrono::steady_clock::now();
-/// blake3pp::update_file(h, path, {.trace = &trace});
+/// blake3pp::update_file(h, path, sched, {.trace = &trace});
 /// const double wall_ns = std::chrono::duration<double, std::nano>(
 ///     std::chrono::steady_clock::now() - t0).count();
 /// const auto d = blake3pp::diagnose_read(trace.driver(), wall_ns, threads,
-///                                        planned, window_bytes);
+///                                        plan.windows, plan.window_bytes);
 /// std::puts(blake3pp::to_string(d.label));
 /// @endcode
 ///

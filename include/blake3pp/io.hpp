@@ -331,9 +331,10 @@ void update_file(hasher& h, const std::filesystem::path& path,
                  std::error_code& ec,
                  const file_io_options& opts = {}) noexcept;
 
-/// What update_file() would engage for a file: the geometry its plan
-/// decides from the options and the file's size, and the rung the open
-/// lands on. See probe_file_io().
+/// What update_file() over a scheduler would engage for a file: the
+/// geometry its plan decides from the options and the file's size, and
+/// the rung the open lands on. The sequential update_file() opens the
+/// same way and reads through queue_depth windows. See probe_file_io().
 struct file_io_probe {
   /// The file's size as the filesystem reports it.
   std::uint64_t file_bytes = 0;
@@ -341,8 +342,8 @@ struct file_io_probe {
   std::size_t window_bytes = 0;
   /// Reads the device sees at once.
   unsigned reads_in_flight = 0;
-  /// Windows in flight at most, reading or being hashed; never more than
-  /// the file has.
+  /// Windows in flight at most, reading or being hashed, in the scheduler
+  /// form; never more than the file has.
   unsigned windows = 0;
   /// Whether the open asks for the cache bypass: the caller's direct_io,
   /// granted only to a file of at least 512 KiB (detail::min_pipeline_bytes)
