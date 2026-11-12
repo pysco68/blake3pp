@@ -72,8 +72,7 @@ inline void chunk_update(const kern::kernel_ops& k, detail::chunk_state& cs,
       cs.block.fill(0);
     }
     const std::size_t take =
-        len < kern::block_len - cs.block_len ? len
-                                             : kern::block_len - cs.block_len;
+        std::min<std::size_t>(len, kern::block_len - cs.block_len);
     std::copy_n(input, take, cs.block.begin() + cs.block_len);
     cs.block_len = static_cast<std::uint8_t>(cs.block_len + take);
     input += take;

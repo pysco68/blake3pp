@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <blake3pp/core.hpp>
 #include <blake3pp/detail/driver.hpp>
 #include <blake3pp/detail/io_geometry.hpp>
 
@@ -58,7 +59,7 @@ inline constexpr std::size_t reducer_nodes = 256;
   const std::size_t per_window = streaming ? nodes_for(parts) : 1;
   const std::size_t edges = streaming ? 0 : 2 * nodes_for(parts);
   const std::size_t needed =
-      2 * 54 + edges +
+      2 * max_cv_stack_depth + edges +
       (static_cast<std::size_t>(windows) + 1) * per_window;
   return std::max(reducer_nodes, needed);
 }

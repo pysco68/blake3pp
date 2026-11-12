@@ -54,6 +54,11 @@ void to_hex(std::span<const std::byte> bytes, std::span<char> out);
 
 namespace detail {
 
+// The deepest a BLAKE3 tree gets: a message of at most 2^64 bytes is at
+// most 2^54 chunks, so a stack of chaining values, one per level, never
+// holds more than 54.
+inline constexpr std::size_t max_cv_stack_depth = 54;
+
 // One chunk (up to 1024 bytes) in flight. The final block of a chunk is kept
 // buffered rather than compressed eagerly. Its flags (CHUNK_END, possibly
 // ROOT) are known only once more input has arrived, or has not.
@@ -388,7 +393,8 @@ class hasher {
   std::array<std::uint32_t, 8> key_words_;
   std::uint32_t base_flags_;
   detail::chunk_state chunk_;
-  std::array<std::array<std::uint32_t, 8>, 54> cv_stack_;
+  std::array<std::array<std::uint32_t, 8>, detail::max_cv_stack_depth>
+      cv_stack_;
   std::uint8_t cv_stack_len_;
   // update_last() leaves the message's rightmost subtree here instead of
   // on the stack: it is the right child of the root parent, the node the
