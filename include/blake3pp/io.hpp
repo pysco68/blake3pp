@@ -49,6 +49,7 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/file_writer.hpp>
 #include <blake3pp/detail/io_geometry.hpp>
+#include <blake3pp/detail/pipeline_plan.hpp>
 
 namespace blake3pp {
 
@@ -267,6 +268,16 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
     return result{};
   }
 }
+
+// The plan update_file() makes over a scheduler, for a hasher whose count
+// is `count`: from the file's size, read before the open because the plan
+// decides the open mode, and a window budget that follows the machine's
+// thread count. A size the filesystem will not give leaves the window
+// count to the budget, and the open reports why. probe_file_io() reports
+// this plan for a fresh hasher. Defined in src/io_hash.cpp.
+[[nodiscard]] pipeline_plan plan_file(const std::filesystem::path& path,
+                                      const file_io_options& opts,
+                                      std::uint64_t count);
 
 }  // namespace detail
 

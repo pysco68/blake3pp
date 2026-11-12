@@ -68,6 +68,8 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/trace.hpp",
           "include/blake3pp/detail/driver.hpp",
           "include/blake3pp/detail/io_geometry.hpp",
+          # Provider-free; io.hpp's plan_file() returns one.
+          "include/blake3pp/detail/pipeline_plan.hpp",
           "include/blake3pp/detail/file_reader.hpp",
           "include/blake3pp/detail/file_writer.hpp",
           # The stream driver and the completion half it borrows. They are

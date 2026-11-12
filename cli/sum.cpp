@@ -971,18 +971,13 @@ int run_main(int argc, char** argv) {
             window = eng.stream().window_bytes;
             windows = eng.stream().windows_planned;
           } else {
-            // The plan update_file() made, from the same budget rule: the
-            // arena figure is read against its window count.
-            window = blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
-            std::error_code size_ec;
-            const std::uintmax_t size =
-                std::filesystem::file_size(o.files.front(), size_ec);
-            windows = blake3pp::detail::plan_pipeline(
-                          0, o.io.window_bytes, o.io.queue_depth, o.io.direct_io,
-                          size_ec ? 0 : static_cast<std::uint64_t>(size),
-                          blake3pp::detail::read_plan_budget_bytes(
-                              hw_threads, o.io.window_bytes))
-                          .windows;
+            // The plan update_file() made, which probe_file_io() reports:
+            // the arena figure is read against its window count.
+            std::error_code probe_ec;
+            const blake3pp::file_io_probe probe =
+                blake3pp::probe_file_io(o.files.front(), probe_ec, o.io);
+            window = probe.window_bytes;
+            windows = probe.windows;
           }
           report_read_diagnosis(
               eng.pipelined()
