@@ -77,8 +77,9 @@ namespace blake3pp::detail::io_impl {
   throw std::system_error(e, std::generic_category(), what);
 }
 
-// The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule.
-constexpr std::size_t direct_align = 4096;
+// The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule: the
+// alignment callers plan their reads around, from driver.hpp.
+constexpr std::size_t direct_align = direct_alignment;
 
 // The buffer arena of the engines and the driver: one direct-I/O-aligned
 // allocation behind an owning pointer, so member declaration order alone

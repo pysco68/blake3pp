@@ -1,17 +1,18 @@
 #pragma once
 
 // The one platform decision left in the I/O layer. Each branch names the
-// reader ENGINE the OS gets and the writer backend, and everything else
-// (the engines and the backends themselves) is straight-line C++. The
-// engine TUs static_assert the concepts (io/backend.hpp) against these
-// aliases, so a backend drifting from the contract fails loudly at this
-// seam, not somewhere inside the engine.
+// io_context the OS gets, and everything else (the engines and the
+// backends themselves) is straight-line C++. The engine TUs
+// static_assert the concepts (io/backend.hpp) against these aliases, so a
+// backend drifting from the contract fails loudly at this seam, not
+// somewhere inside the engine.
 //
-// The reader side names a whole engine, so a platform can bring its own.
-// Every platform runs polled_reader_engine over an io_context today, and
-// the alias is the seam where an engine could differ. The context is
-// named alongside it because detail::io_driver (the file pipeline's
-// compiled seam) drives one directly, without an engine over it.
+// Every platform runs polled_reader_engine and polled_writer_engine over
+// its context, so the engine aliases are written once, after the
+// branches; a platform that brought its own engine would branch there.
+// The context is named on its own because detail::io_driver (the file
+// pipeline's compiled seam) drives one directly, without an engine over
+// it.
 // Internal to src/io/, never installed.
 
 #include "io/engine.hpp"
@@ -20,8 +21,6 @@
 #include "io/uring_backend.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = uring_context;
-using native_reader_engine = polled_reader_engine<native_io_context>;
-using native_writer_engine = polled_writer_engine<native_io_context>;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(_WIN32)
 #include <cstddef>
@@ -271,35 +270,30 @@ class windows_context {
 static_assert(io_context<windows_context>);
 
 using native_io_context = windows_context;
-using native_reader_engine = polled_reader_engine<native_io_context>;
-using native_writer_engine = polled_writer_engine<native_io_context>;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__APPLE__)
 #include "io/gcd_backend.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = gcd_context;
-using native_reader_engine = polled_reader_engine<native_io_context>;
-using native_writer_engine = polled_writer_engine<native_io_context>;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__FreeBSD__)
 #include "io/aio_backend.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = aio_context;
-using native_reader_engine = polled_reader_engine<native_io_context>;
-using native_writer_engine = polled_writer_engine<native_io_context>;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__unix__)
 #include "io/pread_backend.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = pread_context;
-using native_reader_engine = polled_reader_engine<native_io_context>;
-using native_writer_engine = polled_writer_engine<native_io_context>;
 }  // namespace blake3pp::detail::io_impl
 #else
 #include "io/stdio_backend.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = stdio_context;
+}  // namespace blake3pp::detail::io_impl
+#endif
+
+namespace blake3pp::detail::io_impl {
 using native_reader_engine = polled_reader_engine<native_io_context>;
 using native_writer_engine = polled_writer_engine<native_io_context>;
 }  // namespace blake3pp::detail::io_impl
-#endif
