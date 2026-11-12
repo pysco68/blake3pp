@@ -53,20 +53,6 @@
 #include "io/backend.hpp"
 #include "io/posix_file.hpp"
 
-// MemorySanitizer cannot see an AIO completion: the kernel fills the read
-// buffer without any libc call MSan intercepts, so the bytes stay
-// "uninitialized" in its shadow. Read completions therefore unpoison the
-// range they filled, stating a fact MSan has no other way to learn.
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-#include <sanitizer/msan_interface.h>
-#define BLAKE3PP_MSAN_UNPOISON(ptr, len) __msan_unpoison(ptr, len)
-#endif
-#endif
-#if !defined(BLAKE3PP_MSAN_UNPOISON)
-#define BLAKE3PP_MSAN_UNPOISON(ptr, len) ((void)0)
-#endif
-
 namespace blake3pp::detail::io_impl {
 
 // Names the reason AIO is absent, for the fallback backend name the tools
@@ -935,8 +921,8 @@ class aio_context {
       return false;
     }
     if (!op.is_write) {
-      BLAKE3PP_MSAN_UNPOISON(op.buf.data() + op.filled,
-                             static_cast<std::size_t>(r.res));
+      msan_unpoison(op.buf.data() + op.filled,
+                    static_cast<std::size_t>(r.res));
     }
     op.filled += static_cast<std::size_t>(r.res);
     if (op.filled < op.length()) {
