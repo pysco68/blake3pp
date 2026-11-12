@@ -378,8 +378,18 @@ struct uring {
   // The one place the submission tail moves: the entry goes into the
   // next slot and the tail is published with release semantics, which
   // is what the kernel's acquire pairs with.
+  //
+  // Nothing here checks for a full queue: the context sizes the ring for
+  // twice the transfers it was built for plus the wake poll, and every
+  // caller keeps under that count -- a pipeline holds at most one read per
+  // window, and builds its driver for its window count. The assert says
+  // what that rests on.
   void push_sqe(const io_uring_sqe& sqe) noexcept {
     const unsigned tail = *sq_tail;
+    assert(tail - std::atomic_ref<unsigned>(*sq_head).load(
+                      std::memory_order_acquire) <
+               sq_entries &&
+           "the submission queue is sized for every entry in flight");
     const unsigned idx = tail & *sq_mask;
     std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
     std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
@@ -390,22 +400,22 @@ struct uring {
   // Hands the kernel everything queued since it last looked, in one
   // enter. It submits the whole head-to-tail span, so a failed enter is
   // recoverable: its entries stay published, and the next flush picks them
-  // up in order.
-  void flush() {
+  // up in order. Returns 0, or the errno of an enter the kernel refused,
+  // which is an expected answer rather than a failure of this call.
+  [[nodiscard]] int flush() noexcept {
     for (;;) {
       const unsigned tail = *sq_tail;
       const unsigned head =
           std::atomic_ref<unsigned>(*sq_head).load(std::memory_order_acquire);
       if (tail == head) {
-        return;
+        return 0;
       }
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
       if (take_seam(stall_submits)) {
-        return;  // n == 0: the entries stay published
+        return 0;  // n == 0: the entries stay published
       }
       if (refuse_submit.load() || take_seam(refuse_submits)) {
-        errno = EAGAIN;
-        throw_errno("io_uring_enter(submit)");
+        return EAGAIN;
       }
 #endif
       const int n = sys_io_uring_enter(fd.get(), tail - head, 0, 0);
@@ -416,12 +426,12 @@ struct uring {
         // forget() waits out a count that includes them, so they are
         // offered again here. n == 0 is no progress: leave them.
         if (n == 0 || static_cast<unsigned>(n) == tail - head) {
-          return;
+          return 0;
         }
         continue;
       }
       if (errno != EINTR) {
-        throw_errno("io_uring_enter(submit)");
+        return errno;
       }
     }
   }
@@ -442,15 +452,6 @@ struct uring {
       fn(sqe.user_data);
     }
     std::atomic_ref<unsigned>(*sq_tail).store(head, std::memory_order_release);
-  }
-
-  // Queues one READ or WRITE and submits immediately: the writer engine's
-  // one-at-a-time shape.
-  void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
-                 unsigned len, std::uint64_t off, std::uint64_t user_data,
-                 bool offload = false) {
-    fill_rw(opcode, file_fd, buf, len, off, user_data, offload);
-    flush();
   }
 
   // Takes one completion if the ring has one. False leaves the ring
@@ -743,12 +744,7 @@ class uring_context {
   // would leave them counted and uncompleted. They go to the pump's lanes
   // instead.
   void flush() noexcept {
-    if (!use_uring_) {
-      return;
-    }
-    try {
-      ring_.flush();
-    } catch (const std::system_error&) {
+    if (use_uring_ && ring_.flush() != 0) {
       defer_unsubmitted();
     }
   }
@@ -861,11 +857,7 @@ class uring_context {
     // memory this call is about to release. What the kernel refuses comes
     // back on the deferred list, where the sweep below drops this file's
     // share.
-    try {
-      ring_.flush();
-    } catch (const std::system_error&) {
-      defer_unsubmitted();
-    }
+    flush();
     for (;;) {
       std::size_t refused = pump_.remove_queued_if(mine);
       pump_.quiesce();
@@ -907,11 +899,7 @@ class uring_context {
         continue;
       }
       if (settle(op, ud, res)) {
-        try {
-          ring_.flush();
-        } catch (const std::system_error&) {
-          defer_unsubmitted();
-        }
+        flush();
       }
     }
   }
@@ -984,16 +972,18 @@ class uring_context {
   [[nodiscard]] transfer* op_from(std::uint64_t ud) const noexcept {
     return std::bit_cast<transfer*>(static_cast<std::uintptr_t>(ud));
   }
-  // The wake completion needs a user_data no transfer can wear; its own
-  // op's address is one, and costs nothing. A cancel's CQE needs the
-  // same, and for the same reason: reaping it as a read would walk to a
-  // transfer that does not exist.
-  [[nodiscard]] std::uint64_t wake_ud() const noexcept {
-    return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(&wake_op_));
+  // The wake completion needs a user_data no transfer can wear, and so
+  // does a cancel's CQE: reaping either as a read would walk to a
+  // transfer that does not exist. A transfer's user_data is its aligned
+  // address, which is never 1 or 2.
+  static constexpr std::uint64_t wake_ud_value = 1;
+  static constexpr std::uint64_t cancel_ud_value = 2;
+  static_assert(alignof(transfer) > cancel_ud_value);
+  [[nodiscard]] static constexpr std::uint64_t wake_ud() noexcept {
+    return wake_ud_value;
   }
-  [[nodiscard]] std::uint64_t cancel_ud() const noexcept {
-    return static_cast<std::uint64_t>(
-        std::bit_cast<std::uintptr_t>(&cancel_op_));
+  [[nodiscard]] static constexpr std::uint64_t cancel_ud() noexcept {
+    return cancel_ud_value;
   }
 
   void arm_wake() noexcept {
@@ -1083,11 +1073,7 @@ class uring_context {
     if (requeued) {
       // The continuation of a short read is the same kind of entry as
       // the read itself, and the same refusal leaves it owed.
-      try {
-        ring_.flush();
-      } catch (const std::system_error&) {
-        defer_unsubmitted();
-      }
+      flush();
     }
     return ran;
   }
@@ -1191,11 +1177,8 @@ class uring_context {
 
   // Declaration order is the teardown contract: the ring drains, and
   // with it the one-shot poll armed on the eventfd, before the eventfd
-  // is closed and before the op whose address that poll wears goes.
-  // Do not move ring_ above these two.
+  // is closed. Do not move ring_ above waiter_.
   poll_waiter waiter_;
-  transfer wake_op_{};    // address only: the wake completion's user_data
-  transfer cancel_op_{};  // address only: every cancel CQE's user_data
   uring ring_;
   // After the waiter its lanes signal, so the waiter outlives the join in
   // the pump's destructor. The lanes touch nothing declared below.
