@@ -156,7 +156,9 @@ TEST_CASE("the three reductions agree on every kernel and size") {
         std::array<std::uint32_t, 8> from_group{};
         blake3pp::core::compress_subtree_to_cv_recursive(
             *ops, data.data(), chunks, counter, key, 0, from_recursion);
-        blake3pp::core::compress_subtree_to_cv_folded<>(
+        // The fold: the sweep with one leaf per burst, which a
+        // BLAKE3PP_SUBTREE_FOLD build selects.
+        blake3pp::core::compress_subtree_to_cv_grouped<1>(
             *ops, data.data(), chunks, counter, key, 0, from_fold);
         blake3pp::core::compress_subtree_to_cv_grouped<>(
             *ops, data.data(), chunks, counter, key, 0, from_group);
@@ -288,10 +290,10 @@ TEST_CASE("a stack bound that just fits still folds") {
   const auto data = pattern(2048 * blake3pp::chunk_size);
   std::array<std::uint32_t, 8> wide{};
   std::array<std::uint32_t, 8> tight{};
-  blake3pp::core::compress_subtree_to_cv_folded<54>(*ops, data.data(), 2048, 0,
-                                                    key, 0, wide);
-  blake3pp::core::compress_subtree_to_cv_folded<11>(*ops, data.data(), 2048, 0,
-                                                    key, 0, tight);
+  blake3pp::core::compress_subtree_to_cv_grouped<1, 54>(
+      *ops, data.data(), 2048, 0, key, 0, wide);
+  blake3pp::core::compress_subtree_to_cv_grouped<1, 11>(
+      *ops, data.data(), 2048, 0, key, 0, tight);
   CHECK(tight == wide);
 }
 
