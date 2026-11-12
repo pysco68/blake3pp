@@ -177,10 +177,10 @@ class aio_context {
       // failing the open: UFS reserves, ZFS answers EINVAL and the writes
       // extend the file as they land, which is what every backend without
       // preallocation does anyway.
-      if (write_ && how.preallocate_bytes > 0 &&
-          ::posix_fallocate(f_.fd_plain(), 0,
-                            static_cast<off_t>(how.preallocate_bytes)) == 0) {
-        prealloc_ = how.preallocate_bytes;
+      if (write_ && how.preallocate_bytes > 0) {
+        [[maybe_unused]] const int refused =
+            ::posix_fallocate(f_.fd_plain(), 0,
+                              static_cast<off_t>(how.preallocate_bytes));
       }
       bool direct_refused = false;
       if (how.direct_io) {
@@ -221,7 +221,6 @@ class aio_context {
       if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
-      prealloc_ = 0;
     }
 
    private:
@@ -243,7 +242,6 @@ class aio_context {
 
     posix_file f_;
     std::uint64_t size_ = 0;
-    std::uint64_t prealloc_ = 0;
     std::string name_;
     // This file's share of the context's count, which is what forget()
     // waits out. The context-wide count stays the sum of these.
@@ -521,7 +519,7 @@ class aio_context {
   void forget(file& f) noexcept {
     // The file stays on files_: it is still open and may be read again, and
     // a later context-wide drain has to be able to zero its count.
-    drop_queued(f, pending_);
+    drop_queued(f);
     drop_pumped(f);
     if (!use_aio_ || f.inflight_ == 0) {
       return;
@@ -556,7 +554,7 @@ class aio_context {
       }
       // A continuation of this file's own transfer is dropped the same
       // way its first piece was: it never left for the kernel.
-      drop_queued(f, pending_);
+      drop_queued(f);
       drop_pumped(f);
     }
   }
@@ -892,10 +890,10 @@ class aio_context {
   // does, and the first half of what a completion does.
   void retire(transfer& op) noexcept {
     in_flight_ -= std::min<std::size_t>(1, in_flight_);
-    if (op.owner_file != nullptr) {
-      op.owner_file->inflight_ -=
-          std::min<std::size_t>(1, op.owner_file->inflight_);
-    }
+    assert(op.owner_file != nullptr &&
+           "every transfer is armed with its file");
+    op.owner_file->inflight_ -=
+        std::min<std::size_t>(1, op.owner_file->inflight_);
   }
 
   // What one completion of `op` means. A transfer short of its length
@@ -1058,11 +1056,11 @@ class aio_context {
     complete(op, ec);
   }
 
-  // Drops one file's share of a queue, with no wait and no callback:
-  // nothing on either queue was ever given to the kernel, so the request
-  // each entry holds goes straight back to the pool.
-  void drop_queued(file& f, deferred_ops<transfer>& q) noexcept {
-    const std::size_t dropped = q.remove_if([&](transfer& op) noexcept {
+  // Drops one file's share of pending_, with no wait and no callback:
+  // nothing on it was ever given to the kernel, so the request each entry
+  // holds goes straight back to the pool.
+  void drop_queued(file& f) noexcept {
+    const std::size_t dropped = pending_.remove_if([&](transfer& op) noexcept {
       if (op.owner_file != &f) {
         return false;
       }

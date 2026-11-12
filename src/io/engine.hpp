@@ -216,8 +216,9 @@ class polled_reader_engine {
 
   // Declaration order is the teardown contract: the file closes first,
   // then the context drains every read still owed (running no callback),
-  // and only then is the pool it was reading into freed. Do not reorder
-  // these three members.
+  // and only then is the pool it was reading into freed. slots_, declared
+  // above them, goes last of all: it holds the operations the context may
+  // still own until its drain returns. Do not reorder these four members.
   aligned_buffer pool_;
   C ctx_;
   typename C::file file_;
@@ -246,7 +247,6 @@ class polled_writer_engine {
                        const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
         qd_(clamp_queue_depth(opts.queue_depth)),
-        preallocated_(opts.preallocate_bytes),
         slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
         ctx_(reader_context_options{.async = opts.async,
@@ -344,7 +344,6 @@ class polled_writer_engine {
     // flush), and "finish() lands" has to hold for every backend. On
     // the others it is one truncate to the size the file already has.
     file_.set_size(written_);
-    preallocated_ = 0;
   }
 
  private:
@@ -400,15 +399,15 @@ class polled_writer_engine {
   unsigned next_slot_ = 0;       // round-robin acquire order
   std::uint64_t offset_ = 0;     // next sequential file offset
   std::uint64_t written_ = 0;    // total bytes accepted via submit()
-  std::uint64_t preallocated_ = 0;
   std::error_code failed_{};     // the first error, until it is reported
   bool tail_submitted_ = false;  // a partial submit closes the stream
   std::vector<slot_state> slots_;
 
   // Declaration order is the teardown contract: the file closes first,
   // then the context drains every write still owed (running no callback),
-  // and only then is the pool it was writing from freed. Do not reorder
-  // these three members.
+  // and only then is the pool it was writing from freed. slots_, declared
+  // above them, goes last of all: it holds the operations the context may
+  // still own until its drain returns. Do not reorder these four members.
   aligned_buffer pool_;
   C ctx_;
   typename C::file file_;

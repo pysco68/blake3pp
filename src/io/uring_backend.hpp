@@ -496,7 +496,6 @@ class uring_context {
     std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
     std::size_t filled = 0;
-    int fd = -1;                      // the fd this transfer rides
     posix_file* sync_file = nullptr;  // the deferred path needs the pair
     file* owner_file = nullptr;       // whose transfer this is, for forget()
     transfer* next_deferred = nullptr;
@@ -524,10 +523,12 @@ class uring_context {
       // that extends the file serializes on the inode lock, and with
       // async direct I/O that collapses the whole queue to one stalled
       // write at a time. set_size() trims back afterwards.
-      if (write_ && how.preallocate_bytes > 0 &&
-          ::fallocate(f_.fd_plain(), 0, 0,
-                      static_cast<off_t>(how.preallocate_bytes)) == 0) {
-        prealloc_ = how.preallocate_bytes;
+      // A refusal costs only that: the writes extend the file as they
+      // land.
+      if (write_ && how.preallocate_bytes > 0) {
+        [[maybe_unused]] const int refused =
+            ::fallocate(f_.fd_plain(), 0, 0,
+                        static_cast<off_t>(how.preallocate_bytes));
       }
       if (how.direct_io) {
         // Not TRUNC on the reopen: already truncated, and the tail keeps
@@ -562,14 +563,12 @@ class uring_context {
       if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
-      prealloc_ = 0;
     }
 
    private:
     friend class uring_context;
     posix_file f_;
     std::uint64_t size_ = 0;
-    std::uint64_t prealloc_ = 0;
     std::string name_;
     // This file's share of the context's count, which is what forget()
     // waits out. The context-wide count stays the sum of these.
@@ -658,7 +657,6 @@ class uring_context {
   void arm(transfer& op, file& f, std::uint64_t off) noexcept {
     op.off = off;
     op.filled = 0;
-    op.fd = f.f_.fd();
     op.sync_file = &f.f_;
     op.owner_file = &f;
     op.next_deferred = nullptr;
@@ -709,7 +707,6 @@ class uring_context {
     const ring_piece piece = piece_for(op, op.off, len);
     if (piece.fd >= 0) {
       op.on_ring = true;
-      op.fd = piece.fd;
       // The piece is the kernel's from here, and charged to the device
       // from here.
       op.device_begin();
@@ -1007,9 +1004,9 @@ class uring_context {
   void complete(transfer& op, std::error_code ec) noexcept {
     device_.add_if_served(op.device_total_ns());
     in_flight_--;
-    if (op.owner_file != nullptr) {
-      op.owner_file->inflight_--;
-    }
+    assert(op.owner_file != nullptr &&
+           "every transfer is armed with its file");
+    op.owner_file->inflight_--;
     op.done(&op, ec);
   }
 
@@ -1048,7 +1045,6 @@ class uring_context {
         pump_.push(op);
         return false;
       }
-      op.fd = piece.fd;
       op.device_begin();
       ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, piece.fd,
                     from, static_cast<unsigned>(piece.len), op.off + op.filled,

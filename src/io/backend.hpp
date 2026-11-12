@@ -49,6 +49,7 @@
 #include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for the arena
 #endif
 #include <algorithm>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -730,7 +731,6 @@ class deferred_pump {
     if (!lanes_.running()) {
       lanes_.start(&lane_body, &lane_unblock, this);
     }
-    op.next_deferred = nullptr;
     accrue();
     queue_.push(op);
     ++queued_;
@@ -1189,9 +1189,9 @@ class sync_context {
 
   void report(transfer& op) noexcept {
     queued_--;
-    if (op.owner_file != nullptr) {
-      op.owner_file->queued_--;
-    }
+    assert(op.owner_file != nullptr &&
+           "every transfer is queued with its file");
+    op.owner_file->queued_--;
     device_.add_if_served(op.device_total_ns());
     op.done(&op, op.result());
   }
