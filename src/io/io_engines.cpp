@@ -39,10 +39,12 @@
 
 #include <blake3pp/io.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -76,12 +78,8 @@ constexpr engine_row engine_table[] = {
 constexpr std::size_t num_engines = std::size(engine_table);
 
 constexpr const engine_row* row_for(io_engine e) noexcept {
-  for (const engine_row& r : engine_table) {
-    if (r.e == e) {
-      return &r;
-    }
-  }
-  return nullptr;
+  const auto it = std::ranges::find(engine_table, e, &engine_row::e);
+  return it != std::ranges::end(engine_table) ? &*it : nullptr;
 }
 
 constexpr unsigned rank_of(io_engine e) noexcept {
@@ -245,12 +243,7 @@ io_engine engaged_engine() noexcept {
 
 bool is_available(io_engine e) noexcept {
   const std::span<const io_engine> granted = available_io_engines();
-  for (const io_engine g : granted) {
-    if (g == e) {
-      return true;
-    }
-  }
-  return false;
+  return std::ranges::find(granted, e) != granted.end();
 }
 
 std::span<const io_engine> compiled_io_engines() noexcept { return ladder; }
@@ -263,10 +256,8 @@ std::span<const io_engine> available_io_engines() noexcept {
   // second pass over anything.
   const io_engine best = engaged_engine();
   const std::span<const io_engine> all{ladder};
-  for (std::size_t i = 0; i < all.size(); ++i) {
-    if (all[i] == best) {
-      return all.subspan(i);
-    }
+  if (const auto it = std::ranges::find(all, best); it != all.end()) {
+    return all.subspan(static_cast<std::size_t>(it - all.begin()));
   }
   // Unreachable: the verdict is one of the ladder's own rungs. The
   // floor is the answer that is always true if it ever is reached.
