@@ -47,21 +47,7 @@ static_assert(u32v::width > 1 || arch::BLAKE3PP_ARCH_NS == arch::scalar,
               "another BLAKE3PP_SIMD_PROVIDER for it, or build the scalar "
               "variant instead");
 
-// Little-endian load and store, spelled memcpy plus byteswap instead of
-// the byte-wise shift-or idiom. GCC and Clang fold both spellings to a
-// single mov on LE targets. MSVC 19.51 does not recognize the shift-or
-// idiom at all: it emitted the four movzx/shl/or per word verbatim, ten
-// instructions per message word in the scalar kernel's block loop.
-//
-// The memcpy folds to one mov on every compiler, and the byteswap arm
-// keeps the endian independence of the shift-or spelling.
-//
-// std::byteswap is C++23; the C++20 presets get the shift-mask spelling,
-// which every compiler folds to a single bswap. Feature-tested rather
-// than __cplusplus-gated, and needed even though the call sits in a
-// discarded if-constexpr branch: non-dependent names in discarded
-// branches must still exist.
-using endian::bswap32;
+// Little-endian loads and stores; see endian.hpp.
 using endian::load32;
 using endian::store32;
 
@@ -90,12 +76,7 @@ using endian::store32;
 #define BLAKE3PP_ALIGN_MESSAGE_BLOCK 0
 #endif
 
-template <int N>
-BLAKE3PP_FORCE_INLINE std::uint32_t rot(std::uint32_t x) noexcept {
-  return std::rotr(x, N);
-}
-
-// Scalar twin of the wide xor_rot in transpose.hpp: the rounds are written
+// Scalar twin of the wide xor_rot in rotate.hpp: the rounds are written
 // against the fused form so SVE2's XAR can claim it; everywhere else the
 // compilers fold this back to the eor + ror pair.
 template <int N>

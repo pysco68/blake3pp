@@ -3,7 +3,7 @@
 // Arch-agnostic BLAKE3 structure: chunk states, the chaining-value stack
 // discipline, parent nodes, and root finalization. All compression is routed
 // through a kernel_ops table so the same logic drives every architecture
-// variant. Header-only and allocation-free; the parallel engine (M3) reuses
+// variant. Header-only and allocation-free; the parallel engine reuses
 // these pieces for subtree hashing.
 
 #include <algorithm>
