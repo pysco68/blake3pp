@@ -259,20 +259,14 @@ std::optional<arch> arch_from_string(std::string_view name) noexcept {
 
 namespace detail {
 
+// A variant this build or this CPU lacks falls back to the best one
+// available, which is always registered: the available set is filtered
+// from the registry.
 const kern::kernel_ops* resolve(arch a) noexcept {
-  if (a == arch::auto_detect || !cpu_supports_impl(a)) {
+  if (a == arch::auto_detect || !is_available(a)) {
     a = best_available();
   }
-  if (const registry_entry* e = find_registry(a); e != nullptr) {
-    return e->ops;
-  }
-  // Requested variant not compiled in: fall back to the best one that is.
-  for (const arch b : available_impl()) {
-    if (const registry_entry* e = find_registry(b); e != nullptr) {
-      return e->ops;
-    }
-  }
-  return registry[0].ops;  // unreachable: scalar is always registered
+  return find_registry(a)->ops;
 }
 
 }  // namespace detail
