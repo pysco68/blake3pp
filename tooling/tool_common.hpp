@@ -128,8 +128,7 @@ inline constexpr bool help_docs = false;
 // The --threads default: every hardware thread, and never 0 (which
 // hardware_concurrency() may report when it cannot tell).
 [[nodiscard]] inline unsigned default_threads() noexcept {
-  const unsigned n = std::thread::hardware_concurrency();
-  return n == 0 ? 1 : n;
+  return blake3pp::detail::pool_threads(std::thread::hardware_concurrency());
 }
 
 // How --help shows the --threads default.
