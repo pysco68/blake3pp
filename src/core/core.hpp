@@ -82,13 +82,11 @@ inline void chunk_update(const kern::kernel_ops& k, detail::chunk_state& cs,
 
 inline output chunk_output(const detail::chunk_state& cs,
                            std::uint32_t base_flags) noexcept {
-  output o;
-  o.input_cv = cs.cv;
-  o.block = cs.block;
-  o.block_len = cs.block_len;
-  o.counter = cs.chunk_counter;
-  o.flags = chunk_start_flag(cs) | kern::flag_chunk_end | base_flags;
-  return o;
+  return {.input_cv = cs.cv,
+          .block = cs.block,
+          .block_len = cs.block_len,
+          .counter = cs.chunk_counter,
+          .flags = chunk_start_flag(cs) | kern::flag_chunk_end | base_flags};
 }
 
 // Parent nodes always compress one full block (left CV || right CV) with

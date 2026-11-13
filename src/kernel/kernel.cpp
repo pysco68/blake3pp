@@ -629,12 +629,12 @@ extern const kernel_ops ops;
 const kernel_ops ops = {
     // The namespace token doubles as the enum ID, the same single-source-
     // of-truth convention the generated registry relies on.
-    arch::BLAKE3PP_ARCH_NS,
-    /*simd_degree=*/u32v::width,
-    &compress_in_place,
-    &compress_xof,
-    &xof_many,
-    &hash_many,
+    .variant = arch::BLAKE3PP_ARCH_NS,
+    .simd_degree = u32v::width,
+    .compress_in_place = &compress_in_place,
+    .compress_xof = &compress_xof,
+    .xof_many = &xof_many,
+    .hash_many = &hash_many,
 };
 
 }  // namespace blake3pp::kern::BLAKE3PP_ARCH_NS
