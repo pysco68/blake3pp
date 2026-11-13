@@ -148,7 +148,7 @@ OPTIONS:
           --diag Needs: --output
                               report on stderr which side limited the run (the generator or the
                               device); needs --output and --length on the pipelined path
-          --window UINT Needs: --output
+          --window UINT:MiB Needs: --output
                               with --output: write buffer size in MiB (default: 8 MiB with
                               --threads 1; otherwise 4 MiB with --length, or without it 4 MiB
                               per generator thread up to 64 MiB)

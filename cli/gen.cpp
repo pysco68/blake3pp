@@ -211,7 +211,7 @@ int run_main(int argc, char** argv) {
   std::string trace_path;
   bool trace_agents = false;
   bool diag = false;
-  std::size_t window_mib = 0;
+  std::size_t window_bytes = 0;
   unsigned qd = 0;
   bool verbose = false;
   unsigned threads = b3tool::default_threads();
@@ -243,7 +243,7 @@ int run_main(int argc, char** argv) {
   auto* trace_opt = app.add_option("--trace", trace_path, "with --output and --length, on the pipelined path: record per-window timing and write it as Chrome trace JSON to PATH (open in ui.perfetto.dev)")->needs(output_opt);
   app.add_flag("--trace-agents", trace_agents, "with --trace: also record which CPU filled each window, and for how long")->needs(trace_opt);
   app.add_flag("--diag", diag, "report on stderr which side limited the run (the generator or the device); needs --output and --length on the pipelined path")->needs(output_opt);
-  app.add_option("--window", window_mib, "with --output: write buffer size in MiB (default: 8 MiB with --threads 1; otherwise 4 MiB with --length, or without it 4 MiB per generator thread up to 64 MiB)")->needs(output_opt);
+  app.add_option("--window", window_bytes, "with --output: write buffer size in MiB (default: 8 MiB with --threads 1; otherwise 4 MiB with --length, or without it 4 MiB per generator thread up to 64 MiB)")->transform(b3tool::mib_to_bytes)->needs(output_opt);
   app.add_option("--qd", qd, "with --output: write buffers in flight (default: one per generator thread with --length and more than one thread, otherwise 2; the writer clamps it to its range)")->needs(output_opt);
   app.add_flag("-v,--verbose", verbose, "report the engaged write backend on stderr");
   app.add_option("--threads", threads, "generator threads (1 = sequential; default: all)")->check(b3tool::at_least_one_thread)->default_str(b3tool::threads_default_str());
@@ -258,10 +258,6 @@ int run_main(int argc, char** argv) {
       throw CLI::ValidationError("--seek", "must be finite");
     }
     seek = *seek_to;
-    // --window is MiB in a size_t; above this the byte count wraps.
-    if (window_mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
-      throw CLI::ValidationError("--window", "too large");
-    }
   } catch (const std::exception& e) {
     println(stderr, "blake3ppgen: {}", e.what());
     return b3tool::exit_usage;
@@ -337,7 +333,7 @@ int run_main(int argc, char** argv) {
       // One window per thread, each one segment, so every thread has a
       // window to generate into. The depth is this pool's size: the
       // library's automatic depth counts the machine's threads.
-      wopts.window_bytes = window_mib > 0 ? window_mib * 1024 * 1024 : segment;
+      wopts.window_bytes = window_bytes > 0 ? window_bytes : segment;
       wopts.queue_depth = qd > 0 ? qd : threads;
       const std::uint64_t total = *remaining.total();
       // One record per window, and with --trace-agents one agent record
@@ -433,8 +429,8 @@ int run_main(int argc, char** argv) {
       wopts.offload_submit = !inline_submit;
       wopts.ioring = !no_ioring;
       wopts.waive_zero_fill = waive_zero_fill;
-      if (window_mib > 0) {
-        wopts.window_bytes = window_mib * 1024 * 1024;
+      if (window_bytes > 0) {
+        wopts.window_bytes = window_bytes;
       } else if (pool.parallel()) {
         // One segment per thread so every fill fans out, capped at
         // max_buffer: on a 32-thread machine writing to a striped NVMe
