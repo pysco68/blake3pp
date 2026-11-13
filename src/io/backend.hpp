@@ -772,6 +772,25 @@ class deferred_pump {
     return op;
   }
 
+  // Hands `report` every transfer the lanes finished, then the one
+  // run_one_here() serves for a context that got no lanes. Returns how
+  // many it reported. From the polling thread only.
+  template <class Report>
+  std::size_t report_finished(Report&& report) noexcept {
+    std::size_t ran = 0;
+    for (Op* op = take_done(); op != nullptr;) {
+      Op* const next = op->next_deferred;
+      report(*op);
+      ++ran;
+      op = next;
+    }
+    if (Op* const op = run_one_here(); op != nullptr) {
+      report(*op);
+      ++ran;
+    }
+    return ran;
+  }
+
   // Flags a transfer no lane has taken yet, which is the whole of a cancel
   // here: once a lane has one the flag arrives too late and the transfer
   // runs to completion, which is what the contract's advisory cancel
@@ -1174,18 +1193,8 @@ class sync_context {
   // Runs the callbacks of every transfer the lanes finished, on this
   // thread. The inline step serves a context whose lanes could not start.
   std::size_t serve_deferred() noexcept {
-    std::size_t ran = 0;
-    for (transfer* op = pump_.take_done(); op != nullptr;) {
-      transfer* const next = op->next_deferred;
-      report(*op);
-      ++ran;
-      op = next;
-    }
-    if (transfer* const op = pump_.run_one_here(); op != nullptr) {
-      report(*op);
-      ++ran;
-    }
-    return ran;
+    return pump_.report_finished(
+        [this](transfer& op) noexcept { report(op); });
   }
 
   void report(transfer& op) noexcept {

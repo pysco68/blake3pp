@@ -1034,18 +1034,8 @@ class aio_context {
   // thread. The inline step serves a machine that would not give the
   // pump a thread.
   std::size_t serve_deferred() noexcept {
-    std::size_t ran = 0;
-    for (transfer* op = pump_.take_done(); op != nullptr;) {
-      transfer* const next = op->next_deferred;
-      report_deferred(*op);
-      ++ran;
-      op = next;
-    }
-    if (transfer* const op = pump_.run_one_here(); op != nullptr) {
-      report_deferred(*op);
-      ++ran;
-    }
-    return ran;
+    return pump_.report_finished(
+        [this](transfer& op) noexcept { report_deferred(op); });
   }
 
   void report_deferred(transfer& op) noexcept {

@@ -464,24 +464,12 @@ class gcd_context {
   // thread. The inline step serves a machine that would not give the
   // pump a thread.
   std::size_t serve_deferred() noexcept {
-    std::size_t ran = 0;
-    for (transfer* op = sync_pump_.take_done(); op != nullptr;) {
-      transfer* const next = op->next_deferred;
-      device_.add_if_served(op->device_total_ns());
+    return sync_pump_.report_finished([this](transfer& op) noexcept {
+      device_.add_if_served(op.device_total_ns());
       in_flight_--;
-      op->owner_file->inflight_--;
-      op->done(op, op->result());
-      ++ran;
-      op = next;
-    }
-    if (transfer* const op = sync_pump_.run_one_here(); op != nullptr) {
-      device_.add_if_served(op->device_total_ns());
-      in_flight_--;
-      op->owner_file->inflight_--;
-      op->done(op, op->result());
-      ++ran;
-    }
-    return ran;
+      op.owner_file->inflight_--;
+      op.done(&op, op.result());
+    });
   }
 
   // The degradation strings are observable API, so the synchronous rung
