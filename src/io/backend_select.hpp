@@ -98,7 +98,9 @@ class windows_context {
   };
 
   windows_context(const reader_context_options& opts, unsigned max_inflight) {
-    if (opts.ioring) {
+    // A synchronous context goes straight to the port: the ring context
+    // would create its event and lanes only to refuse the ring.
+    if (opts.ioring && opts.async) {
       ring_.emplace(opts, max_inflight);
       if (!ring_->using_ring()) {
         // Taken before the ring goes: whether the reason it was refused
@@ -107,12 +109,10 @@ class windows_context {
         ring_refusal_settled_ = ring_->engaged_rung().settled;
         // A ring that could not be had leaves the port as the better of
         // the two fallbacks, since the ring context's own ladder would
-        // serve every transfer synchronously on its lanes. When async was
-        // asked for, the reason goes onto the port's file names, where a
-        // refused ring would otherwise be invisible.
-        if (opts.async) {
-          ring_refusal_ = no_ioring_suffix(ring_->refusal());
-        }
+        // serve every transfer synchronously on its lanes. The reason goes
+        // onto the port's file names, where a refused ring would otherwise
+        // be invisible.
+        ring_refusal_ = no_ioring_suffix(ring_->refusal());
         ring_.reset();
       }
     }
