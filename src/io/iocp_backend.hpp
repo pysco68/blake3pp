@@ -59,9 +59,12 @@ inline std::atomic<unsigned> refuse_port_reads{0};
 }
 #endif
 
+// The error is read before the exception is built: nothing guarantees
+// that constructing one leaves the thread's last-error value alone.
 [[noreturn]] inline void throw_winerr(const char* what) {
-  throw std::system_error(static_cast<int>(::GetLastError()),
-                          std::system_category(), what);
+  const DWORD error = ::GetLastError();
+  throw std::system_error(static_cast<int>(error), std::system_category(),
+                          what);
 }
 
 // A transfer's Win32 error as the contract names it on every platform, so

@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <format>
 #include <span>
 #include <string>
 #include <string_view>
@@ -62,30 +63,25 @@ inline namespace test_seams {
 // version below 3 are otherwise indistinguishable in bench output, and a
 // CreateIoRing failure is a third thing again.
 struct ioring_refusal {
-  enum kind { none, no_api, old_version, create_failed };
-  kind why = none;
+  enum class kind { none, no_api, old_version, create_failed };
+  kind why = kind::none;
   std::uint32_t version = 0;  // what QueryIoRingCapabilities reported
   std::uint32_t hr = 0;       // what CreateIoRing or the op probe answered
 };
 
 inline std::string hex32(std::uint32_t v) {
-  static constexpr char digits[] = "0123456789abcdef";
-  std::string s = "0x";
-  for (int shift = 28; shift >= 0; shift -= 4) {
-    s += digits[(v >> shift) & 0xFu];
-  }
-  return s;
+  return std::format("{:#010x}", v);
 }
 
 inline std::string no_ioring_suffix(const ioring_refusal& r) {
   switch (r.why) {
-    case ioring_refusal::no_api:
+    case ioring_refusal::kind::no_api:
       return " [ioring: no api]";
-    case ioring_refusal::old_version:
+    case ioring_refusal::kind::old_version:
       return " [ioring: version " + std::to_string(r.version) + "]";
-    case ioring_refusal::create_failed:
+    case ioring_refusal::kind::create_failed:
       return " [ioring: CreateIoRing failed " + hex32(r.hr) + "]";
-    case ioring_refusal::none:
+    case ioring_refusal::kind::none:
       break;
   }
   return {};
@@ -171,17 +167,17 @@ class ioring {
                           std::uint32_t cq_entries) noexcept {
     const ioring_api& api = ioring_entry_points();
     if (!api.ok) {
-      refusal_ = {ioring_refusal::no_api, 0, 0};
+      refusal_ = {ioring_refusal::kind::no_api, 0, 0};
       return false;
     }
     IORING_CAPABILITIES caps{};
     HRESULT hr = api.query_capabilities(&caps);
     if (FAILED(hr)) {
-      refusal_ = {ioring_refusal::no_api, 0, static_cast<std::uint32_t>(hr)};
+      refusal_ = {ioring_refusal::kind::no_api, 0, static_cast<std::uint32_t>(hr)};
       return false;
     }
     if (caps.MaxVersion < IORING_VERSION_3) {
-      refusal_ = {ioring_refusal::old_version,
+      refusal_ = {ioring_refusal::kind::old_version,
                   static_cast<std::uint32_t>(caps.MaxVersion), 0};
       return false;
     }
@@ -191,7 +187,7 @@ class ioring {
     HIORING h = nullptr;
     hr = api.create(IORING_VERSION_3, flags, sq_entries, cq_entries, &h);
     if (FAILED(hr) || h == nullptr) {
-      refusal_ = {ioring_refusal::create_failed, 0,
+      refusal_ = {ioring_refusal::kind::create_failed, 0,
                   static_cast<std::uint32_t>(hr)};
       return false;
     }
@@ -199,7 +195,7 @@ class ioring {
     if (!op_supported(IORING_OP_READ) || !op_supported(IORING_OP_WRITE)) {
       // A ring that claims version 3 and cannot read or write would
       // answer every transfer with an error while name() said "ioring".
-      refusal_ = {ioring_refusal::old_version,
+      refusal_ = {ioring_refusal::kind::old_version,
                   static_cast<std::uint32_t>(caps.MaxVersion), 0};
       close();
       return false;
@@ -247,10 +243,9 @@ class ioring {
 // reached. The ring wraps a Win32 status in an HRESULT, so it is
 // unwrapped here and named the way the completion-port backend names it:
 // a caller sees operation_canceled either way.
-[[nodiscard]] inline std::error_code ring_error(long hr) noexcept {
-  const auto code = static_cast<unsigned long>(hr);
-  if (((code >> 16) & 0x7FFFu) == FACILITY_WIN32) {
-    return read_error(static_cast<DWORD>(code & 0xFFFFu));
+[[nodiscard]] inline std::error_code ring_error(HRESULT hr) noexcept {
+  if (HRESULT_FACILITY(hr) == FACILITY_WIN32) {
+    return read_error(static_cast<DWORD>(HRESULT_CODE(hr)));
   }
   return std::error_code(static_cast<int>(hr), std::system_category());
 }
@@ -473,7 +468,7 @@ class ioring_context {
     use_ring_ = true;
 #else
     (void)max_inflight;
-    refusal_ = {ioring_refusal::no_api, 0, 0};
+    refusal_ = {ioring_refusal::kind::no_api, 0, 0};
 #endif
   }
   ioring_context(const ioring_context&) = delete;
@@ -515,7 +510,7 @@ class ioring_context {
     }
     const ioring_refusal::kind why = refusal().why;
     return {rung_below::rung_engine,
-            why == ioring_refusal::no_api || why == ioring_refusal::old_version};
+            why == ioring_refusal::kind::no_api || why == ioring_refusal::kind::old_version};
   }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,

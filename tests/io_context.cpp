@@ -763,11 +763,12 @@ TEST_CASE("IoRing: a refused ring names the reason") {
   namespace io_impl = blake3pp::detail::io_impl;
   using refusal = io_impl::ioring_refusal;
   CHECK(io_impl::no_ioring_suffix(refusal{}).empty());
-  CHECK(io_impl::no_ioring_suffix({refusal::no_api, 0, 0}) ==
+  CHECK(io_impl::no_ioring_suffix({refusal::kind::no_api, 0, 0}) ==
         " [ioring: no api]");
-  CHECK(io_impl::no_ioring_suffix({refusal::old_version, 1, 0}) ==
+  CHECK(io_impl::no_ioring_suffix({refusal::kind::old_version, 1, 0}) ==
         " [ioring: version 1]");
-  CHECK(io_impl::no_ioring_suffix({refusal::create_failed, 0, 0x80070057}) ==
+  CHECK(io_impl::no_ioring_suffix(
+            {refusal::kind::create_failed, 0, 0x80070057}) ==
         " [ioring: CreateIoRing failed 0x80070057]");
 }
 
