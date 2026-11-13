@@ -692,8 +692,8 @@ elseif(CASE STREQUAL "gen_short_buffer")
   endif()
 
 elseif(CASE STREQUAL "sum_alloc_failure")
-  # A batch whose arena cannot be allocated: four 1 GiB windows in an
-  # address space of 2 GiB. The failure comes after the engine is built,
+  # A batch whose arena cannot be allocated: at least four 1 GiB windows
+  # in an address space of 2 GiB. The failure comes after the engine is built,
   # so it is the run's (exit 1, not the usage status), it is reported
   # rather than aborting the process, and the trace is still written.
   # Linux only, where prlimit sets the limit; a sanitizer or an emulator
