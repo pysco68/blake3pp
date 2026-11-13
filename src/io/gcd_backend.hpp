@@ -146,7 +146,7 @@ class gcd_context {
    public:
     file(gcd_context& ctx, const std::filesystem::path& path,
          const file_open_options& how)
-        : write_(how.write) {
+        : ctx_(&ctx), write_(how.write) {
       const int base = write_ ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY;
       f_.open(path.c_str(), base | O_CLOEXEC, 0644);
       size_ = write_ ? 0 : f_.stat_size();
@@ -154,9 +154,9 @@ class gcd_context {
       // everywhere else: an extending write serializes, which collapses
       // an async queue to one write at a time. F_PREALLOCATE is
       // best-effort, and set_size() trims back afterwards.
-      if (write_ && how.preallocate_bytes > 0 &&
-          preallocate(f_.fd_plain(), how.preallocate_bytes)) {
-        prealloc_ = how.preallocate_bytes;
+      if (write_ && how.preallocate_bytes > 0) {
+        [[maybe_unused]] const bool reserved =
+            preallocate(f_.fd_plain(), how.preallocate_bytes);
       }
       // Darwin's cache bypass is per-fd, not per-open, and tolerates any
       // alignment, so one fd serves every window, tail included.
@@ -164,18 +164,13 @@ class gcd_context {
         f_.set_direct();
       }
       name_ = ctx.name_for(f_.direct(), write_);
-      ctx_ = &ctx;
     }
 
     // The descriptor closes with this object, and a dispatch worker or a
     // lane may be inside a transfer on it: the context waits those out and
     // forgets what this file left behind first. The operations must still
     // be alive (the contract's operation lifetime rule).
-    ~file() {
-      if (ctx_ != nullptr) {
-        ctx_->forget(*this);
-      }
-    }
+    ~file() { ctx_->forget(*this); }
     file(const file&) = delete;
     file& operator=(const file&) = delete;
 
@@ -188,18 +183,16 @@ class gcd_context {
       if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
-      prealloc_ = 0;
     }
 
    private:
     friend class gcd_context;
     posix_file f_;
-    gcd_context* ctx_ = nullptr;
+    gcd_context* ctx_;
     // This file's share of the context's count, so a file that owes
     // nothing closes without waiting on its siblings' transfers.
     std::size_t inflight_ = 0;
     std::uint64_t size_ = 0;
-    std::uint64_t prealloc_ = 0;
     bool write_ = false;
     std::string name_ = "pread";
   };
