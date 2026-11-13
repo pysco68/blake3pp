@@ -68,6 +68,8 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/trace.hpp",
           "include/blake3pp/detail/driver.hpp",
           "include/blake3pp/detail/io_geometry.hpp",
+          # Provider-free; io.hpp's plan_file() returns one.
+          "include/blake3pp/detail/pipeline_plan.hpp",
           "include/blake3pp/detail/file_reader.hpp",
           "include/blake3pp/detail/file_writer.hpp",
           # The stream driver and the completion half it borrows. They are
@@ -89,11 +91,13 @@ GLOBAL = set()          # non-kernel internals: emitted once for the file
 # in PUBLIC above and parallel_io.hpp is emitted only behind
 # BLAKE3PP_AMALGAM_HAS_PARALLEL. probe_file_io() is the one definition
 # in the provider-free sources that reaches across that line (it wants
-# the plan update_file() would have made), so it is cut here instead of
+# the plan update_file() would have made, from detail/pipeline_plan.hpp,
+# and opens the file through io_driver), so it is cut here instead of
 # failing at the paste site.
 OMIT = {"src/io_hash.cpp": [("file_io_probe probe_file_io(",
                              "probe_file_io(): it needs the file pipeline's "
-                             "plan, which needs an execution provider")]}
+                             "plan and io_driver, which this file does "
+                             "not carry")]}
 
 
 def drop_definition(text, head, why):

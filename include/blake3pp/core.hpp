@@ -54,6 +54,11 @@ void to_hex(std::span<const std::byte> bytes, std::span<char> out);
 
 namespace detail {
 
+// The deepest a BLAKE3 tree gets: a message of at most 2^64 bytes is at
+// most 2^54 chunks, so a stack of chaining values, one per level, never
+// holds more than 54.
+inline constexpr std::size_t max_cv_stack_depth = 54;
+
 // One chunk (up to 1024 bytes) in flight. The final block of a chunk is kept
 // buffered rather than compressed eagerly. Its flags (CHUNK_END, possibly
 // ROOT) are known only once more input has arrived, or has not.
@@ -67,6 +72,12 @@ struct chunk_state {
 
 struct reader_access;
 
+// A string's characters as the bytes the hasher takes.
+[[nodiscard]] inline std::span<const std::byte> bytes_of(
+    std::string_view s) noexcept {
+  return std::as_bytes(std::span{s});
+}
+
 }  // namespace detail
 
 /// A 32-byte BLAKE3 digest: a regular value type with constant-time
@@ -76,8 +87,8 @@ struct reader_access;
 /// It formats with std::format ("{}" prints the lowercase hex) where the
 /// standard library provides `<format>`.
 struct digest {
-  /// The digest bytes.
-  std::array<std::byte, digest_size> bytes;
+  /// The digest bytes; zero for a default-constructed digest.
+  std::array<std::byte, digest_size> bytes{};
 
   /// Constant-time equality (matching the Rust reference): the safe
   /// default for a value compared in security-sensitive contexts, at
@@ -382,7 +393,8 @@ class hasher {
   std::array<std::uint32_t, 8> key_words_;
   std::uint32_t base_flags_;
   detail::chunk_state chunk_;
-  std::array<std::array<std::uint32_t, 8>, 54> cv_stack_;
+  std::array<std::array<std::uint32_t, 8>, detail::max_cv_stack_depth>
+      cv_stack_;
   std::uint8_t cv_stack_len_;
   // update_last() leaves the message's rightmost subtree here instead of
   // on the stack: it is the right child of the root parent, the node the
@@ -504,7 +516,9 @@ template <>
 struct std::formatter<blake3pp::digest> : std::formatter<std::string_view> {
   template <class FormatContext>
   auto format(const blake3pp::digest& d, FormatContext& ctx) const {
-    return std::formatter<std::string_view>::format(d.to_hex(), ctx);
+    const std::array<char, 65> hex = d.to_hex_chars();
+    return std::formatter<std::string_view>::format(
+        std::string_view(hex.data(), 2 * blake3pp::digest_size), ctx);
   }
 };
 #endif

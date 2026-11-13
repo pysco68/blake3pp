@@ -229,12 +229,6 @@ namespace {
   }
 }
 
-[[nodiscard]] std::int64_t now_ns() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
 }  // namespace
 
 // The platform under stream_watch: the probe is poll() with a zero
@@ -272,7 +266,7 @@ namespace {
 
 struct posix_watch_platform {
   int fd;
-  [[nodiscard]] std::int64_t now() const noexcept { return now_ns(); }
+  [[nodiscard]] std::int64_t now() const noexcept { return steady_now_ns(); }
   [[nodiscard]] bool probe() const { return readable(fd, 0); }
   void sleep() const { (void)readable(fd, -1); }
   void relax() const noexcept { cpu_relax(); }

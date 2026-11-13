@@ -42,20 +42,6 @@
 #include "io/backend.hpp"
 #include "io/posix_file.hpp"
 
-// MemorySanitizer cannot see io_uring completions: the kernel fills read
-// buffers without any libc call MSan intercepts, so the bytes stay
-// "uninitialized" in its shadow. Read completions therefore unpoison the
-// range they filled, stating a fact MSan has no other way to learn.
-#if defined(__has_feature)
-#if __has_feature(memory_sanitizer)
-#include <sanitizer/msan_interface.h>
-#define BLAKE3PP_MSAN_UNPOISON(ptr, len) __msan_unpoison(ptr, len)
-#endif
-#endif
-#if !defined(BLAKE3PP_MSAN_UNPOISON)
-#define BLAKE3PP_MSAN_UNPOISON(ptr, len) ((void)0)
-#endif
-
 namespace blake3pp::detail::io_impl {
 
 inline int sys_io_uring_setup(unsigned entries, io_uring_params* p) noexcept {
@@ -392,8 +378,18 @@ struct uring {
   // The one place the submission tail moves: the entry goes into the
   // next slot and the tail is published with release semantics, which
   // is what the kernel's acquire pairs with.
+  //
+  // Nothing here checks for a full queue: the context sizes the ring for
+  // twice the transfers it was built for plus the wake poll, and every
+  // caller keeps under that count -- a pipeline holds at most one read per
+  // window, and builds its driver for its window count. The assert says
+  // what that rests on.
   void push_sqe(const io_uring_sqe& sqe) noexcept {
     const unsigned tail = *sq_tail;
+    assert(tail - std::atomic_ref<unsigned>(*sq_head).load(
+                      std::memory_order_acquire) <
+               sq_entries &&
+           "the submission queue is sized for every entry in flight");
     const unsigned idx = tail & *sq_mask;
     std::memcpy(sqes + idx * sizeof(io_uring_sqe), &sqe, sizeof(sqe));
     std::memcpy(sq_array + idx * sizeof(unsigned), &idx, sizeof(idx));
@@ -404,22 +400,22 @@ struct uring {
   // Hands the kernel everything queued since it last looked, in one
   // enter. It submits the whole head-to-tail span, so a failed enter is
   // recoverable: its entries stay published, and the next flush picks them
-  // up in order.
-  void flush() {
+  // up in order. Returns 0, or the errno of an enter the kernel refused,
+  // which is an expected answer rather than a failure of this call.
+  [[nodiscard]] int flush() noexcept {
     for (;;) {
       const unsigned tail = *sq_tail;
       const unsigned head =
           std::atomic_ref<unsigned>(*sq_head).load(std::memory_order_acquire);
       if (tail == head) {
-        return;
+        return 0;
       }
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
       if (take_seam(stall_submits)) {
-        return;  // n == 0: the entries stay published
+        return 0;  // n == 0: the entries stay published
       }
       if (refuse_submit.load() || take_seam(refuse_submits)) {
-        errno = EAGAIN;
-        throw_errno("io_uring_enter(submit)");
+        return EAGAIN;
       }
 #endif
       const int n = sys_io_uring_enter(fd.get(), tail - head, 0, 0);
@@ -430,12 +426,12 @@ struct uring {
         // forget() waits out a count that includes them, so they are
         // offered again here. n == 0 is no progress: leave them.
         if (n == 0 || static_cast<unsigned>(n) == tail - head) {
-          return;
+          return 0;
         }
         continue;
       }
       if (errno != EINTR) {
-        throw_errno("io_uring_enter(submit)");
+        return errno;
       }
     }
   }
@@ -456,15 +452,6 @@ struct uring {
       fn(sqe.user_data);
     }
     std::atomic_ref<unsigned>(*sq_tail).store(head, std::memory_order_release);
-  }
-
-  // Queues one READ or WRITE and submits immediately: the writer engine's
-  // one-at-a-time shape.
-  void submit_rw(std::uint8_t opcode, int file_fd, const void* buf,
-                 unsigned len, std::uint64_t off, std::uint64_t user_data,
-                 bool offload = false) {
-    fill_rw(opcode, file_fd, buf, len, off, user_data, offload);
-    flush();
   }
 
   // Takes one completion if the ring has one. False leaves the ring
@@ -510,7 +497,6 @@ class uring_context {
     std::span<const std::byte> wbuf{};  // writes read from this
     std::uint64_t off = 0;
     std::size_t filled = 0;
-    int fd = -1;                      // the fd this transfer rides
     posix_file* sync_file = nullptr;  // the deferred path needs the pair
     file* owner_file = nullptr;       // whose transfer this is, for forget()
     transfer* next_deferred = nullptr;
@@ -538,10 +524,12 @@ class uring_context {
       // that extends the file serializes on the inode lock, and with
       // async direct I/O that collapses the whole queue to one stalled
       // write at a time. set_size() trims back afterwards.
-      if (write_ && how.preallocate_bytes > 0 &&
-          ::fallocate(f_.fd_plain(), 0, 0,
-                      static_cast<off_t>(how.preallocate_bytes)) == 0) {
-        prealloc_ = how.preallocate_bytes;
+      // A refusal costs only that: the writes extend the file as they
+      // land.
+      if (write_ && how.preallocate_bytes > 0) {
+        [[maybe_unused]] const int refused =
+            ::fallocate(f_.fd_plain(), 0, 0,
+                        static_cast<off_t>(how.preallocate_bytes));
       }
       if (how.direct_io) {
         // Not TRUNC on the reopen: already truncated, and the tail keeps
@@ -576,14 +564,12 @@ class uring_context {
       if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
-      prealloc_ = 0;
     }
 
    private:
     friend class uring_context;
     posix_file f_;
     std::uint64_t size_ = 0;
-    std::uint64_t prealloc_ = 0;
     std::string name_;
     // This file's share of the context's count, which is what forget()
     // waits out. The context-wide count stays the sum of these.
@@ -672,7 +658,6 @@ class uring_context {
   void arm(transfer& op, file& f, std::uint64_t off) noexcept {
     op.off = off;
     op.filled = 0;
-    op.fd = f.f_.fd();
     op.sync_file = &f.f_;
     op.owner_file = &f;
     op.next_deferred = nullptr;
@@ -723,7 +708,6 @@ class uring_context {
     const ring_piece piece = piece_for(op, op.off, len);
     if (piece.fd >= 0) {
       op.on_ring = true;
-      op.fd = piece.fd;
       // The piece is the kernel's from here, and charged to the device
       // from here.
       op.device_begin();
@@ -760,12 +744,7 @@ class uring_context {
   // would leave them counted and uncompleted. They go to the pump's lanes
   // instead.
   void flush() noexcept {
-    if (!use_uring_) {
-      return;
-    }
-    try {
-      ring_.flush();
-    } catch (const std::system_error&) {
+    if (use_uring_ && ring_.flush() != 0) {
       defer_unsubmitted();
     }
   }
@@ -878,11 +857,7 @@ class uring_context {
     // memory this call is about to release. What the kernel refuses comes
     // back on the deferred list, where the sweep below drops this file's
     // share.
-    try {
-      ring_.flush();
-    } catch (const std::system_error&) {
-      defer_unsubmitted();
-    }
+    flush();
     for (;;) {
       std::size_t refused = pump_.remove_queued_if(mine);
       pump_.quiesce();
@@ -924,11 +899,7 @@ class uring_context {
         continue;
       }
       if (settle(op, ud, res)) {
-        try {
-          ring_.flush();
-        } catch (const std::system_error&) {
-          defer_unsubmitted();
-        }
+        flush();
       }
     }
   }
@@ -1001,16 +972,18 @@ class uring_context {
   [[nodiscard]] transfer* op_from(std::uint64_t ud) const noexcept {
     return std::bit_cast<transfer*>(static_cast<std::uintptr_t>(ud));
   }
-  // The wake completion needs a user_data no transfer can wear; its own
-  // op's address is one, and costs nothing. A cancel's CQE needs the
-  // same, and for the same reason: reaping it as a read would walk to a
-  // transfer that does not exist.
-  [[nodiscard]] std::uint64_t wake_ud() const noexcept {
-    return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(&wake_op_));
+  // The wake completion needs a user_data no transfer can wear, and so
+  // does a cancel's CQE: reaping either as a read would walk to a
+  // transfer that does not exist. A transfer's user_data is its aligned
+  // address, which is never 1 or 2.
+  static constexpr std::uint64_t wake_ud_value = 1;
+  static constexpr std::uint64_t cancel_ud_value = 2;
+  static_assert(alignof(transfer) > cancel_ud_value);
+  [[nodiscard]] static constexpr std::uint64_t wake_ud() noexcept {
+    return wake_ud_value;
   }
-  [[nodiscard]] std::uint64_t cancel_ud() const noexcept {
-    return static_cast<std::uint64_t>(
-        std::bit_cast<std::uintptr_t>(&cancel_op_));
+  [[nodiscard]] static constexpr std::uint64_t cancel_ud() noexcept {
+    return cancel_ud_value;
   }
 
   void arm_wake() noexcept {
@@ -1021,9 +994,9 @@ class uring_context {
   void complete(transfer& op, std::error_code ec) noexcept {
     device_.add_if_served(op.device_total_ns());
     in_flight_--;
-    if (op.owner_file != nullptr) {
-      op.owner_file->inflight_--;
-    }
+    assert(op.owner_file != nullptr &&
+           "every transfer is armed with its file");
+    op.owner_file->inflight_--;
     op.done(&op, ec);
   }
 
@@ -1045,8 +1018,8 @@ class uring_context {
       return false;
     }
     if (!op.is_write) {
-      BLAKE3PP_MSAN_UNPOISON(op.buf.data() + op.filled,
-                             static_cast<std::size_t>(res));
+      msan_unpoison(op.buf.data() + op.filled,
+                    static_cast<std::size_t>(res));
     }
     op.filled += static_cast<std::size_t>(res);
     if (op.filled < op.length()) {
@@ -1062,7 +1035,6 @@ class uring_context {
         pump_.push(op);
         return false;
       }
-      op.fd = piece.fd;
       op.device_begin();
       ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, piece.fd,
                     from, static_cast<unsigned>(piece.len), op.off + op.filled,
@@ -1101,11 +1073,7 @@ class uring_context {
     if (requeued) {
       // The continuation of a short read is the same kind of entry as
       // the read itself, and the same refusal leaves it owed.
-      try {
-        ring_.flush();
-      } catch (const std::system_error&) {
-        defer_unsubmitted();
-      }
+      flush();
     }
     return ran;
   }
@@ -1209,11 +1177,8 @@ class uring_context {
 
   // Declaration order is the teardown contract: the ring drains, and
   // with it the one-shot poll armed on the eventfd, before the eventfd
-  // is closed and before the op whose address that poll wears goes.
-  // Do not move ring_ above these two.
+  // is closed. Do not move ring_ above waiter_.
   poll_waiter waiter_;
-  transfer wake_op_{};    // address only: the wake completion's user_data
-  transfer cancel_op_{};  // address only: every cancel CQE's user_data
   uring ring_;
   // After the waiter its lanes signal, so the waiter outlives the join in
   // the pump's destructor. The lanes touch nothing declared below.

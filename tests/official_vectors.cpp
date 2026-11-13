@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -183,6 +184,16 @@ TEST_CASE("output_reader streams, seeks, and agrees with the digest") {
   // The digest is the stream's first 32 bytes.
   const auto d = h.finalize();
   CHECK(std::equal(d.bytes.begin(), d.bytes.end(), big.begin()));
+}
+
+// A digest is a regular value type: one declared without an initialiser
+// holds zero bytes, not whatever its storage held. The constexpr object
+// does not compile unless default construction initialises every byte.
+TEST_CASE("a default-constructed digest is all zero bytes") {
+  static constexpr blake3pp::digest zero;
+  static_assert(zero.bytes == std::array<std::byte, blake3pp::digest_size>{});
+  const blake3pp::digest d;
+  CHECK(d.bytes == std::array<std::byte, blake3pp::digest_size>{});
 }
 
 TEST_CASE("known answer for the empty input") {

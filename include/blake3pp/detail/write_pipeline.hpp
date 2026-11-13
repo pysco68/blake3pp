@@ -27,20 +27,28 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <system_error>
 #include <type_traits>
 #include <utility>
 
-#include <blake3pp/detail/compress.hpp>
+#if defined(__linux__)
+#include <sched.h>  // sched_getcpu() for agent_record::cpu
+#endif
+
+#include <blake3pp/detail/contract.hpp>
+#include <blake3pp/detail/driver.hpp>
+#include <blake3pp/detail/driver_loop.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
-#include <blake3pp/detail/file_pipeline.hpp>
-#include <blake3pp/detail/file_writer.hpp>
+#include <blake3pp/detail/io_geometry.hpp>
+#include <blake3pp/trace.hpp>
 
 namespace blake3pp::detail {
 
@@ -79,10 +87,10 @@ class write_scope
   friend class pipeline_scope_base<write_scope, D>;
 
   using base = pipeline_scope_base<write_scope, D>;
-  using base::dropped_failures_;
   using base::ec_;
   using base::eptr_;
   using base::in_flight_;
+  using base::transfers_;
   using base::transfers_owed_;
   using base::latch_error;
   using base::latch_exception;
@@ -91,7 +99,6 @@ class write_scope
   using base::status_;
   using base::stop_requested;
   using base::stop_source_;
-  using base::stopped_;
 
  public:
   write_scope(D& drv, typename D::file& file, Scheduler sched, Fill fill,
@@ -150,7 +157,6 @@ class write_scope
     std::optional<outer_stop_callback> watch;
     if (opts_stop_token_.stop_possible()) {
       if (opts_stop_token_.stop_requested()) {
-        stopped_ = true;
         request_stop();
         throw_if_stopped();
         return;
@@ -194,23 +200,10 @@ class write_scope
 
   // What the run did, in the same fields a read run fills.
   void report(driver_stats& d) const noexcept {
-    d.transfers_landed = transfers_landed_;
-    d.transfer_bytes = transfer_bytes_;
-    d.starved_ns = starved_ns_;
     d.queue_depth_final = in_flight_cap_;
     d.queue_depth_peak = in_flight_cap_;
     d.agent_busy_ns = fill_busy_ns_.load(std::memory_order_relaxed);
-    // As on the read side: the device's own time is the performer's to
-    // report, and this thread's own span stands only where no performer
-    // can say.
-    const device_service svc = device_service_of(loop_.driver());
-    d.device_depth = svc.depth;
-    d.lane_wait_ns = svc.lane_wait_ns;
-    const bool attributed = svc.device.transfers > 0;
-    d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns_;
-    d.device_wait_min_ns = attributed
-                               ? svc.device.min_ns
-                               : (transfers_landed_ > 0 ? device_min_ns_ : 0);
+    transfers_.report(d, loop_.driver());
   }
 
  private:
@@ -230,36 +223,11 @@ class write_scope
     window_record* rec = nullptr;
   };
 
-  struct scope_env {
-    ex::inplace_stop_token token;
-    [[nodiscard]] ex::inplace_stop_token query(
-        ex::get_stop_token_t) const noexcept {
-      return token;
-    }
-  };
-
-  struct scope_receiver {
-    using receiver_concept = ex_compat::receiver_tag;
-    scope_receiver(write_scope* s, window* win) noexcept : scope(s), w(win) {}
-    write_scope* scope;
-    window* w;
-
-    [[nodiscard]] scope_env get_env() const noexcept {
-      return {scope->stop_source_.get_token()};
-    }
-    void set_value() && noexcept { scope->on_done(*w); }
-    void set_error(std::error_code ec) && noexcept { scope->on_error(*w, ec); }
-    void set_error(std::exception_ptr e) && noexcept {
-      scope->on_exception(*w, std::move(e));
-    }
-    void set_stopped() && noexcept { scope->on_stopped(*w); }
-  };
-
+  using scope_receiver = typename base::template receiver<window>;
   static_assert(std::copy_constructible<scope_receiver>);
 
-  using request_scope_stop = blake3pp::detail::request_scope_stop<D>;
-  using outer_stop_callback =
-      ex::stop_callback_for_t<ex::inplace_stop_token, request_scope_stop>;
+  using typename base::outer_stop_callback;
+  using typename base::request_scope_stop;
 
   // How many window buffers the run uses: what the queue depth asks for,
   // never more than the file has windows.
@@ -272,7 +240,7 @@ class write_scope
   }
 
   // The chain, read backwards from the read side's. Untagged, unlike the
-  // read side's builders, for the reason file_pipeline.hpp gives at its
+  // read side's builders, for the reason window_scope.hpp gives at its
   // compress stages: the body builds the same non-polymorphic layout in
   // every unit, so the one copy the linker keeps serves them all.
   [[nodiscard]] auto window_chain(window& w) {
@@ -345,13 +313,7 @@ class write_scope
 
   void landed(window& w) noexcept {
     w.writing = false;
-    const std::int64_t t = steady_now_ns();
-    ++transfers_landed_;
-    transfer_bytes_ += w.bytes;
-    const auto service = static_cast<std::uint64_t>(
-        std::max<std::int64_t>(0, t - w.t_write_begin));
-    device_wait_ns_ += service;
-    device_min_ns_ = std::min(device_min_ns_, service);
+    const std::int64_t t = transfers_.land(w.t_write_begin, w.bytes);
     if (w.rec != nullptr) {
       w.rec->t_absorbed = t - trace_->epoch_ns();
     }
@@ -399,7 +361,6 @@ class write_scope
         std::min<std::uint64_t>(window_bytes_, total_ - next_offset_));
     w.rec = trace_ != nullptr ? trace_->claim_window() : nullptr;
     if (w.rec != nullptr) {
-      *w.rec = window_record{};
       w.rec->index = w.offset / window_bytes_;
       w.rec->bytes = w.bytes;
       w.rec->slot = w.slot;
@@ -437,24 +398,9 @@ class write_scope
   // and above the width the generator is already as parallel as the
   // pool can make it and the signal means what it says.
   void note_generator_wait() noexcept {
-    const bool starved = in_flight_cap_ >= generator_threads_ &&
-                         loop_.driver().in_flight() == 0 &&
-                         !stop_requested() && next_offset_ < total_;
-    if (starved) {
-      if (starved_at_ == 0) {
-        starved_at_ = steady_now_ns();
-      }
-      return;
-    }
-    note_generator_wait_end();
-  }
-
-  void note_generator_wait_end() noexcept {
-    if (starved_at_ != 0) {
-      starved_ns_ += static_cast<std::uint64_t>(
-          std::max<std::int64_t>(0, steady_now_ns() - starved_at_));
-      starved_at_ = 0;
-    }
+    transfers_.starved(in_flight_cap_ >= generator_threads_ &&
+                       loop_.driver().in_flight() == 0 &&
+                       !stop_requested() && next_offset_ < total_);
   }
 
   [[noreturn]] void report_stall() const {
@@ -475,26 +421,6 @@ class write_scope
         loop_.driver().cancel(w.op);
       }
     }
-  }
-
-  void on_done(window& w) noexcept { finish_window(w); }
-
-  void on_error(window& w, std::error_code ec) noexcept {
-    latch_error(ec);
-    request_stop();
-    finish_window(w);
-  }
-
-  void on_exception(window& w, std::exception_ptr e) noexcept {
-    latch_exception(std::move(e));
-    request_stop();
-    finish_window(w);
-  }
-
-  void on_stopped(window& w) noexcept {
-    stopped_ = true;
-    request_stop();
-    finish_window(w);
   }
 
   void finish_window(window& w) noexcept {
@@ -551,21 +477,10 @@ class write_scope
 
   window* free_ = nullptr;
   std::uint64_t next_offset_ = 0;
-  // What the device did, kept on every run.
-  std::uint64_t transfers_landed_ = 0;
-  std::uint64_t transfer_bytes_ = 0;
-  std::uint64_t device_wait_ns_ = 0;
-  std::uint64_t starved_ns_ = 0;
   // The generator's summed fill time over the run. Written by the
   // agent that filled a window, read by the driver after everything
   // has joined, so it is atomic where the other counters are not.
   std::atomic<std::uint64_t> fill_busy_ns_{0};
-  // The shortest transfer the device served, which is its latency with
-  // nothing queued ahead. One comparison per landed write.
-  std::uint64_t device_min_ns_ = ~std::uint64_t{0};
-  // When the driver last went idle with bytes still owed; zero when it
-  // is not. One clock read per transition, not per round.
-  std::int64_t starved_at_ = 0;
 };
 
 // Generates one file on this thread, fanning the fills out over sched.

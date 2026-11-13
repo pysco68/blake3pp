@@ -335,12 +335,12 @@ static_assert(W <= max_simd_degree);
 
 extern const kernel_ops ops;
 const kernel_ops ops = {
-    arch::xthead,
-    /*simd_degree=*/W,
-    &compress_in_place,
-    &compress_xof,
-    &xof_many,
-    &hash_many,
+    .variant = arch::xthead,
+    .simd_degree = W,
+    .compress_in_place = &compress_in_place,
+    .compress_xof = &compress_xof,
+    .xof_many = &xof_many,
+    .hash_many = &hash_many,
 };
 
 }  // namespace blake3pp::kern::xthead

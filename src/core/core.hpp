@@ -3,7 +3,7 @@
 // Arch-agnostic BLAKE3 structure: chunk states, the chaining-value stack
 // discipline, parent nodes, and root finalization. All compression is routed
 // through a kernel_ops table so the same logic drives every architecture
-// variant. Header-only and allocation-free; the parallel engine (M3) reuses
+// variant. Header-only and allocation-free; the parallel engine reuses
 // these pieces for subtree hashing.
 
 #include <algorithm>
@@ -72,8 +72,7 @@ inline void chunk_update(const kern::kernel_ops& k, detail::chunk_state& cs,
       cs.block.fill(0);
     }
     const std::size_t take =
-        len < kern::block_len - cs.block_len ? len
-                                             : kern::block_len - cs.block_len;
+        std::min<std::size_t>(len, kern::block_len - cs.block_len);
     std::copy_n(input, take, cs.block.begin() + cs.block_len);
     cs.block_len = static_cast<std::uint8_t>(cs.block_len + take);
     input += take;
@@ -83,13 +82,11 @@ inline void chunk_update(const kern::kernel_ops& k, detail::chunk_state& cs,
 
 inline output chunk_output(const detail::chunk_state& cs,
                            std::uint32_t base_flags) noexcept {
-  output o;
-  o.input_cv = cs.cv;
-  o.block = cs.block;
-  o.block_len = cs.block_len;
-  o.counter = cs.chunk_counter;
-  o.flags = chunk_start_flag(cs) | kern::flag_chunk_end | base_flags;
-  return o;
+  return {.input_cv = cs.cv,
+          .block = cs.block,
+          .block_len = cs.block_len,
+          .counter = cs.chunk_counter,
+          .flags = chunk_start_flag(cs) | kern::flag_chunk_end | base_flags};
 }
 
 // Parent nodes always compress one full block (left CV || right CV) with

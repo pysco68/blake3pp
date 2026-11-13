@@ -66,7 +66,7 @@ blake3pp_kernel_switch(INLINE_ENFORCEMENT 1
 
 # aarch64: combine rot12/rot7 with shl+sri rather than the shl+usra the
 # generic shift-or selects. Measured +6% on Apple M2 / clang 22; GCC 15
-# performs the same selection swap. See src/kernel/transpose.hpp.
+# performs the same selection swap. See src/kernel/rotate.hpp.
 blake3pp_kernel_switch(SRI_ROTATE 1
   "aarch64: use shl+sri for rot12/rot7 instead of the generic shift-or")
 
@@ -81,7 +81,7 @@ blake3pp_kernel_switch(STAGED_ROUNDS 1
 # into one XAR instruction instead of eor+tbl / eor+shl+sri, the reason an
 # SVE2 kernel beats NEON at the same 128-bit width. Measured on Neoverse V2
 # (GCP Axion): 1.89 vs 1.61 GiB/s single-thread, off-vs-on the whole
-# difference. See xor_rot in src/kernel/transpose.hpp.
+# difference. See xor_rot in src/kernel/rotate.hpp.
 blake3pp_kernel_switch(XAR_ROTATE 1
   "aarch64 SVE2: fuse xor+rotate into a single XAR instead of eor + rotate")
 
@@ -89,7 +89,7 @@ blake3pp_kernel_switch(XAR_ROTATE 1
 # shift-or (base RVV 1.0 has no vector rotate; GCC 15 does not fuse the
 # pattern on its own: measured, 0 vror emitted). The XAR playbook one ISA
 # over; unmeasured on real Zvbb silicon so far, which is what this switch
-# is for. See xor_rot in src/kernel/transpose.hpp.
+# is for. See xor_rot in src/kernel/rotate.hpp.
 blake3pp_kernel_switch(VROR_ROTATE 1
   "riscv Zvbb: single-instruction vror rotate instead of the 3-op shift-or")
 
@@ -235,6 +235,24 @@ function(blake3pp_add_kernel ns)
     set(_ak_src "${PROJECT_SOURCE_DIR}/${AK_SOURCE}")
   endif()
 
+  # Registered whichever way the object is built.
+  set_property(GLOBAL APPEND PROPERTY BLAKE3PP_KERNELS "${ns}")
+  # What this variant was compiled with, for anything that has to reproduce
+  # the kernel's own build without re-spelling it: the dispatch-cost benches
+  # compile the same TU per variant and read these back.
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_FLAGS" "${AK_ARCH_FLAGS}")
+  set(_ak_provider "facade")
+  if(AK_FORCE_SCALAR)
+    set(_ak_provider "scalar")
+  elseif(AK_FORCE_VEXT)
+    set(_ak_provider "vext")
+  elseif(AK_FORCE_XSIMD)
+    set(_ak_provider "xsimd")
+  endif()
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
+  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
+  _blake3pp_note_simd_provider_use("${_ak_provider}")
+
   # EXTERNAL_COMPILER: the object is produced by a SECOND compiler and
   # linked into the same fat binary, for dialects the primary compiler
   # cannot express at all (LLVM never merged XTheadVector, so the zig/
@@ -302,23 +320,6 @@ function(blake3pp_add_kernel ns)
       COMMENT "kernel ${ns} via external compiler: ${AK_EXTERNAL_COMPILER}"
       VERBATIM)
     add_custom_target(blake3pp_kernel_${ns}_external DEPENDS "${_ak_obj}")
-    set_property(GLOBAL APPEND PROPERTY BLAKE3PP_KERNELS "${ns}")
-  # What this variant was compiled with, for anything that has to reproduce
-  # the kernel's own build without re-spelling it: the dispatch-cost benches
-  # compile the same TU per variant and read these back.
-  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_FLAGS" "${AK_ARCH_FLAGS}")
-  set(_ak_provider "facade")
-  if(AK_FORCE_SCALAR)
-    set(_ak_provider "scalar")
-  elseif(AK_FORCE_VEXT)
-    set(_ak_provider "vext")
-  elseif(AK_FORCE_XSIMD)
-    set(_ak_provider "xsimd")
-  endif()
-  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
-  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
-  _blake3pp_note_simd_provider_use("${_ak_provider}")
-
     set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_OBJECT" "${_ak_obj}")
     return()
   endif()
@@ -409,23 +410,6 @@ function(blake3pp_add_kernel ns)
   set_target_properties(${tgt} PROPERTIES
     INTERPROCEDURAL_OPTIMIZATION OFF
     POSITION_INDEPENDENT_CODE ON)
-
-  set_property(GLOBAL APPEND PROPERTY BLAKE3PP_KERNELS "${ns}")
-  # What this variant was compiled with, for anything that has to reproduce
-  # the kernel's own build without re-spelling it: the dispatch-cost benches
-  # compile the same TU per variant and read these back.
-  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_FLAGS" "${AK_ARCH_FLAGS}")
-  set(_ak_provider "facade")
-  if(AK_FORCE_SCALAR)
-    set(_ak_provider "scalar")
-  elseif(AK_FORCE_VEXT)
-    set(_ak_provider "vext")
-  elseif(AK_FORCE_XSIMD)
-    set(_ak_provider "xsimd")
-  endif()
-  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_PROVIDER" "${_ak_provider}")
-  set_property(GLOBAL PROPERTY "BLAKE3PP_KERNEL_${ns}_VEXT_BYTES" "${AK_VEXT_BYTES}")
-  _blake3pp_note_simd_provider_use("${_ak_provider}")
 endfunction()
 
 # Attaches every registered kernel's objects to <target> and generates the

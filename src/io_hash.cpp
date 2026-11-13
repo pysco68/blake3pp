@@ -1,4 +1,4 @@
-#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/pipeline_plan.hpp>
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/io.hpp>
@@ -13,6 +13,18 @@
 #include <thread>
 
 namespace blake3pp {
+
+detail::pipeline_plan detail::plan_file(const std::filesystem::path& path,
+                                        const file_io_options& opts,
+                                        std::uint64_t count) {
+  std::error_code size_ec;
+  const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
+  return plan_pipeline(count, opts.window_bytes, opts.queue_depth,
+                       opts.direct_io,
+                       size_ec ? 0 : static_cast<std::uint64_t>(size),
+                       read_plan_budget_bytes(std::thread::hardware_concurrency(),
+                                              opts.window_bytes));
+}
 
 void update_file(hasher& h, const std::filesystem::path& path,
                  const file_io_options& opts) {
@@ -46,12 +58,12 @@ void update_file(hasher& h, const std::filesystem::path& path,
     window_record* const rec = trace ? trace->claim_window() : nullptr;
     if (rec) {
       rec->index = index;
-      rec->bytes = w->bytes;
+      rec->bytes = w->bytes.size();
       rec->flags = w->last ? window_record::flag_last : 0;
       rec->t_wait_begin = t_wait_begin;
       rec->t_ready = trace->now();
     }
-    h.update(std::span<const std::byte>{w->data, w->bytes});
+    h.update(w->bytes);
     if (rec) {
       rec->t_joined = rec->t_absorbed = trace->now();
     }
@@ -73,13 +85,7 @@ file_io_probe probe_file_io(const std::filesystem::path& path,
   // The plan update_file() makes over a scheduler for a fresh hasher,
   // and the open it makes from that plan; the sequential form opens the
   // same way and differs only in the geometry it reads with.
-  std::error_code size_ec;
-  const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
-  const detail::pipeline_plan plan = detail::plan_pipeline(
-      0, opts.window_bytes, opts.queue_depth, opts.direct_io,
-      size_ec ? 0 : static_cast<std::uint64_t>(size),
-      detail::read_plan_budget_bytes(std::thread::hardware_concurrency(),
-                                     opts.window_bytes));
+  const detail::pipeline_plan plan = detail::plan_file(path, opts, 0);
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
                          .ioring = opts.ioring},

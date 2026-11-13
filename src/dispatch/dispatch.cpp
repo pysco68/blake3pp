@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstddef>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string_view>
 
@@ -157,7 +158,6 @@ avail_table build_available() noexcept {
 // upgraded rebuild through the atomic pointer. Both live in static
 // storage, so the returned span never dangles, and readers see either
 // snapshot as one consistent unit.
-avail_table g_avail_upgraded;
 std::atomic<const avail_table*> g_avail_active{nullptr};
 
 std::span<const arch> available_impl() noexcept {
@@ -183,8 +183,8 @@ bool run_trap_probes() noexcept {
     if (!detail::platform_run_trap_probes()) {
       return false;
     }
-    g_avail_upgraded = build_available();
-    g_avail_active.store(&g_avail_upgraded, std::memory_order_release);
+    static const avail_table upgraded = build_available();
+    g_avail_active.store(&upgraded, std::memory_order_release);
     return true;
   }();
   return changed;
@@ -259,20 +259,14 @@ std::optional<arch> arch_from_string(std::string_view name) noexcept {
 
 namespace detail {
 
+// A variant this build or this CPU lacks falls back to the best one
+// available, which is always registered: the available set is filtered
+// from the registry.
 const kern::kernel_ops* resolve(arch a) noexcept {
-  if (a == arch::auto_detect || !cpu_supports_impl(a)) {
+  if (a == arch::auto_detect || !is_available(a)) {
     a = best_available();
   }
-  if (const registry_entry* e = find_registry(a); e != nullptr) {
-    return e->ops;
-  }
-  // Requested variant not compiled in: fall back to the best one that is.
-  for (const arch b : available_impl()) {
-    if (const registry_entry* e = find_registry(b); e != nullptr) {
-      return e->ops;
-    }
-  }
-  return registry[0].ops;  // unreachable: scalar is always registered
+  return find_registry(a)->ops;
 }
 
 }  // namespace detail

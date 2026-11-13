@@ -68,7 +68,7 @@ reaches the recursion, whose frame grows with the subtree's depth. Measured with
 
 A thread that hashes **sequentially** pays the same kind of frame, for the
 whole-subtree form of the reduction rather than the part form: 14496 bytes
-at degree 16, 8224 at 8, and 2752 on a scalar build, falling to 768 with
+at degree 16, 8224 at 8, and 2752 on a scalar build, falling to 736 with
 `BLAKE3PP_SUBTREE_FOLD=12`.
 
 Two consequences follow when sizing a thread. `stack_budget` moves no
@@ -86,6 +86,5 @@ These are one toolchain's frames; another compiler, ABI or optimization
 level will differ. Measure yours the same way, by building the library
 with `-fstack-usage` and reading the `.su` entries for
 `compress_subtree_to_cvs_grouped` and `compress_subtree_to_cv_grouped`
-(with the fold on, the first is the same function with one leaf per burst
-and the second is `compress_subtree_to_cv_folded`), and leave the thread
-its own headroom on top.
+(with the fold on, both are the same functions with one leaf per burst),
+and leave the thread its own headroom on top.

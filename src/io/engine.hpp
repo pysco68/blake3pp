@@ -72,12 +72,6 @@ class polled_reader_engine {
     return file_.name();
   }
 
-  // The buffer arena, for callers that must fill it before the first read
-  // (the null source hands back whatever is already there).
-  [[nodiscard]] std::span<std::byte> pool() noexcept {
-    return {pool_.get(), std::size_t{qd_} * window_};
-  }
-
   std::optional<window> next() {
     // release() is noexcept, so a failed submission is latched there and
     // thrown here.
@@ -107,7 +101,7 @@ class polled_reader_engine {
     }
     st.held = true;
     next_deliver_++;
-    return window{buf(s).data(), st.target, want * window_,
+    return window{{buf(s).data(), st.target}, want * window_,
                   want + 1 == num_windows_, s};
   }
 
@@ -222,8 +216,9 @@ class polled_reader_engine {
 
   // Declaration order is the teardown contract: the file closes first,
   // then the context drains every read still owed (running no callback),
-  // and only then is the pool it was reading into freed. Do not reorder
-  // these three members.
+  // and only then is the pool it was reading into freed. slots_, declared
+  // above them, goes last of all: it holds the operations the context may
+  // still own until its drain returns. Do not reorder these four members.
   aligned_buffer pool_;
   C ctx_;
   typename C::file file_;
@@ -252,7 +247,6 @@ class polled_writer_engine {
                        const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
         qd_(clamp_queue_depth(opts.queue_depth)),
-        preallocated_(opts.preallocate_bytes),
         slots_(qd_),
         pool_(make_aligned_buffer(std::size_t{qd_} * buffer_)),
         ctx_(reader_context_options{.async = opts.async,
@@ -294,25 +288,23 @@ class polled_writer_engine {
     throw_if_failed();
     slots_[s].acquired = true;
     next_slot_ = (s + 1) % qd_;
-    return buffer{buf(s).data(), buffer_, s};
+    return buffer{{buf(s).data(), buffer_}, s};
   }
 
   void submit(const buffer& b, std::size_t bytes) {
-    if (bytes == 0) {
-      // Nothing to write, so the slot goes back to the front of the ring
-      // rather than being skipped: a generator that produces nothing on its
-      // last call must not cost a buffer.
-      if (b.slot < qd_ && slots_[b.slot].acquired) {
-        slots_[b.slot].acquired = false;
-        next_slot_ = b.slot;
-      }
-      return;
-    }
     if (b.slot >= qd_ || bytes > buffer_ || !slots_[b.slot].acquired) {
       throw std::system_error(EINVAL, std::generic_category(),
                               "submit() of a buffer this writer did not "
                               "hand out, or has already taken back, or of "
                               "more bytes than it holds");
+    }
+    if (bytes == 0) {
+      // Nothing to write, so the slot goes back to the front of the ring
+      // rather than being skipped: a generator that produces nothing on its
+      // last call must not cost a buffer.
+      slots_[b.slot].acquired = false;
+      next_slot_ = b.slot;
+      return;
     }
     if (tail_submitted_) {
       throw std::system_error(EINVAL, std::generic_category(),
@@ -330,7 +322,7 @@ class polled_writer_engine {
     // that of flush() only); the slot must not stay marked busy for a
     // write that never existed, or wait_slot() polls for it for ever.
     try {
-      ctx_.submit_write(file_, offset_, {b.data, bytes}, st.op);
+      ctx_.submit_write(file_, offset_, b.bytes.first(bytes), st.op);
     } catch (...) {
       st.busy = false;
       throw;
@@ -352,7 +344,6 @@ class polled_writer_engine {
     // flush), and "finish() lands" has to hold for every backend. On
     // the others it is one truncate to the size the file already has.
     file_.set_size(written_);
-    preallocated_ = 0;
   }
 
  private:
@@ -408,15 +399,15 @@ class polled_writer_engine {
   unsigned next_slot_ = 0;       // round-robin acquire order
   std::uint64_t offset_ = 0;     // next sequential file offset
   std::uint64_t written_ = 0;    // total bytes accepted via submit()
-  std::uint64_t preallocated_ = 0;
   std::error_code failed_{};     // the first error, until it is reported
   bool tail_submitted_ = false;  // a partial submit closes the stream
   std::vector<slot_state> slots_;
 
   // Declaration order is the teardown contract: the file closes first,
   // then the context drains every write still owed (running no callback),
-  // and only then is the pool it was writing from freed. Do not reorder
-  // these three members.
+  // and only then is the pool it was writing from freed. slots_, declared
+  // above them, goes last of all: it holds the operations the context may
+  // still own until its drain returns. Do not reorder these four members.
   aligned_buffer pool_;
   C ctx_;
   typename C::file file_;

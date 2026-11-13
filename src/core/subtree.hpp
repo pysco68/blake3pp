@@ -206,80 +206,11 @@ inline void compress_subtree_to_cv_recursive(
     std::size_t num_chunks, std::uint64_t chunk_counter,
     std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
     std::span<std::uint32_t, 8> out_cv) noexcept {
-  std::array<std::uint32_t, 8> cv[1]{};
-  compress_subtree_to_cvs_recursive<MaxDegree>(k, input, num_chunks,
-                                               chunk_counter, key, base_flags,
-                                               cv, /*stop_at=*/1);
-  copy_cv(cv[0], out_cv);
-}
-
-// The same reduction, folding as it goes instead of holding the tree. One
-// group of 2*simd_degree chunks goes through hash_many at a time, is reduced
-// to one CV by wide parent passes, then merges into a binary-counter stack
-// (the shape hasher::push_cv uses, src/blake3pp.cpp).
-//
-// Parents stay batched across lanes inside a group. Only the one parent that
-// joins a group to the stack is compressed alone, once per 2*simd_degree
-// chunks. The working set is two group buffers plus the stack, so it does
-// not grow with the subtree's depth, where the recursion above costs one
-// buffer per level.
-//
-// MaxStack bounds the stack in CVs and so the subtree this can reduce:
-// log2(num_chunks / group) + 1 entries are needed, 54 covering the largest
-// subtree BLAKE3 defines. It is also the working set, so a target picks the
-// smallest bound its parts need.
-//
-// Measured against the recursion (tests/subtree_fold.cpp pins the outputs
-// equal): the same 1023 parent blocks for a 1024-chunk subtree, but spread
-// over 319 hash_many calls instead of 67 on avx2, none of them at full lane
-// occupancy, which costs 11% on sse42 and avx2. On a scalar kernel there is
-// no occupancy to lose and throughput is unchanged, which is why this is
-// opt-in for narrow targets through BLAKE3PP_SUBTREE_FOLD. There it
-// replaces one buffer per level with a fixed working set, 720 bytes at 12
-// levels against 480 + 272 per level.
-template <std::size_t MaxStack = 54, std::size_t MaxDegree = kern::max_simd_degree>
-inline void compress_subtree_to_cv_folded(
-    const kern::kernel_ops& k, const std::uint8_t* input,
-    std::size_t num_chunks, std::uint64_t chunk_counter,
-    std::span<const std::uint32_t, 8> key, std::uint32_t base_flags,
-    std::span<std::uint32_t, 8> out_cv) noexcept {
-  std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
-  std::uint8_t next BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
-  std::uint8_t stack BLAKE3PP_CXXATTR_UNINITIALIZED [MaxStack * kern::out_len];
-  std::size_t depth = 0;
-
-  // Both are powers of two, so every group is a subtree-aligned unit and the
-  // last group is full whenever the subtree spans more than one.
-  const std::size_t group = 2 * k.simd_degree;
-  std::uint64_t groups = 0;
-  for (std::size_t done = 0; done < num_chunks; done += group) {
-    const std::size_t n = std::min(group, num_chunks - done);
-    const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
-    for (std::size_t i = 0; i < n; ++i) {
-      chunks[i] = input + (done + i) * kern::chunk_len;
-    }
-    k.hash_many(chunks, n, kern::chunk_len / kern::block_len, key.data(),
-                chunk_counter + done, /*increment_counter=*/true, base_flags,
-                kern::flag_chunk_start, kern::flag_chunk_end, cvs);
-    // The group's own parents, lanes-wide, down to its single root CV.
-    reduce_generations<MaxDegree>(k, cvs, next, n, 1, key, base_flags);
-    assert(depth < MaxStack);
-    std::copy_n(cvs, kern::out_len, stack + depth * kern::out_len);
-    depth++;
-    // Two subtrees of equal size on top merge; as many times as the group
-    // count has trailing zeros, which is the binary counter's carry.
-    ++groups;
-    for (int carries = std::countr_zero(groups); carries > 0; --carries) {
-      assert(depth >= 2);
-      depth -= 2;
-      compress_parents_wide<MaxDegree>(k, stack + depth * kern::out_len, 2,
-                                       key, base_flags, next);
-      std::copy_n(next, kern::out_len, stack + depth * kern::out_len);
-      depth++;
-    }
-  }
-  assert(depth == 1);
-  load_cv_le(stack, out_cv);
+  std::array<std::uint32_t, 8> cv{};
+  compress_subtree_to_cvs_recursive<MaxDegree>(
+      k, input, num_chunks, chunk_counter, key, base_flags,
+      std::span<std::array<std::uint32_t, 8>>(&cv, 1), /*stop_at=*/1);
+  copy_cv(cv, out_cv);
 }
 
 // The sweep: Leaves chunk batches go through hash_many back to back, then
@@ -302,7 +233,8 @@ inline void compress_subtree_to_cv_folded(
 // MaxStack bounds the stack in CVs and so the subtree this can reduce:
 // log2(num_chunks / group) + 1 entries, 54 covering the largest subtree
 // BLAKE3 defines.
-template <std::size_t Leaves = subtree_group_leaves, std::size_t MaxStack = 54,
+template <std::size_t Leaves = subtree_group_leaves,
+          std::size_t MaxStack = detail::max_cv_stack_depth,
           std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_subtree_to_cv_grouped(
     const kern::kernel_ops& k, const std::uint8_t* input,
@@ -371,7 +303,8 @@ inline void compress_subtree_to_cv_grouped(
 //     covers num_chunks / stop_at chunks. A part of the engine's default
 //     size lands here, and the burst spans what the recursion would have
 //     split into one chunk batch and its parents, over and over.
-template <std::size_t Leaves = subtree_group_leaves, std::size_t MaxStack = 54,
+template <std::size_t Leaves = subtree_group_leaves,
+          std::size_t MaxStack = detail::max_cv_stack_depth,
           std::size_t MaxDegree = kern::max_simd_degree>
 inline std::size_t compress_subtree_to_cvs_grouped(
     const kern::kernel_ops& k, const std::uint8_t* input,
@@ -453,7 +386,8 @@ inline std::size_t compress_subtree_to_cvs(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cvs,
         stop_at);
   } else {
-    return compress_subtree_to_cvs_grouped<subtree_group_leaves, 54, MaxDegree>(
+    return compress_subtree_to_cvs_grouped<subtree_group_leaves,
+                                           detail::max_cv_stack_depth, MaxDegree>(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cvs,
         stop_at);
   }
@@ -475,11 +409,14 @@ inline std::size_t compress_subtree_to_cvs(
                                                   k.simd_degree);
 }
 
-// Which of the three the library uses: the grouped sweep, unless a build
-// opts into the single-leaf fold, which only a target that cannot spare the
-// sweep's staging buffers should (Fold is then the stack bound in levels;
-// see ArchKernels.cmake). All three stay compiled so the tests can compare
-// them on every machine.
+// Which shape the library uses for a whole subtree: the grouped sweep,
+// unless a build opts into the single-leaf fold, which only a target that
+// cannot spare the sweep's staging buffers should (Fold is then the stack
+// bound in levels; see ArchKernels.cmake). The fold is the sweep with one
+// leaf per burst: its working set does not grow with the subtree, and it
+// gives up the lane occupancy of the parents' bursts, which a scalar
+// kernel does not have to lose. The recursion stays compiled so the tests
+// can compare the shapes on every machine.
 template <std::size_t Fold = subtree_fold_levels,
           std::size_t MaxDegree = kern::max_simd_degree>
 inline void compress_subtree_to_cv(const kern::kernel_ops& k,
@@ -491,10 +428,11 @@ inline void compress_subtree_to_cv(const kern::kernel_ops& k,
                                    std::span<std::uint32_t, 8> out_cv) noexcept {
   assert(num_chunks > 0 && std::has_single_bit(num_chunks));
   if constexpr (Fold > 0) {
-    compress_subtree_to_cv_folded<Fold, MaxDegree>(
+    compress_subtree_to_cv_grouped<1, Fold, MaxDegree>(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
   } else {
-    compress_subtree_to_cv_grouped<subtree_group_leaves, 54, MaxDegree>(
+    compress_subtree_to_cv_grouped<subtree_group_leaves,
+                                   detail::max_cv_stack_depth, MaxDegree>(
         k, input, num_chunks, chunk_counter, key, base_flags, out_cv);
   }
 }
@@ -641,9 +579,7 @@ inline void fold_sibling_cvs_wide(const kern::kernel_ops& k,
     }
     n = written;
   }
-  for (std::size_t w = 0; w < 8; ++w) {
-    out_cv[w] = cvs[0][w];
-  }
+  copy_cv(cvs[0], out_cv);
 }
 
 }  // namespace blake3pp::core

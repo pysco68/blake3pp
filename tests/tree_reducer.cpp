@@ -324,33 +324,33 @@ TEST_CASE("one withheld window leaves a logarithmic number of nodes") {
 
 TEST_CASE("windows arriving within K of their turn need (K + 1) chains") {
   constexpr std::uint64_t window = 2;
-  constexpr std::uint64_t windows = 256;
-  constexpr std::uint64_t k = 8;
+  constexpr std::size_t windows = 256;
+  constexpr std::size_t k = 8;
   std::mt19937_64 rng(seed + 2);
 
   // An arrival order in which no window is more than K places from its
   // own: what a pipeline with K windows in flight delivers.
-  std::vector<std::uint64_t> order;
+  std::vector<std::size_t> order;
   std::vector<bool> placed(windows, false);
-  std::uint64_t lowest = 0;
-  for (std::uint64_t t = 0; t < windows; ++t) {
+  std::size_t lowest = 0;
+  for (std::size_t t = 0; t < windows; ++t) {
     while (lowest < windows && placed[lowest]) {
       lowest++;
     }
-    std::uint64_t pick = lowest;
+    std::size_t pick = lowest;
     if (t < k || lowest + k != t) {
-      std::vector<std::uint64_t> candidates;
-      for (std::uint64_t w = lowest; w < windows && w <= t + k; ++w) {
+      std::vector<std::size_t> candidates;
+      for (std::size_t w = lowest; w < windows && w <= t + k; ++w) {
         if (!placed[w]) {
           candidates.push_back(w);
         }
       }
-      pick = candidates[rng() % candidates.size()];
+      pick = candidates[static_cast<std::size_t>(rng() % candidates.size())];
     }
     placed[pick] = true;
     order.push_back(pick);
   }
-  for (std::uint64_t t = 0; t < windows; ++t) {
+  for (std::size_t t = 0; t < windows; ++t) {
     REQUIRE(order[t] <= t + k);
     REQUIRE(order[t] + k >= t);
   }
@@ -361,8 +361,9 @@ TEST_CASE("windows arriving within K of their turn need (K + 1) chains") {
   std::array<tree_reducer::node, 256> storage;
   tree_reducer r(ops, h.key_words(), h.mode_flags(), storage);
   std::size_t max_pending = 0;
-  for (std::uint64_t t = 0; t < windows; ++t) {
-    REQUIRE(r.insert(order[t] * window, window, label(order[t])));
+  for (std::size_t t = 0; t < windows; ++t) {
+    REQUIRE(r.insert(std::uint64_t{order[t]} * window, window,
+                     label(order[t])));
     max_pending = std::max(max_pending, r.pending());
   }
   CHECK(max_pending <= (k + 1) * 2 * 8);

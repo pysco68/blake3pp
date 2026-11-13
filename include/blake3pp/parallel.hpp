@@ -35,8 +35,6 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
-#include <bit>
-#include <cassert>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -50,14 +48,12 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/compress.hpp>
 #include <blake3pp/detail/ex.hpp>
-#include <blake3pp/detail/file_pipeline.hpp>
+#include <blake3pp/detail/io_geometry.hpp>
 #include <blake3pp/detail/memory_driver.hpp>
+#include <blake3pp/detail/pipeline_plan.hpp>
 #include <blake3pp/detail/tree_reducer.hpp>
+#include <blake3pp/detail/window_scope.hpp>
 #include <blake3pp/trace.hpp>
-
-#if defined(__linux__)
-#include <sched.h>  // sched_getcpu() for agent_record::cpu
-#endif
 
 #if defined(BLAKE3PP_EXECUTION_STDEXEC) || \
     (!defined(BLAKE3PP_EXECUTION_STD) && !defined(BLAKE3PP_EXECUTION_BEMAN))
@@ -75,15 +71,6 @@ namespace detail {
 // providers' process pools take their default size from this.
 [[nodiscard]] constexpr unsigned pool_threads(unsigned hardware) noexcept {
   return hardware != 0 ? hardware : 1u;
-}
-
-// The end of the bulk chunk that starts at begin: chunk_length items, or
-// the rest of shape when fewer remain. Requires begin < shape. Spelled so
-// that begin + chunk_length is never formed, since it wraps for a shape
-// near the top of size_t.
-[[nodiscard]] constexpr std::size_t bulk_chunk_end(
-    std::size_t begin, std::size_t chunk_length, std::size_t shape) noexcept {
-  return begin + std::min(chunk_length, shape - begin);
 }
 }  // namespace detail
 
@@ -109,10 +96,12 @@ using parallel_scheduler_t = decltype(std::execution::get_parallel_scheduler());
 using parallel_scheduler_t = beman::execution::parallel_scheduler;
 /// The process-wide parallel scheduler, in P2079's shape.
 ///
-/// Backed by beman.execution's own parallel_scheduler backend. A program
-/// may replace it by defining query_parallel_scheduler_backend() itself:
-/// P2079 replaceability, one definition per program, like a global
-/// allocator.
+/// Backed by beman.execution's own parallel_scheduler backend, or, in a
+/// program that links blake3pp::parallel_backend, by one that runs on the
+/// thread count size_parallel_scheduler() fixed
+/// (<blake3pp/parallel_backend.hpp>). A program may also replace it by
+/// defining query_parallel_scheduler_backend() itself: P2079
+/// replaceability, one definition per program, like a global allocator.
 [[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
   return beman::execution::get_parallel_scheduler();
 }
@@ -168,8 +157,9 @@ using parallel_scheduler_t =
 /// The process-wide parallel scheduler, in P2079's shape.
 ///
 /// The same call C++26 application code makes. The first call creates the
-/// process pool (one thread per hardware thread), joined during static
-/// destruction. The scheduler-taking overloads stay the primary,
+/// process pool, joined during static destruction: one thread per
+/// hardware thread, or the count size_parallel_scheduler() fixed before
+/// it (<blake3pp/parallel_backend.hpp>). The scheduler-taking overloads stay the primary,
 /// caller-controlled API; a sized or bounded pool is the provider's own
 /// (exec::static_thread_pool pool(8); pool.get_scheduler()).
 [[nodiscard]] inline parallel_scheduler_t get_parallel_scheduler() {
@@ -209,7 +199,10 @@ namespace detail {
 // one. A span has nothing to overlap: the bytes are all there already, so
 // a second window buys no concurrency and costs a join, a reducer insert
 // and a part table. The answer is the FEWEST windows that still bound a
-// part table, which is one window up to max_window_bytes.
+// part table: the span's own size, which plan_memory_pipeline() rounds
+// down to a power of two. Into a hasher on a window boundary, a span up
+// to max_window_bytes therefore runs as one window if its size is a power
+// of two and as two otherwise.
 //
 // One window per span against fixed 8 MiB windows, 16 threads, ABBA,
 // eight samples a side, medians: +8% at 8 MiB, +15% at 64 MiB, +53% at
@@ -219,9 +212,34 @@ namespace detail {
 // default_window_bytes is only the floor: a span at or below it is one
 // window either way.
 [[nodiscard]] constexpr std::size_t memory_window_bytes(
-    std::uint64_t span_bytes) noexcept {
-  return std::clamp(static_cast<std::size_t>(span_bytes), default_window_bytes,
-                    max_window_bytes);
+    std::size_t span_bytes) noexcept {
+  return std::clamp(span_bytes, default_window_bytes, max_window_bytes);
+}
+
+// Absorbs a span already in memory: through the pipeline, over a source
+// whose windows are views of the span, or straight into the hasher below
+// the size where the pipeline pays for itself. `ends_message` says
+// whether these bytes end the message, in which case the last window's
+// final part stays with the hasher.
+template <stack_budget Budget, class Scheduler>
+void absorb_span(hasher& h, std::span<const std::byte> bytes,
+                 Scheduler&& sched, std::size_t window_bytes,
+                 bool ends_message) {
+  if (bytes.size() < min_pipeline_bytes) {
+    if (ends_message) {
+      h.update_last(bytes);
+    } else {
+      h.update(bytes);
+    }
+    return;
+  }
+  memory_driver drv;
+  memory_driver::file f(drv, bytes);
+  pipeline_plan plan = plan_memory_pipeline(
+      h.count(), window_bytes, static_cast<std::uint64_t>(bytes.size()));
+  plan.ends_message = ends_message;
+  run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
+                              {});
 }
 
 // The one-shot engine: the same pipeline update_file drives, over a
@@ -234,19 +252,10 @@ namespace detail {
 template <stack_budget Budget, class Scheduler>
 [[nodiscard]] digest hash_into(hasher& h, std::span<const std::byte> input,
                                Scheduler&& sched) {
-  if (input.size() < min_pipeline_bytes) {
-    // The call finalizes, so these bytes end the message.
-    h.update_last(input);
-    return h.finalize();
-  }
-  const std::size_t window =
-      memory_window_bytes(static_cast<std::uint64_t>(input.size()));
-  memory_driver drv;
-  memory_driver::file f(drv, input);
-  const pipeline_plan plan = plan_memory_pipeline(
-      h.count(), window, static_cast<std::uint64_t>(input.size()));
-  run_window_pipeline<Budget>(h, drv, f, std::forward<Scheduler>(sched), plan,
-                              {.window_bytes = window});
+  const std::size_t window = memory_window_bytes(input.size());
+  // The call finalizes, so these bytes end the message.
+  absorb_span<Budget>(h, input, std::forward<Scheduler>(sched), window,
+                      /*ends_message=*/true);
   return h.finalize();
 }
 
@@ -308,8 +317,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
   requires ex::scheduler<std::remove_cvref_t<Scheduler>>
 [[nodiscard]] digest hash(std::string_view input, Scheduler&& sched,
                           arch a = arch::auto_detect) {
-  return hash<Budget>(std::as_bytes(std::span{input.data(), input.size()}),
-                      std::forward<Scheduler>(sched), a);
+  return hash<Budget>(detail::bytes_of(input), std::forward<Scheduler>(sched),
+                      a);
 }
 
 /// Multi-core keyed one-shot: the MAC/PRF of input under a 32-byte key,
@@ -344,9 +353,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
 [[nodiscard]] digest keyed_hash(std::span<const std::byte, key_size> key,
                                 std::string_view input, Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  return keyed_hash<Budget>(
-      key, std::as_bytes(std::span{input.data(), input.size()}),
-      std::forward<Scheduler>(sched), a);
+  return keyed_hash<Budget>(key, detail::bytes_of(input),
+                            std::forward<Scheduler>(sched), a);
 }
 
 /// Multi-core key derivation, for key material large enough to matter (a
@@ -382,10 +390,8 @@ template <stack_budget Budget = default_stack_budget, class Scheduler>
                                 std::string_view key_material,
                                 Scheduler&& sched,
                                 arch a = arch::auto_detect) {
-  return derive_key<Budget>(
-      context,
-      std::as_bytes(std::span{key_material.data(), key_material.size()}),
-      std::forward<Scheduler>(sched), a);
+  return derive_key<Budget>(context, detail::bytes_of(key_material),
+                            std::forward<Scheduler>(sched), a);
 }
 
 /// parallel_hasher's knobs.
@@ -393,9 +399,10 @@ struct parallel_hasher_options {
   /// The SIMD variant of the internal hasher.
   arch a = arch::auto_detect;
   /// Bytes accumulated before a window is fanned out; rounded by
-  /// detail::rounded_window_bytes to a power of two in
-  /// [64 KiB, 1 GiB]. Buffered input below one window hashes
-  /// sequentially at `finalize()`.
+  /// detail::rounded_window_bytes to a power of two in [64 KiB, 1 GiB] on
+  /// a 64-bit target, and below a lower cap on a 32-bit one, where
+  /// max_queue_depth windows have to fit in size_t. Buffered input below
+  /// one window hashes sequentially at `finalize()`.
   std::size_t window_bytes = detail::default_window_bytes;
 };
 
@@ -407,13 +414,14 @@ struct parallel_hasher_options {
 ///   - The digest equals the sequential one.
 ///   - All alignment and final-chunk discipline lives here, not with the
 ///     caller.
-///   - The window buffer is the type's one allocation, made at
-///     construction.
+///   - The window buffer is allocated at construction. Each fan-out also
+///     allocates the pipeline's window objects and reducer storage for
+///     that call.
 ///   - finalize() is non-destructive, like hasher's.
 ///   - A moved-from hasher is in the state reset() leaves; its next
 ///     update() allocates the buffer again.
 ///   - Not thread-safe. The scheduler's workers are used only inside
-///     update().
+///     update() and the finalize forms.
 ///
 /// Input accumulates into an aligned window, and a full window is fanned
 /// out as soon as one more byte arrives. That is the "one byte in reserve"
@@ -501,9 +509,10 @@ class parallel_hasher {
   /// out over the scheduler from here.
   ///
   /// Whole windows of `input` are hashed where they lie, so the cost in
-  /// copying is bounded: at most ONE window is copied per call, and only
-  /// to finish a window a previous call left part-built. The buffer that
-  /// holds it is one window, never more.
+  /// copying is bounded: what finishes a window a previous call left
+  /// part-built, which is under one window, and the tail held back for
+  /// the next call, which is at most one. The buffer that holds them is
+  /// one window, never more.
   /// @param input  Any length, including zero.
   void update(std::span<const std::byte> input) {
     if (input.empty()) {
@@ -514,8 +523,8 @@ class parallel_hasher {
       remainder_.resize(window_bytes_);
     }
     // Whole windows of the caller's own bytes are hashed where they lie.
-    // The only copying is what it takes to finish a window the last call
-    // left part-built, which is under one window and never more.
+    // Copying is what finishes a window the last call left part-built,
+    // here, and the tail held back at the end.
     if (filled_ > 0) {
       const std::size_t take =
           std::min(window_bytes_ - filled_, input.size());
@@ -557,7 +566,7 @@ class parallel_hasher {
   /// Absorbs the next bytes of the message, given as text.
   /// @param input  The bytes of the string, not including any terminator.
   void update(std::string_view input) {
-    update(std::as_bytes(std::span{input.data(), input.size()}));
+    update(detail::bytes_of(input));
   }
 
   /// The digest of everything absorbed so far; the hasher stays usable.
@@ -605,18 +614,9 @@ class parallel_hasher {
   // with the hasher.
   [[nodiscard]] hasher drained() const {
     hasher h = h_;
-    const std::span<const std::byte> tail{remainder_.data(), filled_};
-    if (filled_ < detail::min_pipeline_bytes) {
-      h.update_last(tail);
-      return h;
-    }
-    detail::memory_driver drv;
-    detail::memory_driver::file f(drv, tail);
-    const detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h.count(), window_bytes_, static_cast<std::uint64_t>(filled_));
-    detail::run_window_pipeline<Budget>(
-        h, drv, f, sched_, plan,
-        {.window_bytes = window_bytes_});
+    detail::absorb_span<Budget>(
+        h, std::span<const std::byte>{remainder_.data(), filled_}, sched_,
+        window_bytes_, /*ends_message=*/true);
     return h;
   }
 
@@ -625,21 +625,10 @@ class parallel_hasher {
   // which is what leaves the hasher on a window boundary for the next
   // call. Below the threshold the scope costs more than it saves.
   void absorb(std::span<const std::byte> bytes) {
-    if (bytes.size() < detail::min_pipeline_bytes) {
-      h_.update(bytes);
-      return;
-    }
-    detail::memory_driver drv;
-    detail::memory_driver::file f(drv, bytes);
-    detail::pipeline_plan plan = detail::plan_memory_pipeline(
-        h_.count(), window_bytes_,
-        static_cast<std::uint64_t>(bytes.size()));
-    // Never: update() holds the final window back, so nothing absorbed
-    // here can contain the message's end.
-    plan.ends_message = false;
-    detail::run_window_pipeline<Budget>(
-        h_, drv, f, sched_, plan,
-        {.window_bytes = window_bytes_});
+    // Never the message's end: update() holds the final window back, so
+    // nothing absorbed here can contain it.
+    detail::absorb_span<Budget>(h_, bytes, sched_, window_bytes_,
+                                /*ends_message=*/false);
   }
 
   Scheduler sched_;
@@ -668,7 +657,8 @@ inline constexpr std::size_t default_fill_segment_bytes = 4 * 1024 * 1024;
 /// @param out            Receives the next `out.size()` bytes of r's stream.
 /// @param sched          Where the segments are filled.
 /// @param segment_bytes  Bytes per task; rounded down to a multiple of
-///                       block_size so every task starts on the wide path.
+///                       block_size, so every task starts on the wide path
+///                       when r.position() is a multiple of block_size.
 ///                       Defaults to default_fill_segment_bytes.
 /// @throws std::system_error with errc::operation_canceled if sched
 ///         completes the work stopped; r is then left where it was.

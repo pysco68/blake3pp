@@ -19,7 +19,26 @@
 
 #include "io/backend.hpp"
 
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#define BLAKE3PP_IO_MSAN 1
+#endif
+#endif
+
 namespace blake3pp::detail::io_impl {
+
+// MemorySanitizer cannot see a read the kernel completes on its own: the
+// bytes land without any libc call MSan intercepts, so they stay
+// "uninitialized" in its shadow. A backend whose reads complete that way
+// (io_uring, AIO) unpoisons the range each one filled, stating a fact
+// MSan has no other way to learn. A no-op in every other build.
+inline void msan_unpoison([[maybe_unused]] const void* p,
+                          [[maybe_unused]] std::size_t n) noexcept {
+#if defined(BLAKE3PP_IO_MSAN)
+  __msan_unpoison(p, n);
+#endif
+}
 
 struct posix_file {
   posix_file() = default;

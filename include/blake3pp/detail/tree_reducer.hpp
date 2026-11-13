@@ -188,10 +188,8 @@ class tree_reducer {
   std::uint32_t base_flags_;
   std::span<node> storage_;
   std::size_t count_ = 0;
-  // What insert() checks disjointness with, in three numbers rather than a
-  // scan of what is still pending: the chunks inserted since the last
-  // clear(), and the span they cover. Disjoint ranges keep the first at or
-  // below the second whatever has merged away in between.
+  // Whether the pending nodes are in first_chunk order, which sorted()
+  // restores on demand and every insert() gives up.
   bool sorted_ = true;
 };
 

@@ -14,7 +14,7 @@
 #if defined(STDEXEC_ATTRIBUTE) || defined(BEMAN_EXECUTION_TRY_EVAL) || \
     defined(BEMAN_EXECUTION_DELETE)
 #error \
-    "<blake3pp/io.hpp> pulled in an execution provider. Something under include/blake3pp reachable from io.hpp includes parallel.hpp, ex_compat.hpp or file_pipeline.hpp; the pipeline's provider-facing headers are included by the .cpp that drives them, never by the public I/O surface."
+    "<blake3pp/io.hpp> pulled in an execution provider. Something under include/blake3pp reachable from io.hpp includes parallel.hpp, ex_compat.hpp, file_pipeline.hpp, driver_loop.hpp or window_scope.hpp; the pipeline's provider-facing headers are included by the .cpp that drives them, never by the public I/O surface."
 #endif
 
 TEST_SUITE("io") {

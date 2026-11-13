@@ -240,8 +240,7 @@ class memory_driver {
   //         cover: past the end this hands back a view of the caller's own
   //         memory beyond the span being hashed.
   [[nodiscard]] window_storage window_storage_for(
-      file& f, [[maybe_unused]] unsigned slot, std::uint64_t off,
-      std::size_t bytes) {
+      file& f, unsigned slot, std::uint64_t off, std::size_t bytes) {
     // Checked in every build: the subspan below is a view into the
     // caller's own memory, and a window past its end is a read of whatever
     // follows it -- which on this driver is the caller's address space
@@ -274,7 +273,7 @@ class memory_driver {
 
  private:
   queued_reads reads_;
-  [[maybe_unused]] unsigned windows_ = 0;
+  unsigned windows_ = 0;
 };
 
 static_assert(file_driver<memory_driver>);

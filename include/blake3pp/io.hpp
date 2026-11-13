@@ -49,6 +49,7 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/file_writer.hpp>
 #include <blake3pp/detail/io_geometry.hpp>
+#include <blake3pp/detail/pipeline_plan.hpp>
 
 namespace blake3pp {
 
@@ -268,6 +269,16 @@ auto with_error_code(std::error_code& ec, F&& fn) noexcept
   }
 }
 
+// The plan update_file() makes over a scheduler, for a hasher whose count
+// is `count`: from the file's size, read before the open because the plan
+// decides the open mode, and a window budget that follows the machine's
+// thread count. A size the filesystem will not give leaves the window
+// count to the budget, and the open reports why. probe_file_io() reports
+// this plan for a fresh hasher. Defined in src/io_hash.cpp.
+[[nodiscard]] pipeline_plan plan_file(const std::filesystem::path& path,
+                                      const file_io_options& opts,
+                                      std::uint64_t count);
+
 }  // namespace detail
 
 /// The hasher these options describe: its SIMD variant and its mode.
@@ -320,9 +331,10 @@ void update_file(hasher& h, const std::filesystem::path& path,
                  std::error_code& ec,
                  const file_io_options& opts = {}) noexcept;
 
-/// What update_file() would engage for a file: the geometry its plan
-/// decides from the options and the file's size, and the rung the open
-/// lands on. See probe_file_io().
+/// What update_file() over a scheduler would engage for a file: the
+/// geometry its plan decides from the options and the file's size, and
+/// the rung the open lands on. The sequential update_file() opens the
+/// same way and reads through queue_depth windows. See probe_file_io().
 struct file_io_probe {
   /// The file's size as the filesystem reports it.
   std::uint64_t file_bytes = 0;
@@ -330,8 +342,8 @@ struct file_io_probe {
   std::size_t window_bytes = 0;
   /// Reads the device sees at once.
   unsigned reads_in_flight = 0;
-  /// Windows in flight at most, reading or being hashed; never more than
-  /// the file has.
+  /// Windows in flight at most, reading or being hashed, in the scheduler
+  /// form; never more than the file has.
   unsigned windows = 0;
   /// Whether the open asks for the cache bypass: the caller's direct_io,
   /// granted only to a file of at least 512 KiB (detail::min_pipeline_bytes)
@@ -589,7 +601,7 @@ write_report write_sequential(const std::filesystem::path& path,
       writer.submit(b, n);
       done += n;
     }
-    if (n < b.capacity) {
+    if (n < b.bytes.size()) {
       break;
     }
   }
@@ -637,11 +649,11 @@ write_report write_file(const std::filesystem::path& path, std::uint64_t size,
       path, size,
       [&](const detail::file_writer::buffer& b, std::uint64_t off) {
         const std::size_t n = static_cast<std::size_t>(
-            std::min<std::uint64_t>(b.capacity, size - off));
+            std::min<std::uint64_t>(b.bytes.size(), size - off));
         // At off == size the writer asks once more, which is how it learns
         // the file ended; the generator owes nothing for that window.
         if (n != 0) {
-          fill(std::span{b.data, n}, off);
+          fill(b.bytes.first(n), off);
         }
         return n;
       },
@@ -672,7 +684,7 @@ write_report write_file(const std::filesystem::path& path, Fill&& fill,
       path, 0,
       [&](const detail::file_writer::buffer& b, std::uint64_t off) {
         return static_cast<std::size_t>(
-            fill(std::span{b.data, b.capacity}, off));
+            fill(b.bytes, off));
       },
       opts);
 }

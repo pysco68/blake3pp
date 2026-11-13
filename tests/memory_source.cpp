@@ -379,7 +379,7 @@ TEST_CASE("a stop over a memory source ends the run once") {
       detail::run_window_pipeline<blake3pp::default_stack_budget>(
           h, drv, f, sched,
           detail::plan_memory_pipeline(0, win, bytes.size()),
-          {.window_bytes = win, .stop_token = src.get_token()});
+          {.stop_token = src.get_token()});
     } catch (const std::system_error& e) {
       ec = e.code();
     }
@@ -398,7 +398,7 @@ TEST_CASE("a stop over a memory source ends the run once") {
       detail::run_window_pipeline<blake3pp::default_stack_budget>(
           h, drv, f, sched,
           detail::plan_memory_pipeline(0, win, bytes.size()),
-          {.window_bytes = win, .stop_token = src.get_token()});
+          {.stop_token = src.get_token()});
     } catch (const std::system_error& e) {
       ec = e.code();
     }
@@ -425,8 +425,7 @@ TEST_CASE("the pipeline over a memory source hashes what it was given") {
     detail::memory_driver::file f(drv, bytes);
     blake3pp::hasher h;
     detail::run_window_pipeline<blake3pp::default_stack_budget>(
-        h, drv, f, sched, detail::plan_memory_pipeline(0, win, n),
-        {.window_bytes = win});
+        h, drv, f, sched, detail::plan_memory_pipeline(0, win, n), {});
     CHECK(h.finalize() == blake3pp::hash(std::span<const std::byte>{bytes}));
   }
 }

@@ -186,20 +186,10 @@ void update_file(hasher& h, const std::filesystem::path& path,
   // the grid is aligned: an unaligned head misaligns every window after
   // it and would send each read to the synchronous rung.
   //
-  // The size is read before the open because the plan decides the open
-  // mode and sizes the window objects to the file; a size the filesystem
-  // cannot give leaves the count to the budget, and the open reports why.
-  std::error_code size_ec;
-  const std::uintmax_t size = std::filesystem::file_size(path, size_ec);
-  // The plan's window objects are the arena the pool draws work from.
-  // Their number follows the machine's thread count
-  // (read_plan_budget_bytes), while the engine's queue is sized for the
-  // reads that can actually be outstanding, which is the depth.
-  const detail::pipeline_plan plan = detail::plan_pipeline(
-      h.count(), opts.window_bytes, opts.queue_depth, opts.direct_io,
-      size_ec ? 0 : static_cast<std::uint64_t>(size),
-      detail::read_plan_budget_bytes(std::thread::hardware_concurrency(),
-                                     opts.window_bytes));
+  // The plan's window objects are the arena the pool draws work from,
+  // while the engine's queue is sized for the reads that can actually be
+  // outstanding, which is the depth.
+  const detail::pipeline_plan plan = detail::plan_file(path, opts, h.count());
   detail::io_driver drv({.async = opts.async,
                          .offload_submit = opts.offload_submit,
                          .ioring = opts.ioring},
@@ -207,10 +197,7 @@ void update_file(hasher& h, const std::filesystem::path& path,
   detail::io_driver::file file(drv, path, plan.direct_io);
   detail::run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched), plan,
-      {.window_bytes = opts.window_bytes,
-       .queue_depth = opts.queue_depth,
-       .trace = opts.trace,
-       .stop_token = detail::blocking_stop_token()});
+      {.stop_token = detail::blocking_stop_token()}, opts.trace);
 }
 
 /// Streams a file into a hasher over a scheduler, reporting failure
@@ -431,10 +418,11 @@ struct stream_report {
 
 namespace detail {
 
-// The parts of a stream_report that come from the reader. Each is taken
-// only from a reader that has the member, so the scripted readers in the
-// tests compile without them. The shipped reader has both members on every
-// platform, and reports zero where it does not use them.
+// The parts of a stream_report that come from the reader. The watch is
+// taken only from a reader that has one, so the scripted readers in the
+// tests compile without it; the shipped reader has it on every platform,
+// and reports zero where it does not use it. read_bound() every reader
+// has, because basic_pipe_driver asks for it on every read.
 template <class Reader>
 [[nodiscard]] stream_report::watch_report watch_report_of(
     const Reader& r) noexcept {
@@ -452,11 +440,7 @@ template <class Reader>
 
 template <class Reader>
 [[nodiscard]] std::size_t read_ask_bound_of(const Reader& r) noexcept {
-  if constexpr (requires { { r.read_bound() } -> std::convertible_to<std::size_t>; }) {
-    return r.read_bound();
-  } else {
-    return 0;
-  }
+  return r.read_bound();
 }
 
 }  // namespace detail
@@ -516,9 +500,7 @@ stream_report update_stream(hasher& h, stream_handle handle, Scheduler&& sched,
   detail::pipe_driver::file file(drv);
   detail::run_window_pipeline<Budget>(
       h, drv, file, std::forward<Scheduler>(sched), plan,
-      {.window_bytes = window,
-       .trace = opts.trace,
-       .stop_token = detail::blocking_stop_token()});
+      {.stop_token = detail::blocking_stop_token()}, opts.trace);
   return {.bytes = drv.bytes_read(),
           .windows = drv.windows_filled(),
           .short_flushes = drv.short_flushes(),

@@ -11,7 +11,7 @@
 //
 // Every escape below defends a measurement and answers to a tuning switch
 // (cmake/ArchKernels.cmake) so it can be re-measured on hardware it has
-// not been measured on. The scalar word overloads live in kernel.cpp.
+// not been measured on. The scalar word form of xor_rot lives in kernel.cpp.
 
 #include <bit>
 #include <cstddef>

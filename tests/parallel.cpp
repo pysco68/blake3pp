@@ -14,6 +14,7 @@
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/dispatch.hpp>
 #include <blake3pp/parallel.hpp>
+#include "execution/bulk_chunk.hpp"
 #include "kernel/kernel.hpp"  // max_simd_degree, for the static_assert below
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>

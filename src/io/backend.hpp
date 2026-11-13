@@ -49,7 +49,7 @@
 #include <sys/mman.h>  // madvise(MADV_HUGEPAGE) for the arena
 #endif
 #include <algorithm>
-#include <chrono>
+#include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -77,8 +77,9 @@ namespace blake3pp::detail::io_impl {
   throw std::system_error(e, std::generic_category(), what);
 }
 
-// The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule.
-constexpr std::size_t direct_align = 4096;
+// The O_DIRECT / FILE_FLAG_NO_BUFFERING buffer-and-length granule: the
+// alignment callers plan their reads around, from driver.hpp.
+constexpr std::size_t direct_align = direct_alignment;
 
 // The buffer arena of the engines and the driver: one direct-I/O-aligned
 // allocation behind an owning pointer, so member declaration order alone
@@ -281,13 +282,6 @@ struct transfer_base {
 // around its own pread, which excludes its wait for a lane, and an
 // asynchronous engine stamps from submission to completion.
 
-// Reads the steady clock in nanoseconds, for the stamps above.
-[[nodiscard]] inline std::int64_t io_now_ns() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
 
 // What a transfer needs while a mechanism is performing it. Every context
 // that performs transfers derives its transfer from this.
@@ -308,7 +302,7 @@ struct performed_transfer : transfer_base {
   void device_begin() noexcept {
     if (!charging) {
       charging = true;
-      device_ns -= io_now_ns();
+      device_ns -= steady_now_ns();
     }
   }
   // Ends the charge, whether the piece landed or was taken back unsent.
@@ -317,7 +311,7 @@ struct performed_transfer : transfer_base {
   void device_end() noexcept {
     if (charging) {
       charging = false;
-      device_ns += io_now_ns();
+      device_ns += steady_now_ns();
     }
   }
   // What the device had this transfer for, for device_time::add(). Valid
@@ -364,10 +358,11 @@ struct performed_transfer : transfer_base {
 //
 // A context owns the completion mechanism (a ring, a port, a queue) and
 // nothing about any particular file. C::file is an open file bound to a
-// context: constructed from (C&, const std::filesystem::path&, bool
-// direct_io) and exposing size() and name(). A source that has no path
-// constructs its file differently -- null_context::file takes a size --
-// which is why construction is described here rather than required below.
+// context: constructed from (C&, const std::filesystem::path&,
+// const file_open_options&) and exposing size() and name(). A source that
+// has no path constructs its file differently -- the tests' fake_context
+// takes a size -- which is why construction is described here rather than
+// required below.
 //
 // name() is where the degradation ladder becomes visible: it is settled
 // when the file is opened, against the context that opened it, and
@@ -405,6 +400,9 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // The file_reader::backend() string, computed when the file was opened
   // and owned by it: the engine hands it straight to file_reader.
   { f.name() } noexcept -> std::same_as<std::string_view>;
+  // The file's length as the open found it, which the engines and the
+  // driver read to plan and to bound every transfer.
+  { f.size() } noexcept -> std::same_as<std::uint64_t>;
   // Queues one read of exactly buf.size() bytes at off. Performs no
   // transfer and runs no callback. A transfer the asynchronous engine
   // cannot take (no engine, a length NO_BUFFERING cannot take on Windows,
@@ -641,7 +639,11 @@ class io_lanes {
     started_ = true;
     unblock_ = unblock;
     cookie_ = cookie;
-    lanes_.reserve(want_);
+    try {
+      lanes_.reserve(want_);
+    } catch (...) {  // not one lane, which the result reports
+      return false;
+    }
     for (unsigned i = 0; i < want_; ++i) {
       try {
         lanes_.emplace_back([body, cookie] { body(cookie); });
@@ -730,7 +732,6 @@ class deferred_pump {
     if (!lanes_.running()) {
       lanes_.start(&lane_body, &lane_unblock, this);
     }
-    op.next_deferred = nullptr;
     accrue();
     queue_.push(op);
     ++queued_;
@@ -928,7 +929,7 @@ class deferred_pump {
     if (queued_ == 0) {
       return 0;
     }
-    const std::int64_t d = io_now_ns() - since_;
+    const std::int64_t d = steady_now_ns() - since_;
     return d > 0 ? static_cast<std::uint64_t>(d) * queued_ : 0;
   }
 
@@ -939,7 +940,7 @@ class deferred_pump {
   // changes.
   void accrue() noexcept {
     lane_wait_ns_ += waiting_since_change();
-    since_ = io_now_ns();
+    since_ = steady_now_ns();
   }
 
   mutable std::mutex m_;
@@ -1189,9 +1190,9 @@ class sync_context {
 
   void report(transfer& op) noexcept {
     queued_--;
-    if (op.owner_file != nullptr) {
-      op.owner_file->queued_--;
-    }
+    assert(op.owner_file != nullptr &&
+           "every transfer is queued with its file");
+    op.owner_file->queued_--;
     device_.add_if_served(op.device_total_ns());
     op.done(&op, op.result());
   }

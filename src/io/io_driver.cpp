@@ -34,9 +34,6 @@ using native_op = context::transfer;
 // check: raise storage_size in the header. One whose op acquires
 // anything would have to be released in trampoline() before the
 // callback runs, which no backend needs today.
-static_assert(io_driver::direct_alignment == io_impl::direct_align,
-              "the alignment callers plan their reads around must be the "
-              "one the backends enforce");
 
 // Takes an operation off the driver's owed list. The list is circular
 // around a sentinel the driver owns, so no unlink needs the head.

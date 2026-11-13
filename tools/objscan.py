@@ -610,11 +610,16 @@ def kernel_objects(build_dir):
     OBJECT-library ones (multi-config generators add a configuration
     directory) and the externally compiled ones."""
     found = []
+    # .o* takes MSVC's .obj too, and so would the .o.d depfile an externally
+    # compiled kernel keeps beside its object (ninja deletes its own once
+    # read), which is no object at all.
     for obj in glob.glob(os.path.join(build_dir, "CMakeFiles", "blake3pp_kernel_*.dir", "**", "*kernel.cpp.o*"),
                          recursive=True):
-        found.append((re.search(r"blake3pp_kernel_([^/\\]+)\.dir", obj).group(1), obj))
+        if not obj.endswith(".d"):
+            found.append((re.search(r"blake3pp_kernel_([^/\\]+)\.dir", obj).group(1), obj))
     for obj in glob.glob(os.path.join(build_dir, "blake3pp_generated", "kernel_*.o*")):
-        found.append((re.search(r"kernel_([^/\\]+)\.o", os.path.basename(obj)).group(1), obj))
+        if not obj.endswith(".d"):
+            found.append((re.search(r"kernel_([^/\\]+)\.o", os.path.basename(obj)).group(1), obj))
     return sorted(found)
 
 

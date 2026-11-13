@@ -22,6 +22,8 @@
 
 #include <blake3pp/parallel.hpp>
 
+#include "execution/bulk_chunk.hpp"
+
 #include <atomic>
 #include <mutex>
 #include <new>

@@ -138,7 +138,7 @@ using scheduler_tag = ::blake3pp::ex::scheduler_t;
 //     template <class Scope>
 //     using cells_for = cells<Scope, connect_result_t<...>>;
 //
-// The incident: detail::pipeline_cells (file_pipeline.hpp) was written
+// The incident: detail::pipeline_cells (window_scope.hpp) was written
 // the first way so an asynchronous operation state could hold one as a
 // member, and the sanitizer lane failed on nine cases. A single
 // translation unit was clean either way; tests/provider_linkage.cpp and

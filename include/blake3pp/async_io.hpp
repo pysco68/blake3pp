@@ -216,13 +216,14 @@ class basic_io_context {
   }
 
   /// Asks every started operation to stop and wakes the running thread.
-  /// The only member another thread may call.
+  /// Safe from any thread, as starting an operation is.
   void request_stop() noexcept {
     stop_.store(true, std::memory_order_release);
     drv_.wake();
   }
 
-  /// Whether a stop has been requested. Clears on the next run().
+  /// Whether a stop has been requested. It stays set until a run returns
+  /// with no operation live or waiting to be adopted, and clears there.
   [[nodiscard]] bool stop_requested() const noexcept {
     return stop_.load(std::memory_order_acquire);
   }
@@ -243,9 +244,6 @@ class basic_io_context {
     return host_;
   }
   [[nodiscard]] blake3pp::detail::io_driver& driver() noexcept { return drv_; }
-  [[nodiscard]] const blake3pp::detail::pipeline_plan& plan() const noexcept {
-    return plan_;
-  }
   [[nodiscard]] const io_context_options& options() const noexcept {
     return opts_;
   }
@@ -513,8 +511,6 @@ class update_file_op final : public pipeline_node {
       file_.emplace(ctx_->driver(), path_, plan_.direct_io);
       scope_.emplace(*h_, ctx_->host(), *file_, sched_, plan_,
                      blake3pp::detail::pipeline_options{
-                         .window_bytes = cfg.window_bytes,
-                         .queue_depth = cfg.queue_depth,
                          .file_index = file_index_,
                          .stop_token = stop_.get_token()},
                      tracer_);

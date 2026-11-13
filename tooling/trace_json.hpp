@@ -9,6 +9,7 @@
 #include <format>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -90,11 +91,10 @@ inline bool write_chrome_trace(const std::string& path,
         d.queue_depth_peak, d.agent_busy_ns, d.device_wait_min_ns,
         d.device_depth, d.lane_wait_ns, blake3pp::read_backend(d));
   }
-  std::map<std::uint32_t, bool> slots_named;
+  std::set<std::uint32_t> slots_named;
   for (const auto& w : trace.windows()) {
     const std::uint32_t tid = w.slot;
-    if (!slots_named[tid]) {
-      slots_named[tid] = true;
+    if (slots_named.insert(tid).second) {
       out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
                          "\"pid\":1,\"tid\":{},\"args\":{{\"name\":"
                          "\"window object\"}}}}",
@@ -135,7 +135,7 @@ inline bool write_chrome_trace(const std::string& path,
   // A flow is a start event bound to the slice enclosing it on one lane
   // and an end event ("bp":"e") bound the same way on another, so both
   // sit a hair inside their slices.
-  std::map<std::uint32_t, bool> cpus_named;
+  std::set<std::uint32_t> cpus_named;
   std::map<std::pair<std::uint32_t, std::uint64_t>, std::pair<std::uint32_t, std::int64_t>>
       compute_of;  // (file, window) -> (slot, t_ready)
   for (const auto& w : trace.windows()) {
@@ -144,8 +144,7 @@ inline bool write_chrome_trace(const std::string& path,
   std::uint64_t flow = 0;
   for (const auto& a : trace.agents()) {
     const std::uint32_t tid = a.cpu == ~std::uint32_t{0} ? 99 : a.cpu;
-    if (!cpus_named[tid]) {
-      cpus_named[tid] = true;
+    if (cpus_named.insert(tid).second) {
       out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
                          "\"pid\":2,\"tid\":{},\"args\":{{\"name\":\"{}\"}}}}",
                          tid, tid == 99 ? "cpu unknown, tid" : "cpu");
@@ -188,9 +187,8 @@ inline bool write_chrome_trace(const std::string& path,
     }
     std::sort(edges.begin(), edges.end());
     int busy = 0;
-    std::int64_t at = edges.empty() ? 0 : edges.front().first;
     for (std::size_t i = 0; i < edges.size();) {
-      at = edges[i].first;
+      const std::int64_t at = edges[i].first;
       while (i < edges.size() && edges[i].first == at) {
         busy += edges[i].second;
         ++i;

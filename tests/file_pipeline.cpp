@@ -302,7 +302,6 @@ struct token_probe_sender {
 // off the loop's outstanding count, which is what ends the run.
 struct chain_result {
   bool completed = false;
-  std::size_t bytes = 0;
   std::uint64_t sum = 0;
   std::error_code ec{};
 };
@@ -322,10 +321,6 @@ struct chain_receiver {
     status->done = status->outstanding == 0;
   }
   void set_value() && noexcept { finish(); }
-  void set_value(std::span<const std::byte> w) && noexcept {
-    out->bytes = w.size();
-    finish();
-  }
   void set_value(std::uint64_t v) && noexcept {
     out->sum = v;
     finish();
@@ -401,6 +396,10 @@ struct fake_script {
   bool keep_throwing = false;
   // The window index whose submit_read() throws std::bad_alloc, or -1.
   int bad_alloc_at_window = -1;
+  // The window index whose window_storage_for() throws std::bad_alloc,
+  // once, or -1: a failure while the scope is still building the window,
+  // before anything is counted for it.
+  int storage_throw_at_window = -1;
   // What the device does about a cancel. All three are conforming, and
   // the pipeline has to report the same thing under each: the backends
   // differ exactly here (io_uring and IOCP abort the transfer, GCD cannot
@@ -607,7 +606,13 @@ class fake_driver {
   }
 
   [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
-      file&, unsigned slot, std::uint64_t off, std::size_t bytes) noexcept {
+      file&, unsigned slot, std::uint64_t off, std::size_t bytes) {
+    if (script_.storage_throw_at_window >= 0 &&
+        off / window_bytes_ ==
+            static_cast<std::uint64_t>(script_.storage_throw_at_window)) {
+      script_.storage_throw_at_window = -1;
+      throw std::bad_alloc();
+    }
     const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
                                      bytes};
     if (script_.zero_copy) {
@@ -1277,7 +1282,6 @@ TEST_CASE("a window read is a sender the driver loop completes") {
   io.run_until(st);
   CHECK(r.completed);
   CHECK(!r.ec);
-  CHECK(r.bytes == len);
   CHECK(owed == 0);  // and does not, once it has run
   CHECK(std::equal(pool.begin(), pool.end(), content.begin()));
 }
@@ -1307,7 +1311,6 @@ TEST_CASE("a read that fails reports through the error channel") {
   io.run_until(st);
   CHECK(r.completed);
   CHECK(r.ec == std::errc::io_error);
-  CHECK(r.bytes == 0);
 }
 
 TEST_CASE("the driver scheduler runs work on the loop's own thread") {
@@ -1407,7 +1410,7 @@ TEST_CASE("the four-line window chain composes on this provider") {
       ex::then(
           ex::continues_on(
               ex::let_value(io.read(file, 0, pool, rop, owed),
-                            [&, sched](std::span<const std::byte> w) {
+                            [&, sched, w = std::span<const std::byte>(pool)] {
                               return ex::then(ex::schedule(sched), [&, w] {
                                 summed_elsewhere.store(
                                     std::this_thread::get_id() != here,
@@ -1453,7 +1456,10 @@ namespace {
   io_driver::file f(drv, path, /*direct_io=*/false);
   blake3pp::hasher h;
   blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
-      h, drv, f, sched, {window, depth, nullptr, cap});
+      h, drv, f, sched,
+      {.window_bytes = window,
+       .queue_depth = depth,
+       .options = {.in_flight_cap = cap}});
   return h.finalize();
 }
 
@@ -1530,12 +1536,12 @@ void run_scope(Scope& scope) {
 template <class Scope, class D, class Sched>
 struct pooled_scope {
   pooled_scope(blake3pp::hasher& h, D& drv, typename D::file& f, Sched sched,
-               const blake3pp::detail::pipeline_options& opts)
-      : plan(blake3pp::detail::plan_pipeline(h.count(), opts.window_bytes,
-                                             opts.queue_depth, false,
+               const blake3pp::detail::pipeline_request& req)
+      : plan(blake3pp::detail::plan_pipeline(h.count(), req.window_bytes,
+                                             req.queue_depth, false,
                                              f.size())),
         host(drv, plan.windows, plan.window_bytes),
-        scope(h, host, f, std::move(sched), plan, opts) {}
+        scope(h, host, f, std::move(sched), plan, req.options) {}
 
   blake3pp::detail::pipeline_plan plan;
   blake3pp::detail::pipeline_host<blake3pp::default_stack_budget, D> host;
@@ -1569,9 +1575,7 @@ TEST_CASE("sibling windows the reducer cannot hold still finish") {
   pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 8,
-                    .trace = nullptr,
-                    .in_flight_cap = 0,
-                    .reducer_capacity = 8});
+                    .options = {.reducer_capacity = 8}});
   run_scope(ps.scope);
   CHECK(h.finalize() == blake3pp::hash(content));
 }
@@ -1596,9 +1600,7 @@ TEST_CASE("admission throttles starts instead of refusing an insert") {
   pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 8,
-                    .trace = nullptr,
-                    .in_flight_cap = 0,
-                    .reducer_capacity = 8});
+                    .options = {.reducer_capacity = 8}});
   run_scope(ps.scope);
   CHECK(h.finalize() == blake3pp::hash(content));
   // The scope held windows back, so the reducer refused none.
@@ -1635,7 +1637,9 @@ void fake_run(blake3pp::hasher& h, std::span<const std::byte> content,
   fake_driver::file f(drv);
   blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
       h, drv, f, std::move(sched),
-      {.window_bytes = win, .queue_depth = depth, .in_flight_cap = cap});
+      {.window_bytes = win,
+       .queue_depth = depth,
+       .options = {.in_flight_cap = cap}});
 }
 
 // The stop cases all want the driver afterwards -- how many reads it was
@@ -1665,8 +1669,7 @@ stop_outcome stop_run(blake3pp::hasher& h, std::span<const std::byte> content,
         h, drv, f, std::move(sched),
         {.window_bytes = win,
          .queue_depth = depth,
-         .in_flight_cap = cap,
-         .stop_token = src.get_token()});
+         .options = {.in_flight_cap = cap, .stop_token = src.get_token()}});
   } catch (const std::system_error& e) {
     out.threw = true;
     out.ec = e.code();
@@ -1851,8 +1854,9 @@ TEST_CASE("a stop requested from another thread reaches a parked driver") {
   try {
     blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
         h, drv, f, sched,
-        {.window_bytes = win, .queue_depth = 4,
-         .stop_token = src.get_token()});
+        {.window_bytes = win,
+         .queue_depth = 4,
+         .options = {.stop_token = src.get_token()}});
   } catch (const std::system_error& e) {
     threw = true;
     ec = e.code();
@@ -2158,6 +2162,55 @@ TEST_CASE("a read the driver could not queue reports what it threw") {
   }
 }
 
+// A window that fails while admission is still building it is given
+// back to the pool, and the windows already in flight come back when the
+// run unwinds: a pool shared by several runs loses nothing to one that
+// failed, and the next run on it uses every window and hashes correctly.
+TEST_CASE("a window that fails before it starts goes back to a shared pool") {
+  using scope_type =
+      blake3pp::detail::window_scope<blake3pp::null_tracer,
+                                     blake3pp::default_stack_budget,
+                                     fake_driver,
+                                     blake3pp::parallel_scheduler_t>;
+  auto sched = blake3pp::get_parallel_scheduler();
+  constexpr std::size_t win = 64 * 1024;
+  const std::size_t len = 8 * win;
+  const auto content = pattern(len, 95);
+  for (const int k : {0, 3}) {
+    CAPTURE(k);
+    fake_driver drv(content, win, {.storage_throw_at_window = k});
+    fake_driver::file f(drv);
+    const blake3pp::detail::pipeline_options opts{};
+    const auto plan =
+        blake3pp::detail::plan_pipeline(0, win, 4, false, f.size());
+    blake3pp::detail::pipeline_host<blake3pp::default_stack_budget,
+                                    fake_driver>
+        host(drv, plan.windows, plan.window_bytes);
+    const auto free_windows = [&] {
+      std::vector<scope_type::window*> taken;
+      while (auto* w = host.pool().take()) {
+        taken.push_back(w);
+      }
+      for (auto* w : taken) {
+        host.pool().give_back(w);
+      }
+      return taken.size();
+    };
+    REQUIRE(free_windows() == host.pool().count());
+    {
+      blake3pp::hasher h;
+      scope_type scope(h, host, f, sched, plan, opts);
+      CHECK_THROWS_AS(scope.run(), std::bad_alloc);
+    }
+    CHECK(free_windows() == host.pool().count());
+    CHECK(drv.in_flight() == 0);
+    blake3pp::hasher h;
+    scope_type scope(h, host, f, sched, plan, opts);
+    scope.run();
+    CHECK(h.finalize() == blake3pp::hash(content));
+  }
+}
+
 TEST_CASE("the pipeline runs on an inline scheduler and on one thread") {
   constexpr std::size_t win = 64 * 1024;
   const std::size_t len = 5 * win + 321;
@@ -2409,9 +2462,7 @@ TEST_CASE("a last window with many parts never refuses an insert") {
   pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 4,
-                    .trace = nullptr,
-                    .in_flight_cap = 0,
-                    .reducer_capacity = 12});
+                    .options = {.reducer_capacity = 12}});
   ps.scope.run();
   CHECK(h.finalize() == blake3pp::hash(content));
 }
@@ -2437,9 +2488,7 @@ TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
   pooled_scope<scope_type, fake_driver, decltype(sched)> ps(h, drv, f, sched,
                    {.window_bytes = win,
                     .queue_depth = 8,
-                    .trace = nullptr,
-                    .in_flight_cap = 0,
-                    .reducer_capacity = 2});
+                    .options = {.reducer_capacity = 2}});
   CHECK_THROWS_AS(ps.scope.run(), std::logic_error);
 }
 
@@ -2663,7 +2712,7 @@ TEST_CASE("the pool wait is counted when the hash is behind the device") {
                                       .windows = 4,
                                       .head_bytes = 0,
                                       .direct_io = false},
-      {.window_bytes = win, .queue_depth = 2, .trace = &trace});
+      {}, &trace);
   CHECK(h.finalize() == blake3pp::hash(content));
   const auto& d = trace.driver();
   CHECK(d.starved_ns > 0);
@@ -2697,11 +2746,8 @@ TEST_CASE("reads in flight stay under the plan while windows fill the pool") {
     blake3pp::trace_buffer trace(records);
     blake3pp::hasher h;
     blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
-        h, drv, f, pool.get_scheduler(), plan,
-        {.window_bytes = win,
-         .queue_depth = 2,
-         .trace = &trace,
-         .in_flight_cap = cap});
+        h, drv, f, pool.get_scheduler(), plan, {.in_flight_cap = cap},
+        &trace);
     CHECK(h.finalize() == blake3pp::hash(content));
     CHECK(drv.pool_bytes() == 8 * win);
     const auto& d = trace.driver();
@@ -2863,10 +2909,7 @@ template <class Scheduler>
   drv.reserve(plan.windows, plan.window_bytes);
   const auto t0 = std::chrono::steady_clock::now();
   blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
-      h, drv, f, std::move(sched), plan,
-      {.window_bytes = plan.window_bytes,
-       .queue_depth = plan.reads_in_flight,
-       .trace = &trace});
+      h, drv, f, std::move(sched), plan, {}, &trace);
   const double wall_ns = std::chrono::duration<double, std::nano>(
                              std::chrono::steady_clock::now() - t0)
                              .count();

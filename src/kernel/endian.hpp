@@ -2,8 +2,9 @@
 
 // Little-endian 32-bit loads and stores for the kernels: the message
 // words and chaining values are little-endian bytes on every target. A
-// memcpy folds to one mov on every compiler; the byte-swap arm is what
-// keeps a big-endian target correct. Shared by every kernel translation
+// memcpy folds to one mov on every compiler, where the byte-wise shift-or
+// idiom does not: MSVC emits that one as written. The byte-swap arm is
+// what keeps a big-endian target correct. Shared by every kernel translation
 // unit, so no BLAKE3PP_ARCH_NS here.
 
 #include <bit>

@@ -64,6 +64,33 @@ namespace {
   return static_cast<unsigned>(std::max<std::uint64_t>(1, got));
 }
 
+// What both sides read off the counters the same way: the geometry, and
+// with a run to measure, the device's service, the pool's share, the
+// starved share and the lanes' queueing. False when there is nothing to
+// measure -- no transfer landed, or no wall clock -- and the diagnosis
+// then reports only its geometry.
+bool measure(diagnosis& r, const driver_stats& d, double wall_ns,
+             unsigned threads, std::size_t window, const bands& b) noexcept {
+  r.transfers = d.transfers_landed;
+  r.depth = d.queue_depth_final;
+  r.device_depth = device_depth_of(d, r.depth);
+  r.window_bytes = window;
+  r.bytes_in_flight = r.device_depth * static_cast<std::uint64_t>(window);
+  if (!r.measured() || wall_ns <= 0.0) {
+    return false;
+  }
+  r.mean_service_ns =
+      static_cast<double>(d.device_wait_ns) / static_cast<double>(r.transfers);
+  r.min_service_ns = d.device_wait_min_ns;
+  r.device_unqueued = unqueued(r, b);
+  r.pool_busy = share(d.agent_busy_ns, wall_ns * static_cast<double>(threads));
+  r.device_queued = queued(r, d.device_wait_ns, wall_ns);
+  r.starved = share(d.starved_ns, wall_ns);
+  r.mean_lane_wait_ns = static_cast<double>(d.lane_wait_ns) /
+                        static_cast<double>(r.transfers);
+  return true;
+}
+
 }  // namespace
 
 const char* to_string(bottleneck b) noexcept {
@@ -82,25 +109,11 @@ diagnosis diagnose_read(const driver_stats& d, double wall_ns,
                         unsigned threads, unsigned planned,
                         std::size_t window, bands b) noexcept {
   diagnosis r;
-  r.transfers = d.transfers_landed;
-  r.depth = d.queue_depth_final;
-  r.device_depth = device_depth_of(d, r.depth);
   r.windows_used = d.max_windows_in_flight;
   r.windows_planned = planned;
-  r.window_bytes = window;
-  r.bytes_in_flight = r.device_depth * static_cast<std::uint64_t>(window);
-  if (!r.measured() || wall_ns <= 0.0) {
+  if (!measure(r, d, wall_ns, threads, window, b)) {
     return r;
   }
-  r.mean_service_ns =
-      static_cast<double>(d.device_wait_ns) / static_cast<double>(r.transfers);
-  r.pool_busy = share(d.agent_busy_ns, wall_ns * static_cast<double>(threads));
-  r.min_service_ns = d.device_wait_min_ns;
-  r.device_unqueued = unqueued(r, b);
-  r.device_queued = queued(r, d.device_wait_ns, wall_ns);
-  r.starved = share(d.starved_ns, wall_ns);
-  r.mean_lane_wait_ns = static_cast<double>(d.lane_wait_ns) /
-                        static_cast<double>(r.transfers);
   r.arena_is_depth =
       planned > 0 && r.windows_used >= planned && planned <= r.depth;
   if (!r.long_enough()) {
@@ -142,34 +155,23 @@ diagnosis diagnose_write(const driver_stats& d, double wall_ns,
                          unsigned threads, std::size_t window,
                          bands b) noexcept {
   diagnosis r;
-  r.transfers = d.transfers_landed;
-  r.depth = d.queue_depth_final;
-  r.device_depth = device_depth_of(d, r.depth);
+  const bool measured = measure(r, d, wall_ns, threads, window, b);
+  // The write side's arena is its queue: every window in flight is one
+  // the device or the generator holds.
   r.windows_used = r.depth;
   r.windows_planned = r.depth;
-  r.window_bytes = window;
-  r.bytes_in_flight = r.device_depth * static_cast<std::uint64_t>(window);
   r.arena_is_depth = true;
-  if (!r.measured() || wall_ns <= 0.0) {
+  if (!measured) {
     return r;
   }
   const double in_flight =
       wall_ns * static_cast<double>(std::max<std::uint64_t>(1, r.depth));
-  r.mean_service_ns =
-      static_cast<double>(d.device_wait_ns) / static_cast<double>(r.transfers);
-  r.min_service_ns = d.device_wait_min_ns;
-  r.device_unqueued = unqueued(r, b);
-  r.pool_busy = share(d.agent_busy_ns, wall_ns * static_cast<double>(threads));
   r.fill_busy = share(d.agent_busy_ns, in_flight);
   // The share of the windows in flight the device held, which on this
   // side is directly comparable with fill_busy: the two shares are of
   // the same windows, and a window is either being filled or being
   // written.
   r.device_busy = share(d.device_wait_ns, in_flight);
-  r.device_queued = queued(r, d.device_wait_ns, wall_ns);
-  r.starved = share(d.starved_ns, wall_ns);
-  r.mean_lane_wait_ns = static_cast<double>(d.lane_wait_ns) /
-                        static_cast<double>(r.transfers);
   if (!r.long_enough()) {
     return r;
   }

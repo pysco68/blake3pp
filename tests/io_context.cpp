@@ -1036,7 +1036,7 @@ TEST_CASE("the engine survives a context that finishes in pieces and out of orde
   CHECK(r.backend_name() == "fake");
   std::vector<std::byte> out;
   while (auto w = r.next()) {
-    out.insert(out.end(), w->data, w->data + w->bytes);
+    out.insert(out.end(), w->bytes.begin(), w->bytes.end());
     r.release(*w);
   }
   REQUIRE(out.size() == size);
@@ -2040,7 +2040,7 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
     // And the data is the same however it degraded.
     std::vector<std::byte> out;
     while (auto w = reader.next()) {
-      out.insert(out.end(), w->data, w->data + w->bytes);
+      out.insert(out.end(), w->bytes.begin(), w->bytes.end());
       reader.release(*w);
     }
     CHECK(out == content);
@@ -2116,6 +2116,22 @@ TEST_CASE("callbacks run on the thread that called poll, not the submitter") {
     });
   }
 #endif
+#if defined(__unix__) || defined(__APPLE__)
+  {
+    io_impl::pread_context ctx({}, 4);
+    check(ctx, [&](io_impl::pread_context& c) {
+      return io_impl::pread_context::file(c, f.path,
+                                          io_impl::file_open_options{});
+    });
+  }
+#endif
+  {
+    io_impl::stdio_context ctx({}, 4);
+    check(ctx, [&](io_impl::stdio_context& c) {
+      return io_impl::stdio_context::file(c, f.path,
+                                          io_impl::file_open_options{});
+    });
+  }
 }
 
 // --- Lanes: the transfers happen off the polling thread --------------------
