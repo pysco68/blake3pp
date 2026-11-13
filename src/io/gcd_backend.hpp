@@ -445,9 +445,9 @@ class gcd_context {
   static std::error_code perform_deferred(transfer& op) noexcept {
     try {
       if (op.is_write) {
-        op.owner_file->f_.pwrite_all(op.fd, op.src, op.len, op.off);
+        op.owner_file->f_.pwrite_all(op.fd, {op.src, op.len}, op.off);
       } else {
-        op.owner_file->f_.pread_all(op.fd, op.dst, op.len, op.off);
+        op.owner_file->f_.pread_all(op.fd, {op.dst, op.len}, op.off);
       }
       op.filled = op.len;
     } catch (const std::system_error& e) {

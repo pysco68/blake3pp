@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <system_error>
 
 #include "io/backend.hpp"
@@ -96,11 +97,11 @@ struct posix_file {
     return direct() && len % direct_align == 0 ? fd() : fd_plain();
   }
 
-  void pread_all(int use_fd, std::byte* dst, std::size_t len,
+  void pread_all(int use_fd, std::span<std::byte> dst,
                  std::uint64_t off) const {
     std::size_t got = 0;
-    while (got < len) {
-      const ssize_t n = ::pread(use_fd, dst + got, len - got,
+    while (got < dst.size()) {
+      const ssize_t n = ::pread(use_fd, dst.data() + got, dst.size() - got,
                                 static_cast<off_t>(off + got));
       if (n < 0) {
         if (errno == EINTR) {
@@ -116,11 +117,11 @@ struct posix_file {
     }
   }
 
-  void pwrite_all(int use_fd, const std::byte* src, std::size_t len,
+  void pwrite_all(int use_fd, std::span<const std::byte> src,
                   std::uint64_t off) const {
     std::size_t put = 0;
-    while (put < len) {
-      const ssize_t n = ::pwrite(use_fd, src + put, len - put,
+    while (put < src.size()) {
+      const ssize_t n = ::pwrite(use_fd, src.data() + put, src.size() - put,
                                  static_cast<off_t>(off + put));
       if (n < 0) {
         if (errno == EINTR) {

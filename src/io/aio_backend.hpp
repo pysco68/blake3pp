@@ -1014,10 +1014,10 @@ class aio_context {
       const std::size_t rest = op.length() - done;
       if (op.is_write) {
         op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
-                                 op.wbuf.data() + done, rest, op.off + done);
+                                 op.wbuf.subspan(done), op.off + done);
       } else {
         op.sync_file->pread_all(op.sync_file->sync_fd(rest),
-                                op.buf.data() + done, rest, op.off + done);
+                                op.buf.subspan(done), op.off + done);
       }
       op.filled = op.length();
     } catch (const std::system_error& e) {
