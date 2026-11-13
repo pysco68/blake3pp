@@ -232,7 +232,7 @@ class gcd_context {
   }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     arm(op, f, off, buf.size());
     op.dst = buf.data();
     op.src = nullptr;
@@ -245,7 +245,7 @@ class gcd_context {
   // serves only a context without a dispatch group, and issue() asks
   // about nothing else.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
-                    transfer& op) {
+                    transfer& op) noexcept {
     arm(op, f, off, buf.size());
     op.dst = nullptr;
     op.src = buf.data();

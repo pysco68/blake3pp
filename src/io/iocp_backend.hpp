@@ -459,7 +459,7 @@ class iocp_context {
   ~iocp_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     arm(op, f, off, buf.size());
     op.dst = buf.data();
     op.src = nullptr;
@@ -476,7 +476,7 @@ class iocp_context {
   // bytes posts a completion carrying zero bytes, which is the same
   // shape as a short transfer and cannot be told apart from one.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
-                    transfer& op) {
+                    transfer& op) noexcept {
     arm(op, f, off, buf.size());
     op.dst = nullptr;
     op.src = buf.data();
@@ -530,7 +530,7 @@ class iocp_context {
     return static_cast<DWORD>(len);
   }
 
-  void place(transfer& op, file& f) {
+  void place(transfer& op, file& f) noexcept {
     in_flight_++;
     f.inflight_++;
     route(op);

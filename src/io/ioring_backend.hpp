@@ -514,7 +514,7 @@ class ioring_context {
   }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     arm(op, f, off, buf.size());
     op.dst = buf.data();
     op.src = nullptr;
@@ -531,7 +531,7 @@ class ioring_context {
   // report zero bytes, which is the same shape as a short transfer and
   // cannot be told apart from one.
   void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
-                    transfer& op) {
+                    transfer& op) noexcept {
     arm(op, f, off, buf.size());
     op.dst = nullptr;
     op.src = buf.data();
@@ -785,7 +785,7 @@ class ioring_context {
     return static_cast<std::uint32_t>(len);
   }
 
-  void place(transfer& op, file& f) {
+  void place(transfer& op, file& f) noexcept {
     const std::uint32_t len = ring_len(op, op.off, op.len);
     const bool queued = len != 0 && build(op, len);
     op.on_ring = queued;

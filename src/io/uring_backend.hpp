@@ -632,7 +632,7 @@ class uring_context {
   }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     arm(op, f, off);
     op.buf = buf;
     op.wbuf = {};
@@ -645,7 +645,7 @@ class uring_context {
   // through the plain one, both on the ring. Nothing above the context
   // sees the difference.
   void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, transfer& op) {
+                    std::span<const std::byte> buf, transfer& op) noexcept {
     arm(op, f, off);
     op.buf = {};
     op.wbuf = buf;

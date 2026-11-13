@@ -124,7 +124,7 @@ class windows_context {
   windows_context& operator=(const windows_context&) = delete;
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     if (ring_) {
       ring_->submit_read(*f.ring_, off, buf, arm_ring(op));
     } else {
@@ -133,7 +133,7 @@ class windows_context {
   }
 
   void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, transfer& op) {
+                    std::span<const std::byte> buf, transfer& op) noexcept {
     if (ring_) {
       ring_->submit_write(*f.ring_, off, buf, arm_ring(op));
     } else {

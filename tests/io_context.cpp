@@ -147,7 +147,7 @@ class fake_context {
   [[nodiscard]] bool async() const noexcept { return true; }
 
   void submit_read(file&, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     op.buf = buf;
     op.off = off;
     op.filled = 0;
@@ -160,7 +160,7 @@ class fake_context {
   // The engine under test never writes; the contract still asks, so this
   // records the write and completes it like any other operation.
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
-                    transfer& op) {
+                    transfer& op) noexcept {
     op.buf = {};
     op.off = off;
     op.filled = buf.size();

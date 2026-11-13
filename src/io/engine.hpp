@@ -318,15 +318,7 @@ class polled_writer_engine {
     st.busy = true;
     st.ec = {};
     bind_completion<&slot_state::complete>(st.op, st);
-    // A context may refuse the submission by throwing (the concept asks
-    // that of flush() only); the slot must not stay marked busy for a
-    // write that never existed, or wait_slot() polls for it for ever.
-    try {
-      ctx_.submit_write(file_, offset_, b.bytes.first(bytes), st.op);
-    } catch (...) {
-      st.busy = false;
-      throw;
-    }
+    ctx_.submit_write(file_, offset_, b.bytes.first(bytes), st.op);
     ctx_.flush();
     offset_ += bytes;
     written_ += bytes;

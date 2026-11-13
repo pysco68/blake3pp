@@ -404,15 +404,15 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // driver read to plan and to bound every transfer.
   { f.size() } noexcept -> std::same_as<std::uint64_t>;
   // Queues one read of exactly buf.size() bytes at off. Performs no
-  // transfer and runs no callback. A transfer the asynchronous engine
+  // transfer, runs no callback and cannot fail. A transfer the asynchronous engine
   // cannot take (no engine, a length NO_BUFFERING cannot take on Windows,
   // a zero length) goes on the context's deferred list, where a lane
   // reads it (poll() does, when no lane runs).
-  { c.submit_read(f, off, buf, op) };
+  { c.submit_read(f, off, buf, op) } noexcept;
   // Queues one write of exactly cbuf.size() bytes at off, under the same
   // rules as submit_read. The caller's bytes must stay put until the
   // callback runs.
-  { c.submit_write(f, off, cbuf, op) };
+  { c.submit_write(f, off, cbuf, op) } noexcept;
   // Sets the file's size, for trimming a preallocation back to what was
   // actually written. Only meaningful on a file opened for writing.
   { f.set_size(bytes) };
@@ -1050,7 +1050,7 @@ class sync_context {
   ~sync_context() { drain(); }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     op.buf = buf;
     op.wbuf = {};
     op.off = off;
@@ -1067,7 +1067,7 @@ class sync_context {
   // Handed to the pump like a read; a lane performs it and the callback
   // runs inside poll().
   void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, transfer& op) {
+                    std::span<const std::byte> buf, transfer& op) noexcept {
     op.buf = {};
     op.wbuf = buf;
     op.off = off;
