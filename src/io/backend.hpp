@@ -1003,7 +1003,7 @@ class sync_context {
     // returns. A count a context-wide drain left stale costs one such
     // wait and nothing else.
     ~file() {
-      if (queued_ != 0) {
+      if (inflight_ != 0) {
         ctx_->forget(*this);
       }
     }
@@ -1020,7 +1020,7 @@ class sync_context {
     Source src_;
     // This file's share of the context's count, so the destructor can tell
     // whether anything of its own is queued without walking the queue.
-    std::size_t queued_ = 0;
+    std::size_t inflight_ = 0;
   };
 
   // The rung this is, declared for the ladder walk in
@@ -1059,8 +1059,8 @@ class sync_context {
     op.cancelled = false;
     op.is_write = false;
     op.reset_performance();
-    queued_++;
-    f.queued_++;
+    in_flight_++;
+    f.inflight_++;
     pump_.push(op);
   }
 
@@ -1076,8 +1076,8 @@ class sync_context {
     op.cancelled = false;
     op.is_write = true;
     op.reset_performance();
-    queued_++;
-    f.queued_++;
+    in_flight_++;
+    f.inflight_++;
     pump_.push(op);
   }
 
@@ -1102,8 +1102,8 @@ class sync_context {
     std::size_t dropped = pump_.remove_queued_if(mine);
     pump_.quiesce();
     dropped += pump_.remove_done_if(mine);
-    queued_ -= std::min(dropped, queued_);
-    f.queued_ -= std::min(dropped, f.queued_);
+    in_flight_ -= std::min(dropped, in_flight_);
+    f.inflight_ -= std::min(dropped, f.inflight_);
   }
 
   std::size_t poll(bool block) {
@@ -1131,14 +1131,14 @@ class sync_context {
   // operation_canceled; one a lane already has runs to completion.
   void cancel(transfer& op) noexcept { pump_.cancel(op); }
 
-  [[nodiscard]] std::size_t in_flight() const noexcept { return queued_; }
+  [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
 
   // Waits the lanes out, then forgets everything queued and everything
   // finished: none of it is reported. The files' own counts are left as
   // they were; see ~file().
   void drain() noexcept {
     pump_.clear();
-    queued_ = 0;
+    in_flight_ = 0;
   }
 
   // Every transfer rides the pump here, so its lanes ARE the device's
@@ -1189,15 +1189,15 @@ class sync_context {
   }
 
   void report(transfer& op) noexcept {
-    queued_--;
+    in_flight_--;
     assert(op.owner_file != nullptr &&
            "every transfer is queued with its file");
-    op.owner_file->queued_--;
+    op.owner_file->inflight_--;
     device_.add_if_served(op.device_total_ns());
     op.done(&op, op.result());
   }
 
-  std::size_t queued_ = 0;
+  std::size_t in_flight_ = 0;
   // What the lanes measured around their own transfers.
   device_time device_{};
   poll_waiter waiter_;
