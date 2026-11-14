@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <span>
 #include <system_error>
 #include <utility>
@@ -135,26 +136,24 @@ class unique_handle {
 //
 // `fast` is held ONLY when the reopen genuinely engaged, so it never
 // aliases `plain` and no destructor has to test for that.
-// Shared verbatim between reader and writer; only access/creation differ.
+// Shared by reader and writer, and by both Windows contexts: the
+// completion port's files and the I/O ring's make the same open and
+// differ only in how they reopen.
 struct win_file {
   unique_handle plain;  // always-buffered+sync: unaligned tails, fallback
   unique_handle fast;   // the reopened handle, when one engaged
   bool direct = false;
   bool use_iocp = false;
+  DWORD access = 0;  // as open_file() opened it, for the reopen
+  DWORD share = 0;
+  std::uint64_t size = 0;   // what open_file() found; 0 for a file written
+  bool sparse = false;      // made sparse for the run; cleared by set_size()
+  bool valid_data = false;  // the valid data length was set up front
 
   // The handle the fast path should use: the reopened one when it
   // engaged, else the plain one. Borrowed: the caller never closes it.
   [[nodiscard]] HANDLE h() const noexcept {
     return fast ? fast.get() : plain.get();
-  }
-
-  void open(const wchar_t* path, DWORD access, DWORD share, DWORD creation,
-            DWORD flags) {
-    plain.reset(::CreateFileW(path, access, share, nullptr, creation, flags,
-                              nullptr));
-    if (!plain) {
-      throw_winerr("CreateFileW");
-    }
   }
 
   [[nodiscard]] std::uint64_t stat_size() const {
@@ -163,6 +162,83 @@ struct win_file {
       throw_winerr("GetFileSizeEx");
     }
     return static_cast<std::uint64_t>(sz.QuadPart);
+  }
+
+  // The open both Windows contexts' files make, before either reopens for
+  // its own engine: the plain handle, the size, and for a file being
+  // written its preallocation. `access` and `share` are kept for the
+  // reopen.
+  //
+  // FILE_SHARE_READ and nothing else for a read: a digest describes the
+  // bytes that were there, so nothing may rewrite or shorten the file
+  // while it is being read. The cost is that a test cannot truncate a
+  // file the pipeline holds open, which is why the truncation case in
+  // tests/file_pipeline.cpp does not run here. A writable open shares
+  // write access with ITSELF: the reopen asks for a second GENERIC_WRITE
+  // handle on the same path, and two can only coexist if the first one
+  // permits it. Without FILE_SHARE_WRITE the reopen fails with a sharing
+  // violation every time, and every write silently takes the synchronous
+  // buffered rung.
+  //
+  // Preallocation belongs to the OPEN, not to the finish: a write that
+  // extends the file serializes, and with an async direct queue that
+  // collapses it to one stalled write at a time. On Windows that is
+  // SetEndOfFile, and set_size() trims back afterwards.
+  //
+  // NTFS then zeroes every byte between the valid data length and a
+  // write that lands beyond it, which with several writes in flight cost
+  // the writer half the device. Two ways out, in the order the file
+  // system allows them:
+  //  - the valid data length set to the preallocation up front. It needs
+  //    SeManageVolumePrivilege and exposes the old blocks until they are
+  //    written, so only on request (waive_zero_fill);
+  //  - else a sparse file, whose gaps stay holes that read as zeros, made
+  //    plain again by set_size() once the file is complete.
+  // The sparse flag has to precede the preallocation for the range to be
+  // a hole, and a valid data length can only be set on a file that is not
+  // sparse.
+  void open_file(const std::filesystem::path& path,
+                 const file_open_options& how) {
+    access = how.write ? GENERIC_WRITE : GENERIC_READ;
+    share = how.write ? (FILE_SHARE_READ | FILE_SHARE_WRITE) : FILE_SHARE_READ;
+    plain.reset(::CreateFileW(path.c_str(), access, share, nullptr,
+                              how.write ? CREATE_ALWAYS : OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                              nullptr));
+    if (!plain) {
+      throw_winerr("CreateFileW");
+    }
+    size = how.write ? 0 : stat_size();
+    if (how.write && how.preallocate_bytes > 0) {
+      const bool want_valid_data =
+          how.waive_zero_fill && enable_manage_volume_privilege();
+      if (!want_valid_data) {
+        sparse = set_sparse(true);
+      }
+      if (set_end_of_file(how.preallocate_bytes) && want_valid_data) {
+        valid_data = ::SetFileValidData(
+                         plain.get(),
+                         static_cast<LONGLONG>(how.preallocate_bytes)) != 0;
+      }
+    }
+  }
+
+  // Trims a preallocation back to what was written. Harmless when nothing
+  // was preallocated, which is what a reader's file is. A file made
+  // sparse for the run is a plain file again from here: every byte below
+  // the new end has been written, so there is no hole to keep.
+  void set_size(std::uint64_t bytes) {
+    if (!set_end_of_file(bytes)) {
+      throw_winerr("SetEndOfFile");
+    }
+    if (sparse && set_sparse(false)) {
+      sparse = false;
+    }
+  }
+
+  // What open_file() did to a file being written, for its name.
+  [[nodiscard]] std::string_view suffix() const noexcept {
+    return valid_data ? "+validdata" : sparse ? "+sparse" : "";
   }
 
   // NO_BUFFERING and OVERLAPPED are per-open flags: engage by reopening,
@@ -178,26 +254,26 @@ struct win_file {
   //
   // `port` is the context's: every file it opens associates its
   // overlapped handle with that one port, which the file does not own.
-  void engage(const wchar_t* path, DWORD access, DWORD share,
-              bool want_direct, bool want_async, HANDLE port) noexcept {
+  void engage(const wchar_t* path, bool want_direct, bool want_async,
+              HANDLE port) noexcept {
     // OPEN_EXISTING on the reopen in both directions: the plain handle has
     // already created and truncated a file being written, and a second
     // CREATE_ALWAYS here would truncate it again -- including any
     // preallocation just set on it.
     if (want_direct && want_async) {
-      if (engage_one(path, access, share, true, true, port)) {
+      if (engage_one(path, true, true, port)) {
         return;
       }
       // The port first: per the measurement above, Windows can do
       // without the cache bypass more easily than without the asynchrony.
-      if (engage_one(path, access, share, false, true, port)) {
+      if (engage_one(path, false, true, port)) {
         return;
       }
-      (void)engage_one(path, access, share, true, false, port);
+      (void)engage_one(path, true, false, port);
       return;
     }
     if (want_direct || want_async) {
-      (void)engage_one(path, access, share, want_direct, want_async, port);
+      (void)engage_one(path, want_direct, want_async, port);
     }
   }
 
@@ -205,9 +281,8 @@ struct win_file {
   // async was asked for, and take the handle only if both steps worked.
   // Leaves everything untouched on failure, so the caller may ask again
   // for less.
-  [[nodiscard]] bool engage_one(const wchar_t* path, DWORD access, DWORD share,
-                                bool with_direct, bool with_async,
-                                HANDLE port) noexcept {
+  [[nodiscard]] bool engage_one(const wchar_t* path, bool with_direct,
+                                bool with_async, HANDLE port) noexcept {
     DWORD flags = FILE_ATTRIBUTE_NORMAL;
     if (with_direct) {
       flags |= FILE_FLAG_NO_BUFFERING;
@@ -232,6 +307,53 @@ struct win_file {
     fast = std::move(cand);
     direct = with_direct;
     return true;
+  }
+
+ private:
+  // SetFilePointerEx + SetEndOfFile on the PLAIN handle: the fast one
+  // may be FILE_FLAG_NO_BUFFERING, whose file pointer has alignment
+  // rules of its own, and the plain handle has none.
+  [[nodiscard]] bool set_end_of_file(std::uint64_t bytes) noexcept {
+    LARGE_INTEGER to;
+    to.QuadPart = static_cast<LONGLONG>(bytes);
+    if (::SetFilePointerEx(plain.get(), to, nullptr, FILE_BEGIN) == 0) {
+      return false;
+    }
+    return ::SetEndOfFile(plain.get()) != 0;
+  }
+
+  // Sets or clears the sparse attribute on the plain handle. A file
+  // system without sparse files refuses, and the writer then runs with
+  // the zero-fill it always had.
+  [[nodiscard]] bool set_sparse(bool on) noexcept {
+    FILE_SET_SPARSE_BUFFER in{};
+    in.SetSparse = on ? TRUE : FALSE;
+    DWORD got = 0;
+    return ::DeviceIoControl(plain.get(), FSCTL_SET_SPARSE, &in,
+                             sizeof in, nullptr, 0, &got, nullptr) != 0;
+  }
+
+  // Enables SeManageVolumePrivilege on the process token, which is what
+  // SetFileValidData checks. False where the account does not hold it,
+  // which is every non-elevated session: ERROR_NOT_ALL_ASSIGNED comes
+  // back from a successful AdjustTokenPrivileges call in that case.
+  [[nodiscard]] static bool enable_manage_volume_privilege() noexcept {
+    HANDLE tok = nullptr;
+    if (::OpenProcessToken(::GetCurrentProcess(),
+                           TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                           &tok) == 0) {
+      return false;
+    }
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    const bool ok =
+        ::LookupPrivilegeValueW(nullptr, L"SeManageVolumePrivilege",
+                                &tp.Privileges[0].Luid) != 0 &&
+        ::AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) != 0 &&
+        ::GetLastError() == ERROR_SUCCESS;
+    ::CloseHandle(tok);
+    return ok;
   }
 };
 
@@ -269,62 +391,11 @@ class iocp_context {
     file(iocp_context& ctx, const std::filesystem::path& path,
          const file_open_options& how)
         : ctx_(&ctx) {
-      const bool write = how.write;
-      // FILE_SHARE_READ and nothing else: a digest describes the bytes
-      // that were there, so nothing may rewrite or shorten the file
-      // while it is being read. The cost is that a test cannot truncate
-      // a file the pipeline holds open, which is why the truncation
-      // case in tests/file_pipeline.cpp does not run here.
-      const DWORD access = write ? GENERIC_WRITE : GENERIC_READ;
-      const DWORD creation = write ? CREATE_ALWAYS : OPEN_EXISTING;
-      // A writable open shares write access with ITSELF: engage() reopens
-      // the same path for the direct/overlapped handle, and two
-      // GENERIC_WRITE handles can only coexist if the first one permits
-      // it. Without FILE_SHARE_WRITE the reopen fails with a sharing
-      // violation every time, and every write silently takes the
-      // synchronous buffered rung.
-      const DWORD share =
-          write ? (FILE_SHARE_READ | FILE_SHARE_WRITE) : FILE_SHARE_READ;
-      f_.open(path.c_str(), access, share, creation,
-              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
-      size_ = write ? 0 : f_.stat_size();
-      // Preallocation belongs to the OPEN, not to the finish: a write that
-      // extends the file serializes, and with an async direct queue that
-      // collapses it to one stalled write at a time. On Windows that is
-      // SetEndOfFile, and set_size() trims back afterwards.
-      //
-      // NTFS then zeroes every byte between the valid data length and a
-      // write that lands beyond it, which with several writes in flight
-      // cost the writer half the device. Two ways out, in the order the
-      // file system allows them:
-      //  - the valid data length set to the preallocation up front. It
-      //    needs SeManageVolumePrivilege and exposes the old blocks until
-      //    they are written, so only on request (waive_zero_fill);
-      //  - else a sparse file, whose gaps stay holes that read as zeros,
-      //    made plain again by set_size() once the file is complete.
-      // The sparse flag has to precede the preallocation for the range to
-      // be a hole, and a valid data length can only be set on a file that
-      // is not sparse.
-      if (write && how.preallocate_bytes > 0) {
-        const bool valid_data =
-            how.waive_zero_fill && enable_manage_volume_privilege();
-        if (!valid_data) {
-          sparse_ = set_sparse(true);
-        }
-        if (set_end_of_file(how.preallocate_bytes) && valid_data) {
-          valid_data_ = ::SetFileValidData(
-                            f_.plain.get(),
-                            static_cast<LONGLONG>(how.preallocate_bytes)) != 0;
-        }
-      }
-      f_.engage(path.c_str(), access, share, how.direct_io,
-                ctx.async_requested_, ctx.port_.get());
-      name_ = ctx.name_for(f_.direct, f_.use_iocp, write);
-      if (valid_data_) {
-        name_ += "+validdata";
-      } else if (sparse_) {
-        name_ += "+sparse";
-      }
+      f_.open_file(path, how);
+      f_.engage(path.c_str(), how.direct_io, ctx.async_requested_,
+                ctx.port_.get());
+      name_ = ctx.name_for(f_.direct, f_.use_iocp, how.write);
+      name_ += f_.suffix();
       ctx.adopt(*this);
     }
 
@@ -339,76 +410,15 @@ class iocp_context {
     file(const file&) = delete;
     file& operator=(const file&) = delete;
 
-    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+    [[nodiscard]] std::uint64_t size() const noexcept { return f_.size; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
-    // Trims a preallocation back to what was written. Harmless when
-    // nothing was preallocated, which is what a reader's file is. A file
-    // made sparse for the run is a plain file again from here: every byte
-    // below the new end has been written, so there is no hole to keep.
-    void set_size(std::uint64_t bytes) {
-      if (!set_end_of_file(bytes)) {
-        throw_winerr("SetEndOfFile");
-      }
-      if (sparse_ && set_sparse(false)) {
-        sparse_ = false;
-      }
-    }
+    void set_size(std::uint64_t bytes) { f_.set_size(bytes); }
 
    private:
     friend class iocp_context;
 
-    // SetFilePointerEx + SetEndOfFile on the PLAIN handle: the fast one
-    // may be FILE_FLAG_NO_BUFFERING, whose file pointer has alignment
-    // rules of its own, and the plain handle has none.
-    [[nodiscard]] bool set_end_of_file(std::uint64_t bytes) noexcept {
-      LARGE_INTEGER to;
-      to.QuadPart = static_cast<LONGLONG>(bytes);
-      if (::SetFilePointerEx(f_.plain.get(), to, nullptr, FILE_BEGIN) == 0) {
-        return false;
-      }
-      return ::SetEndOfFile(f_.plain.get()) != 0;
-    }
-
-    // Sets or clears the sparse attribute on the plain handle. A file
-    // system without sparse files refuses, and the writer then runs with
-    // the zero-fill it always had.
-    [[nodiscard]] bool set_sparse(bool on) noexcept {
-      FILE_SET_SPARSE_BUFFER in{};
-      in.SetSparse = on ? TRUE : FALSE;
-      DWORD got = 0;
-      return ::DeviceIoControl(f_.plain.get(), FSCTL_SET_SPARSE, &in,
-                               sizeof in, nullptr, 0, &got, nullptr) != 0;
-    }
-
-    // Enables SeManageVolumePrivilege on the process token, which is what
-    // SetFileValidData checks. False where the account does not hold it,
-    // which is every non-elevated session: ERROR_NOT_ALL_ASSIGNED comes
-    // back from a successful AdjustTokenPrivileges call in that case.
-    [[nodiscard]] static bool enable_manage_volume_privilege() noexcept {
-      HANDLE tok = nullptr;
-      if (::OpenProcessToken(::GetCurrentProcess(),
-                             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                             &tok) == 0) {
-        return false;
-      }
-      TOKEN_PRIVILEGES tp{};
-      tp.PrivilegeCount = 1;
-      tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-      const bool ok =
-          ::LookupPrivilegeValueW(nullptr, L"SeManageVolumePrivilege",
-                                  &tp.Privileges[0].Luid) != 0 &&
-          ::AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr) != 0 &&
-          ::GetLastError() == ERROR_SUCCESS;
-      ::CloseHandle(tok);
-      return ok;
-    }
-
     win_file f_;
-    std::uint64_t size_ = 0;
     std::string name_ = "readfile";
-    bool sparse_ = false;      // made sparse for the run; cleared by set_size()
-    bool valid_data_ = false;  // the valid data length was set up front
     iocp_context* ctx_;
     file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
