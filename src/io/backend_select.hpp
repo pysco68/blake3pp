@@ -123,85 +123,101 @@ class windows_context {
   windows_context(const windows_context&) = delete;
   windows_context& operator=(const windows_context&) = delete;
 
+ private:
+  // Calls `fn` with whichever of the two contexts this one chose; `fn`
+  // is generic, and part() and arm() pick the half of a file or an
+  // operation that belongs to it.
+  template <class Fn>
+  decltype(auto) with(Fn&& fn) {
+    return ring_ ? fn(*ring_) : fn(*port_);
+  }
+  template <class Fn>
+  decltype(auto) with(Fn&& fn) const {
+    return ring_ ? fn(*ring_) : fn(*port_);
+  }
+  static ioring_context::file& part(ioring_context&, file& f) noexcept {
+    return *f.ring_;
+  }
+  static iocp_context::file& part(iocp_context&, file& f) noexcept {
+    return *f.port_;
+  }
+  static ioring_context::transfer& part(ioring_context&,
+                                        transfer& op) noexcept {
+    return op.in.ring;
+  }
+  static iocp_context::transfer& part(iocp_context&, transfer& op) noexcept {
+    return op.in.port;
+  }
+
+  // The chosen backend's operation, made the union's active member and
+  // given the caller's callback. Every callback in the library reaches its
+  // owner through `owner`, never by walking back from a transfer_base, so
+  // forwarding done and owner is the whole hand-over. Constructing it at
+  // each submit lets one operation serve transfer after transfer, as io_op
+  // does with the backend's.
+  [[nodiscard]] static ioring_context::transfer& arm(ioring_context&,
+                                                     transfer& op) noexcept {
+    auto& inner = *::new (static_cast<void*>(&op.in.ring))
+        ioring_context::transfer{};
+    inner.done = op.done;
+    inner.owner = op.owner;
+    return inner;
+  }
+  [[nodiscard]] static iocp_context::transfer& arm(iocp_context&,
+                                                   transfer& op) noexcept {
+    auto& inner = *::new (static_cast<void*>(&op.in.port))
+        iocp_context::transfer{};
+    inner.done = op.done;
+    inner.owner = op.owner;
+    return inner;
+  }
+
+ public:
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
                    transfer& op) noexcept {
-    if (ring_) {
-      ring_->submit_read(*f.ring_, off, buf, arm_ring(op));
-    } else {
-      port_->submit_read(*f.port_, off, buf, arm_port(op));
-    }
+    with([&](auto& c) noexcept {
+      c.submit_read(part(c, f), off, buf, arm(c, op));
+    });
   }
-
   void submit_write(file& f, std::uint64_t off,
                     std::span<const std::byte> buf, transfer& op) noexcept {
-    if (ring_) {
-      ring_->submit_write(*f.ring_, off, buf, arm_ring(op));
-    } else {
-      port_->submit_write(*f.port_, off, buf, arm_port(op));
-    }
+    with([&](auto& c) noexcept {
+      c.submit_write(part(c, f), off, buf, arm(c, op));
+    });
   }
-
   void flush() noexcept {
-    if (ring_) {
-      ring_->flush();
-    } else {
-      port_->flush();
-    }
+    with([](auto& c) noexcept { c.flush(); });
   }
-
   std::size_t poll(bool block) {
-    return ring_ ? ring_->poll(block) : port_->poll(block);
+    return with([&](auto& c) { return c.poll(block); });
   }
-
   void wake() noexcept {
-    if (ring_) {
-      ring_->wake();
-    } else {
-      port_->wake();
-    }
+    with([](auto& c) noexcept { c.wake(); });
   }
-
   void cancel(transfer& op) noexcept {
-    if (ring_) {
-      ring_->cancel(op.in.ring);
-    } else {
-      port_->cancel(op.in.port);
-    }
+    with([&](auto& c) noexcept { c.cancel(part(c, op)); });
   }
-
   [[nodiscard]] unsigned device_depth() const noexcept {
-    return ring_ ? ring_->device_depth() : port_->device_depth();
+    return with([](const auto& c) noexcept { return c.device_depth(); });
   }
   [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
-    return ring_ ? ring_->lane_wait_ns() : port_->lane_wait_ns();
+    return with([](const auto& c) noexcept { return c.lane_wait_ns(); });
   }
   [[nodiscard]] device_time device() const noexcept {
-    return ring_ ? ring_->device() : port_->device();
+    return with([](const auto& c) noexcept { return c.device(); });
   }
-
   [[nodiscard]] std::size_t in_flight() const noexcept {
-    return ring_ ? ring_->in_flight() : port_->in_flight();
+    return with([](const auto& c) noexcept { return c.in_flight(); });
   }
-
   [[nodiscard]] std::size_t served_synchronously() const noexcept {
-    return ring_ ? ring_->served_synchronously()
-                 : port_->served_synchronously();
+    return with(
+        [](const auto& c) noexcept { return c.served_synchronously(); });
   }
-
   void drain() noexcept {
-    if (ring_) {
-      ring_->drain();
-    } else {
-      port_->drain();
-    }
+    with([](auto& c) noexcept { c.drain(); });
   }
-
   void forget(file& f) noexcept {
-    if (ring_) {
-      ring_->forget(*f.ring_);
-    } else {
-      port_->forget(*f.port_);
-    }
+    with([&](auto& c) noexcept { c.forget(part(c, f)); });
   }
 
 #if defined(BLAKE3PP_HAS_IORING_API)
@@ -237,27 +253,6 @@ class windows_context {
   }
 
  private:
-  // The chosen backend's operation, made the union's active member and
-  // given the caller's callback. Every callback in the library reaches its
-  // owner through `owner`, never by walking back from a transfer_base, so
-  // forwarding done and owner is the whole hand-over. Constructing it at
-  // each submit lets one operation serve transfer after transfer, as io_op
-  // does with the backend's.
-  [[nodiscard]] ioring_context::transfer& arm_ring(transfer& op) noexcept {
-    auto& inner = *::new (static_cast<void*>(&op.in.ring))
-        ioring_context::transfer{};
-    inner.done = op.done;
-    inner.owner = op.owner;
-    return inner;
-  }
-  [[nodiscard]] iocp_context::transfer& arm_port(transfer& op) noexcept {
-    auto& inner = *::new (static_cast<void*>(&op.in.port))
-        iocp_context::transfer{};
-    inner.done = op.done;
-    inner.owner = op.owner;
-    return inner;
-  }
-
   std::optional<ioring_context> ring_;
   std::optional<iocp_context> port_;
   std::string ring_refusal_;  // the suffix the port's files carry, or empty
