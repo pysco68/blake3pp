@@ -54,6 +54,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <new>
 #include <span>
@@ -527,22 +528,7 @@ class deferred_ops {
   // and its share of the count. Returns how many were dropped.
   template <class Pred>
   std::size_t remove_if(Pred drop) noexcept {
-    std::size_t dropped = 0;
-    Op* prev = nullptr;
-    for (Op* op = head_; op != nullptr;) {
-      Op* const next = op->*Link;
-      if (drop(*op)) {
-        (prev == nullptr ? head_ : prev->*Link) = next;
-        if (tail_ == op) {
-          tail_ = prev;
-        }
-        ++dropped;
-      } else {
-        prev = op;
-      }
-      op = next;
-    }
-    return dropped;
+    return remove_first_if(std::numeric_limits<std::size_t>::max(), drop);
   }
 
   // The same over the oldest `n` queued ops only: for a batch offered from
