@@ -33,7 +33,11 @@
 //                                     // leaves it holding nothing
 //   void cancel(Op&) noexcept;        // op is on the kernel queue
 //   void flush<Op>(Refused) noexcept; // submit; what the kernel will not
-//                                     // take goes to refused(op)
+//                                     // take goes to refused(op). After
+//                                     // it, whatever is still unsubmitted
+//                                     // is backed by work the kernel or the
+//                                     // pump will complete, or a failure is
+//                                     // latched: a wait can always end.
 //   void take_back<Op>(Refused) noexcept;  // everything not submitted
 //   std::error_code take_failure() noexcept;  // a latched submit failure
 //   engine_event<Op> next<Op>(bool block) noexcept;

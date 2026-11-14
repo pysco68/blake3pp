@@ -588,22 +588,35 @@ class ioring_engine {
   }
 
   // One transition for everything queued. False latches the failure for
-  // take_failure().
+  // take_failure(). A built entry cannot be taken back out of the ring,
+  // and a wait does not submit, so a submit that succeeds but leaves
+  // entries behind is asked once more and then latched as a failure too:
+  // the context must not wait on entries the ring was never given.
   [[nodiscard]] bool submit_quiet() noexcept {
-    UINT32 submitted = 0;
-    const HRESULT hr =
-        ioring_entry_points().submit(ring_.get(), 0, 0, &submitted);
-    if (FAILED(hr)) {
-      if (submit_failed_ == 0) {
-        submit_failed_ = static_cast<std::uint32_t>(hr);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      UINT32 submitted = 0;
+      const HRESULT hr =
+          ioring_entry_points().submit(ring_.get(), 0, 0, &submitted);
+      if (FAILED(hr)) {
+        if (submit_failed_ == 0) {
+          submit_failed_ = static_cast<std::uint32_t>(hr);
+        }
+        return false;
       }
-      return false;
+      queued_ -= std::min<std::size_t>(submitted, queued_);
+      if (queued_ == 0) {
+        // The entries a failed submit left in the ring are offered again
+        // by the next one, so a success is what settles the mechanism
+        // question.
+        submit_failed_ = 0;
+        return true;
+      }
     }
-    queued_ -= std::min<std::size_t>(submitted, queued_);
-    // The entries a failed submit left in the ring are offered again by
-    // the next one, so a success is what settles the mechanism question.
-    submit_failed_ = 0;
-    return true;
+    if (submit_failed_ == 0) {
+      submit_failed_ =
+          static_cast<std::uint32_t>(HRESULT_FROM_WIN32(ERROR_RETRY));
+    }
+    return false;
   }
 #else
   // Without the SDK's declarations there is no ring: use_ring_ is false

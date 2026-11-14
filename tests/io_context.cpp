@@ -1237,6 +1237,52 @@ TEST_CASE("io_uring: a read still published when a re-arm is refused completes")
   CHECK(got == content);
 }
 
+// An enter can succeed and take nothing, leaving the read published. A
+// wait does not submit, so a poll that blocked with it there would sleep
+// for ever; the flush hands it to the pump instead, and poll(true)
+// returns with the read done.
+TEST_CASE("io_uring: a submit that takes nothing does not leave poll waiting") {
+  constexpr std::size_t len = 1024 * 1024;
+  const auto content = pattern(len, 45);
+  const temp_file f(content);
+  io_impl::uring_context ctx({}, 4);
+  io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
+  if (file.name().rfind("io_uring", 0) != 0) {
+    MESSAGE("skipped: no io_uring here (" << file.name() << ")");
+    return;
+  }
+  std::vector<std::byte> got(len);
+  probe p;
+  io_impl::uring_context::transfer a{};
+  a.done = &probe::on_done;
+  a.owner = &p;
+  struct seams_off {
+    ~seams_off() { io_impl::stall_submits.store(0); }
+  } const reset;
+  io_impl::stall_submits.store(1);
+  ctx.submit_read(file, 0, std::span(got), a);
+  std::atomic<bool> returned{false};
+  std::thread poller([&] {
+    while (p.calls == 0) {
+      (void)ctx.poll(true);
+    }
+    returned.store(true);
+  });
+  for (int i = 0; i < 1000 && !returned.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!returned.load()) {
+    std::fprintf(stderr, "io_uring: poll(true) still blocked after 10 s on a "
+                         "read an enter took nothing of\n");
+    std::abort();
+  }
+  poller.join();
+  CHECK(p.calls == 1);
+  CHECK(!p.ec);
+  CHECK(got == content);
+  CHECK(ctx.served_synchronously() == 1);
+}
+
 // A refusal can come before any transfer: the constructor arms the wake
 // poll and submits it. The context must still build, and reads through it
 // must complete.

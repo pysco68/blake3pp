@@ -425,7 +425,8 @@ struct uring {
         // An enter may take fewer than it was offered, and the rest stay
         // published. In steady state the next flush would pick them up, but
         // forget() waits out a count that includes them, so they are
-        // offered again here. n == 0 is no progress: leave them.
+        // offered again here. n == 0 is no progress: leave them, and
+        // uring_engine::flush() takes them back.
         if (n == 0 || static_cast<unsigned>(n) == tail - head) {
           return 0;
         }
@@ -435,6 +436,13 @@ struct uring {
         return errno;
       }
     }
+  }
+
+  // Whether entries are still published that no enter has taken: what a
+  // flush that returned 0 without taking everything leaves behind.
+  [[nodiscard]] bool unsubmitted() const noexcept {
+    return *sq_tail !=
+           std::atomic_ref<unsigned>(*sq_head).load(std::memory_order_acquire);
   }
 
   // Takes back every entry the kernel has not accepted, oldest first,
@@ -551,7 +559,7 @@ class uring_engine {
       // A refused enter takes the wake poll back rather than failing the
       // open; the next flush arms it again.
       arm_wake();
-      if (ring_.flush() != 0) {
+      if (ring_.flush() != 0 || ring_.unsubmitted()) {
         take_back<posix_transfer>([](posix_transfer&) noexcept {});
       }
     }
@@ -623,8 +631,10 @@ class uring_engine {
 
   // A refused enter is not an error the caller can act on: the
   // transfers are already counted, and an exception here would leave
-  // them counted and uncompleted. They go to the pump's lanes instead.
-  // The wake poll is armed again here when a reap took it.
+  // them counted and uncompleted. They go to the pump's lanes instead,
+  // and so does what an enter that took nothing left published: a wait
+  // does not submit, so nothing may stay behind for one. The wake poll
+  // is armed again here when a reap took it.
   template <class Op, class Refused>
   void flush(Refused&& refused) noexcept {
     if (!use_uring_) {
@@ -633,7 +643,7 @@ class uring_engine {
     if (!wake_armed_) {
       arm_wake();
     }
-    if (ring_.flush() != 0) {
+    if (ring_.flush() != 0 || ring_.unsubmitted()) {
       take_back<Op>(refused);
     }
   }
