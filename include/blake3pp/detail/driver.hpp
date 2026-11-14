@@ -109,9 +109,9 @@ struct io_op {
   // compiled, so no header here can sizeof/alignof all of them to take
   // their max. Measured by the "op storage" case in
   // tests/file_pipeline.cpp, which prints what the build actually has:
-  // the real transfer is 120 bytes aligned to 8 on Linux and on FreeBSD,
-  // leaving 72 bytes of headroom for the other backends' larger fields
-  // (Windows' OVERLAPPED among them). What keeps FreeBSD's inside it is
+  // the real transfer is 112 bytes aligned to 8 on Linux, and FreeBSD's
+  // carries one pointer more, which leaves the other backends' larger
+  // fields (Windows' OVERLAPPED among them) the rest. What keeps FreeBSD's inside it is
   // that its 160-byte struct aiocb lives in the CONTEXT's request pool
   // rather than in the operation; src/io/aio_backend.hpp says why the
   // contract requires that anyway.
@@ -127,11 +127,11 @@ struct io_op {
   // around a UNION of both backends' transfers, each of which carries a
   // transfer_base of its own (src/io/backend_select.hpp). A byte added to
   // transfer_base is therefore charged TWICE there, and the larger of the
-  // two members sets the rest: 16 for the composite's base plus 152 for
-  // iocp_context::transfer is 168, against 112 for the ring's. No Linux
+  // two members sets the rest: 16 for the composite's base plus 136 for
+  // iocp_context::transfer is 152, against 112 for the ring's. No Linux
   // build can catch that: every context there is a single transfer.
   //
-  // 192 leaves 24 bytes over that 168. The slack costs bytes per
+  // 192 leaves 40 bytes over that 152. The slack costs bytes per
   // operation in flight, and an operation is one window: at the 256-window
   // ceiling (max_queue_depth) the operations take 48 KiB, against at least
   // 16 MiB for the windows they point into (256 of the 64 KiB minimum). A

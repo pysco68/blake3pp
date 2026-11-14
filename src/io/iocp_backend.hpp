@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -119,11 +120,11 @@ class unique_handle {
 };
 
 // Shared Windows file plumbing, the twin of posix_file: the buffered
-// handle that always exists, the optional NO_BUFFERING/OVERLAPPED reopen
-// next to it (both are per-open flags, hence a second handle), and the
-// completion port when async engages. Every handle lives in a
-// unique_handle, which makes the type non-copyable by construction and
-// unwinds the whole set when a constructor throws part-way through.
+// handle that always exists, and the optional NO_BUFFERING/OVERLAPPED
+// reopen next to it (both are per-open flags, hence a second handle).
+// Every handle lives in a unique_handle, which makes the type
+// non-copyable by construction and unwinds the whole set when a
+// constructor throws part-way through.
 //
 // `fast` is held ONLY when the reopen genuinely engaged, so it never
 // aliases `plain` and no destructor has to test for that.
@@ -131,7 +132,6 @@ class unique_handle {
 struct win_file {
   unique_handle plain;  // always-buffered+sync: unaligned tails, fallback
   unique_handle fast;   // the reopened handle, when one engaged
-  unique_handle port;   // IOCP, when async engaged
   bool direct = false;
   bool use_iocp = false;
 
@@ -169,33 +169,28 @@ struct win_file {
   // not, and on Windows buffered async measures within noise of direct
   // async (docs/performance.md), so the port is the half to keep.
   //
-  // shared_port, when given, is a port this file does not own: the reader
-  // context keeps one port for every file it opens, while the writer still
-  // creates its own here. Ownership is the only difference; association
-  // and the failure handling are the same either way.
+  // `port` is the context's: every file it opens associates its
+  // overlapped handle with that one port, which the file does not own.
   void engage(const wchar_t* path, DWORD access, DWORD share,
-              bool want_direct, bool want_async,
-              HANDLE shared_port = nullptr, bool writing = false) noexcept {
+              bool want_direct, bool want_async, HANDLE port) noexcept {
     // OPEN_EXISTING on the reopen in both directions: the plain handle has
     // already created and truncated a file being written, and a second
     // CREATE_ALWAYS here would truncate it again -- including any
     // preallocation just set on it.
-    (void)writing;
     if (want_direct && want_async) {
-      if (engage_one(path, access, share, true, true, shared_port)) {
+      if (engage_one(path, access, share, true, true, port)) {
         return;
       }
       // The port first: per the measurement above, Windows can do
       // without the cache bypass more easily than without the asynchrony.
-      if (engage_one(path, access, share, false, true, shared_port)) {
+      if (engage_one(path, access, share, false, true, port)) {
         return;
       }
-      (void)engage_one(path, access, share, true, false, shared_port);
+      (void)engage_one(path, access, share, true, false, port);
       return;
     }
     if (want_direct || want_async) {
-      (void)engage_one(path, access, share, want_direct, want_async,
-                       shared_port);
+      (void)engage_one(path, access, share, want_direct, want_async, port);
     }
   }
 
@@ -205,7 +200,7 @@ struct win_file {
   // for less.
   [[nodiscard]] bool engage_one(const wchar_t* path, DWORD access, DWORD share,
                                 bool with_direct, bool with_async,
-                                HANDLE shared_port) noexcept {
+                                HANDLE port) noexcept {
     DWORD flags = FILE_ATTRIBUTE_NORMAL;
     if (with_direct) {
       flags |= FILE_FLAG_NO_BUFFERING;
@@ -218,29 +213,13 @@ struct win_file {
     if (!cand) {
       return false;
     }
-    unique_handle own_port;
-    if (with_async) {
-      if (shared_port != nullptr) {
-        // An unattachable port takes the fast handle down with it: a
-        // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path,
-        // so the candidate closes on the way out and the caller asks for
-        // a rung without it.
-        if (::CreateIoCompletionPort(cand.get(), shared_port, 0, 0) ==
-            nullptr) {
-          return false;
-        }
-      } else {
-        unique_handle p(
-            ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1));
-        if (!p ||
-            ::CreateIoCompletionPort(cand.get(), p.get(), 0, 0) == nullptr) {
-          return false;
-        }
-        own_port = std::move(p);
-      }
-    }
-    if (own_port) {
-      port = std::move(own_port);
+    // An unattachable port takes the fast handle down with it: a
+    // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path, so the
+    // candidate closes on the way out and the caller asks for a rung
+    // without it.
+    if (with_async &&
+        ::CreateIoCompletionPort(cand.get(), port, 0, 0) == nullptr) {
+      return false;
     }
     use_iocp = with_async;
     fast = std::move(cand);
@@ -271,9 +250,8 @@ class iocp_context {
     std::uint64_t off = 0;
     std::size_t filled = 0;
     bool is_write = false;
-    HANDLE h = INVALID_HANDLE_VALUE;
-    win_file* sync_file = nullptr;  // the deferred path needs the handles
-    file* owner_file = nullptr;     // which file's drain owes this op
+    // Which file's drain owes this op, and whose handles carry it.
+    file* owner_file = nullptr;
     transfer* next_deferred = nullptr;
     bool on_port = false;   // the port owes a completion, so cancel is CancelIoEx
     bool cancelled = false;  // a cancel was asked for; one is enough
@@ -283,14 +261,15 @@ class iocp_context {
    public:
     file(iocp_context& ctx, const std::filesystem::path& path,
          const file_open_options& how)
-        : write_(how.write) {
+        : ctx_(&ctx) {
+      const bool write = how.write;
       // FILE_SHARE_READ and nothing else: a digest describes the bytes
       // that were there, so nothing may rewrite or shorten the file
       // while it is being read. The cost is that a test cannot truncate
       // a file the pipeline holds open, which is why the truncation
       // case in tests/file_pipeline.cpp does not run here.
-      const DWORD access = write_ ? GENERIC_WRITE : GENERIC_READ;
-      const DWORD creation = write_ ? CREATE_ALWAYS : OPEN_EXISTING;
+      const DWORD access = write ? GENERIC_WRITE : GENERIC_READ;
+      const DWORD creation = write ? CREATE_ALWAYS : OPEN_EXISTING;
       // A writable open shares write access with ITSELF: engage() reopens
       // the same path for the direct/overlapped handle, and two
       // GENERIC_WRITE handles can only coexist if the first one permits
@@ -298,10 +277,10 @@ class iocp_context {
       // violation every time, and every write silently takes the
       // synchronous buffered rung.
       const DWORD share =
-          write_ ? (FILE_SHARE_READ | FILE_SHARE_WRITE) : FILE_SHARE_READ;
+          write ? (FILE_SHARE_READ | FILE_SHARE_WRITE) : FILE_SHARE_READ;
       f_.open(path.c_str(), access, share, creation,
               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
-      size_ = write_ ? 0 : f_.stat_size();
+      size_ = write ? 0 : f_.stat_size();
       // Preallocation belongs to the OPEN, not to the finish: a write that
       // extends the file serializes, and with an async direct queue that
       // collapses it to one stalled write at a time. On Windows that is
@@ -319,24 +298,21 @@ class iocp_context {
       // The sparse flag has to precede the preallocation for the range to
       // be a hole, and a valid data length can only be set on a file that
       // is not sparse.
-      if (write_ && how.preallocate_bytes > 0) {
+      if (write && how.preallocate_bytes > 0) {
         const bool valid_data =
             how.waive_zero_fill && enable_manage_volume_privilege();
         if (!valid_data) {
           sparse_ = set_sparse(true);
         }
-        if (set_end_of_file(how.preallocate_bytes)) {
-          prealloc_ = how.preallocate_bytes;
-          if (valid_data) {
-            valid_data_ = ::SetFileValidData(
-                              f_.plain.get(),
-                              static_cast<LONGLONG>(how.preallocate_bytes)) != 0;
-          }
+        if (set_end_of_file(how.preallocate_bytes) && valid_data) {
+          valid_data_ = ::SetFileValidData(
+                            f_.plain.get(),
+                            static_cast<LONGLONG>(how.preallocate_bytes)) != 0;
         }
       }
       f_.engage(path.c_str(), access, share, how.direct_io,
-                ctx.port_wanted(), ctx.port(), write_);
-      name_ = ctx.name_for(f_.direct, f_.use_iocp, write_);
+                ctx.async_requested_, ctx.port_.get());
+      name_ = ctx.name_for(f_.direct, f_.use_iocp, write);
       if (valid_data_) {
         name_ += "+validdata";
       } else if (sparse_) {
@@ -345,15 +321,13 @@ class iocp_context {
       ctx.adopt(*this);
     }
 
+    // Reclaimed, then off the context's list: forget() leaves a file on it,
+    // because a file that is merely idled is still open and may be read
+    // again. This one is not -- and a destroyed file still on the list is
+    // what a later drain() would walk.
     ~file() {
-      if (ctx_ != nullptr) {
-        // Reclaimed, then off the context's list: forget() leaves a file on
-        // it, because a file that is merely idled is still open and may be
-        // read again. This one is not -- and a destroyed file still on the
-        // list is what a later drain() would walk.
-        ctx_->forget(*this);
-        ctx_->unlink(*this);
-      }
+      ctx_->forget(*this);
+      ctx_->unlink(*this);
     }
     file(const file&) = delete;
     file& operator=(const file&) = delete;
@@ -369,7 +343,6 @@ class iocp_context {
       if (!set_end_of_file(bytes)) {
         throw_winerr("SetEndOfFile");
       }
-      prealloc_ = 0;
       if (sparse_ && set_sparse(false)) {
         sparse_ = false;
       }
@@ -426,12 +399,10 @@ class iocp_context {
 
     win_file f_;
     std::uint64_t size_ = 0;
-    std::uint64_t prealloc_ = 0;
-    bool write_ = false;
     std::string name_ = "readfile";
     bool sparse_ = false;      // made sparse for the run; cleared by set_size()
     bool valid_data_ = false;  // the valid data length was set up front
-    iocp_context* ctx_ = nullptr;
+    iocp_context* ctx_;
     file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
   };
@@ -490,8 +461,6 @@ class iocp_context {
     op.len = len;
     op.off = off;
     op.filled = 0;
-    op.h = f.f_.h();
-    op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.owner_file = &f;
     op.on_port = false;
@@ -520,10 +489,11 @@ class iocp_context {
   // other transfer error.
   [[nodiscard]] DWORD port_len(const transfer& op, std::uint64_t off,
                                std::size_t len) const noexcept {
-    if (!op.sync_file->use_iocp || len == 0) {
+    const win_file& f = op.owner_file->f_;
+    if (!f.use_iocp || len == 0) {
       return 0;
     }
-    if (op.sync_file->direct) {
+    if (f.direct) {
       const std::size_t granules = len - len % direct_align;
       return off % direct_align == 0 ? static_cast<DWORD>(granules) : 0;
     }
@@ -553,7 +523,7 @@ class iocp_context {
     if (std::exchange(op.cancelled, true)) {
       return;
     }
-    ::CancelIoEx(op.h, &op.ov);
+    ::CancelIoEx(op.owner_file->f_.h(), &op.ov);
   }
 
   // ReadFile queues the request itself, so there is nothing batched to
@@ -744,13 +714,7 @@ class iocp_context {
     return direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
   }
 
-  [[nodiscard]] bool port_wanted() const noexcept { return async_requested_; }
-  [[nodiscard]] HANDLE port() const noexcept {
-    return port_ ? port_.get() : nullptr;
-  }
-
   void adopt(file& f) noexcept {
-    f.ctx_ = this;
     f.next_ = files_;
     files_ = &f;
   }
@@ -798,10 +762,11 @@ class iocp_context {
     // The piece is the kernel's from here, and charged to the device
     // from here: a cached read completes inside the call.
     op.device_begin();
+    const HANDLE h = op.owner_file->f_.h();
     const BOOL ok =
         op.is_write
-            ? ::WriteFile(op.h, op.src + op.filled, len, nullptr, &op.ov)
-            : ::ReadFile(op.h, op.dst + op.filled, len, nullptr, &op.ov);
+            ? ::WriteFile(h, op.src + op.filled, len, nullptr, &op.ov)
+            : ::ReadFile(h, op.dst + op.filled, len, nullptr, &op.ov);
     if (ok == 0 && ::GetLastError() != ERROR_IO_PENDING) {
       op.device_end();
       return false;
@@ -815,9 +780,8 @@ class iocp_context {
   void complete(transfer& op, std::error_code ec) noexcept {
     device_.add_if_served(op.device_total_ns());
     in_flight_--;
-    if (op.owner_file != nullptr) {
-      op.owner_file->inflight_--;
-    }
+    assert(op.owner_file != nullptr && "every transfer is armed with its file");
+    op.owner_file->inflight_--;
     ++reported_;
     op.done(&op, ec);
   }
@@ -925,10 +889,10 @@ class iocp_context {
     try {
       const std::size_t rest = op.len - op.filled;
       if (op.is_write) {
-        write_sync(*op.sync_file, op.off + op.filled,
+        write_sync(op.owner_file->f_, op.off + op.filled,
                    {op.src + op.filled, rest});
       } else {
-        read_sync(*op.sync_file, op.off + op.filled,
+        read_sync(op.owner_file->f_, op.off + op.filled,
                   {op.dst + op.filled, rest});
       }
       op.filled = op.len;
