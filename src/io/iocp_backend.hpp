@@ -643,23 +643,20 @@ class iocp_context {
       }
     }
     while (port_owed_ > 0) {
-      DWORD bytes = 0;
-      ULONG_PTR key = 0;
-      OVERLAPPED* pov = nullptr;
-      ::GetQueuedCompletionStatus(port_.get(), &bytes, &key, &pov, INFINITE);
-      if (pov == nullptr) {
-        if (key == wake_key) {
-          woken_ = true;
-          continue;
-        }
+      const port_event e = next(INFINITE);
+      if (e.what == port_event::kind::wake) {
+        woken_ = true;
+        continue;
+      }
+      if (e.what != port_event::kind::completion) {
         std::fprintf(stderr,
                      "blake3pp: the completion port failed while %zu "
                      "transfer(s) were still owed (error %lu); their buffers "
                      "cannot be released\n",
-                     port_owed_, static_cast<unsigned long>(::GetLastError()));
+                     port_owed_, static_cast<unsigned long>(e.err));
         std::abort();
       }
-      --port_owed_;
+      // Reaped, not reported.
     }
     for (file* f = files_; f != nullptr; f = f->next_) {
       f->inflight_ = 0;
@@ -702,17 +699,12 @@ class iocp_context {
     }
     ::CancelIoEx(f.f_.h(), nullptr);
     while (f.inflight_ > 0) {
-      DWORD bytes = 0;
-      ULONG_PTR key = 0;
-      OVERLAPPED* pov = nullptr;
-      const BOOL ok =
-          ::GetQueuedCompletionStatus(port_.get(), &bytes, &key, &pov,
-                                      INFINITE);
-      if (pov == nullptr) {
-        if (key == wake_key) {
-          woken_ = true;  // remember it; a later poll() still owes it
-          continue;
-        }
+      const port_event e = next(INFINITE);
+      if (e.what == port_event::kind::wake) {
+        woken_ = true;  // remember it; a later poll() still owes it
+        continue;
+      }
+      if (e.what != port_event::kind::completion) {
         // The port is unusable, so this file's transfers can never come
         // back. Its handles close next and the buffers they are writing into
         // are released. Nothing here can make the kernel let go, and
@@ -723,29 +715,17 @@ class iocp_context {
                      "blake3pp: the completion port failed while %zu "
                      "transfer(s) of a closing file were still owed (error "
                      "%lu); their buffers cannot be released\n",
-                     f.inflight_, static_cast<unsigned long>(::GetLastError()));
+                     f.inflight_, static_cast<unsigned long>(e.err));
         std::abort();
       }
-      transfer& op = *op_of(pov);
-      --port_owed_;
-      op.device_end();
+      transfer& op = *e.op;
       if (op.owner_file == &f) {
+        op.device_end();
         in_flight_--;
         f.inflight_--;  // reaped, not reported
         continue;
       }
-      if (ok == 0) {
-        complete(op, read_error(::GetLastError()));
-      } else if (bytes == 0) {
-        complete(op, std::error_code(EIO, std::generic_category()));
-      } else {
-        op.filled += bytes;
-        if (op.filled < op.len) {
-          route(op);
-        } else {
-          complete(op, {});
-        }
-      }
+      (void)settle(op, e.bytes, e.err);
     }
   }
 
@@ -861,41 +841,78 @@ class iocp_context {
     const std::size_t before = reported_;
     bool parked = false;
     for (;;) {
-      DWORD bytes = 0;
-      ULONG_PTR key = 0;
-      OVERLAPPED* pov = nullptr;
-      const BOOL ok = ::GetQueuedCompletionStatus(
-          port_.get(), &bytes, &key, &pov,
-          block && reported_ == before && !parked ? INFINITE : 0);
-      if (pov == nullptr) {
-        if (ok == 0 && ::GetLastError() == WAIT_TIMEOUT) {
+      const port_event e =
+          next(block && reported_ == before && !parked ? INFINITE : 0);
+      switch (e.what) {
+        case port_event::kind::timeout:
           return;  // nothing more queued
-        }
-        if (key == wake_key) {
+        case port_event::kind::wake:
           woken_ = true;
           return;
-        }
-        throw_winerr("GetQueuedCompletionStatus");
+        case port_event::kind::failed:
+          throw std::system_error(static_cast<int>(e.err),
+                                  std::system_category(),
+                                  "GetQueuedCompletionStatus");
+        case port_event::kind::completion:
+          // A rest on the pump ends the wait: see above.
+          parked = settle(*e.op, e.bytes, e.err) || parked;
+          break;
       }
-      transfer& op = *op_of(pov);
-      --port_owed_;
-      op.device_end();
-      if (ok == 0) {
-        complete(op, read_error(::GetLastError()));
-        continue;
-      }
-      if (bytes == 0) {
-        complete(op, std::error_code(EIO, std::generic_category()));
-        continue;
-      }
-      op.filled += bytes;
-      if (op.filled < op.len) {
-        route(op);
-        parked = parked || !op.on_port;  // the rest is on the pump
-        continue;
-      }
-      complete(op, {});
     }
+  }
+
+  // One step of the port: what GetQueuedCompletionStatus handed back. The
+  // error is read before anything else runs, since any call -- a clock
+  // read included -- may overwrite it, and the key is read only for a
+  // dequeue that succeeded with no OVERLAPPED, which is the wake.
+  struct port_event {
+    enum class kind { completion, wake, timeout, failed };
+    kind what;
+    transfer* op = nullptr;
+    DWORD bytes = 0;
+    // A completion's own error, or why the port failed; ERROR_SUCCESS
+    // otherwise.
+    DWORD err = ERROR_SUCCESS;
+  };
+  [[nodiscard]] port_event next(DWORD timeout) noexcept {
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* pov = nullptr;
+    const BOOL ok =
+        ::GetQueuedCompletionStatus(port_.get(), &bytes, &key, &pov, timeout);
+    const DWORD err = ok != 0 ? ERROR_SUCCESS : ::GetLastError();
+    if (pov != nullptr) {
+      --port_owed_;
+      return {port_event::kind::completion, op_of(pov), bytes, err};
+    }
+    if (ok == 0 && err == WAIT_TIMEOUT) {
+      return {port_event::kind::timeout};
+    }
+    if (ok != 0 && key == wake_key) {
+      return {port_event::kind::wake};
+    }
+    return {port_event::kind::failed, nullptr, 0, err};
+  }
+
+  // What one completion of `op` means: its callback, or the rest of a
+  // short transfer reissued. Returns whether that rest went to the pump.
+  [[nodiscard]] bool settle(transfer& op, DWORD bytes, DWORD err) noexcept {
+    op.device_end();
+    if (err != ERROR_SUCCESS) {
+      complete(op, read_error(err));
+      return false;
+    }
+    if (bytes == 0) {
+      complete(op, std::error_code(EIO, std::generic_category()));
+      return false;
+    }
+    op.filled += bytes;
+    if (op.filled < op.len) {
+      route(op);
+      return !op.on_port;
+    }
+    complete(op, {});
+    return false;
   }
 
   // One transfer, on a lane. Touches the operation and the file it names,
