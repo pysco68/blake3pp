@@ -548,36 +548,6 @@ TEST_CASE("IOCP: an unaligned length rides the port but for a direct tail") {
   }
 }
 
-// A file closed with transfers it could not hand to the port (an
-// unaligned length under NO_BUFFERING, or no port at all) has to take
-// them with it: they name its handles and its share of the count. Left
-// queued, they would be performed through a closed handle, and a file
-// with a port would wait on it for completions that never arrive.
-TEST_CASE("an IOCP file closed with deferred transfers takes them with it") {
-  namespace io_impl = blake3pp::detail::io_impl;
-  const std::vector<std::byte> content(64 * 1024 + 100, std::byte{0x5c});
-  const temp_file f(content);
-  for (const bool async : {false, true}) {
-    CAPTURE(async);
-    io_impl::iocp_context ctx({.async = async}, 4);
-    std::array<std::byte, 100> buf{};  // below one NO_BUFFERING granule
-    io_impl::iocp_context::transfer op{};
-    probe p;
-    op.done = &probe::on_done;
-    op.owner = &p;
-    {
-      io_impl::iocp_context::file file(
-          ctx, f.path, io_impl::file_open_options{.direct_io = true});
-      ctx.submit_read(file, 0, std::span{buf}, op);
-      ctx.flush();
-      CHECK(ctx.in_flight() == 1);
-    }
-    CHECK(ctx.in_flight() == 0);
-    CHECK(ctx.poll(false) == 0);
-    CHECK(p.calls == 0);
-  }
-}
-
 // The IoRing half of the unaligned-length contract: the same question the
 // port answers above, with the same two answers. A buffered overlapped
 // handle takes any length, so none of it is synchronous; a NO_BUFFERING
@@ -772,34 +742,6 @@ TEST_CASE("IoRing: a refused ring names the reason") {
   CHECK(io_impl::no_ioring_suffix(
             {refusal::kind::create_failed, 0, 0x80070057}) ==
         " [ioring: CreateIoRing failed 0x80070057]");
-}
-
-// The ring's twin of the case above it: a file closed with transfers it
-// could not hand the ring must take them with it, because they name its
-// handles and its share of the count.
-TEST_CASE("an IoRing file closed with deferred transfers takes them with it") {
-  namespace io_impl = blake3pp::detail::io_impl;
-  const std::vector<std::byte> content(64 * 1024 + 100, std::byte{0x5d});
-  const temp_file f(content);
-  for (const bool async : {false, true}) {
-    CAPTURE(async);
-    io_impl::ioring_context ctx({.async = async}, 4);
-    std::array<std::byte, 100> buf{};  // below one NO_BUFFERING granule
-    io_impl::ioring_context::transfer op{};
-    probe p;
-    op.done = &probe::on_done;
-    op.owner = &p;
-    {
-      io_impl::ioring_context::file file(
-          ctx, f.path, io_impl::file_open_options{.direct_io = true});
-      ctx.submit_read(file, 0, std::span{buf}, op);
-      ctx.flush();
-      CHECK(ctx.in_flight() == 1);
-    }
-    CHECK(ctx.in_flight() == 0);
-    CHECK(ctx.poll(false) == 0);
-    CHECK(p.calls == 0);
-  }
 }
 #endif
 

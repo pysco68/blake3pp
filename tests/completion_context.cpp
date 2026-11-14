@@ -1,0 +1,506 @@
+// The shared completion context, driven by a scripted engine: the rules
+// every completion backend gets from src/io/completion_context.hpp,
+// tested on every platform and under the sanitizers without a kernel
+// queue. Each backend's own engine is tested in io_context.cpp.
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <filesystem>
+#include <limits>
+#include <span>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <vector>
+
+#include <doctest/doctest.h>
+
+#include "io/completion_context.hpp"
+
+// Named rather than anonymous: the engine's constants are its contract
+// with the context, not values this file reads.
+namespace fake_completion {
+
+namespace io_impl = blake3pp::detail::io_impl;
+
+// The byte the fake file holds at an offset.
+[[nodiscard]] std::byte byte_at(std::uint64_t off) noexcept {
+  return static_cast<std::byte>(static_cast<unsigned char>(off * 131 + 7));
+}
+
+void fill(std::span<std::byte> to, std::uint64_t off) noexcept {
+  for (std::size_t i = 0; i < to.size(); ++i) {
+    to[i] = byte_at(off + i);
+  }
+}
+
+// A kernel queue that does what the test script says: completes the
+// pieces it was given in order, as short as `piece`, refuses what it is
+// told to refuse, and answers a wait that could never end with a failure
+// rather than a hang.
+class fake_engine {
+ public:
+  struct transfer_part : io_impl::performed_transfer {
+    std::span<std::byte> buf{};
+    std::span<const std::byte> wbuf{};
+    std::uint64_t off = 0;
+    std::size_t filled = 0;
+    bool is_write = false;
+    bool cancelled = false;
+
+    [[nodiscard]] std::size_t length() const noexcept {
+      return is_write ? wbuf.size() : buf.size();
+    }
+    template <class Part>
+    void arm_read(Part&, std::uint64_t at, std::span<std::byte> to) noexcept {
+      arm(at);
+      buf = to;
+      wbuf = {};
+      is_write = false;
+    }
+    template <class Part>
+    void arm_write(Part&, std::uint64_t at,
+                   std::span<const std::byte> from) noexcept {
+      arm(at);
+      buf = {};
+      wbuf = from;
+      is_write = true;
+    }
+
+   private:
+    void arm(std::uint64_t at) noexcept {
+      off = at;
+      filled = 0;
+      cancelled = false;
+      reset_performance();
+    }
+  };
+
+  class file_part {
+   public:
+    file_part(const fake_engine&, const std::filesystem::path&,
+              const io_impl::file_open_options&) noexcept {}
+    [[nodiscard]] std::uint64_t size() const noexcept {
+      return std::uint64_t{1} << 30;
+    }
+    [[nodiscard]] std::string_view name() const noexcept { return "fake"; }
+    void set_size(std::uint64_t) noexcept {}
+  };
+
+  struct below {
+    static constexpr blake3pp::io_engine rung_engine =
+        blake3pp::io_engine::stdio;
+  };
+  static constexpr blake3pp::io_engine rung_engine =
+      blake3pp::io_engine::io_uring;
+  using rung_below = below;
+  static constexpr std::string_view mechanism = "the fake engine";
+
+  fake_engine(const io_impl::reader_context_options& opts, unsigned) noexcept
+      : engaged_(opts.async) {}
+
+  // The script.
+  std::size_t piece = std::numeric_limits<std::size_t>::max();
+  bool takes_rest = true;         // false: a remainder goes to the pump
+  bool submits_on_flush = false;  // pieces wait for flush(), as on a ring
+  int refuse_flushes = 0;         // flushes the kernel refuses outright
+  std::error_code latched{};      // what check() throws, once
+  bool fail_wait = false;         // a blocking next() answers failed
+
+  // What the engine saw.
+  std::size_t placed = 0;
+  std::size_t released = 0;
+  std::size_t blocked_unsubmitted = 0;
+
+  [[nodiscard]] io_impl::rung_verdict engaged_rung() const noexcept {
+    return {rung_engine, true};
+  }
+  [[nodiscard]] bool engaged() const noexcept { return engaged_; }
+  [[nodiscard]] unsigned device_depth(bool used, unsigned lanes) const noexcept {
+    return used ? 4u : lanes;
+  }
+
+  template <class Op>
+  static std::error_code perform(Op& op) noexcept {
+    if (!op.is_write) {
+      fill(op.buf.subspan(op.filled), op.off + op.filled);
+    }
+    op.filled = op.length();
+    return {};
+  }
+
+  template <class Op>
+  [[nodiscard]] bool place(Op& op) noexcept {
+    if (!engaged_ || op.filled == op.length() ||
+        (op.filled > 0 && !takes_rest)) {
+      return false;
+    }
+    op.device_begin();
+    ++placed;
+    queued_.push_back(&op);
+    if (!submits_on_flush) {
+      submit();
+    }
+    return true;
+  }
+  template <class Op>
+  void cancel(Op&) noexcept {}
+
+  template <class Op, class Refused>
+  void flush(Refused&& refused) noexcept {
+    if (refuse_flushes > 0 && !queued_.empty()) {
+      --refuse_flushes;
+      take_back<Op>(refused);
+      return;
+    }
+    submit();
+  }
+  template <class Op, class Refused>
+  void take_back(Refused&& refused) noexcept {
+    while (!queued_.empty()) {
+      transfer_part* const p = queued_.front();
+      queued_.pop_front();
+      p->device_end();
+      refused(static_cast<Op&>(*p));
+    }
+  }
+  void check() {
+    if (latched) {
+      throw std::system_error(std::exchange(latched, {}), "fake check()");
+    }
+  }
+
+  template <class Op>
+  [[nodiscard]] io_impl::engine_event<Op> next(bool block) noexcept {
+    using event = io_impl::engine_event<Op>;
+    if (!kernel_.empty()) {
+      Op& op = static_cast<Op&>(*kernel_.front());
+      kernel_.pop_front();
+      if (op.cancelled) {
+        return {event::kind::completion, &op,
+                std::make_error_code(std::errc::operation_canceled), 0};
+      }
+      const std::size_t n = std::min(piece, op.length() - op.filled);
+      if (!op.is_write) {
+        fill(op.buf.subspan(op.filled, n), op.off + op.filled);
+      }
+      return {event::kind::completion, &op, {}, n};
+    }
+    if (!block) {
+      return {};
+    }
+    if (fail_wait) {
+      return {event::kind::failed, nullptr,
+              std::make_error_code(std::errc::io_error)};
+    }
+    if (!queued_.empty()) {
+      // A real kernel would sleep for ever here: what it is waited on
+      // for was never given to it.
+      ++blocked_unsubmitted;
+      return {event::kind::failed, nullptr,
+              std::make_error_code(std::errc::resource_deadlock_would_occur)};
+    }
+    // Nothing in the kernel: only a lane's wake can end the wait.
+    woken_.wait(false);
+    woken_.store(false);
+    return {event::kind::wake};
+  }
+
+  [[nodiscard]] bool take_wake() noexcept { return woken_.exchange(false); }
+  void wake() noexcept {
+    woken_.store(true);
+    woken_.notify_one();
+  }
+
+  template <class Part>
+  void cancel_file(Part&, std::size_t) noexcept {}
+  template <class Op, class Pred>
+  [[nodiscard]] std::size_t drop_unsubmitted(Pred&& mine) noexcept {
+    const auto n = std::erase_if(queued_, [&](transfer_part* p) {
+      return mine(static_cast<const Op&>(*p));
+    });
+    return static_cast<std::size_t>(n);
+  }
+  [[nodiscard]] std::size_t owed() const noexcept { return kernel_.size(); }
+  template <class EachFile>
+  void begin_drain(EachFile&&) noexcept {
+    queued_.clear();
+  }
+  void end_drain() noexcept {}
+  template <class Op>
+  void release(Op&) noexcept {
+    ++released;
+  }
+
+ private:
+  void submit() {
+    kernel_.insert(kernel_.end(), queued_.begin(), queued_.end());
+    queued_.clear();
+  }
+
+  bool engaged_ = true;
+  std::deque<transfer_part*> queued_;  // placed, not yet submitted
+  std::deque<transfer_part*> kernel_;  // submitted, owed a completion
+  std::atomic<bool> woken_{false};
+};
+
+using context = io_impl::completion_context<fake_engine>;
+
+struct probe {
+  int calls = 0;
+  std::error_code ec{};
+  static void on_done(io_impl::transfer_base* base,
+                      std::error_code e) noexcept {
+    auto* const p = static_cast<probe*>(base->owner);
+    p->calls++;
+    p->ec = e;
+  }
+};
+
+void arm(context::transfer& op, probe& p) {
+  op.done = &probe::on_done;
+  op.owner = &p;
+}
+
+// Polls until `p` has run, adding up what poll() said it ran.
+std::size_t poll_until(context& ctx, const probe& p) {
+  std::size_t reported = 0;
+  for (int polls = 0; p.calls == 0; ++polls) {
+    REQUIRE(polls < 1000);
+    reported += ctx.poll(true);
+  }
+  return reported;
+}
+
+[[nodiscard]] bool holds_pattern(std::span<const std::byte> got,
+                                 std::uint64_t off) {
+  for (std::size_t i = 0; i < got.size(); ++i) {
+    if (got[i] != byte_at(off + i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace fake_completion
+
+using namespace fake_completion;
+
+TEST_SUITE("completion_context") {
+
+// A short piece's remainder goes back on the queue during the reap, and a
+// queue whose wait does not submit would then sleep on an entry it was
+// never given. io_uring is such a queue; the completion port is not.
+TEST_CASE("a remainder placed during a reap is submitted before poll blocks") {
+  context ctx({}, 4);
+  ctx.engine().piece = 4096;
+  ctx.engine().submits_on_flush = true;
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(4 * 4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 1000, std::span(got), op);
+  ctx.flush();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(!p.ec);
+  CHECK(holds_pattern(got, 1000));
+  CHECK(ctx.engine().placed == 4);
+  CHECK(ctx.engine().blocked_unsubmitted == 0);
+  CHECK(ctx.served_synchronously() == 0);
+  CHECK(ctx.in_flight() == 0);
+}
+
+// The rest of a transfer the engine will not take again finishes on a
+// lane; poll() reports the one callback, not the hand-over.
+TEST_CASE("poll() counts callbacks, not a remainder moved to the pump") {
+  context ctx({}, 4);
+  ctx.engine().piece = 4096;
+  ctx.engine().takes_rest = false;
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(3 * 4096 + 100);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 0, std::span(got), op);
+  ctx.flush();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(!p.ec);
+  CHECK(holds_pattern(got, 0));
+  CHECK(ctx.served_synchronously() == 1);
+}
+
+TEST_CASE("a submission the kernel refuses is served by the lanes") {
+  context ctx({}, 4);
+  ctx.engine().submits_on_flush = true;
+  ctx.engine().refuse_flushes = 1;
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(8192);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 0, std::span(got), op);
+  ctx.flush();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(!p.ec);
+  CHECK(holds_pattern(got, 0));
+  CHECK(ctx.served_synchronously() == 1);
+}
+
+TEST_CASE("an engine that was never had serves everything on the lanes") {
+  context ctx({.async = false}, 4);
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 0, std::span(got), op);
+  ctx.flush();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(holds_pattern(got, 0));
+  CHECK(ctx.engine().placed == 0);
+  CHECK(ctx.served_synchronously() == 1);
+}
+
+TEST_CASE("a latched engine failure is thrown once, from poll") {
+  context ctx({}, 4);
+  ctx.engine().latched = std::make_error_code(std::errc::io_error);
+  CHECK_THROWS_AS(ctx.poll(false), std::system_error);
+  CHECK(ctx.poll(false) == 0);
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 0, std::span(got), op);
+  ctx.flush();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(!p.ec);
+}
+
+TEST_CASE("a failed wait reaches the caller, naming the engine") {
+  context ctx({}, 4);
+  ctx.engine().fail_wait = true;
+  try {
+    (void)ctx.poll(true);
+    FAIL("poll() returned from a wait that failed");
+  } catch (const std::system_error& e) {
+    CHECK(e.code() == std::errc::io_error);
+    CHECK(std::string(e.what()).find("the fake engine") != std::string::npos);
+  }
+}
+
+TEST_CASE("a cancelled transfer on the engine reports operation_canceled once") {
+  context ctx({}, 4);
+  ctx.engine().submits_on_flush = true;
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 0, std::span(got), op);
+  ctx.cancel(op);
+  ctx.cancel(op);
+  ctx.flush();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(p.ec == std::errc::operation_canceled);
+  CHECK(ctx.poll(false) == 0);
+  CHECK(p.calls == 1);
+}
+
+// A file closes with one transfer the kernel holds, one it was never
+// given, and one on the pump. None of them is reported, and a sibling's
+// transfer the kernel holds behind them stays owed.
+TEST_CASE("a closed file takes its unreported transfers with it") {
+  context ctx({}, 4);
+  ctx.engine().submits_on_flush = true;
+  context::file sibling(ctx, "fake", {});
+  std::vector<std::byte> sibling_got(4096);
+  probe sp;
+  context::transfer sop{};
+  arm(sop, sp);
+
+  std::vector<std::byte> a(4096);
+  std::vector<std::byte> b(4096);
+  probe p;
+  context::transfer in_kernel{};
+  context::transfer unsubmitted{};
+  context::transfer on_pump{};
+  arm(in_kernel, p);
+  arm(unsubmitted, p);
+  arm(on_pump, p);
+  {
+    context::file file(ctx, "fake", {});
+    ctx.submit_read(file, 0, std::span(a), in_kernel);
+    ctx.submit_read(sibling, 0, std::span(sibling_got), sop);
+    ctx.flush();
+    ctx.submit_read(file, 4096, std::span(b), unsubmitted);
+    // Zero bytes is a transfer no kernel queue takes.
+    ctx.submit_read(file, 0, std::span<std::byte>{}, on_pump);
+    CHECK(ctx.in_flight() == 4);
+  }
+  CHECK(ctx.in_flight() == 1);
+  CHECK(p.calls == 0);
+  CHECK(sp.calls == 0);
+  CHECK(poll_until(ctx, sp) == 1);
+  CHECK(holds_pattern(sibling_got, 0));
+  CHECK(ctx.poll(false) == 0);
+  CHECK(p.calls == 0);
+  CHECK(ctx.in_flight() == 0);
+}
+
+// The queue is shared, so a sibling's completion can surface while a
+// closing file waits its own out. It is reported then, from the close:
+// dropped, it would strand an operation that can never complete.
+TEST_CASE("a sibling's completion that surfaces while a file closes is reported") {
+  context ctx({}, 4);
+  context::file sibling(ctx, "fake", {});
+  std::vector<std::byte> sibling_got(4096);
+  probe sp;
+  context::transfer sop{};
+  arm(sop, sp);
+  ctx.submit_read(sibling, 0, std::span(sibling_got), sop);
+  std::vector<std::byte> a(4096);
+  probe p;
+  context::transfer mine{};
+  arm(mine, p);
+  {
+    context::file file(ctx, "fake", {});
+    ctx.submit_read(file, 0, std::span(a), mine);
+    ctx.flush();
+  }
+  CHECK(sp.calls == 1);
+  CHECK(!sp.ec);
+  CHECK(holds_pattern(sibling_got, 0));
+  CHECK(p.calls == 0);
+  CHECK(ctx.in_flight() == 0);
+}
+
+TEST_CASE("drain() reports nothing and leaves the context usable") {
+  context ctx({}, 4);
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> a(4096);
+  std::vector<std::byte> b(4096);
+  probe p;
+  context::transfer x{};
+  context::transfer y{};
+  arm(x, p);
+  arm(y, p);
+  ctx.submit_read(file, 0, std::span(a), x);
+  ctx.submit_read(file, 4096, std::span(b), y);
+  ctx.flush();
+  ctx.drain();
+  CHECK(ctx.in_flight() == 0);
+  CHECK(ctx.poll(false) == 0);
+  CHECK(p.calls == 0);
+
+  ctx.submit_read(file, 0, std::span(a), x);
+  ctx.flush();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(holds_pattern(a, 0));
+}
+
+}  // TEST_SUITE
