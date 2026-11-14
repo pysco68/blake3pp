@@ -144,6 +144,89 @@ struct posix_file {
   bool nocache_ = false;
 };
 
+// The part of a transfer that the POSIX backends with a kernel queue,
+// io_uring and AIO, share: what moves, where, how much of it already
+// has, and the file whose descriptors carry it. Each backend's transfer
+// adds its own kernel state, and the file and queue links it needs typed.
+struct posix_transfer : performed_transfer {
+  std::span<std::byte> buf{};         // reads fill this
+  std::span<const std::byte> wbuf{};  // writes read from this
+  std::uint64_t off = 0;
+  std::size_t filled = 0;
+  posix_file* sync_file = nullptr;  // the deferred path needs the pair
+  bool cancelled = false;  // a cancel was asked for; one is enough
+  bool is_write = false;
+
+  [[nodiscard]] std::size_t length() const noexcept {
+    return is_write ? wbuf.size() : buf.size();
+  }
+
+  // What a transfer needs that depends neither on its direction nor on
+  // where it is placed.
+  void arm(posix_file& f, std::uint64_t at) noexcept {
+    off = at;
+    filled = 0;
+    sync_file = &f;
+    cancelled = false;
+    reset_performance();
+  }
+};
+
+// How much of a piece of a transfer the kernel queue takes, and through
+// which descriptor. Asked for both directions and for every piece: the
+// initial one, and what is left after a short completion, which resumes
+// at off + filled -- a granule boundary only if the device stopped on one.
+//
+// O_DIRECT rejects an unaligned length and an unaligned offset, so the
+// direct descriptor carries whole granules at a granule offset, and a
+// piece with a sub-granule end is cut to the granules it holds. The rest
+// goes through the plain descriptor, which takes any shape: the end of a
+// file whose size is not a multiple of the granule, a resumption off a
+// boundary, and every piece of a buffered file. A file's last window
+// therefore stays asynchronous however long it is.
+struct fd_piece {
+  int fd;           // -1: the kernel queue takes none of it
+  std::size_t len;  // what rides, from the piece's start
+};
+[[nodiscard]] inline fd_piece direct_piece(const posix_file& f,
+                                           std::uint64_t off,
+                                           std::size_t len) noexcept {
+  if (f.direct()) {
+    const std::size_t granules = len - len % direct_align;
+    if (off % direct_align == 0 && granules > 0) {
+      return {f.fd(), granules};
+    }
+  }
+  return {f.fd_plain(), len};
+}
+
+// The rest of a transfer, on a lane: from where it stopped, which for a
+// fresh one is the start and for a continuation is what the kernel
+// already moved. The remainder picks the descriptor, since an unalignable
+// rest is exactly what the plain fd exists for. Touches the operation and
+// its file and nothing else.
+[[nodiscard]] inline std::error_code perform_rest(posix_transfer& op) noexcept {
+  try {
+    const std::size_t done = op.filled;
+    const std::size_t rest = op.length() - done;
+    if (op.is_write) {
+      op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
+                               op.wbuf.subspan(done), op.off + done);
+    } else {
+      op.sync_file->pread_all(op.sync_file->sync_fd(rest),
+                              op.buf.subspan(done), op.off + done);
+    }
+    op.filled = op.length();
+  } catch (const std::system_error& e) {
+    return e.code();
+  } catch (...) {
+    // posix_file throws only system_error; anything else is reported as
+    // EIO so it cannot terminate a noexcept lane.
+    return std::make_error_code(std::errc::io_error);
+  }
+  return {};
+}
+
 }  // namespace blake3pp::detail::io_impl
 
 #endif  // __unix__ || __APPLE__

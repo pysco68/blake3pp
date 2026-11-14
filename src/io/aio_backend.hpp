@@ -114,13 +114,9 @@ class aio_context {
   class file;  // defined below; a transfer names the file it belongs to
   struct request;  // the context-owned aiocb a transfer rides on
 
-  struct transfer : performed_transfer {
-    std::span<std::byte> buf{};         // reads fill this
-    std::span<const std::byte> wbuf{};  // writes read from this
-    std::uint64_t off = 0;
-    std::size_t filled = 0;
-    posix_file* sync_file = nullptr;  // the deferred path needs the pair
-    file* owner_file = nullptr;       // whose transfer this is, for forget()
+  struct transfer : posix_transfer {
+    bool issued = false;          // the kernel has it; an event is owed
+    file* owner_file = nullptr;   // whose transfer this is, for forget()
     // The kernel's half of this transfer, borrowed from the context's
     // pool while the transfer is queued or in flight and given back when
     // it finishes; null for one on the synchronous rung.
@@ -130,13 +126,6 @@ class aio_context {
     // at once. The pending queue is a deferred_ops over the same field,
     // so every operation carries one pointer for all of them.
     transfer* next_deferred = nullptr;
-    bool issued = false;     // the kernel has it; an event is owed
-    bool cancelled = false;  // a cancel was asked for; one is enough
-    bool is_write = false;
-
-    [[nodiscard]] std::size_t length() const noexcept {
-      return is_write ? wbuf.size() : buf.size();
-    }
   };
 
   // One kernel request, owned by the context. The kernel reads the aiocb
@@ -596,51 +585,25 @@ class aio_context {
 
   // What a transfer needs that does not depend on its direction.
   void arm(transfer& op, file& f, std::uint64_t off) noexcept {
-    op.off = off;
-    op.filled = 0;
-    op.sync_file = &f.f_;
+    op.arm(f.f_, off);
     op.owner_file = &f;
     op.req = nullptr;
     op.next_deferred = nullptr;
     op.issued = false;
-    op.cancelled = false;
-    op.reset_performance();
     in_flight_++;
     f.inflight_++;
   }
 
-  // How much of a piece of a transfer the kernel takes, and through which
-  // descriptor. Asked for both directions and for every piece: the
-  // initial one, and what is left after a short completion, which
-  // resumes at off + filled -- a granule boundary only if the device
-  // stopped on one.
-  //
-  // O_DIRECT rejects an unaligned length and an unaligned offset, so the
-  // direct descriptor carries whole granules at a granule offset, and a
-  // piece with a sub-granule end is cut to the granules it holds. The rest
-  // goes to the kernel through the plain descriptor, which takes any
-  // shape: the end of a file whose size is not a multiple of the granule,
-  // a resumption off a boundary, and every piece of a buffered file. A
-  // file's last window therefore stays asynchronous however long it is.
-  // What goes to the pump's lanes is a context with no AIO, a
-  // submit the kernel refused, and a zero-length transfer, which has
-  // nothing for the kernel to do.
-  struct aio_piece {
-    int fd;           // -1: the kernel takes none of it
-    std::size_t len;  // what rides, from the piece's start
-  };
-  [[nodiscard]] aio_piece piece_for(const transfer& op, std::uint64_t off,
-                                    std::size_t len) const noexcept {
+  // How much of a piece the kernel takes, and through which descriptor:
+  // direct_piece()'s shapes. What goes to the pump's lanes is a context
+  // with no AIO, a submit the kernel refused, and a zero-length transfer,
+  // which has nothing for the kernel to do.
+  [[nodiscard]] fd_piece piece_for(const transfer& op, std::uint64_t off,
+                                   std::size_t len) const noexcept {
     if (!use_aio_ || len == 0) {
       return {-1, 0};
     }
-    if (op.sync_file->direct()) {
-      const std::size_t granules = len - len % direct_align;
-      if (off % direct_align == 0 && granules > 0) {
-        return {op.sync_file->fd(), granules};
-      }
-    }
-    return {op.sync_file->fd_plain(), len};
+    return direct_piece(*op.sync_file, off, len);
   }
 
   // A request to put the next piece on, taken from the pool or made.
@@ -699,7 +662,7 @@ class aio_context {
   // what already moved; a continuation keeps the request its first piece
   // rode on, which is free to refill once aio_return has been called.
   void issue(transfer& op, const void* data, std::size_t len) noexcept {
-    const aio_piece piece = piece_for(op, op.off + op.filled, len);
+    const fd_piece piece = piece_for(op, op.off + op.filled, len);
     if (piece.fd < 0) {
       release(op);
       pump_.push(op);
@@ -1001,33 +964,11 @@ class aio_context {
     }
   }
 
-  // One transfer, on a lane. Touches the operation and the file it names,
-  // and nothing else of this context, so served_synchronously_ is counted
-  // where the completion is run.
+  // One transfer, on a lane: perform_rest() touches the operation and its
+  // file and nothing else of this context, so served_synchronously_ is
+  // counted where the completion is run.
   static std::error_code perform_deferred(transfer& op) noexcept {
-    try {
-      // From where the transfer stopped, which for a fresh one is the
-      // start and for a continuation is what the kernel already moved.
-      // The remainder picks the descriptor: an unalignable rest is
-      // exactly what the plain fd exists for.
-      const std::size_t done = op.filled;
-      const std::size_t rest = op.length() - done;
-      if (op.is_write) {
-        op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
-                                 op.wbuf.subspan(done), op.off + done);
-      } else {
-        op.sync_file->pread_all(op.sync_file->sync_fd(rest),
-                                op.buf.subspan(done), op.off + done);
-      }
-      op.filled = op.length();
-    } catch (const std::system_error& e) {
-      return e.code();
-    } catch (...) {
-      // posix_file throws only system_error; anything else is reported as
-      // EIO so it cannot terminate a noexcept lane.
-      return std::make_error_code(std::errc::io_error);
-    }
-    return {};
+    return perform_rest(op);
   }
 
   // Runs the callbacks of the transfers the lanes finished, on this
