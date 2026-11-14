@@ -828,8 +828,7 @@ TEST_CASE("a GCD file waits out its workers before its descriptor closes") {
   }
   // The worker ran to completion through a descriptor that was still
   // open, and its result was dropped rather than delivered.
-  CHECK(op.filled == content.size());
-  CHECK(op.error == 0);
+  CHECK(!op.result());
   CHECK(buf == content);
   CHECK(ctx.in_flight() == 0);
   CHECK(ctx.poll(false) == 0);

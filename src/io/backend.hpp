@@ -772,6 +772,19 @@ class deferred_pump {
     return op;
   }
 
+  // Takes a transfer that was performed somewhere other than a lane, with
+  // its result already set, onto the done list, and wakes the polling
+  // thread as a lane does: for a backend whose own workers do the
+  // transfers. Touches the operation only under the lock. Any thread.
+  void land(Op& op) noexcept {
+    {
+      const std::lock_guard<std::mutex> lock(m_);
+      op.next_deferred = done_;
+      done_ = &op;
+    }
+    lanes_.wake_poller();
+  }
+
   // Hands `report` every transfer the lanes finished, then the one
   // run_one_here() serves for a context that got no lanes. Returns how
   // many it reported. From the polling thread only.

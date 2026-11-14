@@ -9,9 +9,10 @@
 // global concurrent pool, straight into the engine's buffers;
 // dispatch_io is not used because it delivers dispatch_data_t chunks it
 // allocated itself, an extra copy. A dispatch_group is the teardown
-// drain, a mutex-guarded list carries finished transfers back, and the
-// contract's poll_waiter signals them. Without a group, transfers go to
-// the deferred pump's lanes. Internal to src/io/, never installed.
+// drain, and a finished transfer lands on the deferred pump's done list,
+// which signals the contract's poll_waiter as a lane does. Without a
+// group, transfers go to the pump's lanes. Internal to src/io/, never
+// installed.
 
 #if defined(__APPLE__)
 
@@ -23,14 +24,10 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <span>
-#include <utility>
 #include <system_error>
-#include <vector>
 
 #include "io/backend.hpp"
 #include "io/posix_file.hpp"
@@ -66,56 +63,49 @@ inline bool preallocate(int fd, std::uint64_t len) noexcept {
   return ::ftruncate(fd, static_cast<off_t>(len)) == 0;
 }
 
-// The submission half of the machinery: submit() queues a transfer onto
-// GCD's global pool inside a dispatch group. The context's done list and
-// waiter carry the completion back.
-//
-// The group exists for teardown. In-flight workers touch the engine's
-// buffer pool, so destroy() must wait them out before the pool is freed.
-struct gcd_pump {
-  dispatch_group_t group = nullptr;
-
-  bool init() noexcept {
-    group = dispatch_group_create();
-    return group != nullptr;
-  }
-
-  // Owning the group means owning its release, also when the owning
-  // context's constructor throws after init() and its destructor never
-  // runs. destroy() is idempotent, so the context's destructor may call it
-  // first.
-  ~gcd_pump() { destroy(); }
-  gcd_pump() = default;
-  gcd_pump(const gcd_pump&) = delete;
-  gcd_pump& operator=(const gcd_pump&) = delete;
-
-  void destroy() noexcept {
-    if (group != nullptr) {
-      dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
-      dispatch_release(group);
-      group = nullptr;
+// A dispatch group, owned: async() queues work onto GCD's global pool
+// inside it, wait() waits that work out, and the destructor waits once
+// more and releases it. The group exists for teardown: in-flight workers
+// touch the engine's buffer pool, which must not be freed under them.
+// Null when it was not created, which async() and wait() must not meet.
+class unique_dispatch_group {
+ public:
+  explicit unique_dispatch_group(dispatch_group_t g) noexcept : g_(g) {}
+  ~unique_dispatch_group() {
+    if (g_ != nullptr) {
+      wait();
+      dispatch_release(g_);
     }
   }
+  unique_dispatch_group(const unique_dispatch_group&) = delete;
+  unique_dispatch_group& operator=(const unique_dispatch_group&) = delete;
+
+  explicit operator bool() const noexcept { return g_ != nullptr; }
+  [[nodiscard]] dispatch_group_t get() const noexcept { return g_; }
+
+  void wait() noexcept { dispatch_group_wait(g_, DISPATCH_TIME_FOREVER); }
 
   // GCD takes a C callback and a cookie, so the cast back to the caller's
   // type lives here, in the one place the boundary forces it.
   template <class T, void (*Run)(T&) noexcept>
-  void submit(T& ctx) noexcept {
+  void async(T& arg) noexcept {
     dispatch_group_async_f(
-        group, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &ctx,
+        g_, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &arg,
         +[](void* p) noexcept { Run(*static_cast<T*>(p)); });
   }
+
+ private:
+  dispatch_group_t g_;
 };
 
 // The Darwin reader context: one dispatch group, any number of files,
 // reads named by the caller's transfer.
 //
 // Completions arrive on GCD worker threads and on the deferred pump's
-// lanes, neither of which runs the callback: a dispatch worker pushes the
-// finished op onto the done list and signals, a lane does the same
-// through the pump, and poll() drains both lists on the thread that
-// called it. The signal is the contract's poll_waiter, the same primitive
-// wake() uses, so a blocked poll has one thing to wait on.
+// lanes, neither of which runs the callback: both put the finished op on
+// the pump's done list and signal, and poll() reports the list on the
+// thread that called it. The signal is the contract's poll_waiter, the
+// same primitive wake() uses, so a blocked poll has one thing to wait on.
 class gcd_context {
  public:
   class file;
@@ -124,17 +114,16 @@ class gcd_context {
     std::byte* dst = nullptr;
     std::size_t len = 0;
     std::uint64_t off = 0;
-    std::size_t filled = 0;
     int fd = -1;
     const std::byte* src = nullptr;   // writes read from this
     bool is_write = false;
-    int error = 0;              // errno captured by the worker
     // Whose transfer this is: forget() matches on it, the file counts it,
     // and the deferred path reads through its descriptors.
     file* owner_file = nullptr;
     gcd_context* ctx = nullptr;
-    transfer* next_deferred = nullptr;  // queued, not yet read
-    transfer* next_done = nullptr;      // finished, not yet reported
+    // The pump's one link: queued for a lane, or finished and not yet
+    // reported, never both.
+    transfer* next_deferred = nullptr;
     // A cancel was asked for; one is enough. Only the deferred pump reads
     // it, and only for a transfer no lane has taken yet: a dispatch
     // worker already inside pread cannot be recalled on Darwin, which is
@@ -198,25 +187,19 @@ class gcd_context {
   };
 
   gcd_context(const reader_context_options& opts, unsigned max_inflight)
-      : queue_depth_(std::max(1u, max_inflight)),
+      : group_(opts.async ? dispatch_group_create() : nullptr),
+        queue_depth_(std::max(1u, max_inflight)),
+        use_gcd_(static_cast<bool>(group_)),
         // Declared last, and initialized last: see the member list.
-        sync_pump_(io_lanes::waker<gcd_context>(), this,
-                   &perform_deferred,
-                   io_lanes_for(max_inflight)) {
-    if (opts.async && pump_.init()) {
-      use_gcd_ = true;
-    }
-  }
+        pump_(io_lanes::waker<gcd_context>(), this, &perform_deferred,
+              io_lanes_for(max_inflight)) {}
   gcd_context(const gcd_context&) = delete;
   gcd_context& operator=(const gcd_context&) = delete;
 
   // In-flight workers write into the engine's buffer pool, which is freed
   // just after this: wait them out. A wake nobody consumed dies with the
   // waiter and needs no nudge: nothing here waits on it.
-  ~gcd_context() {
-    drain();
-    pump_.destroy();
-  }
+  ~gcd_context() { drain(); }
 
   // This context's rung and the one it degrades to; see
   // uring_context::engaged_rung().
@@ -261,22 +244,21 @@ class gcd_context {
   // inside. A transfer no lane has taken yet is flagged and reports
   // operation_canceled; anything else runs to completion and reports
   // once, from poll(), with whatever the transfer produced.
-  void cancel(transfer& op) noexcept { sync_pump_.cancel(op); }
+  void cancel(transfer& op) noexcept { pump_.cancel(op); }
 
   std::size_t poll(bool block) {
-    std::size_t ran = drain_done() + serve_deferred();
+    std::size_t ran = serve_deferred();
     if (ran > 0 || !block) {
       return ran;
     }
     for (;;) {
       if (waiter_.take()) {
-        // A wake, a dispatch worker's signal or a lane's; the lists say
-        // which.
-        ran += drain_done() + serve_deferred();
-        return ran;
+        // A wake, a dispatch worker's signal or a lane's; the done list
+        // says which.
+        return ran + serve_deferred();
       }
       waiter_.sleep();
-      ran += drain_done() + serve_deferred();
+      ran += serve_deferred();
       if (ran > 0) {
         return ran;
       }
@@ -291,18 +273,18 @@ class gcd_context {
   // dispatch group the deferred pump's lanes are the whole of what the
   // device sees.
   [[nodiscard]] unsigned device_depth() const noexcept {
-    return use_gcd_ ? queue_depth_ : sync_pump_.depth();
+    return use_gcd_ ? queue_depth_ : pump_.depth();
   }
   [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
-    return sync_pump_.lane_wait_ns();
+    return pump_.lane_wait_ns();
   }
   [[nodiscard]] device_time device() const noexcept { return device_; }
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
   // Holds the dispatch group the way a worker still inside a transfer
   // does, until released: a sibling in flight, as long as the test likes.
-  void test_hold_group() noexcept { dispatch_group_enter(pump_.group); }
-  void test_release_group() noexcept { dispatch_group_leave(pump_.group); }
+  void test_hold_group() noexcept { dispatch_group_enter(group_.get()); }
+  void test_release_group() noexcept { dispatch_group_leave(group_.get()); }
   [[nodiscard]] bool test_uses_gcd() const noexcept { return use_gcd_; }
 #endif
 
@@ -310,10 +292,9 @@ class gcd_context {
   // finished and what was never started: none of it is reported.
   void drain() noexcept {
     if (use_gcd_) {
-      dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
+      group_.wait();
     }
-    done_.clear();
-    sync_pump_.clear();
+    pump_.clear();
     in_flight_ = 0;
   }
 
@@ -326,8 +307,8 @@ class gcd_context {
   // for one file. Legal only while the operations are alive.
   //
   // The group and the lanes are the context's, so the wait covers sibling
-  // files too, and a sibling's finished transfer stays on its list for a
-  // later poll() to report.
+  // files too, and a sibling's finished transfer stays on the done list
+  // for a later poll() to report.
   void forget(file& f) noexcept {
     // A file that owes nothing has nothing in a worker or on a lane. A
     // count a context-wide drain left stale only brings back the wait.
@@ -342,15 +323,13 @@ class gcd_context {
       in_flight_ -= std::min(n, in_flight_);
       f.inflight_ -= std::min(n, f.inflight_);
     };
-    std::size_t never_started = sync_pump_.remove_queued_if(mine);
-    sync_pump_.quiesce();
-    never_started += sync_pump_.remove_done_if(mine);
-    dropped(never_started);
-    if (!use_gcd_) {
-      return;  // nothing is in a dispatch worker
+    std::size_t never_started = pump_.remove_queued_if(mine);
+    pump_.quiesce();
+    if (use_gcd_) {
+      group_.wait();  // a dispatch worker lands what it holds first
     }
-    dispatch_group_wait(pump_.group, DISPATCH_TIME_FOREVER);
-    dropped(done_.remove_if(mine));
+    never_started += pump_.remove_done_if(mine);
+    dropped(never_started);
   }
 
  private:
@@ -358,13 +337,11 @@ class gcd_context {
   void arm(transfer& op, file& f, std::uint64_t off, std::size_t len) noexcept {
     op.len = len;
     op.off = off;
-    op.filled = 0;
-    op.error = 0;
     op.cancelled = false;
     op.fd = f.f_.fd_plain();
     op.owner_file = &f;
     op.ctx = this;
-    op.next_done = nullptr;
+    op.next_deferred = nullptr;
     op.reset_performance();
     in_flight_++;
     f.inflight_++;
@@ -374,74 +351,26 @@ class gcd_context {
   // deferred pump.
   void issue(transfer& op) noexcept {
     if (use_gcd_) {
-      pump_.submit<transfer, &gcd_context::run_transfer>(op);
+      group_.async<transfer, &gcd_context::run_transfer>(op);
     } else {
-      sync_pump_.push(op);
+      pump_.push(op);
     }
   }
 
-  // Runs on a GCD worker: one positional read or write loop over the
-  // caller's buffer, then the op goes on the done list. noexcept: the
-  // error travels in the op to whoever calls poll().
+  // Runs on a GCD worker: the same transfer a lane performs, charged to
+  // the device around itself, then the op lands on the pump's done list,
+  // which wakes poll(). `op.ctx` is read before the op is handed over,
+  // and nothing touches the op after: once it has landed, poll() may
+  // report it and the caller reuse it.
   static void run_transfer(transfer& op) noexcept {
-    gcd_context& c = *op.ctx;
-    int err = 0;
-    std::size_t got = 0;
-    // A dispatch worker is where this transfer meets the device, so this
-    // is where its time is charged: two clock reads per window.
     op.device_begin();
-    while (got < op.len) {
-      const ssize_t n =
-          op.is_write
-              ? ::pwrite(op.fd, op.src + got, op.len - got,
-                         static_cast<off_t>(op.off + got))
-              : ::pread(op.fd, op.dst + got, op.len - got,
-                        static_cast<off_t>(op.off + got));
-      if (n < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        err = errno;
-        break;
-      }
-      if (n == 0) {
-        // A read that ends early ended the file; a write that moves no
-        // bytes would spin, so both stop here.
-        err = EIO;
-        break;
-      }
-      got += static_cast<std::size_t>(n);
-    }
+    op.set_result(perform_deferred(op));
     op.device_end();
-    op.filled = got;
-    op.error = err;
-    c.done_.push(op);
-    c.waiter_.wake();
+    op.ctx->pump_.land(op);
   }
 
-  // Takes the whole finished list and runs their callbacks here, on the
-  // caller's thread. The list is LIFO, which the contract permits: the
-  // engine matches a completion to its window by the op, not by order.
-  std::size_t drain_done() noexcept {
-    transfer* head = done_.take_all();
-    std::size_t ran = 0;
-    while (head != nullptr) {
-      transfer* const next = head->next_done;
-      device_.add_if_served(head->device_total_ns());
-      in_flight_--;
-      head->owner_file->inflight_--;
-      head->done(head, head->error != 0
-                           ? std::error_code(head->error,
-                                             std::generic_category())
-                           : std::error_code{});
-      ran++;
-      head = next;
-    }
-    return ran;
-  }
-
-  // One transfer, on a lane. Touches the operation and the file it names,
-  // and nothing else of this context.
+  // One transfer, on a lane or a dispatch worker. Touches the operation
+  // and the file it names, and nothing else of this context.
   static std::error_code perform_deferred(transfer& op) noexcept {
     try {
       if (op.is_write) {
@@ -449,7 +378,6 @@ class gcd_context {
       } else {
         op.owner_file->f_.pread_all(op.fd, {op.dst, op.len}, op.off);
       }
-      op.filled = op.len;
     } catch (const std::system_error& e) {
       return e.code();
     } catch (...) {
@@ -460,11 +388,11 @@ class gcd_context {
     return {};
   }
 
-  // Runs the callbacks of the transfers the lanes finished, on this
-  // thread. The inline step serves a machine that would not give the
-  // pump a thread.
+  // Runs the callbacks of the transfers the dispatch workers and the
+  // lanes finished, on this thread. The inline step serves a machine that
+  // would not give the pump a thread.
   std::size_t serve_deferred() noexcept {
-    return sync_pump_.report_finished([this](transfer& op) noexcept {
+    return pump_.report_finished([this](transfer& op) noexcept {
       device_.add_if_served(op.device_total_ns());
       in_flight_--;
       op.owner_file->inflight_--;
@@ -484,58 +412,11 @@ class gcd_context {
     return n;
   }
 
-  // Finished transfers, pushed by GCD workers and drained by poll(). The
-  // link is the op's own next_done, so nothing allocates, and the head is
-  // reachable only through these members, each under the lock.
-  class done_list {
-   public:
-    void push(transfer& op) noexcept {
-      const std::lock_guard<std::mutex> lk(m_);
-      op.next_done = head_;
-      head_ = &op;
-    }
-
-    // The whole list, LIFO, which the contract permits: the engine matches
-    // a completion to its window by the op, not by order.
-    [[nodiscard]] transfer* take_all() noexcept {
-      const std::lock_guard<std::mutex> lk(m_);
-      return std::exchange(head_, nullptr);
-    }
-
-    // Forgets everything on the list: nothing here gets its callback.
-    void clear() noexcept {
-      const std::lock_guard<std::mutex> lk(m_);
-      head_ = nullptr;
-    }
-
-    // Unlinks and forgets the ops `drop` accepts, for a file closing with
-    // transfers that finished but were never reported. Returns how many.
-    template <class Pred>
-    std::size_t remove_if(Pred drop) noexcept {
-      const std::lock_guard<std::mutex> lk(m_);
-      std::size_t dropped = 0;
-      transfer** link = &head_;
-      while (*link != nullptr) {
-        transfer* const op = *link;
-        if (drop(*op)) {
-          *link = op->next_done;
-          op->next_done = nullptr;
-          ++dropped;
-        } else {
-          link = &op->next_done;
-        }
-      }
-      return dropped;
-    }
-
-   private:
-    std::mutex m_;
-    transfer* head_ = nullptr;
-  };
-
-  gcd_pump pump_;
+  // Waited out by drain(), which the destructor runs before any member
+  // goes, because a dispatch worker lands on the pump and wakes the
+  // waiter. Declared first, so use_gcd_ is initialized from it.
+  unique_dispatch_group group_;
   poll_waiter waiter_;
-  done_list done_;
   std::size_t in_flight_ = 0;
   // What the device itself took, stamped by whichever worker carried the
   // transfer -- a dispatch one or a lane.
@@ -544,10 +425,11 @@ class gcd_context {
   // reports it where the dispatch queue took the transfers.
   unsigned queue_depth_ = 1;
   bool use_gcd_ = false;
-  // The lanes that serve transfers when there is no dispatch group.
-  // Declared last, so the destructor's join runs while the waiter its
-  // wake() reaches is still alive. Do not move this up.
-  deferred_pump<transfer> sync_pump_;
+  // The done list every finished transfer lands on, and the lanes that
+  // serve transfers when there is no dispatch group. Declared last, so the
+  // destructor's join runs while the waiter its wake() reaches is still
+  // alive. Do not move this up.
+  deferred_pump<transfer> pump_;
 };
 
 // Definition-site conformance check (see uring_backend.hpp).
