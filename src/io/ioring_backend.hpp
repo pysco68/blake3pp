@@ -283,7 +283,10 @@ class ioring_context {
          const file_open_options& how)
         : ctx_(&ctx) {
       f_.open_file(path, how);
-      ctx.engage(f_, path.c_str(), how.direct_io);
+      // No port: the ring's completions come back through the ring, and
+      // without a ring there is nothing for an overlapped handle to ride,
+      // so only the cache bypass is asked for.
+      f_.engage(path.c_str(), how.direct_io, ctx.use_ring_, nullptr);
       name_ = ctx.name_for(f_.direct, f_.overlapped, how.write);
       name_ += f_.suffix();
       ctx.adopt(*this);
@@ -694,61 +697,6 @@ class ioring_context {
       n += no_ioring_suffix(refusal());
     }
     return n;
-  }
-
-  // NO_BUFFERING and OVERLAPPED are per-open flags, so engaging them
-  // means reopening the path. The plain handle from the first open stays
-  // for whatever the ring cannot carry. NO_BUFFERING is a property of the
-  // filesystem (SMB and some virtual volumes reject it) and OVERLAPPED is
-  // not, so a refusal of both drops the cache bypass and asks again for
-  // the asynchrony alone.
-  //
-  // This is win_file::engage() without the completion port: that one
-  // associates the reopened handle with an IOCP, which would send the
-  // completions somewhere the ring cannot see them.
-  // win_file::overlapped says afterwards whether the handle may ride.
-  void engage(win_file& f, const wchar_t* path,
-              bool want_direct) const noexcept {
-    if (!use_ring_) {
-      // No ring to ride: the cache bypass alone is still worth having,
-      // and the synchronous path can use a non-overlapped direct handle.
-      if (want_direct) {
-        (void)reopen(f, path, /*with_direct=*/true, /*with_async=*/false);
-      }
-      return;
-    }
-    if (want_direct && reopen(f, path, true, true)) {
-      return;
-    }
-    (void)reopen(f, path, false, true);
-  }
-
-  // One rung: reopen with exactly these two flags and take the handle
-  // only if it opened. Leaves everything untouched on failure, so the
-  // caller may ask again for less.
-  [[nodiscard]] static bool reopen(win_file& f, const wchar_t* path,
-                                   bool with_direct,
-                                   bool with_async) noexcept {
-    DWORD flags = FILE_ATTRIBUTE_NORMAL;
-    if (with_direct) {
-      flags |= FILE_FLAG_NO_BUFFERING;
-    }
-    if (with_async) {
-      flags |= FILE_FLAG_OVERLAPPED;
-    }
-    // OPEN_EXISTING in both directions: the plain handle has already
-    // created and truncated a file being written, and a second
-    // CREATE_ALWAYS here would truncate it again -- including any
-    // preallocation just set on it.
-    unique_handle cand(::CreateFileW(path, f.access, f.share, nullptr,
-                                     OPEN_EXISTING, flags, nullptr));
-    if (!cand) {
-      return false;
-    }
-    f.fast = std::move(cand);
-    f.direct = with_direct;
-    f.overlapped = with_async;
-    return true;
   }
 
   void adopt(file& f) noexcept {

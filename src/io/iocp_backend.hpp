@@ -250,10 +250,12 @@ struct win_file {
   // refusal drops one and asks again: NO_BUFFERING is a property of the
   // filesystem (SMB and some virtual volumes reject it) while OVERLAPPED is
   // not, and on Windows buffered async measures within noise of direct
-  // async (docs/performance.md), so the port is the half to keep.
+  // async (docs/performance.md), so the asynchrony is the half to keep.
   //
-  // `port` is the context's: every file it opens associates its
-  // overlapped handle with that one port, which the file does not own.
+  // `port`, when given, is the completion port's context's: every file it
+  // opens associates its overlapped handle with that one port, which the
+  // file does not own. The I/O ring passes none, since its completions
+  // come back through the ring.
   void engage(const wchar_t* path, bool want_direct, bool want_async,
               HANDLE port) noexcept {
     // OPEN_EXISTING on the reopen in both directions: the plain handle has
@@ -264,8 +266,8 @@ struct win_file {
       if (engage_one(path, true, true, port)) {
         return;
       }
-      // The port first: per the measurement above, Windows can do
-      // without the cache bypass more easily than without the asynchrony.
+      // The asynchrony first: per the measurement above, Windows can do
+      // without the cache bypass more easily than without it.
       if (engage_one(path, false, true, port)) {
         return;
       }
@@ -278,7 +280,8 @@ struct win_file {
   }
 
   // One rung: reopen with exactly these two flags, attach the port when
-  // async was asked for, and take the handle only if both steps worked.
+  // async was asked for and there is one, and take the handle only if
+  // both steps worked.
   // Leaves everything untouched on failure, so the caller may ask again
   // for less.
   [[nodiscard]] bool engage_one(const wchar_t* path, bool with_direct,
@@ -299,7 +302,7 @@ struct win_file {
     // FILE_FLAG_OVERLAPPED handle cannot serve the synchronous path, so the
     // candidate closes on the way out and the caller asks for a rung
     // without it.
-    if (with_async &&
+    if (with_async && port != nullptr &&
         ::CreateIoCompletionPort(cand.get(), port, 0, 0) == nullptr) {
       return false;
     }
