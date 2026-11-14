@@ -128,7 +128,7 @@ struct io_op {
   // transfer_base of its own (src/io/backend_select.hpp). A byte added to
   // transfer_base is therefore charged TWICE there, and the larger of the
   // two members sets the rest: 16 for the composite's base plus 136 for
-  // iocp_context::transfer is 152, against 112 for the ring's. No Linux
+  // iocp_context::transfer is 152, against 96 for the ring's. No Linux
   // build can catch that: every context there is a single transfer.
   //
   // 192 leaves 40 bytes over that 152. The slack costs bytes per

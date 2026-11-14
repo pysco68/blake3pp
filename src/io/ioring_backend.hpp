@@ -109,10 +109,6 @@ struct ioring_api {
   decltype(&::BuildIoRingCancelRequest) build_cancel = nullptr;
   decltype(&::GetIoRingInfo) get_info = nullptr;
   decltype(&::IsIoRingOpSupported) is_op_supported = nullptr;
-  // Optional, and resolved for completeness; nothing calls it, because the writer's
-  // finish() lands its bytes through SetEndOfFile on the plain handle,
-  // exactly as the completion-port backend's does.
-  decltype(&::BuildIoRingFlushFile) build_flush = nullptr;
 
   bool ok = false;  // every entry point the read/write path needs is here
 
@@ -139,7 +135,6 @@ struct ioring_api {
     resolve(build_cancel, "BuildIoRingCancelRequest");
     resolve(get_info, "GetIoRingInfo");
     resolve(is_op_supported, "IsIoRingOpSupported");
-    resolve(build_flush, "BuildIoRingFlushFile");
     ok = query_capabilities != nullptr && create != nullptr &&
          close != nullptr && submit != nullptr && pop != nullptr &&
          set_completion_event != nullptr && build_read != nullptr &&
@@ -274,9 +269,8 @@ class ioring_context {
     std::size_t len = 0;
     std::uint64_t off = 0;
     std::size_t filled = 0;
-    HANDLE h = INVALID_HANDLE_VALUE;
-    win_file* sync_file = nullptr;  // the deferred path needs the handles
-    file* owner_file = nullptr;     // which file's drain owes this op
+    // Which file's drain owes this op, and whose handles carry it.
+    file* owner_file = nullptr;
     transfer* next_deferred = nullptr;
     bool is_write = false;
     bool on_ring = false;    // the ring owes a completion for it
@@ -287,20 +281,21 @@ class ioring_context {
    public:
     file(ioring_context& ctx, const std::filesystem::path& path,
          const file_open_options& how)
-        : write_(how.write) {
+        : ctx_(&ctx) {
+      const bool write = how.write;
       // FILE_SHARE_READ and nothing else for a read: a digest describes
       // the bytes that were there, so nothing may rewrite or shorten the
       // file while it is being read. A writable open shares write access
       // with ITSELF, because engage() reopens the same path for the
       // direct handle and two GENERIC_WRITE handles can only coexist if
       // the first one permits it.
-      const DWORD access = write_ ? GENERIC_WRITE : GENERIC_READ;
-      const DWORD creation = write_ ? CREATE_ALWAYS : OPEN_EXISTING;
+      const DWORD access = write ? GENERIC_WRITE : GENERIC_READ;
+      const DWORD creation = write ? CREATE_ALWAYS : OPEN_EXISTING;
       const DWORD share =
-          write_ ? (FILE_SHARE_READ | FILE_SHARE_WRITE) : FILE_SHARE_READ;
+          write ? (FILE_SHARE_READ | FILE_SHARE_WRITE) : FILE_SHARE_READ;
       f_.open(path.c_str(), access, share, creation,
               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN);
-      size_ = write_ ? 0 : f_.stat_size();
+      size_ = write ? 0 : f_.stat_size();
       // Preallocation belongs to the OPEN, not to the finish: a write
       // that extends the file serializes, and with an async direct queue
       // that collapses it to one stalled write at a time.
@@ -317,7 +312,7 @@ class ioring_context {
       // The sparse flag has to precede the preallocation for the range to
       // be a hole, and a valid data length can only be set on a file that
       // is not sparse.
-      if (write_ && how.preallocate_bytes > 0) {
+      if (write && how.preallocate_bytes > 0) {
         const bool valid_data =
             how.waive_zero_fill && enable_manage_volume_privilege();
         if (!valid_data) {
@@ -333,7 +328,7 @@ class ioring_context {
         }
       }
       ring_handle_ = ctx.engage(f_, path.c_str(), access, share, how.direct_io);
-      name_ = ctx.name_for(f_.direct, ring_handle_, write_);
+      name_ = ctx.name_for(f_.direct, ring_handle_, write);
       if (valid_data_) {
         name_ += "+validdata";
       } else if (sparse_) {
@@ -342,15 +337,13 @@ class ioring_context {
       ctx.adopt(*this);
     }
 
+    // Reclaimed, then off the context's list: forget() leaves a file on
+    // it, because a file that is merely idled is still open and may be
+    // read again. This one is not -- and a destroyed file still on the
+    // list is what a later drain() would walk.
     ~file() {
-      if (ctx_ != nullptr) {
-        // Reclaimed, then off the context's list: forget() leaves a file
-        // on it, because a file that is merely idled is still open and
-        // may be read again. This one is not -- and a destroyed file
-        // still on the list is what a later drain() would walk.
-        ctx_->forget(*this);
-        ctx_->unlink(*this);
-      }
+      ctx_->forget(*this);
+      ctx_->unlink(*this);
     }
     file(const file&) = delete;
     file& operator=(const file&) = delete;
@@ -422,7 +415,6 @@ class ioring_context {
 
     win_file f_;
     std::uint64_t size_ = 0;
-    bool write_ = false;
     std::string name_ = "readfile";
     bool sparse_ = false;      // made sparse for the run; cleared by set_size()
     bool valid_data_ = false;  // the valid data length was set up front
@@ -430,7 +422,7 @@ class ioring_context {
     // win_file::use_iocp stays false throughout: there is no port here,
     // and the synchronous ladder reads this instead.
     bool ring_handle_ = false;
-    ioring_context* ctx_ = nullptr;
+    ioring_context* ctx_;
     file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
   };
@@ -752,8 +744,6 @@ class ioring_context {
     op.len = len;
     op.off = off;
     op.filled = 0;
-    op.h = f.f_.h();
-    op.sync_file = &f.f_;
     op.next_deferred = nullptr;
     op.owner_file = &f;
     op.on_ring = false;
@@ -779,12 +769,11 @@ class ioring_context {
   // bytes, the same shape as a short transfer.
   [[nodiscard]] std::uint32_t ring_len(const transfer& op, std::uint64_t off,
                                        std::size_t len) const noexcept {
-    if (!use_ring_ || op.owner_file == nullptr ||
-        !op.owner_file->ring_handle_ || len == 0) {
+    if (!use_ring_ || !op.owner_file->ring_handle_ || len == 0) {
       return 0;
     }
     len = std::min(len, max_win_piece);
-    if (op.sync_file->direct) {
+    if (op.owner_file->f_.direct) {
       const std::size_t granules = len - len % direct_align;
       return off % direct_align == 0 ? static_cast<std::uint32_t>(granules) : 0;
     }
@@ -876,7 +865,6 @@ class ioring_context {
   }
 
   void adopt(file& f) noexcept {
-    f.ctx_ = this;
     f.next_ = files_;
     files_ = &f;
   }
@@ -896,9 +884,8 @@ class ioring_context {
   void complete(transfer& op, std::error_code ec) noexcept {
     device_.add_if_served(op.device_total_ns());
     in_flight_--;
-    if (op.owner_file != nullptr) {
-      op.owner_file->inflight_--;
-    }
+    assert(op.owner_file != nullptr && "every transfer is armed with its file");
+    op.owner_file->inflight_--;
     ++reported_;
     op.done(&op, ec);
   }
@@ -911,9 +898,12 @@ class ioring_context {
   }
   // The cancel request's completion needs a userData no transfer can
   // wear: reaping it as a transfer would walk to an operation that does
-  // not exist. The cancel's own address is such a value and costs nothing.
-  [[nodiscard]] std::uintptr_t cancel_ud() const noexcept {
-    return std::bit_cast<std::uintptr_t>(&cancel_op_);
+  // not exist. A transfer's userData is its aligned address, which is
+  // never 1.
+  static constexpr std::uintptr_t cancel_ud_value = 1;
+  static_assert(alignof(transfer) > cancel_ud_value);
+  [[nodiscard]] static constexpr std::uintptr_t cancel_ud() noexcept {
+    return cancel_ud_value;
   }
 
   // Drains the wake flag. True means a wake() had been issued.
@@ -947,13 +937,12 @@ class ioring_context {
     // already in the buffer must not be fetched again over themselves.
     try {
       const std::size_t rest = op.len - op.filled;
-      const bool fast_async =
-          op.owner_file != nullptr && op.owner_file->ring_handle_;
+      const bool fast_async = op.owner_file->ring_handle_;
       if (op.is_write) {
-        write_sync(*op.sync_file, fast_async, op.off + op.filled,
+        write_sync(op.owner_file->f_, fast_async, op.off + op.filled,
                    {op.src + op.filled, rest});
       } else {
-        read_sync(*op.sync_file, fast_async, op.off + op.filled,
+        read_sync(op.owner_file->f_, fast_async, op.off + op.filled,
                   {op.dst + op.filled, rest});
       }
       op.filled = op.len;
@@ -1210,10 +1199,8 @@ class ioring_context {
 #endif  // BLAKE3PP_HAS_IORING_API
 
   // Declaration order is the teardown contract: the ring is closed before
-  // the event it was given, and both after the operation whose address
-  // every cancel completion wears. Do not move ring_ above these.
+  // the event it was given. Do not move ring_ above event_.
   unique_handle event_;
-  transfer cancel_op_{};  // address only: every cancel completion's userData
 #if defined(BLAKE3PP_HAS_IORING_API)
   ioring ring_;
 #else
