@@ -102,7 +102,7 @@ class windows_context {
     // would create its event and lanes only to refuse the ring.
     if (opts.ioring && opts.async) {
       ring_.emplace(opts, max_inflight);
-      if (!ring_->using_ring()) {
+      if (!ring_->engaged()) {
         // Taken before the ring goes: whether the reason it was refused
         // is this Windows (settled) or this moment (not), which is what
         // keeps best_io_engine() from remembering a resource failure.
@@ -112,7 +112,7 @@ class windows_context {
         // serve every transfer synchronously on its lanes. The reason goes
         // onto the port's file names, where a refused ring would otherwise
         // be invisible.
-        ring_refusal_ = no_ioring_suffix(ring_->refusal());
+        ring_refusal_ = no_ioring_suffix(ring_->engine().refusal());
         ring_.reset();
       }
     }

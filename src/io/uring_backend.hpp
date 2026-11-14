@@ -563,6 +563,8 @@ class uring_engine {
   // ladder walk in src/io/io_engines.cpp. A ring that could not be had
   // leaves every transfer to posix_file's pread on the pump's lanes.
   static constexpr io_engine rung_engine = io_engine::io_uring;
+  // What failed, as the shared context's messages name it.
+  static constexpr std::string_view mechanism = "io_uring_enter";
   using rung_below = posix_sync_rung;
 
   // A refusal is settled only when the kernel is the reason. ENOSYS says
@@ -712,7 +714,7 @@ class uring_engine {
 
   template <class Part>
   void cancel_file(Part&, std::size_t) noexcept {}
-  template <class Pred>
+  template <class Op, class Pred>
   [[nodiscard]] std::size_t drop_unsubmitted(Pred&&) noexcept {
     return 0;
   }

@@ -1446,7 +1446,7 @@ TEST_CASE("aio: transfers the kernel would not take are served by poll()") {
   CHECK(ctx.in_flight() == 2);
 
   // What a refused lio_listio leaves behind, without one.
-  ctx.defer_pending();
+  ctx.defer_unsubmitted();
   CHECK(pa.calls == 0);
   CHECK(pb.calls == 0);
   CHECK(ctx.in_flight() == 2);
@@ -1581,8 +1581,9 @@ TEST_CASE("aio: an unaligned length rides the queue, buffered or direct") {
     CAPTURE(direct);
     const temp_file f(content);
     io_impl::aio_context ctx({}, 4);
-    if (!ctx.using_aio()) {
-      MESSAGE("no kernel AIO here (" << ctx.refusal() << "); nothing to check");
+    if (!ctx.engaged()) {
+      MESSAGE("no kernel AIO here (" << ctx.engine().refusal()
+                                     << "); nothing to check");
       return;
     }
     {
@@ -1965,7 +1966,7 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
   // degrades to buffered with the suffix. Both spellings are the
   // ladder's; which one applies here is not the platform's to say.
   const io_impl::aio_context aio_probe(io_impl::reader_context_options{}, 4);
-  if (aio_probe.using_aio()) {
+  if (aio_probe.engaged()) {
     std::string direct_rung;
     {
       io_impl::aio_context c(io_impl::reader_context_options{}, 2);
@@ -1981,7 +1982,7 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
             {true, false, true, "pread+direct"},
             {false, false, true, "pread"}};
   } else {
-    const std::string why(aio_probe.refusal());
+    const std::string why(aio_probe.engine().refusal());
     MESSAGE("no kernel AIO here" << why << ": testing the fallback ladder");
     // async requested and refused carries the reason; not requested at
     // all says nothing, which is the distinction the suffix exists for.
@@ -2005,7 +2006,7 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
   // some virtual images have no ring -- so it is probed once and the
   // ladder that actually applies here is the one expected.
   const io_impl::ioring_context probe(io_impl::reader_context_options{}, 4);
-  if (probe.using_ring()) {
+  if (probe.engaged()) {
     rows = {{true, true, true, "ioring+direct", true},
             {false, true, true, "ioring", true},
             {true, true, true, "iocp+direct", false},
@@ -2016,7 +2017,8 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
     // The port carries the reason the ring was refused, so a run on
     // such a machine reads as what it is rather than as one that never
     // asked.
-    const std::string why = io_impl::no_ioring_suffix(probe.refusal());
+    const std::string why =
+        io_impl::no_ioring_suffix(probe.engine().refusal());
     MESSAGE("no I/O ring here (" << why << "): testing the port's ladder");
     rows = {{true, true, true, "iocp+direct" + why, true},
             {false, true, true, "iocp" + why, true},

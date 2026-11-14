@@ -22,6 +22,7 @@
 //                           //   file_part(Engine&, path, how)
 //                           // with size(), name(), set_size()
 //   static constexpr io_engine rung_engine; using rung_below;
+//   static constexpr std::string_view mechanism;  // named in failures
 //   Engine(const reader_context_options&, unsigned max_inflight);
 //   bool engaged() const;             // the kernel queue was had
 //   rung_verdict engaged_rung() const;
@@ -38,7 +39,7 @@
 //   engine_event<Op> next<Op>(bool block) noexcept;
 //   bool take_wake() noexcept;  void wake() noexcept;
 //   void cancel_file(file_part&, std::size_t owed) noexcept;
-//   std::size_t drop_unsubmitted(Pred mine) noexcept;
+//   std::size_t drop_unsubmitted<Op>(Pred mine) noexcept;
 //   std::size_t owed() const noexcept;  // requests the kernel holds
 //   void begin_drain() noexcept;  void end_drain() noexcept;
 //   void release(Op&) noexcept;       // what the engine lent the op
@@ -54,6 +55,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -376,7 +378,7 @@ class completion_context {
         continue;
       }
       if (e.what == event::kind::failed) {
-        throw std::system_error(e.ec, "the I/O engine's completion queue");
+        throw std::system_error(e.ec, std::string(Engine::mechanism));
       }
       e.op->on_engine = false;
       switch (settle(*e.op, e.ec, e.moved)) {
@@ -435,7 +437,7 @@ class completion_context {
     const auto mine = [&f](const transfer& op) noexcept {
       return op.owner_file == &f;
     };
-    std::size_t dropped = engine_.drop_unsubmitted(mine);
+    std::size_t dropped = engine_.template drop_unsubmitted<transfer>(mine);
     dropped += pump_.remove_queued_if(mine);
     pump_.quiesce();
     dropped += pump_.remove_done_if(mine);
@@ -449,9 +451,10 @@ class completion_context {
   [[noreturn]] static void lost(const char* whose, std::size_t owed,
                                 std::error_code ec) noexcept {
     std::fprintf(stderr,
-                 "blake3pp: the I/O engine failed while %zu transfer(s)%s "
-                 "were still owed (%s); their buffers cannot be released\n",
-                 owed, whose, ec.message().c_str());
+                 "blake3pp: %.*s failed while %zu transfer(s)%s were still "
+                 "owed (%s); their buffers cannot be released\n",
+                 static_cast<int>(Engine::mechanism.size()),
+                 Engine::mechanism.data(), owed, whose, ec.message().c_str());
     std::abort();
   }
 

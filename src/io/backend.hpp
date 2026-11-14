@@ -478,19 +478,20 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   { cc.device() } noexcept -> std::same_as<device_time>;
 };
 
-// An intrusive FIFO of operations linked through their next_deferred:
-// the queue inside deferred_pump, and the aio backend's list of requests
-// not yet offered to the kernel. Not synchronized; deferred_pump guards
-// its own under a mutex.
-template <class Op>
+// An intrusive FIFO of operations linked through one of their own
+// pointers, next_deferred unless another is named: the queue inside
+// deferred_pump, and the aio engine's list of requests not yet offered to
+// the kernel. Not synchronized; deferred_pump guards its own under a
+// mutex.
+template <class Op, Op* Op::*Link = &Op::next_deferred>
 class deferred_ops {
  public:
   void push(Op& op) noexcept {
-    op.next_deferred = nullptr;
+    op.*Link = nullptr;
     if (tail_ == nullptr) {
       head_ = tail_ = &op;
     } else {
-      tail_->next_deferred = &op;
+      tail_->*Link = &op;
       tail_ = &op;
     }
   }
@@ -502,7 +503,7 @@ class deferred_ops {
     if (op == nullptr) {
       return nullptr;
     }
-    head_ = op->next_deferred;
+    head_ = op->*Link;
     if (head_ == nullptr) {
       tail_ = nullptr;
     }
@@ -511,8 +512,7 @@ class deferred_ops {
 
   [[nodiscard]] bool empty() const noexcept { return head_ == nullptr; }
 
-  // The oldest queued op, left queued; the rest follow its
-  // next_deferred. For a backend that OFFERS a batch to the OS and only
+  // The oldest queued op, left queued; the rest follow its link. For a backend that OFFERS a batch to the OS and only
   // takes off the queue what the OS accepted: reading the queue and
   // emptying it have to be separable for that, since a refusal must
   // leave the order as it was.
@@ -530,9 +530,9 @@ class deferred_ops {
     std::size_t dropped = 0;
     Op* prev = nullptr;
     for (Op* op = head_; op != nullptr;) {
-      Op* const next = op->next_deferred;
+      Op* const next = op->*Link;
       if (drop(*op)) {
-        (prev == nullptr ? head_ : prev->next_deferred) = next;
+        (prev == nullptr ? head_ : prev->*Link) = next;
         if (tail_ == op) {
           tail_ = prev;
         }

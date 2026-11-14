@@ -538,6 +538,8 @@ class iocp_engine {
   iocp_engine& operator=(const iocp_engine&) = delete;
 
   static constexpr io_engine rung_engine = io_engine::iocp;
+  // What failed, as the shared context's messages name it.
+  static constexpr std::string_view mechanism = "the completion port";
   using rung_below = win_sync_rung;
 
   // A constructed engine has a port, because the constructor throws
@@ -653,7 +655,7 @@ class iocp_engine {
       ::CancelIoEx(p.f.h(), nullptr);
     }
   }
-  template <class Pred>
+  template <class Op, class Pred>
   [[nodiscard]] std::size_t drop_unsubmitted(Pred&&) noexcept {
     return 0;
   }
