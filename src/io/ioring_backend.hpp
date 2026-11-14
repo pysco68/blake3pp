@@ -778,6 +778,7 @@ class ioring_context {
         !op.owner_file->ring_handle_ || len == 0) {
       return 0;
     }
+    len = std::min(len, max_win_piece);
     if (op.sync_file->direct) {
       const std::size_t granules = len - len % direct_align;
       return off % direct_align == 0 ? static_cast<std::uint32_t>(granules) : 0;
@@ -993,8 +994,9 @@ class ioring_context {
       ov.Offset = static_cast<DWORD>(o);
       ov.OffsetHigh = static_cast<DWORD>(o >> 32);
       DWORD n = 0;
-      if (::ReadFile(use_h, buf.data() + got,
-                     static_cast<DWORD>(buf.size() - got), &n, &ov) == 0) {
+      const auto ask =
+          static_cast<DWORD>(std::min(buf.size() - got, max_win_piece));
+      if (::ReadFile(use_h, buf.data() + got, ask, &n, &ov) == 0) {
         throw std::system_error(read_error(::GetLastError()), "ReadFile");
       }
       if (n == 0) {
@@ -1024,8 +1026,9 @@ class ioring_context {
       ov.Offset = static_cast<DWORD>(o);
       ov.OffsetHigh = static_cast<DWORD>(o >> 32);
       DWORD n = 0;
-      if (::WriteFile(use_h, buf.data() + put,
-                      static_cast<DWORD>(buf.size() - put), &n, &ov) == 0) {
+      const auto ask =
+          static_cast<DWORD>(std::min(buf.size() - put, max_win_piece));
+      if (::WriteFile(use_h, buf.data() + put, ask, &n, &ov) == 0) {
         throw_winerr("WriteFile");
       }
       if (n == 0) {

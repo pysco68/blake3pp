@@ -84,6 +84,13 @@ inline std::atomic<unsigned> refuse_port_reads{0};
   }
 }
 
+// The most one ReadFile, WriteFile or I/O ring entry carries. Their
+// lengths are 32-bit, and this is the largest whole number of granules
+// below 4 GiB, so a longer piece is cut here and completes short, and its
+// rest is issued as any short transfer's is.
+inline constexpr std::size_t max_win_piece = 0xFFFF'F000;
+static_assert(max_win_piece % direct_align == 0);
+
 // Owns one Win32 HANDLE and closes it exactly once. Win32 spells "no
 // handle" two ways (CreateFileW yields INVALID_HANDLE_VALUE, the IOCP
 // calls yield nullptr), so both count as empty here and neither is ever
@@ -493,6 +500,7 @@ class iocp_context {
     if (!f.use_iocp || len == 0) {
       return 0;
     }
+    len = std::min(len, max_win_piece);
     if (f.direct) {
       const std::size_t granules = len - len % direct_align;
       return off % direct_align == 0 ? static_cast<DWORD>(granules) : 0;
@@ -938,8 +946,9 @@ class iocp_context {
       ov.Offset = static_cast<DWORD>(o);
       ov.OffsetHigh = static_cast<DWORD>(o >> 32);
       DWORD n = 0;
-      if (::ReadFile(use_h, buf.data() + got,
-                     static_cast<DWORD>(buf.size() - got), &n, &ov) == 0) {
+      const auto ask =
+          static_cast<DWORD>(std::min(buf.size() - got, max_win_piece));
+      if (::ReadFile(use_h, buf.data() + got, ask, &n, &ov) == 0) {
         throw std::system_error(read_error(::GetLastError()), "ReadFile");
       }
       if (n == 0) {
@@ -972,8 +981,9 @@ class iocp_context {
       ov.Offset = static_cast<DWORD>(o);
       ov.OffsetHigh = static_cast<DWORD>(o >> 32);
       DWORD n = 0;
-      if (::WriteFile(use_h, buf.data() + put,
-                      static_cast<DWORD>(buf.size() - put), &n, &ov) == 0) {
+      const auto ask =
+          static_cast<DWORD>(std::min(buf.size() - put, max_win_piece));
+      if (::WriteFile(use_h, buf.data() + put, ask, &n, &ov) == 0) {
         throw_winerr("WriteFile");
       }
       if (n == 0) {
