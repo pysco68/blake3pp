@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "io/backend.hpp"
+#include "io/completion_context.hpp"
 
 namespace blake3pp::detail::io_impl {
 
@@ -423,255 +424,123 @@ inline void win_sync_write(const win_file& f, std::uint64_t off,
   }
 }
 
-// The IOCP reader context: one completion port, any number of files,
-// reads named by the caller's transfer, completions delivered as callbacks
-// out of poll(). The port is the context's; each file associates its
-// overlapped handle with it at construction.
-//
-// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is NOT set. With it, a
-// read that completes synchronously returns without posting, and its
-// callback would have to run inside submit_read() -- exactly what the
-// contract forbids. Leaving it unset costs a post per fast completion and
-// buys one path: every read, fast or slow, reports from poll().
-class iocp_context {
- public:
-  class file;
+// The part of a transfer both Windows engines carry: what moves, where,
+// and how much already has. The completion port's adds the OVERLAPPED
+// its requests ride on.
+struct win_transfer : performed_transfer {
+  std::byte* dst = nullptr;        // reads fill this
+  const std::byte* src = nullptr;  // writes read from this
+  std::size_t len = 0;
+  std::uint64_t off = 0;
+  std::size_t filled = 0;
+  bool is_write = false;
+  bool cancelled = false;  // a cancel was asked for; one is enough
 
-  struct transfer : performed_transfer {
+  [[nodiscard]] std::size_t length() const noexcept { return len; }
+
+  template <class Part>
+  void arm_read(Part&, std::uint64_t at, std::span<std::byte> to) noexcept {
+    arm(at, to.size());
+    dst = to.data();
+    src = nullptr;
+    is_write = false;
+  }
+  template <class Part>
+  void arm_write(Part&, std::uint64_t at,
+                 std::span<const std::byte> from) noexcept {
+    arm(at, from.size());
+    dst = nullptr;
+    src = from.data();
+    is_write = true;
+  }
+
+ private:
+  void arm(std::uint64_t at, std::size_t n) noexcept {
+    len = n;
+    off = at;
+    filled = 0;
+    cancelled = false;
+    reset_performance();
+  }
+};
+
+// The rest of a Windows transfer, on a lane, from where it stopped: a
+// short transfer whose remainder the engine would not take arrives here
+// part-done, and the bytes already in the buffer must not be fetched
+// again over themselves. Touches the operation and its file and nothing
+// else.
+template <class Op>
+[[nodiscard]] std::error_code win_perform_rest(Op& op) noexcept {
+  try {
+    const std::size_t rest = op.len - op.filled;
+    const win_file& f = op.owner_file->part().f;
+    if (op.is_write) {
+      win_sync_write(f, op.off + op.filled, {op.src + op.filled, rest});
+    } else {
+      win_sync_read(f, op.off + op.filled, {op.dst + op.filled, rest});
+    }
+    op.filled = op.len;
+  } catch (const std::system_error& e) {
+    return e.code();
+  } catch (...) {
+    // win_sync_read and win_sync_write throw only system_error; anything
+    // else is reported as EIO so it cannot terminate a noexcept lane.
+    return std::make_error_code(std::errc::io_error);
+  }
+  return {};
+}
+
+// The completion-port engine under completion_context: one port, any
+// number of files, each associating its overlapped handle with it at
+// open. The port is also the wake primitive, so a context whose
+// transfers all go to the pump still has exactly one thing a blocked
+// poll sleeps on.
+//
+// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS is NOT set. With it, a read that
+// completes synchronously returns without posting, and its callback
+// would have to run inside submit_read() -- exactly what the contract
+// forbids. Leaving it unset costs a post per fast completion and buys one
+// path: every read, fast or slow, reports from poll().
+class iocp_engine {
+ public:
+  struct transfer_part : win_transfer {
     OVERLAPPED ov{};
-    std::byte* dst = nullptr;         // reads fill this
-    const std::byte* src = nullptr;   // writes read from this
-    std::size_t len = 0;
-    std::uint64_t off = 0;
-    std::size_t filled = 0;
-    bool is_write = false;
-    // Which file's drain owes this op, and whose handles carry it.
-    file* owner_file = nullptr;
-    transfer* next_deferred = nullptr;
-    bool on_port = false;   // the port owes a completion, so cancel is CancelIoEx
-    bool cancelled = false;  // a cancel was asked for; one is enough
   };
 
-  class file {
+  class file_part {
    public:
-    file(iocp_context& ctx, const std::filesystem::path& path,
-         const file_open_options& how)
-        : ctx_(&ctx) {
-      f_.open_file(path, how);
-      f_.engage(path.c_str(), how.direct_io, ctx.async_requested_,
-                ctx.port_.get());
-      name_ = ctx.name_for(f_.direct, f_.overlapped, how.write);
-      name_ += f_.suffix();
-      ctx.adopt(*this);
+    file_part(const iocp_engine& e, const std::filesystem::path& path,
+              const file_open_options& how) {
+      f.open_file(path, how);
+      f.engage(path.c_str(), how.direct_io, e.async_requested_, e.port_.get());
+      name_ = e.name_for(f.direct, f.overlapped, how.write);
+      name_ += f.suffix();
     }
-
-    // Reclaimed, then off the context's list: forget() leaves a file on it,
-    // because a file that is merely idled is still open and may be read
-    // again. This one is not -- and a destroyed file still on the list is
-    // what a later drain() would walk.
-    ~file() {
-      ctx_->forget(*this);
-      ctx_->unlink(*this);
-    }
-    file(const file&) = delete;
-    file& operator=(const file&) = delete;
-
-    [[nodiscard]] std::uint64_t size() const noexcept { return f_.size; }
+    [[nodiscard]] std::uint64_t size() const noexcept { return f.size; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
-    void set_size(std::uint64_t bytes) { f_.set_size(bytes); }
+    void set_size(std::uint64_t bytes) { f.set_size(bytes); }
+
+    win_file f;
 
    private:
-    friend class iocp_context;
-
-    win_file f_;
     std::string name_ = "readfile";
-    iocp_context* ctx_;
-    file* next_ = nullptr;      // the context's list of open files
-    std::size_t inflight_ = 0;  // this file's share of the context's
   };
 
-  // The port exists whether or not files engage the async path: it is
-  // also the wake primitive, so a context whose reads all go through the
-  // deferred list still has exactly one thing a blocked poll sleeps on.
-  iocp_context(const reader_context_options& opts, unsigned max_inflight)
+  iocp_engine(const reader_context_options& opts, unsigned max_inflight)
       : async_requested_(opts.async),
         port_(::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1)),
-        queue_depth_(std::max(1u, max_inflight)),
-        // Declared last, and initialized last: see the member list.
-        pump_(io_lanes::waker<iocp_context>(), this,
-              &perform_deferred, io_lanes_for(max_inflight)) {
+        queue_depth_(std::max(1u, max_inflight)) {
     if (!port_) {
       throw_winerr("CreateIoCompletionPort");
     }
   }
-  iocp_context(const iocp_context&) = delete;
-  iocp_context& operator=(const iocp_context&) = delete;
+  iocp_engine(const iocp_engine&) = delete;
+  iocp_engine& operator=(const iocp_engine&) = delete;
 
-  // Every file is destroyed first, and each one's destructor forgot its
-  // own transfers, so the drain finds nothing owed. What can remain is a
-  // wake nobody consumed, which the port drops with itself.
-  ~iocp_context() { drain(); }
-
-  void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) noexcept {
-    arm(op, f, off, buf.size());
-    op.dst = buf.data();
-    op.src = nullptr;
-    op.is_write = false;
-    place(op, f);
-  }
-
-  // The write half of the same contract, and the same ladder: a length
-  // NO_BUFFERING cannot take, or a file whose reopen never engaged, goes
-  // to the pump and a lane writes it through the plain handle. Nothing
-  // above the context sees the difference.
-  //
-  // A zero-length write takes the deferred path too: WriteFile of zero
-  // bytes posts a completion carrying zero bytes, which is the same
-  // shape as a short transfer and cannot be told apart from one.
-  void submit_write(file& f, std::uint64_t off, std::span<const std::byte> buf,
-                    transfer& op) noexcept {
-    arm(op, f, off, buf.size());
-    op.dst = nullptr;
-    op.src = buf.data();
-    op.is_write = true;
-    place(op, f);
-  }
-
- private:
-  // What a transfer needs that does not depend on its direction.
-  void arm(transfer& op, file& f, std::uint64_t off, std::size_t len) noexcept {
-    op.len = len;
-    op.off = off;
-    op.filled = 0;
-    op.next_deferred = nullptr;
-    op.owner_file = &f;
-    op.on_port = false;
-    op.cancelled = false;
-    op.reset_performance();
-  }
-
-  // How much of a piece of a transfer the port takes; zero means none of
-  // it. Asked for both directions and for every piece: the initial one,
-  // and what is left after a short completion, which resumes at
-  // off + filled -- a granule boundary only if the device stopped on one.
-  //
-  // A buffered overlapped handle takes any shape, so a buffered file's
-  // pieces ride whole. NO_BUFFERING rejects an unaligned length and an
-  // unaligned offset, so a direct file's piece is cut to the whole
-  // granules it holds at a granule offset. The rest (the sub-granule end
-  // of a file, or a resumption off a boundary) goes to a lane, on the
-  // plain handle, which is not overlapped and cannot be given to the
-  // port. The io_uring backend's piece_for() asks the same question with a
-  // plain descriptor that can ride.
-  //
-  // A zero-length transfer goes to a lane too, because it would post a
-  // completion carrying zero bytes, the same shape as a short transfer. A
-  // ReadFile or WriteFile refused outright owes no completion, so it also
-  // goes to a lane, and a second failure there reaches the caller like any
-  // other transfer error.
-  [[nodiscard]] DWORD port_len(const transfer& op, std::uint64_t off,
-                               std::size_t len) const noexcept {
-    const win_file& f = op.owner_file->f_;
-    if (!f.overlapped || len == 0) {
-      return 0;
-    }
-    len = std::min(len, max_win_piece);
-    if (f.direct) {
-      const std::size_t granules = len - len % direct_align;
-      return off % direct_align == 0 ? static_cast<DWORD>(granules) : 0;
-    }
-    return static_cast<DWORD>(len);
-  }
-
-  void place(transfer& op, file& f) noexcept {
-    in_flight_++;
-    f.inflight_++;
-    route(op);
-  }
-
- public:
-
-  // CancelIoEx names one request by its OVERLAPPED, so a sibling read on
-  // the same handle is untouched. It fails with ERROR_NOT_FOUND for a
-  // request that has already finished, which is not an error here: that
-  // completion is already on the port and arrives normally. A transfer
-  // the pump has is cancelled through the pump, under its lock, because
-  // the flag is what a lane reads when it takes one; one a lane already
-  // has runs to completion.
-  void cancel(transfer& op) noexcept {
-    if (!op.on_port) {
-      pump_.cancel(op);
-      return;
-    }
-    if (std::exchange(op.cancelled, true)) {
-      return;
-    }
-    ::CancelIoEx(op.owner_file->f_.h(), &op.ov);
-  }
-
-  // ReadFile queues the request itself, so there is nothing batched to
-  // push. The contract keeps the call because io_uring has one.
-  void flush() noexcept {}
-
-  // The port first, then the pump's finished list: a completion the port
-  // hands back can move its remainder to the pump.
-  std::size_t poll(bool block) {
-    const std::size_t before = reported_;
-    reap_ready(false);
-    serve_deferred();
-    if (reported_ != before || !block) {
-      return reported_ - before;
-    }
-    for (;;) {
-      if (std::exchange(woken_, false)) {
-        serve_deferred();
-        return reported_ - before;
-      }
-      reap_ready(true);
-      serve_deferred();
-      if (reported_ != before || std::exchange(woken_, false)) {
-        return reported_ - before;
-      }
-    }
-  }
-
-  // Posts a sentinel the port hands back with a null OVERLAPPED, which is
-  // how a blocked GetQueuedCompletionStatus is ended from another thread
-  // or from a lane reporting a finished transfer.
-  void wake() noexcept {
-    ::PostQueuedCompletionStatus(port_.get(), 0, wake_key, nullptr);
-  }
-
-  [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
-
-  // The port's depth where any transfer of this run rode it, and one
-  // otherwise. A file whose reopen never engaged sends everything to the
-  // pump, whose lanes read through one non-overlapped handle. More lanes
-  // measured no faster there. On a cached 4 GiB file, --qd 1 and --qd 4
-  // take the same wall clock, with the shared handle and with a handle per
-  // lane.
-  [[nodiscard]] unsigned device_depth() const noexcept {
-    return used_port_ ? queue_depth_ : 1u;
-  }
-  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
-    return pump_.lane_wait_ns();
-  }
-  [[nodiscard]] device_time device() const noexcept { return device_; }
-  // Transfers, or remainders of transfers, performed by the lanes (or by
-  // poll() where no lane runs) and reported since construction: zero for a
-  // buffered file on a port, one per direct file whose size is not a
-  // multiple of the granule.
-  [[nodiscard]] std::size_t served_synchronously() const noexcept {
-    return served_synchronously_;
-  }
-
-  // This context's rung and the one it degrades to, declared for the
-  // ladder walk in src/io/io_engines.cpp.
   static constexpr io_engine rung_engine = io_engine::iocp;
   using rung_below = win_sync_rung;
 
-  // A constructed iocp_context has a port, because the constructor throws
+  // A constructed engine has a port, because the constructor throws
   // otherwise. This answers the synchronous rung only for a caller who
   // asked for no async, which says nothing about the machine, so that
   // verdict is unsettled.
@@ -679,112 +548,127 @@ class iocp_context {
     return async_requested_ ? rung_verdict{rung_engine, true}
                             : rung_verdict{rung_below::rung_engine, false};
   }
+  [[nodiscard]] bool engaged() const noexcept { return true; }
 
-  // Cancels what every open file still has on the port, reaps all of it
-  // without reporting any, and clears the pump, waiting its lanes out.
-  // CancelIoEx bounds the wait: every cancelled request completes,
-  // successfully or with ERROR_OPERATION_ABORTED.
-  //
-  // A null OVERLAPPED that is not the wake sentinel means the port itself
-  // has failed. No completion can arrive, and the requests the kernel
-  // holds can never be given back. The caller frees the buffers they name
-  // as soon as this returns, so the process ends with the reason instead,
-  // as the io_uring drain does in the same position.
-  void drain() noexcept {
-    for (file* f = files_; f != nullptr; f = f->next_) {
-      if (f->f_.overlapped && f->inflight_ > 0) {
-        ::CancelIoEx(f->f_.h(), nullptr);
-      }
-    }
-    while (port_owed_ > 0) {
-      const port_event e = next(INFINITE);
-      if (e.what == port_event::kind::wake) {
-        woken_ = true;
-        continue;
-      }
-      if (e.what != port_event::kind::completion) {
-        std::fprintf(stderr,
-                     "blake3pp: the completion port failed while %zu "
-                     "transfer(s) were still owed (error %lu); their buffers "
-                     "cannot be released\n",
-                     port_owed_, static_cast<unsigned long>(e.err));
-        std::abort();
-      }
-      // Reaped, not reported.
-    }
-    for (file* f = files_; f != nullptr; f = f->next_) {
-      f->inflight_ = 0;
-    }
-    pump_.clear();
-    in_flight_ = 0;
+  // The port's depth where any transfer of this run rode it, and one
+  // otherwise. A file whose reopen never engaged sends everything to the
+  // pump, whose lanes read through one non-overlapped handle. More lanes
+  // measured no faster there.
+  [[nodiscard]] unsigned device_depth(bool used, unsigned) const noexcept {
+    return used ? queue_depth_ : 1u;
   }
 
-  // Gives up every transfer this file owns, running no callback: what the
-  // pump has is dropped or waited out, and what the port has is cancelled
-  // and waited out, since a pending request would write into the caller's
-  // buffer after it is freed. The file's destructor calls this. Legal only
-  // while the operations are alive.
-  //
-  // The port is shared, so a completion belonging to another file can
-  // surface while this one is waited out. It is reported, since dropping
-  // it would strand an operation that can never complete, so destroying
-  // one file while a sibling has transfers in flight can run that
-  // sibling's callback from a destructor. The engines run one file per
-  // context; a multi-file caller reclaims a file through
-  // io_driver::drain(file&) before closing it.
-  void forget(file& f) noexcept {
-    // The file stays on files_: it is still open and may be read again (see
-    // the uring backend's forget).
-    //
-    // What never reached the port goes first: it names this file's handles
-    // and its share of the count, and the port will never hand it back. A
-    // lane inside a transfer on these handles cannot be recalled, so it is
-    // waited out, and what it finished is dropped unreported.
-    const auto mine = [&f](const transfer& op) noexcept {
-      return op.owner_file == &f;
-    };
-    std::size_t dropped = pump_.remove_queued_if(mine);
-    pump_.quiesce();
-    dropped += pump_.remove_done_if(mine);
-    in_flight_ -= std::min(dropped, in_flight_);
-    f.inflight_ -= std::min(dropped, f.inflight_);
-    if (!f.f_.overlapped || f.inflight_ == 0) {
-      return;
-    }
-    ::CancelIoEx(f.f_.h(), nullptr);
-    while (f.inflight_ > 0) {
-      const port_event e = next(INFINITE);
-      if (e.what == port_event::kind::wake) {
-        woken_ = true;  // remember it; a later poll() still owes it
-        continue;
-      }
-      if (e.what != port_event::kind::completion) {
-        // The port is unusable, so this file's transfers can never come
-        // back. Its handles close next and the buffers they are writing into
-        // are released. Nothing here can make the kernel let go, and
-        // returning would leave the context counting a file that no longer
-        // exists, so the process ends with the reason, as the context-wide
-        // drain does.
-        std::fprintf(stderr,
-                     "blake3pp: the completion port failed while %zu "
-                     "transfer(s) of a closing file were still owed (error "
-                     "%lu); their buffers cannot be released\n",
-                     f.inflight_, static_cast<unsigned long>(e.err));
-        std::abort();
-      }
-      transfer& op = *e.op;
-      if (op.owner_file == &f) {
-        op.device_end();
-        in_flight_--;
-        f.inflight_--;  // reaped, not reported
-        continue;
-      }
-      (void)settle(op, e.bytes, e.err);
-    }
+  template <class Op>
+  static std::error_code perform(Op& op) noexcept {
+    return win_perform_rest(op);
   }
 
- private:
-  static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
+  // The rest of a transfer, from op.filled, on the port: all of it for a
+  // buffered overlapped handle, the whole granules of it at a granule
+  // offset for a direct one. The rest (the sub-granule end of a file, or
+  // a resumption off a boundary) goes to a lane, on the plain handle,
+  // which is not overlapped. A zero-length transfer goes to a lane too,
+  // because it would post a completion carrying zero bytes, the same
+  // shape as a short transfer. A ReadFile or WriteFile refused outright
+  // owes no completion, so it also goes to a lane.
+  template <class Op>
+  [[nodiscard]] bool place(Op& op) noexcept {
+    const win_file& f = op.owner_file->part().f;
+    std::size_t len = op.len - op.filled;
+    if (!f.overlapped || len == 0) {
+      return false;
+    }
+    len = std::min(len, max_win_piece);
+    const std::uint64_t at = op.off + op.filled;
+    if (f.direct) {
+      len -= len % direct_align;
+      if (len == 0 || at % direct_align != 0) {
+        return false;
+      }
+    }
+    return issue(op, f.h(), at, static_cast<DWORD>(len));
+  }
+
+  // CancelIoEx names one request by its OVERLAPPED, so a sibling read on
+  // the same handle is untouched. It fails with ERROR_NOT_FOUND for a
+  // request that has already finished, which is not an error here: that
+  // completion is already on the port and arrives normally.
+  template <class Op>
+  void cancel(Op& op) noexcept {
+    ::CancelIoEx(op.owner_file->part().f.h(), &op.ov);
+  }
+
+  // ReadFile queues the request itself, so there is nothing batched to
+  // push and nothing to take back.
+  template <class Op, class Refused>
+  void flush(Refused&&) noexcept {}
+  template <class Op, class Refused>
+  void take_back(Refused&&) noexcept {}
+  void check() const noexcept {}
+
+  // One step of the port. The error is read before anything else runs,
+  // since any call -- a clock read included -- may overwrite it, and the
+  // key is read only for a dequeue that succeeded with no OVERLAPPED,
+  // which is the wake.
+  template <class Op>
+  [[nodiscard]] engine_event<Op> next(bool block) noexcept {
+    using event = engine_event<Op>;
+    DWORD bytes = 0;
+    ULONG_PTR key = 0;
+    OVERLAPPED* pov = nullptr;
+    const BOOL ok = ::GetQueuedCompletionStatus(port_.get(), &bytes, &key,
+                                                &pov, block ? INFINITE : 0);
+    const DWORD err = ok != 0 ? ERROR_SUCCESS : ::GetLastError();
+    if (pov != nullptr) {
+      --port_owed_;
+      Op* const op = static_cast<Op*>(CONTAINING_RECORD(pov, transfer_part, ov));
+      return {event::kind::completion, op,
+              err != ERROR_SUCCESS ? read_error(err) : std::error_code{},
+              bytes};
+    }
+    if (ok == 0 && err == WAIT_TIMEOUT) {
+      return {};
+    }
+    if (ok != 0 && key == wake_key) {
+      return {event::kind::wake};
+    }
+    return {event::kind::failed, nullptr,
+            std::error_code(static_cast<int>(err), std::system_category())};
+  }
+
+  // The wake is a completion of its own on the port, so next() reports
+  // it and there is nothing to take here.
+  [[nodiscard]] bool take_wake() noexcept { return false; }
+  // Posts a sentinel the port hands back with a null OVERLAPPED, which is
+  // how a blocked GetQueuedCompletionStatus is ended from another thread
+  // or from a lane reporting a finished transfer.
+  void wake() noexcept {
+    ::PostQueuedCompletionStatus(port_.get(), 0, wake_key, nullptr);
+  }
+
+  // CancelIoEx bounds a closing file's wait: every cancelled request
+  // completes, successfully or with ERROR_OPERATION_ABORTED.
+  void cancel_file(file_part& p, std::size_t owed) noexcept {
+    if (p.f.overlapped && owed > 0) {
+      ::CancelIoEx(p.f.h(), nullptr);
+    }
+  }
+  template <class Pred>
+  [[nodiscard]] std::size_t drop_unsubmitted(Pred&&) noexcept {
+    return 0;
+  }
+  [[nodiscard]] std::size_t owed() const noexcept { return port_owed_; }
+
+  template <class EachFile>
+  void begin_drain(EachFile&& each) noexcept {
+    each([this](file_part& p, std::size_t owed) noexcept {
+      cancel_file(p, owed);
+    });
+  }
+  void end_drain() noexcept {}
+
+  template <class Op>
+  void release(Op&) noexcept {}
 
   // The degradation strings are observable API: tools print them and a
   // run is read differently depending on which rung it names, so the
@@ -798,43 +682,19 @@ class iocp_context {
     return direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
   }
 
-  void adopt(file& f) noexcept {
-    f.next_ = files_;
-    files_ = &f;
-  }
+ private:
+  static constexpr ULONG_PTR wake_key = ~ULONG_PTR{0};
 
-  void unlink(file& f) noexcept {
-    for (file** link = &files_; *link != nullptr; link = &(*link)->next_) {
-      if (*link == &f) {
-        *link = f.next_;
-        return;
-      }
-    }
-  }
-
-
-  // What the transfer still owes, from op.filled: on the port where it
-  // will take it, otherwise to a lane. A first piece and the rest of a
-  // short one take the same road, as on the ring.
-  void route(transfer& op) noexcept {
-    const DWORD len = port_len(op, op.off + op.filled, op.len - op.filled);
-    op.on_port = len != 0 && issue(op, len);
-    used_port_ = used_port_ || op.on_port;
-    if (!op.on_port) {
-      pump_.push(op);
-    }
-  }
-
-  // Hands the port `len` bytes of what the transfer still owes, from
-  // op.filled: all of it, or the granules of it that port_len() allowed.
-  // False when ReadFile or WriteFile refused it outright, which owes no
-  // completion; the charge ends there, so a lane's own charge does not
-  // take in the wait for the lane.
-  [[nodiscard]] bool issue(transfer& op, DWORD len) noexcept {
+  // Hands the port `len` bytes from `at`. False when ReadFile or
+  // WriteFile refused it outright, which owes no completion; the charge
+  // ends there, so a lane's own charge does not take in the wait for the
+  // lane.
+  template <class Op>
+  [[nodiscard]] bool issue(Op& op, HANDLE h, std::uint64_t at,
+                           DWORD len) noexcept {
     std::memset(&op.ov, 0, sizeof(op.ov));
-    const std::uint64_t off = op.off + op.filled;
-    op.ov.Offset = static_cast<DWORD>(off);
-    op.ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+    op.ov.Offset = static_cast<DWORD>(at);
+    op.ov.OffsetHigh = static_cast<DWORD>(at >> 32);
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
     if (!op.is_write && take_seam(refuse_port_reads)) {
       return false;
@@ -846,7 +706,6 @@ class iocp_context {
     // The piece is the kernel's from here, and charged to the device
     // from here: a cached read completes inside the call.
     op.device_begin();
-    const HANDLE h = op.owner_file->f_.h();
     const BOOL ok =
         op.is_write
             ? ::WriteFile(h, op.src + op.filled, len, nullptr, &op.ov)
@@ -859,177 +718,13 @@ class iocp_context {
     return true;
   }
 
-  // Every callback runs from here, which is what poll() counts: a
-  // remainder moved to the pump is still owed, and is not one.
-  void complete(transfer& op, std::error_code ec) noexcept {
-    device_.add_if_served(op.device_total_ns());
-    in_flight_--;
-    assert(op.owner_file != nullptr && "every transfer is armed with its file");
-    op.owner_file->inflight_--;
-    ++reported_;
-    op.done(&op, ec);
-  }
-
-  // The op is the record its OVERLAPPED is a member of. The caller keeps
-  // it at a fixed address from submit until its callback has run, which
-  // is what makes the walk back valid; it is the documented IOCP idiom
-  // and the reason transfer is the caller's type rather than the
-  // context's.
-  [[nodiscard]] static transfer* op_of(OVERLAPPED* pov) noexcept {
-    return CONTAINING_RECORD(pov, transfer, ov);
-  }
-
-  // Takes what the port has, running the callbacks of transfers that
-  // ended and reissuing the rest of the ones that stopped short. With
-  // `block`, waits for the first completion, but not after a remainder
-  // the port would not take has moved to the pump: where no lane runs,
-  // only poll()'s next step performs it, so a wait on the port with
-  // nothing else owed to it would never return.
-  void reap_ready(bool block) {
-    const std::size_t before = reported_;
-    bool parked = false;
-    for (;;) {
-      const port_event e =
-          next(block && reported_ == before && !parked ? INFINITE : 0);
-      switch (e.what) {
-        case port_event::kind::timeout:
-          return;  // nothing more queued
-        case port_event::kind::wake:
-          woken_ = true;
-          return;
-        case port_event::kind::failed:
-          throw std::system_error(static_cast<int>(e.err),
-                                  std::system_category(),
-                                  "GetQueuedCompletionStatus");
-        case port_event::kind::completion:
-          // A rest on the pump ends the wait: see above.
-          parked = settle(*e.op, e.bytes, e.err) || parked;
-          break;
-      }
-    }
-  }
-
-  // One step of the port: what GetQueuedCompletionStatus handed back. The
-  // error is read before anything else runs, since any call -- a clock
-  // read included -- may overwrite it, and the key is read only for a
-  // dequeue that succeeded with no OVERLAPPED, which is the wake.
-  struct port_event {
-    enum class kind { completion, wake, timeout, failed };
-    kind what;
-    transfer* op = nullptr;
-    DWORD bytes = 0;
-    // A completion's own error, or why the port failed; ERROR_SUCCESS
-    // otherwise.
-    DWORD err = ERROR_SUCCESS;
-  };
-  [[nodiscard]] port_event next(DWORD timeout) noexcept {
-    DWORD bytes = 0;
-    ULONG_PTR key = 0;
-    OVERLAPPED* pov = nullptr;
-    const BOOL ok =
-        ::GetQueuedCompletionStatus(port_.get(), &bytes, &key, &pov, timeout);
-    const DWORD err = ok != 0 ? ERROR_SUCCESS : ::GetLastError();
-    if (pov != nullptr) {
-      --port_owed_;
-      return {port_event::kind::completion, op_of(pov), bytes, err};
-    }
-    if (ok == 0 && err == WAIT_TIMEOUT) {
-      return {port_event::kind::timeout};
-    }
-    if (ok != 0 && key == wake_key) {
-      return {port_event::kind::wake};
-    }
-    return {port_event::kind::failed, nullptr, 0, err};
-  }
-
-  // What one completion of `op` means: its callback, or the rest of a
-  // short transfer reissued. Returns whether that rest went to the pump.
-  [[nodiscard]] bool settle(transfer& op, DWORD bytes, DWORD err) noexcept {
-    op.device_end();
-    if (err != ERROR_SUCCESS) {
-      complete(op, read_error(err));
-      return false;
-    }
-    if (bytes == 0) {
-      complete(op, std::error_code(EIO, std::generic_category()));
-      return false;
-    }
-    op.filled += bytes;
-    if (op.filled < op.len) {
-      route(op);
-      return !op.on_port;
-    }
-    complete(op, {});
-    return false;
-  }
-
-  // One transfer, on a lane. Touches the operation and the file it names,
-  // and nothing else of this context, so served_synchronously_ is counted
-  // where the completion is run.
-  static std::error_code perform_deferred(transfer& op) noexcept {
-    // From op.filled, not from zero: a short transfer whose remainder the
-    // port would not take arrives here part-done, and the bytes already
-    // in the buffer must not be fetched again over themselves.
-    try {
-      const std::size_t rest = op.len - op.filled;
-      if (op.is_write) {
-        win_sync_write(op.owner_file->f_, op.off + op.filled,
-                   {op.src + op.filled, rest});
-      } else {
-        win_sync_read(op.owner_file->f_, op.off + op.filled,
-                  {op.dst + op.filled, rest});
-      }
-      op.filled = op.len;
-    } catch (const std::system_error& e) {
-      return e.code();
-    } catch (...) {
-      // win_sync_read and win_sync_write throw only system_error;
-      // anything else is reported as EIO so it cannot terminate a
-      // noexcept lane.
-      return std::make_error_code(std::errc::io_error);
-    }
-    return {};
-  }
-
-  // Runs the callbacks of the transfers the lanes finished, on this
-  // thread. The inline step serves a machine that would not give the
-  // pump a thread.
-  void serve_deferred() noexcept {
-    pump_.report_finished(
-        [this](transfer& op) noexcept { report_deferred(op); });
-  }
-
-  void report_deferred(transfer& op) noexcept {
-    const std::error_code ec = op.result();
-    if (!ec) {
-      served_synchronously_++;
-    }
-    complete(op, ec);
-  }
-
   bool async_requested_ = true;
   unique_handle port_;
-  file* files_ = nullptr;      // every open file, for the drain
-  std::size_t in_flight_ = 0;
-  std::size_t served_synchronously_ = 0;
-  // Callbacks run since construction; poll() returns its growth.
-  std::size_t reported_ = 0;
   std::size_t port_owed_ = 0;  // requests the port has yet to hand back
-  // What the device itself took, stamped by the port where it carried a
-  // piece and by a lane where one did.
-  device_time device_{};
-  // What the caller asked to have in flight at once; device_depth()
-  // reports it where the port took the transfers.
   unsigned queue_depth_ = 1;
-  bool woken_ = false;
-  // Whether any transfer of this run reached the port, which is what
-  // device_depth() reports against.
-  bool used_port_ = false;
-  // The lanes that serve what the port will not take. Declared last,
-  // so the destructor's join runs while the port its wake() posts to is
-  // still open. Do not move this up.
-  deferred_pump<transfer> pump_;
 };
+
+using iocp_context = completion_context<iocp_engine>;
 
 // Definition-site conformance check (see uring_backend.hpp): fails here,
 // with the missed requirement named, the first time MSVC compiles this

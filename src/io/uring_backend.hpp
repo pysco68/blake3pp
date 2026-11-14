@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "io/backend.hpp"
+#include "io/completion_context.hpp"
 #include "io/posix_file.hpp"
 
 namespace blake3pp::detail::io_impl {
@@ -483,130 +484,87 @@ struct uring {
   }
 };
 
-// The io_uring reader/writer context: one ring, any number of files,
-// transfers named by the caller's operation, completions delivered as
-// callbacks out of poll(). Degrades per feature at runtime, as the whole
-// layer does: O_DIRECT refused by the filesystem -> buffered, io_uring
-// refused -> every transfer performed by the deferred pump's lanes.
-class uring_context {
+// The io_uring engine under completion_context: one ring, its pieces,
+// its completions, and the eventfd a sleeping poll is woken through.
+// Degrades per feature at runtime, as the whole layer does: O_DIRECT
+// refused by the filesystem -> buffered, io_uring refused -> every
+// transfer performed by the deferred pump's lanes.
+class uring_engine {
  public:
-  class file;  // defined below; a transfer names the file it belongs to
+  using transfer_part = posix_transfer;
 
-  struct transfer : posix_transfer {
-    bool on_ring = false;           // the kernel has it, so a cancel is an SQE
-    file* owner_file = nullptr;     // whose transfer this is, for forget()
-    transfer* next_deferred = nullptr;
-  };
-
-  // An open file bound to a context. Every file must be destroyed before
-  // the context it was opened on, which keeps these descriptors open
-  // while the context's drain waits out the transfers on them.
-  class file {
+  // An open file: the plain descriptor, the O_DIRECT reopen when one
+  // engaged, its size and the name tools print. Every file must be
+  // destroyed before the context it was opened on, which keeps these
+  // descriptors open while the context's drain waits out the transfers
+  // on them.
+  class file_part : public posix_file {
    public:
-    file(uring_context& ctx, const std::filesystem::path& path,
-         const file_open_options& how)
-        : write_(how.write) {
-      const int base = write_ ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY;
-      f_.open(path.c_str(), base | O_CLOEXEC, 0644);
-      size_ = write_ ? 0 : f_.stat_size();
+    file_part(const uring_engine& e, const std::filesystem::path& path,
+              const file_open_options& how) {
+      const int base = how.write ? (O_WRONLY | O_CREAT | O_TRUNC) : O_RDONLY;
+      open(path.c_str(), base | O_CLOEXEC, 0644);
+      size_ = how.write ? 0 : stat_size();
       // Preallocation belongs to the OPEN, not to the finish: a write
       // that extends the file serializes on the inode lock, and with
       // async direct I/O that collapses the whole queue to one stalled
-      // write at a time. set_size() trims back afterwards.
-      // A refusal costs only that: the writes extend the file as they
-      // land.
-      if (write_ && how.preallocate_bytes > 0) {
+      // write at a time. set_size() trims back afterwards. A refusal
+      // costs only that: the writes extend the file as they land.
+      if (how.write && how.preallocate_bytes > 0) {
         [[maybe_unused]] const int refused =
-            ::fallocate(f_.fd_plain(), 0, 0,
+            ::fallocate(fd_plain(), 0, 0,
                         static_cast<off_t>(how.preallocate_bytes));
       }
       if (how.direct_io) {
         // Not TRUNC on the reopen: already truncated, and the tail keeps
         // a plain fd.
-        f_.try_odirect(path.c_str(), (write_ ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
+        try_odirect(path.c_str(), (how.write ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
       }
-      name_ = ctx.name_for(f_.direct(), write_);
-      ctx_ = &ctx;
-      next_open_ = ctx.files_;
-      ctx.files_ = this;
-    }
-
-    // Takes this file's transfers with it, and only those: forget() waits
-    // out what the kernel or a lane holds of them, because it may be
-    // writing into the buffers they name, and a sibling's completion that
-    // surfaces meanwhile is reported, not dropped. Its operations must
-    // still be alive (the contract's operation lifetime rule). The file
-    // leaves the context's list only afterwards: forget() waits until this
-    // file's count is zero, and the list is what lets a context-wide drain
-    // zero it.
-    ~file() {
-      ctx_->forget(*this);
-      ctx_->unlink(*this);
+      name_ = e.name_for(direct(), how.write);
     }
 
     [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
     [[nodiscard]] std::string_view name() const noexcept { return name_; }
-
     // Trims a preallocation back to what was written. Harmless when
     // nothing was preallocated, which is what a reader's file is.
     void set_size(std::uint64_t bytes) {
-      if (::ftruncate(f_.fd_plain(), static_cast<off_t>(bytes)) != 0) {
+      if (::ftruncate(fd_plain(), static_cast<off_t>(bytes)) != 0) {
         throw_errno("ftruncate");
       }
     }
 
    private:
-    friend class uring_context;
-    posix_file f_;
     std::uint64_t size_ = 0;
     std::string name_;
-    // This file's share of the context's count, which is what forget()
-    // waits out. The context-wide count stays the sum of these.
-    std::size_t inflight_ = 0;
-    uring_context* ctx_ = nullptr;
-    file* next_open_ = nullptr;  // the context's list, for its own drain
-    bool write_ = false;
   };
 
-  uring_context(const reader_context_options& opts, unsigned max_inflight)
-      : pump_(io_lanes::waker<uring_context>(), this,
-              &perform_deferred, io_lanes_for(max_inflight)),
-        async_requested_(opts.async) {
+  uring_engine(const reader_context_options& opts, unsigned max_inflight)
+      : ring_depth_(std::max(1u, max_inflight)), async_requested_(opts.async) {
     // What one batch between two flushes can hold: a transfer and its
     // continuation for every slot, plus the armed wake poll and one
     // spare. A cancel sweep fits inside the same bound: the scope stops
     // starting transfers before it cancels them, so the two never share
     // a batch.
-    ring_depth_ = std::max(1u, max_inflight);
     if (opts.async && ring_.init(2 * max_inflight + 2)) {
       use_uring_ = true;
       offload_ = opts.offload_submit;
-      // The member flush(): a refused enter moves what it held to the
-      // pump, as it does at any other time, rather than failing the open.
+      // A refused enter takes the wake poll back rather than failing the
+      // open; the next flush arms it again.
       arm_wake();
-      flush();
+      if (ring_.flush() != 0) {
+        take_back<posix_transfer>([](posix_transfer&) noexcept {});
+      }
     }
   }
+  uring_engine(const uring_engine&) = delete;
+  uring_engine& operator=(const uring_engine&) = delete;
 
-  uring_context(const uring_context&) = delete;
-  uring_context& operator=(const uring_context&) = delete;
-
-  // Runs before any member is destroyed, and the eventfd outlives the
-  // ring by declaration order, so the nudge the drain needs lands on an
-  // open descriptor. ~uring drains again and finds nothing.
-  ~uring_context() { drain(); }
-
-  // This context's rung and the one it degrades to, declared for the
-  // ladder walk in src/io/io_engines.cpp. The rung below is only a
-  // declaration: a ring that could not be had leaves every transfer to
-  // posix_file's pread on the pump's lanes, inside this context.
+  // This engine's rung and the one it degrades to, declared for the
+  // ladder walk in src/io/io_engines.cpp. A ring that could not be had
+  // leaves every transfer to posix_file's pread on the pump's lanes.
   static constexpr io_engine rung_engine = io_engine::io_uring;
   using rung_below = posix_sync_rung;
 
-  // Which of the two this context engaged -- the engine question it can
-  // answer with no file in hand, where name_for() below answers the same
-  // question with one.
-  //
   // A refusal is settled only when the kernel is the reason. ENOSYS says
   // io_uring is not in this kernel and EPERM says a policy forbids it;
   // EMFILE or ENOMEM say the ring could not be set up at this moment, and
@@ -619,298 +577,173 @@ class uring_context {
     return {rung_below::rung_engine,
             async_requested_ && !refusal_may_lift(ring_.setup_errno)};
   }
-
-  void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) noexcept {
-    arm(op, f, off);
-    op.buf = buf;
-    op.wbuf = {};
-    op.is_write = false;
-    issue(op, IORING_OP_READ, buf.data(), buf.size());
-  }
-
-  // Same rules as submit_read, and the same choice of descriptor: the
-  // granules O_DIRECT can take go through the direct fd, the rest
-  // through the plain one, both on the ring. Nothing above the context
-  // sees the difference.
-  void submit_write(file& f, std::uint64_t off,
-                    std::span<const std::byte> buf, transfer& op) noexcept {
-    arm(op, f, off);
-    op.buf = {};
-    op.wbuf = buf;
-    op.is_write = true;
-    issue(op, IORING_OP_WRITE, buf.data(), buf.size());
-  }
-
- private:
-  // What a transfer needs that does not depend on its direction.
-  void arm(transfer& op, file& f, std::uint64_t off) noexcept {
-    op.arm(f.f_, off);
-    op.owner_file = &f;
-    op.next_deferred = nullptr;
-    op.on_ring = false;
-    in_flight_++;
-    f.inflight_++;
-  }
-
-  // How much of a piece the ring takes, and through which descriptor:
-  // direct_piece()'s shapes. What goes to the pump's lanes is a context
-  // with no ring, a submit the kernel refused, and a zero-length
-  // transfer, which io_uring would report as res == 0, the signature of a
-  // short transfer with nothing left to give.
-  [[nodiscard]] fd_piece piece_for(const transfer& op, std::uint64_t off,
-                                   std::size_t len) const noexcept {
-    if (!use_uring_ || len == 0) {
-      return {-1, 0};
-    }
-    return direct_piece(*op.sync_file, off, len);
-  }
-
-  void issue(transfer& op, std::uint8_t opcode, const void* data,
-             std::size_t len) noexcept {
-    const fd_piece piece = piece_for(op, op.off, len);
-    if (piece.fd >= 0) {
-      op.on_ring = true;
-      // The piece is the kernel's from here, and charged to the device
-      // from here.
-      op.device_begin();
-      ring_.fill_rw(opcode, piece.fd, data, static_cast<unsigned>(piece.len),
-                    op.off, op_ud(&op), offload_);
-    } else {
-      pump_.push(op);
-    }
-  }
-
- public:
-
-  // The kernel is asked once; a second ask would only add a CQE to drop.
-  // A transfer the pump has is cancelled through the pump, under its
-  // lock, because the flag is what a lane reads when it takes one; a
-  // transfer a lane already has runs to completion.
-  //
-  // on_ring is the polling thread's own state, set where the transfer
-  // was placed and cleared where it was taken back, so it says which of
-  // the two this is.
-  void cancel(transfer& op) noexcept {
-    if (!op.on_ring) {
-      pump_.cancel(op);
-      return;
-    }
-    if (std::exchange(op.cancelled, true)) {
-      return;
-    }
-    ring_.fill_cancel(op_ud(&op), cancel_ud());
-  }
-
-  // A refused submit is not an error the caller can act on: the
-  // transfers are already counted in in_flight(), and an exception here
-  // would leave them counted and uncompleted. They go to the pump's lanes
-  // instead.
-  void flush() noexcept {
-    if (use_uring_ && ring_.flush() != 0) {
-      defer_unsubmitted();
-    }
-  }
-
-  // The ring first, then the deferred list, in that order and never the
-  // other way round: a completion the ring hands back can park its
-  // remainder on the list, and the list is what serves it.
-  std::size_t poll(bool block) {
-    flush();
-    std::size_t ran = reap_ready();
-    ran += serve_deferred();
-    if (ran > 0 || !block) {
-      return ran;
-    }
-    for (;;) {
-      if (take_wake()) {
-        return ran + serve_deferred();
-      }
-      sleep_once();
-      ran += reap_ready();
-      ran += serve_deferred();
-      if (ran > 0 || take_wake()) {
-        return ran;
-      }
-    }
-  }
-
-  // The one member another thread may call, and how a lane reports a
-  // finished transfer. The armed wake poll watches this eventfd.
-  void wake() noexcept { waiter_.wake(); }
-
-  [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
-  // Transfers, or remainders of transfers, performed by the lanes (or by
-  // poll() where no lane runs) and reported since construction: zero for
-  // a context whose ring took everything.
-  [[nodiscard]] std::size_t served_synchronously() const noexcept {
-    return served_synchronously_;
-  }
+  [[nodiscard]] bool engaged() const noexcept { return use_uring_; }
 
   // The ring queues as deep as the caller asked; without it the pump's
   // lanes are the whole of what the device sees.
-  [[nodiscard]] unsigned device_depth() const noexcept {
-    return use_uring_ ? ring_depth_ : pump_.depth();
-  }
-  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
-    return pump_.lane_wait_ns();
-  }
-  [[nodiscard]] device_time device() const noexcept { return device_; }
-
-  // Entries the kernel never took are withdrawn, the transfers it did
-  // take are reaped and discarded, and the pump is cleared and its lanes
-  // waited out. The armed wake poll completes only when the eventfd
-  // becomes readable, so it is nudged first; the ring's drain reaps it
-  // with the rest, and the next blocking poll re-arms it. A wake that
-  // arrives meanwhile stays in the eventfd's counter: at worst the next
-  // poll returns once with nothing to report.
-  void drain() noexcept {
-    if (use_uring_) {
-      ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
-        if (ud == wake_ud()) {
-          wake_armed_ = false;
-        }
-      });
-      if (wake_armed_) {
-        waiter_.wake();
-      }
-      ring_.drain();
-      wake_armed_ = false;
-    }
-    pump_.clear();
-    in_flight_ = 0;
-    for (file* f = files_; f != nullptr; f = f->next_open_) {
-      f->inflight_ = 0;
-    }
+  [[nodiscard]] unsigned device_depth(bool, unsigned lanes) const noexcept {
+    return use_uring_ ? ring_depth_ : lanes;
   }
 
-  // Gives up every transfer this file owns, running no callback, so the
-  // file and the buffers its transfers name may be destroyed while the
-  // context stays usable: afterwards in_flight() counts none of them.
-  //
-  // Legal only while the operations those transfers live in are alive;
-  // ~file() calls it. What never reached the kernel is
-  // dropped; what the kernel or a lane holds is waited out, because it is
-  // writing into those buffers.
-  //
-  // The ring is shared, so a completion belonging to another file can
-  // surface while this one is waited out. It is reported, since dropping
-  // it would strand an operation that can never complete, so reclaiming
-  // one file while a sibling has transfers in flight can run that
-  // sibling's callback from here.
-  void forget(file& f) noexcept {
-    // The file stays on files_: it is still open and may be read again, and
-    // a later context-wide drain has to be able to zero its count.
-    //
-    // A lane inside pread() on this file's descriptor cannot be recalled,
-    // so it is waited out, and what it finished is dropped unreported.
-    const auto mine = [&f](const transfer& op) noexcept {
-      return op.owner_file == &f;
-    };
-    std::size_t never_rode = pump_.remove_queued_if(mine);
-    pump_.quiesce();
-    never_rode += pump_.remove_done_if(mine);
-    in_flight_ -= std::min(never_rode, in_flight_);
-    f.inflight_ -= std::min(never_rode, f.inflight_);
-    if (!use_uring_ || f.inflight_ == 0) {
+  template <class Op>
+  static std::error_code perform(Op& op) noexcept {
+    return perform_rest(op);
+  }
+
+  // The rest of a transfer, from op.filled, on the ring through the
+  // descriptor direct_piece() picks. What does not ride is a context with
+  // no ring and a zero-length transfer, which io_uring would report as
+  // res == 0, the signature of a short transfer with nothing left to
+  // give.
+  template <class Op>
+  [[nodiscard]] bool place(Op& op) noexcept {
+    const std::size_t len = op.length() - op.filled;
+    if (!use_uring_ || len == 0) {
+      return false;
+    }
+    const fd_piece piece = direct_piece(*op.sync_file, op.off + op.filled, len);
+    const void* const data = op.is_write
+                                 ? static_cast<const void*>(op.wbuf.data() + op.filled)
+                                 : static_cast<const void*>(op.buf.data() + op.filled);
+    // The piece is the kernel's from here, and charged to the device from
+    // here.
+    op.device_begin();
+    ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, piece.fd,
+                  data, static_cast<unsigned>(piece.len), op.off + op.filled,
+                  op_ud(&op), offload_);
+    return true;
+  }
+
+  template <class Op>
+  void cancel(Op& op) noexcept {
+    ring_.fill_cancel(op_ud(&op), cancel_ud);
+  }
+
+  // A refused enter is not an error the caller can act on: the
+  // transfers are already counted, and an exception here would leave
+  // them counted and uncompleted. They go to the pump's lanes instead.
+  // The wake poll is armed again here when a reap took it.
+  template <class Op, class Refused>
+  void flush(Refused&& refused) noexcept {
+    if (!use_uring_) {
       return;
     }
-    // Everything queued goes to the kernel first: an entry still in the
-    // submission queue would be submitted by a later flush, reading into
-    // memory this call is about to release. What the kernel refuses comes
-    // back on the deferred list, where the sweep below drops this file's
-    // share.
-    flush();
-    for (;;) {
-      std::size_t refused = pump_.remove_queued_if(mine);
-      pump_.quiesce();
-      refused += pump_.remove_done_if(mine);
-      in_flight_ -= std::min(refused, in_flight_);
-      f.inflight_ -= std::min(refused, f.inflight_);
-      if (f.inflight_ == 0) {
+    if (!wake_armed_) {
+      arm_wake();
+    }
+    if (ring_.flush() != 0) {
+      take_back<Op>(refused);
+    }
+  }
+
+  // Every entry the kernel has not accepted names a transfer that is
+  // counted and that the ring will never complete. Handing them back
+  // keeps the promise that a counted transfer reaches its callback. The
+  // wake's one-shot poll comes back with them; the next flush re-arms it.
+  template <class Op, class Refused>
+  void take_back(Refused&& refused) noexcept {
+    if (!use_uring_) {
+      return;
+    }
+    ring_.take_unsubmitted([&](std::uint64_t ud) noexcept {
+      if (ud == wake_ud) {
+        wake_armed_ = false;
         return;
       }
-      std::uint64_t ud = 0;
-      int res = 0;
-      if (!ring_.reap(ud, res)) {
-        try {
-          ring_.wait_cq();
-        } catch (const std::system_error& e) {
-          // The same position the context-wide drain refuses to return
-          // from: transfers in the kernel, a ring that cannot be waited
-          // on, and buffers about to be reused.
-          std::fprintf(stderr,
-                       "blake3pp: io_uring_enter failed while %zu transfer(s) "
-                       "of a closing file were still owed (%s); their buffers "
-                       "cannot be released\n",
-                       f.inflight_, e.what());
-          std::abort();
+      if (ud == cancel_ud) {
+        return;  // withdrawn with its target; nothing owes a completion
+      }
+      Op& op = *op_from<Op>(ud);
+      op.device_end();  // the kernel never served it
+      refused(op);
+    });
+  }
+
+  void check() const noexcept {}
+
+  // One completion, or a wake, or nothing. Blocking, it sleeps until the
+  // ring has a completion or the eventfd was signalled, deciding on what
+  // the KERNEL holds: with the wake poll armed the completion queue
+  // covers both; with nothing in the kernel only the eventfd can end the
+  // sleep; with submissions in the kernel and the poll not armed, the
+  // ring's descriptor and the eventfd together.
+  template <class Op>
+  [[nodiscard]] engine_event<Op> next(bool block) noexcept {
+    using event = engine_event<Op>;
+    try {
+      for (;;) {
+        std::uint64_t ud = 0;
+        int res = 0;
+        while (use_uring_ && ring_.reap(ud, res)) {
+          if (ud == wake_ud) {
+            wake_armed_ = false;  // one-shot; the next flush re-arms
+            continue;
+          }
+          if (ud == cancel_ud) {
+            continue;  // the target's own completion is the one that matters
+          }
+          Op& op = *op_from<Op>(ud);
+          if (res < 0) {
+            return {event::kind::completion, &op,
+                    std::error_code(-res, std::generic_category()), 0};
+          }
+          if (!op.is_write) {
+            msan_unpoison(op.buf.data() + op.filled,
+                          static_cast<std::size_t>(res));
+          }
+          return {event::kind::completion, &op, {},
+                  static_cast<std::size_t>(res)};
         }
-        continue;
+        if (!block) {
+          return {};
+        }
+        if (waiter_.take()) {
+          return {event::kind::wake};
+        }
+        sleep_once();
       }
-      if (ud == wake_ud()) {
-        wake_armed_ = false;  // one-shot; take_wake() re-arms
-        continue;
-      }
-      if (ud == cancel_ud()) {
-        continue;  // the target's own completion is the one that matters
-      }
-      transfer& op = *op_from(ud);
-      if (op.owner_file == &f) {
-        in_flight_--;
-        f.inflight_--;  // reaped, not reported
-        continue;
-      }
-      if (settle(op, ud, res)) {
-        flush();
-      }
+    } catch (const std::system_error& e) {
+      return {event::kind::failed, nullptr, e.code()};
     }
   }
 
-  void unlink(file& f) noexcept {
-    for (file** at = &files_; *at != nullptr; at = &(*at)->next_open_) {
-      if (*at == &f) {
-        *at = f.next_open_;
-        f.next_open_ = nullptr;
-        return;
-      }
-    }
+  [[nodiscard]] bool take_wake() noexcept { return waiter_.take(); }
+  void wake() noexcept { waiter_.wake(); }
+
+  template <class Part>
+  void cancel_file(Part&, std::size_t) noexcept {}
+  template <class Pred>
+  [[nodiscard]] std::size_t drop_unsubmitted(Pred&&) noexcept {
+    return 0;
+  }
+  [[nodiscard]] std::size_t owed() const noexcept {
+    return use_uring_ ? ring_.outstanding : 0;
   }
 
-  // Every entry the kernel refused to take names a transfer that
-  // in_flight() counts and the ring will never complete. Moving them to
-  // the pump keeps the contract's promise that a counted transfer reaches
-  // its callback: a lane performs each one and poll() reports the
-  // result. The wake's one-shot poll comes back with them; take_wake()
-  // re-arms it.
-  //
-  // Called by flush() on a refused submit, and directly by the test that
-  // covers this path, since a working kernel cannot be asked to refuse.
-  void defer_unsubmitted() noexcept {
-    // A context that never got a ring has nothing published to take
-    // back, and its ring pointers are null: every read it was handed is
-    // already on the deferred list. Callers reach this from flush(),
-    // which knows, and from a test, which does not.
+  // Entries the kernel never took are withdrawn and the transfers it did
+  // take are waited out. The armed wake poll completes only when the
+  // eventfd becomes readable, so it is nudged first; the drain reaps it
+  // with the rest, and the next flush re-arms it.
+  template <class EachFile>
+  void begin_drain(EachFile&&) noexcept {
     if (!use_uring_) {
       return;
     }
     ring_.take_unsubmitted([this](std::uint64_t ud) noexcept {
-      if (ud == wake_ud()) {
+      if (ud == wake_ud) {
         wake_armed_ = false;
-        return;
       }
-      if (ud == cancel_ud()) {
-        return;  // withdrawn with its target; nothing owes a completion
-      }
-      transfer& op = *op_from(ud);
-      op.on_ring = false;  // the kernel never took it; no SQE to cancel
-      op.device_end();     // and never served it, so the charge stops here
-      pump_.push(op);
     });
+    if (wake_armed_) {
+      waiter_.wake();
+    }
   }
+  void end_drain() noexcept { wake_armed_ = false; }
 
- private:
-  // Which rung of the ladder this context reached, for a file that did or
+  template <class Op>
+  void release(Op&) noexcept {}
+
+  // Which rung of the ladder this engine reached, for a file that did or
   // did not get O_DIRECT. file_reader::backend() reports it verbatim and
   // tools print it, so the spellings, their order and the suffixes are
   // observable API.
@@ -929,165 +762,28 @@ class uring_context {
     return n;
   }
 
-  [[nodiscard]] std::uint64_t op_ud(transfer* op) const noexcept {
+ private:
+  template <class Op>
+  [[nodiscard]] static std::uint64_t op_ud(Op* op) noexcept {
     return static_cast<std::uint64_t>(std::bit_cast<std::uintptr_t>(op));
   }
-  [[nodiscard]] transfer* op_from(std::uint64_t ud) const noexcept {
-    return std::bit_cast<transfer*>(static_cast<std::uintptr_t>(ud));
+  template <class Op>
+  [[nodiscard]] static Op* op_from(std::uint64_t ud) noexcept {
+    return std::bit_cast<Op*>(static_cast<std::uintptr_t>(ud));
   }
   // The wake completion needs a user_data no transfer can wear, and so
-  // does a cancel's CQE: reaping either as a read would walk to a
-  // transfer that does not exist. A transfer's user_data is its aligned
-  // address, which is never 1 or 2.
-  static constexpr std::uint64_t wake_ud_value = 1;
-  static constexpr std::uint64_t cancel_ud_value = 2;
-  static_assert(alignof(transfer) > cancel_ud_value);
-  [[nodiscard]] static constexpr std::uint64_t wake_ud() noexcept {
-    return wake_ud_value;
-  }
-  [[nodiscard]] static constexpr std::uint64_t cancel_ud() noexcept {
-    return cancel_ud_value;
-  }
+  // does a cancel's CQE: reaping either as a transfer would walk to one
+  // that does not exist. A transfer's user_data is its aligned address,
+  // which is never 1 or 2.
+  static constexpr std::uint64_t wake_ud = 1;
+  static constexpr std::uint64_t cancel_ud = 2;
+  static_assert(alignof(posix_transfer) > cancel_ud);
 
   void arm_wake() noexcept {
-    ring_.fill_poll_add(waiter_.fd(), wake_ud());
+    ring_.fill_poll_add(waiter_.fd(), wake_ud);
     wake_armed_ = true;
   }
 
-  void complete(transfer& op, std::error_code ec) noexcept {
-    device_.add_if_served(op.device_total_ns());
-    in_flight_--;
-    assert(op.owner_file != nullptr &&
-           "every transfer is armed with its file");
-    op.owner_file->inflight_--;
-    op.done(&op, ec);
-  }
-
-  // What one completion of `op` means. A transfer short of its length
-  // continues from where it stopped, reads and writes alike; only the
-  // opcode and which span it walks differ. Returns whether it was
-  // requeued rather than completed, which is the caller's cue to flush.
-  [[nodiscard]] bool settle(transfer& op, std::uint64_t ud, int res) noexcept {
-    // This piece is back from the kernel, whatever it reports.
-    op.device_end();
-    if (res < 0) {
-      complete(op, std::error_code(-res, std::generic_category()));
-      return false;
-    }
-    if (res == 0) {
-      // Short of the length with nothing left to give: the file ended
-      // where the engine was told it would not.
-      complete(op, std::error_code(EIO, std::generic_category()));
-      return false;
-    }
-    if (!op.is_write) {
-      msan_unpoison(op.buf.data() + op.filled,
-                    static_cast<std::size_t>(res));
-    }
-    op.filled += static_cast<std::size_t>(res);
-    if (op.filled < op.length()) {
-      const std::byte* const from =
-          op.is_write ? op.wbuf.data() + op.filled : op.buf.data() + op.filled;
-      const std::size_t rest = op.length() - op.filled;
-      const fd_piece piece = piece_for(op, op.off + op.filled, rest);
-      if (piece.fd < 0) {
-        // A ring that is reaping takes every non-empty piece, so this is
-        // the path a refusal would take rather than one a ring reaches:
-        // the remainder is still owed and the pump finishes it.
-        op.on_ring = false;
-        pump_.push(op);
-        return false;
-      }
-      op.device_begin();
-      ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, piece.fd,
-                    from, static_cast<unsigned>(piece.len), op.off + op.filled,
-                    ud, offload_);
-      return true;
-    }
-    complete(op, {});
-    return false;
-  }
-
-  // Consumes every completion the ring has without blocking, reissuing
-  // short reads. Returns the number of callbacks run.
-  std::size_t reap_ready() {
-    if (!use_uring_) {
-      return 0;
-    }
-    std::size_t ran = 0;
-    bool requeued = false;
-    std::uint64_t ud = 0;
-    int res = 0;
-    while (ring_.reap(ud, res)) {
-      if (ud == wake_ud()) {
-        wake_armed_ = false;  // one-shot; take_wake() re-arms
-        continue;
-      }
-      if (ud == cancel_ud()) {
-        continue;  // the target's own completion is the one that matters
-      }
-      transfer& op = *op_from(ud);
-      if (settle(op, ud, res)) {
-        requeued = true;
-      } else {
-        ran++;
-      }
-    }
-    if (requeued) {
-      // The continuation of a short read is the same kind of entry as
-      // the read itself, and the same refusal leaves it owed.
-      flush();
-    }
-    return ran;
-  }
-
-  // One transfer, on a lane: perform_rest() touches the operation and its
-  // file and nothing else of this context, so served_synchronously_ is
-  // counted where the completion is run.
-  static std::error_code perform_deferred(transfer& op) noexcept {
-    return perform_rest(op);
-  }
-
-  // Runs the callbacks of the transfers the lanes finished, on this
-  // thread. The inline step serves a machine that would not give the
-  // pump a thread.
-  std::size_t serve_deferred() noexcept {
-    return pump_.report_finished(
-        [this](transfer& op) noexcept { report_deferred(op); });
-  }
-
-  void report_deferred(transfer& op) noexcept {
-    const std::error_code ec = op.result();
-    if (!ec) {
-      served_synchronously_++;
-    }
-    complete(op, ec);
-  }
-
-  // Drains the eventfd counter, re-arming the ring's one-shot poll. True
-  // means a wake() had been issued.
-  bool take_wake() noexcept {
-    const bool woken = waiter_.take();
-    if (use_uring_ && !wake_armed_) {
-      arm_wake();
-      // A refused arm comes back through the member flush like any other
-      // refusal: withdrawn, so wake_armed_ says what is true and
-      // sleep_once() does not block on a wake that cannot arrive, and any
-      // transfer still published with it moves to the pump instead of
-      // being dropped. The next blocking poll arms again.
-      flush();
-    }
-    return woken;
-  }
-
-  // Blocks until something can complete, deciding on what the KERNEL
-  // holds rather than on in_flight(), which also counts the transfers on
-  // the pump's lanes. A lane reports through wake(), so the eventfd has
-  // to be watched whenever the armed poll is not watching it:
-  //  - wake poll armed: the completion queue covers both;
-  //  - nothing in the kernel: only the eventfd can end the sleep;
-  //  - submissions in the kernel and the wake poll not armed (its re-arm
-  //    was refused): the ring's descriptor and the eventfd together.
   void sleep_once() {
     if (!use_uring_ || (!wake_armed_ && ring_.outstanding == 0)) {
       waiter_.sleep();
@@ -1111,26 +807,14 @@ class uring_context {
   // is closed. Do not move ring_ above waiter_.
   poll_waiter waiter_;
   uring ring_;
-  // After the waiter its lanes signal, so the waiter outlives the join in
-  // the pump's destructor. The lanes touch nothing declared below.
-  deferred_pump<transfer> pump_;
-  // Every open file of this context, so its own drain can zero the shares
-  // they count. Linked and unlinked by the file: forget() leaves one on the
-  // list, because an idled file is still open and may be read again.
-  file* files_ = nullptr;
-  std::size_t in_flight_ = 0;
-  std::size_t served_synchronously_ = 0;
-  // What the device itself took, stamped by the ring where it carried a
-  // piece and by a lane where one did.
-  device_time device_{};
-  // What the ring was set up to hold, which is the depth the caller asked
-  // for: device_depth() reports it where the ring took the transfers.
   unsigned ring_depth_ = 1;
   bool async_requested_ = true;
   bool use_uring_ = false;
   bool offload_ = false;
   bool wake_armed_ = false;
 };
+
+using uring_context = completion_context<uring_engine>;
 
 // Definition-site conformance check. Concepts only verify use-sites, so
 // without this a drifting backend wouldn't be diagnosed until an engine

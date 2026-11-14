@@ -170,6 +170,20 @@ struct posix_transfer : performed_transfer {
     cancelled = false;
     reset_performance();
   }
+  void arm_read(posix_file& f, std::uint64_t at,
+                std::span<std::byte> to) noexcept {
+    arm(f, at);
+    buf = to;
+    wbuf = {};
+    is_write = false;
+  }
+  void arm_write(posix_file& f, std::uint64_t at,
+                 std::span<const std::byte> from) noexcept {
+    arm(f, at);
+    buf = {};
+    wbuf = from;
+    is_write = true;
+  }
 };
 
 // How much of a piece of a transfer the kernel queue takes, and through
