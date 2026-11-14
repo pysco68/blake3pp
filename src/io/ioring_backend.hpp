@@ -59,11 +59,12 @@ inline namespace test_seams {
 #endif
 
 // Why a ring could not be had, for the fallback name the tools print.
-// "no api" (Windows 10, or a KernelBase without the exports) and a
-// version below 3 are otherwise indistinguishable in bench output, and a
-// CreateIoRing failure is a third thing again.
+// "no api" (Windows 10, or a KernelBase without the exports), a version
+// below 3 and a ring that cannot read or write are otherwise
+// indistinguishable in bench output, and a CreateIoRing failure is a
+// fourth thing again.
 struct ioring_refusal {
-  enum class kind { none, no_api, old_version, create_failed };
+  enum class kind { none, no_api, old_version, no_read_write, create_failed };
   kind why = kind::none;
   std::uint32_t version = 0;  // what QueryIoRingCapabilities reported
   std::uint32_t hr = 0;       // what CreateIoRing or the op probe answered
@@ -79,6 +80,8 @@ inline std::string no_ioring_suffix(const ioring_refusal& r) {
       return " [ioring: no api]";
     case ioring_refusal::kind::old_version:
       return " [ioring: version " + std::to_string(r.version) + "]";
+    case ioring_refusal::kind::no_read_write:
+      return " [ioring: no read/write ops]";
     case ioring_refusal::kind::create_failed:
       return " [ioring: CreateIoRing failed " + hex32(r.hr) + "]";
     case ioring_refusal::kind::none:
@@ -195,7 +198,7 @@ class ioring {
     if (!op_supported(IORING_OP_READ) || !op_supported(IORING_OP_WRITE)) {
       // A ring that claims version 3 and cannot read or write would
       // answer every transfer with an error while name() said "ioring".
-      refusal_ = {ioring_refusal::kind::old_version,
+      refusal_ = {ioring_refusal::kind::no_read_write,
                   static_cast<std::uint32_t>(caps.MaxVersion), 0};
       close();
       return false;
@@ -510,7 +513,9 @@ class ioring_context {
     }
     const ioring_refusal::kind why = refusal().why;
     return {rung_below::rung_engine,
-            why == ioring_refusal::kind::no_api || why == ioring_refusal::kind::old_version};
+            why == ioring_refusal::kind::no_api ||
+                why == ioring_refusal::kind::old_version ||
+                why == ioring_refusal::kind::no_read_write};
   }
 
   void submit_read(file& f, std::uint64_t off, std::span<std::byte> buf,

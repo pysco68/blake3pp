@@ -196,7 +196,9 @@ for io_uring, or io_uring blocked by seccomp policy -- the Linux backend
 appends why: `" [io_uring: EPERM, blocked by policy]"` or
 `" [io_uring: ENOSYS, kernel too old]"`. The ring does the same where it
 is used directly rather than through the selector: `" [ioring: no api]"`,
-`" [ioring: version 1]"` or `" [ioring: CreateIoRing failed 0x...]"`, and
+`" [ioring: version 1]"`, `" [ioring: no read/write ops]"` (a version-3
+ring whose op probe refuses reads or writes) or
+`" [ioring: CreateIoRing failed 0x...]"`, and
 a ring the selector asked for and could not have puts the same suffix on
 the completion port's names, as in `"iocp+direct [ioring: no api]"`, so a
 run on such a machine reads as what it is. FreeBSD's backend says it the

@@ -767,6 +767,8 @@ TEST_CASE("IoRing: a refused ring names the reason") {
         " [ioring: no api]");
   CHECK(io_impl::no_ioring_suffix({refusal::kind::old_version, 1, 0}) ==
         " [ioring: version 1]");
+  CHECK(io_impl::no_ioring_suffix({refusal::kind::no_read_write, 3, 0}) ==
+        " [ioring: no read/write ops]");
   CHECK(io_impl::no_ioring_suffix(
             {refusal::kind::create_failed, 0, 0x80070057}) ==
         " [ioring: CreateIoRing failed 0x80070057]");
