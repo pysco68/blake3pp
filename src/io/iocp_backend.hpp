@@ -143,7 +143,7 @@ struct win_file {
   unique_handle plain;  // always-buffered+sync: unaligned tails, fallback
   unique_handle fast;   // the reopened handle, when one engaged
   bool direct = false;
-  bool use_iocp = false;
+  bool overlapped = false;  // the reopened handle is FILE_FLAG_OVERLAPPED
   DWORD access = 0;  // as open_file() opened it, for the reopen
   DWORD share = 0;
   std::uint64_t size = 0;   // what open_file() found; 0 for a file written
@@ -244,7 +244,7 @@ struct win_file {
   // NO_BUFFERING and OVERLAPPED are per-open flags: engage by reopening,
   // keeping the plain handle for unaligned lengths. Best-effort: when
   // nothing can be engaged the plain handle stays in charge with direct
-  // and use_iocp still false.
+  // and overlapped still false.
   //
   // Per feature. The two flags are asked for together first, and a
   // refusal drops one and asks again: NO_BUFFERING is a property of the
@@ -303,7 +303,7 @@ struct win_file {
         ::CreateIoCompletionPort(cand.get(), port, 0, 0) == nullptr) {
       return false;
     }
-    use_iocp = with_async;
+    overlapped = with_async;
     fast = std::move(cand);
     direct = with_direct;
     return true;
@@ -357,6 +357,69 @@ struct win_file {
   }
 };
 
+// The synchronous half both Windows contexts' lanes use. The handle is
+// the plain one unless the file has a direct handle that is not
+// overlapped and the length keeps NO_BUFFERING's contract: an overlapped
+// handle is never used synchronously, which is what makes the OVERLAPPED
+// offset below a plain positional read. A non-OVERLAPPED handle plus an
+// OVERLAPPED offset blocks until complete.
+[[nodiscard]] inline HANDLE win_sync_handle(const win_file& f,
+                                            std::size_t len) noexcept {
+  return f.direct && !f.overlapped && len % direct_align == 0 ? f.h()
+                                                              : f.plain.get();
+}
+
+inline void win_sync_read(const win_file& f, std::uint64_t off,
+                          std::span<std::byte> buf) {
+  const HANDLE use_h = win_sync_handle(f, buf.size());
+  std::size_t got = 0;
+  while (got < buf.size()) {
+    OVERLAPPED ov{};
+    const std::uint64_t o = off + got;
+    ov.Offset = static_cast<DWORD>(o);
+    ov.OffsetHigh = static_cast<DWORD>(o >> 32);
+    DWORD n = 0;
+    const auto ask =
+        static_cast<DWORD>(std::min(buf.size() - got, max_win_piece));
+    if (::ReadFile(use_h, buf.data() + got, ask, &n, &ov) == 0) {
+      throw std::system_error(read_error(::GetLastError()), "ReadFile");
+    }
+    if (n == 0) {
+      throw std::system_error(EIO, std::generic_category(), "unexpected EOF");
+    }
+    got += n;
+  }
+}
+
+// The write twin of win_sync_read, and the same handle choice. A
+// zero-length write returns without calling WriteFile, which would only
+// set the file pointer.
+inline void win_sync_write(const win_file& f, std::uint64_t off,
+                           std::span<const std::byte> buf) {
+  if (buf.empty()) {
+    return;
+  }
+  const HANDLE use_h = win_sync_handle(f, buf.size());
+  std::size_t put = 0;
+  while (put < buf.size()) {
+    OVERLAPPED ov{};
+    const std::uint64_t o = off + put;
+    ov.Offset = static_cast<DWORD>(o);
+    ov.OffsetHigh = static_cast<DWORD>(o >> 32);
+    DWORD n = 0;
+    const auto ask =
+        static_cast<DWORD>(std::min(buf.size() - put, max_win_piece));
+    if (::WriteFile(use_h, buf.data() + put, ask, &n, &ov) == 0) {
+      throw_winerr("WriteFile");
+    }
+    if (n == 0) {
+      throw std::system_error(EIO, std::generic_category(),
+                              "write made no progress");
+    }
+    put += n;
+  }
+}
+
 // The IOCP reader context: one completion port, any number of files,
 // reads named by the caller's transfer, completions delivered as callbacks
 // out of poll(). The port is the context's; each file associates its
@@ -394,7 +457,7 @@ class iocp_context {
       f_.open_file(path, how);
       f_.engage(path.c_str(), how.direct_io, ctx.async_requested_,
                 ctx.port_.get());
-      name_ = ctx.name_for(f_.direct, f_.use_iocp, how.write);
+      name_ = ctx.name_for(f_.direct, f_.overlapped, how.write);
       name_ += f_.suffix();
       ctx.adopt(*this);
     }
@@ -507,7 +570,7 @@ class iocp_context {
   [[nodiscard]] DWORD port_len(const transfer& op, std::uint64_t off,
                                std::size_t len) const noexcept {
     const win_file& f = op.owner_file->f_;
-    if (!f.use_iocp || len == 0) {
+    if (!f.overlapped || len == 0) {
       return 0;
     }
     len = std::min(len, max_win_piece);
@@ -626,7 +689,7 @@ class iocp_context {
   // as the io_uring drain does in the same position.
   void drain() noexcept {
     for (file* f = files_; f != nullptr; f = f->next_) {
-      if (f->f_.use_iocp && f->inflight_ > 0) {
+      if (f->f_.overlapped && f->inflight_ > 0) {
         ::CancelIoEx(f->f_.h(), nullptr);
       }
     }
@@ -682,7 +745,7 @@ class iocp_context {
     dropped += pump_.remove_done_if(mine);
     in_flight_ -= std::min(dropped, in_flight_);
     f.inflight_ -= std::min(dropped, f.inflight_);
-    if (!f.f_.use_iocp || f.inflight_ == 0) {
+    if (!f.f_.overlapped || f.inflight_ == 0) {
       return;
     }
     ::CancelIoEx(f.f_.h(), nullptr);
@@ -723,10 +786,10 @@ class iocp_context {
   // The degradation strings are observable API: tools print them and a
   // run is read differently depending on which rung it names, so the
   // spellings and suffixes are fixed.
-  [[nodiscard]] std::string name_for(bool direct, bool use_iocp,
+  [[nodiscard]] std::string name_for(bool direct, bool overlapped,
                                      bool write) const {
     const char* const sync_name = write ? "writefile" : "readfile";
-    if (use_iocp) {
+    if (overlapped) {
       return direct ? "iocp+direct" : "iocp";
     }
     return direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
@@ -907,18 +970,19 @@ class iocp_context {
     try {
       const std::size_t rest = op.len - op.filled;
       if (op.is_write) {
-        write_sync(op.owner_file->f_, op.off + op.filled,
+        win_sync_write(op.owner_file->f_, op.off + op.filled,
                    {op.src + op.filled, rest});
       } else {
-        read_sync(op.owner_file->f_, op.off + op.filled,
+        win_sync_read(op.owner_file->f_, op.off + op.filled,
                   {op.dst + op.filled, rest});
       }
       op.filled = op.len;
     } catch (const std::system_error& e) {
       return e.code();
     } catch (...) {
-      // read_sync and write_sync throw only system_error; anything else
-      // is reported as EIO so it cannot terminate a noexcept lane.
+      // win_sync_read and win_sync_write throw only system_error;
+      // anything else is reported as EIO so it cannot terminate a
+      // noexcept lane.
       return std::make_error_code(std::errc::io_error);
     }
     return {};
@@ -938,70 +1002,6 @@ class iocp_context {
       served_synchronously_++;
     }
     complete(op, ec);
-  }
-
-  // A non-OVERLAPPED handle plus an OVERLAPPED offset blocks until
-  // complete. The use_iocp guard makes it structural that the overlapped
-  // handle is never used synchronously.
-  static void read_sync(win_file& f, std::uint64_t off,
-                        std::span<std::byte> buf) {
-    const HANDLE use_h =
-        f.direct && !f.use_iocp && buf.size() % direct_align == 0
-            ? f.h()
-            : f.plain.get();
-    std::size_t got = 0;
-    while (got < buf.size()) {
-      OVERLAPPED ov{};
-      const std::uint64_t o = off + got;
-      ov.Offset = static_cast<DWORD>(o);
-      ov.OffsetHigh = static_cast<DWORD>(o >> 32);
-      DWORD n = 0;
-      const auto ask =
-          static_cast<DWORD>(std::min(buf.size() - got, max_win_piece));
-      if (::ReadFile(use_h, buf.data() + got, ask, &n, &ov) == 0) {
-        throw std::system_error(read_error(::GetLastError()), "ReadFile");
-      }
-      if (n == 0) {
-        throw std::system_error(EIO, std::generic_category(),
-                                "unexpected EOF");
-      }
-      got += n;
-    }
-  }
-
-  // The write twin of read_sync, and the same handle choice: the
-  // overlapped handle is never used synchronously, and a length
-  // NO_BUFFERING cannot take goes through the plain one.
-  //
-  // A zero-length write returns without calling WriteFile, which would
-  // only set the file pointer.
-  static void write_sync(win_file& f, std::uint64_t off,
-                         std::span<const std::byte> buf) {
-    if (buf.empty()) {
-      return;
-    }
-    const HANDLE use_h =
-        f.direct && !f.use_iocp && buf.size() % direct_align == 0
-            ? f.h()
-            : f.plain.get();
-    std::size_t put = 0;
-    while (put < buf.size()) {
-      OVERLAPPED ov{};
-      const std::uint64_t o = off + put;
-      ov.Offset = static_cast<DWORD>(o);
-      ov.OffsetHigh = static_cast<DWORD>(o >> 32);
-      DWORD n = 0;
-      const auto ask =
-          static_cast<DWORD>(std::min(buf.size() - put, max_win_piece));
-      if (::WriteFile(use_h, buf.data() + put, ask, &n, &ov) == 0) {
-        throw_winerr("WriteFile");
-      }
-      if (n == 0) {
-        throw std::system_error(EIO, std::generic_category(),
-                                "write made no progress");
-      }
-      put += n;
-    }
   }
 
   bool async_requested_ = true;

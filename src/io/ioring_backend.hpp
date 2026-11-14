@@ -283,9 +283,8 @@ class ioring_context {
          const file_open_options& how)
         : ctx_(&ctx) {
       f_.open_file(path, how);
-      ring_handle_ =
-          ctx.engage(f_, path.c_str(), f_.access, f_.share, how.direct_io);
-      name_ = ctx.name_for(f_.direct, ring_handle_, how.write);
+      ctx.engage(f_, path.c_str(), how.direct_io);
+      name_ = ctx.name_for(f_.direct, f_.overlapped, how.write);
       name_ += f_.suffix();
       ctx.adopt(*this);
     }
@@ -310,10 +309,6 @@ class ioring_context {
 
     win_file f_;
     std::string name_ = "readfile";
-    // The reopened handle is FILE_FLAG_OVERLAPPED and may ride the ring.
-    // win_file::use_iocp stays false throughout: there is no port here,
-    // and the synchronous ladder reads this instead.
-    bool ring_handle_ = false;
     ioring_context* ctx_;
     file* next_ = nullptr;      // the context's list of open files
     std::size_t inflight_ = 0;  // this file's share of the context's
@@ -661,7 +656,7 @@ class ioring_context {
   // bytes, the same shape as a short transfer.
   [[nodiscard]] std::uint32_t ring_len(const transfer& op, std::uint64_t off,
                                        std::size_t len) const noexcept {
-    if (!use_ring_ || !op.owner_file->ring_handle_ || len == 0) {
+    if (!use_ring_ || !op.owner_file->f_.overlapped || len == 0) {
       return 0;
     }
     len = std::min(len, max_win_piece);
@@ -711,28 +706,27 @@ class ioring_context {
   // This is win_file::engage() without the completion port: that one
   // associates the reopened handle with an IOCP, which would send the
   // completions somewhere the ring cannot see them.
-  [[nodiscard]] bool engage(win_file& f, const wchar_t* path, DWORD access,
-                            DWORD share, bool want_direct) const noexcept {
+  // win_file::overlapped says afterwards whether the handle may ride.
+  void engage(win_file& f, const wchar_t* path,
+              bool want_direct) const noexcept {
     if (!use_ring_) {
       // No ring to ride: the cache bypass alone is still worth having,
       // and the synchronous path can use a non-overlapped direct handle.
       if (want_direct) {
-        (void)reopen(f, path, access, share, /*with_direct=*/true,
-                     /*with_async=*/false);
+        (void)reopen(f, path, /*with_direct=*/true, /*with_async=*/false);
       }
-      return false;
+      return;
     }
-    if (want_direct && reopen(f, path, access, share, true, true)) {
-      return true;
+    if (want_direct && reopen(f, path, true, true)) {
+      return;
     }
-    return reopen(f, path, access, share, false, true);
+    (void)reopen(f, path, false, true);
   }
 
   // One rung: reopen with exactly these two flags and take the handle
   // only if it opened. Leaves everything untouched on failure, so the
   // caller may ask again for less.
   [[nodiscard]] static bool reopen(win_file& f, const wchar_t* path,
-                                   DWORD access, DWORD share,
                                    bool with_direct,
                                    bool with_async) noexcept {
     DWORD flags = FILE_ATTRIBUTE_NORMAL;
@@ -746,13 +740,14 @@ class ioring_context {
     // created and truncated a file being written, and a second
     // CREATE_ALWAYS here would truncate it again -- including any
     // preallocation just set on it.
-    unique_handle cand(::CreateFileW(path, access, share, nullptr,
+    unique_handle cand(::CreateFileW(path, f.access, f.share, nullptr,
                                      OPEN_EXISTING, flags, nullptr));
     if (!cand) {
       return false;
     }
     f.fast = std::move(cand);
     f.direct = with_direct;
+    f.overlapped = with_async;
     return true;
   }
 
@@ -829,20 +824,20 @@ class ioring_context {
     // already in the buffer must not be fetched again over themselves.
     try {
       const std::size_t rest = op.len - op.filled;
-      const bool fast_async = op.owner_file->ring_handle_;
       if (op.is_write) {
-        write_sync(op.owner_file->f_, fast_async, op.off + op.filled,
-                   {op.src + op.filled, rest});
+        win_sync_write(op.owner_file->f_, op.off + op.filled,
+                       {op.src + op.filled, rest});
       } else {
-        read_sync(op.owner_file->f_, fast_async, op.off + op.filled,
-                  {op.dst + op.filled, rest});
+        win_sync_read(op.owner_file->f_, op.off + op.filled,
+                      {op.dst + op.filled, rest});
       }
       op.filled = op.len;
     } catch (const std::system_error& e) {
       return e.code();
     } catch (...) {
-      // read_sync and write_sync throw only system_error; anything else
-      // is reported as EIO so it cannot terminate a noexcept lane.
+      // win_sync_read and win_sync_write throw only system_error;
+      // anything else is reported as EIO so it cannot terminate a
+      // noexcept lane.
       return std::make_error_code(std::errc::io_error);
     }
     return {};
@@ -862,67 +857,6 @@ class ioring_context {
       served_synchronously_++;
     }
     complete(op, ec);
-  }
-
-  // A non-OVERLAPPED handle plus an OVERLAPPED offset blocks until
-  // complete. `fast_async` makes it structural that an overlapped handle
-  // is never used synchronously.
-  static void read_sync(win_file& f, bool fast_async, std::uint64_t off,
-                        std::span<std::byte> buf) {
-    const HANDLE use_h =
-        f.direct && !fast_async && buf.size() % direct_align == 0
-            ? f.h()
-            : f.plain.get();
-    std::size_t got = 0;
-    while (got < buf.size()) {
-      OVERLAPPED ov{};
-      const std::uint64_t o = off + got;
-      ov.Offset = static_cast<DWORD>(o);
-      ov.OffsetHigh = static_cast<DWORD>(o >> 32);
-      DWORD n = 0;
-      const auto ask =
-          static_cast<DWORD>(std::min(buf.size() - got, max_win_piece));
-      if (::ReadFile(use_h, buf.data() + got, ask, &n, &ov) == 0) {
-        throw std::system_error(read_error(::GetLastError()), "ReadFile");
-      }
-      if (n == 0) {
-        throw std::system_error(EIO, std::generic_category(),
-                                "unexpected EOF");
-      }
-      got += n;
-    }
-  }
-
-  // The write twin of read_sync, and the same handle choice. A
-  // zero-length write returns without calling WriteFile, which would only
-  // set the file pointer.
-  static void write_sync(win_file& f, bool fast_async, std::uint64_t off,
-                         std::span<const std::byte> buf) {
-    if (buf.empty()) {
-      return;
-    }
-    const HANDLE use_h =
-        f.direct && !fast_async && buf.size() % direct_align == 0
-            ? f.h()
-            : f.plain.get();
-    std::size_t put = 0;
-    while (put < buf.size()) {
-      OVERLAPPED ov{};
-      const std::uint64_t o = off + put;
-      ov.Offset = static_cast<DWORD>(o);
-      ov.OffsetHigh = static_cast<DWORD>(o >> 32);
-      DWORD n = 0;
-      const auto ask =
-          static_cast<DWORD>(std::min(buf.size() - put, max_win_piece));
-      if (::WriteFile(use_h, buf.data() + put, ask, &n, &ov) == 0) {
-        throw_winerr("WriteFile");
-      }
-      if (n == 0) {
-        throw std::system_error(EIO, std::generic_category(),
-                                "write made no progress");
-      }
-      put += n;
-    }
   }
 
 #if defined(BLAKE3PP_HAS_IORING_API)
