@@ -623,11 +623,7 @@ class aio_engine {
       return false;  // nothing was queued; the whole batch stays pending
     }
     bool took_any = false;
-    std::size_t seen = 0;
-    pending_.remove_if([&](transfer_part& op) noexcept {
-      if (seen++ >= n) {
-        return false;  // past the batch that was offered
-      }
+    pending_.remove_first_if(n, [&](transfer_part& op) noexcept {
       const long err = all ? EINPROGRESS : op.req->cb._aiocb_private.error;
       if (err == EINPROGRESS) {
         // The kernel has it from here, and charged to the device from

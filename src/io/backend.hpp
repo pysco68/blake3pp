@@ -545,6 +545,29 @@ class deferred_ops {
     return dropped;
   }
 
+  // The same over the oldest `n` queued ops only: for a batch offered from
+  // the front of the queue, whose answer concerns those and leaves the
+  // rest untouched and in order, without walking them.
+  template <class Pred>
+  std::size_t remove_first_if(std::size_t n, Pred drop) noexcept {
+    std::size_t dropped = 0;
+    Op* prev = nullptr;
+    for (Op* op = head_; op != nullptr && n > 0; --n) {
+      Op* const next = op->*Link;
+      if (drop(*op)) {
+        (prev == nullptr ? head_ : prev->*Link) = next;
+        if (tail_ == op) {
+          tail_ = prev;
+        }
+        ++dropped;
+      } else {
+        prev = op;
+      }
+      op = next;
+    }
+    return dropped;
+  }
+
  private:
   Op* head_ = nullptr;
   Op* tail_ = nullptr;
