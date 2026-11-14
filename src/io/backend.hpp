@@ -819,6 +819,14 @@ class deferred_pump {
     return queue_.empty();
   }
 
+  // Whether queued work waits for the polling thread itself: no lane runs
+  // to take it, so only run_one_here() will, and a poll that blocked
+  // instead would wait for what it alone can do.
+  [[nodiscard]] bool needs_poller() const noexcept {
+    const std::lock_guard<std::mutex> lock(m_);
+    return !lanes_.running() && !queue_.empty();
+  }
+
   // Forgets the queued transfers `drop` accepts -- for a file closing with
   // transfers it never issued, which name its handles and its share of
   // the count. None was ever performed, so there is nothing to wait for

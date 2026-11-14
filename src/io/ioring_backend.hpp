@@ -411,9 +411,8 @@ class ioring_engine {
 
   // One kernel transition for everything queued since the last one. A
   // failure is the mechanism's, not a transfer's: there is no way to take
-  // a built entry back out of the ring, so it is latched and check()
-  // throws it from the next poll(), the one place the contract allows a
-  // mechanism failure to surface.
+  // a built entry back out of the ring, so it is latched for
+  // take_failure(), which the context asks before anything waits.
   template <class Op, class Refused>
   void flush(Refused&&) noexcept {
 #if defined(BLAKE3PP_HAS_IORING_API)
@@ -424,13 +423,12 @@ class ioring_engine {
   }
   template <class Op, class Refused>
   void take_back(Refused&&) noexcept {}
-  void check() {
+  [[nodiscard]] std::error_code take_failure() noexcept {
     if (submit_failed_ == 0) {
-      return;
+      return {};
     }
-    const auto hr = std::exchange(submit_failed_, 0u);
-    throw std::system_error(static_cast<int>(hr), std::system_category(),
-                            "SubmitIoRing");
+    return std::error_code(static_cast<int>(std::exchange(submit_failed_, 0u)),
+                           std::system_category());
   }
 
   // One completion, or a wake, or nothing. Blocking, it waits on the
@@ -455,7 +453,7 @@ class ioring_engine {
         if (cqe.UserData == cancel_ud) {
           // The cancel request reports whether it found anything, which
           // changes nothing; the target's own completion is what matters.
-          continue;
+          return {event::kind::progress};
         }
         Op* const op = op_from<Op>(cqe.UserData);
         if (FAILED(cqe.ResultCode)) {
@@ -591,7 +589,7 @@ class ioring_engine {
   }
 
   // One transition for everything queued. False latches the failure for
-  // check() to throw.
+  // take_failure().
   [[nodiscard]] bool submit_quiet() noexcept {
     UINT32 submitted = 0;
     const HRESULT hr =
@@ -627,7 +625,7 @@ class ioring_engine {
 #endif
   std::size_t queued_ = 0;     // entries built and not yet submitted
   std::size_t ring_owed_ = 0;  // requests the ring has yet to hand back
-  std::uint32_t submit_failed_ = 0;  // latched for check() to throw
+  std::uint32_t submit_failed_ = 0;  // latched for take_failure()
   unsigned queue_depth_ = 1;
   bool async_requested_ = true;
   bool use_ring_ = false;

@@ -107,13 +107,19 @@ class fake_engine {
   bool takes_rest = true;         // false: a remainder goes to the pump
   bool submits_on_flush = false;  // pieces wait for flush(), as on a ring
   int refuse_flushes = 0;         // flushes the kernel refuses outright
-  std::error_code latched{};      // what check() throws, once
+  bool fail_submit = false;       // a flush latches a failure, submits nothing
+  std::error_code latched{};      // what take_failure() reports, once
   bool fail_wait = false;         // a blocking next() answers failed
 
   // What the engine saw.
   std::size_t placed = 0;
   std::size_t released = 0;
+  std::size_t submits = 0;  // flushes that gave the kernel something
   std::size_t blocked_unsubmitted = 0;
+
+  // A control entry the kernel owes, a cancel's completion or a wake
+  // poll: next() consumes it as progress.
+  void post_sentinel() { kernel_.push_back(nullptr); }
 
   [[nodiscard]] io_impl::rung_verdict engaged_rung() const noexcept {
     return {rung_engine, true};
@@ -151,7 +157,14 @@ class fake_engine {
 
   template <class Op, class Refused>
   void flush(Refused&& refused) noexcept {
-    if (refuse_flushes > 0 && !queued_.empty()) {
+    if (queued_.empty()) {
+      return;
+    }
+    if (fail_submit) {
+      latched = std::make_error_code(std::errc::io_error);
+      return;
+    }
+    if (refuse_flushes > 0) {
       --refuse_flushes;
       take_back<Op>(refused);
       return;
@@ -167,18 +180,20 @@ class fake_engine {
       refused(static_cast<Op&>(*p));
     }
   }
-  void check() {
-    if (latched) {
-      throw std::system_error(std::exchange(latched, {}), "fake check()");
-    }
+  [[nodiscard]] std::error_code take_failure() noexcept {
+    return std::exchange(latched, {});
   }
 
   template <class Op>
   [[nodiscard]] io_impl::engine_event<Op> next(bool block) noexcept {
     using event = io_impl::engine_event<Op>;
     if (!kernel_.empty()) {
-      Op& op = static_cast<Op&>(*kernel_.front());
+      transfer_part* const front = kernel_.front();
       kernel_.pop_front();
+      if (front == nullptr) {
+        return {event::kind::progress};
+      }
+      Op& op = static_cast<Op&>(*front);
       if (op.cancelled) {
         return {event::kind::completion, &op,
                 std::make_error_code(std::errc::operation_canceled), 0};
@@ -237,6 +252,10 @@ class fake_engine {
 
  private:
   void submit() {
+    if (queued_.empty()) {
+      return;
+    }
+    ++submits;
     kernel_.insert(kernel_.end(), queued_.begin(), queued_.end());
     queued_.clear();
   }
@@ -477,6 +496,84 @@ TEST_CASE("a sibling's completion that surfaces while a file closes is reported"
   CHECK(holds_pattern(sibling_got, 0));
   CHECK(p.calls == 0);
   CHECK(ctx.in_flight() == 0);
+}
+
+// A remainder's submission can fail inside a reap, with the transfer
+// still owed and the entry never given to the kernel. The failure is
+// thrown from that poll, not slept on.
+TEST_CASE("a submit failure latched during a reap is thrown, not waited on") {
+  context ctx({}, 4);
+  ctx.engine().piece = 4096;
+  ctx.engine().submits_on_flush = true;
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(2 * 4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 0, std::span(got), op);
+  ctx.flush();
+  ctx.engine().fail_submit = true;
+  try {
+    (void)ctx.poll(true);
+    FAIL("poll() returned with a remainder it could not submit");
+  } catch (const std::system_error& e) {
+    CHECK(e.code() == std::errc::io_error);
+  }
+  CHECK(ctx.engine().blocked_unsubmitted == 0);
+  CHECK(p.calls == 0);
+  ctx.engine().fail_submit = false;
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(!p.ec);
+  CHECK(holds_pattern(got, 0));
+}
+
+// What the kernel owes can end in a control entry -- a cancel's own
+// completion, a wake poll -- that the engine consumes without a transfer
+// to show for it. The drain finishes on it all the same.
+TEST_CASE("a drain whose last debt is a control entry finishes") {
+  context ctx({}, 4);
+  context::file file(ctx, "fake", {});
+  std::vector<std::byte> got(4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  ctx.submit_read(file, 0, std::span(got), op);
+  ctx.flush();
+  ctx.engine().post_sentinel();
+  ctx.drain();
+  CHECK(ctx.engine().owed() == 0);
+  CHECK(ctx.in_flight() == 0);
+  CHECK(p.calls == 0);
+  ctx.engine().post_sentinel();
+  ctx.drain();
+  CHECK(ctx.engine().owed() == 0);
+}
+
+// Completions that come back together are continued together: their
+// remainders go to the kernel in one submission, not one each.
+TEST_CASE("the remainders of one reap are submitted together") {
+  context ctx({}, 4);
+  ctx.engine().piece = 4096;
+  ctx.engine().submits_on_flush = true;
+  context::file file(ctx, "fake", {});
+  std::vector<std::vector<std::byte>> got(4, std::vector<std::byte>(2 * 4096));
+  std::vector<probe> p(4);
+  std::vector<context::transfer> op(4);
+  for (std::size_t i = 0; i < 4; ++i) {
+    arm(op[i], p[i]);
+    ctx.submit_read(file, i * 2 * 4096, std::span(got[i]), op[i]);
+  }
+  ctx.flush();
+  std::size_t reported = 0;
+  for (int polls = 0; reported < 4; ++polls) {
+    REQUIRE(polls < 1000);
+    reported += ctx.poll(true);
+  }
+  for (std::size_t i = 0; i < 4; ++i) {
+    CHECK(p[i].calls == 1);
+    CHECK(holds_pattern(got[i], i * 2 * 4096));
+  }
+  CHECK(ctx.engine().submits == 2);
 }
 
 TEST_CASE("drain() reports nothing and leaves the context usable") {

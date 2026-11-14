@@ -35,7 +35,7 @@
 //   void flush<Op>(Refused) noexcept; // submit; what the kernel will not
 //                                     // take goes to refused(op)
 //   void take_back<Op>(Refused) noexcept;  // everything not submitted
-//   void check();                     // throws a latched mechanism failure
+//   std::error_code take_failure() noexcept;  // a latched submit failure
 //   engine_event<Op> next<Op>(bool block) noexcept;
 //   bool take_wake() noexcept;  void wake() noexcept;
 //   void cancel_file(file_part&, std::size_t owed) noexcept;
@@ -65,11 +65,13 @@
 namespace blake3pp::detail::io_impl {
 
 // What an engine hands back from one look at its completion queue. Its
-// own sentinels (a cancel's completion, a re-armed wake) never surface:
-// the engine consumes them and looks again.
+// own sentinels (a cancel's completion, a wake poll, a request a drain
+// forgot) are consumed inside it and come back as `progress`: nothing for
+// the caller, but what the kernel owes may have dropped, which is what a
+// drain waits on. A blocking look returns once something happened.
 template <class Op>
 struct engine_event {
-  enum class kind { completion, wake, empty, failed };
+  enum class kind { completion, progress, wake, empty, failed };
   kind what = kind::empty;
   Op* op = nullptr;      // completion: the transfer one piece of was
   std::error_code ec{};  // completion: its error; failed: the queue's own
@@ -182,8 +184,7 @@ class completion_context {
   // The kernel queue first, then the pump's finished list: a completion
   // can move its remainder to the pump, and the list is what serves it.
   std::size_t poll(bool block) {
-    flush();
-    engine_.check();
+    submit_or_throw();
     const std::size_t before = reported_;
     reap(false, before);
     serve_deferred();
@@ -240,16 +241,22 @@ class completion_context {
         each(f->part_, f->inflight_);
       }
     });
+    if (const std::error_code ec = engine_.take_failure()) {
+      lost("", engine_.owed(), ec);
+    }
     while (engine_.owed() > 0) {
       const event e = engine_.template next<transfer>(true);
-      if (e.what == event::kind::wake) {
-        woken_ = true;
-        continue;
+      switch (e.what) {
+        case event::kind::completion:  // reaped, not reported
+        case event::kind::progress:
+          break;
+        case event::kind::wake:
+          woken_ = true;
+          break;
+        case event::kind::empty:
+        case event::kind::failed:
+          lost("", engine_.owed(), e.ec);
       }
-      if (e.what != event::kind::completion) {
-        lost("", engine_.owed(), e.ec);
-      }
-      // Reaped, not reported.
     }
     engine_.end_drain();
     pump_.clear();
@@ -279,7 +286,7 @@ class completion_context {
     // be submitted would be submitted later, into memory this call is
     // about to release. What the kernel refuses comes back to the pump,
     // where the next sweep drops this file's share.
-    flush();
+    submit_or_lost(f);
     engine_.cancel_file(f.part_, f.inflight_);
     for (;;) {
       sweep(f);
@@ -287,6 +294,9 @@ class completion_context {
         return;
       }
       const event e = engine_.template next<transfer>(true);
+      if (e.what == event::kind::progress) {
+        continue;
+      }
       if (e.what == event::kind::wake) {
         woken_ = true;  // remember it; a later poll() still owes it
         continue;
@@ -304,7 +314,7 @@ class completion_context {
         continue;
       }
       if (settle(op, e.ec, e.moved) == settled::requeued) {
-        flush();
+        submit_or_lost(f);
       }
     }
   }
@@ -361,37 +371,66 @@ class completion_context {
     return settled::reported;
   }
 
-  // Takes what the kernel queue has, settling each. With `block`, waits
-  // for the first event, but not once a wake was seen or a remainder went
-  // to the pump: where no lane runs, only poll()'s next step performs it,
-  // so a wait on the queue would never return.
-  void reap(bool block, std::size_t before) {
-    bool parked = false;
-    for (;;) {
-      const event e = engine_.template next<transfer>(
-          block && reported_ == before && !parked && !woken_);
-      if (e.what == event::kind::empty) {
-        break;
-      }
-      if (e.what == event::kind::wake) {
+  // The submission boundary: everything built goes to the kernel, and a
+  // failure the engine latched on the way comes back. Nothing waits on the
+  // kernel queue before this has run since the last placement, because a
+  // wait does not submit and would sleep on entries the kernel never had.
+  void submit_or_throw() {
+    flush();
+    if (const std::error_code ec = engine_.take_failure()) {
+      throw std::system_error(ec, std::string(Engine::mechanism));
+    }
+  }
+  void submit_or_lost(file& f) noexcept {
+    flush();
+    if (const std::error_code ec = engine_.take_failure()) {
+      lost(" of a closing file", f.inflight_, ec);
+    }
+  }
+
+  // One look at the kernel queue, settled. Returns whether it placed a
+  // remainder, which the caller submits with the others before anything
+  // waits.
+  [[nodiscard]] bool take(const event& e) {
+    switch (e.what) {
+      case event::kind::empty:
+      case event::kind::progress:
+        return false;
+      case event::kind::wake:
         woken_ = true;
-        continue;
-      }
-      if (e.what == event::kind::failed) {
+        return false;
+      case event::kind::failed:
         throw std::system_error(e.ec, std::string(Engine::mechanism));
+      case event::kind::completion:
+        break;
+    }
+    e.op->on_engine = false;
+    return settle(*e.op, e.ec, e.moved) == settled::requeued;
+  }
+
+  // Takes everything the kernel queue has ready, then submits the
+  // remainders that produced in one flush. With `block`, while nothing was
+  // reported and no wake arrived, it waits for one more event and goes
+  // round again -- unless the pump holds work only this thread can do,
+  // because no lane runs to take it.
+  void reap(bool block, std::size_t before) {
+    for (;;) {
+      bool requeued = false;
+      for (;;) {
+        const event e = engine_.template next<transfer>(false);
+        if (e.what == event::kind::empty) {
+          break;
+        }
+        requeued = take(e) || requeued;
       }
-      e.op->on_engine = false;
-      switch (settle(*e.op, e.ec, e.moved)) {
-        case settled::requeued:
-          // Submitted before anything can block: a wait does not submit,
-          // and would sleep on an entry the kernel was never given.
-          flush();
-          break;
-        case settled::parked:
-          parked = true;
-          break;
-        case settled::reported:
-          break;
+      if (requeued) {
+        submit_or_throw();
+      }
+      if (!block || reported_ != before || woken_ || pump_.needs_poller()) {
+        return;
+      }
+      if (take(engine_.template next<transfer>(true))) {
+        submit_or_throw();
       }
     }
   }

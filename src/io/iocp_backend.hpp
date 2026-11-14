@@ -606,7 +606,7 @@ class iocp_engine {
   void flush(Refused&&) noexcept {}
   template <class Op, class Refused>
   void take_back(Refused&&) noexcept {}
-  void check() const noexcept {}
+  [[nodiscard]] std::error_code take_failure() noexcept { return {}; }
 
   // One step of the port. The error is read before anything else runs,
   // since any call -- a clock read included -- may overwrite it, and the

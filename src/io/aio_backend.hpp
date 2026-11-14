@@ -386,7 +386,7 @@ class aio_engine {
       refused(static_cast<Op&>(*p));
     }
   }
-  void check() const noexcept {}
+  [[nodiscard]] std::error_code take_failure() noexcept { return {}; }
 
   // One completion, or a wake, or nothing. A kevent() batch is handed out
   // one event at a time; the wake is a user event on the same queue.
@@ -414,7 +414,7 @@ class aio_engine {
         const reaped r = take_result(*req);
         if (req->op == nullptr) {
           release_request(req);  // a drain forgot it; nobody is owed
-          continue;
+          return {event::kind::progress};
         }
         Op& op = static_cast<Op&>(*req->op);
         op.issued = false;

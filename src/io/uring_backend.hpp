@@ -661,7 +661,7 @@ class uring_engine {
     });
   }
 
-  void check() const noexcept {}
+  [[nodiscard]] std::error_code take_failure() noexcept { return {}; }
 
   // One completion, or a wake, or nothing. Blocking, it sleeps until the
   // ring has a completion or the eventfd was signalled, deciding on what
@@ -679,10 +679,11 @@ class uring_engine {
         while (use_uring_ && ring_.reap(ud, res)) {
           if (ud == wake_ud) {
             wake_armed_ = false;  // one-shot; the next flush re-arms
-            continue;
+            return {event::kind::progress};
           }
           if (ud == cancel_ud) {
-            continue;  // the target's own completion is the one that matters
+            // The target's own completion is the one that matters.
+            return {event::kind::progress};
           }
           Op& op = *op_from<Op>(ud);
           if (res < 0) {
