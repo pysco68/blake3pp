@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -14,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <doctest/doctest.h>
@@ -129,8 +131,17 @@ class fake_engine {
     return used ? 4u : lanes;
   }
 
+  // A lane's transfer, which a test can hold at a gate: in_perform says a
+  // lane has taken one, hold_lanes keeps it there.
+  static inline std::atomic<int> in_perform{0};
+  static inline std::atomic<bool> hold_lanes{false};
+
   template <class Op>
   static std::error_code perform(Op& op) noexcept {
+    in_perform.fetch_add(1);
+    while (hold_lanes.load()) {
+      hold_lanes.wait(true);
+    }
     if (!op.is_write) {
       fill(op.buf.subspan(op.filled), op.off + op.filled);
     }
@@ -496,6 +507,50 @@ TEST_CASE("a sibling's completion that surfaces while a file closes is reported"
   CHECK(holds_pattern(sibling_got, 0));
   CHECK(p.calls == 0);
   CHECK(ctx.in_flight() == 0);
+}
+
+// Closing a file that owes nothing does not wait for the lanes, which may
+// be busy with a sibling's transfer for as long as the device takes. The
+// sibling's lane is held at a gate; a watchdog would open it after ten
+// seconds, and the close must not have needed it to.
+TEST_CASE("closing a file that owes nothing does not wait for a busy lane") {
+  context ctx({.async = false}, 4);
+  context::file busy(ctx, "fake", {});
+  std::vector<std::byte> got(4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  fake_engine::in_perform.store(0);
+  fake_engine::hold_lanes.store(true);
+  std::atomic<bool> watchdog_fired{false};
+  std::atomic<bool> done{false};
+  std::thread watchdog([&] {
+    const auto until =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!done.load() && std::chrono::steady_clock::now() < until) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!done.load()) {
+      watchdog_fired.store(true);
+    }
+    fake_engine::hold_lanes.store(false);
+    fake_engine::hold_lanes.notify_all();
+  });
+  ctx.submit_read(busy, 0, std::span(got), op);
+  ctx.flush();
+  while (fake_engine::in_perform.load() == 0 && !watchdog_fired.load()) {
+    std::this_thread::yield();
+  }
+  if (fake_engine::in_perform.load() == 0) {
+    MESSAGE("no lane took the transfer; nothing to check");
+  } else {
+    { context::file idle(ctx, "fake", {}); }
+    CHECK(!watchdog_fired.load());
+  }
+  done.store(true);
+  watchdog.join();
+  CHECK(poll_until(ctx, p) == 1);
+  CHECK(holds_pattern(got, 0));
 }
 
 // A remainder's submission can fail inside a reap, with the transfer

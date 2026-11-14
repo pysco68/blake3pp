@@ -278,6 +278,11 @@ class completion_context {
   // never complete. The file stays on the list: it is still open and may
   // be read again.
   void forget(file& f) noexcept {
+    // A file that owes nothing has nothing queued, on a lane or in the
+    // kernel, so it closes without waiting for its siblings' lanes.
+    if (f.inflight_ == 0) {
+      return;
+    }
     sweep(f);
     if (!engine_.engaged() || f.inflight_ == 0) {
       return;
