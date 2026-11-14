@@ -250,9 +250,8 @@ class fake_engine {
     });
     return static_cast<std::size_t>(n);
   }
-  [[nodiscard]] std::size_t owed() const noexcept { return kernel_.size(); }
-  template <class EachFile>
-  void begin_drain(EachFile&&) noexcept {
+  [[nodiscard]] std::size_t kernel_owed() const noexcept { return kernel_.size(); }
+  void begin_drain() noexcept {
     queued_.clear();
   }
   void end_drain() noexcept {}
@@ -596,12 +595,12 @@ TEST_CASE("a drain whose last debt is a control entry finishes") {
   ctx.flush();
   ctx.engine().post_sentinel();
   ctx.drain();
-  CHECK(ctx.engine().owed() == 0);
+  CHECK(ctx.engine().kernel_owed() == 0);
   CHECK(ctx.in_flight() == 0);
   CHECK(p.calls == 0);
   ctx.engine().post_sentinel();
   ctx.drain();
-  CHECK(ctx.engine().owed() == 0);
+  CHECK(ctx.engine().kernel_owed() == 0);
 }
 
 // Completions that come back together are continued together: their

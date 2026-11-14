@@ -719,7 +719,7 @@ class uring_engine {
   [[nodiscard]] std::size_t drop_unsubmitted(Pred&&) noexcept {
     return 0;
   }
-  [[nodiscard]] std::size_t owed() const noexcept {
+  [[nodiscard]] std::size_t kernel_owed() const noexcept {
     return use_uring_ ? ring_.outstanding : 0;
   }
 
@@ -727,8 +727,7 @@ class uring_engine {
   // take are waited out. The armed wake poll completes only when the
   // eventfd becomes readable, so it is nudged first; the drain reaps it
   // with the rest, and the next flush re-arms it.
-  template <class EachFile>
-  void begin_drain(EachFile&&) noexcept {
+  void begin_drain() noexcept {
     if (!use_uring_) {
       return;
     }

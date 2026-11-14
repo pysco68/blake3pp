@@ -659,14 +659,9 @@ class iocp_engine {
   [[nodiscard]] std::size_t drop_unsubmitted(Pred&&) noexcept {
     return 0;
   }
-  [[nodiscard]] std::size_t owed() const noexcept { return port_owed_; }
+  [[nodiscard]] std::size_t kernel_owed() const noexcept { return port_owed_; }
 
-  template <class EachFile>
-  void begin_drain(EachFile&& each) noexcept {
-    each([this](file_part& p, std::size_t owed) noexcept {
-      cancel_file(p, owed);
-    });
-  }
+  void begin_drain() noexcept {}
   void end_drain() noexcept {}
 
   template <class Op>

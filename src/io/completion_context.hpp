@@ -40,8 +40,10 @@
 //   bool take_wake() noexcept;  void wake() noexcept;
 //   void cancel_file(file_part&, std::size_t owed) noexcept;
 //   std::size_t drop_unsubmitted<Op>(Pred mine) noexcept;
-//   std::size_t owed() const noexcept;  // requests the kernel holds
+//   std::size_t kernel_owed() const noexcept;  // requests the kernel holds,
+//                                      // its own cancel and wake included
 //   void begin_drain() noexcept;  void end_drain() noexcept;
+//                                     // around the drain's wait
 //   void release(Op&) noexcept;       // what the engine lent the op
 //
 // where Op is the context's transfer, so the engine's members are
@@ -86,7 +88,9 @@ class completion_context {
   struct transfer : Engine::transfer_part {
     file* owner_file = nullptr;          // whose transfer this is
     transfer* next_deferred = nullptr;   // the pump's one link
-    bool on_engine = false;  // the kernel owes a completion for it
+    // The engine holds it: queued for the kernel or in the kernel's hands,
+    // so a cancel goes to the engine. False while the pump has it.
+    bool engine_held = false;
   };
   using event = engine_event<transfer>;
 
@@ -171,7 +175,7 @@ class completion_context {
   // under its lock, because the flag is what a lane reads when it takes
   // one; one a lane already has runs to completion.
   void cancel(transfer& op) noexcept {
-    if (!op.on_engine) {
+    if (!op.engine_held) {
       pump_.cancel(op);
       return;
     }
@@ -208,6 +212,9 @@ class completion_context {
   // finished transfer.
   void wake() noexcept { engine_.wake(); }
 
+  // Transfers the caller is still owed a callback for, wherever they are:
+  // queued for the kernel, in its hands, on the pump. A drain or a file's
+  // forget() takes some off without a callback.
   [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
   // Transfers, or remainders of transfers, performed by the lanes (or by
   // poll() where no lane runs) and reported since construction.
@@ -236,15 +243,14 @@ class completion_context {
   // the buffers they name as soon as this returns, so the process ends
   // with the reason instead.
   void drain() noexcept {
-    engine_.begin_drain([this](auto&& each) noexcept {
-      for (file* f = files_; f != nullptr; f = f->next_) {
-        each(f->part_, f->inflight_);
-      }
-    });
-    if (const std::error_code ec = engine_.take_failure()) {
-      lost("", engine_.owed(), ec);
+    engine_.begin_drain();
+    for (file* f = files_; f != nullptr; f = f->next_) {
+      engine_.cancel_file(f->part_, f->inflight_);
     }
-    while (engine_.owed() > 0) {
+    if (const std::error_code ec = engine_.take_failure()) {
+      lost("", engine_.kernel_owed(), ec);
+    }
+    while (engine_.kernel_owed() > 0) {
       const event e = engine_.template next<transfer>(true);
       switch (e.what) {
         case event::kind::completion:  // reaped, not reported
@@ -255,7 +261,7 @@ class completion_context {
           break;
         case event::kind::empty:
         case event::kind::failed:
-          lost("", engine_.owed(), e.ec);
+          lost("", engine_.kernel_owed(), e.ec);
       }
     }
     engine_.end_drain();
@@ -310,7 +316,7 @@ class completion_context {
         lost(" of a closing file", f.inflight_, e.ec);
       }
       transfer& op = *e.op;
-      op.on_engine = false;
+      op.engine_held = false;
       if (op.owner_file == &f) {
         op.device_end();
         engine_.release(op);
@@ -331,7 +337,7 @@ class completion_context {
   void arm(transfer& op, file& f) noexcept {
     op.owner_file = &f;
     op.next_deferred = nullptr;
-    op.on_engine = false;
+    op.engine_held = false;
     in_flight_++;
     f.inflight_++;
   }
@@ -339,17 +345,17 @@ class completion_context {
   // The rest of the transfer, from op.filled: on the kernel queue where
   // the engine takes it, otherwise to a lane.
   bool place(transfer& op) noexcept {
-    op.on_engine = engine_.place(op);
-    used_engine_ = used_engine_ || op.on_engine;
-    if (!op.on_engine) {
+    op.engine_held = engine_.place(op);
+    used_engine_ = used_engine_ || op.engine_held;
+    if (!op.engine_held) {
       pump_.push(op);
     }
-    return op.on_engine;
+    return op.engine_held;
   }
 
   [[nodiscard]] auto to_pump() noexcept {
     return [this](transfer& op) noexcept {
-      op.on_engine = false;
+      op.engine_held = false;
       pump_.push(op);
     };
   }
@@ -409,7 +415,7 @@ class completion_context {
       case event::kind::completion:
         break;
     }
-    e.op->on_engine = false;
+    e.op->engine_held = false;
     return settle(*e.op, e.ec, e.moved) == settled::requeued;
   }
 

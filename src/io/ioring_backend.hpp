@@ -497,10 +497,9 @@ class ioring_engine {
   [[nodiscard]] std::size_t drop_unsubmitted(Pred&&) noexcept {
     return 0;
   }
-  [[nodiscard]] std::size_t owed() const noexcept { return ring_owed_; }
+  [[nodiscard]] std::size_t kernel_owed() const noexcept { return ring_owed_; }
 
-  template <class EachFile>
-  void begin_drain(EachFile&&) noexcept {
+  void begin_drain() noexcept {
 #if defined(BLAKE3PP_HAS_IORING_API)
     if (use_ring_ && queued_ > 0) {
       (void)submit_quiet();

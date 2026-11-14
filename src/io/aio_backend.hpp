@@ -486,16 +486,9 @@ class aio_engine {
       return true;
     });
   }
-  [[nodiscard]] std::size_t owed() const noexcept { return issued_; }
+  [[nodiscard]] std::size_t kernel_owed() const noexcept { return issued_; }
 
-  template <class EachFile>
-  void begin_drain(EachFile&& each) noexcept {
-    if (use_aio_ && issued_ > 0) {
-      each([this](file_part& f, std::size_t) noexcept {
-        cancel_file(f, 1);
-      });
-    }
-  }
+  void begin_drain() noexcept {}
   // The queue is dropped without being walked and the request pool is
   // handed back wholesale, since nothing is in flight by then.
   void end_drain() noexcept {
