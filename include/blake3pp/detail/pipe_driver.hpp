@@ -10,11 +10,11 @@
 // that fills windows in the order admission hands them out delivers the
 // same bytes at the same offsets.
 //
-// The completion half is memory_driver's queued_reads, as in the bench's
-// null_driver: a window whose bytes are already in the arena has one job
-// left, to report from poll() and not before. The fill happens where the
-// pipeline asks for the window's storage, on the driver thread, while the
-// pool hashes the windows admitted before it.
+// The completion half is queued_reads (queued_reads.hpp), as in the bench's
+// null_driver: a window whose bytes are already in the arena has one job left,
+// to report from poll() and not before. The fill happens where the pipeline
+// asks for the window's storage, on the driver thread, while the pool hashes
+// the windows admitted before it.
 //
 // Three things end a window, whichever comes first:
 //
@@ -79,7 +79,7 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/contract.hpp>
 #include <blake3pp/detail/driver.hpp>
-#include <blake3pp/detail/memory_driver.hpp>
+#include <blake3pp/detail/queued_reads.hpp>
 
 namespace blake3pp::detail {
 

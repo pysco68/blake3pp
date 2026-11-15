@@ -15,7 +15,7 @@
 #include <vector>
 
 #include <blake3pp/detail/driver.hpp>
-#include <blake3pp/detail/memory_driver.hpp>
+#include <blake3pp/detail/queued_reads.hpp>
 
 namespace b3bench {
 
@@ -61,7 +61,7 @@ struct null_device {
 // the bytes here are a handful of resident windows, not a working set.
 // See bench/README.md.
 //
-// The completion half is memory_driver's, because a source with nothing
+// The completion half is queued_reads, because a source with nothing
 // to read has exactly one job -- report from poll() and not before.
 // Given a null_device it paces those reports instead, so the synthetic
 // arms can be run against a device whose knee was chosen rather than
