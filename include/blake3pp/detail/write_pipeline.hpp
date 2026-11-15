@@ -198,8 +198,9 @@ class write_scope
   // What the run did, in the same fields a read run fills.
   void report(driver_stats& d) const noexcept {
     d.queue_depth_final = in_flight_cap_;
-    d.queue_depth_peak = in_flight_cap_;
-    d.agent_busy_ns = fill_busy_ns_.load(std::memory_order_relaxed);
+    d.queue_depth_peak =
+        std::max<std::uint64_t>(d.queue_depth_peak, in_flight_cap_);
+    d.agent_busy_ns += fill_busy_ns_.load(std::memory_order_relaxed);
     transfers_.report(d, loop_.driver());
   }
 

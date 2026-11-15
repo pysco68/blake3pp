@@ -73,7 +73,9 @@ auto s = blake3pp::async::async_update_file(ctx, h, path, sched, {},
 
 `async_update_files` takes the same argument and fills one buffer with
 every file's windows; each record's `index` is the window's position in
-its own file.
+its own file. Its `driver_stats` cover the batch: each file's counts are
+added, peaks keep the largest, and `read_backend` names the first file's
+rung. A buffer reused without `clear()` merges the same way.
 
 Per-agent records are opt-in, by giving the buffer a second span. One
 bulk invocation is at most one record per thread per window, which sizes

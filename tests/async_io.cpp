@@ -255,6 +255,12 @@ TEST_CASE("the senders record into a buffer handed in as a tracer") {
     ctx.run_until_idle();
     CHECK(ended == 3);
     CHECK(trace.windows().size() == 3 * windows_per_file);
+    // The driver's counters cover the batch, not whichever file ended
+    // last.
+    const blake3pp::driver_stats& d = trace.driver();
+    CHECK(d.transfers_landed == 3 * windows_per_file);
+    CHECK(d.transfer_bytes == 3 * content.size());
+    CHECK_FALSE(blake3pp::read_backend(d).empty());
   }
 
   SUBCASE("the default records nothing") {

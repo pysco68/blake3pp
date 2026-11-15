@@ -809,18 +809,31 @@ struct transfer_stats {
   // attribute it: that belongs to whoever performed the transfer, so it is
   // preferred, and the admission-to-landing span stands only where no
   // performer can say.
+  //
+  // This run's own counts are added to what the buffer holds, so a
+  // batch's files over one buffer report all of them. What the driver
+  // reports is its own total over every file it served, and is taken as
+  // it stands.
   template <file_driver D>
   void report(driver_stats& d, const D& drv) const noexcept {
-    d.transfers_landed = landed;
-    d.transfer_bytes = bytes;
-    d.starved_ns = starved_ns;
+    d.transfers_landed += landed;
+    d.transfer_bytes += bytes;
+    d.starved_ns += starved_ns;
     const device_service svc = device_service_of(drv);
-    d.device_depth = svc.depth;
+    d.device_depth = std::max<std::uint64_t>(d.device_depth, svc.depth);
     d.lane_wait_ns = svc.lane_wait_ns;
-    const bool attributed = svc.device.transfers > 0;
-    d.device_wait_ns = attributed ? svc.device.total_ns : device_wait_ns;
-    d.device_wait_min_ns =
-        attributed ? svc.device.min_ns : (landed > 0 ? device_min_ns : 0);
+    if (svc.device.transfers > 0) {
+      d.device_wait_ns = svc.device.total_ns;
+      d.device_wait_min_ns = svc.device.min_ns;
+    } else {
+      d.device_wait_ns += device_wait_ns;
+      if (landed > 0) {
+        d.device_wait_min_ns = d.device_wait_min_ns == 0
+                                   ? device_min_ns
+                                   : std::min(d.device_wait_min_ns,
+                                              device_min_ns);
+      }
+    }
   }
 };
 

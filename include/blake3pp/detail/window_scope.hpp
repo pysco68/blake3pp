@@ -384,14 +384,17 @@ class read_instruments {
     }
   }
 
-  // The counters this owns, into the trace's driver_stats. After the
-  // run, with every agent joined.
+  // The counters this owns, merged into the trace's driver_stats: counts
+  // add and peaks keep the larger, so a batch's files over one buffer
+  // report all of them. After the run, with every agent joined.
   void report(driver_stats& d) const noexcept {
-    d.admission_stalls = admission_stalls_;
-    d.max_pending = max_pending_;
-    d.max_reads_in_flight = max_reading_;
-    d.max_windows_in_flight = max_windows_;
-    d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
+    d.admission_stalls += admission_stalls_;
+    d.max_pending = std::max<std::uint64_t>(d.max_pending, max_pending_);
+    d.max_reads_in_flight =
+        std::max<std::uint64_t>(d.max_reads_in_flight, max_reading_);
+    d.max_windows_in_flight =
+        std::max<std::uint64_t>(d.max_windows_in_flight, max_windows_);
+    d.agent_busy_ns += agent_busy_ns_.load(std::memory_order_relaxed);
   }
 
  private:
@@ -649,11 +652,16 @@ class window_scope
     if (trace_buffer* const trace = inst_.trace(); trace != nullptr) {
       driver_stats& d = trace->driver();
       // The rung is the file's, which closes with the run: copied here so a
-      // trace read afterwards still names it.
-      set_read_backend(d, file_.name());
+      // trace read afterwards still names it. Several runs into one buffer
+      // (a batch's files) merge their counts, and the first file names the
+      // rung.
+      if (read_backend(d).empty()) {
+        set_read_backend(d, file_.name());
+      }
       inst_.report(d);
       d.queue_depth_final = reads_in_flight_;
-      d.queue_depth_peak = reads_in_flight_;
+      d.queue_depth_peak =
+          std::max<std::uint64_t>(d.queue_depth_peak, reads_in_flight_);
       transfers_.report(d, loop_.driver());
     }
     if (eptr_) {
