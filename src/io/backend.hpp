@@ -8,10 +8,9 @@
 // Three rules span every operation:
 //  - Teardown drain: a context's destructor drains every in-flight
 //    operation, running no callback. A file's destructor that closes with
-//    transfers owed does the same, either by draining the whole context
-//    (uring, aio, sync_context) or by forget()ting its own transfers
-//    (iocp, ioring, gcd). The engines declare their buffer pool member
-//    before the context, so the drain runs before the pool is freed.
+//    transfers owed does the same for its own, through forget(). The
+//    engines declare their buffer pool member before the context, so the
+//    drain runs before the pool is freed.
 //  - Operation lifetime: an operation must outlive the drain of its file
 //    and of its context. A lane or a dispatch worker may be finishing a
 //    transfer until that drain returns, and it writes the result into the
@@ -832,19 +831,6 @@ class deferred_pump {
     }
     perform_one(perform_, *op, cancelled);
     return op;
-  }
-
-  // Takes a transfer that was performed somewhere other than a lane, with
-  // its result already set, onto the done list, and wakes the polling
-  // thread as a lane does: for a backend whose own workers do the
-  // transfers. Touches the operation only under the lock. Any thread.
-  void land(Op& op) noexcept {
-    {
-      const std::lock_guard<std::mutex> lock(m_);
-      op.next_deferred = done_;
-      done_ = &op;
-    }
-    lanes_.wake_poller();
   }
 
   // Hands `report` every transfer the lanes finished, then the one
