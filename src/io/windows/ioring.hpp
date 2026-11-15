@@ -50,12 +50,12 @@
 #include "io/options.hpp"
 // unique_handle, win_file, throw_winerr and read_error: the Windows
 // handle plumbing is the port backend's and is shared verbatim.
-#include "io/iocp_backend.hpp"
+#include "io/windows/iocp.hpp"
 
 namespace blake3pp::detail::io_impl {
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
-// With the port's helpers, under their seamed name (see iocp_backend.hpp).
+// With the port's helpers, under their seamed name (see windows/iocp.hpp).
 inline namespace test_seams {
 #endif
 
@@ -646,7 +646,7 @@ class ioring_engine {
 
 using ioring_context = completion_context<ioring_engine>;
 
-// Definition-site conformance check (see uring_backend.hpp): fails here,
+// Definition-site conformance check (see linux/io_uring.hpp): fails here,
 // with the missed requirement named, the first time this header is
 // compiled, before any engine instantiation exists.
 static_assert(io_context<ioring_context>);

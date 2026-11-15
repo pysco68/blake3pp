@@ -1,6 +1,6 @@
 // file_reader implementation: a pimpl shell around the portable engine.
 // This TU contains no platform code and no engine logic:
-// io/backend_select.hpp names the engine the OS gets, already bound to
+// io/native.hpp names the engine the OS gets, already bound to
 // its context -- io_uring (Linux), IOCP (Windows), GCD (macOS), plain
 // pread (other POSIX), stdio (everything else) -- and io/engine.hpp is
 // the window/slot machine behind it. Runtime degradation
@@ -15,7 +15,7 @@
 #include <optional>
 #include <string_view>
 
-#include "io/backend_select.hpp"
+#include "io/native.hpp"
 #include "io/engine.hpp"
 
 namespace blake3pp::detail {

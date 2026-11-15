@@ -70,7 +70,7 @@
 
 #include <blake3pp/detail/driver.hpp>
 
-#include "io/engine_rung.hpp"
+#include "io/ladder.hpp"
 #include "io/lanes.hpp"
 #include "io/options.hpp"
 

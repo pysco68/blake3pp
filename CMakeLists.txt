@@ -211,7 +211,7 @@ if(BLAKE3PP_WITH_IO)
     src/io_hash.cpp)
   target_compile_definitions(blake3pp PUBLIC BLAKE3PP_WITH_IO=1)
   # The I/O ring is compiled in only where the SDK has <ioringapi.h>
-  # (src/io/ioring_backend.hpp reads it with __has_include). Without it the
+  # (src/io/windows/ioring.hpp reads it with __has_include). Without it the
   # completion port is the async engine, and an ioring request runs on it.
   if(WIN32)
     include(CheckIncludeFiles)

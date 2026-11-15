@@ -30,29 +30,29 @@
 // off-platform code compiled AND executed on every platform
 // (on Linux the selector only ever compiles the io_uring backend).
 #include "io/engine.hpp"
-#include "io/stdio_backend.hpp"
+#include "io/portable/stdio.hpp"
 #if defined(__unix__) || defined(__APPLE__)
-#include "io/pread_backend.hpp"
+#include "io/posix/pread.hpp"
 #endif
 #if defined(__linux__)
 #include <fcntl.h>
 #include "io/options.hpp"
-#include "io/uring_backend.hpp"
+#include "io/linux/io_uring.hpp"
 #endif
 #if defined(__FreeBSD__)
-#include "io/aio_backend.hpp"
+#include "io/freebsd/aio.hpp"
 #endif
 #if defined(__APPLE__)
-#include "io/gcd_backend.hpp"
+#include "io/macos/dispatch.hpp"
 #endif
 #if defined(_WIN32)
-#include "io/iocp_backend.hpp"
-#include "io/ioring_backend.hpp"
+#include "io/windows/iocp.hpp"
+#include "io/windows/ioring.hpp"
 #endif
 // The platform's own choice, which is what the engine list is read off:
 // the tests below ask the selected context what rung it engaged and
 // hold the public list to the answer.
-#include "io/backend_select.hpp"
+#include "io/native.hpp"
 #include "counting_kernels.hpp"
 #include "temp_names.hpp"
 
@@ -1162,7 +1162,7 @@ TEST_CASE("an engaged backend is the engine this kernel grants, or says why not"
   CAPTURE(engine);
 
   // A degradation the backend could explain carries the reason in
-  // brackets, as uring_backend.hpp's no_uring_suffix() does.
+  // brackets, as linux/io_uring.hpp's no_uring_suffix() does.
   const auto engaged_or_explained = [](std::string_view name,
                                        std::string_view expect) {
     return name.find(expect) != std::string_view::npos ||

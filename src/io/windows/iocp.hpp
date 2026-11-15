@@ -704,7 +704,7 @@ class iocp_engine {
 
 using iocp_context = completion_context<iocp_engine>;
 
-// Definition-site conformance check (see uring_backend.hpp): fails here,
+// Definition-site conformance check (see linux/io_uring.hpp): fails here,
 // with the missed requirement named, the first time MSVC compiles this
 // header, before any engine instantiation exists.
 static_assert(io_context<iocp_context>);

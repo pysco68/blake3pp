@@ -18,7 +18,7 @@
 #include "io/engine.hpp"
 
 #if defined(__linux__)
-#include "io/uring_backend.hpp"
+#include "io/linux/io_uring.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = uring_context;
 }  // namespace blake3pp::detail::io_impl
@@ -31,8 +31,8 @@ using native_io_context = uring_context;
 #include <string>
 #include <string_view>
 
-#include "io/iocp_backend.hpp"
-#include "io/ioring_backend.hpp"
+#include "io/windows/iocp.hpp"
+#include "io/windows/ioring.hpp"
 namespace blake3pp::detail::io_impl {
 
 // Windows has two completion mechanisms, so it is the one platform whose
@@ -208,22 +208,22 @@ static_assert(io_context<windows_context>);
 using native_io_context = windows_context;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__APPLE__)
-#include "io/gcd_backend.hpp"
+#include "io/macos/dispatch.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = gcd_context;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__FreeBSD__)
-#include "io/aio_backend.hpp"
+#include "io/freebsd/aio.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = aio_context;
 }  // namespace blake3pp::detail::io_impl
 #elif defined(__unix__)
-#include "io/pread_backend.hpp"
+#include "io/posix/pread.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = pread_context;
 }  // namespace blake3pp::detail::io_impl
 #else
-#include "io/stdio_backend.hpp"
+#include "io/portable/stdio.hpp"
 namespace blake3pp::detail::io_impl {
 using native_io_context = stdio_context;
 }  // namespace blake3pp::detail::io_impl

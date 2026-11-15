@@ -2,7 +2,7 @@
 
 // The portable floor: buffered, synchronous stdio on one lane, for a
 // platform that matches none of the native backends in
-// backend_select.hpp. Internal to src/io/, never installed.
+// native.hpp. Internal to src/io/, never installed.
 
 #include <cassert>
 #include <cerrno>
@@ -136,7 +136,7 @@ class stdio_source {
 
 using stdio_context = sync_context<stdio_source>;
 
-// Definition-site conformance check (see uring_backend.hpp).
+// Definition-site conformance check (see linux/io_uring.hpp).
 static_assert(io_context<stdio_context>);
 
 }  // namespace blake3pp::detail::io_impl

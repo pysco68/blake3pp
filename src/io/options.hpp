@@ -67,7 +67,7 @@ struct file_open_options {
   // range valid without zeroing it (SetFileValidData), which needs
   // SeManageVolumePrivilege and enables it on the process token. Where
   // that cannot be had the file is made sparse instead, which is also
-  // what a write without this does; see iocp_backend.hpp. Unix file
+  // what a write without this does; see windows/iocp.hpp. Unix file
   // systems preallocate unwritten extents that read as zeros for free,
   // so the flag means nothing there.
   bool waive_zero_fill = false;

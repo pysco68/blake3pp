@@ -1,7 +1,7 @@
 // file_writer implementation: the write-side mirror of file_reader.cpp,
 // and like it just a pimpl shell: polled_writer_engine (io/engine.hpp)
 // is the slot machine, written once against the io_context concept, and
-// io/backend_select.hpp decides which context it is instantiated with
+// io/native.hpp decides which context it is instantiated with
 // here.
 
 #include <blake3pp/detail/file_writer.hpp>
@@ -12,7 +12,7 @@
 #include <memory>
 #include <string_view>
 
-#include "io/backend_select.hpp"
+#include "io/native.hpp"
 #include "io/engine.hpp"
 
 namespace blake3pp::detail {

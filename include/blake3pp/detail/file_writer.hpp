@@ -58,7 +58,7 @@ struct file_writer_options {
   bool async = true;         // try io_uring; silently degrade if refused
   // Issue each write on the kernel's worker threads (io_uring: IOSQE_ASYNC)
   // rather than inline in the submit call, the reader's offload_submit for
-  // the producer side; see src/io/uring_backend.hpp.
+  // the producer side; see src/io/linux/io_uring.hpp.
   bool offload_submit = true;
   // Windows: prefer the I/O ring (Windows 11) over the completion port
   // where the machine has one; off selects the port. The engaged rung is

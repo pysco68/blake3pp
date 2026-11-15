@@ -114,7 +114,7 @@ struct io_op {
   // other backends' larger fields (Windows' OVERLAPPED among them) the
   // rest. What keeps FreeBSD's inside it is
   // that its 160-byte struct aiocb lives in the CONTEXT's request pool
-  // rather than in the operation; src/io/aio_backend.hpp says why the
+  // rather than in the operation; src/io/freebsd/aio.hpp says why the
   // contract requires that anyway.
   // A backend that outgrows these numbers fails the static_assert in
   // emplace_native() below instead of overrunning storage silently, and
@@ -125,7 +125,7 @@ struct io_op {
   //
   // WINDOWS is the binding case. It chooses the ring or the port at
   // runtime, and one transfer type serves both: the completion port's,
-  // whose OVERLAPPED the ring carries unused (src/io/backend_select.hpp).
+  // whose OVERLAPPED the ring carries unused (src/io/native.hpp).
   // That is 144 bytes, as the Windows build's op-storage case reports.
   //
   // 192 leaves 48 bytes over that 144. The slack costs bytes per

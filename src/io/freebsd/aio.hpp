@@ -56,7 +56,7 @@
 #include "io/options.hpp"
 #include "io/waiter.hpp"
 #include "io/completion_context.hpp"
-#include "io/posix_file.hpp"
+#include "io/posix/file.hpp"
 
 namespace blake3pp::detail::io_impl {
 

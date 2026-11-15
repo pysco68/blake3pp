@@ -45,28 +45,28 @@
 #include "io/transfer.hpp"
 #include "io/waiter.hpp"
 #include "io/engine.hpp"
-#include "io/stdio_backend.hpp"
+#include "io/portable/stdio.hpp"
 #if defined(__unix__) || defined(__APPLE__)
-#include "io/pread_backend.hpp"
+#include "io/posix/pread.hpp"
 #endif
 #if defined(__linux__)
 #include <unistd.h>  // getpid, for a temporary name under /dev/shm
 
-#include "io/uring_backend.hpp"
+#include "io/linux/io_uring.hpp"
 #endif
 #if defined(__FreeBSD__)
 #include <aio.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "io/aio_backend.hpp"
+#include "io/freebsd/aio.hpp"
 #endif
 #if defined(_WIN32)
-#include "io/iocp_backend.hpp"
-#include "io/ioring_backend.hpp"
+#include "io/windows/iocp.hpp"
+#include "io/windows/ioring.hpp"
 #endif
 #if defined(__APPLE__)
-#include "io/gcd_backend.hpp"
+#include "io/macos/dispatch.hpp"
 #endif
 
 namespace {

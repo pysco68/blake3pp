@@ -3,7 +3,7 @@
 // The two portable I/O engines, written exactly once as class templates
 // constrained by io_context, the concept in io/io_context.hpp. The public
 // file_reader/file_writer TUs instantiate them with what
-// backend_select.hpp picks; the tests instantiate them again with the
+// native.hpp picks; the tests instantiate them again with the
 // off-platform contexts and backends, so those stay compiled AND executed
 // on every platform even though the selector never chooses them there.
 // The constraint is the contract: an engine can only speak the concept's

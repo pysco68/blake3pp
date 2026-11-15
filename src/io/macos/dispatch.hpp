@@ -36,13 +36,13 @@
 #include "io/lanes.hpp"
 #include "io/options.hpp"
 #include "io/completion_context.hpp"
-#include "io/posix_file.hpp"
+#include "io/posix/file.hpp"
 
 namespace blake3pp::detail::io_impl {
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
 // The test executable compiles this backend with a seam, under a name of
-// its own (see uring_backend.hpp).
+// its own (see linux/io_uring.hpp).
 inline namespace test_seams {
 #endif
 
@@ -342,7 +342,7 @@ class gcd_engine {
 
 using gcd_context = completion_context<gcd_engine>;
 
-// Definition-site conformance check (see uring_backend.hpp).
+// Definition-site conformance check (see linux/io_uring.hpp).
 static_assert(io_context<gcd_context>);
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
