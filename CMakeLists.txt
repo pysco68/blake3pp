@@ -210,6 +210,20 @@ if(BLAKE3PP_WITH_IO)
     src/io/stream_reader.cpp
     src/io_hash.cpp)
   target_compile_definitions(blake3pp PUBLIC BLAKE3PP_WITH_IO=1)
+  # The I/O ring is compiled in only where the SDK has <ioringapi.h>
+  # (src/io/windows/ioring.hpp reads it with __has_include). Without it the
+  # completion port is the async engine, and an ioring request runs on it.
+  if(WIN32)
+    include(CheckIncludeFiles)
+    check_include_files("windows.h;ioringapi.h" BLAKE3PP_SDK_HAS_IORING LANGUAGE CXX)
+    if(BLAKE3PP_SDK_HAS_IORING)
+      message(STATUS "blake3pp: Windows I/O - I/O ring and completion port")
+    else()
+      message(STATUS
+        "blake3pp: Windows I/O - <ioringapi.h> not in this SDK, completion "
+        "port only")
+    endif()
+  endif()
 endif()
 add_library(blake3pp::blake3pp ALIAS blake3pp)
 

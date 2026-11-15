@@ -15,9 +15,12 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <system_error>
 
-#include "io/backend.hpp"
+#include "io/fd.hpp"
+#include "io/options.hpp"
+#include "io/transfer.hpp"
 
 #if defined(__has_feature)
 #if __has_feature(memory_sanitizer)
@@ -96,11 +99,11 @@ struct posix_file {
     return direct() && len % direct_align == 0 ? fd() : fd_plain();
   }
 
-  void pread_all(int use_fd, std::byte* dst, std::size_t len,
+  void pread_all(int use_fd, std::span<std::byte> dst,
                  std::uint64_t off) const {
     std::size_t got = 0;
-    while (got < len) {
-      const ssize_t n = ::pread(use_fd, dst + got, len - got,
+    while (got < dst.size()) {
+      const ssize_t n = ::pread(use_fd, dst.data() + got, dst.size() - got,
                                 static_cast<off_t>(off + got));
       if (n < 0) {
         if (errno == EINTR) {
@@ -116,11 +119,11 @@ struct posix_file {
     }
   }
 
-  void pwrite_all(int use_fd, const std::byte* src, std::size_t len,
+  void pwrite_all(int use_fd, std::span<const std::byte> src,
                   std::uint64_t off) const {
     std::size_t put = 0;
-    while (put < len) {
-      const ssize_t n = ::pwrite(use_fd, src + put, len - put,
+    while (put < src.size()) {
+      const ssize_t n = ::pwrite(use_fd, src.data() + put, src.size() - put,
                                  static_cast<off_t>(off + put));
       if (n < 0) {
         if (errno == EINTR) {
@@ -142,6 +145,87 @@ struct posix_file {
   unique_fd direct_;
   bool nocache_ = false;
 };
+
+// The transfer the POSIX engines with a kernel queue, io_uring and AIO,
+// share: span_transfer and the file whose descriptors carry it. Each
+// engine's transfer adds its own kernel state.
+struct posix_transfer : span_transfer {
+  posix_file* sync_file = nullptr;  // the deferred path needs the pair
+
+  void arm_read(posix_file& f, std::uint64_t at,
+                std::span<std::byte> to) noexcept {
+    arm_span_read(at, to);
+    sync_file = &f;
+  }
+  void arm_write(posix_file& f, std::uint64_t at,
+                 std::span<const std::byte> from) noexcept {
+    arm_span_write(at, from);
+    sync_file = &f;
+  }
+};
+
+// How much of a piece of a transfer the kernel queue takes, and through
+// which descriptor. Asked for both directions and for every piece: the
+// initial one, and what is left after a short completion, which resumes
+// at position() -- a granule boundary only if the device stopped on one.
+//
+// O_DIRECT rejects an unaligned length and an unaligned offset, so the
+// direct descriptor carries whole granules at a granule offset, and a
+// piece with a sub-granule end is cut to the granules it holds. The rest
+// goes through the plain descriptor, which takes any shape: the end of a
+// file whose size is not a multiple of the granule, a resumption off a
+// boundary, and every piece of a buffered file. A file's last window
+// therefore stays asynchronous however long it is.
+struct fd_piece {
+  int fd;           // -1: the kernel queue takes none of it
+  std::size_t len;  // what rides, from the piece's start
+};
+[[nodiscard]] inline fd_piece direct_piece(const posix_file& f,
+                                           std::uint64_t off,
+                                           std::size_t len) noexcept {
+  if (f.direct()) {
+    const std::size_t granules = len - len % direct_align;
+    if (off % direct_align == 0 && granules > 0) {
+      return {f.fd(), granules};
+    }
+  }
+  return {f.fd_plain(), len};
+}
+
+// The rest of a transfer, moved synchronously: from where it stopped,
+// which for a fresh one is the start and for a continuation is what the
+// kernel already moved. The remainder picks the descriptor, since an
+// unalignable rest is exactly what the plain fd exists for. Leaves
+// op.filled alone, so an engine that reports the bytes as a completion
+// is the one place they are counted. Touches the operation and its file
+// and nothing else.
+[[nodiscard]] inline std::error_code carry_rest(
+    const posix_transfer& op) noexcept {
+  try {
+    const int fd = op.sync_file->sync_fd(op.remaining());
+    if (op.is_write) {
+      op.sync_file->pwrite_all(fd, op.write_remaining(), op.position());
+    } else {
+      op.sync_file->pread_all(fd, op.read_remaining(), op.position());
+    }
+  } catch (const std::system_error& e) {
+    return e.code();
+  } catch (...) {
+    // posix_file throws only system_error; anything else is reported as
+    // EIO so it cannot terminate a noexcept lane.
+    return std::make_error_code(std::errc::io_error);
+  }
+  return {};
+}
+
+// The same on a lane, which completes the transfer itself.
+[[nodiscard]] inline std::error_code perform_rest(posix_transfer& op) noexcept {
+  const std::error_code ec = carry_rest(op);
+  if (!ec) {
+    op.filled = op.length();
+  }
+  return ec;
+}
 
 }  // namespace blake3pp::detail::io_impl
 

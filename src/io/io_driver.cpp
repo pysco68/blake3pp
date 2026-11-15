@@ -2,7 +2,7 @@
 // arena whose lifetime the drain depends on.
 //
 // Every member forwards to the native context named by
-// io/backend_select.hpp. The only real work here is fitting the
+// io/native.hpp. The only real work here is fitting the
 // backend's operation inside the caller-owned io_op and putting the
 // arena on the right side of the drain.
 
@@ -19,8 +19,9 @@
 #include <system_error>
 #include <utility>
 
-#include "io/backend.hpp"
-#include "io/backend_select.hpp"
+#include "io/options.hpp"
+#include "io/transfer.hpp"
+#include "io/native.hpp"
 
 namespace blake3pp::detail {
 

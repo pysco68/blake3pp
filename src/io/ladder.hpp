@@ -20,14 +20,14 @@
 //
 // The chain of rung_below from native_io_context is the set of engines
 // this binary carries, in preference order. A build without
-// <ioringapi.h> cannot report an I/O ring: windows_context declares its
+// <ioringapi.h> cannot report an I/O ring: windows_engine declares its
 // top rung behind the same macro the ring itself is behind. The verdict
 // a constructed context hands back is the rung it landed on, which is
 // the engine a fresh open uses.
 //
 // This is the DECLARATION form. The composition form -- every rung a
-// real object, the way windows_context already holds a real
-// ioring_context and a real iocp_context -- is a separate question. The
+// real object, the way windows_engine already holds a real
+// ioring_engine or a real iocp_engine -- is a separate question. The
 // synchronous rung a POSIX context degrades to is served inline from
 // its deferred_ list, which is where the contract's hardest rule lives
 // (a drain must not read a transfer). Declaring a rung moves no code;

@@ -45,7 +45,8 @@ add_executable(blake3pp_tests
 # file-I/O layer there is nothing for it to link against.
 if(BLAKE3PP_WITH_IO)
   target_sources(blake3pp_tests PRIVATE
-    io.cpp io_context.cpp io_no_provider.cpp file_pipeline.cpp
+    io.cpp io_context.cpp completion_context.cpp io_no_provider.cpp
+    file_pipeline.cpp
     pipe_source.cpp write_pipeline.cpp async_io.cpp
     # Two translation units on purpose: see RULE 6 in
     # detail/ex_compat.hpp. One drives the pipeline through the async

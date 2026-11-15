@@ -171,9 +171,17 @@ def disassemble(path, objdump, arch):
     if run.returncode:
         # Usually a host disassembler handed a foreign object: binutils is
         # built per target, and the generic objdump refuses what it cannot
-        # decode. Name the tool and the target instead of a traceback.
+        # decode. Name the tool and the target instead of a traceback, and
+        # the disassemblers that were looked for before the host one.
+        hint = ""
+        cross = BINUTILS_PREFIX.get(arch, "") + "objdump"
+        if base == "objdump" and arch in BINUTILS_PREFIX and not shutil.which(cross) \
+                and not shutil.which("llvm-objdump") and not versioned("llvm-objdump"):
+            hint = (f" -- no {cross} or llvm-objdump on PATH, so the host objdump"
+                    " was used; the toolchain image may predate them")
         sys.exit(f"objscan: {os.path.basename(objdump)} failed on {path} ({arch}): "
-                 + (run.stderr.strip().splitlines() or ["exit " + str(run.returncode)])[0])
+                 + (run.stderr.strip().splitlines() or ["exit " + str(run.returncode)])[0]
+                 + hint)
     out = run.stdout
     functions = collections.OrderedDict()
     current, last = None, None

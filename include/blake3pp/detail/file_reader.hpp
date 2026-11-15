@@ -49,7 +49,7 @@ struct file_reader_options {
   // rather than inline in the submit call. Issuing a large direct read is
   // real CPU work (pinning pages, building and queueing the bios) that
   // otherwise lands on the thread that also waits for the hash; see
-  // src/io/uring_backend.hpp. Ignored by backends without the notion.
+  // src/io/linux/io_uring.hpp. Ignored by backends without the notion.
   bool offload_submit = true;
   // Windows: prefer the I/O ring (Windows 11) over the completion port
   // where the machine has one; off selects the port. The engaged rung is

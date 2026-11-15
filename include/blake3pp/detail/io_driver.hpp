@@ -1,7 +1,7 @@
 #pragma once
 
 // The compiled seam between the file pipeline and the platform's reader
-// context (src/io/backend.hpp). Standard library only: the pipeline is a
+// context (src/io/io_context.hpp). Standard library only: the pipeline is a
 // header that callers compile, and the backends are not something they
 // should see, so everything platform-shaped lives behind a pimpl here
 // and the native context's contract is mirrored member for member.

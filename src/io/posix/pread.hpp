@@ -14,8 +14,11 @@
 #include <cstdint>
 #include <span>
 
-#include "io/backend.hpp"
-#include "io/posix_file.hpp"
+#include "io/fd.hpp"
+#include "io/io_context.hpp"
+#include "io/options.hpp"
+#include "io/sync_context.hpp"
+#include "io/posix/file.hpp"
 
 namespace blake3pp::detail::io_impl {
 
@@ -53,11 +56,11 @@ class pread_source {
   }
 
   void read_at(std::uint64_t off, std::span<std::byte> buf) {
-    f_.pread_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+    f_.pread_all(f_.sync_fd(buf.size()), buf, off);
   }
 
   void write_at(std::uint64_t off, std::span<const std::byte> buf) {
-    f_.pwrite_all(f_.sync_fd(buf.size()), buf.data(), buf.size(), off);
+    f_.pwrite_all(f_.sync_fd(buf.size()), buf, off);
   }
 
   void set_size(std::uint64_t bytes) {
@@ -74,7 +77,7 @@ class pread_source {
 
 using pread_context = sync_context<pread_source>;
 
-// Definition-site conformance check (see uring_backend.hpp).
+// Definition-site conformance check (see linux/io_uring.hpp).
 static_assert(io_context<pread_context>);
 
 }  // namespace blake3pp::detail::io_impl

@@ -1,7 +1,7 @@
 // file_writer implementation: the write-side mirror of file_reader.cpp,
-// and like it just a pimpl shell: polled_writer_engine (io/engine.hpp)
+// and like it just a pimpl shell: polled_writer (io/polled_io.hpp)
 // is the slot machine, written once against the io_context concept, and
-// io/backend_select.hpp decides which context it is instantiated with
+// io/native.hpp decides which context it is instantiated with
 // here.
 
 #include <blake3pp/detail/file_writer.hpp>
@@ -12,16 +12,16 @@
 #include <memory>
 #include <string_view>
 
-#include "io/backend_select.hpp"
-#include "io/engine.hpp"
+#include "io/native.hpp"
+#include "io/polled_io.hpp"
 
 namespace blake3pp::detail {
 
-// Conformance is checked in the backend headers themselves (each ends
-// with definition-site static_asserts) and again by the engine's
+// Conformance is checked in the per-OS headers themselves (each ends
+// with definition-site static_asserts) and again by polled_writer's
 // io_context constraint at this instantiation.
-struct file_writer::impl : io_impl::native_writer_engine {
-  using io_impl::native_writer_engine::native_writer_engine;
+struct file_writer::impl : io_impl::native_writer {
+  using io_impl::native_writer::native_writer;
 };
 
 file_writer::file_writer(const std::filesystem::path& path,

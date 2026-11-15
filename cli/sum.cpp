@@ -326,7 +326,6 @@ class engine {
                 const std::vector<std::size_t>& out_lens, Report report) {
     blake3pp::async::io_context ctx({.window_bytes = opts_.io.window_bytes,
                                      .queue_depth = opts_.io.queue_depth,
-                                     .arena_bytes = 128u << 20,
                                      .direct_io = opts_.io.direct_io,
                                      .offload_submit = opts_.io.offload_submit,
                                      .ioring = opts_.io.ioring});

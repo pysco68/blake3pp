@@ -13,15 +13,14 @@
 
 namespace blake3pp::detail {
 
-// The deepest queue the engines and the pipeline accept. The ceiling is
-// set by memory: a window in flight costs window_bytes of arena plus its
-// own tables (a part table and the chaining values its groups fold into,
-// and the lane slots its parts write; see parallel.hpp), so 256 of them
-// at the default 8 MiB window is over 2 GiB, and at the 1 GiB maximum
-// window more than any machine has. NVMe itself takes tens of thousands of
-// outstanding commands. The ceiling guards against a typo, and
-// BLAKE3PP_MAX_QUEUE_DEPTH raises or lowers it for a caller who knows the
-// device and the budget.
+// The deepest queue the window machines and the pipeline accept. The ceiling is
+// set by memory: a window in flight costs window_bytes of arena plus its own
+// tables (a part table and the chaining values its groups fold into, and the
+// lane slots its parts write; see parallel.hpp), so 256 of them at the default
+// 8 MiB window is over 2 GiB, and at the 1 GiB maximum window more than any
+// machine has. NVMe itself takes tens of thousands of outstanding commands. The
+// ceiling guards against a typo, and BLAKE3PP_MAX_QUEUE_DEPTH raises or lowers
+// it for a caller who knows the device and the budget.
 #if defined(BLAKE3PP_MAX_QUEUE_DEPTH)
 inline constexpr unsigned max_queue_depth = BLAKE3PP_MAX_QUEUE_DEPTH;
 #else
@@ -30,10 +29,10 @@ inline constexpr unsigned max_queue_depth = 256;
 static_assert(max_queue_depth >= 2,
               "a queue depth below two cannot overlap a read with a hash");
 
-// The largest window or buffer the engines accept, 1 GiB, or less where
-// max_queue_depth of them would not fit in size_t. The cap keeps the pool
-// size from wrapping and every transfer below the 32-bit length the
-// backends hand the kernel (io_uring's sqe.len, WriteFile's DWORD).
+// The largest window or buffer the window machines accept, 1 GiB, or less where
+// max_queue_depth of them would not fit in size_t. The cap keeps the pool size
+// from wrapping and every transfer below the 32-bit length the backends hand
+// the kernel (io_uring's sqe.len, WriteFile's DWORD).
 inline constexpr std::size_t max_window_bytes =
     std::min<std::size_t>(std::size_t{1} << 30,
                           std::numeric_limits<std::size_t>::max() / max_queue_depth);
@@ -99,9 +98,9 @@ inline constexpr unsigned default_queue_depth = 4;
       std::clamp<std::size_t>(requested, min_window_bytes, max_window_bytes));
 }
 
-// The queue depth the engines and the pipeline actually use for a
-// requested one: at least two, so one window can be read while another
-// is hashed, and at most max_queue_depth.
+// The queue depth the window machines and the pipeline actually use for a
+// requested one: at least two, so one window can be read while another is
+// hashed, and at most max_queue_depth.
 [[nodiscard]] constexpr unsigned clamp_queue_depth(unsigned requested) noexcept {
   return std::clamp(requested, 2u, max_queue_depth);
 }

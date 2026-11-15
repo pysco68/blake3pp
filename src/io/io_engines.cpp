@@ -12,7 +12,7 @@
 // reported an engine that was not in it.
 //
 // What replaces the list is the ladder the layer already had. Every
-// backend degrades, and src/io/engine_rung.hpp turns that into two
+// backend degrades, and src/io/ladder.hpp turns that into two
 // declarations per context: the engine it is, and the rung it defers
 // to. From those:
 //
@@ -50,9 +50,9 @@
 #include <string_view>
 #include <type_traits>
 
-#include "io/backend.hpp"
-#include "io/backend_select.hpp"
-#include "io/engine_rung.hpp"
+#include "io/options.hpp"
+#include "io/native.hpp"
+#include "io/ladder.hpp"
 
 namespace blake3pp {
 namespace {
@@ -112,7 +112,7 @@ namespace rung = detail::io_impl;
 // How many rungs the native context's chain has, and the engines along
 // it. The recursion ends at the floor, whose `rung_below` is void: a
 // synchronous rung served from a context's own deferred_ list, declared
-// in engine_rung.hpp because there is no object to ask.
+// in ladder.hpp because there is no object to ask.
 template <class R>
 consteval std::size_t rung_depth() {
   if constexpr (std::is_void_v<typename R::rung_below>) {
@@ -134,7 +134,7 @@ constexpr void write_rungs(std::array<io_engine, N>& out,
 // The engines this binary carries, best-first, because that is what
 // "the rung below" means. This is the list compiled_io_engines()
 // returns, and it is not written anywhere: it is read off the types the
-// platform branch of backend_select.hpp actually selected.
+// platform branch of native.hpp actually selected.
 constexpr std::array<io_engine, rung_depth<rung::native_io_context>()>
     ladder = [] {
       std::array<io_engine, rung_depth<rung::native_io_context>()> out{};

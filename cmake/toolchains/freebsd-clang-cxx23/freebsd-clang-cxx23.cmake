@@ -1,5 +1,5 @@
 # FreeBSD base-system Clang, C++23: the lane that exercises the POSIX AIO
-# backend (src/io/aio_backend.hpp, completions on a kqueue).
+# backend (src/io/freebsd/aio.hpp, completions on a kqueue).
 #
 #   cmake -S . -B build/freebsd-clang-cxx23 -G Ninja \
 #         -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/freebsd-clang-cxx23/freebsd-clang-cxx23.cmake

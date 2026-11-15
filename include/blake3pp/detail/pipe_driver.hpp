@@ -371,7 +371,7 @@ class stream_reader {
 #if defined(_WIN32)
     const bool names_none =
         h == nullptr ||
-        h == reinterpret_cast<native_stream>(static_cast<std::intptr_t>(-1));
+        h == std::bit_cast<native_stream>(std::intptr_t{-1});
 #else
     const bool names_none = h < 0;
 #endif

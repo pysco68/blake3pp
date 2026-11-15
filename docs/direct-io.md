@@ -19,16 +19,16 @@ caller, and when to turn it off.
 | macOS | GCD (libdispatch) | `F_NOCACHE` |
 | FreeBSD | POSIX AIO (`lio_listio`) on a kqueue | `O_DIRECT` |
 
-Each is a per-open property. `src/io/posix_file.hpp` engages `O_DIRECT`
+Each is a per-open property. `src/io/posix/file.hpp` engages `O_DIRECT`
 by reopening the path a second time with the flag set, and keeps the
 plain, always-buffered descriptor from the first open beside it for
 whatever the direct one cannot carry. Darwin has no `O_DIRECT`;
-`src/io/gcd_backend.hpp` instead flips `F_NOCACHE` on the single
+`src/io/macos/dispatch.hpp` instead flips `F_NOCACHE` on the single
 descriptor with `fcntl`, per-fd rather than per-open. Windows carries two
 independent per-open flags, `FILE_FLAG_NO_BUFFERING` and
-`FILE_FLAG_OVERLAPPED` (the asynchronous handle); `src/io/iocp_backend.hpp`
-and `src/io/ioring_backend.hpp` both ask for the two together on the
-first reopen and, if that is refused, ask again for the asynchronous
+`FILE_FLAG_OVERLAPPED` (the asynchronous handle); the file both engines
+open, in `src/io/windows/file.hpp`, asks for the two together on the
+first reopen and, if that is refused, asks again for the asynchronous
 handle alone before falling back further. The asynchrony is kept on its
 own deliberately: `NO_BUFFERING` is usually what a filesystem (SMB
 shares, some virtual volumes) actually rejects, and buffered-but-async
@@ -42,7 +42,7 @@ the submission-queue model io_uring introduced: entries are built into a
 queue the application owns, one `SubmitIoRing` hands a whole batch to the
 kernel, and completions are popped from a second queue. Where the machine
 offers `IORING_VERSION_3` -- reads, writes, cancel and registration --
-`src/io/backend_select.hpp` takes it; everything older gets the completion
+`src/io/windows/engine.hpp` takes it; everything older gets the completion
 port. `file_io_options::ioring` and `file_write_options::ioring` (both
 default `true`) choose the port instead, which is what the IOCP-against-
 IoRing comparison needs, and the rung names below say which one ran. The
@@ -51,7 +51,7 @@ linked, so a binary built against the Windows 11 SDK still loads on
 Windows 10.
 
 FreeBSD reaches the device through the one widely deployed Unix
-asynchronous file API that is not io_uring: POSIX AIO. `src/io/aio_backend.hpp`
+asynchronous file API that is not io_uring: POSIX AIO. `src/io/freebsd/aio.hpp`
 fills a `struct aiocb` per transfer, hands whole batches to the kernel
 with one `lio_listio(LIO_NOWAIT, ...)`, and asks for each completion as
 an `EVFILT_AIO` event on the context's kqueue
@@ -96,7 +96,7 @@ its number has to actually move the bytes.
 
 `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` both reject a transfer unless
 the buffer address, the length and the file offset are all multiples of
-one granule. `src/io/backend.hpp` fixes that granule at 4096 bytes
+one granule. `src/io/options.hpp` fixes that granule at 4096 bytes
 (`direct_align`), the common sector and page size on the platforms this
 applies to. `F_NOCACHE` carries no such contract: macOS serves a
 misaligned edge through the cache transparently instead of rejecting it,
@@ -122,7 +122,7 @@ is not a whole number of granules, or the last short write of a
 generator that stops mid-window. Almost every file has one, and a file
 smaller than a window is nothing else. On Linux, every piece of a
 transfer -- the initial one, or what is left after a short completion --
-passes `piece_for()` in `src/io/uring_backend.hpp`, which says how much
+passes `piece_for()` in `src/io/linux/io_uring.hpp`, which says how much
 of it the ring takes and through which descriptor: a direct file's piece
 rides the `O_DIRECT` descriptor for the whole granules it holds at a
 granule offset, and what that leaves -- the sub-granule end, a
@@ -136,7 +136,7 @@ above the backend can tell a window's bytes arrived through one
 descriptor from arriving through two; both land in the same buffer.
 
 FreeBSD asks it with the same function under the same name:
-`piece_for()` in `src/io/aio_backend.hpp` picks the direct descriptor for
+`piece_for()` in `src/io/freebsd/aio.hpp` picks the direct descriptor for
 the whole granules at a granule offset and the plain one for the rest,
 both as AIO requests, so a direct file's last window is as asynchronous
 as the others there too.
@@ -196,7 +196,9 @@ for io_uring, or io_uring blocked by seccomp policy -- the Linux backend
 appends why: `" [io_uring: EPERM, blocked by policy]"` or
 `" [io_uring: ENOSYS, kernel too old]"`. The ring does the same where it
 is used directly rather than through the selector: `" [ioring: no api]"`,
-`" [ioring: version 1]"` or `" [ioring: CreateIoRing failed 0x...]"`, and
+`" [ioring: version 1]"`, `" [ioring: no read/write ops]"` (a version-3
+ring whose op probe refuses reads or writes) or
+`" [ioring: CreateIoRing failed 0x...]"`, and
 a ring the selector asked for and could not have puts the same suffix on
 the completion port's names, as in `"iocp+direct [ioring: no api]"`, so a
 run on such a machine reads as what it is. FreeBSD's backend says it the

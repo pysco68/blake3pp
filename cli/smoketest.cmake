@@ -692,8 +692,8 @@ elseif(CASE STREQUAL "gen_short_buffer")
   endif()
 
 elseif(CASE STREQUAL "sum_alloc_failure")
-  # A batch whose arena cannot be allocated: four 1 GiB windows in an
-  # address space of 2 GiB. The failure comes after the engine is built,
+  # A batch whose arena cannot be allocated: at least four 1 GiB windows
+  # in an address space of 2 GiB. The failure comes after the engine is built,
   # so it is the run's (exit 1, not the usage status), it is reported
   # rather than aborting the process, and the trace is still written.
   # Linux only, where prlimit sets the limit; a sanitizer or an emulator
@@ -917,6 +917,13 @@ elseif(CASE STREQUAL "gen_errors")
       message(FATAL_ERROR "gen did not reject '${bad}': ${r}")
     endif()
   endforeach()
+  # --window counts MiB from 1: 0 is refused by the option's validator,
+  # not taken as the default.
+  run_gen(ARGS --seed s --length 16 --output ${WORK}/w0.bin --window 0
+    OUTPUT_QUIET ERROR_VARIABLE err RESULT_VARIABLE r)
+  if(r EQUAL 0 OR NOT err MATCHES "--window")
+    message(FATAL_ERROR "gen --window 0 was accepted: exit ${r}: ${err}")
+  endif()
 
 elseif(CASE STREQUAL "engines")
   # The engine introspection, end to end. --version prints the list the

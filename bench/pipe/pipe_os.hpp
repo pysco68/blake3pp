@@ -45,7 +45,7 @@ inline handle std_out() noexcept { return STDOUT_FILENO; }
 
 // std::fopen, which the Microsoft CRT deprecates in favour of fopen_s;
 // fopen_s opens without sharing, and std::fopen is the call meant here.
-// The same pair as src/io/stdio_backend.hpp, so the tools build with
+// The same pair as src/io/portable/stdio.hpp, so the tools build with
 // BLAKE3PP_WARNINGS_AS_ERRORS on every compiler.
 inline std::FILE* open_file(const char* path, const char* mode) noexcept {
 #if defined(__clang__)

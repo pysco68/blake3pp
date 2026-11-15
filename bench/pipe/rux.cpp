@@ -312,7 +312,7 @@ int main(int argc, char** argv) {
     std::fputs(line.c_str(), stderr);
   } else {
     // The Microsoft CRT deprecates std::fopen in favour of fopen_s, which
-    // opens without sharing; the same pair as src/io/stdio_backend.hpp.
+    // opens without sharing; the same pair as src/io/portable/stdio.hpp.
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

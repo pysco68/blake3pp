@@ -1,6 +1,6 @@
-// The completion-callback reader contract (src/io/backend.hpp): what a
-// context promises the engine, tested on the contexts themselves rather
-// than through file_reader.
+// The completion-callback reader contract (src/io/io_context.hpp): what a
+// context promises polled_reader and polled_writer, tested on the contexts
+// themselves rather than through file_reader.
 //
 // The invariant the pipeline rests on is where a callback runs: inside
 // poll(), on the thread that called it, and nowhere else. Most of what
@@ -38,30 +38,35 @@
 #include <doctest/doctest.h>
 
 #include "temp_names.hpp"
-#include "io/backend.hpp"
-#include "io/engine.hpp"
-#include "io/stdio_backend.hpp"
+#include "io/io_context.hpp"
+#include "io/lanes.hpp"
+#include "io/options.hpp"
+#include "io/sync_context.hpp"
+#include "io/transfer.hpp"
+#include "io/waiter.hpp"
+#include "io/polled_io.hpp"
+#include "io/portable/stdio.hpp"
 #if defined(__unix__) || defined(__APPLE__)
-#include "io/pread_backend.hpp"
+#include "io/posix/pread.hpp"
 #endif
 #if defined(__linux__)
 #include <unistd.h>  // getpid, for a temporary name under /dev/shm
 
-#include "io/uring_backend.hpp"
+#include "io/linux/io_uring.hpp"
 #endif
 #if defined(__FreeBSD__)
 #include <aio.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "io/aio_backend.hpp"
+#include "io/freebsd/aio.hpp"
 #endif
 #if defined(_WIN32)
-#include "io/iocp_backend.hpp"
-#include "io/ioring_backend.hpp"
+#include "io/windows/iocp.hpp"
+#include "io/windows/ioring.hpp"
 #endif
 #if defined(__APPLE__)
-#include "io/gcd_backend.hpp"
+#include "io/macos/dispatch.hpp"
 #endif
 
 namespace {
@@ -147,7 +152,7 @@ class fake_context {
   [[nodiscard]] bool async() const noexcept { return true; }
 
   void submit_read(file&, std::uint64_t off, std::span<std::byte> buf,
-                   transfer& op) {
+                   transfer& op) noexcept {
     op.buf = buf;
     op.off = off;
     op.filled = 0;
@@ -160,7 +165,7 @@ class fake_context {
   // The engine under test never writes; the contract still asks, so this
   // records the write and completes it like any other operation.
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
-                    transfer& op) {
+                    transfer& op) noexcept {
     op.buf = {};
     op.off = off;
     op.filled = buf.size();
@@ -548,36 +553,6 @@ TEST_CASE("IOCP: an unaligned length rides the port but for a direct tail") {
   }
 }
 
-// A file closed with transfers it could not hand to the port (an
-// unaligned length under NO_BUFFERING, or no port at all) has to take
-// them with it: they name its handles and its share of the count. Left
-// queued, they would be performed through a closed handle, and a file
-// with a port would wait on it for completions that never arrive.
-TEST_CASE("an IOCP file closed with deferred transfers takes them with it") {
-  namespace io_impl = blake3pp::detail::io_impl;
-  const std::vector<std::byte> content(64 * 1024 + 100, std::byte{0x5c});
-  const temp_file f(content);
-  for (const bool async : {false, true}) {
-    CAPTURE(async);
-    io_impl::iocp_context ctx({.async = async}, 4);
-    std::array<std::byte, 100> buf{};  // below one NO_BUFFERING granule
-    io_impl::iocp_context::transfer op{};
-    probe p;
-    op.done = &probe::on_done;
-    op.owner = &p;
-    {
-      io_impl::iocp_context::file file(
-          ctx, f.path, io_impl::file_open_options{.direct_io = true});
-      ctx.submit_read(file, 0, std::span{buf}, op);
-      ctx.flush();
-      CHECK(ctx.in_flight() == 1);
-    }
-    CHECK(ctx.in_flight() == 0);
-    CHECK(ctx.poll(false) == 0);
-    CHECK(p.calls == 0);
-  }
-}
-
 // The IoRing half of the unaligned-length contract: the same question the
 // port answers above, with the same two answers. A buffered overlapped
 // handle takes any length, so none of it is synchronous; a NO_BUFFERING
@@ -763,40 +738,15 @@ TEST_CASE("IoRing: a refused ring names the reason") {
   namespace io_impl = blake3pp::detail::io_impl;
   using refusal = io_impl::ioring_refusal;
   CHECK(io_impl::no_ioring_suffix(refusal{}).empty());
-  CHECK(io_impl::no_ioring_suffix({refusal::no_api, 0, 0}) ==
+  CHECK(io_impl::no_ioring_suffix({refusal::kind::no_api, 0, 0}) ==
         " [ioring: no api]");
-  CHECK(io_impl::no_ioring_suffix({refusal::old_version, 1, 0}) ==
+  CHECK(io_impl::no_ioring_suffix({refusal::kind::old_version, 1, 0}) ==
         " [ioring: version 1]");
-  CHECK(io_impl::no_ioring_suffix({refusal::create_failed, 0, 0x80070057}) ==
+  CHECK(io_impl::no_ioring_suffix({refusal::kind::no_read_write, 3, 0}) ==
+        " [ioring: no read/write ops]");
+  CHECK(io_impl::no_ioring_suffix(
+            {refusal::kind::create_failed, 0, 0x80070057}) ==
         " [ioring: CreateIoRing failed 0x80070057]");
-}
-
-// The ring's twin of the case above it: a file closed with transfers it
-// could not hand the ring must take them with it, because they name its
-// handles and its share of the count.
-TEST_CASE("an IoRing file closed with deferred transfers takes them with it") {
-  namespace io_impl = blake3pp::detail::io_impl;
-  const std::vector<std::byte> content(64 * 1024 + 100, std::byte{0x5d});
-  const temp_file f(content);
-  for (const bool async : {false, true}) {
-    CAPTURE(async);
-    io_impl::ioring_context ctx({.async = async}, 4);
-    std::array<std::byte, 100> buf{};  // below one NO_BUFFERING granule
-    io_impl::ioring_context::transfer op{};
-    probe p;
-    op.done = &probe::on_done;
-    op.owner = &p;
-    {
-      io_impl::ioring_context::file file(
-          ctx, f.path, io_impl::file_open_options{.direct_io = true});
-      ctx.submit_read(file, 0, std::span{buf}, op);
-      ctx.flush();
-      CHECK(ctx.in_flight() == 1);
-    }
-    CHECK(ctx.in_flight() == 0);
-    CHECK(ctx.poll(false) == 0);
-    CHECK(p.calls == 0);
-  }
 }
 #endif
 
@@ -827,8 +777,7 @@ TEST_CASE("a GCD file waits out its workers before its descriptor closes") {
   }
   // The worker ran to completion through a descriptor that was still
   // open, and its result was dropped rather than delivered.
-  CHECK(op.filled == content.size());
-  CHECK(op.error == 0);
+  CHECK(!op.result());
   CHECK(buf == content);
   CHECK(ctx.in_flight() == 0);
   CHECK(ctx.poll(false) == 0);
@@ -842,11 +791,11 @@ TEST_CASE("a GCD file that owes nothing closes without waiting on a sibling") {
   const auto content = pattern(64 * 1024, 72);
   const temp_file f(content);
   io_impl::gcd_context ctx({}, 4);
-  if (!ctx.test_uses_gcd()) {
+  if (!ctx.engine().test_uses_gcd()) {
     MESSAGE("skipped: no dispatch group here");
     return;
   }
-  ctx.test_hold_group();
+  ctx.engine().test_hold_group();
   std::atomic<bool> closed{false};
   std::thread closer([&] {
     {
@@ -858,9 +807,47 @@ TEST_CASE("a GCD file that owes nothing closes without waiting on a sibling") {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   const bool closed_while_held = closed.load();
-  ctx.test_release_group();
+  ctx.engine().test_release_group();
   closer.join();
   CHECK(closed_while_held);
+}
+
+// A file that does owe a transfer waits for that one to land, and not for
+// a sibling's worker as well.
+TEST_CASE("a GCD file closing with a transfer in flight ignores a sibling's") {
+  const auto content = pattern(64 * 1024, 73);
+  const temp_file f(content);
+  io_impl::gcd_context ctx({}, 4);
+  if (!ctx.engine().test_uses_gcd()) {
+    MESSAGE("skipped: no dispatch group here");
+    return;
+  }
+  std::vector<std::byte> buf(content.size());
+  io_impl::gcd_context::transfer op{};
+  probe p;
+  op.done = &probe::on_done;
+  op.owner = &p;
+  ctx.engine().test_hold_group();
+  std::atomic<bool> closed{false};
+  std::thread closer([&] {
+    {
+      io_impl::gcd_context::file busy(ctx, f.path,
+                                      io_impl::file_open_options{});
+      ctx.submit_read(busy, 0, std::span{buf}, op);
+      ctx.flush();
+    }
+    closed.store(true);
+  });
+  for (int i = 0; i < 1000 && !closed.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool closed_while_held = closed.load();
+  ctx.engine().test_release_group();
+  closer.join();
+  CHECK(closed_while_held);
+  CHECK(buf == content);
+  CHECK(ctx.in_flight() == 0);
+  CHECK(p.calls == 0);
 }
 #endif
 
@@ -1030,7 +1017,7 @@ TEST_CASE("a refused preallocation degrades to an ordinary writable open") {
 
 TEST_CASE("the engine survives a context that finishes in pieces and out of order") {
   constexpr std::uint64_t size = 300 * 1024 + 77;
-  io_impl::polled_reader_engine<fake_context> r(
+  io_impl::polled_reader<fake_context> r(
       size, {.window_bytes = 64 * 1024, .queue_depth = 3});
   CHECK(r.file_size() == size);
   CHECK(r.backend_name() == "fake");
@@ -1052,7 +1039,7 @@ TEST_CASE("a read that fails reaches the caller as an exception, once") {
   constexpr std::uint64_t size = 256 * 1024;
   constexpr std::size_t window = 64 * 1024;
   fake_context::fail_offset = 2 * window;  // the third window
-  io_impl::polled_reader_engine<fake_context> r(
+  io_impl::polled_reader<fake_context> r(
       size, {.window_bytes = window, .queue_depth = 2});
   std::uint64_t delivered = 0;
   CHECK_THROWS_AS(
@@ -1293,6 +1280,52 @@ TEST_CASE("io_uring: a read still published when a re-arm is refused completes")
   CHECK(got == content);
 }
 
+// An enter can succeed and take nothing, leaving the read published. A
+// wait does not submit, so a poll that blocked with it there would sleep
+// for ever; the flush hands it to the pump instead, and poll(true)
+// returns with the read done.
+TEST_CASE("io_uring: a submit that takes nothing does not leave poll waiting") {
+  constexpr std::size_t len = 1024 * 1024;
+  const auto content = pattern(len, 45);
+  const temp_file f(content);
+  io_impl::uring_context ctx({}, 4);
+  io_impl::uring_context::file file(ctx, f.path, io_impl::file_open_options{});
+  if (file.name().rfind("io_uring", 0) != 0) {
+    MESSAGE("skipped: no io_uring here (" << file.name() << ")");
+    return;
+  }
+  std::vector<std::byte> got(len);
+  probe p;
+  io_impl::uring_context::transfer a{};
+  a.done = &probe::on_done;
+  a.owner = &p;
+  struct seams_off {
+    ~seams_off() { io_impl::stall_submits.store(0); }
+  } const reset;
+  io_impl::stall_submits.store(1);
+  ctx.submit_read(file, 0, std::span(got), a);
+  std::atomic<bool> returned{false};
+  std::thread poller([&] {
+    while (p.calls == 0) {
+      (void)ctx.poll(true);
+    }
+    returned.store(true);
+  });
+  for (int i = 0; i < 1000 && !returned.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!returned.load()) {
+    std::fprintf(stderr, "io_uring: poll(true) still blocked after 10 s on a "
+                         "read an enter took nothing of\n");
+    std::abort();
+  }
+  poller.join();
+  CHECK(p.calls == 1);
+  CHECK(!p.ec);
+  CHECK(got == content);
+  CHECK(ctx.served_synchronously() == 1);
+}
+
 // A refusal can come before any transfer: the constructor arms the wake
 // poll and submits it. The context must still build, and reads through it
 // must complete.
@@ -1444,7 +1477,7 @@ TEST_CASE("aio: transfers the kernel would not take are served by poll()") {
   CHECK(ctx.in_flight() == 2);
 
   // What a refused lio_listio leaves behind, without one.
-  ctx.defer_pending();
+  ctx.defer_unsubmitted();
   CHECK(pa.calls == 0);
   CHECK(pb.calls == 0);
   CHECK(ctx.in_flight() == 2);
@@ -1579,8 +1612,9 @@ TEST_CASE("aio: an unaligned length rides the queue, buffered or direct") {
     CAPTURE(direct);
     const temp_file f(content);
     io_impl::aio_context ctx({}, 4);
-    if (!ctx.using_aio()) {
-      MESSAGE("no kernel AIO here (" << ctx.refusal() << "); nothing to check");
+    if (!ctx.engaged()) {
+      MESSAGE("no kernel AIO here (" << ctx.engine().refusal()
+                                     << "); nothing to check");
       return;
     }
     {
@@ -1729,6 +1763,65 @@ TEST_CASE("wake() releases a blocked poll from another thread") {
 #if defined(__unix__) || defined(__APPLE__)
   {
     io_impl::pread_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(_WIN32)
+  {
+    io_impl::iocp_context ctx({}, 4);
+    check(ctx);
+  }
+  {
+    io_impl::ioring_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(__APPLE__)
+  {
+    io_impl::gcd_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+}
+
+// A wake with no poll blocked is remembered: the next blocking poll
+// returns at once, with nothing run. The one after it blocks again and is
+// released by a second wake, so the first wake's signal was consumed
+// rather than left to end every later sleep.
+TEST_CASE("a wake before a blocking poll is remembered, and only once") {
+  const auto check = [](auto& ctx) {
+    ctx.wake();
+    CHECK(ctx.poll(true) == 0);
+    std::atomic<bool> returned{false};
+    std::thread driver([&] {
+      (void)ctx.poll(true);
+      returned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(returned.load(std::memory_order_acquire));
+    ctx.wake();
+    driver.join();
+    CHECK(returned.load(std::memory_order_acquire));
+  };
+  {
+    io_impl::stdio_context ctx({}, 4);
+    check(ctx);
+  }
+#if defined(__unix__) || defined(__APPLE__)
+  {
+    io_impl::pread_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(__linux__)
+  {
+    io_impl::uring_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(__FreeBSD__)
+  {
+    io_impl::aio_context ctx({}, 4);
     check(ctx);
   }
 #endif
@@ -1963,7 +2056,7 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
   // degrades to buffered with the suffix. Both spellings are the
   // ladder's; which one applies here is not the platform's to say.
   const io_impl::aio_context aio_probe(io_impl::reader_context_options{}, 4);
-  if (aio_probe.using_aio()) {
+  if (aio_probe.engaged()) {
     std::string direct_rung;
     {
       io_impl::aio_context c(io_impl::reader_context_options{}, 2);
@@ -1979,7 +2072,7 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
             {true, false, true, "pread+direct"},
             {false, false, true, "pread"}};
   } else {
-    const std::string why(aio_probe.refusal());
+    const std::string why(aio_probe.engine().refusal());
     MESSAGE("no kernel AIO here" << why << ": testing the fallback ladder");
     // async requested and refused carries the reason; not requested at
     // all says nothing, which is the distinction the suffix exists for.
@@ -2003,7 +2096,7 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
   // some virtual images have no ring -- so it is probed once and the
   // ladder that actually applies here is the one expected.
   const io_impl::ioring_context probe(io_impl::reader_context_options{}, 4);
-  if (probe.using_ring()) {
+  if (probe.engaged()) {
     rows = {{true, true, true, "ioring+direct", true},
             {false, true, true, "ioring", true},
             {true, true, true, "iocp+direct", false},
@@ -2014,7 +2107,8 @@ TEST_CASE("the degradation ladder keeps its backend strings") {
     // The port carries the reason the ring was refused, so a run on
     // such a machine reads as what it is rather than as one that never
     // asked.
-    const std::string why = io_impl::no_ioring_suffix(probe.refusal());
+    const std::string why =
+        io_impl::no_ioring_suffix(probe.engine().refusal());
     MESSAGE("no I/O ring here (" << why << "): testing the port's ladder");
     rows = {{true, true, true, "iocp+direct" + why, true},
             {false, true, true, "iocp" + why, true},

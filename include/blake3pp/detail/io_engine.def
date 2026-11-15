@@ -11,7 +11,7 @@
 //   * RANK is the preference, lower wins, unique (asserted in
 //     src/io/io_engines.cpp). Ranks are spaced by 10, so a reordering
 //     is a one-number edit with no ABI consequence. Most of the ranking
-//     is within a platform: src/io/backend_select.hpp compiles one
+//     is within a platform: src/io/native.hpp compiles one
 //     native engine per OS plus the synchronous rung it degrades to.
 //     Windows is the exception, carrying both the ring and the port,
 //     and the ring is preferred.
