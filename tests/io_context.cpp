@@ -786,11 +786,11 @@ TEST_CASE("a GCD file that owes nothing closes without waiting on a sibling") {
   const auto content = pattern(64 * 1024, 72);
   const temp_file f(content);
   io_impl::gcd_context ctx({}, 4);
-  if (!ctx.test_uses_gcd()) {
+  if (!ctx.engine().test_uses_gcd()) {
     MESSAGE("skipped: no dispatch group here");
     return;
   }
-  ctx.test_hold_group();
+  ctx.engine().test_hold_group();
   std::atomic<bool> closed{false};
   std::thread closer([&] {
     {
@@ -802,9 +802,47 @@ TEST_CASE("a GCD file that owes nothing closes without waiting on a sibling") {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   const bool closed_while_held = closed.load();
-  ctx.test_release_group();
+  ctx.engine().test_release_group();
   closer.join();
   CHECK(closed_while_held);
+}
+
+// A file that does owe a transfer waits for that one to land, and not for
+// a sibling's worker as well.
+TEST_CASE("a GCD file closing with a transfer in flight ignores a sibling's") {
+  const auto content = pattern(64 * 1024, 73);
+  const temp_file f(content);
+  io_impl::gcd_context ctx({}, 4);
+  if (!ctx.engine().test_uses_gcd()) {
+    MESSAGE("skipped: no dispatch group here");
+    return;
+  }
+  std::vector<std::byte> buf(content.size());
+  io_impl::gcd_context::transfer op{};
+  probe p;
+  op.done = &probe::on_done;
+  op.owner = &p;
+  ctx.engine().test_hold_group();
+  std::atomic<bool> closed{false};
+  std::thread closer([&] {
+    {
+      io_impl::gcd_context::file busy(ctx, f.path,
+                                      io_impl::file_open_options{});
+      ctx.submit_read(busy, 0, std::span{buf}, op);
+      ctx.flush();
+    }
+    closed.store(true);
+  });
+  for (int i = 0; i < 1000 && !closed.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool closed_while_held = closed.load();
+  ctx.engine().test_release_group();
+  closer.join();
+  CHECK(closed_while_held);
+  CHECK(buf == content);
+  CHECK(ctx.in_flight() == 0);
+  CHECK(p.calls == 0);
 }
 #endif
 

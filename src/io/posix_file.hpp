@@ -190,12 +190,15 @@ struct fd_piece {
   return {f.fd_plain(), len};
 }
 
-// The rest of a transfer, on a lane: from where it stopped, which for a
-// fresh one is the start and for a continuation is what the kernel
-// already moved. The remainder picks the descriptor, since an unalignable
-// rest is exactly what the plain fd exists for. Touches the operation and
-// its file and nothing else.
-[[nodiscard]] inline std::error_code perform_rest(posix_transfer& op) noexcept {
+// The rest of a transfer, moved synchronously: from where it stopped,
+// which for a fresh one is the start and for a continuation is what the
+// kernel already moved. The remainder picks the descriptor, since an
+// unalignable rest is exactly what the plain fd exists for. Leaves
+// op.filled alone, so an engine that reports the bytes as a completion
+// is the one place they are counted. Touches the operation and its file
+// and nothing else.
+[[nodiscard]] inline std::error_code carry_rest(
+    const posix_transfer& op) noexcept {
   try {
     const int fd = op.sync_file->sync_fd(op.remaining());
     if (op.is_write) {
@@ -203,7 +206,6 @@ struct fd_piece {
     } else {
       op.sync_file->pread_all(fd, op.read_remaining(), op.position());
     }
-    op.filled = op.length();
   } catch (const std::system_error& e) {
     return e.code();
   } catch (...) {
@@ -212,6 +214,15 @@ struct fd_piece {
     return std::make_error_code(std::errc::io_error);
   }
   return {};
+}
+
+// The same on a lane, which completes the transfer itself.
+[[nodiscard]] inline std::error_code perform_rest(posix_transfer& op) noexcept {
+  const std::error_code ec = carry_rest(op);
+  if (!ec) {
+    op.filled = op.length();
+  }
+  return ec;
 }
 
 }  // namespace blake3pp::detail::io_impl

@@ -2,7 +2,8 @@
 
 // One io_context for every backend whose kernel completes transfers on a
 // queue of its own: io_uring, POSIX AIO over kqueue, the completion port
-// and the I/O ring. The context is written once here -- the files and
+// and the I/O ring -- and libdispatch, whose worker pool completes them
+// the same way. The context is written once here -- the files and
 // their list, the counts, the deferred pump, what a completion means,
 // how poll() waits, how a closing file and a closing context wait out
 // what the kernel still holds. A backend supplies only its engine: how a

@@ -525,16 +525,17 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // everything through its asynchronous engine.
   { cc.lane_wait_ns() } noexcept -> std::same_as<std::uint64_t>;
   // What the device itself took over this run, stamped by whoever
-  // performed each transfer: a lane around its own pread, an engine from
-  // submission to completion. A wait for a lane is never part of it. Zero
+  // performed each transfer: a lane or a dispatch worker around its own
+  // pread, a kernel queue from submission to completion. A wait for a lane is never part of it. Zero
   // transfers means this context cannot say.
   { cc.device() } noexcept -> std::same_as<device_time>;
 };
 
 // An intrusive FIFO of operations linked through one of their own
 // pointers, next_deferred unless another is named: the queue inside
-// deferred_pump, and the aio engine's list of requests not yet offered to
-// the kernel. Not synchronized; deferred_pump guards its own under a
+// deferred_pump, the aio engine's list of requests not yet offered to
+// the kernel, and the GCD engine's list of landed transfers. Not
+// synchronized; deferred_pump and the GCD engine guard theirs under a
 // mutex.
 template <class Op, Op* Op::*Link = &Op::next_deferred>
 class deferred_ops {
