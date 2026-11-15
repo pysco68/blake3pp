@@ -75,7 +75,9 @@ class fake_engine {
   static constexpr blake3pp::io_engine rung_engine =
       blake3pp::io_engine::io_uring;
   using rung_below = below;
-  static constexpr std::string_view mechanism = "the fake engine";
+  [[nodiscard]] std::string_view mechanism() const noexcept {
+    return "the fake engine";
+  }
 
   fake_engine(const io_impl::reader_context_options& opts, unsigned) noexcept
       : engaged_(opts.async) {}

@@ -572,7 +572,9 @@ class uring_engine {
   // leaves every transfer to posix_file's pread on the pump's lanes.
   static constexpr io_engine rung_engine = io_engine::io_uring;
   // What failed, as the shared context's messages name it.
-  static constexpr std::string_view mechanism = "io_uring_enter";
+  [[nodiscard]] std::string_view mechanism() const noexcept {
+    return "io_uring_enter";
+  }
   using rung_below = posix_sync_rung;
 
   // A refusal is settled only when the kernel is the reason. ENOSYS says

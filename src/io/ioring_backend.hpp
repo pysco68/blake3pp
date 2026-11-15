@@ -334,11 +334,13 @@ class ioring_engine {
 
   // This engine's rung and the one it degrades to, declared for the
   // ladder walk in src/io/io_engines.cpp: a ring it cannot have leaves
-  // its transfers to ReadFile on the lanes. windows_context composes a
+  // its transfers to ReadFile on the lanes. windows_engine composes a
   // second ladder on top, with the completion port between the two.
   static constexpr io_engine rung_engine = io_engine::ioring;
   // What failed, as the shared context's messages name it.
-  static constexpr std::string_view mechanism = "the I/O ring";
+  [[nodiscard]] std::string_view mechanism() const noexcept {
+    return "the I/O ring";
+  }
   using rung_below = win_sync_rung;
 
   // Settled unless the machine might hand over a ring next time. An

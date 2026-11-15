@@ -266,7 +266,9 @@ class aio_engine {
 
   static constexpr io_engine rung_engine = io_engine::aio;
   // What failed, as the shared context's messages name it.
-  static constexpr std::string_view mechanism = "kevent";
+  [[nodiscard]] std::string_view mechanism() const noexcept {
+    return "kevent";
+  }
   using rung_below = posix_sync_rung;
 
   // A refused AIO is never settled here, unlike a refused io_uring on

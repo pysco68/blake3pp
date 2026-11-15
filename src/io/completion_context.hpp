@@ -22,7 +22,7 @@
 //                           //   file_part(Engine&, path, how)
 //                           // with size(), name(), set_size()
 //   static constexpr io_engine rung_engine; using rung_below;
-//   static constexpr std::string_view mechanism;  // named in failures
+//   std::string_view mechanism() const;  // named in failures
 //   Engine(const reader_context_options&, unsigned max_inflight);
 //   bool engaged() const;             // the kernel queue was had
 //   rung_verdict engaged_rung() const;
@@ -393,7 +393,7 @@ class completion_context {
   void submit_or_throw() {
     flush();
     if (const std::error_code ec = engine_.take_failure()) {
-      throw std::system_error(ec, std::string(Engine::mechanism));
+      throw std::system_error(ec, std::string(engine_.mechanism()));
     }
   }
   void submit_or_lost(file& f) noexcept {
@@ -415,7 +415,7 @@ class completion_context {
         woken_ = true;
         return false;
       case event::kind::failed:
-        throw std::system_error(e.ec, std::string(Engine::mechanism));
+        throw std::system_error(e.ec, std::string(engine_.mechanism()));
       case event::kind::completion:
         break;
     }
@@ -502,13 +502,13 @@ class completion_context {
   // Requests in the kernel, a queue that cannot be waited on, and buffers
   // about to be reused: nothing can make the kernel let go, and returning
   // would let a transfer land in memory the caller has given back.
-  [[noreturn]] static void lost(const char* whose, std::size_t owed,
+  [[noreturn]] void lost(const char* whose, std::size_t owed,
                                 std::error_code ec) noexcept {
     std::fprintf(stderr,
                  "blake3pp: %.*s failed while %zu transfer(s)%s were still "
                  "owed (%s); their buffers cannot be released\n",
-                 static_cast<int>(Engine::mechanism.size()),
-                 Engine::mechanism.data(), owed, whose, ec.message().c_str());
+                 static_cast<int>(engine_.mechanism().size()),
+                 engine_.mechanism().data(), owed, whose, ec.message().c_str());
     std::abort();
   }
 

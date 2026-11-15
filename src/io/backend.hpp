@@ -285,13 +285,8 @@ struct transfer_base {
 
 
 // What a transfer needs while a mechanism is performing it. Every context
-// that performs transfers derives its transfer from this.
-//
-// Kept out of transfer_base because windows_context::transfer is a
-// transfer_base around a union of the ring and the port transfers, each a
-// transfer_base of its own (backend_select.hpp): a byte added to the base
-// would be charged twice there. The composite only forwards the transfer
-// the chosen backend performed, so it needs none of this.
+// that performs transfers derives its transfer from this; transfer_base
+// is the part the driver and the callbacks see.
 struct performed_transfer : transfer_base {
   // The device's own time over this transfer, summed over the pieces it
   // was carried in, and the error the performer saw.

@@ -514,8 +514,14 @@ class iocp_engine {
 
   static constexpr io_engine rung_engine = io_engine::iocp;
   // What failed, as the shared context's messages name it.
-  static constexpr std::string_view mechanism = "the completion port";
+  [[nodiscard]] std::string_view mechanism() const noexcept {
+    return "the completion port";
+  }
   using rung_below = win_sync_rung;
+
+  // What a file needs from the engine to open against it.
+  [[nodiscard]] bool async_requested() const noexcept { return async_requested_; }
+  [[nodiscard]] HANDLE port() const noexcept { return port_.get(); }
 
   // A constructed engine has a port, because the constructor throws
   // otherwise. This answers the synchronous rung only for a caller who
@@ -625,7 +631,8 @@ class iocp_engine {
 
   // CancelIoEx bounds a closing file's wait: every cancelled request
   // completes, successfully or with ERROR_OPERATION_ABORTED.
-  void cancel_file(file_part& p, std::size_t owed) noexcept {
+  template <class Part>
+  void cancel_file(Part& p, std::size_t owed) noexcept {
     if (p.f.overlapped && owed > 0) {
       ::CancelIoEx(p.f.h(), nullptr);
     }
