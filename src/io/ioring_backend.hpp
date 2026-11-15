@@ -378,14 +378,14 @@ class ioring_engine {
   template <class Op>
   [[nodiscard]] bool place(Op& op) noexcept {
     const win_file& f = op.owner_file->part().f;
-    std::size_t len = op.len - op.filled;
+    std::size_t len = op.remaining();
     if (!use_ring_ || !f.overlapped || len == 0) {
       return false;
     }
     len = std::min(len, max_win_piece);
     if (f.direct) {
       len -= len % direct_align;
-      if (len == 0 || (op.off + op.filled) % direct_align != 0) {
+      if (len == 0 || op.position() % direct_align != 0) {
         return false;
       }
     }
@@ -557,17 +557,17 @@ class ioring_engine {
   [[nodiscard]] bool build(Op& op, std::uint32_t len) noexcept {
     const ioring_api& api = ioring_entry_points();
     const IORING_HANDLE_REF h = handle_ref(op.owner_file->part().f);
-    const std::uint64_t at = op.off + op.filled;
+    const std::uint64_t at = op.position();
     HRESULT hr = 0;
     if (op.is_write) {
-      void* const from = const_cast<std::byte*>(op.src) + op.filled;
+      void* const from = const_cast<std::byte*>(op.write_remaining().data());
       hr = api.build_write(ring_.get(), h, IoRingBufferRefFromPointer(from),
                            len, at, FILE_WRITE_FLAGS_NONE, op_ud(&op),
                            IOSQE_FLAGS_NONE);
     } else {
       hr = api.build_read(ring_.get(), h,
-                          IoRingBufferRefFromPointer(op.dst + op.filled), len,
-                          at, op_ud(&op), IOSQE_FLAGS_NONE);
+                          IoRingBufferRefFromPointer(op.read_remaining().data()),
+                          len, at, op_ud(&op), IOSQE_FLAGS_NONE);
     }
     // The submission queue holds a transfer and its continuation for
     // every slot plus four, and nothing queues past that between two

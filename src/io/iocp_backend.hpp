@@ -424,43 +424,19 @@ inline void win_sync_write(const win_file& f, std::uint64_t off,
   }
 }
 
-// The part of a transfer both Windows engines carry: what moves, where,
-// and how much already has. The completion port's adds the OVERLAPPED
-// its requests ride on.
-struct win_transfer : performed_transfer {
-  std::byte* dst = nullptr;        // reads fill this
-  const std::byte* src = nullptr;  // writes read from this
-  std::size_t len = 0;
-  std::uint64_t off = 0;
-  std::size_t filled = 0;
-  bool is_write = false;
-  bool cancelled = false;  // a cancel was asked for; one is enough
-
-  [[nodiscard]] std::size_t length() const noexcept { return len; }
-
+// The transfer both Windows engines carry: span_transfer, armed
+// without a descriptor of its own, since the file's handles are reached
+// through the owner file. The completion port's adds the OVERLAPPED its
+// requests ride on.
+struct win_transfer : span_transfer {
   template <class Part>
   void arm_read(Part&, std::uint64_t at, std::span<std::byte> to) noexcept {
-    arm(at, to.size());
-    dst = to.data();
-    src = nullptr;
-    is_write = false;
+    arm_span_read(at, to);
   }
   template <class Part>
   void arm_write(Part&, std::uint64_t at,
                  std::span<const std::byte> from) noexcept {
-    arm(at, from.size());
-    dst = nullptr;
-    src = from.data();
-    is_write = true;
-  }
-
- private:
-  void arm(std::uint64_t at, std::size_t n) noexcept {
-    len = n;
-    off = at;
-    filled = 0;
-    cancelled = false;
-    reset_performance();
+    arm_span_write(at, from);
   }
 };
 
@@ -472,14 +448,13 @@ struct win_transfer : performed_transfer {
 template <class Op>
 [[nodiscard]] std::error_code win_perform_rest(Op& op) noexcept {
   try {
-    const std::size_t rest = op.len - op.filled;
     const win_file& f = op.owner_file->part().f;
     if (op.is_write) {
-      win_sync_write(f, op.off + op.filled, {op.src + op.filled, rest});
+      win_sync_write(f, op.position(), op.write_remaining());
     } else {
-      win_sync_read(f, op.off + op.filled, {op.dst + op.filled, rest});
+      win_sync_read(f, op.position(), op.read_remaining());
     }
-    op.filled = op.len;
+    op.filled = op.length();
   } catch (const std::system_error& e) {
     return e.code();
   } catch (...) {
@@ -576,12 +551,12 @@ class iocp_engine {
   template <class Op>
   [[nodiscard]] bool place(Op& op) noexcept {
     const win_file& f = op.owner_file->part().f;
-    std::size_t len = op.len - op.filled;
+    std::size_t len = op.remaining();
     if (!f.overlapped || len == 0) {
       return false;
     }
     len = std::min(len, max_win_piece);
-    const std::uint64_t at = op.off + op.filled;
+    const std::uint64_t at = op.position();
     if (f.direct) {
       len -= len % direct_align;
       if (len == 0 || at % direct_align != 0) {
@@ -705,8 +680,8 @@ class iocp_engine {
     op.device_begin();
     const BOOL ok =
         op.is_write
-            ? ::WriteFile(h, op.src + op.filled, len, nullptr, &op.ov)
-            : ::ReadFile(h, op.dst + op.filled, len, nullptr, &op.ov);
+            ? ::WriteFile(h, op.write_remaining().data(), len, nullptr, &op.ov)
+            : ::ReadFile(h, op.read_remaining().data(), len, nullptr, &op.ov);
     if (ok == 0 && ::GetLastError() != ERROR_IO_PENDING) {
       op.device_end();
       return false;

@@ -301,12 +301,12 @@ class aio_engine {
   // is free to refill once aio_return has been called.
   template <class Op>
   [[nodiscard]] bool place(Op& op) noexcept {
-    const std::size_t len = op.length() - op.filled;
+    const std::size_t len = op.remaining();
     if (!use_aio_ || len == 0) {
       release(op);
       return false;
     }
-    const fd_piece piece = direct_piece(*op.sync_file, op.off + op.filled, len);
+    const fd_piece piece = direct_piece(*op.sync_file, op.position(), len);
     request* const req = op.req != nullptr ? op.req : acquire_request();
     if (req == nullptr) {
       return false;
@@ -315,13 +315,13 @@ class aio_engine {
     req->op = &op;
     std::memset(&req->cb, 0, sizeof req->cb);
     req->cb.aio_fildes = piece.fd;
-    req->cb.aio_offset = static_cast<off_t>(op.off + op.filled);
+    req->cb.aio_offset = static_cast<off_t>(op.position());
     // aio_buf is `volatile void *`, so a write's source loses its const
     // on the way in; the kernel only reads it, which is what LIO_WRITE
     // means.
     req->cb.aio_buf = op.is_write
-                          ? const_cast<std::byte*>(op.wbuf.data() + op.filled)
-                          : op.buf.data() + op.filled;
+                          ? const_cast<std::byte*>(op.write_remaining().data())
+                          : op.read_remaining().data();
     req->cb.aio_nbytes = piece.len;
     req->cb.aio_lio_opcode = op.is_write ? LIO_WRITE : LIO_READ;
     req->cb.aio_sigevent.sigev_notify = SIGEV_KEVENT;
@@ -429,7 +429,7 @@ class aio_engine {
                   0};
         }
         if (!op.is_write) {
-          msan_unpoison(op.buf.data() + op.filled,
+          msan_unpoison(op.read_remaining().data(),
                         static_cast<std::size_t>(r.res));
         }
         return {event::kind::completion, &op, {},

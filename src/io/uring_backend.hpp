@@ -607,19 +607,19 @@ class uring_engine {
   // give.
   template <class Op>
   [[nodiscard]] bool place(Op& op) noexcept {
-    const std::size_t len = op.length() - op.filled;
+    const std::size_t len = op.remaining();
     if (!use_uring_ || len == 0) {
       return false;
     }
-    const fd_piece piece = direct_piece(*op.sync_file, op.off + op.filled, len);
-    const void* const data = op.is_write
-                                 ? static_cast<const void*>(op.wbuf.data() + op.filled)
-                                 : static_cast<const void*>(op.buf.data() + op.filled);
+    const fd_piece piece = direct_piece(*op.sync_file, op.position(), len);
+    const void* const data =
+        op.is_write ? static_cast<const void*>(op.write_remaining().data())
+                    : static_cast<const void*>(op.read_remaining().data());
     // The piece is the kernel's from here, and charged to the device from
     // here.
     op.device_begin();
     ring_.fill_rw(op.is_write ? IORING_OP_WRITE : IORING_OP_READ, piece.fd,
-                  data, static_cast<unsigned>(piece.len), op.off + op.filled,
+                  data, static_cast<unsigned>(piece.len), op.position(),
                   op_ud(&op), offload_);
     return true;
   }
@@ -701,7 +701,7 @@ class uring_engine {
                     std::error_code(-res, std::generic_category()), 0};
           }
           if (!op.is_write) {
-            msan_unpoison(op.buf.data() + op.filled,
+            msan_unpoison(op.read_remaining().data(),
                           static_cast<std::size_t>(res));
           }
           return {event::kind::completion, &op, {},

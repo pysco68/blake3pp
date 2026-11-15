@@ -355,6 +355,63 @@ struct performed_transfer : transfer_base {
   bool result_is_system = false;  // the category of result_value
 };
 
+// What a transfer moves, where, and how far it has got, in the one
+// vocabulary the completion engines and their lanes share: the caller's
+// buffer as a span for each direction, the file offset it starts at, and
+// what has moved so far. Direction is its own flag, since an empty span
+// cannot say whether a zero-length transfer was a read or a write. Each
+// engine's transfer derives from this and arms it through its own
+// arm_read()/arm_write(), which reset its own state as well.
+struct span_transfer : performed_transfer {
+  std::span<std::byte> buf{};         // reads fill this
+  std::span<const std::byte> wbuf{};  // writes read from this
+  std::uint64_t off = 0;
+  std::size_t filled = 0;
+  bool is_write = false;
+  bool cancelled = false;  // a cancel was asked for; one is enough
+
+  [[nodiscard]] std::size_t length() const noexcept {
+    return is_write ? wbuf.size() : buf.size();
+  }
+  // Where the rest of the transfer starts in the file, and how much of it
+  // there is: a fresh transfer's whole length from its offset, or what a
+  // short piece left.
+  [[nodiscard]] std::uint64_t position() const noexcept { return off + filled; }
+  [[nodiscard]] std::size_t remaining() const noexcept {
+    return length() - filled;
+  }
+  // The caller's bytes the rest moves, in the transfer's direction.
+  [[nodiscard]] std::span<std::byte> read_remaining() const noexcept {
+    return buf.subspan(filled);
+  }
+  [[nodiscard]] std::span<const std::byte> write_remaining() const noexcept {
+    return wbuf.subspan(filled);
+  }
+
+ protected:
+  void arm_span_read(std::uint64_t at, std::span<std::byte> to) noexcept {
+    arm_span(at);
+    buf = to;
+    wbuf = {};
+    is_write = false;
+  }
+  void arm_span_write(std::uint64_t at,
+                      std::span<const std::byte> from) noexcept {
+    arm_span(at);
+    buf = {};
+    wbuf = from;
+    is_write = true;
+  }
+
+ private:
+  void arm_span(std::uint64_t at) noexcept {
+    off = at;
+    filled = 0;
+    cancelled = false;
+    reset_performance();
+  }
+};
+
 // The completion-callback I/O contract.
 //
 // A context owns the completion mechanism (a ring, a port, a queue) and

@@ -45,39 +45,15 @@ void fill(std::span<std::byte> to, std::uint64_t off) noexcept {
 // rather than a hang.
 class fake_engine {
  public:
-  struct transfer_part : io_impl::performed_transfer {
-    std::span<std::byte> buf{};
-    std::span<const std::byte> wbuf{};
-    std::uint64_t off = 0;
-    std::size_t filled = 0;
-    bool is_write = false;
-    bool cancelled = false;
-
-    [[nodiscard]] std::size_t length() const noexcept {
-      return is_write ? wbuf.size() : buf.size();
-    }
+  struct transfer_part : io_impl::span_transfer {
     template <class Part>
     void arm_read(Part&, std::uint64_t at, std::span<std::byte> to) noexcept {
-      arm(at);
-      buf = to;
-      wbuf = {};
-      is_write = false;
+      arm_span_read(at, to);
     }
     template <class Part>
     void arm_write(Part&, std::uint64_t at,
                    std::span<const std::byte> from) noexcept {
-      arm(at);
-      buf = {};
-      wbuf = from;
-      is_write = true;
-    }
-
-   private:
-    void arm(std::uint64_t at) noexcept {
-      off = at;
-      filled = 0;
-      cancelled = false;
-      reset_performance();
+      arm_span_write(at, from);
     }
   };
 
@@ -143,7 +119,7 @@ class fake_engine {
       hold_lanes.wait(true);
     }
     if (!op.is_write) {
-      fill(op.buf.subspan(op.filled), op.off + op.filled);
+      fill(op.read_remaining(), op.position());
     }
     op.filled = op.length();
     return {};
@@ -151,8 +127,7 @@ class fake_engine {
 
   template <class Op>
   [[nodiscard]] bool place(Op& op) noexcept {
-    if (!engaged_ || op.filled == op.length() ||
-        (op.filled > 0 && !takes_rest)) {
+    if (!engaged_ || op.remaining() == 0 || (op.filled > 0 && !takes_rest)) {
       return false;
     }
     op.device_begin();
@@ -209,9 +184,9 @@ class fake_engine {
         return {event::kind::completion, &op,
                 std::make_error_code(std::errc::operation_canceled), 0};
       }
-      const std::size_t n = std::min(piece, op.length() - op.filled);
+      const std::size_t n = std::min(piece, op.remaining());
       if (!op.is_write) {
-        fill(op.buf.subspan(op.filled, n), op.off + op.filled);
+        fill(op.read_remaining().first(n), op.position());
       }
       return {event::kind::completion, &op, {}, n};
     }

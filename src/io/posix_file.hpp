@@ -144,52 +144,28 @@ struct posix_file {
   bool nocache_ = false;
 };
 
-// The part of a transfer that the POSIX backends with a kernel queue,
-// io_uring and AIO, share: what moves, where, how much of it already
-// has, and the file whose descriptors carry it. Each backend's transfer
-// adds its own kernel state, and the file and queue links it needs typed.
-struct posix_transfer : performed_transfer {
-  std::span<std::byte> buf{};         // reads fill this
-  std::span<const std::byte> wbuf{};  // writes read from this
-  std::uint64_t off = 0;
-  std::size_t filled = 0;
+// The transfer the POSIX engines with a kernel queue, io_uring and AIO,
+// share: span_transfer and the file whose descriptors carry it. Each
+// engine's transfer adds its own kernel state.
+struct posix_transfer : span_transfer {
   posix_file* sync_file = nullptr;  // the deferred path needs the pair
-  bool cancelled = false;  // a cancel was asked for; one is enough
-  bool is_write = false;
 
-  [[nodiscard]] std::size_t length() const noexcept {
-    return is_write ? wbuf.size() : buf.size();
-  }
-
-  // What a transfer needs that depends neither on its direction nor on
-  // where it is placed.
-  void arm(posix_file& f, std::uint64_t at) noexcept {
-    off = at;
-    filled = 0;
-    sync_file = &f;
-    cancelled = false;
-    reset_performance();
-  }
   void arm_read(posix_file& f, std::uint64_t at,
                 std::span<std::byte> to) noexcept {
-    arm(f, at);
-    buf = to;
-    wbuf = {};
-    is_write = false;
+    arm_span_read(at, to);
+    sync_file = &f;
   }
   void arm_write(posix_file& f, std::uint64_t at,
                  std::span<const std::byte> from) noexcept {
-    arm(f, at);
-    buf = {};
-    wbuf = from;
-    is_write = true;
+    arm_span_write(at, from);
+    sync_file = &f;
   }
 };
 
 // How much of a piece of a transfer the kernel queue takes, and through
 // which descriptor. Asked for both directions and for every piece: the
 // initial one, and what is left after a short completion, which resumes
-// at off + filled -- a granule boundary only if the device stopped on one.
+// at position() -- a granule boundary only if the device stopped on one.
 //
 // O_DIRECT rejects an unaligned length and an unaligned offset, so the
 // direct descriptor carries whole granules at a granule offset, and a
@@ -221,14 +197,11 @@ struct fd_piece {
 // its file and nothing else.
 [[nodiscard]] inline std::error_code perform_rest(posix_transfer& op) noexcept {
   try {
-    const std::size_t done = op.filled;
-    const std::size_t rest = op.length() - done;
+    const int fd = op.sync_file->sync_fd(op.remaining());
     if (op.is_write) {
-      op.sync_file->pwrite_all(op.sync_file->sync_fd(rest),
-                               op.wbuf.subspan(done), op.off + done);
+      op.sync_file->pwrite_all(fd, op.write_remaining(), op.position());
     } else {
-      op.sync_file->pread_all(op.sync_file->sync_fd(rest),
-                              op.buf.subspan(done), op.off + done);
+      op.sync_file->pread_all(fd, op.read_remaining(), op.position());
     }
     op.filled = op.length();
   } catch (const std::system_error& e) {
