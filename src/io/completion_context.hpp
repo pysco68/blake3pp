@@ -68,7 +68,11 @@
 #include <system_error>
 #include <utility>
 
-#include "io/backend.hpp"
+#include <blake3pp/detail/driver.hpp>
+
+#include "io/engine_rung.hpp"
+#include "io/lanes.hpp"
+#include "io/options.hpp"
 
 namespace blake3pp::detail::io_impl {
 

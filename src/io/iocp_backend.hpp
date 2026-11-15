@@ -35,7 +35,9 @@
 #include <utility>
 #include <vector>
 
-#include "io/backend.hpp"
+#include "io/io_context.hpp"
+#include "io/options.hpp"
+#include "io/transfer.hpp"
 #include "io/completion_context.hpp"
 
 namespace blake3pp::detail::io_impl {

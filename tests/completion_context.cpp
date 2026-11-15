@@ -21,6 +21,7 @@
 #include <doctest/doctest.h>
 
 #include "io/completion_context.hpp"
+#include "io/transfer.hpp"
 
 // Named rather than anonymous: the engine's constants are its contract
 // with the context, not values this file reads.

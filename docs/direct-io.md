@@ -96,7 +96,7 @@ its number has to actually move the bytes.
 
 `O_DIRECT` and `FILE_FLAG_NO_BUFFERING` both reject a transfer unless
 the buffer address, the length and the file offset are all multiples of
-one granule. `src/io/backend.hpp` fixes that granule at 4096 bytes
+one granule. `src/io/options.hpp` fixes that granule at 4096 bytes
 (`direct_align`), the common sector and page size on the platforms this
 applies to. `F_NOCACHE` carries no such contract: macOS serves a
 misaligned edge through the cache transparently instead of rejecting it,

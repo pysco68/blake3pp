@@ -1,4 +1,4 @@
-// The completion-callback reader contract (src/io/backend.hpp): what a
+// The completion-callback reader contract (src/io/io_context.hpp): what a
 // context promises the engine, tested on the contexts themselves rather
 // than through file_reader.
 //
@@ -38,7 +38,12 @@
 #include <doctest/doctest.h>
 
 #include "temp_names.hpp"
-#include "io/backend.hpp"
+#include "io/io_context.hpp"
+#include "io/lanes.hpp"
+#include "io/options.hpp"
+#include "io/sync_context.hpp"
+#include "io/transfer.hpp"
+#include "io/waiter.hpp"
 #include "io/engine.hpp"
 #include "io/stdio_backend.hpp"
 #if defined(__unix__) || defined(__APPLE__)

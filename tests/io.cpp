@@ -36,7 +36,7 @@
 #endif
 #if defined(__linux__)
 #include <fcntl.h>
-#include "io/backend.hpp"
+#include "io/options.hpp"
 #include "io/uring_backend.hpp"
 #endif
 #if defined(__FreeBSD__)

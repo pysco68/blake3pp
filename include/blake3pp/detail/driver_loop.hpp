@@ -27,7 +27,7 @@
 // completion may run and who may touch what afterwards:
 //
 //   * callbacks run only inside poll(), which is the I/O backends'
-//     contract (src/io/backend.hpp);
+//     contract (src/io/io_context.hpp);
 //   * nothing completes inside a start(), which is this header's;
 //   * once a node is on the run queue, the thread that put it there
 //     touches neither the node nor the operation state it lives in ever

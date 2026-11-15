@@ -19,7 +19,8 @@
 #include <system_error>
 #include <utility>
 
-#include "io/backend.hpp"
+#include "io/options.hpp"
+#include "io/transfer.hpp"
 #include "io/backend_select.hpp"
 
 namespace blake3pp::detail {

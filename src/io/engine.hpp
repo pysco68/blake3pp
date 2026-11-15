@@ -1,7 +1,7 @@
 #pragma once
 
 // The two portable I/O engines, written exactly once as class templates
-// constrained by io_context, the concept in io/backend.hpp. The public
+// constrained by io_context, the concept in io/io_context.hpp. The public
 // file_reader/file_writer TUs instantiate them with what
 // backend_select.hpp picks; the tests instantiate them again with the
 // off-platform contexts and backends, so those stay compiled AND executed
@@ -30,12 +30,13 @@
 #include <blake3pp/detail/file_reader.hpp>
 #include <blake3pp/detail/file_writer.hpp>
 
-#include "io/backend.hpp"
+#include "io/io_context.hpp"
+#include "io/options.hpp"
 
 namespace blake3pp::detail::io_impl {
 
 // The read-side window/slot engine on the completion-callback contract
-// (io_context in io/backend.hpp): windows are delivered strictly in
+// (io_context in io/io_context.hpp): windows are delivered strictly in
 // file order, release() recycles a slot and that recycling is the
 // backpressure, and a submission that fails inside the noexcept
 // release() is latched for the next next() to throw.

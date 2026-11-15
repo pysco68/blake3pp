@@ -14,7 +14,10 @@
 #include <cstdint>
 #include <span>
 
-#include "io/backend.hpp"
+#include "io/fd.hpp"
+#include "io/io_context.hpp"
+#include "io/options.hpp"
+#include "io/sync_context.hpp"
 #include "io/posix_file.hpp"
 
 namespace blake3pp::detail::io_impl {

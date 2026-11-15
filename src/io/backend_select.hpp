@@ -3,7 +3,7 @@
 // The one platform decision left in the I/O layer. Each branch names the
 // io_context the OS gets, and everything else (the engines and the
 // backends themselves) is straight-line C++. The engine TUs
-// static_assert the concepts (io/backend.hpp) against these aliases, so a
+// static_assert the concepts (io/io_context.hpp) against these aliases, so a
 // backend drifting from the contract fails loudly at this seam, not
 // somewhere inside the engine.
 //

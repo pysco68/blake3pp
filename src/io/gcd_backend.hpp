@@ -31,7 +31,10 @@
 #include <system_error>
 #include <utility>
 
-#include "io/backend.hpp"
+#include "io/fd.hpp"
+#include "io/io_context.hpp"
+#include "io/lanes.hpp"
+#include "io/options.hpp"
 #include "io/completion_context.hpp"
 #include "io/posix_file.hpp"
 

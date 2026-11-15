@@ -50,7 +50,7 @@
 #include <string_view>
 #include <type_traits>
 
-#include "io/backend.hpp"
+#include "io/options.hpp"
 #include "io/backend_select.hpp"
 #include "io/engine_rung.hpp"
 
