@@ -1,15 +1,16 @@
 #pragma once
 
-// One io_context for every backend whose kernel completes transfers on a
-// queue of its own: io_uring, POSIX AIO over kqueue, the completion port
-// and the I/O ring -- and libdispatch, whose worker pool completes them
-// the same way. The context is written once here -- the files and
-// their list, the counts, the deferred pump, what a completion means,
-// how poll() waits, how a closing file and a closing context wait out
-// what the kernel still holds. A backend supplies only its engine: how a
-// piece goes to the kernel, how a completion comes back, how a sleeping
-// poll is woken, and what it does when the kernel refuses a submission.
-// Internal to src/io/, never installed.
+// One io_context for every backend whose kernel completes transfers on a queue
+// of its own: io_uring, POSIX AIO over kqueue, the completion port and the I/O
+// ring -- and libdispatch, whose worker pool completes them the same way. The
+// synchronous sources (sync_context.hpp) run on it too, with no queue: every
+// transfer goes to the lanes. The context is written once here -- the files and
+// their list, the counts, the deferred pump, what a completion means, how
+// poll() waits, how a closing file and a closing context wait out what the
+// kernel still holds. A backend supplies only its engine: how a piece goes to
+// the kernel, how a completion comes back, how a sleeping poll is woken, and
+// what it does when the kernel refuses a submission. Internal to src/io/, never
+// installed.
 //
 // The engine a context is instantiated with provides:
 //
@@ -51,6 +52,13 @@
 //   void begin_drain() noexcept;  void end_drain() noexcept;
 //                                     // around the drain's wait
 //   void release(Op&) noexcept;       // what the engine lent the op
+//
+// and may provide
+//
+//   static unsigned lanes_for(unsigned max_inflight) noexcept;
+//                                     // the pump's lane count, for an
+//                                     // engine whose lanes may not
+//                                     // overlap; io_lanes_for() otherwise
 //
 // where Op is the context's transfer, so the engine's members are
 // templates over it.
@@ -150,7 +158,7 @@ class completion_context {
       : engine_(opts, max_inflight),
         // Declared last, and initialized last: see the member list.
         pump_(io_lanes::waker<completion_context>(), this, &perform_deferred,
-              io_lanes_for(max_inflight)) {}
+              lanes_for(max_inflight)) {}
   completion_context(const completion_context&) = delete;
   completion_context& operator=(const completion_context&) = delete;
 
@@ -505,6 +513,16 @@ class completion_context {
     dropped += pump_.remove_done_if(mine);
     in_flight_ -= std::min(dropped, in_flight_);
     f.inflight_ -= std::min(dropped, f.inflight_);
+  }
+
+  // The lanes the pump runs: the engine's own count where it declares one,
+  // else as many as the caller's depth, up to max_io_lanes.
+  [[nodiscard]] static unsigned lanes_for(unsigned max_inflight) noexcept {
+    if constexpr (requires { Engine::lanes_for(max_inflight); }) {
+      return Engine::lanes_for(max_inflight);
+    } else {
+      return io_lanes_for(max_inflight);
+    }
   }
 
   // Requests in the kernel, a queue that cannot be waited on, and buffers

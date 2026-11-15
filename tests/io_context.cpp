@@ -1784,6 +1784,65 @@ TEST_CASE("wake() releases a blocked poll from another thread") {
 #endif
 }
 
+// A wake with no poll blocked is remembered: the next blocking poll
+// returns at once, with nothing run. The one after it blocks again and is
+// released by a second wake, so the first wake's signal was consumed
+// rather than left to end every later sleep.
+TEST_CASE("a wake before a blocking poll is remembered, and only once") {
+  const auto check = [](auto& ctx) {
+    ctx.wake();
+    CHECK(ctx.poll(true) == 0);
+    std::atomic<bool> returned{false};
+    std::thread driver([&] {
+      (void)ctx.poll(true);
+      returned.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK_FALSE(returned.load(std::memory_order_acquire));
+    ctx.wake();
+    driver.join();
+    CHECK(returned.load(std::memory_order_acquire));
+  };
+  {
+    io_impl::stdio_context ctx({}, 4);
+    check(ctx);
+  }
+#if defined(__unix__) || defined(__APPLE__)
+  {
+    io_impl::pread_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(__linux__)
+  {
+    io_impl::uring_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(__FreeBSD__)
+  {
+    io_impl::aio_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(_WIN32)
+  {
+    io_impl::iocp_context ctx({}, 4);
+    check(ctx);
+  }
+  {
+    io_impl::ioring_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+#if defined(__APPLE__)
+  {
+    io_impl::gcd_context ctx({}, 4);
+    check(ctx);
+  }
+#endif
+}
+
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__) || \
     defined(__FreeBSD__)
 // The destructor drains without completing anything into the caller's
