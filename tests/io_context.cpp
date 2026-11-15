@@ -342,7 +342,11 @@ void check_write_discipline(std::string_view tag, const fs::path& path,
     op.done = &probe::on_done;
     op.owner = &p;
 
-    ctx.submit_write(f, 0, std::span<const std::byte>{content}, op);
+    // A direct write takes a buffer aligned as the engines' arena is, so
+    // the test hands it the same kind of buffer.
+    const auto buf = io_impl::make_aligned_buffer(std::max<std::size_t>(len, 1));
+    std::ranges::copy(content, buf.get());
+    ctx.submit_write(f, 0, std::span<const std::byte>{buf.get(), len}, op);
     CHECK(p.calls == 0);
     ctx.flush();
     CHECK(p.calls == 0);
