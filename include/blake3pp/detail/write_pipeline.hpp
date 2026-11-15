@@ -39,11 +39,8 @@
 #include <type_traits>
 #include <utility>
 
-#if defined(__linux__)
-#include <sched.h>  // sched_getcpu() for agent_record::cpu
-#endif
-
 #include <blake3pp/detail/contract.hpp>
+#include <blake3pp/detail/current_cpu.hpp>
 #include <blake3pp/detail/driver.hpp>
 #include <blake3pp/detail/driver_loop.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
@@ -301,12 +298,7 @@ class write_scope
         a->busy_ns = w.rec->agent_busy_ns;
         a->parts = 1;
         a->min_part_ns = a->max_part_ns = w.rec->agent_busy_ns;
-        a->cpu = ~std::uint32_t{0};
-#if defined(__linux__)
-        if (const int c = ::sched_getcpu(); c >= 0) {
-          a->cpu = static_cast<std::uint32_t>(c);
-        }
-#endif
+        a->cpu = current_cpu();
       }
     }
   }

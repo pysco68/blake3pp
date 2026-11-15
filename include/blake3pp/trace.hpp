@@ -113,8 +113,9 @@ struct agent_record {
   std::uint32_t parts;
   /// Chunks per part (the same for every part of a window).
   std::uint32_t part_chunks;
-  /// The CPU the invocation ran on at t_begin (sched_getcpu() on Linux);
-  /// UINT32_MAX where the platform cannot say.
+  /// The CPU the invocation ran on at t_begin: sched_getcpu() on Linux
+  /// and FreeBSD, processor group x 64 + number on Windows; UINT32_MAX
+  /// where the platform cannot say.
   std::uint32_t cpu;
   /// window_record::file of the window this belongs to.
   std::uint32_t file;

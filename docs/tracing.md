@@ -148,7 +148,8 @@ One piece of a window's work on one agent. For a bulk invocation over
 the window's parts: which window and file, when it started (`t_begin`),
 how long it was busy, how many parts it took, the shortest and longest of
 those parts, the chunks per part, and the CPU it was on at `t_begin`
-(`sched_getcpu()` on Linux, `UINT32_MAX` where the platform cannot say).
+(`sched_getcpu()` on Linux and FreeBSD, processor group × 64 + number on
+Windows, `UINT32_MAX` where the platform cannot say).
 Bytes compressed is `parts * part_chunks * chunk_size`, which over
 `busy_ns` is that invocation's effective rate. A record with `parts == 0`
 is the fold of the window's chaining values, which runs on the agent

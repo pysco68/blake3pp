@@ -21,11 +21,8 @@
 #include <utility>
 #include <vector>
 
-#if defined(__linux__)
-#include <sched.h>  // sched_getcpu() for agent_record::cpu
-#endif
-
 #include <blake3pp/core.hpp>
+#include <blake3pp/detail/current_cpu.hpp>
 #include <blake3pp/detail/ex.hpp>
 #include <blake3pp/detail/stack_budget.hpp>
 #include <blake3pp/detail/tree_reducer.hpp>
@@ -148,10 +145,7 @@ template <bool Traced, class Scheduler, stack_budget Budget,
              std::uint64_t max_ns = 0;
              std::uint32_t cpu = ~std::uint32_t{0};
              if (per_agent) {
-#if defined(__linux__)
-               const int c = ::sched_getcpu();
-               cpu = c < 0 ? ~std::uint32_t{0} : static_cast<std::uint32_t>(c);
-#endif
+               cpu = current_cpu();
                do {
                  body(i);
                  const std::int64_t t_end = buf.now();
@@ -429,12 +423,7 @@ class fold_timer {
       r->min_part_ns = r->max_part_ns = 0;
       r->parts = 0;
       r->part_chunks = pt_->part_chunks;
-      r->cpu = ~std::uint32_t{0};
-#if defined(__linux__)
-      if (const int c = ::sched_getcpu(); c >= 0) {
-        r->cpu = static_cast<std::uint32_t>(c);
-      }
-#endif
+      r->cpu = current_cpu();
     }
   }
 
