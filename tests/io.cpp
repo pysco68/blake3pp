@@ -25,11 +25,11 @@
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
 
-// The portable engines and the I/O contexts the platform selector never
-// picks here: instantiating the engines with them below keeps the
+// polled_reader, polled_writer and the I/O contexts the platform selector
+// never picks here: instantiating the two with them below keeps the
 // off-platform code compiled AND executed on every platform
 // (on Linux the selector only ever compiles the io_uring backend).
-#include "io/engine.hpp"
+#include "io/polled_io.hpp"
 #include "io/portable/stdio.hpp"
 #if defined(__unix__) || defined(__APPLE__)
 #include "io/posix/pread.hpp"
@@ -1427,19 +1427,19 @@ TEST_CASE("writer submit modes deliver identical data") {
   }
 }
 
-// Writes `content` through polled_writer_engine<C>, reads it back
-// through polled_reader_engine<C>, and checks byte identity. Small
+// Writes `content` through polled_writer<C>, reads it back
+// through polled_reader<C>, and checks byte identity. Small
 // buffers and low queue depth force slot recycling; the odd length
 // forces an unaligned tail through the deferred path. One context type
 // serves both directions.
 template <class C>
-void roundtrip_engines(std::string_view tag) {
+void roundtrip_polled(std::string_view tag) {
   namespace io_impl = blake3pp::detail::io_impl;
   const auto content = make_input(300 * 1024 + 77);
   const temp_file f({});  // placeholder path; the writer recreates it
 
   {
-    io_impl::polled_writer_engine<C> w(
+    io_impl::polled_writer<C> w(
         f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2,
                  .preallocate_bytes = content.size()});
     MESSAGE(tag << " writer backend: " << w.backend_name());
@@ -1455,7 +1455,7 @@ void roundtrip_engines(std::string_view tag) {
     CHECK(w.bytes_written() == content.size());
   }
 
-  io_impl::polled_reader_engine<C> r(
+  io_impl::polled_reader<C> r(
       f.path, {.window_bytes = 64 * 1024, .queue_depth = 2});
   MESSAGE(tag << " reader backend: " << r.backend_name());
   CHECK(r.file_size() == content.size());
@@ -1478,7 +1478,7 @@ TEST_CASE("the stdio rung opens a path outside the ANSI code page") {
       (fs::path(u8"blake3pp_\u043f\u0443\u0442\u044c_\u65e5\u672c_") +=
        b3test::process_salt());
   {
-    io_impl::polled_writer_engine<io_impl::stdio_context> w(
+    io_impl::polled_writer<io_impl::stdio_context> w(
         path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
     std::size_t pos = 0;
     while (pos < content.size()) {
@@ -1493,7 +1493,7 @@ TEST_CASE("the stdio rung opens a path outside the ANSI code page") {
   REQUIRE(fs::file_size(path) == content.size());
   std::vector<std::byte> out;
   {
-    io_impl::polled_reader_engine<io_impl::stdio_context> r(
+    io_impl::polled_reader<io_impl::stdio_context> r(
         path, {.window_bytes = 64 * 1024, .queue_depth = 2});
     while (auto win = r.next()) {
       out.insert(out.end(), win->bytes.begin(), win->bytes.end());
@@ -1505,23 +1505,24 @@ TEST_CASE("the stdio rung opens a path outside the ANSI code page") {
   CHECK(out == content);
 }
 
-// The engines are templates over the backend concepts, so the backends
-// the selector ignores on this platform still get concept-checked (the
-// definition-site static_asserts in their headers fire on #include) and
-// driven through the full engine machinery: compiled AND executed
-// everywhere, not just where the selector picks them.
-TEST_CASE("engine templates drive the off-platform backends") {
+// polled_reader and polled_writer are templates over the io_context
+// concept, so the contexts the selector ignores on this platform still
+// get concept-checked (the definition-site static_asserts in their
+// headers fire on #include) and driven through the full window machinery:
+// compiled AND executed everywhere, not just where the selector picks
+// them.
+TEST_CASE("polled_reader and polled_writer drive the off-platform contexts") {
   namespace io_impl = blake3pp::detail::io_impl;
-  roundtrip_engines<io_impl::stdio_context>("stdio");
+  roundtrip_polled<io_impl::stdio_context>("stdio");
 #if defined(__unix__) || defined(__APPLE__)
-  roundtrip_engines<io_impl::pread_context>("pread");
+  roundtrip_polled<io_impl::pread_context>("pread");
 #endif
 #if defined(_WIN32)
   // The ring is the one backend the Windows selector reaches only at
-  // runtime, so the engines are driven over it here whatever this machine
+  // runtime, so the two are driven over it here whatever this machine
   // answered: a host without a ring runs the same round trip through the
   // context's synchronous rung.
-  roundtrip_engines<io_impl::ioring_context>("ioring");
+  roundtrip_polled<io_impl::ioring_context>("ioring");
 #endif
 }
 
@@ -1535,7 +1536,7 @@ TEST_CASE("finish() lands every byte on the stdio backend") {
   namespace io_impl = blake3pp::detail::io_impl;
   const auto content = make_input(100 * 1024 + 13);
   const temp_file f({});  // placeholder path; the writer recreates it
-  io_impl::polled_writer_engine<io_impl::stdio_context> w(
+  io_impl::polled_writer<io_impl::stdio_context> w(
       f.path, {.buffer_bytes = 64 * 1024, .queue_depth = 2});
   std::size_t pos = 0;
   while (pos < content.size()) {

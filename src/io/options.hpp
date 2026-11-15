@@ -1,7 +1,7 @@
 #pragma once
 
 // What a context and a file are opened with, and the direct-I/O-aligned
-// buffer arena the engines and the driver read into.
+// buffer arena polled_reader, polled_writer and the driver use.
 // Internal to src/io/, never installed.
 
 #include <cstddef>
@@ -20,9 +20,10 @@ namespace blake3pp::detail::io_impl {
 // alignment callers plan their reads around, from driver.hpp.
 constexpr std::size_t direct_align = direct_alignment;
 
-// The buffer arena of the engines and the driver: one direct-I/O-aligned
-// allocation behind an owning pointer, so member declaration order alone
-// sequences its release against the backend's drain.
+// The buffer arena of polled_reader, polled_writer and the driver: one
+// direct-I/O-aligned allocation behind an owning pointer, so member
+// declaration order alone sequences its release against the context's
+// drain.
 struct aligned_delete {
   void operator()(std::byte* p) const noexcept {
     ::operator delete(p, std::align_val_t{direct_align});
@@ -73,10 +74,10 @@ struct file_open_options {
   bool waive_zero_fill = false;
 };
 
-// What a context needs to know at construction; the engine fills it from
-// file_reader_options. A type of its own because the window size and
-// queue depth are the engine's, and a context outlives any one file's
-// options once several files share it.
+// What a context needs to know at construction; polled_reader and
+// polled_writer fill it from their options. A type of its own because the
+// window size and queue depth are theirs, and a context outlives any one
+// file's options once several files share it.
 struct reader_context_options {
   bool async = true;           // try the OS's async engine at all
   bool offload_submit = true;  // io_uring: issue on io-wq (IOSQE_ASYNC)

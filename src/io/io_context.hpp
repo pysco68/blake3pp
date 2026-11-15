@@ -1,16 +1,16 @@
 #pragma once
 
-// The portable contract between the engines and the per-OS I/O
-// backends. Reads and writes share it: an io_context owns the completion
-// mechanism, a file is opened against it, and every transfer is named by
-// a caller-owned operation whose callback reports it.
+// The portable contract between polled_reader/polled_writer and the
+// per-OS contexts. Reads and writes share it: an io_context owns the
+// completion mechanism, a file is opened against it, and every transfer
+// is named by a caller-owned operation whose callback reports it.
 //
 // Three rules span every operation:
 //  - Teardown drain: a context's destructor drains every in-flight
 //    operation, running no callback. A file's destructor that closes with
-//    transfers owed does the same for its own, through forget(). The
-//    engines declare their buffer pool member before the context, so the
-//    drain runs before the pool is freed.
+//    transfers owed does the same for its own, through forget().
+//    polled_reader and polled_writer declare their buffer pool member
+//    before the context, so the drain runs before the pool is freed.
 //  - Operation lifetime: an operation must outlive the drain of its file
 //    and of its context. A lane or a dispatch worker may be finishing a
 //    transfer until that drain returns, and it writes the result into the
@@ -61,7 +61,7 @@ namespace blake3pp::detail::io_impl {
 // context's destructor drains every in-flight transfer without running
 // callbacks. Every operation must outlive both drains: the file's, which
 // its destructor runs when transfers are owed, and the context's. The
-// engines' member order enforces all three.
+// member order of polled_reader and polled_writer enforces all three.
 //
 // Errors reach the callback as std::error_code:
 //  - errno values in the generic category;
@@ -87,10 +87,11 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   requires std::derived_from<typename C::transfer, transfer_base>;
   requires std::default_initializable<typename C::transfer>;
   // The file_reader::backend() string, computed when the file was opened
-  // and owned by it: the engine hands it straight to file_reader.
+  // and owned by it: polled_reader hands it straight to file_reader.
   { f.name() } noexcept -> std::same_as<std::string_view>;
-  // The file's length as the open found it, which the engines and the
-  // driver read to plan and to bound every transfer.
+  // The file's length as the open found it, which polled_reader,
+  // polled_writer and the driver read to plan and to bound every
+  // transfer.
   { f.size() } noexcept -> std::same_as<std::uint64_t>;
   // Queues one read of exactly buf.size() bytes at off. Performs no
   // transfer, runs no callback and cannot fail. A transfer the

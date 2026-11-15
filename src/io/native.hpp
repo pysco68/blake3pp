@@ -1,21 +1,19 @@
 #pragma once
 
 // The one platform decision left in the I/O layer. Each branch names the
-// io_context the OS gets, and everything else (the engines and the
-// backends themselves) is straight-line C++. The engine TUs
-// static_assert the concepts (io/io_context.hpp) against these aliases, so a
-// backend drifting from the contract fails loudly at this seam, not
-// somewhere inside the engine.
+// io_context the OS gets, and everything else is straight-line C++. Each
+// per-OS header static_asserts the concept (io/io_context.hpp) against
+// its context, and polled_reader and polled_writer are constrained by it,
+// so a context drifting from the contract fails at its definition, not
+// somewhere inside the window machine.
 //
-// Every platform runs polled_reader_engine and polled_writer_engine over
-// its context, so the engine aliases are written once, after the
-// branches; a platform that brought its own engine would branch there.
-// The context is named on its own because detail::io_driver (the file
-// pipeline's compiled seam) drives one directly, without an engine over
-// it.
+// Every platform runs polled_reader and polled_writer over its context,
+// so their aliases are written once, after the branches. The context is
+// named on its own because detail::io_driver (the file pipeline's
+// compiled seam) drives one directly, with neither over it.
 // Internal to src/io/, never installed.
 
-#include "io/engine.hpp"
+#include "io/polled_io.hpp"
 
 #if defined(__linux__)
 #include "io/linux/io_uring.hpp"
@@ -50,6 +48,6 @@ using native_io_context = stdio_context;
 #endif
 
 namespace blake3pp::detail::io_impl {
-using native_reader_engine = polled_reader_engine<native_io_context>;
-using native_writer_engine = polled_writer_engine<native_io_context>;
+using native_reader = polled_reader<native_io_context>;
+using native_writer = polled_writer<native_io_context>;
 }  // namespace blake3pp::detail::io_impl

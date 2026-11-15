@@ -1,14 +1,14 @@
 #pragma once
 
-// The two portable I/O engines, written exactly once as class templates
-// constrained by io_context, the concept in io/io_context.hpp. The public
-// file_reader/file_writer TUs instantiate them with what
-// native.hpp picks; the tests instantiate them again with the
-// off-platform contexts and backends, so those stay compiled AND executed
-// on every platform even though the selector never chooses them there.
-// The constraint is the contract: an engine can only speak the concept's
-// vocabulary, and a backend drifting from it fails at the instantiation
-// with a diagnostic naming the missed requirement. Internal to src/io/,
+// polled_reader and polled_writer, the window/slot machines that drive an
+// io_context, written exactly once as class templates constrained by the
+// concept in io/io_context.hpp. The public file_reader/file_writer TUs
+// instantiate them with what native.hpp picks; the tests instantiate them
+// again with the off-platform contexts, so those stay compiled AND
+// executed on every platform even though the selector never chooses them
+// there. The constraint is the contract: either can only speak the
+// concept's vocabulary, and a context drifting from it fails at the
+// instantiation with a diagnostic naming the missed requirement. Internal to src/io/,
 // never installed.
 
 #include <algorithm>
@@ -35,7 +35,7 @@
 
 namespace blake3pp::detail::io_impl {
 
-// The read-side window/slot engine on the completion-callback contract
+// The read-side window/slot machine on the completion-callback contract
 // (io_context in io/io_context.hpp): windows are delivered strictly in
 // file order, release() recycles a slot and that recycling is the
 // backpressure, and a submission that fails inside the noexcept
@@ -47,24 +47,24 @@ namespace blake3pp::detail::io_impl {
 // absorbing the others on the way; one poll serves every window in
 // flight, which is what lets the file pipeline share it across several.
 template <io_context C>
-class polled_reader_engine {
+class polled_reader {
  public:
   using window = file_reader::window;
 
-  polled_reader_engine(const std::filesystem::path& path,
+  polled_reader(const std::filesystem::path& path,
                        const file_reader_options& opts)
     requires std::constructible_from<typename C::file, C&,
                                      const std::filesystem::path&,
                                      const file_open_options&>
-      : polled_reader_engine(over_file{}, opts, path,
+      : polled_reader(over_file{}, opts, path,
                              file_open_options{.direct_io = opts.direct_io}) {}
 
   // A source with no path: the null source is constructed from the size
   // it should pretend to have. Everything downstream -- window count,
   // slots, delivery order -- is the same machine.
-  polled_reader_engine(std::uint64_t size, const file_reader_options& opts)
+  polled_reader(std::uint64_t size, const file_reader_options& opts)
     requires std::constructible_from<typename C::file, C&, std::uint64_t>
-      : polled_reader_engine(over_file{}, opts, size) {}
+      : polled_reader(over_file{}, opts, size) {}
 
   [[nodiscard]] std::uint64_t file_size() const noexcept {
     return file_.size();
@@ -108,7 +108,7 @@ class polled_reader_engine {
 
   // The slot AND the window in it: a window object names a slot, and a
   // slot is reassigned the moment it is released, so the index alone
-  // cannot tell the window being handed back from one this engine already
+  // cannot tell the window being handed back from one this reader already
   // recycled. Releasing a stale window twice would hand its buffer to the
   // next read while the caller is still hashing the window that came
   // after it -- a wrong digest with nothing to see. The offset is the
@@ -148,7 +148,7 @@ class polled_reader_engine {
     bool held = false;   // delivered, not yet released
 
     // The one place a context hands control back. Marking the slot is all
-    // it may do: the engine is not reentrant, and the contract's promise
+    // it may do: the reader is not reentrant, and the contract's promise
     // is that this runs on the thread inside poll().
     void complete(std::error_code e) noexcept {
       ec = e;
@@ -156,12 +156,12 @@ class polled_reader_engine {
     }
   };
 
-  // The engine behind both public constructors: the file is whatever the
+  // The constructor behind both public ones: the file is whatever the
   // context makes of the arguments after opts, and the first batch of
   // reads goes out before the constructor returns.
   struct over_file {};
   template <class... FileArgs>
-  polled_reader_engine(over_file, const file_reader_options& opts,
+  polled_reader(over_file, const file_reader_options& opts,
                        FileArgs&&... file_args)
       : window_(rounded_window_bytes(opts.window_bytes)),
         qd_(clamp_queue_depth(opts.queue_depth)),
@@ -225,7 +225,7 @@ class polled_reader_engine {
   typename C::file file_;
 };
 
-// The write-side slot engine, the reader's inverse, over the same
+// The write-side slot machine, the reader's inverse, over the same
 // io_context: the producer fills buffers ahead of the device, and
 // acquire() blocking on a slot whose write is still in flight is the
 // backpressure.
@@ -240,11 +240,11 @@ class polled_reader_engine {
 //   A WRITE error surfaces from acquire() or finish(), never from submit();
 //   a broken contract throws where it is detected.
 template <io_context C>
-class polled_writer_engine {
+class polled_writer {
  public:
   using buffer = file_writer::buffer;
 
-  polled_writer_engine(const std::filesystem::path& path,
+  polled_writer(const std::filesystem::path& path,
                        const file_writer_options& opts)
       : buffer_(rounded_buffer(opts.buffer_bytes)),
         qd_(clamp_queue_depth(opts.queue_depth)),
@@ -347,7 +347,7 @@ class polled_writer_engine {
     bool acquired = false;  // handed out, not yet submitted
 
     // The one place the context hands control back. Marking the slot is
-    // all it may do: the engine is not reentrant.
+    // all it may do: the writer is not reentrant.
     void complete(std::error_code e) noexcept {
       ec = e;
       busy = false;

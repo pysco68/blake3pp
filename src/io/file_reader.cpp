@@ -1,11 +1,10 @@
-// file_reader implementation: a pimpl shell around the portable engine.
-// This TU contains no platform code and no engine logic:
-// io/native.hpp names the engine the OS gets, already bound to
-// its context -- io_uring (Linux), IOCP (Windows), GCD (macOS), plain
-// pread (other POSIX), stdio (everything else) -- and io/engine.hpp is
-// the window/slot machine behind it. Runtime degradation
-// (O_DIRECT refused -> buffered, async engine refused -> sync) happens
-// inside the backends.
+// file_reader implementation: a pimpl shell around polled_reader. This
+// TU contains no platform code and no window logic: io/native.hpp names
+// the context the OS gets -- io_uring (Linux), the I/O ring or the
+// completion port (Windows), libdispatch (macOS), AIO (FreeBSD), plain
+// pread (other POSIX), stdio (everything else) -- and io/polled_io.hpp is
+// the window/slot machine over it. Runtime degradation (O_DIRECT refused
+// -> buffered, async engine refused -> sync) happens inside the contexts.
 
 #include <blake3pp/detail/file_reader.hpp>
 
@@ -16,15 +15,15 @@
 #include <string_view>
 
 #include "io/native.hpp"
-#include "io/engine.hpp"
+#include "io/polled_io.hpp"
 
 namespace blake3pp::detail {
 
 // Conformance is checked in the backend headers themselves (each ends
 // with definition-site static_asserts) and again by the
-// polled_reader_engine constraint at this instantiation.
-struct file_reader::impl : io_impl::native_reader_engine {
-  using base = io_impl::native_reader_engine;
+// polled_reader constraint at this instantiation.
+struct file_reader::impl : io_impl::native_reader {
+  using base = io_impl::native_reader;
   using base::base;
 };
 

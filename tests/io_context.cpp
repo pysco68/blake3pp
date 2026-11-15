@@ -1,6 +1,6 @@
 // The completion-callback reader contract (src/io/io_context.hpp): what a
-// context promises the engine, tested on the contexts themselves rather
-// than through file_reader.
+// context promises polled_reader and polled_writer, tested on the contexts
+// themselves rather than through file_reader.
 //
 // The invariant the pipeline rests on is where a callback runs: inside
 // poll(), on the thread that called it, and nowhere else. Most of what
@@ -44,7 +44,7 @@
 #include "io/sync_context.hpp"
 #include "io/transfer.hpp"
 #include "io/waiter.hpp"
-#include "io/engine.hpp"
+#include "io/polled_io.hpp"
 #include "io/portable/stdio.hpp"
 #if defined(__unix__) || defined(__APPLE__)
 #include "io/posix/pread.hpp"
@@ -1017,7 +1017,7 @@ TEST_CASE("a refused preallocation degrades to an ordinary writable open") {
 
 TEST_CASE("the engine survives a context that finishes in pieces and out of order") {
   constexpr std::uint64_t size = 300 * 1024 + 77;
-  io_impl::polled_reader_engine<fake_context> r(
+  io_impl::polled_reader<fake_context> r(
       size, {.window_bytes = 64 * 1024, .queue_depth = 3});
   CHECK(r.file_size() == size);
   CHECK(r.backend_name() == "fake");
@@ -1039,7 +1039,7 @@ TEST_CASE("a read that fails reaches the caller as an exception, once") {
   constexpr std::uint64_t size = 256 * 1024;
   constexpr std::size_t window = 64 * 1024;
   fake_context::fail_offset = 2 * window;  // the third window
-  io_impl::polled_reader_engine<fake_context> r(
+  io_impl::polled_reader<fake_context> r(
       size, {.window_bytes = window, .queue_depth = 2});
   std::uint64_t delivered = 0;
   CHECK_THROWS_AS(
