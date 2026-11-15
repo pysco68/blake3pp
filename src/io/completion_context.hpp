@@ -41,7 +41,8 @@
 //   void take_back<Op>(Refused) noexcept;  // everything not submitted
 //   std::error_code take_failure() noexcept;  // a latched submit failure
 //   engine_event<Op> next<Op>(bool block) noexcept;
-//   bool take_wake() noexcept;  void wake() noexcept;
+//   void wake() noexcept;             // any thread; next() reports it,
+//                                     // next(false) before it says empty
 //   void cancel_file(file_part&, std::size_t owed) noexcept;
 //   std::size_t drop_unsubmitted<Op>(Pred mine) noexcept;
 //   std::size_t kernel_owed() const noexcept;  // requests the kernel holds,
@@ -450,9 +451,11 @@ class completion_context {
     }
   }
 
+  // A wake is reported by the engine's next(), and remembered here
+  // wherever it was seen -- an ordinary reap, or a closing file's or a
+  // drain's wait -- until a poll() takes it.
   [[nodiscard]] bool take_wake() noexcept {
-    const bool engine_woken = engine_.take_wake();
-    return std::exchange(woken_, false) || engine_woken;
+    return std::exchange(woken_, false);
   }
 
   // Every callback runs from here, which is what poll() counts: a

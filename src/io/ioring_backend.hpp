@@ -465,11 +465,11 @@ class ioring_engine {
                 static_cast<std::size_t>(cqe.Information)};
       }
 #endif
-      if (!block) {
-        return {};
-      }
       if (woken_.exchange(false, std::memory_order_acquire)) {
         return {event::kind::wake};
+      }
+      if (!block) {
+        return {};
       }
       if (::WaitForSingleObject(event_.get(), INFINITE) == WAIT_FAILED) {
         return {event::kind::failed, nullptr,
@@ -481,10 +481,7 @@ class ioring_engine {
 
   // The flag is the memory and the event is only the nudge: the ring
   // signals the same event on every completion, so a wake whose signal a
-  // completion's wait consumed is still seen by the next take_wake().
-  [[nodiscard]] bool take_wake() noexcept {
-    return woken_.exchange(false, std::memory_order_acquire);
-  }
+  // completion's wait consumed is still in the flag for the next look.
   void wake() noexcept {
     woken_.store(true, std::memory_order_release);
     (void)::SetEvent(event_.get());

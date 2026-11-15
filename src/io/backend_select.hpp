@@ -171,9 +171,6 @@ class windows_engine {
     return ring_ ? ring_->template next<Op>(block)
                  : port_->template next<Op>(block);
   }
-  [[nodiscard]] bool take_wake() noexcept {
-    return ring_ ? ring_->take_wake() : port_->take_wake();
-  }
   void wake() noexcept { ring_ ? ring_->wake() : port_->wake(); }
   void cancel_file(file_part& p, std::size_t owed) noexcept {
     ring_ ? ring_->cancel_file(p, owed) : port_->cancel_file(p, owed);

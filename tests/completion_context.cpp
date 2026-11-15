@@ -90,11 +90,13 @@ class fake_engine {
   bool fail_submit = false;       // a flush latches a failure, submits nothing
   std::error_code latched{};      // what take_failure() reports, once
   bool fail_wait = false;         // a blocking next() answers failed
+  bool wake_first = false;        // a pending wake comes before completions
 
   // What the engine saw.
   std::size_t placed = 0;
   std::size_t released = 0;
   std::size_t submits = 0;  // flushes that gave the kernel something
+  std::size_t blocked_waits = 0;  // blocking looks that had to wait
   std::size_t blocked_unsubmitted = 0;
 
   // A control entry the kernel owes, a cancel's completion or a wake
@@ -175,6 +177,9 @@ class fake_engine {
   template <class Op>
   [[nodiscard]] io_impl::engine_event<Op> next(bool block) noexcept {
     using event = io_impl::engine_event<Op>;
+    if (wake_first && woken_.exchange(false)) {
+      return {event::kind::wake};
+    }
     if (!kernel_.empty()) {
       transfer_part* const front = kernel_.front();
       kernel_.pop_front();
@@ -192,6 +197,9 @@ class fake_engine {
       }
       return {event::kind::completion, &op, {}, n};
     }
+    if (woken_.exchange(false)) {
+      return {event::kind::wake};
+    }
     if (!block) {
       return {};
     }
@@ -207,12 +215,12 @@ class fake_engine {
               std::make_error_code(std::errc::resource_deadlock_would_occur)};
     }
     // Nothing in the kernel: only a lane's wake can end the wait.
+    ++blocked_waits;
     woken_.wait(false);
     woken_.store(false);
     return {event::kind::wake};
   }
 
-  [[nodiscard]] bool take_wake() noexcept { return woken_.exchange(false); }
   void wake() noexcept {
     woken_.store(true);
     woken_.notify_one();
@@ -605,6 +613,70 @@ TEST_CASE("the remainders of one reap are submitted together") {
     CHECK(holds_pattern(got[i], i * 2 * 4096));
   }
   CHECK(ctx.engine().submits == 2);
+}
+
+// A wake raised before a poll() is reported by the engine's first,
+// non-blocking look, so the poll returns without waiting at all.
+TEST_CASE("a wake before the wait ends poll(true) without a wait") {
+  context ctx({}, 4);
+  ctx.wake();
+  CHECK(ctx.poll(true) == 0);
+  CHECK(ctx.engine().blocked_waits == 0);
+}
+
+// A wake from another thread ends a poll that is already waiting.
+TEST_CASE("a wake racing a blocking poll ends it") {
+  context ctx({}, 4);
+  std::atomic<bool> returned{false};
+  std::thread poller([&] {
+    (void)ctx.poll(true);
+    returned.store(true);
+  });
+  ctx.wake();
+  for (int i = 0; i < 1000 && !returned.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!returned.load()) {
+    ctx.wake();  // release it before failing, so join() returns
+  }
+  poller.join();
+  CHECK(returned.load());
+}
+
+// A wake a closing file's wait consumed is remembered: the next poll
+// returns on it, as it would have had the file not closed first. A
+// watchdog wakes the context after ten seconds, so a forgotten wake fails
+// here instead of hanging.
+TEST_CASE("a wake consumed while a file closes is seen by the next poll") {
+  context ctx({}, 4);
+  ctx.engine().wake_first = true;
+  std::vector<std::byte> got(4096);
+  probe p;
+  context::transfer op{};
+  arm(op, p);
+  {
+    context::file file(ctx, "fake", {});
+    ctx.submit_read(file, 0, std::span(got), op);
+    ctx.flush();
+    ctx.wake();
+  }
+  CHECK(p.calls == 0);
+  std::atomic<bool> done{false};
+  std::atomic<bool> watchdog_fired{false};
+  std::thread watchdog([&] {
+    for (int i = 0; i < 1000 && !done.load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    if (!done.load()) {
+      watchdog_fired.store(true);
+      ctx.wake();
+    }
+  });
+  CHECK(ctx.poll(true) == 0);
+  done.store(true);
+  watchdog.join();
+  CHECK(!watchdog_fired.load());
+  CHECK(ctx.engine().blocked_waits == 0);
 }
 
 TEST_CASE("drain() reports nothing and leaves the context usable") {

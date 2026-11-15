@@ -398,13 +398,15 @@ class aio_engine {
     if (!use_aio_) {
       // No queue to wait on: the only event that can end a sleep is a
       // wake, and that is what the waiter is for.
-      if (!block) {
-        return {};
-      }
-      while (!waiter_.take()) {
+      for (;;) {
+        if (waiter_.take()) {
+          return {event::kind::wake};
+        }
+        if (!block) {
+          return {};
+        }
         waiter_.sleep();
       }
-      return {event::kind::wake};
     }
     for (;;) {
       while (cursor_ < got_) {
@@ -450,9 +452,6 @@ class aio_engine {
     }
   }
 
-  // With a kqueue the wake is one of its events, which next() reports;
-  // without one, the waiter is it.
-  [[nodiscard]] bool take_wake() noexcept { return !use_aio_ && waiter_.take(); }
   // A user event on the kqueue is thread-safe, and a trigger nobody is
   // waiting for stays pending until a kevent() takes it, which is the
   // contract's "a wake with no blocked poll is remembered".

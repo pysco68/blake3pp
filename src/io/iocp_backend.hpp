@@ -619,9 +619,6 @@ class iocp_engine {
             std::error_code(static_cast<int>(err), std::system_category())};
   }
 
-  // The wake is a completion of its own on the port, so next() reports
-  // it and there is nothing to take here.
-  [[nodiscard]] bool take_wake() noexcept { return false; }
   // Posts a sentinel the port hands back with a null OVERLAPPED, which is
   // how a blocked GetQueuedCompletionStatus is ended from another thread
   // or from a lane reporting a finished transfer.

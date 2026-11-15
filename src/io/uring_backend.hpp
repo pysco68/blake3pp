@@ -709,11 +709,13 @@ class uring_engine {
           return {event::kind::completion, &op, {},
                   static_cast<std::size_t>(res)};
         }
-        if (!block) {
-          return {};
-        }
+        // The eventfd only once the completion queue is empty, so a burst
+        // of completions costs no read of it each.
         if (waiter_.take()) {
           return {event::kind::wake};
+        }
+        if (!block) {
+          return {};
         }
         sleep_once();
       }
@@ -722,7 +724,6 @@ class uring_engine {
     }
   }
 
-  [[nodiscard]] bool take_wake() noexcept { return waiter_.take(); }
   void wake() noexcept { waiter_.wake(); }
 
   template <class Part>
