@@ -46,16 +46,16 @@
 #include <system_error>
 #include <utility>
 
+#include "io/completion_context.hpp"
 #include "io/io_context.hpp"
 #include "io/options.hpp"
-// unique_handle, win_file, throw_winerr and read_error: the Windows
-// handle plumbing is the port backend's and is shared verbatim.
-#include "io/windows/iocp.hpp"
+#include "io/windows/file.hpp"
 
 namespace blake3pp::detail::io_impl {
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
-// With the port's helpers, under their seamed name (see windows/iocp.hpp).
+// The test executable compiles this backend with seams and under a name
+// of its own (see windows/iocp.hpp).
 inline namespace test_seams {
 #endif
 

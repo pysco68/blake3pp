@@ -26,9 +26,9 @@ whatever the direct one cannot carry. Darwin has no `O_DIRECT`;
 `src/io/macos/dispatch.hpp` instead flips `F_NOCACHE` on the single
 descriptor with `fcntl`, per-fd rather than per-open. Windows carries two
 independent per-open flags, `FILE_FLAG_NO_BUFFERING` and
-`FILE_FLAG_OVERLAPPED` (the asynchronous handle); `src/io/windows/iocp.hpp`
-and `src/io/windows/ioring.hpp` both ask for the two together on the
-first reopen and, if that is refused, ask again for the asynchronous
+`FILE_FLAG_OVERLAPPED` (the asynchronous handle); the file both engines
+open, in `src/io/windows/file.hpp`, asks for the two together on the
+first reopen and, if that is refused, asks again for the asynchronous
 handle alone before falling back further. The asynchrony is kept on its
 own deliberately: `NO_BUFFERING` is usually what a filesystem (SMB
 shares, some virtual volumes) actually rejects, and buffered-but-async
@@ -42,7 +42,7 @@ the submission-queue model io_uring introduced: entries are built into a
 queue the application owns, one `SubmitIoRing` hands a whole batch to the
 kernel, and completions are popped from a second queue. Where the machine
 offers `IORING_VERSION_3` -- reads, writes, cancel and registration --
-`src/io/native.hpp` takes it; everything older gets the completion
+`src/io/windows/engine.hpp` takes it; everything older gets the completion
 port. `file_io_options::ioring` and `file_write_options::ioring` (both
 default `true`) choose the port instead, which is what the IOCP-against-
 IoRing comparison needs, and the rung names below say which one ran. The

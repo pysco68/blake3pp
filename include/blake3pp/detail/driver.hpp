@@ -125,7 +125,7 @@ struct io_op {
   //
   // WINDOWS is the binding case. It chooses the ring or the port at
   // runtime, and one transfer type serves both: the completion port's,
-  // whose OVERLAPPED the ring carries unused (src/io/native.hpp).
+  // whose OVERLAPPED the ring carries unused (src/io/windows/engine.hpp).
   // That is 144 bytes, as the Windows build's op-storage case reports.
   //
   // 192 leaves 48 bytes over that 144. The slack costs bytes per
