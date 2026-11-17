@@ -3,7 +3,7 @@
   "builders": [
     {
       "type": "docker",
-      "image": "ghcr.io/pysco68/blake3pp/toolchain-ppc64le-gcc15:tree-492dee988b6ea9c4@sha256:6eeb0f0e7bdbba41ed2f58e37811e53588b32f3d38f60ad14dfe8764dbe142d7",
+      "image": "ghcr.io/pysco68/blake3pp/toolchain-ppc64le-gcc15:tree-812545565beaeb7e@sha256:0d1fecf2f3a3db39ec871500ada77245a7828c63efe48c08f4bfaddeb1e378de",
       "commit": true
     }
   ]
