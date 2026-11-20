@@ -101,8 +101,9 @@ inline constexpr std::size_t no_aio_suffix_max =
 // What the kernel will let this process keep queued at once, or zero when
 // the facility is absent. Read once per context: the batch below is cut
 // to what is still free, so the per-process limit never turns a flush
-// into a refusal the backend has to unpick.
-[[nodiscard]] inline int aio_queue_limit(int& why) noexcept {
+// into a refusal the backend has to unpick. The sysctl is an int; the
+// count comes back in the type the queue arithmetic uses.
+[[nodiscard]] inline std::size_t aio_queue_limit(int& why) noexcept {
   int limit = 0;
   std::size_t len = sizeof limit;
   if (::sysctlbyname("vfs.aio.max_aio_queue_per_proc", &limit, &len, nullptr,
@@ -114,7 +115,7 @@ inline constexpr std::size_t no_aio_suffix_max =
     why = EAGAIN;
     return 0;
   }
-  return limit;
+  return static_cast<std::size_t>(limit);
 }
 
 // How many aiocbs one lio_listio may carry. AIO_LISTIO_MAX is the
@@ -271,7 +272,7 @@ class aio_engine {
     }
     use_aio_ = true;
     batch_.resize(std::min<std::size_t>(
-        aio_listio_max(), static_cast<std::size_t>(queue_limit_)));
+        aio_listio_max(), queue_limit_));
     // What one wait can hand back: a completion for every slot, its
     // continuation, and the wake.
     events_.resize(std::size_t{2} * max_inflight + 2);
@@ -594,9 +595,7 @@ class aio_engine {
   // The transfers stay queued until the kernel's answer says which of
   // them it took.
   [[nodiscard]] std::size_t fill_batch() noexcept {
-    const std::size_t room =
-        static_cast<std::size_t>(queue_limit_) -
-        std::min<std::size_t>(issued_, static_cast<std::size_t>(queue_limit_));
+    const std::size_t room = queue_limit_ - std::min(issued_, queue_limit_);
     const std::size_t cap = std::min(batch_.size(), room);
     std::size_t n = 0;
     for (transfer_part* op = pending_.front(); op != nullptr && n < cap;
@@ -696,7 +695,7 @@ class aio_engine {
   }
 
   unique_fd kq_;
-  int queue_limit_ = 0;
+  std::size_t queue_limit_ = 0;
   std::string refusal_;  // why the queue was not had, or empty
   std::vector<struct aiocb*> batch_;
   std::vector<struct kevent> events_;
