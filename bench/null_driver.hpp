@@ -1,9 +1,10 @@
 #pragma once
 
 // The file bench's stand-in for a device: a file_driver whose reads land
-// without touching storage, optionally behind a modelled device with a
-// chosen service time and knee, so the pipeline's engine ceiling and its
-// control law can be measured apart from any real drive.
+// without touching storage, optionally behind a modelled device
+// (tooling/modelled_device.hpp) with a chosen service time and knee, so
+// the pipeline's engine ceiling and its control law can be measured apart
+// from any real drive.
 
 #include <algorithm>
 #include <chrono>
@@ -17,36 +18,9 @@
 #include <blake3pp/detail/driver.hpp>
 #include <blake3pp/detail/queued_reads.hpp>
 
+#include "modelled_device.hpp"
+
 namespace b3bench {
-
-// A device to put under the null driver, so a control law can be shown
-// a knee that was chosen rather than measured.
-//
-// One FIFO server with a fixed service time per window plus a fixed
-// propagation delay: a transfer starts when the server is free, holds
-// it for `service`, and lands `latency` later. At depth d the
-// steady-state rate is min(d x window / (service + latency), window /
-// service), so throughput rises linearly to a knee at
-// 1 + latency / service and is flat above it. `knee` names that depth
-// and the latency follows from it.
-struct null_device {
-  double rate_gib_s = 0.0;  // 0: complete immediately, no device at all
-  unsigned knee = 1;
-  std::chrono::nanoseconds service{};
-  std::chrono::nanoseconds latency{};
-
-  [[nodiscard]] bool active() const noexcept { return rate_gib_s > 0.0; }
-
-  void settle(std::size_t window_bytes) noexcept {
-    if (!active()) {
-      return;
-    }
-    const double bytes_per_ns = rate_gib_s * 1024.0 * 1024.0 * 1024.0 / 1e9;
-    service = std::chrono::nanoseconds{static_cast<std::int64_t>(
-        std::max(1.0, static_cast<double>(window_bytes) / bytes_per_ns))};
-    latency = static_cast<std::int64_t>(knee > 1 ? knee - 1 : 0) * service;
-  }
-};
 
 // The pipeline with no device under it, and no bytes either.
 //
@@ -62,7 +36,7 @@ struct null_device {
 //
 // The completion half is queued_reads, because a source with nothing
 // to read has exactly one job -- report from poll() and not before.
-// Given a null_device it paces those reports instead, so the synthetic
+// Given a modelled device it paces those reports instead, so the synthetic
 // arms can be run against a device whose knee was chosen rather than
 // measured.
 class null_driver {
@@ -74,7 +48,7 @@ class null_driver {
   // not one.
   null_driver(const blake3pp::detail::io_driver_options&, unsigned,
               std::uint64_t size, std::byte filler, std::size_t pool_bytes,
-              null_device dev = {})
+              b3tool::modelled_device dev = {})
       : size_(size), dev_(dev), pool_(pool_bytes, filler) {}
   null_driver(const null_driver&) = delete;
   null_driver& operator=(const null_driver&) = delete;
@@ -128,7 +102,7 @@ class null_driver {
     }
     release_ready();
     if (block && reads_.in_flight() == 0 && !timed_.empty()) {
-      wait_until(timed_.front().ready);
+      (void)dev_.wait_toward(timed_.front().ready);
       release_ready();
     }
     // Only ever park on the waiter with nothing of the device's own
@@ -175,18 +149,13 @@ class null_driver {
       reads_.push(op, &f);
       return;
     }
-    // One server, FIFO, so the ready times this produces are already in
+    // The device admits in FIFO order, so the ready times are already in
     // order and the queue is a plain deque.
-    const double share = dev_.service == std::chrono::nanoseconds::zero() ||
-                                 window_stride_ == 0
+    const double share = window_stride_ == 0
                              ? 1.0
                              : static_cast<double>(bytes) /
                                    static_cast<double>(window_stride_);
-    const auto service = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        dev_.service * share);
-    const instant start = std::max(blake3pp::detail::steady_now(), server_free_);
-    server_free_ = start + service;
-    timed_.push_back({&op, &f, server_free_ + dev_.latency});
+    timed_.push_back({&op, &f, dev_.admit(share)});
     op.live = true;
   }
 
@@ -205,33 +174,10 @@ class null_driver {
     }
   }
 
-  // Waits for one completion, in slices no longer than a service time:
-  // sleeping the whole way would park the driver thread through the
-  // rounds that admit the next windows, which caps the concurrency at
-  // whatever one sleep allows. Spins for the last microsecond, which is
-  // what keeps a service time of a few hundred microseconds from being
-  // quantised by the scheduler's timer slack.
-  void wait_until(instant ready) const noexcept {
-    using std::chrono::microseconds;
-    const std::chrono::nanoseconds slice =
-        std::max<std::chrono::nanoseconds>(dev_.service, microseconds{1});
-    const std::chrono::nanoseconds left = ready - blake3pp::detail::steady_now();
-    if (left <= std::chrono::nanoseconds::zero()) {
-      return;
-    }
-    if (left > microseconds{2}) {
-      std::this_thread::sleep_for(std::min<std::chrono::nanoseconds>(
-          left - microseconds{1}, slice));
-    } else {
-      std::this_thread::yield();
-    }
-  }
-
   std::uint64_t size_;
   std::byte filler_{};
   std::size_t window_stride_ = 0;
-  null_device dev_{};
-  instant server_free_{};
+  b3tool::modelled_device dev_{};
   std::deque<timed_op> timed_;
   std::vector<std::byte> pool_;
   blake3pp::detail::queued_reads reads_;

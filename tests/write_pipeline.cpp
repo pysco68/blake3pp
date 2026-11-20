@@ -35,6 +35,7 @@
 #include <blake3pp/parallel_io.hpp>
 #include <blake3pp/trace.hpp>
 
+#include "modelled_device.hpp"
 #include "temp_names.hpp"
 #include "test_schedulers.hpp"
 #include <doctest/doctest.h>
@@ -98,12 +99,11 @@ struct write_script {
   int stop_at_window = -1;
   blake3pp::ex::inplace_stop_source* stop_source = nullptr;
   // A device under the sink, instead of writes that land the instant
-  // they are polled. One FIFO server holding each write for service_ns,
-  // plus a propagation delay of (knee - 1) service times, so the rate
-  // rises with the writes in flight up to `knee` and is flat above it.
+  // they are polled: tooling/modelled_device.hpp's FIFO server, holding
+  // each write for `service` behind (knee - 1) service times of delay.
   // Zero service is no device at all, which is what every other case
   // wants.
-  std::int64_t service_ns = 0;
+  std::chrono::nanoseconds service{};
   unsigned knee = 1;
 };
 
@@ -111,7 +111,8 @@ class fake_write_driver {
  public:
   fake_write_driver(std::uint64_t size, std::size_t window, write_script s)
       : size_(size), window_(window), script_(std::move(s)),
-        sink_(static_cast<std::size_t>(size)) {}
+        sink_(static_cast<std::size_t>(size)),
+        device_(script_.service, script_.knee) {}
 
   class file {
    public:
@@ -142,7 +143,10 @@ class fake_write_driver {
 
   void submit_write(file&, std::uint64_t off, std::span<const std::byte> buf,
                     detail::io_op& op) {
-    queued_.push_back(write{&op, off, buf, 0, false, device_ready()});
+    queued_.push_back(write{&op, off, buf, 0, false,
+                            device_.active()
+                                ? device_.admit()
+                                : b3tool::modelled_device::instant{}});
     op.live = true;  // the driver owes this one a callback now
   }
 
@@ -239,52 +243,18 @@ class fake_write_driver {
     std::span<const std::byte> buf;
     std::size_t done;
     bool cancelled = false;
-    // When the modelled device would land this one; 0 for no device.
-    std::int64_t ready = 0;
+    // When the modelled device would land this one; the clock's epoch for
+    // no device.
+    b3tool::modelled_device::instant ready{};
   };
 
-  [[nodiscard]] static std::int64_t device_now() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-  }
-
-  // When a write submitted now would land: the server takes it as soon
-  // as it is free, holds it for service_ns, and the completion arrives
-  // a propagation delay later. Assigned at submission, which is what
-  // makes the service of several writes overlap and the rate rise with
-  // the depth. Zero means no device: the write lands on the next poll.
-  [[nodiscard]] std::int64_t device_ready() noexcept {
-    if (script_.service_ns <= 0) {
-      return 0;
-    }
-    const std::int64_t latency =
-        static_cast<std::int64_t>(script_.knee > 1 ? script_.knee - 1 : 0) *
-        script_.service_ns;
-    const std::int64_t start = std::max(device_now(), server_free_);
-    server_free_ = start + script_.service_ns;
-    return server_free_ + latency;
-  }
-
-  // Holds a completion back until the device would have it. False
-  // leaves the write queued for a later poll. The order script is not
-  // combined with a device: the server is FIFO, so submission order is
-  // completion order.
+  // Holds a completion back until the device would have it, waiting a
+  // slice toward it first. False leaves the write queued for a later
+  // poll. The order script is not combined with a device: the server is
+  // FIFO, so submission order is completion order.
   bool await_device(const write& w) {
-    if (w.ready == 0) {
-      return true;
-    }
-    const std::int64_t left = w.ready - device_now();
-    if (left > 0) {
-      // One service time at most. Sleeping the whole way would park the
-      // driver thread through the rounds that admit the next windows,
-      // which caps the concurrency at whatever one sleep allows and
-      // makes the modelled device's depth meaningless.
-      std::this_thread::sleep_for(
-          std::chrono::nanoseconds(std::min(left, script_.service_ns)));
-      return false;
-    }
-    return true;
+    return w.ready == b3tool::modelled_device::instant{} ||
+           device_.wait_toward(w.ready);
   }
 
   [[nodiscard]] std::size_t choose() const noexcept {
@@ -317,8 +287,7 @@ class fake_write_driver {
   std::size_t stride_ = 0;
   std::uint64_t final_size_ = ~std::uint64_t{0};
   std::vector<write> queued_;
-  // The modelled device's one server: when it is next free.
-  std::int64_t server_free_ = 0;
+  b3tool::modelled_device device_;
   std::mutex m_;
   std::condition_variable cv_;
   bool woken_ = false;
@@ -871,13 +840,13 @@ TEST_CASE("a slow sink feeds the diagnosis coherent counters on the write side")
   // guarantees.
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
-  constexpr std::int64_t service_ns = 8'000'000;
+  constexpr std::chrono::nanoseconds service{8'000'000};
   const std::uint64_t size = 48 * win;
 
   const auto r =
       diagnose_write_run(sched, win, size, 2,
                          std::thread::hardware_concurrency(),
-                         {.service_ns = service_ns, .knee = 1});
+                         {.service = service, .knee = 1});
   report_write("slow sink", r);
   CHECK(r.arena_is_depth);
   CHECK(r.depth == 2);
@@ -886,7 +855,7 @@ TEST_CASE("a slow sink feeds the diagnosis coherent counters on the write side")
   CHECK(r.transfers == 48u);
   // A write is timed from the moment it is handed to the driver, and
   // the device holds it at least one service time: load can only add.
-  CHECK(r.min_service >= std::chrono::nanoseconds{service_ns});
+  CHECK(r.min_service >= service);
   CHECK(r.min_service <= r.mean_service);
   CHECK(r.fill_busy >= 0.0);
   CHECK(r.fill_busy <= 1.0);

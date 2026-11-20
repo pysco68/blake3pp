@@ -44,6 +44,7 @@
 #include <ratio>
 #include <vector>
 
+#include "modelled_device.hpp"
 #include "suite_pool.hpp"
 #include "temp_names.hpp"
 #include "test_schedulers.hpp"
@@ -423,12 +424,11 @@ struct fake_script {
   // the case where the two race.
   int fail_after_stop_polls = 0;
   // A device under the driver, instead of reads that land the instant
-  // they are polled. One FIFO server holding each read for service_ns,
-  // plus a propagation delay of (knee - 1) service times, so the rate
-  // rises with the reads in flight up to `knee` and is flat above it.
+  // they are polled: tooling/modelled_device.hpp's FIFO server, holding
+  // each read for `service` behind (knee - 1) service times of delay.
   // Zero service is no device at all, which is what every other case
   // wants.
-  std::int64_t service_ns = 0;
+  std::chrono::nanoseconds service{};
   unsigned knee = 1;
   // A source that costs nothing: every window views the content where
   // it already is and no read copies a byte, as the bench's --null-source
@@ -447,7 +447,10 @@ class fake_driver {
 
   fake_driver(std::span<const std::byte> content, std::size_t window_bytes,
               script s = {})
-      : content_(content), window_bytes_(window_bytes), script_(std::move(s)) {}
+      : content_(content),
+        window_bytes_(window_bytes),
+        script_(std::move(s)),
+        device_(script_.service, script_.knee) {}
 
   class file {
    public:
@@ -468,7 +471,9 @@ class fake_driver {
             static_cast<std::uint64_t>(script_.bad_alloc_at_window)) {
       throw std::bad_alloc();
     }
-    queued_.push_back(read{&op, off, buf, 0, false, 0, device_ready()});
+    queued_.push_back(read{&op, off, buf, 0, false, 0,
+                           device_.active() ? device_.admit()
+                                            : b3tool::modelled_device::instant{}});
     op.live = true;  // the driver owes this one a callback now
   }
 
@@ -644,52 +649,18 @@ class fake_driver {
     std::size_t filled;
     bool cancelled = false;
     unsigned cancel_polls = 0;
-    // When the modelled device would land this one; 0 for no device.
-    std::int64_t ready = 0;
+    // When the modelled device would land this one; the clock's epoch for
+    // no device.
+    b3tool::modelled_device::instant ready{};
   };
 
-  [[nodiscard]] static std::int64_t device_now() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-  }
-
-  // When a read submitted now would land: the server takes it as soon
-  // as it is free, holds it for service_ns, and the result arrives a
-  // propagation delay later. Assigned at submission, which is what makes
-  // the service of several reads overlap and the rate rise with the
-  // depth. Zero means no device: the read lands on the next poll.
-  [[nodiscard]] std::int64_t device_ready() noexcept {
-    if (script_.service_ns <= 0) {
-      return 0;
-    }
-    const std::int64_t latency =
-        static_cast<std::int64_t>(script_.knee > 1 ? script_.knee - 1 : 0) *
-        script_.service_ns;
-    const std::int64_t start = std::max(device_now(), server_free_);
-    server_free_ = start + script_.service_ns;
-    return server_free_ + latency;
-  }
-
-  // Holds a completion back until the device would have it. False
-  // leaves the read queued for a later poll. The order script is not
-  // combined with a device: the server is FIFO, so submission order is
-  // completion order.
+  // Holds a completion back until the device would have it, waiting a
+  // slice toward it first. False leaves the read queued for a later poll.
+  // The order script is not combined with a device: the server is FIFO,
+  // so submission order is completion order.
   bool await_device(const read& r) {
-    if (r.ready == 0) {
-      return true;
-    }
-    const std::int64_t left = r.ready - device_now();
-    if (left > 0) {
-      // One service time at most. Sleeping the whole way would park the
-      // driver thread through the rounds that admit the next windows,
-      // which caps the concurrency at whatever one sleep allows and
-      // makes the modelled device's depth meaningless.
-      std::this_thread::sleep_for(
-          std::chrono::nanoseconds(std::min(left, script_.service_ns)));
-      return false;
-    }
-    return true;
+    return r.ready == b3tool::modelled_device::instant{} ||
+           device_.wait_toward(r.ready);
   }
 
   // The queued read the script prefers: lowest rank wins, and a read the
@@ -722,8 +693,7 @@ class fake_driver {
   script script_;
   std::vector<read> queued_;
   std::vector<std::byte> pool_;
-  // The modelled device's one server: when it is next free.
-  std::int64_t server_free_ = 0;
+  b3tool::modelled_device device_;
   std::mutex m_;
   std::condition_variable cv_;
   bool woken_ = false;
@@ -2952,7 +2922,7 @@ TEST_CASE("a narrow arena feeds the diagnosis coherent counters") {
 
   const auto r =
       diagnose_run(sched, content, plan, b3test::suite_pool_threads(),
-                   {.service_ns = 20'000, .knee = 200});
+                   {.service = std::chrono::nanoseconds{20'000}, .knee = 200});
   report("narrow arena", r);
 
   // The geometry, which the plan fixes and no clock touches.
@@ -2984,13 +2954,13 @@ TEST_CASE("a slow device under a wide arena feeds the diagnosis coherent counter
   // tests/diagnosis.cpp against hand-built counters of this shape.
   auto sched = blake3pp::get_parallel_scheduler();
   constexpr std::size_t win = 64 * 1024;
-  constexpr std::int64_t service_ns = 8'000'000;
+  constexpr std::chrono::nanoseconds service{8'000'000};
   const auto content = pattern(48 * win, 212);
   const blake3pp::detail::pipeline_plan plan{win, 2, 8, 0, false};
 
   const auto r =
       diagnose_run(sched, content, plan, b3test::suite_pool_threads(),
-                   {.service_ns = service_ns, .knee = 1});
+                   {.service = service, .knee = 1});
   report("slow device", r);
 
   // The geometry, which the plan fixes and no clock touches.
@@ -3008,7 +2978,7 @@ TEST_CASE("a slow device under a wide arena feeds the diagnosis coherent counter
   // A floor the device model guarantees at any speed: the pipeline
   // timestamps a read before it asks the driver, and the driver lands
   // it no sooner than one service time later. Load can only lengthen it.
-  CHECK(r.min_service >= std::chrono::nanoseconds{service_ns});
+  CHECK(r.min_service >= service);
   CHECK(r.min_service <= r.mean_service);
   CHECK(r.pool_busy >= 0.0);
   CHECK(r.pool_busy <= 1.0);
@@ -3065,7 +3035,7 @@ TEST_CASE("a wide arena feeds the diagnosis coherent counters") {
 
   const auto r =
       diagnose_run(sched, content, plan, b3test::suite_pool_threads(),
-                   {.service_ns = 2'000'000, .knee = 16});
+                   {.service = std::chrono::nanoseconds{2'000'000}, .knee = 16});
   report("wide arena", r);
 
   // The geometry the plan fixes.

@@ -111,7 +111,6 @@ using b3bench::iowq_cpu_ticks;
 using b3bench::kernel_counters;
 using b3bench::kernel_delta;
 using b3bench::kernel_deltas;
-using b3bench::null_device;
 using b3bench::null_driver;
 using b3bench::read_kernel_counters;
 
@@ -614,8 +613,8 @@ int main(int argc, char** argv) {
         .direct_io = opts.direct_io,
         .offload_submit = opts.offload_submit,
         .ioring = opts.ioring};
-    null_device dev{.rate_gib_s = null_rate, .knee = null_knee};
-    dev.settle(win);
+    const b3tool::modelled_device dev =
+        b3tool::modelled_device::at_rate(null_rate, null_knee, win);
     if (!trace_path.empty()) {
       const std::size_t n = static_cast<std::size_t>((total + win - 1) / win) + 1;
       window_records.resize(n);
@@ -633,8 +632,8 @@ int main(int argc, char** argv) {
       println(stdout,
               "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
               "{:.3f} ms latency)",
-              dev.rate_gib_s, dev.knee,
-              ms_of(dev.service), ms_of(dev.latency));
+              null_rate, null_knee, ms_of(dev.service()),
+              ms_of(dev.latency()));
     }
     // The arena the pool draws its work from, resolved the way every
     // read entry point resolves it: from this machine's thread count.
@@ -709,8 +708,8 @@ int main(int argc, char** argv) {
         blake3pp::detail::rounded_window_bytes(opts.window_bytes);
     const unsigned threads =
         pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
-    null_device dev{.rate_gib_s = null_rate, .knee = null_knee};
-    dev.settle(win);
+    const b3tool::modelled_device dev =
+        b3tool::modelled_device::at_rate(null_rate, null_knee, win);
     const unsigned start_depth = blake3pp::detail::resolve_write_queue_depth(
         opts.queue_depth, opts.window_bytes, threads);
     println(stdout,
@@ -720,8 +719,8 @@ int main(int argc, char** argv) {
       println(stdout,
               "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
               "{:.3f} ms latency)",
-              dev.rate_gib_s, dev.knee,
-              ms_of(dev.service), ms_of(dev.latency));
+              null_rate, null_knee, ms_of(dev.service()),
+              ms_of(dev.latency()));
     }
     blake3pp::trace_buffer sink_trace{std::span<blake3pp::window_record>{}};
 
