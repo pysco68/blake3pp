@@ -32,6 +32,7 @@
 #include <blake3pp/detail/write_pipeline.hpp>
 #include <blake3pp/parallel.hpp>
 #include <blake3pp/parallel_backend.hpp>
+#include <blake3pp/detail/waiter.hpp>
 #include <blake3pp/parallel_io.hpp>
 #include <blake3pp/trace.hpp>
 
@@ -155,9 +156,8 @@ class fake_write_driver {
   std::size_t poll(bool block) {
     if (queued_.empty()) {
       if (block) {
-        std::unique_lock lock(m_);
-        cv_.wait(lock, [this] { return woken_; });
-        woken_ = false;
+        waiter_.sleep();
+        (void)waiter_.take();
       }
       return 0;
     }
@@ -204,13 +204,7 @@ class fake_write_driver {
     return 1;
   }
 
-  void wake() noexcept {
-    {
-      const std::lock_guard lock(m_);
-      woken_ = true;
-    }
-    cv_.notify_one();
-  }
+  void wake() noexcept { waiter_.wake(); }
 
   void cancel(detail::io_op& op) noexcept {
     for (write& w : queued_) {
@@ -288,9 +282,7 @@ class fake_write_driver {
   std::uint64_t final_size_ = ~std::uint64_t{0};
   std::vector<write> queued_;
   b3tool::modelled_device device_;
-  std::mutex m_;
-  std::condition_variable cv_;
-  bool woken_ = false;
+  blake3pp::detail::waiter waiter_;
 };
 
 static_assert(detail::file_driver<fake_write_driver>);

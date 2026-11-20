@@ -53,6 +53,7 @@
 #include <blake3pp/detail/file_pipeline.hpp>
 #include <blake3pp/detail/io_driver.hpp>
 #include <blake3pp/parallel.hpp>
+#include <blake3pp/detail/waiter.hpp>
 #include <blake3pp/parallel_io.hpp>
 #include <blake3pp/trace.hpp>
 #include <doctest/doctest.h>
@@ -491,9 +492,8 @@ class fake_driver {
         if (script_.on_park) {
           script_.on_park();
         }
-        std::unique_lock lock(m_);
-        cv_.wait(lock, [this] { return woken_; });
-        woken_ = false;
+        waiter_.sleep();
+        (void)waiter_.take();
       }
       return 0;
     }
@@ -550,13 +550,7 @@ class fake_driver {
     return 1;
   }
 
-  void wake() noexcept {
-    {
-      const std::lock_guard lock(m_);
-      woken_ = true;
-    }
-    cv_.notify_one();
-  }
+  void wake() noexcept { waiter_.wake(); }
 
   // What the script says this driver's device does about a cancel. The
   // three answers a real one can give are all here, because which of
@@ -694,9 +688,7 @@ class fake_driver {
   std::vector<read> queued_;
   std::vector<std::byte> pool_;
   b3tool::modelled_device device_;
-  std::mutex m_;
-  std::condition_variable cv_;
-  bool woken_ = false;
+  blake3pp::detail::waiter waiter_;
   int polls_ = 0;
   unsigned cancels_ = 0;
   unsigned callbacks_ = 0;

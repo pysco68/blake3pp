@@ -24,16 +24,14 @@
 
 #include "io/fd.hpp"
 #else
-#include <condition_variable>
-#include <mutex>
-#include <utility>
+#include <blake3pp/detail/waiter.hpp>
 #endif
 
 namespace blake3pp::detail::io_impl {
 
+#if defined(__linux__)
 class poll_waiter {
  public:
-#if defined(__linux__)
   poll_waiter() noexcept : fd_(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {}
   poll_waiter(const poll_waiter&) = delete;
   poll_waiter& operator=(const poll_waiter&) = delete;
@@ -74,30 +72,11 @@ class poll_waiter {
 
  private:
   unique_fd fd_;
-#else
-  void wake() noexcept {
-    {
-      const std::lock_guard<std::mutex> lock(m_);
-      signalled_ = true;
-    }
-    cv_.notify_one();
-  }
-
-  [[nodiscard]] bool take() noexcept {
-    const std::lock_guard<std::mutex> lock(m_);
-    return std::exchange(signalled_, false);
-  }
-
-  void sleep() {
-    std::unique_lock<std::mutex> lock(m_);
-    cv_.wait(lock, [this] { return signalled_; });
-  }
-
- private:
-  std::mutex m_;
-  std::condition_variable cv_;
-  bool signalled_ = false;
-#endif
 };
+#else
+// Elsewhere nothing has to poll the wake, so it is the library's
+// condition-variable waiter.
+using poll_waiter = blake3pp::detail::waiter;
+#endif
 
 }  // namespace blake3pp::detail::io_impl

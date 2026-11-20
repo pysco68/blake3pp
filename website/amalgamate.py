@@ -73,11 +73,12 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/detail/file_reader.hpp",
           "include/blake3pp/detail/file_writer.hpp",
           # The memory and stream drivers, with the completion half they
-          # share (queued_reads). They are pasted here, not left to the
-          # parallel block's stripped includes: update_stream() is the one
-          # entry point there whose definition is compiled, and a reader
-          # who enabled the provider would otherwise reach it as a link
-          # error.
+          # share (queued_reads and its waiter). They are pasted here, not
+          # left to the parallel block's stripped includes:
+          # update_stream() is the one entry point there whose definition
+          # is compiled, and a reader who enabled the provider would
+          # otherwise reach it as a link error.
+          "include/blake3pp/detail/waiter.hpp",
           "include/blake3pp/detail/queued_reads.hpp",
           "include/blake3pp/detail/memory_driver.hpp",
           "include/blake3pp/detail/pipe_driver.hpp",

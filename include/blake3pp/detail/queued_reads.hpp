@@ -7,15 +7,14 @@
 // provider.
 
 #include <cassert>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
 #include <system_error>
 #include <utility>
 
 #include <blake3pp/detail/contract.hpp>
 #include <blake3pp/detail/driver.hpp>
+#include <blake3pp/detail/waiter.hpp>
 
 namespace blake3pp::detail {
 
@@ -148,36 +147,12 @@ class queued_reads {
     return op.native<op_node>();
   }
 
-  // The only shared state: a pool thread handing a window back wakes a
-  // driver parked in poll(). Everything else here is the driver's own
-  // thread by contract.
-  class waiter {
-   public:
-    void wake() noexcept {
-      {
-        const std::lock_guard<std::mutex> lock(m_);
-        signalled_ = true;
-      }
-      cv_.notify_one();
-    }
-    [[nodiscard]] bool take() noexcept {
-      const std::lock_guard<std::mutex> lock(m_);
-      return std::exchange(signalled_, false);
-    }
-    void sleep() {
-      std::unique_lock<std::mutex> lock(m_);
-      cv_.wait(lock, [this] { return signalled_; });
-    }
-
-   private:
-    std::mutex m_;
-    std::condition_variable cv_;
-    bool signalled_ = false;
-  };
-
   io_op* head_ = nullptr;
   io_op* tail_ = nullptr;
   std::size_t queued_ = 0;
+  // The only shared state: a pool thread handing a window back wakes a
+  // driver parked in poll(). Everything else here is the driver's own
+  // thread by contract.
   waiter waiter_;
 };
 
