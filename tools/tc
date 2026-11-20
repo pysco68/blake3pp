@@ -24,40 +24,34 @@ WORKDIR=/workspaces/blake3pp
 # a build box that is not the devcontainer runs the same images.
 RUNTIME="${BLAKE3PP_TC_RUNTIME:-docker}"
 
-ALL_IMAGES=(gcc14 gcc16 clang18 clang20 clang22 arm64-gcc15 riscv64-gcc15 ppc64le-gcc15 s390x-gcc15
-            mips64el-gcc14 zig emscripten)
+# The preset -> image table, shared with tools/gen-environments.py.
+IMAGE_TABLE="$(dirname "$0")/toolchain-images.txt"
 
 die() { echo "tc: $*" >&2; exit 1; }
 
 usage() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; }
 
-# The linux-<compiler><N>-... naming convention enforced by
-# tools/gen-toolchains.py is the contract here.
+# Every row of the table, comments dropped: pattern, image, reason.
+image_rows() {
+  local pattern image reason
+  while read -r pattern image reason; do
+    case "$pattern" in ''|'#'*) continue ;; esac
+    printf '%s\t%s\t%s\n' "$pattern" "$image" "$reason"
+  done < "$IMAGE_TABLE"
+}
+
 image_for() {
-  case "$1" in
-    linux-gcc14-*)        echo gcc14 ;;
-    linux-gcc16-*)        echo gcc16 ;;
-    linux-clang18-*)      echo clang18 ;;
-    linux-clang20-*)      echo clang20 ;;
-    linux-clang22-*)      echo clang22 ;;
-    linux-arm64-gcc15-*)  echo arm64-gcc15 ;;
-    linux-riscv64-gcc15-*) echo riscv64-gcc15 ;;
-    linux-ppc64le-gcc15-*) echo ppc64le-gcc15 ;;
-    linux-s390x-gcc15-*) echo s390x-gcc15 ;;
-    linux-mips64el-gcc14-*) echo mips64el-gcc14 ;;
-    *zigmusl*)            echo zig ;;
-    # The FreeBSD cross presets are in the zig image too; they miss the
-    # *zigmusl* glob because their triples carry an ABI version rather
-    # than a libc name. `ctest` finds nothing in these build trees on
-    # purpose (the toolchain leaves CMAKE_CROSSCOMPILING_EMULATOR empty:
-    # nothing here can execute a FreeBSD binary); tools/freebsd-guest.sh
-    # is what runs them.
-    freebsd-*zig-cxx23)   echo zig ;;
-    freebsd-clang-*)      die "the freebsd-clang presets are for a FreeBSD host's base system compiler, not a container (see docs/building.md); cross-build with freebsd-zig-cxx23 or freebsd-arm64-zig-cxx23 instead" ;;
-    wasm32-*)             echo emscripten ;;
-    windows-*)            die "windows presets are not containerized (build them natively or in CI)" ;;
-    *)                    die "unknown preset '$1' (see tools/tc --list)" ;;
-  esac
+  local pattern image reason
+  while IFS=$'\t' read -r pattern image reason; do
+    # Unquoted on the right: the pattern is a glob.
+    # shellcheck disable=SC2053
+    if [[ "$1" == $pattern ]]; then
+      [ "$image" != native ] || die "$reason"
+      echo "$image"
+      return
+    fi
+  done < <(image_rows)
+  die "unknown preset '$1' (see tools/tc --list)"
 }
 
 host_workspace() {
@@ -121,21 +115,20 @@ case "$1" in
     usage; exit 0 ;;
   --list)
     printf '%-38s %s\n' "PRESET PATTERN" "IMAGE"
-    printf '%-38s %s\n' \
-      'linux-gcc14-*'       "${REGISTRY}/toolchain-gcc14:${TAG}" \
-      'linux-gcc16-*'       "${REGISTRY}/toolchain-gcc16:${TAG}" \
-      'linux-clang18-*'     "${REGISTRY}/toolchain-clang18:${TAG}" \
-      'linux-clang20-*'     "${REGISTRY}/toolchain-clang20:${TAG}" \
-      'linux-clang22-*'     "${REGISTRY}/toolchain-clang22:${TAG}" \
-      'linux-arm64-gcc15-*' "${REGISTRY}/toolchain-arm64-gcc15:${TAG}" \
-      '*zigmusl*'           "${REGISTRY}/toolchain-zig:${TAG}" \
-      'freebsd-*zig-cxx23'  "${REGISTRY}/toolchain-zig:${TAG}" \
-      'wasm32-*'            "${REGISTRY}/toolchain-emscripten:${TAG}"
+    while IFS=$'\t' read -r pattern image _; do
+      if [ "$image" = native ]; then
+        printf '%-38s %s\n' "$pattern" "(native, no image)"
+      else
+        printf '%-38s %s\n' "$pattern" "${REGISTRY}/toolchain-${image}:${TAG}"
+      fi
+    done < <(image_rows)
     exit 0 ;;
   --pull)
-    for img in "${ALL_IMAGES[@]}"; do
-      "${RUNTIME}" pull "${REGISTRY}/toolchain-${img}:${TAG}"
-    done
+    # Each image once, in the table's order.
+    image_rows | cut -f2 | grep -vx native | awk '!seen[$0]++' |
+      while read -r img; do
+        "${RUNTIME}" pull "${REGISTRY}/toolchain-${img}:${TAG}" </dev/null
+      done
     exit 0 ;;
   --shell)
     [ $# -ge 2 ] || die "--shell needs a preset name"

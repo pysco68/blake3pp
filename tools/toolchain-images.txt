@@ -1,0 +1,30 @@
+# Which toolchain image builds a preset: a preset glob, then the image's
+# short name, the first matching row winning. tools/tc runs presets in
+# these images and tools/gen-environments.py pins them; both read this
+# file, and tc --list and --pull are this table.
+#
+# An image of `native` marks presets no image builds, followed by the
+# reason tc gives when asked to run one. The linux-<compiler><N>-...
+# naming convention enforced by tools/gen-toolchains.py is the contract
+# the globs rely on.
+linux-gcc14-*           gcc14
+linux-gcc16-*           gcc16
+linux-clang18-*         clang18
+linux-clang20-*         clang20
+linux-clang22-*         clang22
+linux-arm64-gcc15-*     arm64-gcc15
+linux-riscv64-gcc15-*   riscv64-gcc15
+linux-ppc64le-gcc15-*   ppc64le-gcc15
+linux-s390x-gcc15-*     s390x-gcc15
+linux-mips64el-gcc14-*  mips64el-gcc14
+*zigmusl*               zig
+# The FreeBSD cross presets are in the zig image too; they miss the
+# *zigmusl* glob because their triples carry an ABI version rather than a
+# libc name. ctest finds nothing in these build trees on purpose (the
+# toolchain leaves CMAKE_CROSSCOMPILING_EMULATOR empty: nothing here can
+# execute a FreeBSD binary); tools/freebsd-guest.sh is what runs them.
+freebsd-*zig-cxx23      zig
+wasm32-*                emscripten
+freebsd-clang-*         native  the freebsd-clang presets are for a FreeBSD host's base system compiler, not a container (see docs/building.md); cross-build with freebsd-zig-cxx23 or freebsd-arm64-zig-cxx23 instead
+windows-*               native  windows presets are not containerized (build them natively or in CI)
+macos-*                 native  macos presets are not containerized (build them natively on a Mac)

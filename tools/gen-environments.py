@@ -56,37 +56,33 @@ REGISTRY = os.environ.get("BLAKE3PP_TC_REGISTRY", "ghcr.io/pysco68/blake3pp").re
 #   BLAKE3PP_TC_REGISTRY=<ns> BLAKE3PP_TC_IMAGE_TEMPLATE="{registry}/blake3pp-toolchain-{image}"
 IMAGE_TEMPLATE = os.environ.get("BLAKE3PP_TC_IMAGE_TEMPLATE", "{registry}/toolchain-{image}")
 
-# Same table as tools/tc (image_for_preset), preset glob -> image name.
-IMAGE_FOR = [
-    ("linux-gcc14-*", "gcc14"),
-    ("linux-gcc16-*", "gcc16"),
-    ("linux-clang18-*", "clang18"),
-    ("linux-clang20-*", "clang20"),
-    ("linux-clang22-*", "clang22"),
-    ("linux-arm64-gcc15-*", "arm64-gcc15"),
-    ("linux-riscv64-gcc15-*", "riscv64-gcc15"),
-    ("linux-ppc64le-gcc15-*", "ppc64le-gcc15"),
-    ("linux-mips64el-gcc14-*", "mips64el-gcc14"),
-    ("linux-s390x-gcc15-*", "s390x-gcc15"),
-    ("*zigmusl*", "zig"),
-    # The FreeBSD cross presets live in the zig image beside the musl
-    # ones; they do not match *zigmusl* because their triples name an
-    # ABI version instead of a libc.
-    ("freebsd-*-zig-cxx23", "zig"),
-    ("freebsd-zig-cxx23", "zig"),
-    ("wasm32-*", "emscripten"),
-]
-# Not containerized: no environment. windows and macos build natively,
-# and so do the freebsd-clang-* presets -- those are for someone sitting
-# on a FreeBSD machine using its base system compiler, which no image
-# here contains. The freebsd-*zig* presets above are the opposite case:
-# they cross-build FreeBSD binaries FROM a Linux container.
-SKIP = ["windows-*", "macos-*", "freebsd-clang-*"]
+# The preset glob -> image table tools/tc reads too; the first matching
+# row wins. An image of "native" marks presets no container builds:
+# windows and macos build natively, and so do the freebsd-clang-*
+# presets -- those are for someone sitting on a FreeBSD machine using its
+# base system compiler, which no image here contains. The freebsd-*zig*
+# presets are the opposite case: they cross-build FreeBSD binaries FROM a
+# Linux container. Those presets get no environment.
+NATIVE = "native"
+
+
+def image_table():
+    rows = []
+    with open(os.path.join(REPO, "tools", "toolchain-images.txt")) as f:
+        for line in f:
+            fields = line.split(maxsplit=2)
+            if fields and not fields[0].startswith("#"):
+                rows.append((fields[0], fields[1]))
+    return rows
+
+
+IMAGE_TABLE = image_table()
 
 
 def image_for(name):
-    for pattern, image in IMAGE_FOR:
-        if fnmatch.fnmatch(name, pattern):
+    """The image that builds the preset, NATIVE, or None for no row."""
+    for pattern, image in IMAGE_TABLE:
+        if fnmatch.fnmatchcase(name, pattern):
             return image
     return None
 
@@ -157,11 +153,11 @@ def main():
     for name in sorted(os.listdir(TOOLCHAINS)):
         if not os.path.isfile(os.path.join(TOOLCHAINS, name, f"{name}.cmake")):
             continue  # common.cmake and friends live at the top level
-        if any(fnmatch.fnmatch(name, s) for s in SKIP):
-            continue
-        if image_for(name) is None:
-            sys.exit(f"gen-environments: no image pattern for {name}; extend IMAGE_FOR (and tools/tc)")
         image = image_for(name)
+        if image == NATIVE:
+            continue
+        if image is None:
+            sys.exit(f"gen-environments: no image pattern for {name}; add a row to tools/toolchain-images.txt")
         if image not in digests:
             digests[image] = resolve_digest(image_ref(name, tag))
         wanted = {
