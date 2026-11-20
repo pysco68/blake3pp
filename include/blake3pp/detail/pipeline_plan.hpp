@@ -147,7 +147,7 @@ struct pipeline_plan {
     n = 1;
     rest -= std::min<std::uint64_t>(head_bytes, rest);
   }
-  n += (rest + window_bytes - 1) / window_bytes;
+  n += ceil_div(rest, window_bytes);
   return n > max_queue_depth ? max_queue_depth : static_cast<unsigned>(n);
 }
 

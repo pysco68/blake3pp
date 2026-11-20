@@ -27,6 +27,7 @@
 #include <functional>
 #include <mutex>
 #include <new>
+#include <limits>
 #include <thread>
 #include <stdexcept>
 #include <system_error>
@@ -2435,6 +2436,36 @@ TEST_CASE("a reducer capacity below the floor is reported, not a hang") {
 // The window count is arithmetic over four inputs, so it is checked as
 // arithmetic: the budget buys windows beyond the reads, the reads are
 // the floor, max_queue_depth the ceiling, and the file the last word.
+TEST_CASE("window counts do not wrap near the top of the range") {
+  using blake3pp::detail::ceil_div;
+  using blake3pp::detail::file_windows;
+  using blake3pp::detail::max_queue_depth;
+  using blake3pp::detail::plan_pipeline;
+  constexpr std::uint64_t top = std::numeric_limits<std::uint64_t>::max();
+  constexpr std::size_t w = 64 * 1024;
+
+  CHECK(ceil_div(0, 7) == 0);
+  CHECK(ceil_div(3 * w, w) == 3);
+  CHECK(ceil_div(3 * w + 1, w) == 4);
+  CHECK(ceil_div(top, w) == std::uint64_t{1} << 48);
+  CHECK(ceil_div(top, 1) == top);
+  CHECK(ceil_div(top - 1, top) == 1);
+
+  CHECK(file_windows(0, w, 0) == 0);
+  CHECK(file_windows(3 * w, w, 0) == 3);
+  CHECK(file_windows(3 * w + 1, w, 0) == 4);
+  CHECK(file_windows(3 * w + 1, w, 1) == 4);
+  CHECK(file_windows(top, w, 0) == max_queue_depth);
+  CHECK(file_windows(top, w, 100) == max_queue_depth);
+  CHECK(file_windows(top - w + 2, w, 0) == max_queue_depth);
+
+  // A nonempty file the planner cannot count must not plan zero windows
+  // with reads in flight.
+  const auto p = plan_pipeline(0, w, 4, false, top);
+  CHECK(p.windows >= p.reads_in_flight);
+  CHECK(p.reads_in_flight == 4);
+}
+
 TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the file") {
   using blake3pp::detail::default_window_budget_bytes;
   using blake3pp::detail::max_queue_depth;

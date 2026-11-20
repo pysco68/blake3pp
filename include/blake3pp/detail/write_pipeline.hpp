@@ -45,6 +45,7 @@
 #include <blake3pp/detail/driver_loop.hpp>
 #include <blake3pp/detail/ex_compat.hpp>
 #include <blake3pp/detail/io_geometry.hpp>
+#include <blake3pp/detail/pipeline_plan.hpp>
 #include <blake3pp/trace.hpp>
 
 namespace blake3pp::detail {
@@ -234,9 +235,7 @@ class write_scope
   [[nodiscard]] static unsigned plan_windows(std::uint64_t total,
                                              std::size_t window,
                                              unsigned qd) noexcept {
-    const unsigned want = clamp_queue_depth(qd);
-    const std::uint64_t have = (total + window - 1) / window;
-    return have < want ? static_cast<unsigned>(have) : want;
+    return std::min(clamp_queue_depth(qd), file_windows(total, window, 0));
   }
 
   // The chain, read backwards from the read side's. Untagged, unlike the

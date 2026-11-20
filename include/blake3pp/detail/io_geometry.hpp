@@ -105,6 +105,14 @@ inline constexpr unsigned default_queue_depth = 4;
   return std::clamp(requested, 2u, max_queue_depth);
 }
 
+// How many pieces of `divisor` bytes cover `total`, the last one possibly
+// short. Unlike (total + divisor - 1) / divisor, it does not wrap for a
+// total near the top of the range. `divisor` must be nonzero.
+[[nodiscard]] constexpr std::uint64_t ceil_div(std::uint64_t total,
+                                               std::uint64_t divisor) noexcept {
+  return total / divisor + (total % divisor != 0 ? 1 : 0);
+}
+
 // Window objects a stream's run allocates.
 //
 // A stream has one position, so exactly one window is ever being filled:
