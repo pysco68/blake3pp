@@ -74,6 +74,7 @@
 #include <vector>
 
 #include <CLI/CLI.hpp>
+#include "cli_ranges.hpp"
 
 #include <blake3pp/detail/cpu_relax.hpp>
 #include <blake3pp/detail/stream_watch.hpp>
@@ -297,7 +298,7 @@ int main(int argc, char** argv) {
 
   CLI::App app{"drain: read stdin to the end and report what the reads did"};
   app.add_option("--buf", buf_kib, "bytes asked for per read, in KiB")
-      ->check(CLI::PositiveNumber);
+      ->check(b3tool::units_fitting(10));
   auto* thr = app.add_option("--threads", threads,
                              "concurrent blocking readers; 2 or more never leave the pipe without a read posted")
                   ->check(CLI::Range(1u, 64u));
@@ -310,10 +311,11 @@ int main(int argc, char** argv) {
                              std::string("probe an empty pipe before each read: ") + probes);
   wat->excludes(thr);
   app.add_option("--budget", budget_us, "watch ceiling in microseconds")
-      ->check(CLI::NonNegativeNumber);
+      ->check(b3tool::delay_range<std::chrono::microseconds>());
   app.add_option("--interval", interval_ns, "nanoseconds between probes")
-      ->check(CLI::PositiveNumber);
-  app.add_option("--widen", widen_kib, "pipe buffer to ask the OS for, in KiB (Linux); 0 leaves it");
+      ->check(b3tool::delay_range<std::chrono::nanoseconds>(1));
+  app.add_option("--widen", widen_kib, "pipe buffer to ask the OS for, in KiB (Linux); 0 leaves it")
+      ->check(b3tool::units_fitting(10, 0));
   auto* close_opt = app.add_option("--close-after", close_after,
                                    "read this many bytes, then close stdin under the writer and exit 0");
   close_opt->excludes(thr)->excludes(wat);

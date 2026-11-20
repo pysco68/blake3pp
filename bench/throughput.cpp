@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
       "Single-thread and parallel BLAKE3 hashing throughput.\n"
       "With no ARCH, measures every variant available on this machine."};
   app.add_option("--size", mib, "input size in MiB")
-      ->check(CLI::PositiveNumber)
+      ->check(b3tool::units_fitting(20))
       ->capture_default_str();
   app.add_option("--reps", reps, "timed repetitions (best wins)")
       ->check(CLI::PositiveNumber)

@@ -55,6 +55,7 @@
 #include <ostream>
 #include <span>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -569,11 +570,11 @@ int main(int argc, char** argv) {
   app.add_option("--null-source", null_gib,
                  "hash this many GiB from a source that performs no I/O: the "
                  "pipeline's hash-bound ceiling, with no file and no device")
-      ->check(CLI::PositiveNumber);
+      ->check(b3tool::gib_size);
   app.add_option("--null-sink", null_sink_gib,
                  "write N GiB through the write pipeline into a sink that "
                  "completes immediately (the device-free ceiling)")
-      ->check(CLI::PositiveNumber);
+      ->check(b3tool::gib_size);
   bool sweep = false;
   auto* sweep_opt =
       app.add_flag("--io-sweep", sweep,
@@ -592,14 +593,24 @@ int main(int argc, char** argv) {
                "window (parts, busy time, cpu)")
       ->needs(trace_opt);
   CLI11_PARSE(app, argc, argv);
+  // The model is built per run, after the setup; a rate and knee it
+  // cannot represent are refused here, before anything runs.
+  try {
+    (void)b3tool::modelled_device::at_rate(
+        null_rate, null_knee,
+        blake3pp::detail::rounded_window_bytes(opts.window_bytes));
+  } catch (const std::out_of_range& e) {
+    println(stderr, "--null-rate {} at --null-knee {}: {}", null_rate,
+            null_knee, e.what());
+    return b3tool::exit_usage;
+  }
 
   opts.direct_io = !no_direct;
   opts.async = !no_async;
   opts.offload_submit = !inline_submit;
   opts.ioring = !no_ioring;
   if (null_gib > 0) {
-        const auto total =
-        static_cast<std::uint64_t>(null_gib * 1024.0 * 1024.0 * 1024.0);
+        const std::uint64_t total = b3tool::gib_bytes(null_gib);
     const std::size_t win =
         blake3pp::detail::rounded_window_bytes(opts.window_bytes);
     const unsigned threads =
@@ -702,8 +713,7 @@ int main(int argc, char** argv) {
   // is left is the generator, the chain and the loop -- the ceiling a
   // real drive is measured against, the mirror of --null-source.
   if (null_sink_gib > 0) {
-    const auto total =
-        static_cast<std::uint64_t>(null_sink_gib * 1024.0 * 1024.0 * 1024.0);
+    const std::uint64_t total = b3tool::gib_bytes(null_sink_gib);
     const std::size_t win =
         blake3pp::detail::rounded_window_bytes(opts.window_bytes);
     const unsigned threads =

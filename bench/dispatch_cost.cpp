@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <ratio>
 #include <string>
 #include <vector>
@@ -286,7 +287,13 @@ void print(const row& r, std::size_t reps) {
 // difference between two processes' totals is the mechanism's exact
 // instruction count.
 int main(int argc, char** argv) {
-  const std::size_t total = argc > 1 ? std::stoull(argv[1]) : 64;   // MiB per rep
+  const unsigned long long mib = argc > 1 ? std::stoull(argv[1]) : 64;  // per rep
+  if (mib == 0 || mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+    std::fprintf(stderr, "dispatch_cost: MiB must be from 1 to %zu\n",
+                 std::numeric_limits<std::size_t>::max() >> 20);
+    return 2;
+  }
+  const auto total = static_cast<std::size_t>(mib);
   const std::size_t reps = argc > 2 ? std::stoull(argv[2]) : 9;
   const int only_variant = argc > 3 ? std::stoi(argv[3]) : -1;
   const int only_row = argc > 4 ? std::stoi(argv[4]) : -1;

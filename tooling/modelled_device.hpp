@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <thread>
 
 #include <blake3pp/detail/driver.hpp>
@@ -37,15 +38,26 @@ class modelled_device {
                  service) {}
 
   // The server a device of `gib_s` GiB/s is for windows of
-  // `window_bytes`, at `knee`.
+  // `window_bytes`, at `knee`. Throws std::out_of_range when a window's
+  // service time and propagation delay together would not fit the
+  // clock's range with room for the deadlines built from them.
   [[nodiscard]] static modelled_device at_rate(double gib_s, unsigned knee,
                                                std::size_t window_bytes) {
     if (gib_s <= 0.0) {
       return {};
     }
     const double bytes_per_ns = gib_s * 1024.0 * 1024.0 * 1024.0 / 1e9;
-    return {std::chrono::nanoseconds{static_cast<std::int64_t>(std::max(
-                1.0, static_cast<double>(window_bytes) / bytes_per_ns))},
+    const double service_ns =
+        std::max(1.0, static_cast<double>(window_bytes) / bytes_per_ns);
+    // Service plus (knee - 1) services of latency; 2^62, exact as a
+    // double, leaves half the range for the instants they are added to.
+    constexpr double most = static_cast<double>(std::int64_t{1} << 62);
+    if (!(service_ns * std::max(1u, knee) <= most)) {
+      throw std::out_of_range(
+          "the modelled device's service time and latency do not fit the "
+          "clock: raise the rate or lower the knee");
+    }
+    return {std::chrono::nanoseconds{static_cast<std::int64_t>(service_ns)},
             knee};
   }
 

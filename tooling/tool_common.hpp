@@ -17,6 +17,7 @@
 #include <version>
 
 #include <CLI/CLI.hpp>
+#include "cli_ranges.hpp"
 #include <blake3pp/parallel.hpp>
 #if BLAKE3PP_WITH_IO
 #include <blake3pp/io.hpp>
@@ -149,20 +150,6 @@ inline const CLI::Validator at_least_one_thread(
                                                 // UINT conversion
     },
     "THREADS");
-
-// --window transform: typed in MiB, stored in bytes (bind the option
-// straight to window_bytes and give it default_str(window_mib)).
-inline const CLI::Validator mib_to_bytes(
-    [](std::string& value) {
-      unsigned long long mib = 0;
-      if (!CLI::detail::lexical_cast(value, mib) || mib == 0 ||
-          mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
-        return std::string{"must be a positive number of MiB"};
-      }
-      value = std::to_string(mib << 20);
-      return std::string{};
-    },
-    "MiB");
 
 // --arch / ARCH... transform: the name<->enum mapping comes from the
 // library's canonical list; no tool re-enumerates the arch enum.
