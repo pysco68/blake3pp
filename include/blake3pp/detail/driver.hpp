@@ -104,8 +104,8 @@ struct io_op {
 
   // Sized for whatever transfer type the native backend derives from
   // transfer_base (uring_context::transfer, aio_context::transfer,
-  // iocp_context::transfer or gcd_context::transfer --
-  // src/io/{uring,aio,iocp,gcd}_backend.hpp): only one of those is ever
+  // windows_context::transfer or gcd_context::transfer, under
+  // src/io/<os>/): only one of those is ever
   // compiled, so no header here can sizeof/alignof all of them to take
   // their max. Measured by the "op storage" case in
   // tests/file_pipeline.cpp, which prints what the build actually has:
