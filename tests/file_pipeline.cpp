@@ -2618,14 +2618,28 @@ TEST_CASE("the read plan's window budget follows the thread count") {
   CHECK(read_plan_budget_bytes(32, 8 * mib) == default_window_budget_bytes);
   CHECK(read_plan_budget_bytes(4, 8 * mib) == default_window_budget_bytes);
   CHECK(read_plan_budget_bytes(4, 64 * mib) == default_window_budget_bytes);
-  // A wide machine asking for a wide window is bounded. The counts stop
-  // at 1024 threads: on 32-bit size_t, 2048 threads buy 512 windows of
-  // 8 MiB, 4 GiB, which wraps to zero before the ceiling applies.
-  const unsigned wide = std::min<unsigned>(256 * static_cast<unsigned>(64 * mib / w64), 1024);
-  CHECK(read_plan_budget_bytes(wide, 64 * mib) == max_window_budget_bytes);
-  const std::size_t w1g = rounded_window_bytes(1024 * mib);
-  const unsigned huge = std::min<unsigned>(1024 * static_cast<unsigned>(1024 * mib / w1g), 1024);
-  CHECK(read_plan_budget_bytes(huge, 1024 * mib) == max_window_budget_bytes);
+  // A wide machine asking for a wide window is bounded. On 32-bit
+  // size_t, 2048 threads buy 512 windows of 8 MiB, 4 GiB, past the range.
+  CHECK(read_plan_budget_bytes(2048, 64 * mib) == max_window_budget_bytes);
+  CHECK(read_plan_budget_bytes(2048, 1024 * mib) == max_window_budget_bytes);
+  // And the budget never falls as the thread count grows, up to the
+  // largest count there is.
+  for (const std::size_t window : {std::size_t{64} * 1024, 8 * mib, 64 * mib,
+                                   1024 * mib}) {
+    CAPTURE(window);
+    std::size_t last = 0;
+    for (const unsigned threads :
+         {1u, 4u, 32u, 1024u, 2048u, 4096u, 1u << 20,
+          std::numeric_limits<unsigned>::max()}) {
+      CAPTURE(threads);
+      const std::size_t budget = read_plan_budget_bytes(threads, window);
+      CHECK(budget >= default_window_budget_bytes);
+      CHECK(budget <= max_window_budget_bytes);
+      CHECK(budget >= last);
+      last = budget;
+    }
+    CHECK(last == max_window_budget_bytes);
+  }
   // The window is rounded before it is counted, as everywhere else.
   CHECK(read_plan_budget_bytes(scaled, 96 * mib) ==
         read_plan_budget_bytes(scaled, 64 * mib));
