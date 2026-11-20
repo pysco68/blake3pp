@@ -37,6 +37,7 @@
 #include <blake3pp/trace.hpp>
 
 #include "modelled_device.hpp"
+#include "scripted_order.hpp"
 #include "temp_names.hpp"
 #include "test_schedulers.hpp"
 #include <doctest/doctest.h>
@@ -161,7 +162,8 @@ class fake_write_driver {
       }
       return 0;
     }
-    const std::size_t pick = choose();
+    const std::size_t pick =
+        b3test::scripted_pick(queued_, script_.order, window_);
     write& w = queued_[pick];
     if (!await_device(w)) {
       return 0;
@@ -251,27 +253,6 @@ class fake_write_driver {
            device_.wait_toward(w.ready);
   }
 
-  [[nodiscard]] std::size_t choose() const noexcept {
-    std::size_t best = 0;
-    std::size_t best_rank = rank_of(queued_.front());
-    for (std::size_t i = 1; i < queued_.size(); ++i) {
-      const std::size_t r = rank_of(queued_[i]);
-      if (r < best_rank) {
-        best = i;
-        best_rank = r;
-      }
-    }
-    return best;
-  }
-  [[nodiscard]] std::size_t rank_of(const write& w) const noexcept {
-    const auto index = static_cast<unsigned>(w.off / window_);
-    for (std::size_t i = 0; i < script_.order.size(); ++i) {
-      if (script_.order[i] == index) {
-        return i;
-      }
-    }
-    return script_.order.size() + index;
-  }
 
   std::uint64_t size_;
   std::size_t window_;
