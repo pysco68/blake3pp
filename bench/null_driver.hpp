@@ -24,7 +24,7 @@ namespace b3bench {
 //
 // One FIFO server with a fixed service time per window plus a fixed
 // propagation delay: a transfer starts when the server is free, holds
-// it for `service_ns`, and lands `latency_ns` later. At depth d the
+// it for `service`, and lands `latency` later. At depth d the
 // steady-state rate is min(d x window / (service + latency), window /
 // service), so throughput rises linearly to a knee at
 // 1 + latency / service and is flat above it. `knee` names that depth
@@ -32,8 +32,8 @@ namespace b3bench {
 struct null_device {
   double rate_gib_s = 0.0;  // 0: complete immediately, no device at all
   unsigned knee = 1;
-  std::int64_t service_ns = 0;
-  std::int64_t latency_ns = 0;
+  std::chrono::nanoseconds service{};
+  std::chrono::nanoseconds latency{};
 
   [[nodiscard]] bool active() const noexcept { return rate_gib_s > 0.0; }
 
@@ -42,10 +42,9 @@ struct null_device {
       return;
     }
     const double bytes_per_ns = rate_gib_s * 1024.0 * 1024.0 * 1024.0 / 1e9;
-    service_ns = static_cast<std::int64_t>(
-        std::max(1.0, static_cast<double>(window_bytes) / bytes_per_ns));
-    latency_ns = static_cast<std::int64_t>(knee > 1 ? knee - 1 : 0) *
-                 service_ns;
+    service = std::chrono::nanoseconds{static_cast<std::int64_t>(
+        std::max(1.0, static_cast<double>(window_bytes) / bytes_per_ns))};
+    latency = static_cast<std::int64_t>(knee > 1 ? knee - 1 : 0) * service;
   }
 };
 
@@ -163,17 +162,13 @@ class null_driver {
   }
 
  private:
+  using instant = std::chrono::steady_clock::time_point;
+
   struct timed_op {
     blake3pp::detail::io_op* op;
     const void* owner;
-    std::int64_t ready;
+    instant ready;
   };
-
-  [[nodiscard]] static std::int64_t now_ns() noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-  }
 
   void submit(file& f, std::size_t bytes, blake3pp::detail::io_op& op) noexcept {
     if (!dev_.active()) {
@@ -182,20 +177,21 @@ class null_driver {
     }
     // One server, FIFO, so the ready times this produces are already in
     // order and the queue is a plain deque.
-    const double share = dev_.service_ns == 0 || window_stride_ == 0
+    const double share = dev_.service == std::chrono::nanoseconds::zero() ||
+                                 window_stride_ == 0
                              ? 1.0
                              : static_cast<double>(bytes) /
                                    static_cast<double>(window_stride_);
-    const auto service =
-        static_cast<std::int64_t>(static_cast<double>(dev_.service_ns) * share);
-    const std::int64_t start = std::max(now_ns(), server_free_);
+    const auto service = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        dev_.service * share);
+    const instant start = std::max(blake3pp::detail::steady_now(), server_free_);
     server_free_ = start + service;
-    timed_.push_back({&op, &f, server_free_ + dev_.latency_ns});
+    timed_.push_back({&op, &f, server_free_ + dev_.latency});
     op.live = true;
   }
 
   void release_ready() noexcept {
-    const std::int64_t t = now_ns();
+    const instant t = blake3pp::detail::steady_now();
     while (!timed_.empty() && timed_.front().ready <= t) {
       reads_.push(*timed_.front().op, timed_.front().owner);
       timed_.pop_front();
@@ -215,15 +211,17 @@ class null_driver {
   // whatever one sleep allows. Spins for the last microsecond, which is
   // what keeps a service time of a few hundred microseconds from being
   // quantised by the scheduler's timer slack.
-  void wait_until(std::int64_t ready) const noexcept {
-    const std::int64_t slice = std::max<std::int64_t>(dev_.service_ns, 1000);
-    const std::int64_t left = ready - now_ns();
-    if (left <= 0) {
+  void wait_until(instant ready) const noexcept {
+    using std::chrono::microseconds;
+    const std::chrono::nanoseconds slice =
+        std::max<std::chrono::nanoseconds>(dev_.service, microseconds{1});
+    const std::chrono::nanoseconds left = ready - blake3pp::detail::steady_now();
+    if (left <= std::chrono::nanoseconds::zero()) {
       return;
     }
-    if (left > 2000) {
-      std::this_thread::sleep_for(
-          std::chrono::nanoseconds(std::min(left - 1000, slice)));
+    if (left > microseconds{2}) {
+      std::this_thread::sleep_for(std::min<std::chrono::nanoseconds>(
+          left - microseconds{1}, slice));
     } else {
       std::this_thread::yield();
     }
@@ -233,7 +231,7 @@ class null_driver {
   std::byte filler_{};
   std::size_t window_stride_ = 0;
   null_device dev_{};
-  std::int64_t server_free_ = 0;
+  instant server_free_{};
   std::deque<timed_op> timed_;
   std::vector<std::byte> pool_;
   blake3pp::detail::queued_reads reads_;

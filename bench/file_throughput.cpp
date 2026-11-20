@@ -634,8 +634,7 @@ int main(int argc, char** argv) {
               "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
               "{:.3f} ms latency)",
               dev.rate_gib_s, dev.knee,
-              static_cast<double>(dev.service_ns) / 1e6,
-              static_cast<double>(dev.latency_ns) / 1e6);
+              ms_of(dev.service), ms_of(dev.latency));
     }
     // The arena the pool draws its work from, resolved the way every
     // read entry point resolves it: from this machine's thread count.
@@ -722,8 +721,7 @@ int main(int argc, char** argv) {
               "  device: {:.1f} GiB/s, knee at qd {} ({:.3f} ms service, "
               "{:.3f} ms latency)",
               dev.rate_gib_s, dev.knee,
-              static_cast<double>(dev.service_ns) / 1e6,
-              static_cast<double>(dev.latency_ns) / 1e6);
+              ms_of(dev.service), ms_of(dev.latency));
     }
     blake3pp::trace_buffer sink_trace{std::span<blake3pp::window_record>{}};
 
