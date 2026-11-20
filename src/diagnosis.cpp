@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include <blake3pp/trace.hpp>
 
@@ -62,12 +63,13 @@ using fractional_ns = std::chrono::duration<double, std::nano>;
 [[nodiscard]] unsigned device_depth_of(const driver_stats& d,
                                        std::uint64_t depth) noexcept {
   // Both arrive 64-bit, because driver_stats and diagnosis keep every
-  // count that wide, and both are queue depths bounded by
-  // max_queue_depth -- so the one narrowing here is exact and is spelled
-  // once rather than at each caller.
+  // count that wide. A pipeline's depths are bounded by max_queue_depth,
+  // but the counters are the caller's to fill in, so the narrowing
+  // saturates rather than wrapping a depth past UINT_MAX to zero.
   const std::uint64_t said = d.device_depth;
   const std::uint64_t got = said != 0 ? std::min(said, depth) : depth;
-  return static_cast<unsigned>(std::max<std::uint64_t>(1, got));
+  return static_cast<unsigned>(std::clamp<std::uint64_t>(
+      got, 1, std::numeric_limits<unsigned>::max()));
 }
 
 // What both sides read off the counters the same way: the geometry, and

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -264,4 +265,19 @@ TEST_CASE("a read backend name is copied whole, up to the field's length") {
   CHECK(blake3pp::read_backend(d) == want);
   blake3pp::set_read_backend(d, want + "yz");
   CHECK(blake3pp::read_backend(d) == want);
+}
+
+TEST_CASE("a depth past the range of unsigned saturates instead of wrapping") {
+  constexpr std::uint64_t past = std::uint64_t{1} << 32;
+  constexpr unsigned top = std::numeric_limits<unsigned>::max();
+  auto d = counters(64, 0.10, 0.95, 10'000'000);
+  d.queue_depth_final = past;
+  CHECK(blake3pp::diagnose_read(d, wall, threads, 4, window).device_depth ==
+        top);
+  d.device_depth = past + 1;
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 4, window);
+  CHECK(r.device_depth == top);
+  CHECK(r.bytes_in_flight == std::uint64_t{top} * window);
+  d.device_depth = 3;
+  CHECK(blake3pp::diagnose_read(d, wall, threads, 4, window).device_depth == 3);
 }
