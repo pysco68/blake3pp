@@ -24,6 +24,8 @@
 #include <system_error>
 #include <type_traits>
 
+#include <blake3pp/detail/contract.hpp>
+
 namespace blake3pp::detail {
 
 // What a read must be aligned to for a platform's direct-I/O path to
@@ -196,6 +198,19 @@ struct window_storage {
   std::span<std::byte> read_into;
   std::span<const std::byte> view;
 };
+
+// Window `slot`'s first `bytes` of an arena laid out as windows of
+// `window_bytes` side by side: the slicing every driver with an arena
+// does. Checked in every build, because a window outside the arena
+// reserve() took would point past the allocation.
+[[nodiscard]] inline std::span<std::byte> window_slice(
+    std::span<std::byte> arena, unsigned slot, std::size_t window_bytes,
+    std::size_t bytes) {
+  const std::size_t at = static_cast<std::size_t>(slot) * window_bytes;
+  require(bytes <= window_bytes && at + bytes <= arena.size(),
+          "window_storage_for(): a window outside the arena reserve() took");
+  return arena.subspan(at, bytes);
+}
 
 // What the pipeline needs of whatever is feeding it: a source of
 // windows that reports its completions from poll(), on the thread that

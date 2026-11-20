@@ -510,9 +510,10 @@ class basic_pipe_driver {
   [[nodiscard]] window_storage window_storage_for(file&, unsigned slot,
                                                   std::uint64_t,
                                                   std::size_t bytes) {
-    require(slot < windows_ && bytes <= window_bytes_,
-            "pipe_driver::window_storage_for(): a window outside the "
-            "reserved geometry");
+    const std::span<std::byte> slice = window_slice(
+        std::span<std::byte>(arena_).first(
+            static_cast<std::size_t>(windows_) * window_bytes_),
+        slot, window_bytes_, bytes);
     // The bytes carried from the previous window open this one, so it
     // must have room for them. The grid never asks for less: a flush
     // leaves at least two quanta of the ask, and the carry is at most
@@ -520,8 +521,6 @@ class basic_pipe_driver {
     require(bytes >= carry_len_,
             "pipe_driver::window_storage_for(): a window shorter than the "
             "bytes the previous one carried");
-    const std::span<std::byte> slice{
-        arena_.data() + static_cast<std::size_t>(slot) * window_bytes_, bytes};
     const std::size_t got = fill(slice);
     return {{}, std::span<const std::byte>(slice.first(got))};
   }

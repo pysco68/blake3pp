@@ -278,10 +278,9 @@ void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
 window_storage io_driver::window_storage_for(file&, unsigned slot,
                                              std::uint64_t,
                                              std::size_t bytes) noexcept {
-  const std::size_t at = static_cast<std::size_t>(slot) * impl_->window_bytes;
-  assert(at + bytes <= impl_->arena_bytes &&
-         "a window asked for arena the reserve did not take");
-  const std::span<std::byte> slice{impl_->buffers.get() + at, bytes};
+  const std::span<std::byte> slice = window_slice(
+      {impl_->buffers.get(), impl_->arena_bytes}, slot, impl_->window_bytes,
+      bytes);
   return {slice, std::span<const std::byte>(slice)};
 }
 

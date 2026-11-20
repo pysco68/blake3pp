@@ -79,8 +79,8 @@ class null_driver {
   // the reads from overlapping.
   [[nodiscard]] blake3pp::detail::window_storage window_storage_for(
       file&, unsigned slot, std::uint64_t, std::size_t bytes) noexcept {
-    const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
-                                     bytes};
+    const std::span<std::byte> slice = blake3pp::detail::window_slice(
+        pool_, slot, window_stride_, bytes);
     return {slice, std::span<const std::byte>(slice)};
   }
 

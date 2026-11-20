@@ -614,8 +614,9 @@ class fake_driver {
       script_.storage_throw_at_window = -1;
       throw std::bad_alloc();
     }
-    const std::span<std::byte> slice{pool_.data() + slot * window_stride_,
-                                     bytes};
+    const std::span<std::byte> slice = blake3pp::detail::window_slice(
+        std::span<std::byte>(pool_).first(arena_bytes_), slot, window_stride_,
+        bytes);
     if (script_.zero_copy) {
       // The window is read where the bytes already are. The slot's own
       // buffer is still handed out as the read target so the guard below

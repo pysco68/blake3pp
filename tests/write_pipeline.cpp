@@ -134,7 +134,8 @@ class fake_write_driver {
 
   [[nodiscard]] detail::window_storage window_storage_for(
       file&, unsigned slot, std::uint64_t, std::size_t bytes) noexcept {
-    const std::span<std::byte> s{pool_.data() + slot * stride_, bytes};
+    const std::span<std::byte> s =
+        detail::window_slice(pool_, slot, stride_, bytes);
     return {s, std::span<const std::byte>(s)};
   }
 
