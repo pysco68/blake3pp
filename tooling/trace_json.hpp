@@ -6,19 +6,46 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <fstream>
 #include <map>
+#include <limits>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <utility>
 
+#include <blake3pp/detail/io_geometry.hpp>
 #include <blake3pp/trace.hpp>
 
 namespace b3tool {
+
+// Window records for a run over `bytes` at the window the pipeline
+// rounds `window_bytes` to: one per window, plus one for a short first
+// window.
+[[nodiscard]] constexpr std::uint64_t trace_windows(
+    std::uint64_t bytes, std::size_t window_bytes) noexcept {
+  return blake3pp::detail::ceil_div(
+             bytes, blake3pp::detail::rounded_window_bytes(window_bytes)) +
+         1;
+}
+
+// `records` trace records, `per_record` times over (one agent record
+// per pool thread per window), as a count to size storage by. Throws
+// std::length_error when the count does not fit in size_t, which on a
+// 32-bit target is a few terabytes of input.
+[[nodiscard]] inline std::size_t trace_storage(std::uint64_t records,
+                                               unsigned per_record = 1) {
+  constexpr std::uint64_t most = std::numeric_limits<std::size_t>::max();
+  if (per_record != 0 && records > most / per_record) {
+    throw std::length_error("trace storage for this input does not fit in memory");
+  }
+  return static_cast<std::size_t>(records * per_record);
+}
 
 // The record kinds as Chrome trace JSON, one complete ("X") event per
 // phase per window on the lane of the window object that carried it.

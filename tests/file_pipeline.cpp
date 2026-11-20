@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "modelled_device.hpp"
+#include "trace_json.hpp"
 #include "suite_pool.hpp"
 #include "scripted_order.hpp"
 #include "temp_names.hpp"
@@ -2464,6 +2465,29 @@ TEST_CASE("window counts do not wrap near the top of the range") {
   const auto p = plan_pipeline(0, w, 4, false, top);
   CHECK(p.windows >= p.reads_in_flight);
   CHECK(p.reads_in_flight == 4);
+}
+
+TEST_CASE("the tools' trace storage is counted without wrapping") {
+  constexpr std::uint64_t top = std::numeric_limits<std::uint64_t>::max();
+  constexpr std::size_t w = 64 * 1024;
+  CHECK(b3tool::trace_windows(0, w) == 1);
+  CHECK(b3tool::trace_windows(3 * w, w) == 4);
+  CHECK(b3tool::trace_windows(3 * w + 1, w) == 5);
+  // The window is rounded as the pipeline rounds it.
+  CHECK(b3tool::trace_windows(3 * w, w + 1) == 4);
+  CHECK(b3tool::trace_windows(top, w) == (std::uint64_t{1} << 48) + 1);
+
+  CHECK(b3tool::trace_storage(5) == 5);
+  CHECK(b3tool::trace_storage(5, 8) == 40);
+  CHECK(b3tool::trace_storage(5, 0) == 0);
+  constexpr std::uint64_t most = std::numeric_limits<std::size_t>::max();
+  CHECK(b3tool::trace_storage(most) == most);
+  CHECK_THROWS_AS((void)b3tool::trace_storage(most / 2 + 1, 2),
+                  std::length_error);
+  CHECK_THROWS_AS((void)b3tool::trace_storage(top, 3), std::length_error);
+  if constexpr (most < top) {
+    CHECK_THROWS_AS((void)b3tool::trace_storage(most + 1), std::length_error);
+  }
 }
 
 TEST_CASE("plan_pipeline sizes the windows from the budget, the reads and the file") {

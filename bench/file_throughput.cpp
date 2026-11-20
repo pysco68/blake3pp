@@ -616,10 +616,10 @@ int main(int argc, char** argv) {
     const b3tool::modelled_device dev =
         b3tool::modelled_device::at_rate(null_rate, null_knee, win);
     if (!trace_path.empty()) {
-      const std::size_t n = static_cast<std::size_t>((total + win - 1) / win) + 1;
-      window_records.resize(n);
+      const std::uint64_t n = b3tool::trace_windows(total, win);
+      window_records.resize(b3tool::trace_storage(n));
       if (trace_agents) {
-        agent_records.resize(n * threads);
+        agent_records.resize(b3tool::trace_storage(n, threads));
       }
       trace.emplace(std::span{window_records}, std::span{agent_records});
       io_opts.trace = &*trace;
@@ -741,7 +741,7 @@ int main(int argc, char** argv) {
       // reserve() is a no-op and no first-touch page fault lands inside
       // the clock.
       const unsigned windows = static_cast<unsigned>(std::min<std::uint64_t>(
-          (total + win - 1) / win, start_depth));
+          blake3pp::detail::ceil_div(total, win), start_depth));
       null_driver drv({.async = true,
                        .offload_submit = opts.offload_submit,
                        .ioring = opts.ioring},
@@ -811,19 +811,16 @@ int main(int argc, char** argv) {
   // Trace storage sized for the file: one record per window as the
   // reader rounds it, plus one, and with agents one record per pool
   // thread per window, since a bulk invocation is at most one per thread.
-  const std::size_t effective_window =
-      blake3pp::detail::rounded_window_bytes(opts.window_bytes);
-  const std::size_t n_windows =
-      static_cast<std::size_t>((bytes + effective_window - 1) / effective_window) + 1;
+  const std::uint64_t n_windows = b3tool::trace_windows(bytes, opts.window_bytes);
   std::vector<blake3pp::window_record> window_records;
   std::vector<blake3pp::agent_record> agent_records;
   std::optional<blake3pp::trace_buffer> trace;
   const unsigned threads_for_trace =
       pool_threads != 0 ? pool_threads : std::thread::hardware_concurrency();
   if (!trace_path.empty()) {
-    window_records.resize(n_windows);
+    window_records.resize(b3tool::trace_storage(n_windows));
     if (trace_agents) {
-      agent_records.resize(n_windows * threads_for_trace);
+      agent_records.resize(b3tool::trace_storage(n_windows, threads_for_trace));
     }
     trace.emplace(std::span{window_records}, std::span{agent_records});
     opts.trace = &*trace;

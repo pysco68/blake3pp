@@ -349,13 +349,11 @@ int run_main(int argc, char** argv) {
         wopts.trace = &*trace;
       }
       if (!trace_path.empty()) {
-        const std::size_t window =
-            blake3pp::detail::rounded_window_bytes(wopts.window_bytes);
-        const std::size_t windows =
-            static_cast<std::size_t>((total + window - 1) / window) + 1;
-        window_records.resize(windows);
+        const std::uint64_t windows =
+            b3tool::trace_windows(total, wopts.window_bytes);
+        window_records.resize(b3tool::trace_storage(windows));
         if (trace_agents) {
-          agent_records.resize(windows);
+          agent_records.resize(b3tool::trace_storage(windows));
         }
         trace.emplace(std::span{window_records}, std::span{agent_records});
         wopts.trace = &*trace;

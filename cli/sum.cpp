@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <ratio>
 #include <span>
@@ -837,9 +838,7 @@ int run_main(int argc, char** argv) {
       o.files.emplace_back("-");
     }
     if (!o.trace_path.empty()) {
-      const std::size_t window =
-          blake3pp::detail::rounded_window_bytes(o.io.window_bytes);
-      std::size_t windows = 0;
+      std::uint64_t windows = 0;
       for (const auto& f : o.files) {
         std::optional<std::uint64_t> size;
         if (o.check) {
@@ -857,12 +856,15 @@ int run_main(int argc, char** argv) {
             size = 0;
           }
         }
-        windows += size ? static_cast<std::size_t>(*size / window) + 2
-                        : unsized_trace_windows;
+        const std::uint64_t file_windows =
+            size ? b3tool::trace_windows(*size, o.io.window_bytes)
+                 : unsized_trace_windows;
+        windows += std::min(file_windows,
+                            std::numeric_limits<std::uint64_t>::max() - windows);
       }
-      window_records.resize(windows);
+      window_records.resize(b3tool::trace_storage(windows));
       if (o.trace_agents) {
-        agent_records.resize(windows * o.threads);
+        agent_records.resize(b3tool::trace_storage(windows, o.threads));
       }
       trace.emplace(std::span{window_records}, std::span{agent_records});
       o.io.trace = &*trace;
