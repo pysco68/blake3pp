@@ -387,7 +387,8 @@ int run_main(int argc, char** argv) {
       }
       if (trace && !trace_path.empty()) {
         if (b3tool::write_chrome_trace(trace_path, *trace, "blake3ppgen",
-                                       threads, /*write_side=*/true)) {
+                                       threads, /*write_side=*/true,
+                                       report.backend)) {
           println(stderr, "blake3ppgen: trace: {} window records{}, JSON to {}",
                   trace->windows().size(),
                   trace_agents ? std::format(" and {} agent records",

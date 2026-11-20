@@ -478,9 +478,9 @@ below is from `--null-source 1 --trace-agents` on the same machine:
 
 | process | track | holds |
 |---|---|---|
-| `pid` 0, "driver" | `tid` 0, "driver loop" | one event over the whole run, carrying `driver_stats` in `args` |
+| `pid` 0, "driver" | `tid` 0, "driver loop" | one event over the whole run, carrying `driver_stats` in `args`, and on a write run the backend that wrote it as `write_backend` |
 | `pid` 1, "pipeline, by window object" | `tid` = `slot`, "window object" | the `wait`, `hash`, `absorb` and `release` events of every window that object carried |
-| `pid` 2, "pool agents, by cpu" | `tid` = cpu (99 unknown), "cpu" | one `compress`, `fold` or `fill` event per agent record, with its parts and part extremes, and an "agents busy" counter |
+| `pid` 2, "pool agents, by cpu" | `tid` = cpu, "cpu"; records whose cpu is unknown on the lane after the highest, "cpu unknown" | one `compress`, `fold` or `fill` event per agent record, with its parts and part extremes, and an "agents busy" counter |
 
 Windows go on the track of the window object that carried them rather
 than on one shared track, so several in flight read as parallel lanes

@@ -28,20 +28,22 @@ namespace b3tool {
 //   * process 1, the pipeline's window objects: tid = slot, so a lane
 //     reads "window object 4";
 //   * process 2, the agent records, the other view of the same windows --
-//     which core did the work, and for how long: tid = cpu (99 where
-//     unknown), each slice named by its kind (compress, fold, fill) with
-//     the window and file in its args, and a flow from the window's
-//     compute phase to it.
+//     which core did the work, and for how long: tid = cpu, and the lane
+//     after the highest cpu for a record whose cpu is unknown, each slice
+//     named by its kind (compress, fold, fill) with the window and file in
+//     its args, and a flow from the window's compute phase to it.
 //
 // The views collapse independently in the viewer. ts and dur are in
 // microseconds, as the format wants; epoch_ns at the top level is the
 // records' zero as absolute CLOCK_MONOTONIC nanoseconds, for joining with
-// timestamps other tools take on the same clock.
+// timestamps other tools take on the same clock. A write run names its
+// backend in `write_backend`, which driver_stats does not carry.
 inline bool write_chrome_trace(const std::string& path,
                                const blake3pp::trace_buffer& trace,
                                std::string_view process_name,
                                unsigned pool_threads = 0,
-                               bool write_side = false) {
+                               bool write_side = false,
+                               std::string_view write_backend = {}) {
   std::ofstream out(path);
   if (!out.is_open()) {
     return false;
@@ -68,10 +70,17 @@ inline bool write_chrome_trace(const std::string& path,
   // files still name the backend that read them.
   const auto& d = trace.driver();
   const auto windows = trace.windows();
-  if ((d.iterations > 0 || !blake3pp::read_backend(d).empty()) &&
+  if ((d.iterations > 0 || !blake3pp::read_backend(d).empty() ||
+       !write_backend.empty()) &&
       !windows.empty()) {
-    const std::int64_t begin = windows.front().t_wait_begin;
-    const std::int64_t end = windows.back().t_released;
+    // Over every window, not the first and last record: windows finish
+    // out of order, writes especially.
+    std::int64_t begin = windows.front().t_wait_begin;
+    std::int64_t end = windows.front().t_released;
+    for (const auto& w : windows) {
+      begin = std::min(begin, w.t_wait_begin);
+      end = std::max(end, w.t_released);
+    }
     out << std::format(
         ",\n{{\"name\":\"driver\",\"ph\":\"X\",\"pid\":0,\"tid\":0,"
         "\"ts\":{:.3f},\"dur\":{:.3f},\"args\":{{\"busy_ns\":{},"
@@ -83,13 +92,15 @@ inline bool write_chrome_trace(const std::string& path,
         "\"queue_depth_final\":{},"
         "\"queue_depth_peak\":{},\"agent_busy_ns\":{},"
         "\"device_wait_min_ns\":{},\"device_depth\":{},"
-        "\"lane_wait_ns\":{},\"read_backend\":\"{}\"}}}}",
+        "\"lane_wait_ns\":{},\"read_backend\":\"{}\"{}}}}}",
         us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
         d.polls, d.blocking_polls, d.wakes, d.queue_runs, d.admission_stalls,
         d.max_pending, d.transfers_landed, d.transfer_bytes,
         d.device_wait_ns, d.starved_ns, d.queue_depth_final,
         d.queue_depth_peak, d.agent_busy_ns, d.device_wait_min_ns,
-        d.device_depth, d.lane_wait_ns, blake3pp::read_backend(d));
+        d.device_depth, d.lane_wait_ns, blake3pp::read_backend(d),
+        write_side ? std::format(",\"write_backend\":\"{}\"", write_backend)
+                   : std::string{});
   }
   std::set<std::uint32_t> slots_named;
   for (const auto& w : trace.windows()) {
@@ -142,12 +153,21 @@ inline bool write_chrome_trace(const std::string& path,
     compute_of[{w.file, w.index}] = {w.slot, w.t_ready};
   }
   std::uint64_t flow = 0;
+  // A record whose cpu the platform could not say goes on the lane after
+  // the highest cpu seen, which no real cpu can share.
+  std::uint32_t unknown_tid = 0;
   for (const auto& a : trace.agents()) {
-    const std::uint32_t tid = a.cpu == ~std::uint32_t{0} ? 99 : a.cpu;
+    if (a.cpu != ~std::uint32_t{0}) {
+      unknown_tid = std::max(unknown_tid, a.cpu + 1);
+    }
+  }
+  for (const auto& a : trace.agents()) {
+    const bool known = a.cpu != ~std::uint32_t{0};
+    const std::uint32_t tid = known ? a.cpu : unknown_tid;
     if (cpus_named.insert(tid).second) {
       out << std::format(",\n{{\"name\":\"thread_name\",\"ph\":\"M\","
                          "\"pid\":2,\"tid\":{},\"args\":{{\"name\":\"{}\"}}}}",
-                         tid, tid == 99 ? "cpu unknown, tid" : "cpu");
+                         tid, known ? "cpu" : "cpu unknown");
     }
     const char* const kind =
         write_side ? "fill" : (a.parts == 0 ? "fold" : "compress");
