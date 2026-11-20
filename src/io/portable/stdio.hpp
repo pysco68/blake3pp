@@ -99,7 +99,9 @@ class stdio_source {
   stdio_source& operator=(const stdio_source&) = delete;
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] std::string_view name() const noexcept { return "stdio"; }
+  [[nodiscard]] std::string_view name() const noexcept {
+    return engine_token(rung_engine, false);
+  }
 
   void read_at(std::uint64_t off, std::span<std::byte> buf) {
     if (seek64(stream_.get(), off) != 0) {
@@ -141,7 +143,8 @@ using stdio_context = sync_context<stdio_source>;
 static_assert(io_context<stdio_context>);
 
 // stdio_source::name() has one spelling.
-static_assert(std::string_view("stdio").size() <= max_read_backend_length,
+static_assert(engine_token(stdio_source::rung_engine, false).size() <=
+                  max_read_backend_length,
               "a read backend name would not fit driver_stats::read_backend");
 
 }  // namespace blake3pp::detail::io_impl

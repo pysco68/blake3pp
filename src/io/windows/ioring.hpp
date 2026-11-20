@@ -533,12 +533,14 @@ class ioring_engine {
   // spellings and suffixes are fixed.
   [[nodiscard]] std::string name_for(bool direct, bool on_ring,
                                      bool write) const {
-    if (on_ring) {
-      return direct ? "ioring+direct" : "ioring";
+    std::string n(engine_token(
+        on_ring ? io_engine::ioring : io_engine::win_sync, write));
+    if (direct) {
+      n += direct_tag;
     }
-    const char* const sync_name = write ? "writefile" : "readfile";
-    std::string n =
-        direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
+    if (on_ring) {
+      return n;
+    }
     if (async_requested_ && !use_ring_) {
       n += no_ioring_suffix(refusal());
     }
@@ -671,8 +673,9 @@ static_assert(io_context<ioring_context>);
 // The longest read name ioring_engine::name_for() gives: the ring, or the
 // synchronous rung and why the ring was refused.
 inline constexpr std::size_t ioring_read_name_max =
-    std::max(std::string_view("ioring+direct").size(),
-             std::string_view("readfile+direct").size() + no_ioring_suffix_max);
+    std::max(engine_token(io_engine::ioring, false).size() + direct_tag.size(),
+             engine_token(io_engine::win_sync, false).size() +
+                 direct_tag.size() + no_ioring_suffix_max);
 static_assert(ioring_read_name_max <= max_read_backend_length,
               "a read backend name would not fit driver_stats::read_backend");
 

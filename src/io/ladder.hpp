@@ -130,4 +130,25 @@ inline constexpr std::size_t u32_text_max = 10;  // 4294967295
   return n;
 }
 
+// An engine's token as io_engine.def spells it for one direction: the
+// part of a rung name the table owns, and what to_string() prints. A
+// backend's name_for() starts from it and appends the decorations below
+// and its own reasons; its bound measures the same pieces.
+[[nodiscard]] constexpr std::string_view engine_token(io_engine e,
+                                                      bool write) noexcept {
+  switch (e) {
+#define BLAKE3PP_IO_ENGINE(enumerator, read_name, write_name, rank, async) \
+  case io_engine::enumerator:                                            \
+    return write ? std::string_view(write_name) : std::string_view(read_name);
+#include <blake3pp/detail/io_engine.def>
+#undef BLAKE3PP_IO_ENGINE
+  }
+  return {};
+}
+
+// The cache bypass engaged: a second O_DIRECT or NO_BUFFERING descriptor,
+// or Darwin's F_NOCACHE on the one.
+inline constexpr std::string_view direct_tag = "+direct";
+inline constexpr std::string_view nocache_tag = "+nocache";
+
 }  // namespace blake3pp::detail::io_impl

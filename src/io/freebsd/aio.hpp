@@ -539,10 +539,11 @@ class aio_engine {
   // observable API.
   [[nodiscard]] std::string name_for(bool direct, bool write,
                                      bool direct_refused) const {
-    const char* const sync_name = write ? "pwrite" : "pread";
-    std::string n = use_aio_ ? (direct ? "aio+direct" : "aio")
-                             : (direct ? std::string(sync_name) + "+direct"
-                                       : std::string(sync_name));
+    std::string n(
+        engine_token(use_aio_ ? io_engine::aio : io_engine::posix_sync, write));
+    if (direct) {
+      n += direct_tag;
+    }
     if (async_requested_ && !use_aio_) {
       n += refusal_;
     }
@@ -724,8 +725,9 @@ static_assert(io_context<aio_context>);
 // the longest rung, why AIO was refused, and the refused direct
 // descriptor, as though all three could meet.
 inline constexpr std::size_t aio_read_name_max =
-    longest_of({"aio+direct", "pread+direct"}) + no_aio_suffix_max +
-    direct_einval_suffix.size();
+    longest_of({engine_token(io_engine::aio, false),
+                engine_token(io_engine::posix_sync, false)}) +
+    direct_tag.size() + no_aio_suffix_max + direct_einval_suffix.size();
 static_assert(aio_read_name_max <= max_read_backend_length,
               "a read backend name would not fit driver_stats::read_backend");
 
