@@ -459,6 +459,37 @@ std::size_t window_count(std::size_t len, std::size_t window_bytes) {
   return (len + window_bytes - 1) / window_bytes;
 }
 
+// A buffer reused without clear() adds the second run to the first:
+// both runs' transfers, and both runs' device time. Each call builds a
+// driver of its own, so no driver's total can stand for the buffer's.
+TEST_CASE("a trace buffer reused across calls adds the runs up") {
+  constexpr std::size_t window = 64 * 1024;
+  const auto a = make_input(4 * 1024 * 1024 + 5);
+  const auto b = make_input(3 * window + 9);
+  const temp_file fa(a);
+  const temp_file fb(b);
+  const std::size_t na = window_count(a.size(), window);
+  const std::size_t nb = window_count(b.size(), window);
+  std::vector<blake3pp::window_record> windows(na + nb);
+  blake3pp::trace_buffer trace(windows);
+  const blake3pp::file_io_options opts{.window_bytes = window,
+                                       .trace = &trace};
+  auto sched = blake3pp::get_parallel_scheduler();
+
+  blake3pp::hasher ha;
+  blake3pp::update_file(ha, fa.path, sched, opts);
+  const blake3pp::driver_stats first = trace.driver();
+  REQUIRE(first.transfers_landed == na);
+
+  blake3pp::hasher hb;
+  blake3pp::update_file(hb, fb.path, sched, opts);
+  const blake3pp::driver_stats& both = trace.driver();
+  CHECK(both.transfers_landed == na + nb);
+  CHECK(both.transfer_bytes == a.size() + b.size());
+  CHECK(both.device_wait_ns > first.device_wait_ns);
+  CHECK(both.device_wait_min_ns <= first.device_wait_min_ns);
+}
+
 TEST_CASE("tracing leaves the digest unchanged") {
   auto sched = blake3pp::get_parallel_scheduler();
   const std::size_t len = 3 * 1024 * 1024 + 17;  // not a window multiple

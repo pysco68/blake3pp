@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -286,6 +287,7 @@ class deferred_pump {
       lanes_.start(&lane_body, &lane_unblock, this);
     }
     accrue();
+    op.lane_queued(std::chrono::nanoseconds{since_});  // accrue()'s read
     queue_.push(op);
     ++queued_;
     if (!lanes_.running()) {
@@ -318,6 +320,7 @@ class deferred_pump {
       }
       op = queue_.take();
       accrue();
+      op->lane_taken(std::chrono::nanoseconds{since_});
       --queued_;
       cancelled = op->cancelled;
     }
@@ -486,6 +489,7 @@ class deferred_pump {
         }
         op = queue_.take();
         accrue();
+        op->lane_taken(std::chrono::nanoseconds{since_});
         --queued_;
         cancelled = op->cancelled;
         ++busy_;

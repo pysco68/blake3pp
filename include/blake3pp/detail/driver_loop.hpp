@@ -760,27 +760,46 @@ class driver_loop {
 struct transfer_stats {
   std::uint64_t landed = 0;
   std::uint64_t bytes = 0;
-  // Admission to landing, summed, for a driver that cannot attribute the
-  // device's own time (device_service).
+  // The device's time over this run's transfers, summed: what the
+  // performer stamped where the driver attributes it (transfer_service),
+  // and the admission-to-landing span where it cannot.
   std::uint64_t device_wait_ns = 0;
-  // The shortest admission-to-landing span: the device's latency with
-  // nothing queued ahead.
+  // The shortest of those: the device's latency with nothing queued
+  // ahead. Over `timed` transfers.
   std::uint64_t device_min_ns = ~std::uint64_t{0};
+  std::uint64_t timed = 0;
+  // The waits for one of the driver's own threads, summed over this run's
+  // transfers.
+  std::uint64_t lane_wait_ns = 0;
   std::uint64_t starved_ns = 0;
   // When the open starved interval began; zero when there is none.
   std::int64_t starved_at = 0;
 
-  // One transfer of n bytes, admitted at t_begin, has landed. Returns the
-  // landing time, which the caller stamps into its trace record from the
-  // same clock read.
-  std::int64_t land(std::int64_t t_begin, std::size_t n) noexcept {
+  // One transfer of n bytes, admitted at t_begin, has landed through
+  // `op`. Called inside its completion, where the driver can still say
+  // what the transfer cost. Returns the landing time, which the caller
+  // stamps into its trace record from the same clock read.
+  template <class D>
+  std::int64_t land(const D& drv, const io_op& op, std::int64_t t_begin,
+                    std::size_t n) noexcept {
     const std::int64_t t = steady_now_ns();
     ++landed;
     bytes += n;
-    const auto service =
+    std::uint64_t service =
         static_cast<std::uint64_t>(std::max<std::int64_t>(0, t - t_begin));
+    if constexpr (attributes_transfers<D>) {
+      const transfer_service s = drv.service_of(op);
+      lane_wait_ns += static_cast<std::uint64_t>(s.lane_wait.count());
+      // A transfer the device never had (cancelled before it was issued)
+      // stamped nothing, and would pull the minimum to zero.
+      if (s.device <= std::chrono::nanoseconds::zero()) {
+        return t;
+      }
+      service = static_cast<std::uint64_t>(s.device.count());
+    }
     device_wait_ns += service;
     device_min_ns = std::min(device_min_ns, service);
+    ++timed;
     return t;
   }
 
@@ -805,34 +824,24 @@ struct transfer_stats {
     }
   }
 
-  // The counters, and the device's own time where the driver can
-  // attribute it: that belongs to whoever performed the transfer, so it is
-  // preferred, and the admission-to-landing span stands only where no
-  // performer can say.
-  //
-  // This run's own counts are added to what the buffer holds, so a
-  // batch's files over one buffer report all of them. What the driver
-  // reports is its own total over every file it served, and is taken as
-  // it stands.
+  // This run's counts, added to what the buffer holds: every figure here
+  // is this run's own, counted transfer by transfer, so runs that share
+  // one buffer -- a batch's files, or calls that reuse it -- add up, and
+  // nothing a shared driver did for another operation is in them.
   template <file_driver D>
   void report(driver_stats& d, const D& drv) const noexcept {
     d.transfers_landed += landed;
     d.transfer_bytes += bytes;
     d.starved_ns += starved_ns;
-    const device_service svc = device_service_of(drv);
-    d.device_depth = std::max<std::uint64_t>(d.device_depth, svc.depth);
-    d.lane_wait_ns = svc.lane_wait_ns;
-    if (svc.device.transfers > 0) {
-      d.device_wait_ns = svc.device.total_ns;
-      d.device_wait_min_ns = svc.device.min_ns;
-    } else {
-      d.device_wait_ns += device_wait_ns;
-      if (landed > 0) {
-        d.device_wait_min_ns = d.device_wait_min_ns == 0
-                                   ? device_min_ns
-                                   : std::min(d.device_wait_min_ns,
-                                              device_min_ns);
-      }
+    d.device_depth =
+        std::max<std::uint64_t>(d.device_depth, device_depth_of(drv));
+    d.lane_wait_ns += lane_wait_ns;
+    d.device_wait_ns += device_wait_ns;
+    if (timed > 0) {
+      d.device_wait_min_ns = d.device_wait_min_ns == 0
+                                 ? device_min_ns
+                                 : std::min(d.device_wait_min_ns,
+                                            device_min_ns);
     }
   }
 };

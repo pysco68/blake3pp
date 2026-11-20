@@ -306,7 +306,8 @@ class write_scope
 
   void landed(window& w) noexcept {
     w.writing = false;
-    const std::int64_t t = transfers_.land(w.t_write_begin, w.bytes);
+    const std::int64_t t =
+        transfers_.land(loop_.driver(), w.op, w.t_write_begin, w.bytes);
     if (w.rec != nullptr) {
       w.rec->t_absorbed = t - trace_->epoch_ns();
     }

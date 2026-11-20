@@ -126,9 +126,9 @@ struct io_op {
   // WINDOWS is the binding case. It chooses the ring or the port at
   // runtime, and one transfer type serves both: the completion port's,
   // whose OVERLAPPED the ring carries unused (src/io/windows/engine.hpp).
-  // That is 144 bytes, as the Windows build's op-storage case reports.
+  // That is 152 bytes, as the Windows build's op-storage case reports.
   //
-  // 192 leaves 48 bytes over that 144. The slack costs bytes per
+  // 192 leaves 40 bytes over that 152. The slack costs bytes per
   // operation in flight, and an operation is one window: at the 256-window
   // ceiling (max_queue_depth) the operations take 48 KiB, against at least
   // 16 MiB for the windows they point into (256 of the 64 KiB minimum). A
@@ -163,6 +163,14 @@ struct io_op {
   [[nodiscard]] Op& native() noexcept {
     assert(live && "io_op::native() on an operation no driver owes");
     return *std::launder(reinterpret_cast<Op*>(storage));
+  }
+
+  // The same op once its transfer has completed, for reading what it
+  // recorded: only from inside that completion, before a submit builds
+  // the next op over the storage.
+  template <class Op>
+  [[nodiscard]] const Op& finished_native() const noexcept {
+    return *std::launder(reinterpret_cast<const Op*>(storage));
   }
 };
 
@@ -227,13 +235,10 @@ concept file_driver =
           -> std::same_as<window_storage>;
     };
 
-// What the driver's engine actually offered the device, where it can say.
-//
-// Optional rather than part of file_driver: only the file I/O driver has
-// an engine with a queue of its own. A driver without these
-// members (memory_driver, pipe_driver) leaves the depth the pipeline asked
-// for standing and the pipeline's own admission-to-landing span as the
-// device's time.
+// What a context's device had over the context's life: its device()
+// answers in these. A trace does not read it, because a context shared by
+// several operations would hand each one the others' time; it reads
+// transfer_service, per transfer, below.
 struct device_time {
   // Summed nanoseconds the device had a transfer, over the pieces it was
   // carried in.
@@ -263,29 +268,39 @@ struct device_time {
   }
 };
 
-struct device_service {
-  // The most transfers the engine can have at the device at once; zero
-  // means the driver cannot say and the queue depth in force stands.
-  unsigned depth = 0;
-  // Nanoseconds transfers spent waiting for one of the driver's own
-  // servers before they started, with none of the device in it.
-  std::uint64_t lane_wait_ns = 0;
-  // What the device itself took, stamped where the transfer happened.
-  device_time device{};
+// What the driver's engine actually offered the device, where it can say.
+//
+// Optional rather than part of file_driver: only the file I/O driver has
+// an engine with a queue of its own. A driver without these members
+// (memory_driver, pipe_driver) leaves the depth the pipeline asked for
+// standing and the pipeline's own admission-to-landing span as the
+// device's time.
+//
+// What one finished transfer cost, where the driver can say: the
+// device's own time, stamped by whoever performed the transfer, and how
+// long it first waited for one of the driver's own threads, with none of
+// the device in it. Read per transfer, inside its completion, so a run
+// counts its own transfers and nothing a shared driver did for another.
+struct transfer_service {
+  std::chrono::nanoseconds device{};
+  std::chrono::nanoseconds lane_wait{};
 };
 
 template <class D>
-[[nodiscard]] device_service device_service_of(const D& drv) noexcept {
+concept attributes_transfers = requires(const D& drv, const io_op& op) {
+  { drv.service_of(op) } noexcept -> std::same_as<transfer_service>;
+};
+
+// The most transfers the driver's engine can have at the device at once;
+// zero means the driver cannot say and the queue depth in force stands.
+template <class D>
+[[nodiscard]] unsigned device_depth_of(const D& drv) noexcept {
   if constexpr (requires {
                   { drv.device_depth() } noexcept -> std::same_as<unsigned>;
-                  { drv.lane_wait_ns() } noexcept -> std::same_as<std::uint64_t>;
-                  {
-                    drv.device_time_of_run()
-                  } noexcept -> std::same_as<device_time>;
                 }) {
-    return {drv.device_depth(), drv.lane_wait_ns(), drv.device_time_of_run()};
+    return drv.device_depth();
   } else {
-    return {};
+    return 0;
   }
 }
 

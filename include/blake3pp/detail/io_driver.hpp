@@ -130,14 +130,11 @@ class io_driver {
   // and were measured to gain nothing over one. What the diagnosis reads
   // the device's queue against.
   [[nodiscard]] unsigned device_depth() const noexcept;
-  // Nanoseconds transfers spent waiting for one of those threads before
-  // they started, with none of the device in it: the measure of too few
-  // of them. Zero on a run the engine carried.
-  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept;
-  // What the device itself took over this run, stamped by whoever
-  // performed each transfer rather than inferred from a span of the
-  // pipeline's timeline.
-  [[nodiscard]] device_time device_time_of_run() const noexcept;
+  // What one finished transfer cost: the device's own time, stamped by
+  // whoever performed it rather than inferred from a span of the
+  // pipeline's timeline, and how long it waited for one of the driver's
+  // threads first. Only from inside that transfer's completion.
+  [[nodiscard]] transfer_service service_of(const io_op& op) const noexcept;
   // Waits out every read still owed, running no callback, and forgets
   // the rest. The invariant it establishes: afterwards in_flight() is
   // zero, the driver references no io_op, and every op it owed has

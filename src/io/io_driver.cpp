@@ -245,12 +245,11 @@ unsigned io_driver::device_depth() const noexcept {
   return impl_->ctx.device_depth();
 }
 
-std::uint64_t io_driver::lane_wait_ns() const noexcept {
-  return impl_->ctx.lane_wait_ns();
-}
-
-device_time io_driver::device_time_of_run() const noexcept {
-  return impl_->ctx.device();
+transfer_service io_driver::service_of(const io_op& op) const noexcept {
+  const native_op& inner = op.finished_native<native_op>();
+  return {std::chrono::nanoseconds{
+              static_cast<std::int64_t>(inner.device_total_ns())},
+          inner.lane_wait_total()};
 }
 
 void io_driver::drain() noexcept {

@@ -274,6 +274,46 @@ TEST_CASE("the senders record into a buffer handed in as a tracer") {
   }
 }
 
+// What a trace says about the device belongs to its own operation: a
+// context that already served other reads, and a buffer reused after
+// clear(), add nothing to it. A transfer's device time and its wait for a
+// lane both lie between its submit and its landing, so a run's sums are
+// bounded by its own windows' submit-to-ready spans.
+TEST_CASE("a trace counts its own transfers, not the context's earlier ones") {
+  constexpr std::size_t win = 64 * 1024;
+  const auto big = pattern(16 * 1024 * 1024, 31);
+  const auto small = pattern(5 * win + 4097, 32);
+  const temp_file fbig(big);
+  const temp_file fsmall(small);
+  const std::size_t n = (small.size() + win - 1) / win;
+
+  async::io_context ctx(tight());
+  auto sched = blake3pp::get_parallel_scheduler();
+  REQUIRE(async::sync_wait(ctx, async::async_hash_file(ctx, fbig.path(), sched))
+              .has_value());
+
+  std::vector<blake3pp::window_record> windows(n);
+  blake3pp::trace_buffer trace(windows);
+  for (int round = 0; round < 2; ++round) {
+    CAPTURE(round);
+    trace.clear();
+    REQUIRE(async::sync_wait(
+                ctx, async::async_hash_file(ctx, fsmall.path(), sched, {},
+                                            blake3pp::buffer_tracer{&trace}))
+                .has_value());
+    REQUIRE(trace.windows().size() == n);
+    std::uint64_t spans = 0;
+    for (const blake3pp::window_record& w : trace.windows()) {
+      spans += static_cast<std::uint64_t>(w.t_ready - w.t_wait_begin);
+    }
+    const blake3pp::driver_stats& d = trace.driver();
+    CHECK(d.transfers_landed == n);
+    CHECK(d.transfer_bytes == small.size());
+    CHECK(d.device_wait_ns <= spans);
+    CHECK(d.lane_wait_ns <= spans);
+  }
+}
+
 // sync_wait() on a context another thread is running is a misuse that
 // drive() reports with logic_error. It must reach the caller as that,
 // with nothing started and nothing stopped: the running thread's own

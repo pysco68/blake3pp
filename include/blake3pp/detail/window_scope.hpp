@@ -1307,7 +1307,8 @@ class window_scope
   void read_landed(window& w) noexcept {
     w.view_ready = true;
     release_read_slot(w);
-    inst_.landed(w, transfers_.land(w.t_read_begin, w.bytes));
+    inst_.landed(w, transfers_.land(loop_.driver(), w.op, w.t_read_begin,
+                                    w.bytes));
   }
 
   void release_read_slot(window& w) noexcept {
