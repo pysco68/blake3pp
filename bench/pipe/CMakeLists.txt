@@ -12,6 +12,9 @@ foreach(tool IN ITEMS pump drain rux pipeprobe)
   set_target_properties(pipe_${tool} PROPERTIES OUTPUT_NAME ${tool})
   target_link_libraries(pipe_${tool} PRIVATE blake3pp_warnings blake3pp::tooling Threads::Threads)
 endforeach()
+# drain runs the library's stream_watch, a header that needs nothing but
+# the standard library: the include directory, and still no library.
+target_include_directories(pipe_drain PRIVATE "${PROJECT_SOURCE_DIR}/include")
 
 # The scripts sit beside the binaries, so runpipe finds its tools there.
 foreach(script IN ITEMS runpipe.sh runpipe.ps1)

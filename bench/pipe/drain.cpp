@@ -20,14 +20,15 @@
 //     That is the never-sleeping drain: the floor any consumer is measured
 //     against. Byte order does not matter to a drain, which is what makes
 //     concurrent reads on one handle legitimate here.
-//   * --watch: one reader that probes an empty pipe before it reads, by
-//     the rule the library's stream_watch (detail/pipe_driver.hpp)
-//     follows -- a 16 us budget that grows on a catch and halves on a
-//     time-out, one probe per microsecond. There is no readiness wait on
-//     a Windows anonymous pipe, so the "sleep" at the end of a watch is
-//     the blocking read itself, on every platform alike. The rule is
-//     transcribed, not linked, so this builds where the library's bench
-//     targets do not.
+//   * --watch: one reader that probes an empty pipe before it reads,
+//     through the library's own stream_watch (detail/stream_watch.hpp)
+//     -- by default a 16 us budget that grows on a catch and halves on a
+//     time-out, one probe per microsecond; --budget and --interval set
+//     the two. There is no readiness wait on a Windows anonymous pipe, so
+//     the "sleep" at the end of a watch is the blocking read itself, on
+//     every platform alike. stream_watch is a header with nothing but the
+//     standard library in it, so this still links no library and builds
+//     where the library's bench targets do not.
 //
 // --widen <KiB> asks the OS for that much pipe buffer first, the way
 // update_stream() does (1024 KiB by default, update_stream's own
@@ -67,11 +68,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <CLI/CLI.hpp>
+
+#include <blake3pp/detail/stream_watch.hpp>
 
 #include "pipe_os.hpp"
 
@@ -87,12 +91,6 @@
 namespace {
 
 using clock_type = std::chrono::steady_clock;
-
-std::int64_t now_ns() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             clock_type::now().time_since_epoch())
-      .count();
-}
 
 #if defined(_WIN32)
 // The ntdll entry point, looked up at run time so nothing links ntdll.lib.
@@ -241,57 +239,41 @@ void closing_reader(pipebench::handle h, std::size_t buf_bytes, std::uint64_t li
   }
 }
 
-// One reader with the watch in front of each read.
+// The platform under the library's stream_watch for one pipe: the probe
+// is the one chosen, and the "sleep" is the blocking read itself, kept for
+// the reader that follows, since a Windows anonymous pipe has no
+// readiness wait to sleep on.
+struct drain_platform {
+  pipebench::handle h;
+  const prober& probes;
+  std::vector<unsigned char>& buf;
+  std::optional<pipebench::read_result> slept_read{};
+
+  [[nodiscard]] clock_type::time_point now() const noexcept {
+    return clock_type::now();
+  }
+  [[nodiscard]] bool probe() const { return probes.ready(h); }
+  void relax() const noexcept { pipebench::relax(); }
+  void sleep() { slept_read = pipebench::read_some(h, buf.data(), buf.size()); }
+};
+
+// One reader with the library's watch in front of each read.
 void watching_reader(pipebench::handle h, std::size_t buf_bytes,
-                     const prober& probe, std::int64_t ceiling_ns,
-                     std::int64_t interval_ns, tally& t) {
+                     const prober& probe,
+                     blake3pp::detail::stream_watch::bounds bounds, tally& t) {
   std::vector<unsigned char> buf(buf_bytes, 1);
-  const std::int64_t step_ns = std::max<std::int64_t>(1, ceiling_ns / 8);
-  const std::int64_t floor_ns = interval_ns;
-  std::int64_t budget = ceiling_ns;
+  blake3pp::detail::stream_watch watch(bounds);
+  drain_platform p{h, probe, buf};
   for (;;) {
-    ++t.probes;
-    if (!probe.ready(h)) {
-      const std::int64_t t0 = now_ns();
-      const std::int64_t b = budget;
-      std::int64_t last = t0;
-      bool hit = false;
-      for (;;) {
-        std::int64_t now = now_ns();
-        while (now - last < interval_ns) {
-          pipebench::relax();
-          now = now_ns();
-        }
-        last = now;
-        ++t.probes;
-        if (probe.ready(h)) {
-          budget = std::min(ceiling_ns, b + step_ns);
-          ++t.caught;
-          hit = true;
-          break;
-        }
-        if (now - t0 >= b) {
-          break;
-        }
-      }
-      if (!hit) {
-        budget = std::max(floor_ns, b / 2);
-        ++t.slept;
-        const pipebench::read_result r = pipebench::read_some(h, buf.data(), buf.size());
-        if (r.eof || r.error) {
-          finish(t, r);
-          return;
-        }
-        t.bytes += r.bytes;
-        ++t.reads;
-        if (now_ns() - t0 < ceiling_ns) {
-          budget = std::min(ceiling_ns, b + step_ns);
-        }
-        continue;
-      }
-    }
-    const pipebench::read_result r = pipebench::read_some(h, buf.data(), buf.size());
+    p.slept_read.reset();
+    watch.wait(p);
+    const pipebench::read_result r =
+        p.slept_read ? *p.slept_read
+                     : pipebench::read_some(h, buf.data(), buf.size());
     if (r.eof || r.error) {
+      t.probes = watch.stats().probes;
+      t.caught = watch.stats().caught;
+      t.slept = watch.stats().slept;
       finish(t, r);
       return;
     }
@@ -363,7 +345,10 @@ int main(int argc, char** argv) {
   if (close_opt->count() > 0) {
     closing_reader(in, buf_bytes, close_after, mark, tallies[0]);
   } else if (!watch.empty()) {
-    watching_reader(in, buf_bytes, probe, budget_us * 1000, interval_ns, tallies[0]);
+    watching_reader(in, buf_bytes, probe,
+                    {.ceiling = std::chrono::microseconds{budget_us},
+                     .probe_interval = std::chrono::nanoseconds{interval_ns}},
+                    tallies[0]);
   } else if (threads == 1) {
     plain_reader(in, buf_bytes, tallies[0]);
   } else {

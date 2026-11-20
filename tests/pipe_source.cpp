@@ -1682,6 +1682,17 @@ struct scripted_watch_platform {
 
 }  // namespace
 
+// The figures the rule was measured at, which pipe_driver.hpp's readers
+// run by default and stream_watch.hpp states.
+TEST_CASE("the watch's default bounds are a 16 us ceiling and a 1 us pace") {
+  const detail::stream_watch w;
+  CHECK(w.ceiling() == std::chrono::microseconds{16});
+  CHECK(w.probe_interval() == std::chrono::microseconds{1});
+  CHECK(w.step() == std::chrono::microseconds{2});
+  CHECK(w.floor() == std::chrono::microseconds{1});
+  CHECK(w.budget() == w.ceiling());
+}
+
 TEST_CASE("a producer whose gaps sit inside the ceiling is never slept on") {
   detail::stream_watch w;
   scripted_watch_platform p;
@@ -1695,10 +1706,10 @@ TEST_CASE("a producer whose gaps sit inside the ceiling is never slept on") {
   // One opening probe and then one per interval until the data at 5 us,
   // give or take the probe's own cost.
   const auto paced = static_cast<std::uint64_t>(
-      std::chrono::nanoseconds{5'000} / detail::stream_watch::probe_interval);
+      std::chrono::nanoseconds{5'000} / w.probe_interval());
   CHECK(c.probes >= 64 * paced);
   CHECK(c.probes <= 64 * (paced + 2));
-  CHECK(w.budget() == detail::stream_watch::ceiling);
+  CHECK(w.budget() == w.ceiling());
 }
 
 TEST_CASE("a producer whose gaps exceed the ceiling decays the budget to the floor") {
@@ -1711,12 +1722,12 @@ TEST_CASE("a producer whose gaps exceed the ceiling decays the budget to the flo
   }
   CHECK(w.stats().slept == 8);
   CHECK(w.stats().caught == 0);
-  CHECK(w.budget() == detail::stream_watch::floor);
+  CHECK(w.budget() == w.floor());
   // And a short sleep re-arms it by one step.
   p.wake_latency = 2'000;
   p.arrive_in(5'000);
   w.wait(p);
-  CHECK(w.budget() == detail::stream_watch::floor + detail::stream_watch::step);
+  CHECK(w.budget() == w.floor() + w.step());
 }
 
 TEST_CASE("at the floor every wait still makes one paced probe") {
@@ -1730,7 +1741,7 @@ TEST_CASE("at the floor every wait still makes one paced probe") {
     p.arrive_in(100'000);
     w.wait(p);
   }
-  REQUIRE(w.budget() == detail::stream_watch::floor);
+  REQUIRE(w.budget() == w.floor());
   const auto before = w.stats();
   p.arrive_in(100'000);
   w.wait(p);
@@ -1739,7 +1750,7 @@ TEST_CASE("at the floor every wait still makes one paced probe") {
   CHECK(w.stats().slept - before.slept == 1);
   // And data that arrives inside that one interval is caught, not slept on.
   p.arrive_in(
-      (detail::stream_watch::probe_interval - std::chrono::nanoseconds{200})
+      (w.probe_interval() - std::chrono::nanoseconds{200})
           .count());
   w.wait(p);
   CHECK(w.stats().slept - before.slept == 1);
