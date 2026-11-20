@@ -344,9 +344,17 @@ class trace_buffer {
 
   /// The next agent record, zeroed, or nullptr when the storage is full
   /// (counted in dropped_agents()) or when no agent storage was given
-  /// (not counted). Any thread; one atomic increment.
+  /// (not counted). Any thread. Once full, the storage stays full until
+  /// clear(): later claims are refused without advancing the claim index.
   [[nodiscard]] agent_record* claim_agent() noexcept {
     if (agents_.empty()) {
+      return nullptr;
+    }
+    // A full buffer refuses before incrementing, so the index passes the
+    // storage size by at most the claims racing on that load and never
+    // wraps back onto records already handed out.
+    if (next_agent_.load(std::memory_order_relaxed) >= agents_.size()) {
+      dropped_agents_.fetch_add(1, std::memory_order_relaxed);
       return nullptr;
     }
     const std::size_t i = next_agent_.fetch_add(1, std::memory_order_relaxed);
@@ -415,6 +423,14 @@ class trace_buffer {
     next_agent_.store(0, std::memory_order_relaxed);
     dropped_agents_.store(0, std::memory_order_relaxed);
   }
+
+#if defined(BLAKE3PP_TEST_IO_SEAMS)
+  // Sets the agent claim index, which no test could otherwise push to
+  // the end of its range. Test builds only.
+  void seam_set_agent_claims(std::size_t claims) noexcept {
+    next_agent_.store(claims, std::memory_order_relaxed);
+  }
+#endif
 
  private:
   std::span<window_record> windows_;

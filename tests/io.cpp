@@ -10,12 +10,14 @@
 #include <format>
 #include <fstream>
 #include <ios>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -744,6 +746,68 @@ TEST_CASE("trace_buffer::clear keeps the epoch") {
   // Same epoch: the new records come after the old ones on the same axis.
   CHECK(trace.windows().front().t_wait_begin >= before);
 }
+
+TEST_CASE("an exhausted trace buffer stays full until clear") {
+  std::vector<blake3pp::window_record> windows(1);
+  std::vector<blake3pp::agent_record> agents(2);
+  blake3pp::trace_buffer trace(windows, agents);
+  blake3pp::agent_record* const first = trace.claim_agent();
+  blake3pp::agent_record* const second = trace.claim_agent();
+  REQUIRE(first == &agents[0]);
+  REQUIRE(second == &agents[1]);
+  first->parts = 7;
+  second->parts = 8;
+
+  // The claim index at the end of its range, as if refused claims had
+  // pushed it there: the next ones must neither wrap nor reuse a record.
+  trace.seam_set_agent_claims(std::numeric_limits<std::size_t>::max() - 1);
+  for (int i = 0; i < 3; ++i) {
+    CHECK(trace.claim_agent() == nullptr);
+  }
+  CHECK(trace.agents().size() == 2);
+  CHECK(trace.dropped_agents() == 3);
+  CHECK(agents[0].parts == 7);
+  CHECK(agents[1].parts == 8);
+
+  trace.clear();
+  CHECK(trace.agents().empty());
+  CHECK(trace.claim_agent() == &agents[0]);
+  CHECK(trace.agents().size() == 1);
+}
+
+#if defined(BLAKE3PP_HAS_STD_THREAD)
+TEST_CASE("concurrent agent claims hand out each record once") {
+  constexpr std::size_t storage = 64;
+  constexpr std::size_t threads = 4;
+  constexpr std::size_t claims_per_thread = 1000;
+  std::vector<blake3pp::window_record> windows(1);
+  std::vector<blake3pp::agent_record> agents(storage);
+  blake3pp::trace_buffer trace(windows, agents);
+  std::vector<std::vector<blake3pp::agent_record*>> got(threads);
+  std::vector<std::thread> pool;
+  for (std::size_t t = 0; t < threads; ++t) {
+    pool.emplace_back([&trace, &mine = got[t]] {
+      for (std::size_t i = 0; i < claims_per_thread; ++i) {
+        if (blake3pp::agent_record* const r = trace.claim_agent()) {
+          mine.push_back(r);
+        }
+      }
+    });
+  }
+  for (std::thread& t : pool) {
+    t.join();
+  }
+  std::vector<blake3pp::agent_record*> all;
+  for (const auto& mine : got) {
+    all.insert(all.end(), mine.begin(), mine.end());
+  }
+  std::ranges::sort(all);
+  CHECK(all.size() == storage);
+  CHECK(std::ranges::adjacent_find(all) == all.end());
+  CHECK(trace.agents().size() == storage);
+  CHECK(trace.dropped_agents() == threads * claims_per_thread - storage);
+}
+#endif
 
 TEST_CASE("missing file throws system_error") {
   CHECK_THROWS_AS(
