@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include <blake3pp/trace.hpp>
@@ -245,3 +246,21 @@ TEST_CASE("the bands are the caller's to set") {
 }
 
 }  // TEST_SUITE
+
+// The engaged rung is copied into the record, so it outlives the string
+// it was recorded from (the file that names it closes with the run). A
+// name of the field's full length comes back whole; the engines assert
+// at compile time that theirs never exceed it, and a longer one from
+// elsewhere is cut to the field.
+TEST_CASE("a read backend name is copied whole, up to the field's length") {
+  const std::string want(blake3pp::max_read_backend_length, 'x');
+  blake3pp::driver_stats d{};
+  CHECK(blake3pp::read_backend(d).empty());
+  {
+    const std::string source = want;
+    blake3pp::set_read_backend(d, source);
+  }
+  CHECK(blake3pp::read_backend(d) == want);
+  blake3pp::set_read_backend(d, want + "yz");
+  CHECK(blake3pp::read_backend(d) == want);
+}

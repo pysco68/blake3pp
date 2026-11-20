@@ -121,6 +121,11 @@ struct agent_record {
   std::uint32_t file;
 };
 
+/// The longest name driver_stats::read_backend holds. Each engine bounds
+/// the read names it can produce, its refusal reasons' numbers at their
+/// widest, and asserts at compile time that they fit.
+inline constexpr std::size_t max_read_backend_length = 63;
+
 /// What the thread driving the pipeline spent its own time on.
 ///
 /// The stage shares of a window do not sum to the wall clock once
@@ -173,7 +178,7 @@ struct driver_stats {
   /// asynchronous engine was asked for and refused. Copied rather than
   /// referenced, so it outlives the file. Read it through
   /// read_backend(), which trims the padding.
-  std::array<char, 56> read_backend;
+  std::array<char, max_read_backend_length + 1> read_backend;
   // Fields are appended, never inserted: a caller that reads this out of
   // a build it did not compile reads it by offset.
   /// Windows whose transfer landed: reads on a read run, writes on a
@@ -277,10 +282,12 @@ struct driver_stats {
   return {d.read_backend.data(), n};
 }
 
-/// Records `name` in `d`, truncated to what the field holds.
+/// Records `name` in `d`. Every engine's read names fit, which each one
+/// asserts at compile time; a longer name from elsewhere is cut to the
+/// field.
 inline void set_read_backend(driver_stats& d, std::string_view name) noexcept {
   d.read_backend = {};
-  const std::size_t n = std::min(name.size(), d.read_backend.size() - 1);
+  const std::size_t n = std::min(name.size(), max_read_backend_length);
   std::copy_n(name.begin(), n, d.read_backend.begin());
 }
 

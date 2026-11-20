@@ -36,8 +36,13 @@
 // Internal to src/io/, never installed.
 
 #include <blake3pp/io.hpp>
+#include <blake3pp/trace.hpp>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
+#include <initializer_list>
+#include <string_view>
 
 namespace blake3pp::detail::io_impl {
 
@@ -107,5 +112,22 @@ struct win_sync_rung {
   static constexpr io_engine rung_engine = io_engine::win_sync;
   using rung_below = void;
 };
+
+// A rung's name is what driver_stats::read_backend records, so every
+// engine bounds the read names it can produce and asserts the bound at
+// compile time against max_read_backend_length. A refusal reason may
+// print a number; these are the widest each kind prints.
+inline constexpr std::size_t int_text_max = 11;  // -2147483648
+inline constexpr std::size_t u32_text_max = 10;  // 4294967295
+
+// The longest of a set of names.
+[[nodiscard]] constexpr std::size_t longest_of(
+    std::initializer_list<std::string_view> names) noexcept {
+  std::size_t n = 0;
+  for (const std::string_view s : names) {
+    n = std::max(n, s.size());
+  }
+  return n;
+}
 
 }  // namespace blake3pp::detail::io_impl

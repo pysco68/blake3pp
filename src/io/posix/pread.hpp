@@ -16,6 +16,7 @@
 
 #include "io/fd.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/options.hpp"
 #include "io/sync_context.hpp"
 #include "io/posix/file.hpp"
@@ -79,6 +80,11 @@ using pread_context = sync_context<pread_source>;
 
 // Definition-site conformance check (see linux/io_uring.hpp).
 static_assert(io_context<pread_context>);
+
+// The longest read name pread_source::name() gives.
+static_assert(longest_of({"pread+direct", "pread"}) <=
+                  max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 }  // namespace blake3pp::detail::io_impl
 

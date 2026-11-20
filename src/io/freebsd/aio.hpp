@@ -52,6 +52,7 @@
 
 #include "io/fd.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/lanes.hpp"
 #include "io/options.hpp"
 #include "io/waiter.hpp"
@@ -64,24 +65,38 @@ namespace blake3pp::detail::io_impl {
 // print: a kernel without the facility (the sysctl tree is not there) and
 // a per-process queue closed by the administrator are otherwise
 // indistinguishable in bench output.
+inline constexpr std::string_view aio_eagain_suffix = " [aio: EAGAIN]";
+inline constexpr std::string_view aio_enosys_suffix =
+    " [aio: ENOSYS, no kernel AIO]";
+inline constexpr std::string_view aio_errno_prefix = " [aio: errno ";
+inline constexpr std::string_view kqueue_errno_prefix = " [kqueue: errno ";
+// A direct descriptor the filesystem would not serve (see direct_serves()).
+inline constexpr std::string_view direct_einval_suffix = " [direct: EINVAL]";
+
 inline std::string no_aio_suffix(int err) {
   switch (err) {
     case EAGAIN:
       // vfs.aio.max_aio_queue_per_proc is zero: the facility is there and
       // will take nothing, which is what a refused lio_listio reports.
-      return " [aio: EAGAIN]";
+      return std::string(aio_eagain_suffix);
     case ENOSYS:
-      return " [aio: ENOSYS, no kernel AIO]";
+      return std::string(aio_enosys_suffix);
     default:
-      return " [aio: errno " + std::to_string(err) + "]";
+      return std::string(aio_errno_prefix) + std::to_string(err) + "]";
   }
 }
 
 // The same for the completion queue itself: without a kqueue there is
 // nowhere for a completion to arrive, whatever the AIO limits say.
 inline std::string no_kqueue_suffix(int err) {
-  return " [kqueue: errno " + std::to_string(err) + "]";
+  return std::string(kqueue_errno_prefix) + std::to_string(err) + "]";
 }
+
+// The longest reason either gives, its errno at the widest.
+inline constexpr std::size_t no_aio_suffix_max =
+    std::max({aio_eagain_suffix.size(), aio_enosys_suffix.size(),
+              aio_errno_prefix.size() + int_text_max + 1,
+              kqueue_errno_prefix.size() + int_text_max + 1});
 
 // What the kernel will let this process keep queued at once, or zero when
 // the facility is absent. Read once per context: the batch below is cut
@@ -532,7 +547,7 @@ class aio_engine {
       n += refusal_;
     }
     if (direct_refused) {
-      n += " [direct: EINVAL]";
+      n += direct_einval_suffix;
     }
     return n;
   }
@@ -704,6 +719,15 @@ using aio_context = completion_context<aio_engine>;
 // without this a drifting backend wouldn't be diagnosed until an engine
 // instantiation in some other TU; this makes the header self-checking.
 static_assert(io_context<aio_context>);
+
+// The longest read name aio_engine::name_for() gives, counted generously:
+// the longest rung, why AIO was refused, and the refused direct
+// descriptor, as though all three could meet.
+inline constexpr std::size_t aio_read_name_max =
+    longest_of({"aio+direct", "pread+direct"}) + no_aio_suffix_max +
+    direct_einval_suffix.size();
+static_assert(aio_read_name_max <= max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 }  // namespace blake3pp::detail::io_impl
 
