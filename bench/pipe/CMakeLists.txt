@@ -3,7 +3,8 @@
 # plus the two scripts that run them (see README.md in the parent).
 #
 # They are standalone: no blake3pp library, only CLI11 for their options
-# (thief also needs stdexec), so they build wherever the compiler does --
+# and two of its headers that link nothing (thief also needs stdexec), so
+# they build wherever the compiler does --
 # including Windows, where the bench executables above do not link.
 find_package(Threads REQUIRED)
 
@@ -11,10 +12,10 @@ foreach(tool IN ITEMS pump drain rux pipeprobe)
   add_executable(pipe_${tool} ${tool}.cpp)
   set_target_properties(pipe_${tool} PROPERTIES OUTPUT_NAME ${tool})
   target_link_libraries(pipe_${tool} PRIVATE blake3pp_warnings blake3pp::tooling Threads::Threads)
+  # The library's busy-wait hint and drain's stream_watch are headers that
+  # need no library to link: the include directory, and still no library.
+  target_include_directories(pipe_${tool} PRIVATE "${PROJECT_SOURCE_DIR}/include")
 endforeach()
-# drain runs the library's stream_watch, a header that needs nothing but
-# the standard library: the include directory, and still no library.
-target_include_directories(pipe_drain PRIVATE "${PROJECT_SOURCE_DIR}/include")
 
 # The scripts sit beside the binaries, so runpipe finds its tools there.
 foreach(script IN ITEMS runpipe.sh runpipe.ps1)

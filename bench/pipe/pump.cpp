@@ -44,6 +44,8 @@
 
 #include <CLI/CLI.hpp>
 
+#include <blake3pp/detail/cpu_relax.hpp>
+
 #include "pipe_os.hpp"
 
 namespace {
@@ -58,7 +60,7 @@ void wait_until(clock_type::time_point from, std::chrono::microseconds gap) {
     return;
   }
   while (clock_type::now() < until) {
-    pipebench::relax();
+    blake3pp::detail::cpu_relax();
   }
 }
 

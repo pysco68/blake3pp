@@ -75,6 +75,7 @@
 
 #include <CLI/CLI.hpp>
 
+#include <blake3pp/detail/cpu_relax.hpp>
 #include <blake3pp/detail/stream_watch.hpp>
 
 #include "pipe_os.hpp"
@@ -253,7 +254,7 @@ struct drain_platform {
     return clock_type::now();
   }
   [[nodiscard]] bool probe() const { return probes.ready(h); }
-  void relax() const noexcept { pipebench::relax(); }
+  void relax() const noexcept { blake3pp::detail::cpu_relax(); }
   void sleep() { slept_read = pipebench::read_some(h, buf.data(), buf.size()); }
 };
 

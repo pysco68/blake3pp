@@ -19,16 +19,10 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#if defined(_M_ARM64)
-#include <intrin.h>  // __isb
-#endif
 #else
 #include <cerrno>
 #include <csignal>
 #include <unistd.h>
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
 #endif
 
 namespace pipebench {
@@ -154,23 +148,6 @@ inline bool write_all(handle h, const void* buf, std::size_t n) noexcept {
 #else
   ::kill(::getpid(), SIGKILL);
   for (;;) ::pause();
-#endif
-}
-
-// One iteration of a busy wait. On AArch64 `isb` rather than `yield`,
-// which most implementations execute as a no-op (the library's
-// stream_reader.cpp has the same choice and its reasoning).
-inline void relax() noexcept {
-#if defined(_M_ARM64)
-  __isb(_ARM64_BARRIER_SY);
-#elif defined(_WIN32)
-  YieldProcessor();
-#elif defined(__x86_64__) || defined(__i386__)
-  _mm_pause();
-#elif defined(__aarch64__)
-  asm volatile("isb" ::: "memory");
-#else
-  asm volatile("" ::: "memory");
 #endif
 }
 

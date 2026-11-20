@@ -46,6 +46,8 @@
 
 #include <CLI/CLI.hpp>
 
+#include <blake3pp/detail/cpu_relax.hpp>
+
 #include "pipe_os.hpp"
 
 #if !defined(_WIN32)
@@ -202,7 +204,7 @@ int cost(unsigned spin) {
   std::vector<std::thread> load;
   for (unsigned i = 0; i < spin; ++i) {
     load.emplace_back([&stop] {
-      while (!stop.load(std::memory_order_relaxed)) pipebench::relax();
+      while (!stop.load(std::memory_order_relaxed)) blake3pp::detail::cpu_relax();
     });
   }
   owned_pipe p;
@@ -247,7 +249,7 @@ int cost(unsigned spin) {
                 (void)t;
               }));
   std::printf("%-36s: %8.2f ns\n", "busy-wait hint",
-              per_call_ns(n * 10, [] { pipebench::relax(); }));
+              per_call_ns(n * 10, [] { blake3pp::detail::cpu_relax(); }));
   stop = true;
   for (auto& t : load) t.join();
   return 0;
@@ -286,7 +288,7 @@ int price(int trials) {
             fits = false;
             break;
           }
-          pipebench::relax();
+          blake3pp::detail::cpu_relax();
         }
         if (!fits) {
           std::printf("%zu,skipped: the pipe never queued more than %lld bytes\n", hold, q);
