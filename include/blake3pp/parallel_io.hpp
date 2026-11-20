@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <concepts>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -405,8 +406,8 @@ struct stream_report {
     std::uint64_t caught = 0;
     /// Waits that reached the sleep.
     std::uint64_t slept = 0;
-    /// The watch budget in force when the run ended, in nanoseconds.
-    std::int64_t budget_ns = 0;
+    /// The watch budget in force when the run ended.
+    std::chrono::nanoseconds budget{};
   } watch;
   /// The most one read may ask for, as it stood at the end of the run.
   /// Windows only, where the bound follows what earlier reads returned.
@@ -433,7 +434,7 @@ template <class Reader>
     w.probes = watch.stats().probes;
     w.caught = watch.stats().caught;
     w.slept = watch.stats().slept;
-    w.budget_ns = watch.budget();
+    w.budget = watch.budget();
   }
   return w;
 }

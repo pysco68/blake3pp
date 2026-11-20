@@ -66,6 +66,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -102,7 +103,7 @@ inline constexpr std::uint64_t streaming_size = ~std::uint64_t{0};
 //
 // A template over the platform, which supplies four operations --
 //
-//   now()    the monotonic clock, in nanoseconds;
+//   now()    the monotonic clock, as a steady_clock time_point;
 //   probe()  whether a read would return now, without waiting;
 //   sleep()  wait until a read would return;
 //   relax()  one iteration of a busy wait;
@@ -150,10 +151,10 @@ inline constexpr std::uint64_t streaming_size = ~std::uint64_t{0};
 // driver; a reader shared between threads would race here.
 class stream_watch {
  public:
-  static constexpr std::int64_t ceiling_ns = 16 * 1000;
-  static constexpr std::int64_t probe_interval_ns = 1000;
-  static constexpr std::int64_t step_ns = ceiling_ns / 8;
-  static constexpr std::int64_t floor_ns = probe_interval_ns;
+  static constexpr std::chrono::nanoseconds ceiling{16'000};
+  static constexpr std::chrono::nanoseconds probe_interval{1'000};
+  static constexpr std::chrono::nanoseconds step = ceiling / 8;
+  static constexpr std::chrono::nanoseconds floor = probe_interval;
 
   // What the waits did. `probes` counts every probe, the one each wait
   // opens with included; `caught` the waits a probe ended; `slept` the
@@ -172,19 +173,19 @@ class stream_watch {
     if (p.probe()) {
       return;
     }
-    const std::int64_t t0 = p.now();
-    const std::int64_t budget = budget_;
-    std::int64_t last_probe = t0;
+    const std::chrono::steady_clock::time_point t0 = p.now();
+    const std::chrono::nanoseconds budget = budget_;
+    std::chrono::steady_clock::time_point last_probe = t0;
     for (;;) {
-      std::int64_t t = p.now();
-      while (t - last_probe < probe_interval_ns) {
+      std::chrono::steady_clock::time_point t = p.now();
+      while (t - last_probe < probe_interval) {
         p.relax();
         t = p.now();
       }
       last_probe = t;
       ++stats_.probes;
       if (p.probe()) {
-        budget_ = std::min(ceiling_ns, budget + step_ns);
+        budget_ = std::min(ceiling, budget + step);
         ++stats_.caught;
         return;
       }
@@ -194,19 +195,21 @@ class stream_watch {
         break;
       }
     }
-    budget_ = std::max(floor_ns, budget / 2);
+    budget_ = std::max(floor, budget / 2);
     p.sleep();
     ++stats_.slept;
-    if (p.now() - t0 < ceiling_ns) {
-      budget_ = std::min(ceiling_ns, budget + step_ns);
+    if (p.now() - t0 < ceiling) {
+      budget_ = std::min(ceiling, budget + step);
     }
   }
 
-  [[nodiscard]] std::int64_t budget() const noexcept { return budget_; }
+  [[nodiscard]] std::chrono::nanoseconds budget() const noexcept {
+    return budget_;
+  }
   [[nodiscard]] const counters& stats() const noexcept { return stats_; }
 
  private:
-  std::int64_t budget_ = ceiling_ns;
+  std::chrono::nanoseconds budget_ = ceiling;
   counters stats_{};
 };
 

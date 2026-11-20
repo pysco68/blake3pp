@@ -247,9 +247,7 @@ unsigned io_driver::device_depth() const noexcept {
 
 transfer_service io_driver::service_of(const io_op& op) const noexcept {
   const native_op& inner = op.finished_native<native_op>();
-  return {std::chrono::nanoseconds{
-              static_cast<std::int64_t>(inner.device_total_ns())},
-          inner.lane_wait_total()};
+  return {inner.device_total(), inner.lane_wait_total()};
 }
 
 void io_driver::drain() noexcept {

@@ -5,6 +5,7 @@
 // file in ui.perfetto.dev or chrome://tracing.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <format>
 #include <fstream>
@@ -48,12 +49,22 @@ inline bool write_chrome_trace(const std::string& path,
   if (!out.is_open()) {
     return false;
   }
-  const auto us = [](std::int64_t ns) {
-    return static_cast<double>(ns) / 1000.0;
+  // Where the records' instants and spans become numbers, and the one
+  // place: an instant as microseconds since the buffer's epoch, the
+  // format's ts; a span as microseconds for dur, and as integer
+  // nanoseconds where an args field says _ns.
+  using std::chrono::nanoseconds;
+  const blake3pp::trace_clock::time_point epoch = trace.epoch();
+  const auto us_at = [epoch](blake3pp::trace_clock::time_point t) {
+    return std::chrono::duration<double, std::micro>(t - epoch).count();
   };
+  const auto us = [](nanoseconds d) {
+    return std::chrono::duration<double, std::micro>(d).count();
+  };
+  const auto ns = [](nanoseconds d) { return d.count(); };
   out << std::format("{{\"epoch_ns\":{},\"displayTimeUnit\":\"ns\","
                      "\"pool_threads\":{},\"traceEvents\":[\n",
-                     trace.epoch_ns(), pool_threads);
+                     ns(epoch.time_since_epoch()), pool_threads);
   out << std::format("{{\"name\":\"process_name\",\"ph\":\"M\",\"pid\":0,"
                      "\"args\":{{\"name\":\"{} driver\"}}}},\n",
                      process_name);
@@ -75,8 +86,8 @@ inline bool write_chrome_trace(const std::string& path,
       !windows.empty()) {
     // Over every window, not the first and last record: windows finish
     // out of order, writes especially.
-    std::int64_t begin = windows.front().t_wait_begin;
-    std::int64_t end = windows.front().t_released;
+    blake3pp::trace_clock::time_point begin = windows.front().t_wait_begin;
+    blake3pp::trace_clock::time_point end = windows.front().t_released;
     for (const auto& w : windows) {
       begin = std::min(begin, w.t_wait_begin);
       end = std::max(end, w.t_released);
@@ -93,12 +104,13 @@ inline bool write_chrome_trace(const std::string& path,
         "\"queue_depth_peak\":{},\"agent_busy_ns\":{},"
         "\"device_wait_min_ns\":{},\"device_depth\":{},"
         "\"lane_wait_ns\":{},\"read_backend\":\"{}\"{}}}}}",
-        us(begin), us(end - begin), d.busy_ns, d.parked_ns, d.iterations,
-        d.polls, d.blocking_polls, d.wakes, d.queue_runs, d.admission_stalls,
-        d.max_pending, d.transfers_landed, d.transfer_bytes,
-        d.device_wait_ns, d.starved_ns, d.queue_depth_final,
-        d.queue_depth_peak, d.agent_busy_ns, d.device_wait_min_ns,
-        d.device_depth, d.lane_wait_ns, blake3pp::read_backend(d),
+        us_at(begin), us(end - begin), ns(d.busy), ns(d.parked),
+        d.iterations, d.polls, d.blocking_polls, d.wakes, d.queue_runs,
+        d.admission_stalls, d.max_pending, d.transfers_landed,
+        d.transfer_bytes, ns(d.device_wait), ns(d.starved),
+        d.queue_depth_final, d.queue_depth_peak, ns(d.agent_busy),
+        ns(d.device_wait_min), d.device_depth, ns(d.lane_wait),
+        blake3pp::read_backend(d),
         write_side ? std::format(",\"write_backend\":\"{}\"", write_backend)
                    : std::string{});
   }
@@ -113,7 +125,8 @@ inline bool write_chrome_trace(const std::string& path,
     }
     // The same five stamps mean different stages on the write side:
     // admitted, fill begun on an agent, fill done, write landed, released.
-    const std::pair<const char*, std::pair<std::int64_t, std::int64_t>>
+    const std::pair<const char*, std::pair<blake3pp::trace_clock::time_point,
+                                           blake3pp::trace_clock::time_point>>
         phases[] = {{write_side ? "queue" : "wait", {w.t_wait_begin, w.t_ready}},
                     {write_side ? "fill" : "hash", {w.t_ready, w.t_joined}},
                     {write_side ? "write" : "absorb", {w.t_joined, w.t_absorbed}},
@@ -123,7 +136,7 @@ inline bool write_chrome_trace(const std::string& path,
                          "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
                          "\"args\":{{\"window\":{},\"file\":{},\"slot\":{},"
                          "\"bytes\":{},\"last\":{},\"parallel\":{}}}}}",
-                         name, tid, us(span.first),
+                         name, tid, us_at(span.first),
                          us(span.second - span.first), w.index, w.file,
                          w.slot, w.bytes,
                          (w.flags & blake3pp::window_record::flag_last) != 0
@@ -147,7 +160,8 @@ inline bool write_chrome_trace(const std::string& path,
   // and an end event ("bp":"e") bound the same way on another, so both
   // sit a hair inside their slices.
   std::set<std::uint32_t> cpus_named;
-  std::map<std::pair<std::uint32_t, std::uint64_t>, std::pair<std::uint32_t, std::int64_t>>
+  std::map<std::pair<std::uint32_t, std::uint64_t>,
+           std::pair<std::uint32_t, blake3pp::trace_clock::time_point>>
       compute_of;  // (file, window) -> (slot, t_ready)
   for (const auto& w : trace.windows()) {
     compute_of[{w.file, w.index}] = {w.slot, w.t_ready};
@@ -175,20 +189,19 @@ inline bool write_chrome_trace(const std::string& path,
                        "\"tid\":{},\"ts\":{:.3f},\"dur\":{:.3f},"
                        "\"args\":{{\"window\":{},\"file\":{},\"parts\":{},"
                        "\"min_part_ns\":{},\"max_part_ns\":{}}}}}",
-                       kind, tid, us(a.t_begin),
-                       us(static_cast<std::int64_t>(a.busy_ns)), a.window,
-                       a.file, a.parts, a.min_part_ns, a.max_part_ns);
+                       kind, tid, us_at(a.t_begin), us(a.busy), a.window,
+                       a.file, a.parts, ns(a.min_part), ns(a.max_part));
     if (const auto it = compute_of.find({a.file, a.window});
-        it != compute_of.end() && a.busy_ns > 0) {
+        it != compute_of.end() && a.busy > nanoseconds::zero()) {
       ++flow;
       const auto [slot, t_ready] = it->second;
       out << std::format(",\n{{\"name\":\"{}\",\"cat\":\"window\",\"ph\":\"s\","
                          "\"id\":{},\"pid\":1,\"tid\":{},\"ts\":{:.3f}}}",
-                         kind, flow, slot, us(t_ready) + 0.001);
+                         kind, flow, slot, us_at(t_ready) + 0.001);
       out << std::format(",\n{{\"name\":\"{}\",\"cat\":\"window\",\"ph\":\"f\","
                          "\"bp\":\"e\",\"id\":{},\"pid\":2,\"tid\":{},"
                          "\"ts\":{:.3f}}}",
-                         kind, flow, tid, us(a.t_begin) + 0.001);
+                         kind, flow, tid, us_at(a.t_begin) + 0.001);
     }
   }
   // A counter beside the agent slices, because the slices alone mislead.
@@ -199,16 +212,16 @@ inline bool write_chrome_trace(const std::string& path,
   // says the second thing. It is emitted at every change point, so it is
   // exact rather than sampled, and it costs two events per agent record.
   if (!trace.agents().empty()) {
-    std::vector<std::pair<std::int64_t, int>> edges;
+    std::vector<std::pair<blake3pp::trace_clock::time_point, int>> edges;
     edges.reserve(trace.agents().size() * 2);
     for (const auto& a : trace.agents()) {
       edges.emplace_back(a.t_begin, +1);
-      edges.emplace_back(a.t_begin + static_cast<std::int64_t>(a.busy_ns), -1);
+      edges.emplace_back(a.t_begin + a.busy, -1);
     }
     std::sort(edges.begin(), edges.end());
     int busy = 0;
     for (std::size_t i = 0; i < edges.size();) {
-      const std::int64_t at = edges[i].first;
+      const blake3pp::trace_clock::time_point at = edges[i].first;
       while (i < edges.size() && edges[i].first == at) {
         busy += edges[i].second;
         ++i;
@@ -216,7 +229,7 @@ inline bool write_chrome_trace(const std::string& path,
       out << std::format(",\n{{\"name\":\"agents busy\",\"ph\":\"C\","
                          "\"pid\":2,\"tid\":0,\"ts\":{:.3f},"
                          "\"args\":{{\"busy\":{}}}}}",
-                         us(at), busy);
+                         us_at(at), busy);
     }
   }
   out << "\n]}\n";

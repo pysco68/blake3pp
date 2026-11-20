@@ -33,14 +33,13 @@ namespace blake3pp::detail {
 // against this one.
 inline constexpr std::size_t direct_alignment = 4096;
 
-// steady_clock in nanoseconds, absolute: the scale of every transfer
-// stamp the backends take and every counter the pipelines keep, traced
-// or not. A trace's own scale is this minus its epoch, so a traced run
-// reads the clock once per event and not twice.
-[[nodiscard]] inline std::int64_t steady_now_ns() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
+// steady_clock, absolute: the clock of every transfer stamp the backends
+// take, every counter the pipelines keep, traced or not, and every trace
+// record (trace_clock is the same clock), so one read serves a counter
+// and a record alike.
+[[nodiscard]] inline std::chrono::steady_clock::time_point
+steady_now() noexcept {
+  return std::chrono::steady_clock::now();
 }
 
 // Binds an operation's completion to a member of the object that owns it:
@@ -240,30 +239,30 @@ concept file_driver =
 // several operations would hand each one the others' time; it reads
 // transfer_service, per transfer, below.
 struct device_time {
-  // Summed nanoseconds the device had a transfer, over the pieces it was
-  // carried in.
-  std::uint64_t total_ns = 0;
+  // Summed time the device had a transfer, over the pieces it was carried
+  // in.
+  std::chrono::nanoseconds total{};
   // The shortest of those, which is the device's latency with nothing
   // queued ahead.
-  std::uint64_t min_ns = 0;
+  std::chrono::nanoseconds min{};
   // Transfers that contributed. Zero means the driver cannot say, and
   // the pipeline's own measure stands.
   std::uint64_t transfers = 0;
 
-  void add(std::uint64_t ns) noexcept {
-    total_ns += ns;
-    min_ns = transfers == 0 ? ns : (ns < min_ns ? ns : min_ns);
+  void add(std::chrono::nanoseconds t) noexcept {
+    total += t;
+    min = transfers == 0 ? t : (t < min ? t : min);
     ++transfers;
   }
 
   // Records a transfer the device actually had, and ignores one it never
   // did -- cancelled before it was issued, or refused outright. Counting
-  // a zero would pull `min_ns` to zero, which is the yardstick the mean
+  // a zero would pull `min` to zero, which is the yardstick the mean
   // is read against, and dilute the mean with a transfer that never
   // happened.
-  void add_if_served(std::uint64_t ns) noexcept {
-    if (ns > 0) {
-      add(ns);
+  void add_if_served(std::chrono::nanoseconds t) noexcept {
+    if (t > std::chrono::nanoseconds::zero()) {
+      add(t);
     }
   }
 };

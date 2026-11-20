@@ -276,16 +276,16 @@ class engine {
     blake3pp::hasher h = blake3pp::make_hasher(opts_.io);
     const auto t0 = std::chrono::steady_clock::now();
     pipelined_ = path == "-" ? hash_stdin(h) : hash_path(h, path);
-    wall_ns_ = std::chrono::duration<double, std::nano>(
-                   std::chrono::steady_clock::now() - t0)
-                   .count();
+    wall_ = std::chrono::steady_clock::now() - t0;
     return hex_of(h, out_len);
   }
 
   // The last file's wall clock, and whether it took the pipeline. --diag
   // reads both: a run on the sequential path has no driver and no
   // counters to read.
-  [[nodiscard]] double wall_ns() const noexcept { return wall_ns_; }
+  [[nodiscard]] std::chrono::nanoseconds wall() const noexcept {
+    return wall_;
+  }
   [[nodiscard]] bool pipelined() const noexcept { return pipelined_; }
   // What the last stdin run did, for the geometry --diag reads its
   // figures against. Zeroed unless a stream was hashed.
@@ -504,7 +504,7 @@ class engine {
   options opts_;
   b3tool::compute_pool pool_;
   blake3pp::stream_report stream_{};
-  double wall_ns_ = 0.0;
+  std::chrono::nanoseconds wall_{};
   bool pipelined_ = false;
 };
 #if defined(_MSC_VER)
@@ -548,13 +548,13 @@ void report_read_diagnosis(const blake3pp::diagnosis& r, unsigned threads,
     println(stderr,
             "                 (the queue depth is {}; this engine holds {} at "
             "a time, and each read waited {} for a slot)",
-            r.depth, r.device_depth, service_label(r.mean_lane_wait_ns));
+            r.depth, r.device_depth, service_label(r.mean_lane_wait));
   }
   println(stderr,
           "  device         {} per window over {} reads (min {}, {:.1f} of {} "
           "queued)",
-          service_label(r.mean_service_ns), r.transfers,
-          service_label(static_cast<double>(r.min_service_ns)),
+          service_label(r.mean_service), r.transfers,
+          service_label(r.min_service),
           r.device_queued * static_cast<double>(r.device_depth),
           r.device_depth);
   switch (r.label) {
@@ -980,7 +980,7 @@ int run_main(int argc, char** argv) {
           }
           report_read_diagnosis(
               eng.pipelined()
-                  ? blake3pp::diagnose_read(trace->driver(), eng.wall_ns(),
+                  ? blake3pp::diagnose_read(trace->driver(), eng.wall(),
                                             o.threads, windows, window)
                   : blake3pp::diagnosis{},
               o.threads, hw_threads);

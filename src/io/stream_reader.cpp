@@ -266,7 +266,9 @@ namespace {
 
 struct posix_watch_platform {
   int fd;
-  [[nodiscard]] std::int64_t now() const noexcept { return steady_now_ns(); }
+  [[nodiscard]] std::chrono::steady_clock::time_point now() const noexcept {
+    return steady_now();
+  }
   [[nodiscard]] bool probe() const { return readable(fd, 0); }
   void sleep() const { (void)readable(fd, -1); }
   void relax() const noexcept { cpu_relax(); }

@@ -200,7 +200,9 @@ class write_scope
     d.queue_depth_final = in_flight_cap_;
     d.queue_depth_peak =
         std::max<std::uint64_t>(d.queue_depth_peak, in_flight_cap_);
-    d.agent_busy_ns += fill_busy_ns_.load(std::memory_order_relaxed);
+    d.agent_busy += std::chrono::nanoseconds{
+        static_cast<std::chrono::nanoseconds::rep>(
+            fill_busy_ns_.load(std::memory_order_relaxed))};
     transfers_.report(d, loop_.driver());
   }
 
@@ -211,7 +213,7 @@ class write_scope
     // When the write was handed to the driver, on steady_clock. Kept
     // whether or not a trace buffer was given: the device counters are
     // the landing minus this.
-    std::int64_t t_write_begin = 0;
+    trace_clock::time_point t_write_begin{};
     window* next_free = nullptr;
     std::uint64_t offset = 0;
     std::size_t bytes = 0;
@@ -249,7 +251,7 @@ class write_scope
                          [this, &w] { fill_window(w); }),
                 loop_.scheduler())),
             [this, &w] {
-              w.t_write_begin = steady_now_ns();
+              w.t_write_begin = steady_now();
               return loop_.write(file_, w.offset,
                                  std::span<const std::byte>(w.buffer.data(),
                                                             w.bytes),
@@ -280,25 +282,26 @@ class write_scope
       fill_(w.buffer.first(w.bytes), w.offset);
       return;
     }
-    const std::int64_t t_begin = trace_->now();
+    const trace_clock::time_point t_begin = trace_->now();
     if (w.rec != nullptr) {
       w.rec->t_ready = t_begin;
     }
     fill_(w.buffer.first(w.bytes), w.offset);
-    const std::int64_t t_end = trace_->now();
-    fill_busy_ns_.fetch_add(static_cast<std::uint64_t>(t_end - t_begin),
+    const trace_clock::time_point t_end = trace_->now();
+    const std::chrono::nanoseconds busy = t_end - t_begin;
+    fill_busy_ns_.fetch_add(static_cast<std::uint64_t>(busy.count()),
                             std::memory_order_relaxed);
     if (w.rec != nullptr) {
       w.rec->t_joined = t_end;
       w.rec->agents_active = 1;
-      w.rec->agent_busy_ns = static_cast<std::uint64_t>(t_end - t_begin);
+      w.rec->agent_busy = busy;
       if (agent_record* const a = trace_->claim_agent(); a != nullptr) {
         a->window = w.rec->index;
         a->file = 0;
         a->t_begin = w.rec->t_ready;
-        a->busy_ns = w.rec->agent_busy_ns;
+        a->busy = busy;
         a->parts = 1;
-        a->min_part_ns = a->max_part_ns = w.rec->agent_busy_ns;
+        a->min_part = a->max_part = busy;
         a->cpu = current_cpu();
       }
     }
@@ -306,10 +309,10 @@ class write_scope
 
   void landed(window& w) noexcept {
     w.writing = false;
-    const std::int64_t t =
+    const trace_clock::time_point t =
         transfers_.land(loop_.driver(), w.op, w.t_write_begin, w.bytes);
     if (w.rec != nullptr) {
-      w.rec->t_absorbed = t - trace_->epoch_ns();
+      w.rec->t_absorbed = t;
     }
   }
 
@@ -387,12 +390,12 @@ class write_scope
   // once as well as how many writes do: below the pool's width the
   // device is idle because the depth left threads with nothing to
   // fill, which is the depth's own doing and not the generator failing
-  // to keep up. driver_stats::starved_ns is the time lost for a reason
+  // to keep up. driver_stats::starved is the time lost for a reason
   // more depth cannot fix, so that stretch does not belong in it. At
   // and above the width the generator is already as parallel as the
   // pool can make it and the signal means what it says.
   void note_generator_wait() noexcept {
-    transfers_.starved(in_flight_cap_ >= generator_threads_ &&
+    transfers_.starved_now(in_flight_cap_ >= generator_threads_ &&
                        loop_.driver().in_flight() == 0 &&
                        !stop_requested() && next_offset_ < total_);
   }

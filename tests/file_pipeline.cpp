@@ -2266,7 +2266,7 @@ TEST_CASE("the driver records where its own thread went") {
   CHECK(d.iterations > 0);
   CHECK(d.polls > 0);
   CHECK(d.queue_runs >= 12);
-  CHECK(d.busy_ns + d.parked_ns > 0);
+  CHECK(d.busy + d.parked > std::chrono::nanoseconds::zero());
   CHECK(d.blocking_polls <= d.polls);
   // A wake is a blocking poll released with no completion of its own,
   // so there is at most one per blocking poll, and there need not be
@@ -2276,7 +2276,7 @@ TEST_CASE("the driver records where its own thread went") {
   // The default reducer capacity is far above what a twelve-window file
   // decomposes into.
   CHECK(d.admission_stalls == 0);
-  MESSAGE("driver busy " << d.busy_ns << " ns, parked " << d.parked_ns
+  MESSAGE("driver busy " << d.busy.count() << " ns, parked " << d.parked.count()
                          << " ns over " << d.iterations << " iterations, "
                          << d.polls << " polls (" << d.blocking_polls
                          << " blocking)");
@@ -2296,7 +2296,7 @@ TEST_CASE("the sequential window loop leaves the driver record empty") {
   blake3pp::update_file(h, f.path, {.window_bytes = win, .trace = &trace});
   CHECK(h.finalize() == blake3pp::hash(content));
   CHECK(trace.driver().iterations == 0);
-  CHECK(trace.driver().busy_ns == 0);
+  CHECK(trace.driver().busy == std::chrono::nanoseconds::zero());
 }
 
 // The error path of the real driver, without a fault injector: a file
@@ -2684,7 +2684,7 @@ TEST_CASE("the read depth is the depth, start to finish") {
 }
 
 TEST_CASE("the pool wait is counted when the hash is behind the device") {
-  // starved_ns, counted by the real pipeline: four window objects
+  // starved, counted by the real pipeline: four window objects
   // against a file of thirty-two windows, a driver that completes at
   // once and a pool that sleeps per node, so the driver finds no free
   // window with bytes still to read.
@@ -2714,10 +2714,10 @@ TEST_CASE("the pool wait is counted when the hash is behind the device") {
       {}, &trace);
   CHECK(h.finalize() == blake3pp::hash(content));
   const auto& d = trace.driver();
-  CHECK(d.starved_ns > 0);
+  CHECK(d.starved > std::chrono::nanoseconds::zero());
   // The device's time is counted apart from the starvation.
   CHECK(d.transfers_landed == 32);
-  CHECK(d.device_wait_ns > 0);
+  CHECK(d.device_wait > std::chrono::nanoseconds::zero());
 }
 
 // The two bounds, apart: with two reads allowed and eight windows, the
@@ -2909,11 +2909,9 @@ template <class Scheduler>
   const auto t0 = std::chrono::steady_clock::now();
   blake3pp::detail::run_window_pipeline<blake3pp::default_stack_budget>(
       h, drv, f, std::move(sched), plan, {}, &trace);
-  const double wall_ns = std::chrono::duration<double, std::nano>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count();
+  const auto wall = std::chrono::steady_clock::now() - t0;
   REQUIRE(h.finalize() == blake3pp::hash(content));
-  return blake3pp::diagnose_read(trace.driver(), wall_ns, threads, plan.windows,
+  return blake3pp::diagnose_read(trace.driver(), wall, threads, plan.windows,
                                plan.window_bytes, bands);
 }
 
@@ -2967,8 +2965,8 @@ TEST_CASE("a narrow arena feeds the diagnosis coherent counters") {
   // the device was timed, and a minimum cannot exceed its own mean.
   CHECK(r.measured());
   CHECK(r.transfers == 32u);
-  CHECK(r.min_service_ns > 0);
-  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.min_service > std::chrono::nanoseconds::zero());
+  CHECK(r.min_service <= r.mean_service);
   CHECK(r.pool_busy >= 0.0);
   CHECK(r.pool_busy <= 1.0);
   CHECK(r.device_queued > 0.0);
@@ -3010,8 +3008,8 @@ TEST_CASE("a slow device under a wide arena feeds the diagnosis coherent counter
   // A floor the device model guarantees at any speed: the pipeline
   // timestamps a read before it asks the driver, and the driver lands
   // it no sooner than one service time later. Load can only lengthen it.
-  CHECK(r.min_service_ns >= static_cast<std::uint64_t>(service_ns));
-  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.min_service >= std::chrono::nanoseconds{service_ns});
+  CHECK(r.min_service <= r.mean_service);
   CHECK(r.pool_busy >= 0.0);
   CHECK(r.pool_busy <= 1.0);
   CHECK(r.device_queued > 0.0);
@@ -3034,7 +3032,7 @@ TEST_CASE("a device faster than the pool feeds the diagnosis coherent counters")
   // clock against a band, and the machine's load moves that share
   // whatever the pipeline does. The run asserts the geometry and that
   // the counters cohere. tests/diagnosis.cpp asserts the reading, and the
-  // starved_ns shape this run produces, against hand-built counters.
+  // starved shape this run produces, against hand-built counters.
   const auto r =
       diagnose_run(sched, content, plan, b3test::suite_pool_threads(),
                    {.zero_copy = true});
@@ -3046,7 +3044,7 @@ TEST_CASE("a device faster than the pool feeds the diagnosis coherent counters")
   CHECK(r.long_enough());
   // Sixty-four whole windows and the kilobyte past them.
   CHECK(r.transfers == 65u);
-  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.min_service <= r.mean_service);
   CHECK(r.pool_busy > 0.0);
   CHECK(r.pool_busy <= 1.0);
   CHECK(r.starved >= 0.0);
@@ -3079,8 +3077,8 @@ TEST_CASE("a wide arena feeds the diagnosis coherent counters") {
   // The counters reached the diagnosis and cohere.
   CHECK(r.measured());
   CHECK(r.transfers == 48u);
-  CHECK(r.min_service_ns > 0);
-  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.min_service > std::chrono::nanoseconds::zero());
+  CHECK(r.min_service <= r.mean_service);
   CHECK(r.pool_busy >= 0.0);
   CHECK(r.pool_busy <= 1.0);
   CHECK(r.device_queued > 0.0);

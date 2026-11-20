@@ -653,7 +653,8 @@ class driver_loop {
     // whether this thread is the bottleneck once the stage shares of a
     // window no longer sum to the wall clock. One clock read per poll,
     // and none at all without a trace buffer.
-    std::int64_t t = stats != nullptr ? trace->now() : 0;
+    trace_clock::time_point t =
+        stats != nullptr ? trace->now() : trace_clock::time_point{};
     for (;;) {
       const std::size_t ran_queue = drain();
       before_flush();
@@ -663,7 +664,7 @@ class driver_loop {
       }
       if (status.done) {
         if (stats != nullptr) {
-          stats->busy_ns += static_cast<std::uint64_t>(trace->now() - t);
+          stats->busy += trace->now() - t;
         }
         return;
       }
@@ -683,21 +684,21 @@ class driver_loop {
         drv_.poll(block);
         continue;
       }
-      const std::int64_t t_poll = trace->now();
-      stats->busy_ns += static_cast<std::uint64_t>(t_poll - t);
+      const trace_clock::time_point t_poll = trace->now();
+      stats->busy += t_poll - t;
       const std::size_t ran = drv_.poll(block);
       t = trace->now();
       ++stats->polls;
       if (block) {
         ++stats->blocking_polls;
-        stats->parked_ns += static_cast<std::uint64_t>(t - t_poll);
+        stats->parked += t - t_poll;
         if (ran == 0) {
           // Nothing of the driver's own finished, so what released this
           // poll was a wake from a thread handing a window back.
           ++stats->wakes;
         }
       } else {
-        stats->busy_ns += static_cast<std::uint64_t>(t - t_poll);
+        stats->busy += t - t_poll;
       }
     }
   }
@@ -763,51 +764,53 @@ struct transfer_stats {
   // The device's time over this run's transfers, summed: what the
   // performer stamped where the driver attributes it (transfer_service),
   // and the admission-to-landing span where it cannot.
-  std::uint64_t device_wait_ns = 0;
+  std::chrono::nanoseconds device_wait{};
   // The shortest of those: the device's latency with nothing queued
   // ahead. Over `timed` transfers.
-  std::uint64_t device_min_ns = ~std::uint64_t{0};
+  std::chrono::nanoseconds device_min = std::chrono::nanoseconds::max();
   std::uint64_t timed = 0;
   // The waits for one of the driver's own threads, summed over this run's
   // transfers.
-  std::uint64_t lane_wait_ns = 0;
-  std::uint64_t starved_ns = 0;
-  // When the open starved interval began; zero when there is none.
-  std::int64_t starved_at = 0;
+  std::chrono::nanoseconds lane_wait{};
+  std::chrono::nanoseconds starved{};
+  // When the open starved interval began; the clock's epoch when there is
+  // none.
+  trace_clock::time_point starved_at{};
 
   // One transfer of n bytes, admitted at t_begin, has landed through
   // `op`. Called inside its completion, where the driver can still say
   // what the transfer cost. Returns the landing time, which the caller
   // stamps into its trace record from the same clock read.
   template <class D>
-  std::int64_t land(const D& drv, const io_op& op, std::int64_t t_begin,
-                    std::size_t n) noexcept {
-    const std::int64_t t = steady_now_ns();
+  trace_clock::time_point land(const D& drv, const io_op& op,
+                               trace_clock::time_point t_begin,
+                               std::size_t n) noexcept {
+    const trace_clock::time_point t = steady_now();
     ++landed;
     bytes += n;
-    std::uint64_t service =
-        static_cast<std::uint64_t>(std::max<std::int64_t>(0, t - t_begin));
+    std::chrono::nanoseconds service =
+        std::max(std::chrono::nanoseconds::zero(), t - t_begin);
     if constexpr (attributes_transfers<D>) {
       const transfer_service s = drv.service_of(op);
-      lane_wait_ns += static_cast<std::uint64_t>(s.lane_wait.count());
+      lane_wait += s.lane_wait;
       // A transfer the device never had (cancelled before it was issued)
       // stamped nothing, and would pull the minimum to zero.
       if (s.device <= std::chrono::nanoseconds::zero()) {
         return t;
       }
-      service = static_cast<std::uint64_t>(s.device.count());
+      service = s.device;
     }
-    device_wait_ns += service;
-    device_min_ns = std::min(device_min_ns, service);
+    device_wait += service;
+    device_min = std::min(device_min, service);
     ++timed;
     return t;
   }
 
   // Opens a starved interval if none is open, or closes the open one.
-  void starved(bool now) noexcept {
+  void starved_now(bool now) noexcept {
     if (now) {
-      if (starved_at == 0) {
-        starved_at = steady_now_ns();
+      if (starved_at == trace_clock::time_point{}) {
+        starved_at = steady_now();
       }
       return;
     }
@@ -817,10 +820,10 @@ struct transfer_stats {
   // Closes an open starved interval, from the round that ends it or from
   // the end of the run.
   void end_starved() noexcept {
-    if (starved_at != 0) {
-      starved_ns += static_cast<std::uint64_t>(
-          std::max<std::int64_t>(0, steady_now_ns() - starved_at));
-      starved_at = 0;
+    if (starved_at != trace_clock::time_point{}) {
+      starved += std::max(std::chrono::nanoseconds::zero(),
+                          steady_now() - starved_at);
+      starved_at = {};
     }
   }
 
@@ -832,16 +835,15 @@ struct transfer_stats {
   void report(driver_stats& d, const D& drv) const noexcept {
     d.transfers_landed += landed;
     d.transfer_bytes += bytes;
-    d.starved_ns += starved_ns;
+    d.starved += starved;
     d.device_depth =
         std::max<std::uint64_t>(d.device_depth, device_depth_of(drv));
-    d.lane_wait_ns += lane_wait_ns;
-    d.device_wait_ns += device_wait_ns;
+    d.lane_wait += lane_wait;
+    d.device_wait += device_wait;
     if (timed > 0) {
-      d.device_wait_min_ns = d.device_wait_min_ns == 0
-                                 ? device_min_ns
-                                 : std::min(d.device_wait_min_ns,
-                                            device_min_ns);
+      d.device_wait_min = d.device_wait_min == std::chrono::nanoseconds::zero()
+                              ? device_min
+                              : std::min(d.device_wait_min, device_min);
     }
   }
 };

@@ -486,8 +486,8 @@ TEST_CASE("a trace buffer reused across calls adds the runs up") {
   const blake3pp::driver_stats& both = trace.driver();
   CHECK(both.transfers_landed == na + nb);
   CHECK(both.transfer_bytes == a.size() + b.size());
-  CHECK(both.device_wait_ns > first.device_wait_ns);
-  CHECK(both.device_wait_min_ns <= first.device_wait_min_ns);
+  CHECK(both.device_wait > first.device_wait);
+  CHECK(both.device_wait_min <= first.device_wait_min);
 }
 
 TEST_CASE("tracing leaves the digest unchanged") {
@@ -579,11 +579,11 @@ TEST_CASE("window records are complete, in order and consistent") {
         // 64 chunks in 16-chunk parts: fanned out over the scheduler.
         CHECK((r.flags & blake3pp::window_record::flag_parallel) != 0);
         CHECK(r.agents_active >= 1);
-        CHECK(r.agent_busy_ns > 0);
+        CHECK(r.agent_busy > std::chrono::nanoseconds::zero());
       } else {
         CHECK((r.flags & blake3pp::window_record::flag_parallel) == 0);
         CHECK(r.agents_active == 0);
-        CHECK(r.agent_busy_ns == 0);
+        CHECK(r.agent_busy == std::chrono::nanoseconds::zero());
         CHECK(r.t_joined == r.t_absorbed);
       }
     }
@@ -616,7 +616,7 @@ TEST_CASE("the read counters are kept whether or not a window is recorded") {
   CHECK(trace.dropped_windows() == window_count(len, window));
   CHECK(d.transfers_landed > 0);
   CHECK(d.transfer_bytes == len);
-  CHECK(d.device_wait_ns > 0);
+  CHECK(d.device_wait > std::chrono::nanoseconds::zero());
   // The depth is the request, start to finish.
   CHECK(d.queue_depth_final == 3);
   CHECK(d.queue_depth_peak == 3);
@@ -645,7 +645,7 @@ TEST_CASE("agent records account for every part of their window") {
   for (const auto& w : recs) {
     CAPTURE(w.index);
     std::uint64_t parts = 0;
-    std::uint64_t busy = 0;
+    std::chrono::nanoseconds busy{};
     std::uint32_t active = 0;
     std::uint32_t folds = 0;
     for (const auto& a : trace.agents()) {
@@ -655,25 +655,25 @@ TEST_CASE("agent records account for every part of their window") {
       CHECK(a.file == 0);
       CHECK(a.part_chunks == 16);
       CHECK(a.t_begin >= w.t_ready);
-      CHECK(a.t_begin + static_cast<std::int64_t>(a.busy_ns) <= w.t_joined);
+      CHECK(a.t_begin + a.busy <= w.t_joined);
       if (a.parts == 0) {
         // The fold, on the agent that finished the bulk last: one per
         // fanned-out window, after every bulk record's work.
         ++folds;
-        CHECK(a.min_part_ns == 0);
-        CHECK(a.max_part_ns == 0);
+        CHECK(a.min_part == std::chrono::nanoseconds::zero());
+        CHECK(a.max_part == std::chrono::nanoseconds::zero());
         continue;
       }
       ++active;
       parts += a.parts;
-      busy += a.busy_ns;
-      CHECK(a.min_part_ns <= a.max_part_ns);
-      const std::uint64_t floor_ns = a.min_part_ns * a.parts;
-      CHECK(floor_ns <= a.busy_ns);
+      busy += a.busy;
+      CHECK(a.min_part <= a.max_part);
+      const std::chrono::nanoseconds floor = a.min_part * a.parts;
+      CHECK(floor <= a.busy);
     }
     if (w.flags & blake3pp::window_record::flag_parallel) {
       CHECK(parts == w.bytes / blake3pp::chunk_size / 16);
-      CHECK(busy == w.agent_busy_ns);
+      CHECK(busy == w.agent_busy);
       CHECK(active == w.agents_active);
       CHECK(folds == 1);
     } else {
@@ -723,14 +723,15 @@ TEST_CASE("trace_buffer::clear keeps the epoch") {
   blake3pp::trace_buffer trace(windows, agents);
   const blake3pp::hash_file_options opts{.window_bytes = window,
                                        .trace = &trace};
-  CHECK(trace.epoch_ns() > 0);
-  CHECK(trace.now() >= 0);
+  CHECK(trace.epoch() > blake3pp::trace_clock::time_point{});
+  CHECK(trace.now() >= trace.epoch());
 
   (void)blake3pp::hash_file(f.path, opts);
   (void)blake3pp::hash_file(f.path, opts);  // a second call overflows
   REQUIRE(trace.windows().size() == 3);
   CHECK(trace.dropped_windows() == 3);
-  const std::int64_t before = trace.windows().back().t_released;
+  const blake3pp::trace_clock::time_point before =
+      trace.windows().back().t_released;
 
   trace.clear();
   CHECK(trace.windows().empty());

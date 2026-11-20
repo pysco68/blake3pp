@@ -40,10 +40,12 @@ struct transfer_base {
 // that performs transfers derives its transfer from this; transfer_base
 // is the part the driver and the callbacks see.
 struct performed_transfer : transfer_base {
-  // The clock the charges are taken against, as a duration since its
-  // epoch.
-  [[nodiscard]] static std::chrono::nanoseconds since_epoch() noexcept {
-    return std::chrono::nanoseconds{steady_now_ns()};
+  // A reading of the clock the charges are taken against, as the
+  // duration since its epoch they add and subtract.
+  [[nodiscard]] static std::chrono::nanoseconds at(
+      std::chrono::steady_clock::time_point t) noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        t.time_since_epoch());
   }
 
   // The device's own time over this transfer, summed over the pieces it
@@ -57,7 +59,7 @@ struct performed_transfer : transfer_base {
   void device_begin() noexcept {
     if (!charging) {
       charging = true;
-      device_charge -= since_epoch();
+      device_charge -= at(steady_now());
     }
   }
   // Ends the charge, whether the piece landed or was taken back unsent.
@@ -66,27 +68,25 @@ struct performed_transfer : transfer_base {
   void device_end() noexcept {
     if (charging) {
       charging = false;
-      device_charge += since_epoch();
+      device_charge += at(steady_now());
     }
   }
   // What the device had this transfer for, for device_time::add(). Valid
   // once no piece is outstanding, which is what reporting a transfer
   // means.
-  [[nodiscard]] std::uint64_t device_total_ns() const noexcept {
-    return device_charge.count() > 0
-               ? static_cast<std::uint64_t>(device_charge.count())
-               : 0;
+  [[nodiscard]] std::chrono::nanoseconds device_total() const noexcept {
+    return std::max(device_charge, std::chrono::nanoseconds::zero());
   }
 
   // The same trick for the wait for a lane: the pump subtracts the clock
   // it read when it queued a piece and adds the one it read when a lane
   // took it, so what is left is the summed wait. Valid once no piece is
   // queued.
-  void lane_queued(std::chrono::nanoseconds now) noexcept {
-    lane_charge -= now;
+  void lane_queued(std::chrono::steady_clock::time_point now) noexcept {
+    lane_charge -= at(now);
   }
-  void lane_taken(std::chrono::nanoseconds now) noexcept {
-    lane_charge += now;
+  void lane_taken(std::chrono::steady_clock::time_point now) noexcept {
+    lane_charge += at(now);
   }
   [[nodiscard]] std::chrono::nanoseconds lane_wait_total() const noexcept {
     return std::max(lane_charge, std::chrono::nanoseconds::zero());

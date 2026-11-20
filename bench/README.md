@@ -147,10 +147,12 @@ The records and `perf` share `CLOCK_MONOTONIC`; the JSON's top-level
         blake3pp_bench_file FILE --trace t.json --trace-agents
     perf script -F time,cpu,ip,sym
 
-A sample at time `T` seconds belongs to the window whose interval
-covers `T * 1e9 - epoch_ns`, and to the agent record with the same
-`cpu` whose `[t_begin, t_begin + busy_ns)` covers it. No probes or
-markers are involved; the join is by time and CPU alone.
+The records' instants are `CLOCK_MONOTONIC` time points, so a sample
+at time `T` belongs to the window whose interval covers `T`, and to the
+agent record with the same `cpu` whose `[t_begin, t_begin + busy)` covers
+it. In the JSON, `ts` is microseconds since the top-level `epoch_ns`, so
+there the window covers `T * 1e6 - epoch_ns / 1e3`. No probes or markers
+are involved; the join is by time and CPU alone.
 
 ## dispatch_cost: what the fat binary pays at the call boundary
 

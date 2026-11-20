@@ -31,6 +31,7 @@
 //    forget() can therefore run a sibling's callback.
 // Internal to src/io/, never installed.
 
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -160,7 +161,7 @@ concept io_context = requires(C c, const C cc, typename C::file& f,
   // with none of the device in it: the measure of too few lanes, as
   // opposed to a device that is the wall. Zero on a context that served
   // everything through its asynchronous engine.
-  { cc.lane_wait_ns() } noexcept -> std::same_as<std::uint64_t>;
+  { cc.lane_wait() } noexcept -> std::same_as<std::chrono::nanoseconds>;
   // What the device itself took over this run, stamped by whoever
   // performed each transfer: a lane or a dispatch worker around its own
   // pread, a kernel queue from submission to completion. A wait for a

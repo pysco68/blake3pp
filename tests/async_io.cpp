@@ -302,15 +302,15 @@ TEST_CASE("a trace counts its own transfers, not the context's earlier ones") {
                                             blake3pp::buffer_tracer{&trace}))
                 .has_value());
     REQUIRE(trace.windows().size() == n);
-    std::uint64_t spans = 0;
+    std::chrono::nanoseconds spans{};
     for (const blake3pp::window_record& w : trace.windows()) {
-      spans += static_cast<std::uint64_t>(w.t_ready - w.t_wait_begin);
+      spans += w.t_ready - w.t_wait_begin;
     }
     const blake3pp::driver_stats& d = trace.driver();
     CHECK(d.transfers_landed == n);
     CHECK(d.transfer_bytes == small.size());
-    CHECK(d.device_wait_ns <= spans);
-    CHECK(d.lane_wait_ns <= spans);
+    CHECK(d.device_wait <= spans);
+    CHECK(d.lane_wait <= spans);
   }
 }
 

@@ -115,33 +115,49 @@ using b3bench::null_device;
 using b3bench::null_driver;
 using b3bench::read_kernel_counters;
 
+// Spans as the summary prints them: a double count of nanoseconds keeps
+// a sum of thousands of them exact enough, and a ratio of two is a
+// plain number.
+using fractional_ns = std::chrono::duration<double, std::nano>;
+
+[[nodiscard]] double seconds_of(fractional_ns t) {
+  return std::chrono::duration<double>(t).count();
+}
+[[nodiscard]] double ms_of(fractional_ns t) {
+  return std::chrono::duration<double, std::milli>(t).count();
+}
+[[nodiscard]] double us_of(fractional_ns t) {
+  return std::chrono::duration<double, std::micro>(t).count();
+}
+
 // The share of the wall clock during which at least one agent was
 // busy, from merged intervals, since agents overlap.
 [[nodiscard]] double idle_covered(std::span<const blake3pp::agent_record> agents,
-                                  double wall_ns) {
-  if (agents.empty() || wall_ns <= 0) {
+                                  fractional_ns wall) {
+  if (agents.empty() || wall <= fractional_ns::zero()) {
     return 0.0;
   }
-  std::vector<std::pair<std::int64_t, std::int64_t>> iv;
+  using instant = blake3pp::trace_clock::time_point;
+  std::vector<std::pair<instant, instant>> iv;
   iv.reserve(agents.size());
   for (const auto& a : agents) {
-    iv.emplace_back(a.t_begin, a.t_begin + static_cast<std::int64_t>(a.busy_ns));
+    iv.emplace_back(a.t_begin, a.t_begin + a.busy);
   }
   std::sort(iv.begin(), iv.end());
-  double covered = 0;
-  std::int64_t cur_begin = iv.front().first;
-  std::int64_t cur_end = iv.front().second;
+  std::chrono::nanoseconds covered{};
+  instant cur_begin = iv.front().first;
+  instant cur_end = iv.front().second;
   for (const auto& [b, e] : iv) {
     if (b > cur_end) {
-      covered += static_cast<double>(cur_end - cur_begin);
+      covered += cur_end - cur_begin;
       cur_begin = b;
       cur_end = e;
     } else if (e > cur_end) {
       cur_end = e;
     }
   }
-  covered += static_cast<double>(cur_end - cur_begin);
-  return covered / wall_ns;
+  covered += cur_end - cur_begin;
+  return fractional_ns(covered) / wall;
 }
 
 // The per-row summary of one traced rep: where the wall time went, how
@@ -155,31 +171,38 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     println(stdout, "  trace: no window records");
     return;
   }
-  const double wall_ns =
-      static_cast<double>(windows.back().t_released - windows.front().t_wait_begin);
-  double wait = 0;
-  double hash = 0;
-  double absorb = 0;
-  double release = 0;
-  double busy = 0;
+  // The span the windows cover, earliest submit to latest release: they
+  // finish out of order, so the first and last records need not bound it.
+  blake3pp::trace_clock::time_point first = windows.front().t_wait_begin;
+  blake3pp::trace_clock::time_point last = windows.front().t_released;
+  for (const auto& w : windows) {
+    first = std::min(first, w.t_wait_begin);
+    last = std::max(last, w.t_released);
+  }
+  const fractional_ns wall = last - first;
+  fractional_ns wait{};
+  fractional_ns hash{};
+  fractional_ns absorb{};
+  fractional_ns release{};
+  fractional_ns busy{};
   double active = 0;
   std::size_t fanned = 0;
   for (const auto& w : windows) {
-    wait += static_cast<double>(w.t_ready - w.t_wait_begin);
-    hash += static_cast<double>(w.t_joined - w.t_ready);
-    absorb += static_cast<double>(w.t_absorbed - w.t_joined);
-    release += static_cast<double>(w.t_released - w.t_absorbed);
-    busy += static_cast<double>(w.agent_busy_ns);
+    wait += w.t_ready - w.t_wait_begin;
+    hash += w.t_joined - w.t_ready;
+    absorb += w.t_absorbed - w.t_joined;
+    release += w.t_released - w.t_absorbed;
+    busy += w.agent_busy;
     if (w.flags & blake3pp::window_record::flag_parallel) {
       ++fanned;
       active += w.agents_active;
     }
   }
-  const auto pct = [&](double ns) { return 100.0 * ns / wall_ns; };
+  const auto pct = [&](fractional_ns t) { return 100.0 * (t / wall); };
   println(stdout,
           "  trace (last rep): {} windows ({} fanned out, {} dropped), wall "
           "{:.3f} s",
-          windows.size(), fanned, trace.dropped_windows(), wall_ns / 1e9);
+          windows.size(), fanned, trace.dropped_windows(), seconds_of(wall));
   // With several windows in flight these no longer sum to the wall
   // clock: they are per-window shares of a pipeline, not a timeline.
   println(stdout,
@@ -193,39 +216,39 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
   // sub-pixel and the viewer does not draw them. The trace carries one
   // fold record per window; their share is printed here.
   if (const auto agents = trace.agents(); !agents.empty()) {
-    double compress_ns = 0;
-    double fold_ns = 0;
+    fractional_ns compress{};
+    fractional_ns fold{};
     std::size_t compress_n = 0;
     std::size_t fold_n = 0;
     for (const auto& a : agents) {
       if (a.parts == 0) {
-        fold_ns += static_cast<double>(a.busy_ns);
+        fold += a.busy;
         ++fold_n;
       } else {
-        compress_ns += static_cast<double>(a.busy_ns);
+        compress += a.busy;
         ++compress_n;
       }
     }
-    const double agent_ns = compress_ns + fold_ns;
-    const auto share = [&](double ns) {
-      return agent_ns > 0 ? 100.0 * ns / agent_ns : 0.0;
+    const fractional_ns agent = compress + fold;
+    const auto share = [&](fractional_ns t) {
+      return agent > fractional_ns::zero() ? 100.0 * (t / agent) : 0.0;
     };
     println(stdout,
             "    agent slices: compress {} ({:.1f} ms, {:4.1f}%)  fold {} "
             "({:.1f} ms, {:4.1f}%)",
-            compress_n, compress_ns / 1e6, share(compress_ns), fold_n,
-            fold_ns / 1e6, share(fold_ns));
+            compress_n, ms_of(compress), share(compress), fold_n,
+            ms_of(fold), share(fold));
     // And what those slices look like in the viewer, said as a number
     // so nobody has to infer it from how empty the lanes are: the pool
     // is busy for a fraction of the run whenever the device cannot feed
     // it, which is most runs. A low occupancy here is the reader
     // starving the pool, not the trace losing records.
-    if (threads > 0 && wall_ns > 0) {
+    if (threads > 0 && wall > fractional_ns::zero()) {
       println(stdout,
               "    pool occupancy: {:4.1f}% of {} threads x wall; no agent "
               "busy at all for {:4.1f}% of it",
-              100.0 * agent_ns / (wall_ns * threads), threads,
-              100.0 * (1.0 - idle_covered(agents, wall_ns)));
+              100.0 * (agent / (wall * threads)), threads,
+              100.0 * (1.0 - idle_covered(agents, wall)));
     }
   }
 
@@ -234,7 +257,7 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
   // for more work, one that is busy is the ceiling.
   const auto& d = trace.driver();
   if (d.iterations > 0) {
-    const double driver_ns = static_cast<double>(d.busy_ns + d.parked_ns);
+    const fractional_ns driver = d.busy + d.parked;
     if (const std::string_view rung = blake3pp::read_backend(d);
         !rung.empty()) {
       println(stdout, "    read backend: {}", rung);
@@ -244,27 +267,26 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
             "polls ({} blocking, {} woken), {} completions, {} admission "
             "stalls, reducer held at most {}, at most {} reads and {} "
             "windows in flight",
-            100.0 * static_cast<double>(d.busy_ns) / driver_ns,
-            driver_ns / 1e9, d.iterations, d.polls, d.blocking_polls,
-            d.wakes, d.queue_runs, d.admission_stalls, d.max_pending,
-            d.max_reads_in_flight, d.max_windows_in_flight);
+            100.0 * (fractional_ns(d.busy) / driver), seconds_of(driver),
+            d.iterations, d.polls, d.blocking_polls, d.wakes, d.queue_runs,
+            d.admission_stalls, d.max_pending, d.max_reads_in_flight,
+            d.max_windows_in_flight);
     if (d.transfers_landed > 0) {
       println(stdout,
               "    queue depth: settled at {} (peak {}); device {:.3f} ms per "
               "window over {} transfers, starved {:.3f} s",
               d.queue_depth_final, d.queue_depth_peak,
-              static_cast<double>(d.device_wait_ns) /
-                  static_cast<double>(d.transfers_landed) / 1e6,
-              d.transfers_landed, static_cast<double>(d.starved_ns) / 1e9);
+              ms_of(d.device_wait) / static_cast<double>(d.transfers_landed),
+              d.transfers_landed, seconds_of(d.starved));
     }
   }
 
   // Per-window latencies, as medians: with windows overlapping, an
   // average over stages says less than where the middle window sat.
   {
-    std::vector<std::int64_t> to_read;
-    std::vector<std::int64_t> to_cv;
-    std::vector<std::int64_t> to_reduced;
+    std::vector<std::chrono::nanoseconds> to_read;
+    std::vector<std::chrono::nanoseconds> to_cv;
+    std::vector<std::chrono::nanoseconds> to_reduced;
     to_read.reserve(windows.size());
     to_cv.reserve(windows.size());
     to_reduced.reserve(windows.size());
@@ -273,9 +295,9 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
       to_cv.push_back(w.t_joined - w.t_ready);
       to_reduced.push_back(w.t_absorbed - w.t_joined);
     }
-    const auto median = [](std::vector<std::int64_t>& v) {
+    const auto median = [](std::vector<std::chrono::nanoseconds>& v) {
       std::ranges::nth_element(v, v.begin() + std::ssize(v) / 2);
-      return static_cast<double>(v[v.size() / 2]) / 1000.0;
+      return us_of(v[v.size() / 2]);
     };
     println(stdout,
             "    median per window: submit->read {:8.1f} us  read->cv {:8.1f} "
@@ -286,7 +308,7 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     println(stdout,
             "    pool busy {:5.1f}% of {} threads, {:.1f} agents active per "
             "fanned window",
-            100.0 * busy / (static_cast<double>(threads) * wall_ns), threads,
+            100.0 * (busy / (wall * static_cast<double>(threads))), threads,
             active / static_cast<double>(fanned));
   }
   std::string machine;
@@ -299,7 +321,7 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     machine += " cores";
   }
   println(stdout, "    io-wq cpu = {:.2f} cores (worker threads' cpu / wall){}",
-          iowq_cpu_s / (wall_ns / 1e9), machine);
+          iowq_cpu_s / seconds_of(wall), machine);
 
   const auto agents = trace.agents();
   if (agents.empty() && trace.dropped_agents() == 0) {
@@ -310,7 +332,7 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     std::uint64_t records = 0;
     std::uint64_t parts = 0;
     std::uint64_t bytes = 0;
-    std::uint64_t busy_ns = 0;
+    std::chrono::nanoseconds busy{};
   };
   std::map<std::uint32_t, cpu_sum> per_cpu;
   double worst_spread = 0.0;
@@ -320,11 +342,10 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     c.parts += a.parts;
     c.bytes += static_cast<std::uint64_t>(a.parts) * a.part_chunks *
                blake3pp::chunk_size;
-    c.busy_ns += a.busy_ns;
-    if (a.min_part_ns > 0) {
-      worst_spread = std::max(worst_spread,
-                              static_cast<double>(a.max_part_ns) /
-                                  static_cast<double>(a.min_part_ns));
+    c.busy += a.busy;
+    if (a.min_part > std::chrono::nanoseconds::zero()) {
+      worst_spread = std::max(
+          worst_spread, fractional_ns(a.max_part) / fractional_ns(a.min_part));
     }
   }
   std::vector<double> rates;
@@ -334,7 +355,7 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
   println(stdout, "      {:>5} {:>8} {:>8} {:>10} {:>14}{}", "cpu", "records",
           "parts", "busy ms", "effective", irqs ? "      irqs" : "");
   for (const auto& [cpu, c] : per_cpu) {
-    const double secs = static_cast<double>(c.busy_ns) / 1e9;
+    const double secs = seconds_of(c.busy);
     rates.push_back(b3tool::gib_per_s(c.bytes, secs));
     std::string irq_col;
     if (irqs) {
@@ -344,8 +365,8 @@ void print_trace_summary(const blake3pp::trace_buffer& trace,
     }
     println(stdout, "      {:>5} {:>8} {:>8} {:>10.1f} {}{}",
             cpu == ~std::uint32_t{0} ? std::string{"?"} : std::to_string(cpu),
-            c.records, c.parts, static_cast<double>(c.busy_ns) / 1e6,
-            b3tool::rate(c.bytes, secs), irq_col);
+            c.records, c.parts, ms_of(c.busy), b3tool::rate(c.bytes, secs),
+            irq_col);
   }
   if (!rates.empty()) {
     std::ranges::sort(rates);
@@ -753,10 +774,10 @@ int main(int argc, char** argv) {
               "  device: {:.3f} ms per window over {} writes, generator "
               "starved {:.3f} s",
               d.transfers_landed > 0
-                  ? static_cast<double>(d.device_wait_ns) /
-                        static_cast<double>(d.transfers_landed) / 1e6
+                  ? ms_of(d.device_wait) /
+                        static_cast<double>(d.transfers_landed)
                   : 0.0,
-              d.transfers_landed, static_cast<double>(d.starved_ns) / 1e9);
+              d.transfers_landed, seconds_of(d.starved));
     }
     return 0;
   }

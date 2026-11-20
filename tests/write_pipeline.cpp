@@ -818,11 +818,9 @@ template <class Scheduler>
                              {.window_bytes = win,
                               .queue_depth = depth,
                               .trace = &trace});
-  const double wall_ns = std::chrono::duration<double, std::nano>(
-                             std::chrono::steady_clock::now() - t0)
-                             .count();
+  const auto wall = std::chrono::steady_clock::now() - t0;
   REQUIRE(drv.final_size() == size);
-  return blake3pp::diagnose_write(trace.driver(), wall_ns, threads, win);
+  return blake3pp::diagnose_write(trace.driver(), wall, threads, win);
 }
 
 // doctest streams a const char* as a pointer, so the line is built as a
@@ -888,8 +886,8 @@ TEST_CASE("a slow sink feeds the diagnosis coherent counters on the write side")
   CHECK(r.transfers == 48u);
   // A write is timed from the moment it is handed to the driver, and
   // the device holds it at least one service time: load can only add.
-  CHECK(r.min_service_ns >= static_cast<std::uint64_t>(service_ns));
-  CHECK(static_cast<double>(r.min_service_ns) <= r.mean_service_ns);
+  CHECK(r.min_service >= std::chrono::nanoseconds{service_ns});
+  CHECK(r.min_service <= r.mean_service);
   CHECK(r.fill_busy >= 0.0);
   CHECK(r.fill_busy <= 1.0);
   CHECK(r.device_busy > 0.0);

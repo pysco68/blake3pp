@@ -35,10 +35,13 @@
 
 namespace blake3pp {
 
+/// The clock every record is stamped on. Instants are its time_points,
+/// absolute (CLOCK_MONOTONIC on Linux), so they join with timestamps other
+/// tools take on the same clock; a difference is a duration.
+using trace_clock = std::chrono::steady_clock;
+
 /// One I/O window from the reader handing it out to the reader taking
-/// it back. Timestamps are nanoseconds on std::chrono::steady_clock
-/// relative to the trace_buffer's construction, so a plain difference is
-/// a duration.
+/// it back.
 struct window_record {
   /// Bit in flags: the window was fanned out over the scheduler.
   static constexpr std::uint32_t flag_parallel = 1u << 0;
@@ -64,19 +67,19 @@ struct window_record {
   /// Bytes in the window.
   std::uint64_t bytes;
   /// Before the pipeline asked the reader for the window.
-  std::int64_t t_wait_begin;
+  trace_clock::time_point t_wait_begin;
   /// The reader handed the window out; its bytes are in memory.
-  std::int64_t t_ready;
+  trace_clock::time_point t_ready;
   /// The compute is done: every agent has joined, or hasher::update()
   /// returned when the window was hashed inline.
-  std::int64_t t_joined;
+  trace_clock::time_point t_joined;
   /// The chaining values are in the hasher. Equals t_joined for an inline
   /// window, which has no separate absorb step.
-  std::int64_t t_absorbed;
+  trace_clock::time_point t_absorbed;
   /// The window's buffer is back with the reader.
-  std::int64_t t_released;
-  /// Summed over the agents that took part: nanoseconds spent compressing.
-  std::uint64_t agent_busy_ns;
+  trace_clock::time_point t_released;
+  /// Summed over the agents that took part: time spent compressing.
+  std::chrono::nanoseconds agent_busy;
   /// Bulk invocations that compressed at least one part.
   std::uint32_t agents_active;
   /// flag_parallel, flag_last, flag_short_first, flag_part_run.
@@ -100,16 +103,16 @@ struct window_record {
 struct agent_record {
   /// window_record::index of the window this belongs to.
   std::uint64_t window;
-  /// The first part started (same clock and epoch as window_record).
-  std::int64_t t_begin;
+  /// The first part started (the same clock as window_record).
+  trace_clock::time_point t_begin;
   /// From the first part starting to the last part ending.
-  std::uint64_t busy_ns;
+  std::chrono::nanoseconds busy;
   /// The shortest part this invocation compressed.
-  std::uint64_t min_part_ns;
+  std::chrono::nanoseconds min_part;
   /// The longest part this invocation compressed.
-  std::uint64_t max_part_ns;
+  std::chrono::nanoseconds max_part;
   /// Parts this invocation compressed; zero marks the fold that followed
-  /// the bulk, whose busy_ns is the fold's own time.
+  /// the bulk, whose busy is the fold's own time.
   std::uint32_t parts;
   /// Chunks per part (the same for every part of a window).
   std::uint32_t part_chunks;
@@ -141,15 +144,15 @@ inline constexpr std::size_t max_read_backend_length = 63;
 /// moved between versions. Read them by name, through the build that
 /// wrote the record.
 struct driver_stats {
-  /// Nanoseconds the driver spent outside a blocking poll: submitting,
+  /// Time the driver spent outside a blocking poll: submitting,
   /// reaping, running completions and inserting into the reducer.
-  std::uint64_t busy_ns;
-  /// Nanoseconds the driver spent inside a blocking poll, waiting for a
+  std::chrono::nanoseconds busy;
+  /// Time the driver spent inside a blocking poll, waiting for a
   /// read or for a window to come back from the pool. The two waits are
   /// summed: this field answers whether the driver thread is the
   /// bottleneck, and for that it does not matter which of them it was
-  /// waiting on. device_wait_ns and starved_ns separate them.
-  std::uint64_t parked_ns;
+  /// waiting on. device_wait and starved separate them.
+  std::chrono::nanoseconds parked;
   /// Times round the loop: one drain, one round of starts, one flush and
   /// one poll each.
   std::uint64_t iterations;
@@ -188,10 +191,10 @@ struct driver_stats {
   std::uint64_t transfers_landed;
   /// Bytes those transfers moved.
   std::uint64_t transfer_bytes;
-  /// Summed nanoseconds the device had the transfers, stamped by whoever
+  /// Summed time the device had the transfers, stamped by whoever
   /// performed each one: submission to completion for an asynchronous
   /// engine, and around the transfer itself on a thread of the driver's
-  /// own, which leaves that thread's own queueing outside (lane_wait_ns).
+  /// own, which leaves that thread's own queueing outside (lane_wait).
   ///
   /// NOT a span of the pipeline's timeline. Admission-to-landing contains
   /// the device's time but is not it, and the difference goes both ways:
@@ -211,8 +214,8 @@ struct driver_stats {
   /// by transfers_landed for the mean per-transfer latency, and by the
   /// wall clock TIMES device_depth for how full the device's queue was,
   /// which is what diagnosis::device_queued is.
-  std::uint64_t device_wait_ns;
-  /// Nanoseconds the pipeline could not use a window it already had,
+  std::chrono::nanoseconds device_wait;
+  /// Time the pipeline could not use a window it already had,
   /// for the one reason more depth cannot fix. Reading, that is bytes
   /// left and no free window on the pool -- the hash behind the device.
   /// Writing, it is the opposite event: the driver with nothing to
@@ -223,40 +226,40 @@ struct driver_stats {
   /// counts "no free window", which fires structurally whenever the
   /// arena is no wider than the queue depth, so it is nonzero on a run
   /// that is purely hash-limited: a 64 MiB x depth 16 arm at 96%
-  /// agent_busy_ns still showed 1.33 s of it. Read it as "the arena is
-  /// not wider than the depth" and use agent_busy_ns for the hash
+  /// agent_busy still showed 1.33 s of it. Read it as "the arena is
+  /// not wider than the depth" and use agent_busy for the hash
   /// side. Writing it is the clean signal it reads like, because there
   /// the windows in flight are the generator's parallelism.
-  std::uint64_t starved_ns;
+  std::chrono::nanoseconds starved;
   /// The queue depth the run finished on: the geometry to pass back as
   /// queue_depth to repeat it.
   std::uint64_t queue_depth_final;
   /// The deepest queue depth the run reached.
   std::uint64_t queue_depth_peak;
   /// Summed over every window and every agent that took part:
-  /// nanoseconds the pool spent compressing on a read run, filling on
+  /// time the pool spent compressing on a read run, filling on
   /// a write one. Divided by the wall clock and the thread count it is
   /// the pool's busy share, which is the hash side's answer to the
-  /// question device_wait_ns answers for the device. Counted on every
+  /// question device_wait answers for the device. Counted on every
   /// run that passes a trace buffer, whether or not it asked for
   /// per-window records.
   ///
-  /// starved_ns is not the same measure and does not substitute for
+  /// starved is not the same measure and does not substitute for
   /// it: see the note on that field.
-  std::uint64_t agent_busy_ns;
+  std::chrono::nanoseconds agent_busy;
   /// The shortest of those per-transfer times, which is the device
   /// serving one transfer with nothing queued ahead of it. Zero when
   /// nothing landed, and zero where the driver cannot attribute.
   ///
   /// It is what makes the mean readable. A queue's latency is
-  /// proportional to its depth by construction, so device_wait_ns /
+  /// proportional to its depth by construction, so device_wait /
   /// transfers_landed alone cannot say whether the device was the
   /// constraint: against this it can. A mean at depth times this is a
   /// queue that was full for the run, and the device is the wall; a mean
   /// at this is a device that served every transfer alone and had
   /// capacity to spare, whatever the mean's absolute size. Counted on
   /// every run, at one comparison per transfer.
-  std::uint64_t device_wait_min_ns;
+  std::chrono::nanoseconds device_wait_min;
   /// The most transfers the I/O engine could have at the device at once:
   /// the queue depth in force where an asynchronous engine carried the
   /// run, and the threads serving the synchronous rung where it did not
@@ -267,12 +270,12 @@ struct driver_stats {
   /// transfers at a time is not reported as a full queue of thirty-two.
   /// Counted on every run.
   std::uint64_t device_depth;
-  /// Nanoseconds transfers spent waiting for one of those threads before
+  /// Time transfers spent waiting for one of those threads before
   /// they started, with none of the device in it. Nonzero only where the
   /// transfers were served by threads of the driver's own, and a measure
   /// of too few of them rather than of a device that is the wall: the
   /// device's time is already outside this. Counted on every run.
-  std::uint64_t lane_wait_ns;
+  std::chrono::nanoseconds lane_wait;
 };
 
 /// The engaged read rung as text; empty when nothing recorded one.
@@ -322,8 +325,7 @@ class trace_buffer {
   ///                 recording off (wants_agents() is false).
   explicit trace_buffer(std::span<window_record> windows,
                         std::span<agent_record> agents = {}) noexcept
-      : windows_(windows), agents_(agents),
-        epoch_(std::chrono::steady_clock::now()) {}
+      : windows_(windows), agents_(agents), epoch_(trace_clock::now()) {}
 
   trace_buffer(const trace_buffer&) = delete;
   trace_buffer& operator=(const trace_buffer&) = delete;
@@ -360,20 +362,15 @@ class trace_buffer {
   /// Whether agent records are wanted: agent storage was given.
   [[nodiscard]] bool wants_agents() const noexcept { return !agents_.empty(); }
 
-  /// Nanoseconds since construction on std::chrono::steady_clock.
-  [[nodiscard]] std::int64_t now() const noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now() - epoch_)
-        .count();
+  /// The current instant on the records' clock.
+  [[nodiscard]] trace_clock::time_point now() const noexcept {
+    return trace_clock::now();
   }
 
-  /// The epoch as absolute steady_clock nanoseconds (CLOCK_MONOTONIC on
-  /// Linux), so timestamps taken by other tools on the same clock align
-  /// with the records: theirs minus this is on the records' scale.
-  [[nodiscard]] std::int64_t epoch_ns() const noexcept {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               epoch_.time_since_epoch())
-        .count();
+  /// When the buffer was built: a zero a reader of the records may
+  /// measure from, as the Chrome trace writer does. clear() keeps it.
+  [[nodiscard]] trace_clock::time_point epoch() const noexcept {
+    return epoch_;
   }
 
   /// The window records claimed so far, in claim order.
@@ -564,10 +561,10 @@ struct diagnosis {
   /// pipeline queued -- and a run read against `depth` there would be
   /// reported as a full queue the device never had.
   unsigned device_depth = 0;
-  /// Nanoseconds a transfer waited for one of those threads before it
+  /// How long a transfer waited for one of those threads before it
   /// started, per transfer. None of the device is in it, so this is the
   /// measure of too few threads and not of a device that is the wall,
-  /// and it is directly comparable with mean_service_ns: the two are the
+  /// and it is directly comparable with mean_service: the two are the
   /// wait and the work of the same transfer. Zero wherever an
   /// asynchronous engine carried the run.
   ///
@@ -575,7 +572,7 @@ struct diagnosis {
   /// waits of transfers queued together overlap: their sum exceeds the
   /// wall clock whenever more than one is waiting, so a share of it means
   /// nothing.
-  double mean_lane_wait_ns = 0.0;
+  std::chrono::duration<double, std::nano> mean_lane_wait{};
   /// How full the device's queue was, as a share of device_depth.
   /// 1.0 is a queue that was full for the run, so the device's latency
   /// is at its ceiling here and the device is the wall; 1/depth is a
@@ -608,13 +605,13 @@ struct diagnosis {
   /// device's queue are separate resources with no common denominator.
   double device_busy = 0.0;
   /// The driver with a window it could not use. Reading this is
-  /// structural and says little (see driver_stats::starved_ns); writing
+  /// structural and says little (see driver_stats::starved); writing
   /// it is the generator being behind.
   double starved = 0.0;
 
   std::uint64_t transfers = 0;
-  double mean_service_ns = 0.0;
-  std::uint64_t min_service_ns = 0;
+  std::chrono::duration<double, std::nano> mean_service{};
+  std::chrono::nanoseconds min_service{};
   std::uint64_t depth = 0;
   std::uint64_t windows_used = 0;
   std::uint64_t windows_planned = 0;
@@ -666,7 +663,7 @@ struct diagnosis {
 /// The third is a relation and not a size. The windows beyond the reads
 /// are what the pool draws on while the device serves the next ones, so
 /// where there are none the pool runs dry whenever a window is out.
-/// That is also the only case driver_stats::starved_ns can fire in,
+/// That is also the only case driver_stats::starved can fire in,
 /// which is why that counter reads "the arena is not wider than the
 /// depth" and not "the pool starved" -- a purely hash-limited run shows
 /// most of its wall clock in it.
@@ -694,22 +691,22 @@ struct diagnosis {
 /// blake3pp::trace_buffer trace(windows);
 /// const auto t0 = std::chrono::steady_clock::now();
 /// blake3pp::update_file(h, path, sched, {.trace = &trace});
-/// const double wall_ns = std::chrono::duration<double, std::nano>(
-///     std::chrono::steady_clock::now() - t0).count();
-/// const auto d = blake3pp::diagnose_read(trace.driver(), wall_ns, threads,
+/// const auto wall = std::chrono::steady_clock::now() - t0;
+/// const auto d = blake3pp::diagnose_read(trace.driver(), wall, threads,
 ///                                        plan.windows, plan.window_bytes);
 /// std::puts(blake3pp::to_string(d.label));
 /// @endcode
 ///
 /// @param d          The run's counters.
-/// @param wall_ns    Wall clock the caller measured around the call.
+/// @param wall       Wall clock the caller measured around the call.
 /// @param threads    The compute pool's width.
 /// @param planned    Window objects the plan allocated, which is the
 ///                   arena's width in windows.
 /// @param window     Bytes per window, after the pipeline's rounding.
 /// @param b          The bands each share is read in.
-[[nodiscard]] diagnosis diagnose_read(const driver_stats& d, double wall_ns,
-                                      unsigned threads, unsigned planned,
+[[nodiscard]] diagnosis diagnose_read(
+    const driver_stats& d, std::chrono::duration<double, std::nano> wall,
+    unsigned threads, unsigned planned,
                                       std::size_t window,
                                       bands b = {}) noexcept;
 
@@ -727,12 +724,12 @@ struct diagnosis {
 /// The windows in flight come from driver_stats::queue_depth_final.
 ///
 /// @param d          The run's counters.
-/// @param wall_ns    Wall clock the caller measured around the call.
+/// @param wall       Wall clock the caller measured around the call.
 /// @param threads    The compute pool's width.
 /// @param window     Bytes per window, after the pipeline's rounding.
 /// @param b          The bands each share is read in.
-[[nodiscard]] diagnosis diagnose_write(const driver_stats& d, double wall_ns,
-                                       unsigned threads, std::size_t window,
-                                       bands b = {}) noexcept;
+[[nodiscard]] diagnosis diagnose_write(
+    const driver_stats& d, std::chrono::duration<double, std::nano> wall,
+    unsigned threads, std::size_t window, bands b = {}) noexcept;
 
 }  // namespace blake3pp

@@ -9,6 +9,7 @@
 // file also holds the facility to <blake3pp/trace.hpp> alone, the
 // contract a caller outside this repository has.
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -19,7 +20,7 @@
 
 namespace {
 
-constexpr double wall_ns = 1e9;
+constexpr std::chrono::duration<double, std::nano> wall{1e9};
 constexpr unsigned threads = 8;
 constexpr std::uint64_t depth = 4;
 constexpr std::size_t window = 8u << 20;
@@ -36,11 +37,11 @@ constexpr std::size_t window = 8u << 20;
   d.transfers_landed = transfers;
   d.queue_depth_final = depth;
   d.max_windows_in_flight = depth;
-  d.agent_busy_ns =
-      static_cast<std::uint64_t>(pool_share * wall_ns * threads);
-  d.device_wait_ns = static_cast<std::uint64_t>(
-      device_share * wall_ns * static_cast<double>(depth));
-  d.device_wait_min_ns = min_ns;
+  d.agent_busy = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      pool_share * wall * threads);
+  d.device_wait = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      device_share * wall * static_cast<double>(depth));
+  d.device_wait_min = std::chrono::nanoseconds{min_ns};
   return d;
 }
 
@@ -54,7 +55,7 @@ TEST_SUITE("diagnosis") {
 
 TEST_CASE("a saturated pool reads as hash-limited") {
   const auto d = counters(64, 0.95, 0.02, 1'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 4, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 4, window);
   REQUIRE(r.measured());
   REQUIRE(r.long_enough());
   CHECK(r.label == blake3pp::bottleneck::hash);
@@ -68,7 +69,7 @@ TEST_CASE("a full queue over an idle pool reads as device-limited") {
   // The mean service time is far above the unqueued minimum, so the
   // device really did put transfers behind one another.
   const auto d = counters(64, 0.10, 0.95, 10'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 4, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 4, window);
   CHECK(r.label == blake3pp::bottleneck::device);
   CHECK(label(r.label) == "device-limited");
   CHECK_FALSE(r.device_unqueued);
@@ -81,7 +82,7 @@ TEST_CASE("a full queue under a wide arena reads as device-limited") {
   // That run's queue share is a share of the wall clock, which load
   // moves; here the share is stated.
   const auto d = counters(64, 0.10, 0.95, 10'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 16, window);
   REQUIRE(r.long_enough());
   CHECK_FALSE(r.arena_is_depth);
   CHECK_FALSE(r.device_unqueued);
@@ -90,14 +91,14 @@ TEST_CASE("a full queue under a wide arena reads as device-limited") {
 
 TEST_CASE("a saturated pool that starves the driver still reads as hash-limited") {
   // A pool that is the constraint leaves the driver with no free window
-  // most of the run, so starved_ns is most of the wall clock. starved_ns
+  // most of the run, so starved is most of the wall clock. starved
   // does not measure pool starvation, and a reading built on it would
   // call this arena-limited. tests/file_pipeline.cpp produces this shape
   // with a zero-copy source; the shares are stated here because load
   // moves the pool's share of a real clock.
   auto d = counters(64, 0.95, 0.02, 1'000'000);
-  d.starved_ns = static_cast<std::uint64_t>(0.9 * wall_ns);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  d.starved = std::chrono::duration_cast<std::chrono::nanoseconds>(0.9 * wall);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 16, window);
   REQUIRE(r.long_enough());
   CHECK(r.starved > 0.5);
   CHECK_FALSE(r.arena_is_depth);
@@ -106,7 +107,7 @@ TEST_CASE("a saturated pool that starves the driver still reads as hash-limited"
 
 TEST_CASE("an arena at the queue depth reads as arena-limited") {
   const auto d = counters(64, 0.10, 0.50, 10'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 4, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 4, window);
   REQUIRE(r.arena_is_depth);
   CHECK(r.label == blake3pp::bottleneck::arena);
   CHECK(label(r.label) == "arena-limited");
@@ -117,7 +118,7 @@ TEST_CASE("a wide arena over an unqueued device reads as in-flight-limited") {
   // the minimum: the pool had windows to spare and the device served
   // every transfer alone.
   const auto d = counters(64, 0.10, 0.016, 1'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 16, window);
   REQUIRE(r.device_unqueued);
   CHECK_FALSE(r.arena_is_depth);
   CHECK(r.label == blake3pp::bottleneck::in_flight);
@@ -135,7 +136,7 @@ TEST_CASE("a narrow arena over an unqueued device still reads as arena-limited")
   // minimum, and a run on a real clock cannot promise a mean that close
   // to its own minimum, so the reading is asserted here.
   const auto d = counters(64, 0.10, 0.016, 1'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, depth, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, depth, window);
   REQUIRE(r.device_unqueued);
   REQUIRE(r.arena_is_depth);
   CHECK(r.label == blake3pp::bottleneck::arena);
@@ -144,7 +145,7 @@ TEST_CASE("a narrow arena over an unqueued device still reads as arena-limited")
 
 TEST_CASE("a run shorter than four turns of the queue gets no reading") {
   const auto d = counters(4, 0.95, 0.95, 1'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 4, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 4, window);
   CHECK(r.measured());
   CHECK_FALSE(r.long_enough());
   CHECK(r.label == blake3pp::bottleneck::undecided);
@@ -164,13 +165,13 @@ TEST_CASE("a pool between the bands is undecided between hash and the arena or d
   // but neither end is decided. The second candidate is the arena when
   // the arena is the depth, and the device otherwise.
   const auto d = counters(64, 0.85, 0.50, 10'000'000);
-  const auto narrow = blake3pp::diagnose_read(d, wall_ns, threads, depth, window);
+  const auto narrow = blake3pp::diagnose_read(d, wall, threads, depth, window);
   REQUIRE(narrow.long_enough());
   CHECK(narrow.label == blake3pp::bottleneck::undecided);
   CHECK(narrow.first == blake3pp::bottleneck::hash);
   CHECK(narrow.second == blake3pp::bottleneck::arena);
 
-  const auto wide = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  const auto wide = blake3pp::diagnose_read(d, wall, threads, 16, window);
   REQUIRE(wide.long_enough());
   CHECK(wide.label == blake3pp::bottleneck::undecided);
   CHECK(wide.first == blake3pp::bottleneck::hash);
@@ -181,13 +182,13 @@ TEST_CASE("a device between the bands is undecided between device and the arena 
   // The device at 85% of its queue, the pool idle: the device is the
   // first candidate, and the second is whichever the arena leaves.
   const auto d = counters(64, 0.10, 0.85, 10'000'000);
-  const auto narrow = blake3pp::diagnose_read(d, wall_ns, threads, depth, window);
+  const auto narrow = blake3pp::diagnose_read(d, wall, threads, depth, window);
   REQUIRE(narrow.long_enough());
   CHECK(narrow.label == blake3pp::bottleneck::undecided);
   CHECK(narrow.first == blake3pp::bottleneck::device);
   CHECK(narrow.second == blake3pp::bottleneck::arena);
 
-  const auto wide = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  const auto wide = blake3pp::diagnose_read(d, wall, threads, 16, window);
   REQUIRE(wide.long_enough());
   CHECK(wide.label == blake3pp::bottleneck::undecided);
   CHECK(wide.first == blake3pp::bottleneck::device);
@@ -198,7 +199,7 @@ TEST_CASE("a queued device between the bands with a wide arena is undecided devi
   // Neither share reaches its band, the arena is wider than the queue,
   // and the device did queue: the final branch of diagnose_read().
   const auto d = counters(64, 0.10, 0.60, 10'000'000);
-  const auto r = blake3pp::diagnose_read(d, wall_ns, threads, 16, window);
+  const auto r = blake3pp::diagnose_read(d, wall, threads, 16, window);
   REQUIRE(r.long_enough());
   CHECK_FALSE(r.arena_is_depth);
   CHECK_FALSE(r.device_unqueued);
@@ -212,7 +213,7 @@ TEST_CASE("a write run whose fill and device shares tie is undecided between gen
   // 0.60: within the tie band of each other, and the device's queue
   // share 0.60 is below saturation.
   const auto d = counters(64, 0.30, 0.60, 10'000'000);
-  const auto r = blake3pp::diagnose_write(d, wall_ns, threads, window);
+  const auto r = blake3pp::diagnose_write(d, wall, threads, window);
   REQUIRE(r.long_enough());
   CHECK(r.label == blake3pp::bottleneck::undecided);
   CHECK(r.first == blake3pp::bottleneck::generator);
@@ -224,13 +225,13 @@ TEST_CASE("the write side names the generator and the device") {
   // well as the device's queue, so the reading is which of the two held
   // them longer.
   const auto filling = counters(64, 0.30, 0.016, 1'000'000);
-  const auto g = blake3pp::diagnose_write(filling, wall_ns, threads, window);
+  const auto g = blake3pp::diagnose_write(filling, wall, threads, window);
   CHECK(g.label == blake3pp::bottleneck::generator);
   CHECK(label(g.label) == "generator-limited");
   CHECK(g.arena_is_depth);
 
   const auto draining = counters(64, 0.02, 0.95, 10'000'000);
-  const auto s = blake3pp::diagnose_write(draining, wall_ns, threads, window);
+  const auto s = blake3pp::diagnose_write(draining, wall, threads, window);
   CHECK(s.label == blake3pp::bottleneck::device);
 }
 
@@ -238,9 +239,9 @@ TEST_CASE("the bands are the caller's to set") {
   // A pool at 85% is undecided under the defaults and saturated once the
   // caller moves the band under it.
   const auto d = counters(64, 0.85, 0.50, 10'000'000);
-  CHECK(blake3pp::diagnose_read(d, wall_ns, threads, 4, window).label ==
+  CHECK(blake3pp::diagnose_read(d, wall, threads, 4, window).label ==
         blake3pp::bottleneck::undecided);
-  CHECK(blake3pp::diagnose_read(d, wall_ns, threads, 4, window,
+  CHECK(blake3pp::diagnose_read(d, wall, threads, 4, window,
                                 {.saturated = 0.80, .idle = 0.70})
             .label == blake3pp::bottleneck::hash);
 }

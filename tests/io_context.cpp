@@ -206,7 +206,7 @@ class fake_context {
     op.done_once = true;
     // Attributed like a real performer's, so the engine over this context
     // sees a device time rather than a hole.
-    device_.add(1);
+    device_.add(std::chrono::nanoseconds{1});
     op.done(&op, {});
     return 1;
   }
@@ -224,7 +224,9 @@ class fake_context {
   // queues nothing anywhere else: one at the device, no wait for a lane,
   // and the transfer itself stamped like any other performer's.
   [[nodiscard]] unsigned device_depth() const noexcept { return 1; }
-  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept { return 0; }
+  [[nodiscard]] std::chrono::nanoseconds lane_wait() const noexcept {
+    return {};
+  }
   [[nodiscard]] blake3pp::detail::device_time device() const noexcept {
     return device_;
   }
@@ -2327,7 +2329,7 @@ class counting_source {
 template <bool Positional>
 struct lane_run {
   blake3pp::detail::device_time device{};
-  std::uint64_t lane_wait_ns = 0;
+  std::chrono::nanoseconds lane_wait{};
   unsigned device_depth = 0;
   int most_concurrent = 0;
   int completed = 0;
@@ -2380,7 +2382,7 @@ lane_run<Positional> run_counting(unsigned depth, int n,
   // (checked per callback above); the transfers themselves ran on the
   // lanes.
   out.device = ctx.device();
-  out.lane_wait_ns = ctx.lane_wait_ns();
+  out.lane_wait = ctx.lane_wait();
   out.device_depth = ctx.device_depth();
   out.most_concurrent = shared.most.load();
   out.rendezvous_timed_out = shared.rendezvous_timed_out.load();
@@ -2429,11 +2431,11 @@ TEST_CASE("the device's own time has no wait for a lane in it") {
   const lane_run<true> r = run_counting<true>(/*depth=*/8, /*n=*/12);
   CHECK(r.device.transfers == 12);
   // Generous bands: this is a sleep on a loaded test machine.
-  CHECK(r.device.total_ns > 12 * 2'000'000ULL);
-  CHECK(r.device.min_ns > 1'000'000ULL);
+  CHECK(r.device.total > std::chrono::nanoseconds{12 * 2'000'000});
+  CHECK(r.device.min > std::chrono::nanoseconds{1'000'000});
   // Twelve transfers over four lanes queue three deep, so the wait is
   // real and it is NOT in the device figure above.
-  CHECK(r.lane_wait_ns > 0);
+  CHECK(r.lane_wait > std::chrono::nanoseconds::zero());
 }
 
 TEST_CASE("a failed transfer's error survives the lane's encoding") {

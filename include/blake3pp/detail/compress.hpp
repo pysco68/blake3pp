@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cassert>
 
 #include <blake3pp/detail/contract.hpp>
@@ -138,20 +139,20 @@ template <bool Traced, class Scheduler, stack_budget Budget,
              }
              trace_buffer& buf = *pt->buf;
              const bool per_agent = buf.wants_agents();
-             const std::int64_t t_begin = buf.now();
-             std::int64_t t = t_begin;
+             const trace_clock::time_point t_begin = buf.now();
+             trace_clock::time_point t = t_begin;
              std::uint32_t parts = 0;
-             std::uint64_t min_ns = ~std::uint64_t{0};
-             std::uint64_t max_ns = 0;
+             std::chrono::nanoseconds min_part = std::chrono::nanoseconds::max();
+             std::chrono::nanoseconds max_part{};
              std::uint32_t cpu = ~std::uint32_t{0};
              if (per_agent) {
                cpu = current_cpu();
                do {
                  body(i);
-                 const std::int64_t t_end = buf.now();
-                 const auto d = static_cast<std::uint64_t>(t_end - t);
-                 min_ns = std::min(min_ns, d);
-                 max_ns = std::max(max_ns, d);
+                 const trace_clock::time_point t_end = buf.now();
+                 const std::chrono::nanoseconds d = t_end - t;
+                 min_part = std::min(min_part, d);
+                 max_part = std::max(max_part, d);
                  t = t_end;
                  ++parts;
                  if (parts_stopped(tok)) {
@@ -170,17 +171,18 @@ template <bool Traced, class Scheduler, stack_budget Budget,
                } while (i < n);
                t = buf.now();
              }
-             const auto busy = static_cast<std::uint64_t>(t - t_begin);
-             pt->busy_ns.fetch_add(busy, std::memory_order_relaxed);
+             const std::chrono::nanoseconds busy = t - t_begin;
+             pt->busy_ns.fetch_add(static_cast<std::uint64_t>(busy.count()),
+                                   std::memory_order_relaxed);
              pt->active.fetch_add(1, std::memory_order_relaxed);
              if (per_agent) {
                if (agent_record* const r = buf.claim_agent()) {
                  r->window = pt->window;
                  r->file = pt->file;
                  r->t_begin = t_begin;
-                 r->busy_ns = busy;
-                 r->min_part_ns = min_ns;
-                 r->max_part_ns = max_ns;
+                 r->busy = busy;
+                 r->min_part = min_part;
+                 r->max_part = max_part;
                  r->parts = parts;
                  r->part_chunks = pt->part_chunks;
                  r->cpu = cpu;
@@ -407,7 +409,7 @@ class fold_timer {
       : pt_(pt != nullptr && pt->buf != nullptr && pt->buf->wants_agents()
                 ? pt
                 : nullptr),
-        t_begin_(pt_ != nullptr ? pt_->buf->now() : 0) {}
+        t_begin_(pt_ != nullptr ? pt_->buf->now() : trace_clock::time_point{}) {}
   fold_timer(const fold_timer&) = delete;
   fold_timer& operator=(const fold_timer&) = delete;
   ~fold_timer() {
@@ -415,12 +417,12 @@ class fold_timer {
       return;
     }
     if (agent_record* const r = pt_->buf->claim_agent()) {
-      const std::int64_t t_end = pt_->buf->now();
+      const trace_clock::time_point t_end = pt_->buf->now();
       r->window = pt_->window;
       r->file = pt_->file;
       r->t_begin = t_begin_;
-      r->busy_ns = static_cast<std::uint64_t>(t_end - t_begin_);
-      r->min_part_ns = r->max_part_ns = 0;
+      r->busy = t_end - t_begin_;
+      r->min_part = r->max_part = {};
       r->parts = 0;
       r->part_chunks = pt_->part_chunks;
       r->cpu = current_cpu();
@@ -429,7 +431,7 @@ class fold_timer {
 
  private:
   part_trace* pt_;
-  std::int64_t t_begin_;
+  trace_clock::time_point t_begin_;
 };
 
 template <bool Traced, stack_budget Budget, class Scheduler,
