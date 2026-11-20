@@ -222,8 +222,9 @@ by construction.
 `queue_depth_final` is the geometry to pass back as `queue_depth` to
 repeat a run.
 
-Fields are appended to `driver_stats`, never inserted, because a caller
-may read it out of a build it did not compile.
+The layout of `driver_stats` is not stable before 1.0: fields may be
+added, widened or moved between versions, so read them by name, through
+the build that wrote the record.
 
 `read_backend(d)` is how the read side's degradation becomes visible to a
 caller: `"io_uring+direct"` when everything was granted, `"io_uring"` when

@@ -136,6 +136,10 @@ inline constexpr std::size_t max_read_backend_length = 63;
 ///
 /// Written only by the driver thread, and only while it is inside its
 /// own loop.
+///
+/// The layout is not stable before 1.0: fields may be added, widened or
+/// moved between versions. Read them by name, through the build that
+/// wrote the record.
 struct driver_stats {
   /// Nanoseconds the driver spent outside a blocking poll: submitting,
   /// reaping, running completions and inserting into the reducer.
@@ -179,8 +183,6 @@ struct driver_stats {
   /// referenced, so it outlives the file. Read it through
   /// read_backend(), which trims the padding.
   std::array<char, max_read_backend_length + 1> read_backend;
-  // Fields are appended, never inserted: a caller that reads this out of
-  // a build it did not compile reads it by offset.
   /// Windows whose transfer landed: reads on a read run, writes on a
   /// write one. Counted on every run, traced or not.
   std::uint64_t transfers_landed;
