@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <random>
@@ -279,6 +280,20 @@ TEST_CASE("the senders record into a buffer handed in as a tracer") {
 // clear(), add nothing to it. A transfer's device time and its wait for a
 // lane both lie between its submit and its landing, so a run's sums are
 // bounded by its own windows' submit-to-ready spans.
+TEST_CASE("a batch's trace file ids saturate instead of wrapping") {
+  using blake3pp::async::detail::trace_file_id;
+  constexpr std::uint32_t top = std::numeric_limits<std::uint32_t>::max();
+  CHECK(trace_file_id(0) == 0);
+  CHECK(trace_file_id(7) == 7);
+  CHECK(trace_file_id(top - 1) == top - 1);
+  CHECK(trace_file_id(top) == top);
+  if constexpr (sizeof(std::size_t) > sizeof(std::uint32_t)) {
+    const auto past = static_cast<std::size_t>(std::uint64_t{1} << 32);
+    CHECK(trace_file_id(past) == top);
+    CHECK(trace_file_id(past + 5) == top);
+  }
+}
+
 TEST_CASE("a trace counts its own transfers, not the context's earlier ones") {
   constexpr std::size_t win = 64 * 1024;
   const auto big = pattern(16 * 1024 * 1024, 31);

@@ -91,7 +91,7 @@ struct window_record {
   std::uint32_t slot;
   /// The file's index in a many-files operation (async_update_files),
   /// which fills one buffer with every file's windows; zero for a single
-  /// file.
+  /// file. Files from index UINT32_MAX on all carry UINT32_MAX.
   std::uint32_t file;
 };
 

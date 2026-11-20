@@ -54,6 +54,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -807,6 +808,14 @@ struct many_files_options {
 
 namespace detail {
 
+// The trace records' file id for the batch's `index`th file. The id is
+// 32 bits wide, so every file from UINT32_MAX on shares that id rather
+// than wrapping onto the first files' ids.
+[[nodiscard]] constexpr std::uint32_t trace_file_id(std::size_t index) noexcept {
+  return static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(index, std::numeric_limits<std::uint32_t>::max()));
+}
+
 // Many files over one context, a bounded number in flight: a node that
 // owns up to `in_flight` child operations and refills a slot from its
 // own round once the child in it has reported. The child reports from
@@ -990,7 +999,7 @@ class update_files_op final : public pipeline_node {
       return blake3pp::ex::connect(
           child_sender(*op->ctx_, &*s->h, op->paths_[s->index], op->sched_,
                        op->opts_.io, op->tracer_,
-                       static_cast<std::uint32_t>(s->index)),
+                       trace_file_id(s->index)),
           child_receiver{op, s});
     }
   };
