@@ -227,18 +227,44 @@ bool is_path(const std::string& name) noexcept {
 #endif
 }
 
-// What --check found, summed over every list.
+// What --check found, summed over every list. 64-bit, so no list a
+// machine can hold wraps a count back to zero.
 struct check_counts {
-  int malformed = 0;    // lines not in the checksum-line format
-  int unreadable = 0;   // listed files that could not be read
-  int mismatched = 0;   // files whose digest differs from the listed one
-  int bad_lists = 0;    // lists that could not be read or hold no
-                        // well-formed line, each reported on its own
+  std::uint64_t malformed = 0;   // lines not in the checksum-line format
+  std::uint64_t unreadable = 0;  // listed files that could not be read
+  std::uint64_t mismatched = 0;  // files whose digest differs from the
+                                 // listed one
+  std::uint64_t bad_lists = 0;   // lists that could not be read or hold no
+                                 // well-formed line, each reported on its
+                                 // own
 
   [[nodiscard]] bool failed() const noexcept {
-    return malformed + unreadable + mismatched + bad_lists > 0;
+    return malformed != 0 || unreadable != 0 || mismatched != 0 ||
+           bad_lists != 0;
   }
 };
+
+// One listed file's verdict under --check, printed and counted the same
+// way whichever path hashed it: why the file could not be read, on
+// stderr, then the line for it on stdout. Returns whether it passed. A
+// failed write to stdout throws std::system_error, which the caller
+// turns into the end of the run.
+bool report_check(const std::string& name, const std::string& expected,
+                  const result& r, check_counts& counts) {
+  const line_name n = escape_name(name);
+  if (!r.error.empty()) {
+    println(stderr, "blake3ppsum: {}: {}", name, r.error);
+    println(stdout, "{}{}: FAILED open or read", n.prefix, n.text);
+    counts.unreadable++;
+    return false;
+  }
+  const bool ok = r.hex == expected;
+  println(stdout, "{}{}: {}", n.prefix, n.text, ok ? "OK" : "FAILED");
+  if (!ok) {
+    counts.mismatched++;
+  }
+  return ok;
+}
 
 // The first out_len bytes of h's output, as hex.
 [[nodiscard]] std::string hex_of(const blake3pp::hasher& h,
@@ -319,11 +345,11 @@ class engine {
   //
   // A file that fails carries its message instead of a digest, so one bad
   // file does not end the run. report(index, result) says whether that
-  // file passed; the count of the ones that did not is returned. A write
-  // to stdout that throws ends the run instead: it is stopped, counted as
-  // one failure, and left to main()'s check of stdout to report.
+  // file passed; whether any did not is returned. A write to stdout that
+  // throws ends the run instead: it is stopped, counted as a failure, and
+  // left to main()'s check of stdout to report.
   template <class Report>
-  int run_batch(const std::vector<std::string>& files,
+  bool run_batch(const std::vector<std::string>& files,
                 const std::vector<std::size_t>& out_lens, Report report) {
     blake3pp::async::io_context ctx({.window_bytes = opts_.io.window_bytes,
                                      .queue_depth = opts_.io.queue_depth,
@@ -333,7 +359,7 @@ class engine {
     const std::vector<std::filesystem::path> paths(files.begin(), files.end());
     std::vector<std::optional<result>> out(files.size());
     std::size_t next = 0;  // the next outcome to report
-    int failures = 0;
+    bool failed = false;
     bool write_failed = false;
     // The tracer is a type the sender carries, so the two spellings are
     // two instantiations of the same call.
@@ -350,7 +376,7 @@ class engine {
             try {
               for (; next < out.size() && out[next].has_value(); ++next) {
                 if (!report(next, *out[next])) {
-                  failures++;
+                  failed = true;
                 }
                 // Reported is done with: a long --length is megabytes of
                 // hex per file.
@@ -371,11 +397,12 @@ class engine {
     } else {
       run(blake3pp::null_tracer{});
     }
-    return failures + (write_failed ? 1 : 0);
+    return failed || write_failed;
   }
 
-  // The batch behind the printing path: one line per file.
-  int hash_many(const std::vector<std::string>& files, std::size_t out_len) {
+  // The batch behind the printing path: one line per file. True when a
+  // file failed.
+  bool hash_many(const std::vector<std::string>& files, std::size_t out_len) {
     return run_batch(files, std::vector<std::size_t>(files.size(), out_len),
                      [&](std::size_t i, const result& r) {
                        if (!r.error.empty()) {
@@ -398,24 +425,9 @@ class engine {
     for (std::size_t i = 0; i < files.size(); ++i) {
       out_lens[i] = expected[i].size() / 2;
     }
-    run_batch(files, out_lens,
-              [&](std::size_t i, const result& r) {
-                const line_name n = escape_name(files[i]);
-                if (!r.error.empty()) {
-                  println(stderr, "blake3ppsum: {}: {}", files[i], r.error);
-                  println(stdout, "{}{}: FAILED open or read", n.prefix,
-                          n.text);
-                  counts.unreadable++;
-                  return false;
-                }
-                const bool ok = r.hex == expected[i];
-                println(stdout, "{}{}: {}", n.prefix, n.text,
-                        ok ? "OK" : "FAILED");
-                if (!ok) {
-                  counts.mismatched++;
-                }
-                return ok;
-              });
+    run_batch(files, out_lens, [&](std::size_t i, const result& r) {
+      return report_check(files[i], expected[i], r, counts);
+    });
   }
 
  private:
@@ -683,7 +695,7 @@ void run_check(engine& eng, std::istream& in, std::string_view list_name,
   std::vector<std::string> names;
   std::vector<std::string> expected;
   std::string line;
-  for (int line_no = 1; std::getline(in, line); ++line_no) {
+  for (std::uint64_t line_no = 1; std::getline(in, line); ++line_no) {
     std::string_view sv{line};
     if (sv.ends_with('\r')) {
       sv.remove_suffix(1);
@@ -717,24 +729,14 @@ void run_check(engine& eng, std::istream& in, std::string_view list_name,
   // A failed read is the file's and the run goes on; a failed write is
   // stdout's, which ends the list and is left to main() to report.
   for (std::size_t i = 0; i < names.size(); ++i) {
-    const std::string& name = names[i];
-    const line_name n = escape_name(name);
+    result r;
     try {
-      std::optional<std::string> got;
-      try {
-        got = eng.hash_hex(name, expected[i].size() / 2);
-      } catch (const std::exception& e) {
-        println(stderr, "blake3ppsum: {}: {}", name, e.what());
-      }
-      if (!got) {
-        println(stdout, "{}{}: FAILED open or read", n.prefix, n.text);
-        counts.unreadable++;
-      } else if (*got == expected[i]) {
-        println(stdout, "{}{}: OK", n.prefix, n.text);
-      } else {
-        println(stdout, "{}{}: FAILED", n.prefix, n.text);
-        counts.mismatched++;
-      }
+      r.hex = eng.hash_hex(names[i], expected[i].size() / 2);
+    } catch (const std::exception& e) {
+      r.error = e.what();
+    }
+    try {
+      report_check(names[i], expected[i], r, counts);
     } catch (const std::system_error&) {
       return;
     }
@@ -815,7 +817,7 @@ int run_main(int argc, char** argv) {
     return b3tool::exit_usage;
   }
 
-  int failures = 0;
+  bool failed = false;
   try {
     // Trace storage is sized up front: one record per window of each
     // input, with a spare for the short first window. Standard input
@@ -889,7 +891,7 @@ int run_main(int argc, char** argv) {
                   o.trace_path);
         } else {
           println(stderr, "blake3ppsum: could not write {}", o.trace_path);
-          failures++;
+          failed = true;
         }
       }
     };
@@ -934,13 +936,15 @@ int run_main(int argc, char** argv) {
                   counts.mismatched == 1 ? "checksum" : "checksums");
         }
         if (counts.failed()) {
-          failures++;
+          failed = true;
         }
       } else {
         if (eng.can_batch(o.files)) {
           // Several files over one context: one arena, several in flight,
           // lines printed as files complete, in input order.
-          failures += eng.hash_many(o.files, o.out_len);
+          if (eng.hash_many(o.files, o.out_len)) {
+            failed = true;
+          }
         } else {
           for (const auto& f : o.files) {
             std::string hex;
@@ -948,7 +952,7 @@ int run_main(int argc, char** argv) {
               hex = eng.hash_hex(f, o.out_len);
             } catch (const std::exception& e) {
               println(stderr, "blake3ppsum: {}: {}", f, e.what());
-              failures++;
+              failed = true;
               continue;
             }
             // A failed write is stdout's, not the file's: main() reports it.
@@ -956,7 +960,7 @@ int run_main(int argc, char** argv) {
               const line_name n = escape_name(f);
               println(stdout, "{}{}  {}", n.prefix, hex, n.text);
             } catch (const std::system_error&) {
-              failures++;
+              failed = true;
               break;
             }
           }
@@ -998,7 +1002,7 @@ int run_main(int argc, char** argv) {
       }
     } catch (const std::exception& e) {
       println(stderr, "blake3ppsum: {}", e.what());
-      failures++;
+      failed = true;
     }
     write_trace();
   } catch (const std::exception& e) {
@@ -1006,7 +1010,7 @@ int run_main(int argc, char** argv) {
     return b3tool::exit_usage;
   }
 
-  return failures == 0 ? 0 : b3tool::exit_failure;
+  return failed ? b3tool::exit_failure : 0;
 }
 
 }  // namespace
