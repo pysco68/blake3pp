@@ -96,6 +96,29 @@ inline std::size_t compress_parents_wide(const kern::kernel_ops& k,
   return num_parents;
 }
 
+// n complete chunks from input hashed to n CVs at out (LE bytes), in calls
+// of at most one leaf: 2 * simd_degree chunks, two SIMD batches, so
+// hash_many can run its dual-batch interleaved path. Every chunk this file
+// hashes goes through here.
+template <std::size_t MaxDegree = kern::max_simd_degree>
+inline void hash_chunks(const kern::kernel_ops& k, const std::uint8_t* input,
+                        std::size_t n, std::uint64_t chunk_counter,
+                        std::span<const std::uint32_t, 8> key,
+                        std::uint32_t base_flags, std::uint8_t* out) noexcept {
+  const std::size_t leaf = 2 * k.simd_degree;
+  for (std::size_t at = 0; at < n; at += leaf) {
+    const std::size_t take = std::min(leaf, n - at);
+    const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
+    for (std::size_t i = 0; i < take; ++i) {
+      chunks[i] = input + (at + i) * kern::chunk_len;
+    }
+    k.hash_many(chunks, take, kern::chunk_len / kern::block_len, key.data(),
+                chunk_counter + at, /*increment_counter=*/true, base_flags,
+                kern::flag_chunk_start, kern::flag_chunk_end,
+                out + at * kern::out_len);
+  }
+}
+
 // Parent generations over n CVs in cvs (LE bytes), lanes-wide, until at most
 // stop_at remain; next is scratch for n/2 CVs. Returns the count.
 //
@@ -164,17 +187,8 @@ inline void compress_subtree_to_cv_grouped(
   std::uint64_t groups = 0;
   for (std::size_t done = 0; done < num_chunks; done += group) {
     const std::size_t n = std::min(group, num_chunks - done);
-    for (std::size_t at = 0; at < n; at += leaf) {
-      const std::size_t take = std::min(leaf, n - at);
-      const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
-      for (std::size_t i = 0; i < take; ++i) {
-        chunks[i] = input + (done + at + i) * kern::chunk_len;
-      }
-      k.hash_many(chunks, take, kern::chunk_len / kern::block_len, key.data(),
-                  chunk_counter + done + at, /*increment_counter=*/true,
-                  base_flags, kern::flag_chunk_start, kern::flag_chunk_end,
-                  cvs + at * kern::out_len);
-    }
+    hash_chunks<MaxDegree>(k, input + done * kern::chunk_len, n,
+                           chunk_counter + done, key, base_flags, cvs);
     // The group's own parents, lanes-wide, down to its single root CV: the
     // burst this shape exists for.
     reduce_generations<MaxDegree>(k, cvs, next, n, 1, key, base_flags);
@@ -250,17 +264,8 @@ inline std::size_t compress_subtree_to_cvs_grouped(
   std::size_t written = 0;
   for (std::size_t done = 0; done < num_chunks; done += group) {
     const std::size_t n = std::min(group, num_chunks - done);
-    for (std::size_t at = 0; at < n; at += leaf) {
-      const std::size_t take = std::min(leaf, n - at);
-      const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
-      for (std::size_t i = 0; i < take; ++i) {
-        chunks[i] = input + (done + at + i) * kern::chunk_len;
-      }
-      k.hash_many(chunks, take, kern::chunk_len / kern::block_len, key.data(),
-                  chunk_counter + done + at, /*increment_counter=*/true,
-                  base_flags, kern::flag_chunk_start, kern::flag_chunk_end,
-                  cvs + at * kern::out_len);
-    }
+    hash_chunks<MaxDegree>(k, input + done * kern::chunk_len, n,
+                           chunk_counter + done, key, base_flags, cvs);
     const std::size_t left = reduce_generations<MaxDegree>(
         k, cvs, next, n, n / sub, key, base_flags);
     for (std::size_t i = 0; i < left; ++i) {
@@ -403,14 +408,8 @@ inline void compress_chunks(const kern::kernel_ops& k,
       take = std::min(
           take, wide - static_cast<std::size_t>(chunk_counter % wide));
     }
-    const std::uint8_t* chunks BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree];
-    for (std::size_t i = 0; i < take; ++i) {
-      chunks[i] = input + i * kern::chunk_len;
-    }
     std::uint8_t cvs BLAKE3PP_CXXATTR_UNINITIALIZED [2 * MaxDegree * kern::out_len];
-    k.hash_many(chunks, take, kern::chunk_len / kern::block_len, key.data(),
-                chunk_counter, /*increment_counter=*/true, base_flags,
-                kern::flag_chunk_start, kern::flag_chunk_end, cvs);
+    hash_chunks<MaxDegree>(k, input, take, chunk_counter, key, base_flags, cvs);
     // One chaining value per chunk, which leaves the caller one scalar
     // parent block per chunk: six for an 8 KiB message, around a sixth
     // of its time. Compressing those parents here as generations, one

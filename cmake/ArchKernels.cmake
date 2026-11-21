@@ -125,14 +125,15 @@ blake3pp_kernel_switch(ROT16_PER_COMPILER 1
 
 # The widest simd_degree any kernel in THIS build may have. It sizes the
 # caller-side staging buffers for hash_many batches, and with them the
-# subtree sweep's (src/core/subtree.hpp): 6528 bytes per agent at 8 where
-# 16 needs 12800 (docs/freestanding.md), which is the difference between
-# fitting an RTOS thread stack and not. The default is the ceiling
-# of every variant the project can compile; a narrower target lowers it, and
-# each kernel TU static_asserts its own degree against it, so a value too
-# low fails the build instead of overflowing a staging buffer. Not derived
-# from the registered kernels yet: an externally compiled kernel's command
-# line is fixed when it registers, before the set is known.
+# subtree sweep's (src/core/subtree.hpp): the part form's frame is 6512
+# bytes at 8 where 16 needs 12784 (docs/freestanding.md), which is the
+# difference between fitting an RTOS thread stack and not. The default is
+# the ceiling of every variant the project can compile; a narrower target
+# lowers it, and each kernel TU static_asserts its own degree against it,
+# so a value too low fails the build instead of overflowing a staging
+# buffer. Not derived from the registered kernels yet: an externally
+# compiled kernel's command line is fixed when it registers, before the
+# set is known.
 set(BLAKE3PP_MAX_SIMD_DEGREE 16 CACHE STRING
   "Widest simd_degree any compiled kernel may have (sizes the subtree staging buffers)")
 if(NOT BLAKE3PP_MAX_SIMD_DEGREE MATCHES "^(1|2|4|8|16)$")
