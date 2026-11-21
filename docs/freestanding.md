@@ -57,8 +57,8 @@ build may contain rather than the one that runs.
 default. `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
 single-leaf fold, whose staging is one batch and whose stack is the levels
 asked for. It applies to both forms of the reduction, the part form the
-agents run and the whole-subtree form a sequential caller runs; neither
-reaches the recursion, whose frame grows with the subtree's depth. Measured with g++ 16 at `-O2` on x86-64, bytes per agent:
+agents run and the whole-subtree form a sequential caller runs, and neither
+frame grows with the subtree's depth. Measured with g++ 16 at `-O2` on x86-64, bytes per agent:
 
 | `BLAKE3PP_MAX_SIMD_DEGREE` | default (group 8) | group 1 | fold, 12 levels | fold, 54 levels |
 |---|---|---|---|---|

@@ -125,10 +125,9 @@ blake3pp_kernel_switch(ROT16_PER_COMPILER 1
 
 # The widest simd_degree any kernel in THIS build may have. It sizes the
 # caller-side staging buffers for hash_many batches, and with them the
-# subtree recursion's per-level buffers (4 * degree chaining values, see
-# src/core/subtree.hpp): a build whose only kernel is scalar pays 128 bytes
-# per level where an AVX-512 build needs 2 KiB, which is the difference
-# between fitting an RTOS thread stack and not. The default is the ceiling
+# subtree sweep's (src/core/subtree.hpp): 6528 bytes per agent at 8 where
+# 16 needs 12800 (docs/freestanding.md), which is the difference between
+# fitting an RTOS thread stack and not. The default is the ceiling
 # of every variant the project can compile; a narrower target lowers it, and
 # each kernel TU static_asserts its own degree against it, so a value too
 # low fails the build instead of overflowing a staging buffer. Not derived
@@ -188,8 +187,7 @@ endif()
 
 # Opt-in: reduce a subtree one batch at a time, merging through a
 # binary-counter stack, instead of the grouped sweep the library takes by
-# default (both in src/core/subtree.hpp; neither is the old recursion, which
-# nothing reaches). The value is the stack bound in levels, so it is also the
+# default (both in src/core/subtree.hpp). The value is the stack bound in levels, so it is also the
 # working set: 12 levels is 384 bytes plus one group's staging, and ON means
 # 54, the largest subtree BLAKE3 defines. For microcontrollers: the fold
 # trades lane occupancy in the parent compressions for a working set that
