@@ -10,11 +10,11 @@
 // that fills windows in the order admission hands them out delivers the
 // same bytes at the same offsets.
 //
-// The completion half is memory_driver's queued_reads, as in the bench's
-// null_driver: a window whose bytes are already in the arena has one job
-// left, to report from poll() and not before. The fill happens where the
-// pipeline asks for the window's storage, on the driver thread, while the
-// pool hashes the windows admitted before it.
+// The completion half is queued_reads (queued_reads.hpp), as in the bench's
+// null_driver: a window whose bytes are already in the arena has one job left,
+// to report from poll() and not before. The fill happens where the pipeline
+// asks for the window's storage, on the driver thread, while the pool hashes
+// the windows admitted before it.
 //
 // Three things end a window, whichever comes first:
 //
@@ -66,6 +66,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -79,7 +80,8 @@
 #include <blake3pp/core.hpp>
 #include <blake3pp/detail/contract.hpp>
 #include <blake3pp/detail/driver.hpp>
-#include <blake3pp/detail/memory_driver.hpp>
+#include <blake3pp/detail/queued_reads.hpp>
+#include <blake3pp/detail/stream_watch.hpp>
 
 namespace blake3pp::detail {
 
@@ -96,119 +98,6 @@ using native_stream = int;
 // yet". It is BLAKE3's own message ceiling, so the geometry arithmetic
 // around it is the arithmetic a 2^64-byte file would get.
 inline constexpr std::uint64_t streaming_size = ~std::uint64_t{0};
-
-// The wait before a read of a stream that is empty: watch it for a
-// bounded, adaptive budget, then sleep.
-//
-// A template over the platform, which supplies four operations --
-//
-//   now()    the monotonic clock, in nanoseconds;
-//   probe()  whether a read would return now, without waiting;
-//   sleep()  wait until a read would return;
-//   relax()  one iteration of a busy wait;
-//
-// -- so the tests drive the loop with a scripted clock and scripted
-// arrivals and assert on what it counted, and the shipped reader
-// supplies the real ones (stream_reader.cpp). The rule can only ever
-// cost time, never a byte, so a digest test cannot see a defect in it;
-// the counters are what make its shape observable.
-//
-// The watch replaces a sleep and a wake-up with a few probes, so it pays
-// only where a probe costs less than the sleep it removes. Two platforms
-// read without it:
-//
-//   * Darwin. A zero-timeout poll() costs the caller an involuntary
-//     context switch whenever anything else is runnable, data queued or
-//     not, so the probe that opens every wait is already a loss.
-//   * Windows. PeekNamedPipe costs 1.50 us a call, and a watch built on it
-//     lost every one of 42 counterbalanced pairs.
-//
-// Such a platform skips wait() entirely rather than running it with a
-// zero budget (stream_reader.cpp carries the measurements).
-//
-// The budget moves in steps of an eighth of the ceiling and never jumps:
-// a probe that finds data grows it, a budget that times out is halved,
-// and a sleep that a full-ceiling watch would have avoided grows it.
-// Eight consecutive hits re-arm a fully decayed budget. A smaller step
-// notices a producer that speeds up more slowly. A step as large as the
-// ceiling pays a full wasted watch on every long gap of a producer whose
-// gaps straddle the ceiling; measured, that rule lost 5% to a reader that
-// only sleeps. The floor is one probe interval: the smallest budget that
-// still makes one probe before the sleep.
-//
-// The ceiling is 16 us and the watch is paced to one probe per
-// microsecond, so a full budget is sixteen probes and a write is noticed
-// at most a microsecond late. Measured on Linux against probe intervals
-// of 4 and 16 us, 1 us was the fastest at 4 KiB producer writes and level
-// at 512-byte ones.
-//
-// This is the only clock in the stream path, and it decides nothing the
-// hasher can see: it chooses how the thread waits, watching or sleeping,
-// for the same readiness. Nothing here ends a window.
-//
-// One instance per reader, touched only by the thread that owns the
-// driver; a reader shared between threads would race here.
-class stream_watch {
- public:
-  static constexpr std::int64_t ceiling_ns = 16 * 1000;
-  static constexpr std::int64_t probe_interval_ns = 1000;
-  static constexpr std::int64_t step_ns = ceiling_ns / 8;
-  static constexpr std::int64_t floor_ns = probe_interval_ns;
-
-  // What the waits did. `probes` counts every probe, the one each wait
-  // opens with included; `caught` the waits a probe ended; `slept` the
-  // waits that reached the sleep.
-  struct counters {
-    std::uint64_t probes = 0;
-    std::uint64_t caught = 0;
-    std::uint64_t slept = 0;
-  };
-
-  // Returns once a read would return something. May throw whatever the
-  // platform's probe or sleep throws.
-  template <class Platform>
-  void wait(Platform& p) {
-    ++stats_.probes;
-    if (p.probe()) {
-      return;
-    }
-    const std::int64_t t0 = p.now();
-    const std::int64_t budget = budget_;
-    std::int64_t last_probe = t0;
-    for (;;) {
-      std::int64_t t = p.now();
-      while (t - last_probe < probe_interval_ns) {
-        p.relax();
-        t = p.now();
-      }
-      last_probe = t;
-      ++stats_.probes;
-      if (p.probe()) {
-        budget_ = std::min(ceiling_ns, budget + step_ns);
-        ++stats_.caught;
-        return;
-      }
-      // The probe before the budget: a budget of one interval makes
-      // exactly one probe, as the floor promises.
-      if (t - t0 >= budget) {
-        break;
-      }
-    }
-    budget_ = std::max(floor_ns, budget / 2);
-    p.sleep();
-    ++stats_.slept;
-    if (p.now() - t0 < ceiling_ns) {
-      budget_ = std::min(ceiling_ns, budget + step_ns);
-    }
-  }
-
-  [[nodiscard]] std::int64_t budget() const noexcept { return budget_; }
-  [[nodiscard]] const counters& stats() const noexcept { return stats_; }
-
- private:
-  std::int64_t budget_ = ceiling_ns;
-  counters stats_{};
-};
 
 #if defined(_WIN32)
 // The bound on a read's ask, learned from what the reads return.
@@ -507,9 +396,10 @@ class basic_pipe_driver {
   [[nodiscard]] window_storage window_storage_for(file&, unsigned slot,
                                                   std::uint64_t,
                                                   std::size_t bytes) {
-    require(slot < windows_ && bytes <= window_bytes_,
-            "pipe_driver::window_storage_for(): a window outside the "
-            "reserved geometry");
+    const std::span<std::byte> slice = window_slice(
+        std::span<std::byte>(arena_).first(
+            static_cast<std::size_t>(windows_) * window_bytes_),
+        slot, window_bytes_, bytes);
     // The bytes carried from the previous window open this one, so it
     // must have room for them. The grid never asks for less: a flush
     // leaves at least two quanta of the ask, and the carry is at most
@@ -517,8 +407,6 @@ class basic_pipe_driver {
     require(bytes >= carry_len_,
             "pipe_driver::window_storage_for(): a window shorter than the "
             "bytes the previous one carried");
-    const std::span<std::byte> slice{
-        arena_.data() + static_cast<std::size_t>(slot) * window_bytes_, bytes};
     const std::size_t got = fill(slice);
     return {{}, std::span<const std::byte>(slice.first(got))};
   }

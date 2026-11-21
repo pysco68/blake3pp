@@ -53,10 +53,8 @@ A budget that is not a multiple of 32 bytes, or that holds fewer than two
 parts, does not compile.
 
 The budget covers that table and nothing else. Each part is reduced on
-the agent that took it, by a recursion holding one chaining-value buffer
-per level, so the agent threads need stack of their own. The two costs
-pull against each other: a smaller budget makes each part larger, which
-makes that recursion deeper.
+the agent that took it, in a fixed staging area that does not grow with
+the part, so the agent threads need stack of their own.
 [Freestanding and RTOS builds](../../docs/freestanding.md) works the
 numbers through.
 

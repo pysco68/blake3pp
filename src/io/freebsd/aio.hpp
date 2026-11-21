@@ -52,6 +52,7 @@
 
 #include "io/fd.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/lanes.hpp"
 #include "io/options.hpp"
 #include "io/waiter.hpp"
@@ -64,30 +65,45 @@ namespace blake3pp::detail::io_impl {
 // print: a kernel without the facility (the sysctl tree is not there) and
 // a per-process queue closed by the administrator are otherwise
 // indistinguishable in bench output.
+inline constexpr std::string_view aio_eagain_suffix = " [aio: EAGAIN]";
+inline constexpr std::string_view aio_enosys_suffix =
+    " [aio: ENOSYS, no kernel AIO]";
+inline constexpr std::string_view aio_errno_prefix = " [aio: errno ";
+inline constexpr std::string_view kqueue_errno_prefix = " [kqueue: errno ";
+// A direct descriptor the filesystem would not serve (see direct_serves()).
+inline constexpr std::string_view direct_einval_suffix = " [direct: EINVAL]";
+
 inline std::string no_aio_suffix(int err) {
   switch (err) {
     case EAGAIN:
       // vfs.aio.max_aio_queue_per_proc is zero: the facility is there and
       // will take nothing, which is what a refused lio_listio reports.
-      return " [aio: EAGAIN]";
+      return std::string(aio_eagain_suffix);
     case ENOSYS:
-      return " [aio: ENOSYS, no kernel AIO]";
+      return std::string(aio_enosys_suffix);
     default:
-      return " [aio: errno " + std::to_string(err) + "]";
+      return std::string(aio_errno_prefix) + std::to_string(err) + "]";
   }
 }
 
 // The same for the completion queue itself: without a kqueue there is
 // nowhere for a completion to arrive, whatever the AIO limits say.
 inline std::string no_kqueue_suffix(int err) {
-  return " [kqueue: errno " + std::to_string(err) + "]";
+  return std::string(kqueue_errno_prefix) + std::to_string(err) + "]";
 }
+
+// The longest reason either gives, its errno at the widest.
+inline constexpr std::size_t no_aio_suffix_max =
+    std::max({aio_eagain_suffix.size(), aio_enosys_suffix.size(),
+              aio_errno_prefix.size() + int_text_max + 1,
+              kqueue_errno_prefix.size() + int_text_max + 1});
 
 // What the kernel will let this process keep queued at once, or zero when
 // the facility is absent. Read once per context: the batch below is cut
 // to what is still free, so the per-process limit never turns a flush
-// into a refusal the backend has to unpick.
-[[nodiscard]] inline int aio_queue_limit(int& why) noexcept {
+// into a refusal the backend has to unpick. The sysctl is an int; the
+// count comes back in the type the queue arithmetic uses.
+[[nodiscard]] inline std::size_t aio_queue_limit(int& why) noexcept {
   int limit = 0;
   std::size_t len = sizeof limit;
   if (::sysctlbyname("vfs.aio.max_aio_queue_per_proc", &limit, &len, nullptr,
@@ -99,7 +115,7 @@ inline std::string no_kqueue_suffix(int err) {
     why = EAGAIN;
     return 0;
   }
-  return limit;
+  return static_cast<std::size_t>(limit);
 }
 
 // How many aiocbs one lio_listio may carry. AIO_LISTIO_MAX is the
@@ -256,7 +272,7 @@ class aio_engine {
     }
     use_aio_ = true;
     batch_.resize(std::min<std::size_t>(
-        aio_listio_max(), static_cast<std::size_t>(queue_limit_)));
+        aio_listio_max(), queue_limit_));
     // What one wait can hand back: a completion for every slot, its
     // continuation, and the wake.
     events_.resize(std::size_t{2} * max_inflight + 2);
@@ -524,15 +540,16 @@ class aio_engine {
   // observable API.
   [[nodiscard]] std::string name_for(bool direct, bool write,
                                      bool direct_refused) const {
-    const char* const sync_name = write ? "pwrite" : "pread";
-    std::string n = use_aio_ ? (direct ? "aio+direct" : "aio")
-                             : (direct ? std::string(sync_name) + "+direct"
-                                       : std::string(sync_name));
+    std::string n(
+        engine_token(use_aio_ ? io_engine::aio : io_engine::posix_sync, write));
+    if (direct) {
+      n += direct_tag;
+    }
     if (async_requested_ && !use_aio_) {
       n += refusal_;
     }
     if (direct_refused) {
-      n += " [direct: EINVAL]";
+      n += direct_einval_suffix;
     }
     return n;
   }
@@ -578,9 +595,7 @@ class aio_engine {
   // The transfers stay queued until the kernel's answer says which of
   // them it took.
   [[nodiscard]] std::size_t fill_batch() noexcept {
-    const std::size_t room =
-        static_cast<std::size_t>(queue_limit_) -
-        std::min<std::size_t>(issued_, static_cast<std::size_t>(queue_limit_));
+    const std::size_t room = queue_limit_ - std::min(issued_, queue_limit_);
     const std::size_t cap = std::min(batch_.size(), room);
     std::size_t n = 0;
     for (transfer_part* op = pending_.front(); op != nullptr && n < cap;
@@ -680,7 +695,7 @@ class aio_engine {
   }
 
   unique_fd kq_;
-  int queue_limit_ = 0;
+  std::size_t queue_limit_ = 0;
   std::string refusal_;  // why the queue was not had, or empty
   std::vector<struct aiocb*> batch_;
   std::vector<struct kevent> events_;
@@ -704,6 +719,16 @@ using aio_context = completion_context<aio_engine>;
 // without this a drifting backend wouldn't be diagnosed until an engine
 // instantiation in some other TU; this makes the header self-checking.
 static_assert(io_context<aio_context>);
+
+// The longest read name aio_engine::name_for() gives, counted generously:
+// the longest rung, why AIO was refused, and the refused direct
+// descriptor, as though all three could meet.
+inline constexpr std::size_t aio_read_name_max =
+    longest_of({engine_token(io_engine::aio, false),
+                engine_token(io_engine::posix_sync, false)}) +
+    direct_tag.size() + no_aio_suffix_max + direct_einval_suffix.size();
+static_assert(aio_read_name_max <= max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 }  // namespace blake3pp::detail::io_impl
 

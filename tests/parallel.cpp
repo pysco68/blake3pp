@@ -594,6 +594,14 @@ TEST_CASE("the traced compress stage computes the same chaining value") {
   CHECK(std::get<0>(*a) == std::get<0>(*b));
   CHECK(traced.pt.active.load() > 0);
   CHECK(traced.pt.busy_ns.load() > 0);
+#if defined(__linux__) || defined(__FreeBSD__) || defined(_WIN32)
+  // Where the platform can say which CPU an agent ran on, every record
+  // says it.
+  REQUIRE_FALSE(buf.agents().empty());
+  for (const agent_record& r : buf.agents()) {
+    CHECK(r.cpu != ~std::uint32_t{0});
+  }
+#endif
 }
 
 TEST_CASE("a scheduler that completes stopped is reported, not read") {

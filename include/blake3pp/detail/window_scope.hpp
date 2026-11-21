@@ -109,7 +109,7 @@ struct pipeline_window {
   // device counters driver_stats reports are differences of this and
   // the landing, and a counter that only worked for a tracing caller
   // would be a different pipeline from the one everyone else runs.
-  std::int64_t t_read_begin = 0;
+  trace_clock::time_point t_read_begin{};
   // The pool's free list and the scope's list of what it currently
   // holds. A window is on exactly one of them, never both.
   pipeline_window* next_free = nullptr;
@@ -312,7 +312,7 @@ class read_instruments {
                : 0);
       w.rec->slot = w.slot;
       w.rec->file = file_index_;
-      w.rec->t_wait_begin = w.t_read_begin - trace_->epoch_ns();
+      w.rec->t_wait_begin = w.t_read_begin;
     }
   }
 
@@ -327,10 +327,10 @@ class read_instruments {
   // a reducer node.
   void stalled() noexcept { ++admission_stalls_; }
 
-  // The read landed at `t`, on steady_clock.
-  void landed(Window& w, std::int64_t t) noexcept {
+  // The read landed at `t`.
+  void landed(Window& w, trace_clock::time_point t) noexcept {
     if (w.rec != nullptr) {
-      w.rec->t_ready = t - trace_->epoch_ns();
+      w.rec->t_ready = t;
     }
   }
 
@@ -355,7 +355,8 @@ class read_instruments {
     agent_busy_ns_.fetch_add(busy, std::memory_order_relaxed);
     if (w.rec != nullptr) {
       w.rec->t_joined = trace_->now();
-      w.rec->agent_busy_ns = busy;
+      w.rec->agent_busy = std::chrono::nanoseconds{
+          static_cast<std::chrono::nanoseconds::rep>(busy)};
       w.rec->agents_active =
           w.compress.pt.active.load(std::memory_order_relaxed);
       w.rec->flags |= window_record::flag_parallel;
@@ -384,14 +385,19 @@ class read_instruments {
     }
   }
 
-  // The counters this owns, into the trace's driver_stats. After the
-  // run, with every agent joined.
+  // The counters this owns, merged into the trace's driver_stats: counts
+  // add and peaks keep the larger, so a batch's files over one buffer
+  // report all of them. After the run, with every agent joined.
   void report(driver_stats& d) const noexcept {
-    d.admission_stalls = admission_stalls_;
-    d.max_pending = max_pending_;
-    d.max_reads_in_flight = max_reading_;
-    d.max_windows_in_flight = max_windows_;
-    d.agent_busy_ns = agent_busy_ns_.load(std::memory_order_relaxed);
+    d.admission_stalls += admission_stalls_;
+    d.max_pending = std::max<std::uint64_t>(d.max_pending, max_pending_);
+    d.max_reads_in_flight =
+        std::max<std::uint64_t>(d.max_reads_in_flight, max_reading_);
+    d.max_windows_in_flight =
+        std::max<std::uint64_t>(d.max_windows_in_flight, max_windows_);
+    d.agent_busy += std::chrono::nanoseconds{
+        static_cast<std::chrono::nanoseconds::rep>(
+            agent_busy_ns_.load(std::memory_order_relaxed))};
   }
 
  private:
@@ -649,11 +655,16 @@ class window_scope
     if (trace_buffer* const trace = inst_.trace(); trace != nullptr) {
       driver_stats& d = trace->driver();
       // The rung is the file's, which closes with the run: copied here so a
-      // trace read afterwards still names it.
-      set_read_backend(d, file_.name());
+      // trace read afterwards still names it. Several runs into one buffer
+      // (a batch's files) merge their counts, and the first file names the
+      // rung.
+      if (read_backend(d).empty()) {
+        set_read_backend(d, file_.name());
+      }
       inst_.report(d);
       d.queue_depth_final = reads_in_flight_;
-      d.queue_depth_peak = reads_in_flight_;
+      d.queue_depth_peak =
+          std::max<std::uint64_t>(d.queue_depth_peak, reads_in_flight_);
       transfers_.report(d, loop_.driver());
     }
     if (eptr_) {
@@ -1095,7 +1106,7 @@ class window_scope
   // the count against its cap would be false wherever the rest is true,
   // and the counter would stay at zero on every run.
   void note_pool_wait() noexcept {
-    transfers_.starved(pool_.empty() && !stop_requested() &&
+    transfers_.starved_now(pool_.empty() && !stop_requested() &&
                        !planner_.exhausted() &&
                        reading_ < reads_in_flight_);
   }
@@ -1161,7 +1172,7 @@ class window_scope
     // window where it names it, because the window's length is what the
     // subtrees are planned from and a stream only knows the length once
     // it has the bytes. One clock read per window either way.
-    w.t_read_begin = steady_now_ns();
+    w.t_read_begin = steady_now();
     window_geometry g = planner_.next_geometry();
     const window_storage storage =
         loop_.driver().window_storage_for(file_, w.slot, g.offset, g.bytes);
@@ -1299,7 +1310,8 @@ class window_scope
   void read_landed(window& w) noexcept {
     w.view_ready = true;
     release_read_slot(w);
-    inst_.landed(w, transfers_.land(w.t_read_begin, w.bytes));
+    inst_.landed(w, transfers_.land(loop_.driver(), w.op, w.t_read_begin,
+                                    w.bytes));
   }
 
   void release_read_slot(window& w) noexcept {

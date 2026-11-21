@@ -50,7 +50,8 @@ void update_file(hasher& h, const std::filesystem::path& path,
   for (;;) {
     // The wait is timed before the record is claimed: the last next()
     // returns nothing, and that iteration gets no record.
-    const std::int64_t t_wait_begin = trace ? trace->now() : 0;
+    const trace_clock::time_point t_wait_begin =
+        trace ? trace->now() : trace_clock::time_point{};
     auto w = reader.next();
     if (!w) {
       break;

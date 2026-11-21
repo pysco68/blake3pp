@@ -6,6 +6,8 @@
 // progress the completion engines and their lanes share.
 // Internal to src/io/, never installed.
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -38,17 +40,26 @@ struct transfer_base {
 // that performs transfers derives its transfer from this; transfer_base
 // is the part the driver and the callbacks see.
 struct performed_transfer : transfer_base {
+  // A reading of the clock the charges are taken against, as the
+  // duration since its epoch they add and subtract.
+  [[nodiscard]] static std::chrono::nanoseconds at(
+      std::chrono::steady_clock::time_point t) noexcept {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        t.time_since_epoch());
+  }
+
   // The device's own time over this transfer, summed over the pieces it
   // was carried in, and the error the performer saw.
   //
   // One accumulator and no start stamp: beginning a piece subtracts the
   // clock and ending it adds the clock back, so what is left is the sum
-  // of the stretches. Eight bytes instead of sixteen keeps the Windows
-  // union inside io_op's storage.
+  // of the stretches. While a piece is out the charge is the negative of
+  // its start, which a duration's signed count holds. Eight bytes instead
+  // of sixteen keeps the Windows union inside io_op's storage.
   void device_begin() noexcept {
     if (!charging) {
       charging = true;
-      device_ns -= steady_now_ns();
+      device_charge -= at(steady_now());
     }
   }
   // Ends the charge, whether the piece landed or was taken back unsent.
@@ -57,14 +68,28 @@ struct performed_transfer : transfer_base {
   void device_end() noexcept {
     if (charging) {
       charging = false;
-      device_ns += steady_now_ns();
+      device_charge += at(steady_now());
     }
   }
   // What the device had this transfer for, for device_time::add(). Valid
   // once no piece is outstanding, which is what reporting a transfer
   // means.
-  [[nodiscard]] std::uint64_t device_total_ns() const noexcept {
-    return device_ns > 0 ? static_cast<std::uint64_t>(device_ns) : 0;
+  [[nodiscard]] std::chrono::nanoseconds device_total() const noexcept {
+    return std::max(device_charge, std::chrono::nanoseconds::zero());
+  }
+
+  // The same trick for the wait for a lane: the pump subtracts the clock
+  // it read when it queued a piece and adds the one it read when a lane
+  // took it, so what is left is the summed wait. Valid once no piece is
+  // queued.
+  void lane_queued(std::chrono::steady_clock::time_point now) noexcept {
+    lane_charge -= at(now);
+  }
+  void lane_taken(std::chrono::steady_clock::time_point now) noexcept {
+    lane_charge += at(now);
+  }
+  [[nodiscard]] std::chrono::nanoseconds lane_wait_total() const noexcept {
+    return std::max(lane_charge, std::chrono::nanoseconds::zero());
   }
 
   // The performer's result, as four bytes and a flag instead of the
@@ -88,13 +113,15 @@ struct performed_transfer : transfer_base {
   // Back to the state a fresh submit starts from. Called where a backend
   // arms a transfer, since one operation serves transfer after transfer.
   void reset_performance() noexcept {
-    device_ns = 0;
+    device_charge = {};
+    lane_charge = {};
     result_value = 0;
     charging = false;
     result_is_system = false;
   }
 
-  std::int64_t device_ns = 0;
+  std::chrono::nanoseconds device_charge{};
+  std::chrono::nanoseconds lane_charge{};
   std::int32_t result_value = 0;
   bool charging = false;          // a piece is outstanding
   bool result_is_system = false;  // the category of result_value

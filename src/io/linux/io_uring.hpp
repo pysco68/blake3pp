@@ -41,6 +41,7 @@
 
 #include "io/fd.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/options.hpp"
 #include "io/waiter.hpp"
 #include "io/completion_context.hpp"
@@ -62,19 +63,33 @@ inline int sys_io_uring_enter(int ring_fd, unsigned to_submit,
 // tools print: "blocked by policy" (Android's seccomp filter, EPERM) and
 // "kernel too old" (ENOSYS) are otherwise indistinguishable in bench
 // output.
+// A ring that submits on the calling thread (offload_submit off).
+inline constexpr std::string_view uring_inline_note = " (inline submit)";
+
+inline constexpr std::string_view uring_eperm_suffix =
+    " [io_uring: EPERM, blocked by policy]";
+inline constexpr std::string_view uring_enosys_suffix =
+    " [io_uring: ENOSYS, kernel too old]";
+inline constexpr std::string_view uring_errno_prefix = " [io_uring: errno ";
+
 inline std::string no_uring_suffix(int err) {
   switch (err) {
     case EPERM:
-      return " [io_uring: EPERM, blocked by policy]";
+      return std::string(uring_eperm_suffix);
     case ENOSYS:
       // Either io_uring_setup is absent (pre-5.1) or the ring came up
       // without the read/write opcodes this backend needs (pre-5.6); both
       // are the same answer to a caller: this kernel cannot serve it.
-      return " [io_uring: ENOSYS, kernel too old]";
+      return std::string(uring_enosys_suffix);
     default:
-      return " [io_uring: errno " + std::to_string(err) + "]";
+      return std::string(uring_errno_prefix) + std::to_string(err) + "]";
   }
 }
+
+// The longest no_uring_suffix(), its errno at the widest.
+inline constexpr std::size_t no_uring_suffix_max =
+    std::max(longest_of({uring_eperm_suffix, uring_enosys_suffix}),
+             uring_errno_prefix.size() + int_text_max + 1);
 
 // The ring is memory the kernel mapped and writes into, so no C++ object
 // was ever created in it, while the accesses below want a T there: an
@@ -766,13 +781,13 @@ class uring_engine {
   // tools print it, so the spellings, their order and the suffixes are
   // observable API.
   [[nodiscard]] std::string name_for(bool direct, bool write) const {
-    const char* const sync_name = write ? "pwrite" : "pread";
-    std::string n = use_uring_
-                        ? (direct ? "io_uring+direct" : "io_uring")
-                        : (direct ? std::string(sync_name) + "+direct"
-                                  : std::string(sync_name));
+    std::string n(engine_token(
+        use_uring_ ? io_engine::io_uring : io_engine::posix_sync, write));
+    if (direct) {
+      n += direct_tag;
+    }
     if (use_uring_ && !offload_) {
-      n += " (inline submit)";
+      n += uring_inline_note;
     }
     if (async_requested_ && !use_uring_ && ring_.setup_errno != 0) {
       n += no_uring_suffix(ring_.setup_errno);
@@ -838,6 +853,17 @@ using uring_context = completion_context<uring_engine>;
 // without this a drifting backend wouldn't be diagnosed until an engine
 // instantiation in some other TU; this makes the header self-checking.
 static_assert(io_context<uring_context>);
+
+// The longest read name uring_engine::name_for() gives: the ring with the
+// inline-submit note, or the synchronous rung and why the ring was
+// refused.
+inline constexpr std::size_t uring_read_name_max =
+    std::max(engine_token(io_engine::io_uring, false).size() +
+                 direct_tag.size() + uring_inline_note.size(),
+             engine_token(io_engine::posix_sync, false).size() +
+                 direct_tag.size() + no_uring_suffix_max);
+static_assert(uring_read_name_max <= max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
 }  // inline namespace test_seams

@@ -9,6 +9,7 @@
 // a read that comes back short of its ask is how it learns the stream
 // ran dry: the queue is empty, so a full pipe is never left undrained.
 
+#include <blake3pp/detail/cpu_relax.hpp>
 #include <blake3pp/detail/pipe_driver.hpp>
 
 #include <algorithm>
@@ -27,34 +28,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
 #endif
 
 namespace {
-
-// One iteration of a busy wait: tells the core it is spinning where the
-// ISA has a way to say so.
-//
-// On AArch64 the hint is `isb`, an instruction synchronisation barrier
-// used for its latency rather than its ordering: `yield` is the hint the
-// architecture names for this, but it is a no-op on most implementations
-// and spins at full rate, and `wfe` waits for an event the producer never
-// sends and so could sleep until the next timer tick. `isb` drains the
-// pipeline, which costs a few tens of cycles and nothing else, and is
-// what Rust's std::hint::spin_loop emits on AArch64 for the same reason.
-#if !defined(_WIN32)
-inline void cpu_relax() noexcept {
-#if defined(__x86_64__) || defined(__i386__)
-  _mm_pause();
-#elif defined(__aarch64__)
-  asm volatile("isb" ::: "memory");
-#else
-  asm volatile("" ::: "memory");
-#endif
-}
-#endif
 
 }  // namespace
 
@@ -266,10 +242,12 @@ namespace {
 
 struct posix_watch_platform {
   int fd;
-  [[nodiscard]] std::int64_t now() const noexcept { return steady_now_ns(); }
+  [[nodiscard]] std::chrono::steady_clock::time_point now() const noexcept {
+    return steady_now();
+  }
   [[nodiscard]] bool probe() const { return readable(fd, 0); }
   void sleep() const { (void)readable(fd, -1); }
-  void relax() const noexcept { cpu_relax(); }
+  void relax() const noexcept { blake3pp::detail::cpu_relax(); }
 };
 
 }  // namespace

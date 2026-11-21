@@ -17,7 +17,8 @@
 //     and the ring is preferred.
 //
 // The two names are what the backends' own name_for() builds a rung
-// name from, read side and write side (src/io/*_backend.hpp). They are
+// name from, read side and write side, through engine_token() in
+// src/io/ladder.hpp. They are
 // API: `file_io_probe::backend` and `write_report::backend` have always
 // been spelled this way, and to_string() says the same words from this
 // table. A backend may decorate the name -- "+direct", "+nocache",

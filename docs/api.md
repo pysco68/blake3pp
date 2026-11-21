@@ -551,8 +551,9 @@ nothing to take, and the slowest part sets the finish time.
 If the agents' frames are the problem, two build settings cut them:
 `BLAKE3PP_SUBTREE_GROUP=1` stages one chunk batch per burst instead of
 eight, and `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
-single-leaf fold, whose frame is a 32-byte chaining value per level plus one
-leaf's staging (3152 bytes at 12 levels and degree 16). Both cost throughput, and
+single-leaf fold, whose frame is a 32-byte chaining value per level plus
+one leaf's staging (2384 bytes for the whole-subtree form at 12 levels and
+degree 16, against 14480 for the sweep). Both cost throughput, and
 `BLAKE3PP_MAX_SIMD_DEGREE` scales every figure with the widest kernel the
 build carries. The measured frames and a worked Zephyr case are in
 [Freestanding and RTOS builds](freestanding.md#stack-requirements).

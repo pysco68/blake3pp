@@ -33,6 +33,7 @@
 
 #include "io/fd.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/lanes.hpp"
 #include "io/options.hpp"
 #include "io/completion_context.hpp"
@@ -287,11 +288,10 @@ class gcd_engine {
   // The degradation strings are observable API, so the synchronous rung
   // keeps the spellings the other backends use.
   [[nodiscard]] std::string name_for(bool direct, bool write) const {
-    const char* const sync_name = write ? "pwrite" : "pread";
-    const char* const fast_name = write ? "gcd-write" : "gcd";
-    std::string n = use_gcd_ ? fast_name : sync_name;
+    std::string n(
+        engine_token(use_gcd_ ? io_engine::gcd : io_engine::posix_sync, write));
     if (direct) {
-      n += "+nocache";
+      n += nocache_tag;
     }
     return n;
   }
@@ -344,6 +344,13 @@ using gcd_context = completion_context<gcd_engine>;
 
 // Definition-site conformance check (see linux/io_uring.hpp).
 static_assert(io_context<gcd_context>);
+
+// The longest read name gcd_engine::name_for() gives.
+static_assert(longest_of({engine_token(io_engine::gcd, false),
+                          engine_token(io_engine::posix_sync, false)}) +
+                      nocache_tag.size() <=
+                  max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
 }  // inline namespace test_seams

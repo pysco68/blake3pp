@@ -117,7 +117,7 @@ class budget {
 // arena reading separate from it. So the two candidates share the same
 // windows and the reading is which of them held them longer.
 //
-// starved_ns is not printed on either side. Reading, it counts "no free
+// starved is not printed on either side. Reading, it counts "no free
 // window", which a run whose pool is the constraint spends most of its
 // wall clock in, so it is not the pool-starvation measure it reads like.
 // Writing, it is only counted where the depth is at least the
@@ -144,8 +144,8 @@ void report_write_diagnosis(const blake3pp::diagnosis& r, unsigned threads) {
   println(stderr,
           "  device         {} per window over {} writes (min {}), holding "
           "{:5.1f}% of the windows, {} at a time",
-          service_label(r.mean_service_ns), r.transfers,
-          service_label(static_cast<double>(r.min_service_ns)),
+          service_label(r.mean_service), r.transfers,
+          service_label(r.min_service),
           100.0 * r.device_busy, r.device_depth);
   // Where the engine holds fewer than the pipeline queued, the windows
   // line above is not what the device answered.
@@ -153,7 +153,7 @@ void report_write_diagnosis(const blake3pp::diagnosis& r, unsigned threads) {
     println(stderr,
             "                 ({} of those {} windows could be at the device "
             "at once, and each write waited {} for a slot)",
-            r.device_depth, r.depth, service_label(r.mean_lane_wait_ns));
+            r.device_depth, r.depth, service_label(r.mean_lane_wait));
   }
   switch (r.label) {
     case blake3pp::bottleneck::generator:
@@ -349,13 +349,11 @@ int run_main(int argc, char** argv) {
         wopts.trace = &*trace;
       }
       if (!trace_path.empty()) {
-        const std::size_t window =
-            blake3pp::detail::rounded_window_bytes(wopts.window_bytes);
-        const std::size_t windows =
-            static_cast<std::size_t>((total + window - 1) / window) + 1;
-        window_records.resize(windows);
+        const std::uint64_t windows =
+            b3tool::trace_windows(total, wopts.window_bytes);
+        window_records.resize(b3tool::trace_storage(windows));
         if (trace_agents) {
-          agent_records.resize(windows);
+          agent_records.resize(b3tool::trace_storage(windows));
         }
         trace.emplace(std::span{window_records}, std::span{agent_records});
         wopts.trace = &*trace;
@@ -371,9 +369,7 @@ int run_main(int argc, char** argv) {
             blake3pp::fill(r, out);
           },
           pool.scheduler(), wopts);
-      const double wall_ns = std::chrono::duration<double, std::nano>(
-                                 std::chrono::steady_clock::now() - t0)
-                                 .count();
+      const auto wall = std::chrono::steady_clock::now() - t0;
       if (verbose) {
         println(stderr, "blake3ppgen: write backend: {} (pipeline)",
                 report.backend);
@@ -381,13 +377,14 @@ int run_main(int argc, char** argv) {
       if (diag) {
         report_write_diagnosis(
             blake3pp::diagnose_write(
-                trace->driver(), wall_ns, threads,
+                trace->driver(), wall, threads,
                 blake3pp::detail::rounded_window_bytes(wopts.window_bytes)),
             threads);
       }
       if (trace && !trace_path.empty()) {
         if (b3tool::write_chrome_trace(trace_path, *trace, "blake3ppgen",
-                                       threads, /*write_side=*/true)) {
+                                       threads, /*write_side=*/true,
+                                       report.backend)) {
           println(stderr, "blake3ppgen: trace: {} window records{}, JSON to {}",
                   trace->windows().size(),
                   trace_agents ? std::format(" and {} agent records",

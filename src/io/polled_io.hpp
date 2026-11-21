@@ -172,7 +172,7 @@ class polled_reader {
                                     .ioring = opts.ioring},
              qd_),
         file_(ctx_, std::forward<FileArgs>(file_args)...) {
-    num_windows_ = (file_.size() + window_ - 1) / window_;
+    num_windows_ = ceil_div(file_.size(), window_);
     const std::uint64_t initial = std::min<std::uint64_t>(qd_, num_windows_);
     for (unsigned s = 0; s < initial; ++s) {
       assign(s);

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -286,6 +287,7 @@ class deferred_pump {
       lanes_.start(&lane_body, &lane_unblock, this);
     }
     accrue();
+    op.lane_queued(since_);  // the clock accrue() just read
     queue_.push(op);
     ++queued_;
     if (!lanes_.running()) {
@@ -318,6 +320,7 @@ class deferred_pump {
       }
       op = queue_.take();
       accrue();
+      op->lane_taken(since_);
       --queued_;
       cancelled = op->cancelled;
     }
@@ -434,12 +437,12 @@ class deferred_pump {
   // Summed time transfers spent queued here waiting for a lane, with none
   // of the device in it: the measure of too few lanes, as opposed to a
   // device that is the wall.
-  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
+  [[nodiscard]] std::chrono::nanoseconds lane_wait() const noexcept {
     const std::lock_guard<std::mutex> lock(m_);
     // Whatever is queued right now has been waiting since the last
     // change, and a caller reading this at the end of a run has usually
     // just drained: accrue that stretch too rather than losing it.
-    return lane_wait_ns_ + waiting_since_change();
+    return lane_wait_ + waiting_since_change();
   }
 
  private:
@@ -486,6 +489,7 @@ class deferred_pump {
         }
         op = queue_.take();
         accrue();
+        op->lane_taken(since_);
         --queued_;
         cancelled = op->cancelled;
         ++busy_;
@@ -505,22 +509,25 @@ class deferred_pump {
 
   // What everything currently queued has waited since the length last
   // changed. Under the lock.
-  [[nodiscard]] std::uint64_t waiting_since_change() const noexcept {
+  [[nodiscard]] std::chrono::nanoseconds waiting_since_change() const noexcept {
     if (queued_ == 0) {
-      return 0;
+      return {};
     }
-    const std::int64_t d = steady_now_ns() - since_;
-    return d > 0 ? static_cast<std::uint64_t>(d) * queued_ : 0;
+    const std::chrono::nanoseconds d = steady_now() - since_;
+    return d > std::chrono::nanoseconds::zero()
+               ? d * static_cast<std::int64_t>(queued_)
+               : std::chrono::nanoseconds::zero();
   }
 
   // Little's law, kept incrementally: the summed wait of every transfer
   // that passes through the queue is the integral of the queue's length
-  // over time. So one clock read per change of length is enough and no
-  // transfer needs a stamp of its own. Under the lock, before the length
-  // changes.
+  // over time, so one clock read per change of length gives the
+  // context's total. Each transfer's own share is charged on the
+  // transfer from the same reads (lane_queued(), lane_taken()). Under
+  // the lock, before the length changes.
   void accrue() noexcept {
-    lane_wait_ns_ += waiting_since_change();
-    since_ = steady_now_ns();
+    lane_wait_ += waiting_since_change();
+    since_ = steady_now();
   }
 
   mutable std::mutex m_;
@@ -531,8 +538,8 @@ class deferred_pump {
   perform_fn perform_;
   std::size_t queued_ = 0;
   std::size_t busy_ = 0;
-  std::uint64_t lane_wait_ns_ = 0;
-  std::int64_t since_ = 0;
+  std::chrono::nanoseconds lane_wait_{};
+  std::chrono::steady_clock::time_point since_{};
   // Declared last of the state they touch, and joined by its own
   // destructor before any of it goes.
   io_lanes lanes_;

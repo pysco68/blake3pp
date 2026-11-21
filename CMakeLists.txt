@@ -193,6 +193,8 @@ add_library(blake3pp STATIC
   # the file-I/O layer, so a BLAKE3PP_WITH_IO=OFF build still offers it
   # to a caller with counters of its own.
   src/diagnosis.cpp
+  # The platform's answer to which CPU a thread is on, for agent records.
+  src/trace.cpp
   src/dispatch/dispatch.cpp
   src/dispatch/cpu_detect_x86.cpp
   src/dispatch/cpu_detect_arm.cpp

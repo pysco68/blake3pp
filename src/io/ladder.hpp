@@ -36,8 +36,13 @@
 // Internal to src/io/, never installed.
 
 #include <blake3pp/io.hpp>
+#include <blake3pp/trace.hpp>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
+#include <initializer_list>
+#include <string_view>
 
 namespace blake3pp::detail::io_impl {
 
@@ -107,5 +112,43 @@ struct win_sync_rung {
   static constexpr io_engine rung_engine = io_engine::win_sync;
   using rung_below = void;
 };
+
+// A rung's name is what driver_stats::read_backend records, so every
+// engine bounds the read names it can produce and asserts the bound at
+// compile time against max_read_backend_length. A refusal reason may
+// print a number; these are the widest each kind prints.
+inline constexpr std::size_t int_text_max = 11;  // -2147483648
+inline constexpr std::size_t u32_text_max = 10;  // 4294967295
+
+// The longest of a set of names.
+[[nodiscard]] constexpr std::size_t longest_of(
+    std::initializer_list<std::string_view> names) noexcept {
+  std::size_t n = 0;
+  for (const std::string_view s : names) {
+    n = std::max(n, s.size());
+  }
+  return n;
+}
+
+// An engine's token as io_engine.def spells it for one direction: the
+// part of a rung name the table owns, and what to_string() prints. A
+// backend's name_for() starts from it and appends the decorations below
+// and its own reasons; its bound measures the same pieces.
+[[nodiscard]] constexpr std::string_view engine_token(io_engine e,
+                                                      bool write) noexcept {
+  switch (e) {
+#define BLAKE3PP_IO_ENGINE(enumerator, read_name, write_name, rank, async) \
+  case io_engine::enumerator:                                            \
+    return write ? std::string_view(write_name) : std::string_view(read_name);
+#include <blake3pp/detail/io_engine.def>
+#undef BLAKE3PP_IO_ENGINE
+  }
+  return {};
+}
+
+// The cache bypass engaged: a second O_DIRECT or NO_BUFFERING descriptor,
+// or Darwin's F_NOCACHE on the one.
+inline constexpr std::string_view direct_tag = "+direct";
+inline constexpr std::string_view nocache_tag = "+nocache";
 
 }  // namespace blake3pp::detail::io_impl

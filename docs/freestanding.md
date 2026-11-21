@@ -56,35 +56,65 @@ build may contain rather than the one that runs.
 `BLAKE3PP_SUBTREE_GROUP` is how many chunk batches one burst stages, 8 by
 default. `BLAKE3PP_SUBTREE_FOLD=<levels>` replaces the sweep with the
 single-leaf fold, whose staging is one batch and whose stack is the levels
-asked for. It applies to both forms of the reduction, the part form the
-agents run and the whole-subtree form a sequential caller runs; neither
-reaches the recursion, whose frame grows with the subtree's depth. Measured with g++ 16 at `-O2` on x86-64, bytes per agent:
+asked for. It applies to both forms of the reduction, and neither frame
+grows with the subtree's depth.
 
-| `BLAKE3PP_MAX_SIMD_DEGREE` | default (group 8) | group 1 | fold, 12 levels | fold, 54 levels |
+The reduction has two forms. The part form,
+`compress_subtree_to_cvs_grouped`, reduces a part to the chaining values
+the engine folds afterwards; the whole-subtree form,
+`compress_subtree_to_cv_grouped`, reduces a subtree to one. Their frames,
+measured with g++ 16.0.1 at `-O2` on x86-64 Linux (`-fstack-usage` on
+`src/blake3pp.cpp`), in bytes:
+
+| `BLAKE3PP_MAX_SIMD_DEGREE` | form | default (group 8) | group 1 | fold, 12 levels |
 |---|---|---|---|---|
-| 16 (default) | 12800 | 2016 | 3152 | 4496 |
-| 8 | 6528 | 1120 | 1872 | 3216 |
-| 1 | 1056 | 1056 | 768 | 2112 |
+| 16 (default) | part | 12784 | 2032 | 2032 |
+| | whole subtree | 14480 | 3728 | 2384 |
+| 8 | part | 6512 | 1136 | 1136 |
+| | whole subtree | 8208 | 2832 | 1488 |
+| 1 | part | 1024 | 352 | 352 |
+| | whole subtree | 2736 | 2064 | 720 |
 
-A thread that hashes **sequentially** pays the same kind of frame, for the
-whole-subtree form of the reduction rather than the part form: 14496 bytes
-at degree 16, 8224 at 8, and 2752 on a scalar build, falling to 736 with
-`BLAKE3PP_SUBTREE_FOLD=12`.
+The fold at 54 levels is the group 1 build, the same functions; each level
+below 54 takes 32 bytes off the whole-subtree frame and nothing off the
+part form, which has no stack. On the scalar builds with group 1 or the
+fold, g++ inlines the part form into its caller `compress_subtree_cvs`,
+and the cell is that caller's frame.
 
-Two consequences follow when sizing a thread. `stack_budget` moves no
-stack between the two sides: it bounds the caller's part table, and the
-agents' frames are what the table above says whatever the parts' size. And
-the cheapest agent on a small device is the fold, which is what it exists
-for.
+What a thread pays:
+
+- An agent reducing a part of a full window runs the part form, and under
+  it the whole-subtree form whenever one of the part's output chaining
+  values covers a whole group: a part of at least
+  2 · group · `simd_degree`² chunks for the running kernel's `simd_degree`,
+  which is 4096 chunks at 16 lanes, 1024 at 8, and every part on a scalar
+  kernel (16 chunks at the default group, 2 at group 1 or the fold). The
+  agent that completes a group of parts then folds their chaining values,
+  in `fold_sibling_cvs_wide`, after its own part: 3488 bytes at degree 16,
+  1824 at 8 and 368 at 1.
+- An agent reducing a part of an end window, or of a message that fits in
+  one window, runs the whole-subtree form alone.
+- A thread that hashes **sequentially** runs the whole-subtree form under
+  `compress_chunks`, which stages one chunk batch's chaining values: 1456
+  bytes at degree 16, 816 at 8, and 320 at 1, where it is inlined into
+  `hasher::update`.
+
+The kernel's `hash_many` frame and the scheduler's own frames come on top
+of all three.
+
+Two consequences follow when sizing a thread. `stack_budget` bounds the
+caller's part table, and a part's size changes an agent's frame only
+through the nesting above, never through the depth of the tree. And the
+cheapest agent on a small device is the fold, which is what it exists for.
 
 A worked case, a Zephyr port: a scalar-only build
 (`BLAKE3PP_MAX_SIMD_DEGREE=1`) hashing 1 MiB with `stack_budget{1024}`, so
-32 parts of 32 chunks. The caller needs 1 KiB for the table and each agent
-1056 bytes, or 768 with `BLAKE3PP_SUBTREE_FOLD=12`.
+parts of 32 chunks. The caller needs 1 KiB for the table. The message fits
+one window, so each agent runs the whole-subtree form: 2736 bytes, or 720
+with `BLAKE3PP_SUBTREE_FOLD=12`. A longer message's full windows cost an
+agent both forms, 1024 + 2736 bytes, or 352 + 720 with the fold.
 
 These are one toolchain's frames; another compiler, ABI or optimization
-level will differ. Measure yours the same way, by building the library
-with `-fstack-usage` and reading the `.su` entries for
-`compress_subtree_to_cvs_grouped` and `compress_subtree_to_cv_grouped`
-(with the fold on, both are the same functions with one leaf per burst),
-and leave the thread its own headroom on top.
+level will differ. Measure yours the same way: compile `src/blake3pp.cpp`
+with `-fstack-usage`, read the `.su` entries for the functions named
+above, and leave the thread its own headroom on top.

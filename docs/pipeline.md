@@ -59,7 +59,7 @@ schedule(sched) | bulk(par, parts, compress_one_part) | then(fold)
 Starting that only enqueues onto the caller's scheduler. Every part, and
 the fold behind the bulk, then run on an agent of that scheduler, so the
 driver's share of a window's compute is one enqueue. With a trace buffer
-set, `driver_stats::busy_ns` against `parked_ns` is where a provider that
+set, `driver_stats::busy` against `parked` is where a provider that
 ran the bulk on the starting thread would show up instead. On the captures in
 [Performance tracing](tracing.md) the driver is busy 0.6% of its own time on
 a read-limited file run, and 4.0% on a compute-bound one whose 32 pool

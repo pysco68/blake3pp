@@ -72,11 +72,17 @@ PUBLIC = ["include/blake3pp/detail/contract.hpp",
           "include/blake3pp/detail/pipeline_plan.hpp",
           "include/blake3pp/detail/file_reader.hpp",
           "include/blake3pp/detail/file_writer.hpp",
-          # The stream driver and the completion half it borrows. They are
-          # pasted here, not left to the parallel block's stripped
-          # includes: update_stream() is the one entry point there whose
-          # definition is compiled, and a reader who enabled the provider
-          # would otherwise reach it as a link error.
+          # The memory and stream drivers, with the completion half they
+          # share (queued_reads and its waiter), the stream's watch, and
+          # the spin hint src/io/stream_reader.cpp uses. They are pasted
+          # here, not left to the parallel block's stripped includes:
+          # update_stream() is the one entry point there whose definition
+          # is compiled, and a reader who enabled the provider would
+          # otherwise reach it as a link error.
+          "include/blake3pp/detail/waiter.hpp",
+          "include/blake3pp/detail/queued_reads.hpp",
+          "include/blake3pp/detail/stream_watch.hpp",
+          "include/blake3pp/detail/cpu_relax.hpp",
           "include/blake3pp/detail/memory_driver.hpp",
           "include/blake3pp/detail/pipe_driver.hpp",
           "include/blake3pp/io.hpp"]

@@ -65,6 +65,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -242,8 +243,8 @@ class completion_context {
   [[nodiscard]] unsigned device_depth() const noexcept {
     return engine_.device_depth(used_engine_, pump_.depth());
   }
-  [[nodiscard]] std::uint64_t lane_wait_ns() const noexcept {
-    return pump_.lane_wait_ns();
+  [[nodiscard]] std::chrono::nanoseconds lane_wait() const noexcept {
+    return pump_.lane_wait();
   }
   [[nodiscard]] device_time device() const noexcept { return device_; }
 
@@ -474,7 +475,7 @@ class completion_context {
   // Every callback runs from here, which is what poll() counts: a
   // remainder moved to the pump is still owed, and is not one.
   void complete(transfer& op, std::error_code ec) noexcept {
-    device_.add_if_served(op.device_total_ns());
+    device_.add_if_served(op.device_total());
     engine_.release(op);
     in_flight_ -= std::min<std::size_t>(1, in_flight_);
     op.owner_file->inflight_ -=

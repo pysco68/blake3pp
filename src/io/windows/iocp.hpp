@@ -36,6 +36,7 @@
 
 #include "io/completion_context.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/options.hpp"
 #include "io/windows/file.hpp"
 
@@ -248,11 +249,12 @@ class iocp_engine {
   // spellings and suffixes are fixed.
   [[nodiscard]] std::string name_for(bool direct, bool overlapped,
                                      bool write) const {
-    const char* const sync_name = write ? "writefile" : "readfile";
-    if (overlapped) {
-      return direct ? "iocp+direct" : "iocp";
+    std::string n(engine_token(
+        overlapped ? io_engine::iocp : io_engine::win_sync, write));
+    if (direct) {
+      n += direct_tag;
     }
-    return direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
+    return n;
   }
 
  private:
@@ -303,6 +305,15 @@ using iocp_context = completion_context<iocp_engine>;
 // with the missed requirement named, the first time MSVC compiles this
 // header, before any engine instantiation exists.
 static_assert(io_context<iocp_context>);
+
+// The longest read name iocp_engine::name_for() gives. A port that stands
+// in for a refused ring adds the ring's reason (windows/engine.hpp).
+inline constexpr std::size_t iocp_read_name_max =
+    longest_of({engine_token(io_engine::iocp, false),
+                engine_token(io_engine::win_sync, false)}) +
+    direct_tag.size();
+static_assert(iocp_read_name_max <= max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
 }  // inline namespace test_seams

@@ -9,6 +9,7 @@
 #if defined(__unix__) || defined(__APPLE__)
 
 #include <cassert>
+#include <string>
 #include <string_view>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +17,7 @@
 
 #include "io/fd.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/options.hpp"
 #include "io/sync_context.hpp"
 #include "io/posix/file.hpp"
@@ -45,15 +47,14 @@ class pread_source {
     if (how.direct_io) {
       f_.try_odirect(path.c_str(), (write_ ? O_WRONLY : O_RDONLY) | O_CLOEXEC);
     }
+    name_ = engine_token(rung_engine, write_);
+    if (f_.direct()) {
+      name_ += direct_tag;
+    }
   }
 
   [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-  [[nodiscard]] std::string_view name() const noexcept {
-    if (write_) {
-      return f_.direct() ? "pwrite+direct" : "pwrite";
-    }
-    return f_.direct() ? "pread+direct" : "pread";
-  }
+  [[nodiscard]] std::string_view name() const noexcept { return name_; }
 
   void read_at(std::uint64_t off, std::span<std::byte> buf) {
     f_.pread_all(f_.sync_fd(buf.size()), buf, off);
@@ -73,12 +74,19 @@ class pread_source {
   posix_file f_;
   std::uint64_t size_ = 0;
   bool write_ = false;
+  std::string name_;
 };
 
 using pread_context = sync_context<pread_source>;
 
 // Definition-site conformance check (see linux/io_uring.hpp).
 static_assert(io_context<pread_context>);
+
+// The longest read name pread_source::name() gives.
+static_assert(engine_token(pread_source::rung_engine, false).size() +
+                      direct_tag.size() <=
+                  max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 }  // namespace blake3pp::detail::io_impl
 

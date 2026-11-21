@@ -54,9 +54,14 @@ if(BLAKE3PP_WITH_IO)
     # pair reproduces the linkage defect they guard.
     provider_linkage.cpp provider_linkage_tu2.cpp)
 endif()
+# tooling/ for the device model the bench's null driver and the tests'
+# drivers share (modelled_device.hpp), which needs neither <format> nor
+# CLI11, so the include path rather than the blake3pp::tooling target,
+# which exists only where those do.
 target_include_directories(blake3pp_tests PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}/generated"
-  "${PROJECT_SOURCE_DIR}/src")
+  "${PROJECT_SOURCE_DIR}/src"
+  "${PROJECT_SOURCE_DIR}/tooling")
 # A sanitized build runs the reducer's property cases tens of times
 # slower, to the point where one case takes minutes and a timeout can no
 # longer tell a stall from work. Those lanes run a prefix of the same

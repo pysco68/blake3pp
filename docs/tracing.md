@@ -73,7 +73,9 @@ auto s = blake3pp::async::async_update_file(ctx, h, path, sched, {},
 
 `async_update_files` takes the same argument and fills one buffer with
 every file's windows; each record's `index` is the window's position in
-its own file.
+its own file. Its `driver_stats` cover the batch: each file's counts are
+added, peaks keep the largest, and `read_backend` names the first file's
+rung. A buffer reused without `clear()` merges the same way.
 
 Per-agent records are opt-in, by giving the buffer a second span. One
 bulk invocation is at most one record per thread per window, which sizes
@@ -93,10 +95,12 @@ can come out short. `clear()` forgets the records but keeps the epoch, so
 a tool that runs several reps into one buffer can still compare
 timestamps across them.
 
-Timestamps are nanoseconds on `std::chrono::steady_clock` relative to the
-buffer's construction, so a difference is a duration. `epoch_ns()` gives
-that zero as absolute `steady_clock` nanoseconds (`CLOCK_MONOTONIC` on
-Linux) for joining with timestamps another tool took on the same clock.
+Every instant is a `blake3pp::trace_clock::time_point`, which is
+`std::chrono::steady_clock` (`CLOCK_MONOTONIC` on Linux), and absolute, so
+it joins with timestamps another tool took on the same clock; every span
+is a `std::chrono::nanoseconds`. A difference of two instants is a
+duration. `epoch()` is the buffer's construction, a zero a reader may
+measure from, which is what the Chrome trace writer does.
 
 ### What it costs
 
@@ -136,7 +140,7 @@ The rest describes the window:
 |---|---|
 | `index` | position within this call, from 0 |
 | `bytes` | bytes in the window |
-| `agent_busy_ns` | summed over the agents that took part: nanoseconds compressing |
+| `agent_busy` | summed over the agents that took part: nanoseconds compressing |
 | `agents_active` | bulk invocations that compressed at least one part |
 | `slot` | which window object carried it — the track its phases belong on when several are in flight; 0 on the sequential path, which has one |
 | `file` | the file's index in a many-files operation (`async_update_files`), which fills one buffer with every file's windows; 0 for a single file |
@@ -148,11 +152,12 @@ One piece of a window's work on one agent. For a bulk invocation over
 the window's parts: which window and file, when it started (`t_begin`),
 how long it was busy, how many parts it took, the shortest and longest of
 those parts, the chunks per part, and the CPU it was on at `t_begin`
-(`sched_getcpu()` on Linux, `UINT32_MAX` where the platform cannot say).
+(`sched_getcpu()` on Linux and FreeBSD, processor group × 64 + number on
+Windows, `UINT32_MAX` where the platform cannot say).
 Bytes compressed is `parts * part_chunks * chunk_size`, which over
-`busy_ns` is that invocation's effective rate. A record with `parts == 0`
+`busy` is that invocation's effective rate. A record with `parts == 0`
 is the fold of the window's chaining values, which runs on the agent
-that finished the bulk last, and its `busy_ns` is the fold's own time; on
+that finished the bulk last, and its `busy` is the fold's own time; on
 the write side a record is one window's fill. In the Chrome trace each
 of these is a slice on its CPU's lane, named `compress`, `fold` or
 `fill`, with a flow arrow from the window's compute phase on the
@@ -166,8 +171,8 @@ thread is the bottleneck.
 
 | field | meaning |
 |---|---|
-| `busy_ns` | outside a blocking poll: submitting, reaping, running completions, inserting into the reducer |
-| `parked_ns` | inside a blocking poll, waiting for a read or for a window to come back |
+| `busy` | outside a blocking poll: submitting, reaping, running completions, inserting into the reducer |
+| `parked` | inside a blocking poll, waiting for a read or for a window to come back |
 | `iterations` | times round the loop |
 | `polls`, `blocking_polls` | `poll()` calls, and those of them that blocked |
 | `wakes` | blocking polls released without a completion of their own: a thread handing a finished window back. One per window is the expected shape |
@@ -177,39 +182,39 @@ thread is the bottleneck.
 | `max_reads_in_flight` | the most reads submitted and not yet landed: what the device saw |
 | `max_windows_in_flight` | the most windows reading, on the pool or waiting to reduce |
 | `transfers_landed`, `transfer_bytes` | windows whose transfer landed, and the bytes they moved |
-| `device_wait_ns` | summed per-window time the device had the transfer, stamped by whoever performed it; where the driver cannot attribute (memory, a stream), the admission-to-landing span |
-| `starved_ns` | the pipeline unable to use a window it already held: reading, no free window; writing, nothing to write |
+| `device_wait` | summed per-window time the device had the transfer, stamped by whoever performed it; where the driver cannot attribute (memory, a stream), the admission-to-landing span |
+| `starved` | the pipeline unable to use a window it already held: reading, no free window; writing, nothing to write |
 | `queue_depth_final`, `queue_depth_peak` | the depth the run ended on and the deepest it reached |
-| `agent_busy_ns` | summed over every window and agent: the pool compressing on a read run, filling on a write one |
-| `device_wait_min_ns` | the shortest of those per-transfer times: the device with nothing queued ahead of it |
+| `agent_busy` | summed over every window and agent: the pool compressing on a read run, filling on a write one |
+| `device_wait_min` | the shortest of those per-transfer times: the device with nothing queued ahead of it |
 | `device_depth` | the most transfers the engine could have at the device at once: the queue depth on an asynchronous engine, the I/O threads on the synchronous rung (one on Windows); 0 where the driver cannot say |
-| `lane_wait_ns` | time transfers waited for one of those I/O threads before they started; nonzero only where those threads served transfers |
+| `lane_wait` | time transfers waited for one of those I/O threads before they started; nonzero only where those threads served transfers |
 | `read_backend` | the rung the reads engaged, through `read_backend(d)` |
 
 The four transfer counters are kept on every run, traced or not, and a
 write run fills them as a read run does. They cost two clock reads per
-window. `agent_busy_ns` is collected the same way -- for a buffer with no
+window. `agent_busy` is collected the same way -- for a buffer with no
 window storage at all -- because the pool's busy share is the hash side's
 answer to the question the device counters answer for the device, and a
 caller may want it without paying for one record per window. It costs one
 relaxed add per window on a read run, and two clock reads and an add on a
 write one.
 
-`starved_ns` is NOT a measure of how starved the pool was on a read run.
+`starved` is NOT a measure of how starved the pool was on a read run.
 It counts "bytes left and no free window", which can only fire where the
 arena is no wider than the queue depth, and it fires there even when the
-run is purely hash-limited: a 64 MiB x depth 16 arm at 96% `agent_busy_ns`
+run is purely hash-limited: a 64 MiB x depth 16 arm at 96% `agent_busy`
 still showed 1.33 s of it. Read it as "the arena is not wider than the
-depth" and use `agent_busy_ns` for the hash side. Writing, it is the clean
+depth" and use `agent_busy` for the hash side. Writing, it is the clean
 signal it reads like, because there the windows in flight are the
 generator's parallelism.
 
-`parked_ns` sums waiting for a transfer and waiting for a window. That
+`parked` sums waiting for a transfer and waiting for a window. That
 answers "is the driver the bottleneck" and neither end on its own, so
-`device_wait_ns` and `starved_ns` separate the two.
+`device_wait` and `starved` separate the two.
 
-`device_wait_ns / transfers_landed` is the device's mean per-window
-latency. Against `device_wait_min_ns` the same mean says how queued the
+`device_wait / transfers_landed` is the device's mean per-window
+latency. Against `device_wait_min` the same mean says how queued the
 device was: a mean at the depth times the minimum is a queue that was full
 for the run, and a mean at the minimum is a device that served every
 transfer alone and had capacity to spare. The absolute latency says
@@ -219,8 +224,9 @@ by construction.
 `queue_depth_final` is the geometry to pass back as `queue_depth` to
 repeat a run.
 
-Fields are appended to `driver_stats`, never inserted, because a caller
-may read it out of a build it did not compile.
+The layout of `driver_stats` is not stable before 1.0: fields may be
+added, widened or moved between versions, so read them by name, through
+the build that wrote the record.
 
 `read_backend(d)` is how the read side's degradation becomes visible to a
 caller: `"io_uring+direct"` when everything was granted, `"io_uring"` when
@@ -230,7 +236,7 @@ lists the rungs.
 
 ## How to read a run
 
-**`busy_ns` against `parked_ns` is the first question.** A driver parked
+**`busy` against `parked` is the first question.** A driver parked
 most of the run has room for more work and the limit is elsewhere; a busy
 driver *is* the limit.
 
@@ -242,7 +248,7 @@ of their lives queued behind the device.
 
 **Agent records answer "which core".** Aggregated per CPU, bytes over busy
 time is an effective rate, and the run's min, median and max of it
-separate a slow core from a slow run. A large `max_part_ns / min_part_ns`
+separate a slow core from a slow run. A large `max_part / min_part`
 on one invocation is preemption or a cache-cold part, not a slow core.
 Cores that only arrive after the part counter is drained produce no
 records at all.
@@ -264,11 +270,10 @@ blake3pp::trace_buffer trace(windows);
 
 const auto t0 = std::chrono::steady_clock::now();
 blake3pp::update_file(h, path, {.trace = &trace});
-const double wall_ns = std::chrono::duration<double, std::nano>(
-    std::chrono::steady_clock::now() - t0).count();
+const auto wall = std::chrono::steady_clock::now() - t0;
 
 const blake3pp::diagnosis d = blake3pp::diagnose_read(
-    trace.driver(), wall_ns, threads, planned_windows, window_bytes);
+    trace.driver(), wall, threads, planned_windows, window_bytes);
 std::println("{}", blake3pp::to_string(d.label));
 ```
 
@@ -475,9 +480,9 @@ below is from `--null-source 1 --trace-agents` on the same machine:
 
 | process | track | holds |
 |---|---|---|
-| `pid` 0, "driver" | `tid` 0, "driver loop" | one event over the whole run, carrying `driver_stats` in `args` |
+| `pid` 0, "driver" | `tid` 0, "driver loop" | one event over the whole run, carrying `driver_stats` in `args`, and on a write run the backend that wrote it as `write_backend` |
 | `pid` 1, "pipeline, by window object" | `tid` = `slot`, "window object" | the `wait`, `hash`, `absorb` and `release` events of every window that object carried |
-| `pid` 2, "pool agents, by cpu" | `tid` = cpu (99 unknown), "cpu" | one `compress`, `fold` or `fill` event per agent record, with its parts and part extremes, and an "agents busy" counter |
+| `pid` 2, "pool agents, by cpu" | `tid` = cpu, "cpu"; records whose cpu is unknown on the lane after the highest, "cpu unknown" | one `compress`, `fold` or `fill` event per agent record, with its parts and part extremes, and an "agents busy" counter |
 
 Windows go on the track of the window object that carried them rather
 than on one shared track, so several in flight read as parallel lanes
@@ -490,8 +495,9 @@ empty lanes. `ts` and `dur` are microseconds, as the format wants.
 
 ### Pairing with perf
 
-The records and `perf` share `CLOCK_MONOTONIC`, and the JSON's top-level
-`epoch_ns` is the records' zero on that clock:
+The records and `perf` share `CLOCK_MONOTONIC`: a record's instants are
+that clock's own, and the JSON's top-level `epoch_ns` is the zero its `ts`
+values count from:
 
 ```bash
 perf record -k CLOCK_MONOTONIC -e cycles --call-graph lbr -- \
@@ -499,7 +505,8 @@ perf record -k CLOCK_MONOTONIC -e cycles --call-graph lbr -- \
 perf script -F time,cpu,ip,sym
 ```
 
-A sample at time `T` seconds belongs to the window whose interval covers
-`T * 1e9 - epoch_ns`, and to the agent record with the same `cpu` whose
-`[t_begin, t_begin + busy_ns)` covers it. No probes or markers are
-involved; the join is by time and CPU alone.
+A sample at time `T` belongs to the window whose interval covers `T`, and
+to the agent record with the same `cpu` whose `[t_begin, t_begin + busy)`
+covers it. In the JSON, the window is the one whose `ts` interval covers
+`T * 1e6 - epoch_ns / 1e3`. No probes or markers are involved; the join
+is by time and CPU alone.

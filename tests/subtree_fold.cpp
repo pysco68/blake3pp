@@ -1,9 +1,12 @@
-// The three subtree reductions must be computationally identical: the
-// recursion that holds a CV buffer per level, the grouped sweep the library
-// uses by default, and the single-leaf fold a tight target opts into
-// (src/core/subtree.hpp). Every compiled kernel runs all three over every
-// subtree size the engine can hand them, since the group size follows the
-// kernel's simd_degree and the interesting sizes are the ones around it.
+// The subtree reductions in src/core/subtree.hpp -- the grouped sweep the
+// library uses by default and the single-leaf fold a tight target opts
+// into -- must produce the tree the spec defines. They are checked against
+// an oracle that shares none of their code: every block through the scalar
+// kernel's compress_in_place, the chunk state and parent nodes of the
+// serial hasher, and the tree built pairwise by recursion. Every
+// available kernel runs over every subtree size the engine can hand it,
+// since the group size follows the kernel's simd_degree and the
+// interesting sizes are the ones around it.
 //
 // The same file covers detail::fold_sibling_cvs, which takes the other way
 // in: the parallel engine hashes a window's parts separately, and the fold
@@ -112,8 +115,56 @@ void check_fold(const blake3pp::kern::kernel_ops* ops, std::size_t part,
   CHECK(folded == whole);
 }
 
+// The oracle: a subtree's CV from one compress_in_place per block, on the
+// scalar kernel whatever kernel is under test, and the parents built
+// pairwise. No hash_many anywhere, which is what every reduction under
+// test is made of.
+[[nodiscard]] std::array<std::uint32_t, 8> serial_subtree_cv(
+    const std::uint8_t* input, std::size_t chunks, std::uint64_t counter,
+    std::span<const std::uint32_t, 8> key, std::uint32_t flags) {
+  const blake3pp::kern::kernel_ops& scalar =
+      *blake3pp::detail::resolve(blake3pp::arch::scalar);
+  std::array<std::uint32_t, 8> cv{};
+  if (chunks == 1) {
+    blake3pp::detail::chunk_state cs{};
+    blake3pp::core::chunk_init(cs, key, counter);
+    blake3pp::core::chunk_update(scalar, cs, input, blake3pp::kern::chunk_len,
+                                 flags);
+    blake3pp::core::chaining_value(scalar,
+                                   blake3pp::core::chunk_output(cs, flags), cv);
+    return cv;
+  }
+  const std::size_t half = chunks / 2;
+  const auto left = serial_subtree_cv(input, half, counter, key, flags);
+  const auto right =
+      serial_subtree_cv(input + half * blake3pp::kern::chunk_len, half,
+                        counter + half, key, flags);
+  blake3pp::core::chaining_value(
+      scalar, blake3pp::core::parent_output(left, right, key, flags), cv);
+  return cv;
+}
+
+// What a part reduction stopped at `stop` must hand back: the CVs of
+// equal adjacent subtrees, min(chunks, stop, 2 * simd_degree) of them --
+// a stop past the kernel's last full-width generation gets that one.
+[[nodiscard]] std::vector<std::array<std::uint32_t, 8>> serial_part_cvs(
+    const blake3pp::kern::kernel_ops& ops, const std::uint8_t* input,
+    std::size_t chunks, std::uint64_t counter,
+    std::span<const std::uint32_t, 8> key, std::uint32_t flags,
+    std::size_t stop) {
+  const std::size_t parts =
+      std::min(chunks, std::min(stop, 2 * ops.simd_degree));
+  const std::size_t sub = chunks / parts;
+  std::vector<std::array<std::uint32_t, 8>> cvs;
+  for (std::size_t i = 0; i < parts; ++i) {
+    cvs.push_back(serial_subtree_cv(input + i * sub * blake3pp::kern::chunk_len,
+                                    sub, counter + i * sub, key, flags));
+  }
+  return cvs;
+}
+
 // One part reduction at a chosen burst size, trimmed to the CV count the
-// recursion produced for the same stop.
+// oracle gives for the same stop.
 template <std::size_t Leaves>
 [[nodiscard]] std::vector<std::array<std::uint32_t, 8>> reduce_part(
     const blake3pp::kern::kernel_ops& ops,
@@ -131,7 +182,7 @@ template <std::size_t Leaves>
 
 TEST_SUITE("subtree_fold") {
 
-TEST_CASE("the three reductions agree on every kernel and size") {
+TEST_CASE("the reductions agree with the oracle on every kernel and size") {
   const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
   // available_arches(), not compiled_arches(): resolve() hands back a
   // fallback table for a variant this CPU cannot run, so iterating the
@@ -147,23 +198,26 @@ TEST_CASE("the three reductions agree on every kernel and size") {
     for (std::size_t chunks = 2; chunks <= 2048; chunks *= 2) {
       CAPTURE(chunks);
       const auto data = pattern(chunks * blake3pp::chunk_size);
-      // A non-zero counter and a mode flag travel through both paths: the
+      // A non-zero counter and a mode flag travel through every path: the
       // counter feeds every chunk's compression, the flag every node's.
       for (const std::uint64_t counter : {std::uint64_t{0}, std::uint64_t{64}}) {
         CAPTURE(counter);
-        std::array<std::uint32_t, 8> from_recursion{};
-        std::array<std::uint32_t, 8> from_fold{};
-        std::array<std::uint32_t, 8> from_group{};
-        blake3pp::core::compress_subtree_to_cv_recursive(
-            *ops, data.data(), chunks, counter, key, 0, from_recursion);
-        // The fold: the sweep with one leaf per burst, which a
-        // BLAKE3PP_SUBTREE_FOLD build selects.
-        blake3pp::core::compress_subtree_to_cv_grouped<1>(
-            *ops, data.data(), chunks, counter, key, 0, from_fold);
-        blake3pp::core::compress_subtree_to_cv_grouped<>(
-            *ops, data.data(), chunks, counter, key, 0, from_group);
-        CHECK(from_fold == from_recursion);
-        CHECK(from_group == from_recursion);
+        for (const std::uint32_t flags :
+             {std::uint32_t{0}, std::uint32_t{blake3pp::kern::flag_keyed_hash}}) {
+          CAPTURE(flags);
+          const auto expected =
+              serial_subtree_cv(data.data(), chunks, counter, key, flags);
+          std::array<std::uint32_t, 8> from_fold{};
+          std::array<std::uint32_t, 8> from_group{};
+          // The fold: the sweep with one leaf per burst, which a
+          // BLAKE3PP_SUBTREE_FOLD build selects.
+          blake3pp::core::compress_subtree_to_cv_grouped<1>(
+              *ops, data.data(), chunks, counter, key, flags, from_fold);
+          blake3pp::core::compress_subtree_to_cv_grouped<>(
+              *ops, data.data(), chunks, counter, key, flags, from_group);
+          CHECK(from_fold == expected);
+          CHECK(from_group == expected);
+        }
       }
     }
   }
@@ -181,9 +235,7 @@ TEST_CASE("every group size reduces to the same CV") {
     for (std::size_t chunks = 2; chunks <= 512; chunks *= 2) {
       CAPTURE(chunks);
       const auto data = pattern(chunks * blake3pp::chunk_size);
-      std::array<std::uint32_t, 8> expected{};
-      blake3pp::core::compress_subtree_to_cv_recursive(
-          *ops, data.data(), chunks, 7, key, 0, expected);
+      const auto expected = serial_subtree_cv(data.data(), chunks, 7, key, 0);
       std::array<std::uint32_t, 8> g1{};
       std::array<std::uint32_t, 8> g4{};
       std::array<std::uint32_t, 8> g64{};
@@ -201,9 +253,9 @@ TEST_CASE("every group size reduces to the same CV") {
 }
 
 // The part-shaped reduction, which stops several CVs short of the root:
-// the sweep and the recursion have to agree CV for CV at every stop, since
-// the engine folds those CVs across parts afterwards and a different split
-// of the same tree would still hash to the same root while handing the fold
+// it has to agree with the oracle CV for CV at every stop, since the
+// engine folds those CVs across parts afterwards and a different split of
+// the same tree would still hash to the same root while handing the fold
 // something else.
 TEST_CASE("the part reductions agree at every stop") {
   const std::array<std::uint32_t, 8> key = blake3pp::kern::iv;
@@ -219,34 +271,26 @@ TEST_CASE("the part reductions agree at every stop") {
       // kernel's lanes leaves.
       for (std::size_t stop = 1; stop <= 64; stop *= 2) {
         CAPTURE(stop);
-        // How many CVs a stop leaves is the reduction's own business (a
-        // stop past the last wide level gets that level), so the counts
-        // are compared with each other, not with a formula.
-        std::vector<std::array<std::uint32_t, 8>> recursive(64);
+        const auto expected =
+            serial_part_cvs(*ops, data.data(), chunks, 11, key, 0, stop);
         std::vector<std::array<std::uint32_t, 8>> grouped(64);
         // The third shape is what a BLAKE3PP_SUBTREE_FOLD build selects:
         // the sweep with one leaf per burst and the switch's level count
         // as its stack bound. It has to agree too, since a part's CVs
         // reach the same tree whichever build produced them.
         std::vector<std::array<std::uint32_t, 8>> folded(64);
-        const std::size_t n_rec =
-            blake3pp::core::compress_subtree_to_cvs_recursive(
-                *ops, data.data(), chunks, 11, key, 0, recursive, stop);
         const std::size_t n_grp =
             blake3pp::core::compress_subtree_to_cvs_grouped<>(
                 *ops, data.data(), chunks, 11, key, 0, grouped, stop);
         const std::size_t n_fold =
             blake3pp::core::compress_subtree_to_cvs<12>(
                 *ops, data.data(), chunks, 11, key, 0, folded, stop);
-        REQUIRE(n_grp == n_rec);
-        REQUIRE(n_fold == n_rec);
-        CHECK(n_rec >= 1);
-        CHECK(n_rec <= std::min(chunks, stop));
-        recursive.resize(n_rec);
+        REQUIRE(n_grp == expected.size());
+        REQUIRE(n_fold == expected.size());
         grouped.resize(n_grp);
         folded.resize(n_fold);
-        CHECK(grouped == recursive);
-        CHECK(folded == recursive);
+        CHECK(grouped == expected);
+        CHECK(folded == expected);
       }
     }
   }
@@ -266,10 +310,9 @@ TEST_CASE("every group size reduces a part the same way") {
       const auto data = pattern(chunks * blake3pp::chunk_size);
       for (const std::size_t stop : {std::size_t{2}, std::size_t{16}}) {
         CAPTURE(stop);
-        std::vector<std::array<std::uint32_t, 8>> expected(64);
-        const std::size_t n = blake3pp::core::compress_subtree_to_cvs_recursive(
-            *ops, data.data(), chunks, 3, key, 0, expected, stop);
-        expected.resize(n);
+        const auto expected =
+            serial_part_cvs(*ops, data.data(), chunks, 3, key, 0, stop);
+        const std::size_t n = expected.size();
         for (const auto& got : {reduce_part<1>(*ops, data, chunks, stop, key, n),
                                 reduce_part<4>(*ops, data, chunks, stop, key, n),
                                 reduce_part<64>(*ops, data, chunks, stop, key,

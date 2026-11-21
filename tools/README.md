@@ -10,6 +10,7 @@ not here.
 | Script | Purpose |
 | --- | --- |
 | `tc` | Run a CMake preset inside its per-compiler toolchain image (`tools/tc <preset>`, `tools/tc --shell <preset>`, `tools/tc --list`). |
+| `toolchain-images.txt` | Which toolchain image builds each preset, read by `tc` and `gen-environments.py`. |
 | `gen-toolchains.py` | Regenerate the CMake toolchain files under `cmake/toolchains/` for the whole matrix. |
 | `gen-environments.py` | Regenerate the cmake-re environment files next to the toolchain files, keyed by the toolchain image tag. |
 | `preset-args.py` | Print the configure arguments a CMake preset stands for, for tools that do not read presets (cmake-re). |

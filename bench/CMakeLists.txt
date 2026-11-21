@@ -98,6 +98,39 @@ if(TARGET blake3pp_bench_file)
     COMMAND blake3pp_bench_file --make 8 --reps 1 --cooldown 0 --threads 2)
 endif()
 
+# Sizes and device models past what the code can represent are refused
+# with the option's diagnostic before anything is allocated or run; each
+# of these used to crash or sleep for ever. A test passes only on the
+# diagnostic, so a crash or a hang fails it. The first MiB count past
+# size_t's range depends on the width.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(_b3_first_bad_mib 17592186044416)
+else()
+  set(_b3_first_bad_mib 4096)
+endif()
+add_test(NAME bench_rejects_size
+  COMMAND blake3pp_bench --size ${_b3_first_bad_mib} --reps 1 --cooldown 0)
+set_tests_properties(bench_rejects_size PROPERTIES
+  PASS_REGULAR_EXPRESSION "--size: Value ${_b3_first_bad_mib} not in range"
+  TIMEOUT 60)
+if(TARGET blake3pp_bench_file)
+  add_test(NAME bench_file_rejects_null_source
+    COMMAND blake3pp_bench_file --null-source 17179869184 --reps 1 --cooldown 0)
+  set_tests_properties(bench_file_rejects_null_source PROPERTIES
+    PASS_REGULAR_EXPRESSION "--null-source: must be a positive number of GiB"
+    TIMEOUT 60)
+  # A service time past the clock's range, and one that fits but whose
+  # latency at the knee does not.
+  add_test(NAME bench_file_rejects_null_rate
+    COMMAND blake3pp_bench_file --null-source 1 --null-rate 1e-300
+            --reps 1 --cooldown 0)
+  add_test(NAME bench_file_rejects_null_knee
+    COMMAND blake3pp_bench_file --null-source 1 --null-rate 2e-12
+            --null-knee 1024 --reps 1 --cooldown 0)
+  set_tests_properties(bench_file_rejects_null_rate bench_file_rejects_null_knee
+    PROPERTIES PASS_REGULAR_EXPRESSION "do not fit the clock" TIMEOUT 60)
+endif()
+
 # The fat binary's cost at the call boundary, isolated (see the file's
 # header): the kernel TU compiled into the bench itself, one executable
 # per vector variant the compiler can express for this target, then
@@ -148,6 +181,10 @@ function(_blake3pp_dispatch_cost ns)
     "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/include")
   target_link_libraries(${tgt} PRIVATE blake3pp::features blake3pp_warnings)
   set_target_properties(${tgt} PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+  # As bench_rejects_size, for the positional MiB count.
+  add_test(NAME ${tgt}_rejects_size COMMAND ${tgt} ${_b3_first_bad_mib} 1)
+  set_tests_properties(${tgt}_rejects_size PROPERTIES
+    PASS_REGULAR_EXPRESSION "MiB must be from 1 to" TIMEOUT 60)
 endfunction()
 # Off by default: up to four extra kernel compilations that only the
 # dispatch question needs.

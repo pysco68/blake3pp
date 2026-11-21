@@ -24,6 +24,8 @@
 #include <system_error>
 #include <type_traits>
 
+#include <blake3pp/detail/contract.hpp>
+
 namespace blake3pp::detail {
 
 // What a read must be aligned to for a platform's direct-I/O path to
@@ -33,14 +35,13 @@ namespace blake3pp::detail {
 // against this one.
 inline constexpr std::size_t direct_alignment = 4096;
 
-// steady_clock in nanoseconds, absolute: the scale of every transfer
-// stamp the backends take and every counter the pipelines keep, traced
-// or not. A trace's own scale is this minus its epoch, so a traced run
-// reads the clock once per event and not twice.
-[[nodiscard]] inline std::int64_t steady_now_ns() noexcept {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
+// steady_clock, absolute: the clock of every transfer stamp the backends
+// take, every counter the pipelines keep, traced or not, and every trace
+// record (trace_clock is the same clock), so one read serves a counter
+// and a record alike.
+[[nodiscard]] inline std::chrono::steady_clock::time_point
+steady_now() noexcept {
+  return std::chrono::steady_clock::now();
 }
 
 // Binds an operation's completion to a member of the object that owns it:
@@ -104,8 +105,8 @@ struct io_op {
 
   // Sized for whatever transfer type the native backend derives from
   // transfer_base (uring_context::transfer, aio_context::transfer,
-  // iocp_context::transfer or gcd_context::transfer --
-  // src/io/{uring,aio,iocp,gcd}_backend.hpp): only one of those is ever
+  // windows_context::transfer or gcd_context::transfer, under
+  // src/io/<os>/): only one of those is ever
   // compiled, so no header here can sizeof/alignof all of them to take
   // their max. Measured by the "op storage" case in
   // tests/file_pipeline.cpp, which prints what the build actually has:
@@ -126,9 +127,9 @@ struct io_op {
   // WINDOWS is the binding case. It chooses the ring or the port at
   // runtime, and one transfer type serves both: the completion port's,
   // whose OVERLAPPED the ring carries unused (src/io/windows/engine.hpp).
-  // That is 144 bytes, as the Windows build's op-storage case reports.
+  // That is 152 bytes, as the Windows build's op-storage case reports.
   //
-  // 192 leaves 48 bytes over that 144. The slack costs bytes per
+  // 192 leaves 40 bytes over that 152. The slack costs bytes per
   // operation in flight, and an operation is one window: at the 256-window
   // ceiling (max_queue_depth) the operations take 48 KiB, against at least
   // 16 MiB for the windows they point into (256 of the 64 KiB minimum). A
@@ -164,6 +165,14 @@ struct io_op {
     assert(live && "io_op::native() on an operation no driver owes");
     return *std::launder(reinterpret_cast<Op*>(storage));
   }
+
+  // The same op once its transfer has completed, for reading what it
+  // recorded: only from inside that completion, before a submit builds
+  // the next op over the storage.
+  template <class Op>
+  [[nodiscard]] const Op& finished_native() const noexcept {
+    return *std::launder(reinterpret_cast<const Op*>(storage));
+  }
 };
 
 // Size and alignment of the platform backend's own operation: what
@@ -189,6 +198,19 @@ struct window_storage {
   std::span<std::byte> read_into;
   std::span<const std::byte> view;
 };
+
+// Window `slot`'s first `bytes` of an arena laid out as windows of
+// `window_bytes` side by side: the slicing every driver with an arena
+// does. Checked in every build, because a window outside the arena
+// reserve() took would point past the allocation.
+[[nodiscard]] inline std::span<std::byte> window_slice(
+    std::span<std::byte> arena, unsigned slot, std::size_t window_bytes,
+    std::size_t bytes) {
+  const std::size_t at = static_cast<std::size_t>(slot) * window_bytes;
+  require(bytes <= window_bytes && at + bytes <= arena.size(),
+          "window_storage_for(): a window outside the arena reserve() took");
+  return arena.subspan(at, bytes);
+}
 
 // What the pipeline needs of whatever is feeding it: a source of
 // windows that reports its completions from poll(), on the thread that
@@ -227,65 +249,72 @@ concept file_driver =
           -> std::same_as<window_storage>;
     };
 
-// What the driver's engine actually offered the device, where it can say.
-//
-// Optional rather than part of file_driver: only the file I/O driver has
-// an engine with a queue of its own. A driver without these
-// members (memory_driver, pipe_driver) leaves the depth the pipeline asked
-// for standing and the pipeline's own admission-to-landing span as the
-// device's time.
+// What a context's device had over the context's life: its device()
+// answers in these. A trace does not read it, because a context shared by
+// several operations would hand each one the others' time; it reads
+// transfer_service, per transfer, below.
 struct device_time {
-  // Summed nanoseconds the device had a transfer, over the pieces it was
-  // carried in.
-  std::uint64_t total_ns = 0;
+  // Summed time the device had a transfer, over the pieces it was carried
+  // in.
+  std::chrono::nanoseconds total{};
   // The shortest of those, which is the device's latency with nothing
   // queued ahead.
-  std::uint64_t min_ns = 0;
+  std::chrono::nanoseconds min{};
   // Transfers that contributed. Zero means the driver cannot say, and
   // the pipeline's own measure stands.
   std::uint64_t transfers = 0;
 
-  void add(std::uint64_t ns) noexcept {
-    total_ns += ns;
-    min_ns = transfers == 0 ? ns : (ns < min_ns ? ns : min_ns);
+  void add(std::chrono::nanoseconds t) noexcept {
+    total += t;
+    min = transfers == 0 ? t : (t < min ? t : min);
     ++transfers;
   }
 
   // Records a transfer the device actually had, and ignores one it never
   // did -- cancelled before it was issued, or refused outright. Counting
-  // a zero would pull `min_ns` to zero, which is the yardstick the mean
+  // a zero would pull `min` to zero, which is the yardstick the mean
   // is read against, and dilute the mean with a transfer that never
   // happened.
-  void add_if_served(std::uint64_t ns) noexcept {
-    if (ns > 0) {
-      add(ns);
+  void add_if_served(std::chrono::nanoseconds t) noexcept {
+    if (t > std::chrono::nanoseconds::zero()) {
+      add(t);
     }
   }
 };
 
-struct device_service {
-  // The most transfers the engine can have at the device at once; zero
-  // means the driver cannot say and the queue depth in force stands.
-  unsigned depth = 0;
-  // Nanoseconds transfers spent waiting for one of the driver's own
-  // servers before they started, with none of the device in it.
-  std::uint64_t lane_wait_ns = 0;
-  // What the device itself took, stamped where the transfer happened.
-  device_time device{};
+// What the driver's engine actually offered the device, where it can say.
+//
+// Optional rather than part of file_driver: only the file I/O driver has
+// an engine with a queue of its own. A driver without these members
+// (memory_driver, pipe_driver) leaves the depth the pipeline asked for
+// standing and the pipeline's own admission-to-landing span as the
+// device's time.
+//
+// What one finished transfer cost, where the driver can say: the
+// device's own time, stamped by whoever performed the transfer, and how
+// long it first waited for one of the driver's own threads, with none of
+// the device in it. Read per transfer, inside its completion, so a run
+// counts its own transfers and nothing a shared driver did for another.
+struct transfer_service {
+  std::chrono::nanoseconds device{};
+  std::chrono::nanoseconds lane_wait{};
 };
 
 template <class D>
-[[nodiscard]] device_service device_service_of(const D& drv) noexcept {
+concept attributes_transfers = requires(const D& drv, const io_op& op) {
+  { drv.service_of(op) } noexcept -> std::same_as<transfer_service>;
+};
+
+// The most transfers the driver's engine can have at the device at once;
+// zero means the driver cannot say and the queue depth in force stands.
+template <class D>
+[[nodiscard]] unsigned device_depth_of(const D& drv) noexcept {
   if constexpr (requires {
                   { drv.device_depth() } noexcept -> std::same_as<unsigned>;
-                  { drv.lane_wait_ns() } noexcept -> std::same_as<std::uint64_t>;
-                  {
-                    drv.device_time_of_run()
-                  } noexcept -> std::same_as<device_time>;
                 }) {
-    return {drv.device_depth(), drv.lane_wait_ns(), drv.device_time_of_run()};
+    return drv.device_depth();
   } else {
-    return {};
+    return 0;
   }
 }
 

@@ -6,6 +6,7 @@
 
 #if defined(_WIN32)
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -192,6 +193,14 @@ class windows_engine {
 
 using windows_context = completion_context<windows_engine>;
 static_assert(io_context<windows_context>);
+
+// A read file is named by the ring, or by the port with the ring's reason
+// for refusing appended (file_part above). A read file has no
+// preallocation suffix.
+static_assert(std::max(ioring_read_name_max,
+                       iocp_read_name_max + no_ioring_suffix_max) <=
+                  max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 }  // namespace blake3pp::detail::io_impl
 

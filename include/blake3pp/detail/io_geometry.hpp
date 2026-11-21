@@ -105,6 +105,14 @@ inline constexpr unsigned default_queue_depth = 4;
   return std::clamp(requested, 2u, max_queue_depth);
 }
 
+// How many pieces of `divisor` bytes cover `total`, the last one possibly
+// short. Unlike (total + divisor - 1) / divisor, it does not wrap for a
+// total near the top of the range. `divisor` must be nonzero.
+[[nodiscard]] constexpr std::uint64_t ceil_div(std::uint64_t total,
+                                               std::uint64_t divisor) noexcept {
+  return total / divisor + (total % divisor != 0 ? 1 : 0);
+}
+
 // Window objects a stream's run allocates.
 //
 // A stream has one position, so exactly one window is ever being filled:
@@ -215,10 +223,15 @@ inline constexpr std::size_t max_window_budget_bytes = std::size_t{2} << 30;
   if (threads == 0) {
     return default_window_budget_bytes;
   }
+  const std::size_t window = rounded_window_bytes(window_bytes);
   const std::size_t windows =
       std::max<std::size_t>(1, threads / threads_per_window);
-  return std::clamp<std::size_t>(rounded_window_bytes(window_bytes) * windows,
-                                 default_window_budget_bytes,
+  // Compared before multiplying: on 32-bit size_t a thread count in the
+  // thousands times a wide window wraps.
+  if (windows > max_window_budget_bytes / window) {
+    return max_window_budget_bytes;
+  }
+  return std::clamp<std::size_t>(window * windows, default_window_budget_bytes,
                                  max_window_budget_bytes);
 }
 

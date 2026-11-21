@@ -5,6 +5,7 @@
 // this is the half that formats, so only the tools include it. It returns
 // strings and writes nothing, so each tool prints with its own println().
 
+#include <chrono>
 #include <format>
 #include <optional>
 #include <string>
@@ -20,9 +21,14 @@ namespace b3tool {
 
 // A service time at the scale it reads at. Device figures span a drive's
 // microseconds and a loaded queue's milliseconds in the same report.
-[[nodiscard]] inline std::string service_label(double ns) {
-  return ns >= 1e6 ? std::format("{:.3f} ms", ns / 1e6)
-                   : std::format("{:.1f} us", ns / 1e3);
+[[nodiscard]] inline std::string service_label(
+    std::chrono::duration<double, std::nano> t) {
+  if (t >= std::chrono::milliseconds{1}) {
+    return std::format(
+        "{:.3f} ms", std::chrono::duration<double, std::milli>(t).count());
+  }
+  return std::format("{:.1f} us",
+                     std::chrono::duration<double, std::micro>(t).count());
 }
 
 // The reading, or the two a run could not separate.
@@ -90,7 +96,9 @@ namespace b3tool {
         "  watch          {} waits on an empty stream: {} caught by a "
         "probe, {} slept; {} probes; budget {} us",
         s.watch.caught + s.watch.slept, s.watch.caught, s.watch.slept,
-        s.watch.probes, s.watch.budget_ns / 1000));
+        s.watch.probes,
+        std::chrono::duration_cast<std::chrono::microseconds>(s.watch.budget)
+            .count()));
   } else {
     out.push_back("  watch          none on this platform: a read blocks");
   }

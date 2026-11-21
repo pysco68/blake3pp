@@ -43,6 +43,9 @@
 #include <vector>
 
 #include <CLI/CLI.hpp>
+#include "cli_ranges.hpp"
+
+#include <blake3pp/detail/cpu_relax.hpp>
 
 #include "pipe_os.hpp"
 
@@ -58,7 +61,7 @@ void wait_until(clock_type::time_point from, std::chrono::microseconds gap) {
     return;
   }
   while (clock_type::now() < until) {
-    pipebench::relax();
+    blake3pp::detail::cpu_relax();
   }
 }
 
@@ -74,18 +77,19 @@ int main(int argc, char** argv) {
   std::string wait_for;
 
   CLI::App app{"pump: write a generated or file-backed stream to stdout in fixed-size writes"};
-  auto* gen = app.add_option("--gen", gib, "GiB to generate in memory");
+  auto* gen = app.add_option("--gen", gib, "GiB to generate in memory")
+                  ->check(b3tool::gib_size);
   auto* file = app.add_option("--file", path, "file to forward");
   gen->excludes(file);
   app.add_option("--chunk", chunk_kib, "bytes per write, in KiB")
-      ->check(CLI::PositiveNumber);
+      ->check(b3tool::units_fitting(10));
   app.add_option("--gap-us", gap_us, "microseconds from one write's start to the next")
-      ->check(CLI::NonNegativeNumber);
+      ->check(b3tool::delay_range<std::chrono::microseconds>());
   auto* close_opt = app.add_option("--close-after", close_after, "write this many bytes, then exit cleanly");
   auto* die_opt = app.add_option("--die-after", die_after, "write this many bytes, then terminate abnormally");
   close_opt->excludes(die_opt);
   auto* stall_opt = app.add_option("--stall-ms", stall_ms, "pause this long once, after --after bytes")
-                        ->check(CLI::NonNegativeNumber);
+                        ->check(b3tool::delay_range<std::chrono::milliseconds>());
   auto* wait_opt = app.add_option("--wait-for", wait_for, "after --after bytes, wait until this file exists");
   auto* after_opt = app.add_option("--after", stall_after, "where --stall-ms or --wait-for pauses, in bytes");
   stall_opt->needs(after_opt);
@@ -191,7 +195,7 @@ int main(int argc, char** argv) {
       return 1;
     }
   } else {
-    auto total = static_cast<std::uint64_t>(gib * 1073741824.0);
+    std::uint64_t total = b3tool::gib_bytes(gib);
     while (total > 0) {
       const std::size_t n = total < chunk ? static_cast<std::size_t>(total) : chunk;
       const int rc = emit(buf.data(), n);

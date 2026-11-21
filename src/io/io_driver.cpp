@@ -245,12 +245,9 @@ unsigned io_driver::device_depth() const noexcept {
   return impl_->ctx.device_depth();
 }
 
-std::uint64_t io_driver::lane_wait_ns() const noexcept {
-  return impl_->ctx.lane_wait_ns();
-}
-
-device_time io_driver::device_time_of_run() const noexcept {
-  return impl_->ctx.device();
+transfer_service io_driver::service_of(const io_op& op) const noexcept {
+  const native_op& inner = op.finished_native<native_op>();
+  return {inner.device_total(), inner.lane_wait_total()};
 }
 
 void io_driver::drain() noexcept {
@@ -281,10 +278,9 @@ void io_driver::reserve(unsigned windows, std::size_t window_bytes) {
 window_storage io_driver::window_storage_for(file&, unsigned slot,
                                              std::uint64_t,
                                              std::size_t bytes) noexcept {
-  const std::size_t at = static_cast<std::size_t>(slot) * impl_->window_bytes;
-  assert(at + bytes <= impl_->arena_bytes &&
-         "a window asked for arena the reserve did not take");
-  const std::span<std::byte> slice{impl_->buffers.get() + at, bytes};
+  const std::span<std::byte> slice = window_slice(
+      {impl_->buffers.get(), impl_->arena_bytes}, slot, impl_->window_bytes,
+      bytes);
   return {slice, std::span<const std::byte>(slice)};
 }
 

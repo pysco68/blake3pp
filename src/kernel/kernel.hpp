@@ -26,8 +26,7 @@ inline constexpr std::size_t out_len = 32;
 
 // Upper bound on any variant's simd_degree in THIS build, 16 u32 lanes for
 // AVX-512. It sizes the caller-side staging buffers for hash_many batches,
-// and with them the subtree recursion's per-level buffers
-// (core/subtree.hpp).
+// and with them the subtree sweep's (core/subtree.hpp).
 //
 // The build system defines it from BLAKE3PP_MAX_SIMD_DEGREE on
 // blake3pp::features, which the kernel objects link and the library

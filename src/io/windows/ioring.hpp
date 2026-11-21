@@ -48,6 +48,7 @@
 
 #include "io/completion_context.hpp"
 #include "io/io_context.hpp"
+#include "io/ladder.hpp"
 #include "io/options.hpp"
 #include "io/windows/file.hpp"
 
@@ -71,25 +72,41 @@ struct ioring_refusal {
   std::uint32_t hr = 0;       // what CreateIoRing or the op probe answered
 };
 
+// Always "0x" and eight digits.
+inline constexpr std::size_t hex32_text = 10;
 inline std::string hex32(std::uint32_t v) {
   return std::format("{:#010x}", v);
 }
 
+inline constexpr std::string_view ioring_no_api_suffix = " [ioring: no api]";
+inline constexpr std::string_view ioring_version_prefix = " [ioring: version ";
+inline constexpr std::string_view ioring_no_rw_suffix =
+    " [ioring: no read/write ops]";
+inline constexpr std::string_view ioring_create_prefix =
+    " [ioring: CreateIoRing failed ";
+
 inline std::string no_ioring_suffix(const ioring_refusal& r) {
   switch (r.why) {
     case ioring_refusal::kind::no_api:
-      return " [ioring: no api]";
+      return std::string(ioring_no_api_suffix);
     case ioring_refusal::kind::old_version:
-      return " [ioring: version " + std::to_string(r.version) + "]";
+      return std::string(ioring_version_prefix) + std::to_string(r.version) +
+             "]";
     case ioring_refusal::kind::no_read_write:
-      return " [ioring: no read/write ops]";
+      return std::string(ioring_no_rw_suffix);
     case ioring_refusal::kind::create_failed:
-      return " [ioring: CreateIoRing failed " + hex32(r.hr) + "]";
+      return std::string(ioring_create_prefix) + hex32(r.hr) + "]";
     case ioring_refusal::kind::none:
       break;
   }
   return {};
 }
+
+// The longest no_ioring_suffix(), its numbers at the widest.
+inline constexpr std::size_t no_ioring_suffix_max =
+    std::max({ioring_no_api_suffix.size(), ioring_no_rw_suffix.size(),
+              ioring_version_prefix.size() + u32_text_max + 1,
+              ioring_create_prefix.size() + hex32_text + 1});
 
 #if defined(BLAKE3PP_HAS_IORING_API)
 
@@ -516,12 +533,14 @@ class ioring_engine {
   // spellings and suffixes are fixed.
   [[nodiscard]] std::string name_for(bool direct, bool on_ring,
                                      bool write) const {
-    if (on_ring) {
-      return direct ? "ioring+direct" : "ioring";
+    std::string n(engine_token(
+        on_ring ? io_engine::ioring : io_engine::win_sync, write));
+    if (direct) {
+      n += direct_tag;
     }
-    const char* const sync_name = write ? "writefile" : "readfile";
-    std::string n =
-        direct ? std::string(sync_name) + "+direct" : std::string(sync_name);
+    if (on_ring) {
+      return n;
+    }
     if (async_requested_ && !use_ring_) {
       n += no_ioring_suffix(refusal());
     }
@@ -650,6 +669,15 @@ using ioring_context = completion_context<ioring_engine>;
 // with the missed requirement named, the first time this header is
 // compiled, before any engine instantiation exists.
 static_assert(io_context<ioring_context>);
+
+// The longest read name ioring_engine::name_for() gives: the ring, or the
+// synchronous rung and why the ring was refused.
+inline constexpr std::size_t ioring_read_name_max =
+    std::max(engine_token(io_engine::ioring, false).size() + direct_tag.size(),
+             engine_token(io_engine::win_sync, false).size() +
+                 direct_tag.size() + no_ioring_suffix_max);
+static_assert(ioring_read_name_max <= max_read_backend_length,
+              "a read backend name would not fit driver_stats::read_backend");
 
 #if defined(BLAKE3PP_TEST_IO_SEAMS)
 }  // inline namespace test_seams
